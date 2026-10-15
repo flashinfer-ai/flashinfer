@@ -918,6 +918,31 @@ and re-measured at the H6 numbers.  Worst cell after: und.kv tp8 M = 1 at 1.73x 
 the hand kernel; the 30 worst cells are all narrow N (N <= 1280) at M <= 512, where both
 kernels are 1.2-1.7x cuBLAS: next step.  Per-cell table: `hopper-mail/step2a_routing.md`.
 
+**Step 2b: the 64x128 ping-pong tile** (`cutlass_64x128`, algo code 9).  Measured against
+the 2a default on 216 cells (M <= 2048, `s2b_*`): it beats it by more than 3% on 16 cells, by up
+to 34% (attn.out tp4 M = 128: 1.44 -> 0.94 of cuBLAS; und.kv tp1 / und.q tp8 M = 1024: 1.33 ->
+1.06).  All 16 are cells where its grid (64-row weight tiles x 128-row activation tiles) is
+80-128 tiles, 0.6-1.0 of a wave: one tile per SM and no split-K round trip.  Above one wave it
+is 1.3-1.9x of the 128-row tiles (the register-sourced conversion runs once per activation
+tile), and at M < 128 with long K split-K wins.
+
+The dispatcher was refitted against the new menu (not stacked on 2a): at M <= 4096, 64x128 for
+a 0.6-1.0 wave grid when M >= 128 and K <= 5120 or K <= 1024; hand split-K for at most one
+128x256 wave at M <= 512 (except short K at M = 129-256), and up to two waves at M <= 128; at
+1-2 waves the tile by last-wave fill (K <= 1024 -> 64x256; 128x256 last wave >= 0.8 full ->
+128x256; 64x256 last wave >= 0.6 -> 64x256; <= 1.3 waves -> stream-K at K >= 4096 or 64x256;
+else 128x256).  The 2a hand window at 1.4-1.6 waves was a fit artifact: every 1-2 wave cell of
+the 24 rows at M = 256..4096 (51 cells, all variants pinned, `s2c_*`) has the hand kernel within
+1% of 128x256 there, because its split model picks no split.  Fit check over the 267 measured
+cells: none more than 3% behind the per-cell best.
+
+Result (`s2d_*`, `s2e_*`): 112 of 240 cells within 1.02 of cuBLAS (2a 108, baseline 29), 240 of
+240 at or under cast-copy, auto within 2% of the hand kernel on 232 of 240.  Geomean auto /
+cuBLAS at M = 1 / 16 / 32 / 64 / 128 / 256 / 512 / 1024 / 2048 / 4096: 1.060 / 1.048 / 1.032 /
+1.015 / 0.956 / 1.063 / 1.189 / 1.120 / 1.069 / 1.024.  M = 88320 untouched (max 1.033,
+attn.out tp8).  Worst cell: und.kv tp8 M = 1 at 1.72x cuBLAS, on the hand kernel.  Per-cell
+table: `hopper-mail/step2b_64x128.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16

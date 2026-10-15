@@ -345,6 +345,7 @@ using W8A16Sm90Cfg128x192 = W8A16Sm90Cfg<128, 192>;  // wave-fill heights (see P
 using W8A16Sm90Cfg128x160 = W8A16Sm90Cfg<128, 160>;
 using W8A16Sm90Cfg128x128 = W8A16Sm90Cfg<128, 128>;
 using W8A16Sm90Cfg64x256 = W8A16Sm90Cfg<64, 256>;  // ping-pong: 2 tiles in flight per SM
+using W8A16Sm90Cfg64x128 = W8A16Sm90Cfg<64, 128>;  // ping-pong, short activation tile
 // W8A16Sm90Cfg<128, 256, 64, 2> (activation multicast pair) was swept on Tue 13 Oct 2026:
 // within +-2% of the cluster-1 tile on all 144 rows, so it is not instantiated.
 
@@ -488,8 +489,9 @@ enum class W8A16Sm90Algo {
   kCutlass64x256 = 6,
   kCutlass128x256StreamK = 7,
   kCutlass128x192StreamK = 8,
+  kCutlass64x128 = 9,
 };
-constexpr int kW8A16Sm90MaxAlgoCode = 8;
+constexpr int kW8A16Sm90MaxAlgoCode = 9;
 
 inline W8A16Sm90Algo W8A16Sm90AlgoFromCode(int code) {
   return (code >= 1 && code <= kW8A16Sm90MaxAlgoCode) ? static_cast<W8A16Sm90Algo>(code)
@@ -511,6 +513,7 @@ inline W8A16Sm90Algo W8A16Sm90AlgoEnv() {
     if (std::strcmp(s, "cutlass_64x256") == 0) return W8A16Sm90Algo::kCutlass64x256;
     if (std::strcmp(s, "cutlass_128x256_streamk") == 0)
       return W8A16Sm90Algo::kCutlass128x256StreamK;
+    if (std::strcmp(s, "cutlass_64x128") == 0) return W8A16Sm90Algo::kCutlass64x128;
     if (std::strcmp(s, "cutlass_128x192_streamk") == 0)
       return W8A16Sm90Algo::kCutlass128x192StreamK;
     return W8A16Sm90Algo::kAuto;
@@ -687,22 +690,46 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   const long long units = 1LL * ((N + 127) / 128) * ((M + 255) / 256);
   const double waves = static_cast<double>(units) / std::max(num_sms, 1);
   const double frac = waves - std::floor(waves);
-  // Version H7 (small M): the hand kernel's split-K (its own cost model splits K across
-  // up to 8 blocks per tile plus an fp32 reduce) is what fills the machine when the
-  // 128x256 tile grid is at most one wave; the CUTLASS tiles leave most SMs idle there
-  // (mlp.down tp1 M=1: 64x256 229 us, hand 82 us, cuBLAS 104 us).  At M = 129-256 with short
-  // K (<= 3200, attn.out tp4/tp8, mlp.down tp8) there are too few K slabs to split and the
-  // 64x256 ping-pong tile wins instead (hand 1.20-1.26x of it).  At 1.4-1.6 waves
-  // (mlp.gate_up tp1-tp8 at M <= 2048) the hand model's split evens the last wave where
-  // the CUTLASS tiles run two waves with a half-empty tail (hand 0.40-0.97 of auto).
-  // Between 1 and 1.4 waves CUTLASS keeps the rows (gen.qkv tp1 M=512: hand 1.28x).
-  // Fitted to the 240-cell small-M sweep of Thu 15 Oct 2026 (24 rows x M = 1..4096,
-  // 5 rotated rounds x 2 passes): 9 cells more than 2% behind the better of the two
-  // kernels, worst 7% (gen.qkv tp8 M=2048).
+  // Version H7 (small M, M <= 4096), refitted with the 64x128 ping-pong tile on the menu
+  // (Thu 15 Oct 2026: 24 rows x M = 1..2048, 5 rotated rounds x 2 passes, plus every
+  // 1-2 wave cell of the 24 rows at M = 256..4096 with all variants pinned; 267 cells, none
+  // more than 3% behind the per-cell best).  Mechanisms, in order:
+  //  * 64x128 when its grid (64-row weight tiles x 128-row activation tiles) is 80-128
+  //    tiles, i.e. 0.6-1.0 of a wave, with M >= 128 and K <= 5120, or any M at K <= 1024:
+  //    one tile per SM, no split overhead (und.kv tp1 / und.q tp8 at M = 1024: 0.80 of hand,
+  //    attn.out tp4 at M = 128: 0.66).  Long K and M < 128 go to split-K instead.
+  //  * hand (split-K over up to 8 blocks per tile + fp32 reduce) when the 128x256 grid is at
+  //    most one wave at M <= 512: the CUTLASS tiles leave most SMs idle there (mlp.down tp1
+  //    M = 1: 64x256 229 us, hand 82 us, cuBLAS 104 us).  Short K (<= 3200) at M = 129-256
+  //    has too few K slabs to split and falls through to 64x256.  At M <= 128 the same
+  //    holds up to 2 waves (mlp.gate_up tp1).
+  //  * 1-2 waves: K <= 1024 -> 64x256 (two tiles in flight hide the short mainloop's
+  //    epilogue); a last 128x256 wave >= 0.8 full -> 128x256; else 64x256 when its own last
+  //    wave is >= 0.6 full; else, up to 1.3 waves, stream-K for K >= 4096 (64x256 below);
+  //    else 128x256.  The hand kernel no longer wins anywhere in 1-2 waves: its split model
+  //    picks no split there and it runs as a plain 128x256 (the 1.4-1.6 window of the first
+  //    H7 fit was within 1% of 128x256 on every edge and in-band cell re-measured).
   if (M <= 4096) {
-    const bool one_wave = M <= 512 && waves <= 1.0 && !(K <= 3200 && M > 128 && M <= 256);
-    const bool split_tail = waves >= 1.4 && waves <= 1.6;
-    if (one_wave || split_tail) return W8A16Sm90Algo::kHand;
+    const long long tiles_64x128 = 1LL * ((N + 63) / 64) * ((M + 127) / 128);
+    const double tw = static_cast<double>(tiles_64x128) / std::max(num_sms, 1);
+    if (M <= 2048 && tw >= 0.6 && tw <= 1.0 && ((M >= 128 && K <= 5120) || K <= 1024))
+      return W8A16Sm90Algo::kCutlass64x128;
+    if (M <= 512 && waves <= 1.0 && !(K <= 3200 && M > 128 && M <= 256))
+      return W8A16Sm90Algo::kHand;
+    // At M <= 128 the activation tile is mostly empty and the time is the weight stream;
+    // splitting K wins at any wave count up to 2 (mlp.gate_up tp1, 1.5 waves at M = 1-128:
+    // hand 0.74-1.15 of cuBLAS, 128x256 1.20-1.38).
+    if (M <= 128 && waves < 2.0) return W8A16Sm90Algo::kHand;
+    if (N <= 512 && units <= 32) return W8A16Sm90Algo::kHand;
+    if (waves > 1.0 && waves < 2.0) {
+      const double frac64 = 2.0 * waves - std::floor(2.0 * waves);
+      if (K <= 1024) return W8A16Sm90Algo::kCutlass64x256;
+      if (frac >= 0.8) return W8A16Sm90Algo::kCutlass128x256;
+      if (frac64 >= 0.6) return W8A16Sm90Algo::kCutlass64x256;
+      if (waves <= 1.3)
+        return K >= 4096 ? W8A16Sm90Algo::kCutlass128x256StreamK : W8A16Sm90Algo::kCutlass64x256;
+      return W8A16Sm90Algo::kCutlass128x256;
+    }
   }
   if (N <= 512) {
     if (units <= 32 && M <= 4096) return W8A16Sm90Algo::kHand;
@@ -751,6 +778,8 @@ size_t W8A16Fp8GemmSm90CutlassWorkspaceBytes(W8A16Sm90Algo algo, int M, int N, i
     case W8A16Sm90Algo::kCutlass128x256StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, true>::WorkspaceBytes(M, N, K, device_id,
                                                                          num_sms);
+    case W8A16Sm90Algo::kCutlass64x128:
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x128>::WorkspaceBytes(M, N, K, device_id, num_sms);
     case W8A16Sm90Algo::kCutlass128x192StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, true>::WorkspaceBytes(M, N, K, device_id,
                                                                          num_sms);
@@ -789,6 +818,10 @@ cudaError_t W8A16Fp8GemmSm90Cutlass(W8A16Sm90Algo algo, const T* act, const __nv
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, true>::Run(act, weight, scale, bias, out, M, N,
                                                               K, workspace, workspace_bytes,
                                                               device_id, num_sms, stream);
+    case W8A16Sm90Algo::kCutlass64x128:
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x128>::Run(act, weight, scale, bias, out, M, N, K,
+                                                       workspace, workspace_bytes, device_id,
+                                                       num_sms, stream);
     case W8A16Sm90Algo::kCutlass128x192StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, true>::Run(act, weight, scale, bias, out, M, N,
                                                               K, workspace, workspace_bytes,

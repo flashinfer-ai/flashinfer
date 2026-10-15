@@ -113,6 +113,7 @@ W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "cutlass_64x256": 6,
     "cutlass_128x256_streamk": 7,
     "cutlass_128x192_streamk": 8,
+    "cutlass_64x128": 9,
 }
 
 
