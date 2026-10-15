@@ -18,10 +18,17 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit);
+struct CakeFastDivmod {
+  int32_t divisor;
+  uint32_t multiplier;
+  uint32_t shift_right;
+};
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
+extern "C" __global__ void kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit, CakeFastDivmod mini_tasks_div, CakeFastDivmod minis_per_macro_div, CakeFastDivmod fused_col_blocks_div, CakeFastDivmod down_col_blocks_div);
 
 
-namespace cake_host_shim_5ebc620d7dedfe52 {
+namespace cake_host_shim_0b0177378f9e9882 {
 
 using tvm::ffi::TensorView;
 
@@ -1296,7 +1303,7 @@ inline CUtensorMap EncodeTma_y_routed(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_shared, TensorView arg_wu_shared, TensorView arg_wd_shared, TensorView arg_wg_routed, TensorView arg_wu_routed, TensorView arg_wd_routed, TensorView arg_gate_shared_out, TensorView arg_up_shared_out, TensorView arg_gate_routed_out, TensorView arg_up_routed_out, TensorView arg_hidden_shared_out, TensorView arg_hidden_routed_out, TensorView arg_hidden_shared_in, TensorView arg_hidden_routed_in, TensorView arg_y_shared, TensorView arg_y_routed, TensorView arg_x_routed_ptr, TensorView arg_y_routed_ptr, TensorView arg_x_peers, TensorView arg_y_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_hidden_ready, TensorView arg_x_ready, TensorView arg_y_ready, TensorView arg_y_done, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, double arg_swiglu_limit, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_shared, TensorView arg_wu_shared, TensorView arg_wd_shared, TensorView arg_wg_routed, TensorView arg_wu_routed, TensorView arg_wd_routed, TensorView arg_gate_shared_out, TensorView arg_up_shared_out, TensorView arg_gate_routed_out, TensorView arg_up_routed_out, TensorView arg_hidden_shared_out, TensorView arg_hidden_routed_out, TensorView arg_hidden_shared_in, TensorView arg_hidden_routed_in, TensorView arg_y_shared, TensorView arg_y_routed, TensorView arg_x_routed_ptr, TensorView arg_y_routed_ptr, TensorView arg_x_peers, TensorView arg_y_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_hidden_ready, TensorView arg_x_ready, TensorView arg_y_ready, TensorView arg_y_done, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, double arg_swiglu_limit, tvm::ffi::Shape arg_mini_tasks_div, tvm::ffi::Shape arg_minis_per_macro_div, tvm::ffi::Shape arg_fused_col_blocks_div, tvm::ffi::Shape arg_down_col_blocks_div, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_x_shared.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   {
@@ -1403,6 +1410,38 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   TVM_FFI_CHECK(arg_mini_size >= -2147483648LL && arg_mini_size <= 2147483647LL, ValueError)
       << "scalar 'mini_size' value " << arg_mini_size
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_mini_tasks_div.size() == 3, ValueError)
+      << "FastDivmod parameter 'mini_tasks_div' expects 3 fields, got " << arg_mini_tasks_div.size();
+  TVM_FFI_CHECK(arg_mini_tasks_div[0] >= 1 && arg_mini_tasks_div[0] <= 2147483647LL, ValueError)
+      << "FastDivmod parameter 'mini_tasks_div' divisor is outside [1, 2147483647]";
+  TVM_FFI_CHECK(arg_mini_tasks_div[1] >= 0 && arg_mini_tasks_div[1] <= 4294967295LL, ValueError)
+      << "FastDivmod parameter 'mini_tasks_div' multiplier is outside u32 range";
+  TVM_FFI_CHECK(arg_mini_tasks_div[2] >= 0 && arg_mini_tasks_div[2] <= 30, ValueError)
+      << "FastDivmod parameter 'mini_tasks_div' shift_right is outside [0, 30]";
+  TVM_FFI_CHECK(arg_minis_per_macro_div.size() == 3, ValueError)
+      << "FastDivmod parameter 'minis_per_macro_div' expects 3 fields, got " << arg_minis_per_macro_div.size();
+  TVM_FFI_CHECK(arg_minis_per_macro_div[0] >= 1 && arg_minis_per_macro_div[0] <= 2147483647LL, ValueError)
+      << "FastDivmod parameter 'minis_per_macro_div' divisor is outside [1, 2147483647]";
+  TVM_FFI_CHECK(arg_minis_per_macro_div[1] >= 0 && arg_minis_per_macro_div[1] <= 4294967295LL, ValueError)
+      << "FastDivmod parameter 'minis_per_macro_div' multiplier is outside u32 range";
+  TVM_FFI_CHECK(arg_minis_per_macro_div[2] >= 0 && arg_minis_per_macro_div[2] <= 30, ValueError)
+      << "FastDivmod parameter 'minis_per_macro_div' shift_right is outside [0, 30]";
+  TVM_FFI_CHECK(arg_fused_col_blocks_div.size() == 3, ValueError)
+      << "FastDivmod parameter 'fused_col_blocks_div' expects 3 fields, got " << arg_fused_col_blocks_div.size();
+  TVM_FFI_CHECK(arg_fused_col_blocks_div[0] >= 1 && arg_fused_col_blocks_div[0] <= 2147483647LL, ValueError)
+      << "FastDivmod parameter 'fused_col_blocks_div' divisor is outside [1, 2147483647]";
+  TVM_FFI_CHECK(arg_fused_col_blocks_div[1] >= 0 && arg_fused_col_blocks_div[1] <= 4294967295LL, ValueError)
+      << "FastDivmod parameter 'fused_col_blocks_div' multiplier is outside u32 range";
+  TVM_FFI_CHECK(arg_fused_col_blocks_div[2] >= 0 && arg_fused_col_blocks_div[2] <= 30, ValueError)
+      << "FastDivmod parameter 'fused_col_blocks_div' shift_right is outside [0, 30]";
+  TVM_FFI_CHECK(arg_down_col_blocks_div.size() == 3, ValueError)
+      << "FastDivmod parameter 'down_col_blocks_div' expects 3 fields, got " << arg_down_col_blocks_div.size();
+  TVM_FFI_CHECK(arg_down_col_blocks_div[0] >= 1 && arg_down_col_blocks_div[0] <= 2147483647LL, ValueError)
+      << "FastDivmod parameter 'down_col_blocks_div' divisor is outside [1, 2147483647]";
+  TVM_FFI_CHECK(arg_down_col_blocks_div[1] >= 0 && arg_down_col_blocks_div[1] <= 4294967295LL, ValueError)
+      << "FastDivmod parameter 'down_col_blocks_div' multiplier is outside u32 range";
+  TVM_FFI_CHECK(arg_down_col_blocks_div[2] >= 0 && arg_down_col_blocks_div[2] <= 30, ValueError)
+      << "FastDivmod parameter 'down_col_blocks_div' shift_right is outside [0, 30]";
   check_same_device(arg_x_routed, arg_x_shared, "x_routed", "x_shared");
   check_same_device(arg_wg_shared, arg_x_shared, "wg_shared", "x_shared");
   check_same_device(arg_wu_shared, arg_x_shared, "wu_shared", "x_shared");
@@ -1479,7 +1518,11 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
   int32_t v_macro_size = (int32_t)arg_macro_size;
   int32_t v_mini_size = (int32_t)arg_mini_size;
   float v_swiglu_limit = (float)arg_swiglu_limit;
-  void* kargs[] = {&p_x_shared, &p_x_routed, &p_wg_shared, &p_wu_shared, &p_wd_shared, &p_wg_routed, &p_wu_routed, &p_wd_routed, &p_gate_shared_out, &p_up_shared_out, &p_gate_routed_out, &p_up_routed_out, &p_hidden_shared_out, &p_hidden_routed_out, &p_hidden_shared_in, &p_hidden_routed_in, &p_y_shared, &p_y_routed, &p_x_routed_ptr, &p_y_routed_ptr, &p_x_peers, &p_y_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_hidden_ready, &p_x_ready, &p_y_ready, &p_y_done, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size, &v_swiglu_limit};
+  CakeFastDivmod v_mini_tasks_div{(int32_t)arg_mini_tasks_div[0], (uint32_t)arg_mini_tasks_div[1], (uint32_t)arg_mini_tasks_div[2]};
+  CakeFastDivmod v_minis_per_macro_div{(int32_t)arg_minis_per_macro_div[0], (uint32_t)arg_minis_per_macro_div[1], (uint32_t)arg_minis_per_macro_div[2]};
+  CakeFastDivmod v_fused_col_blocks_div{(int32_t)arg_fused_col_blocks_div[0], (uint32_t)arg_fused_col_blocks_div[1], (uint32_t)arg_fused_col_blocks_div[2]};
+  CakeFastDivmod v_down_col_blocks_div{(int32_t)arg_down_col_blocks_div[0], (uint32_t)arg_down_col_blocks_div[1], (uint32_t)arg_down_col_blocks_div[2]};
+  void* kargs[] = {&p_x_shared, &p_x_routed, &p_wg_shared, &p_wu_shared, &p_wd_shared, &p_wg_routed, &p_wu_routed, &p_wd_routed, &p_gate_shared_out, &p_up_shared_out, &p_gate_routed_out, &p_up_routed_out, &p_hidden_shared_out, &p_hidden_routed_out, &p_hidden_shared_in, &p_hidden_routed_in, &p_y_shared, &p_y_routed, &p_x_routed_ptr, &p_y_routed_ptr, &p_x_peers, &p_y_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_hidden_ready, &p_x_ready, &p_y_ready, &p_y_done, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size, &v_swiglu_limit, &v_mini_tasks_div, &v_minis_per_macro_div, &v_fused_col_blocks_div, &v_down_col_blocks_div};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
       reinterpret_cast<const void*>(kernel_cake_mok_forward), 232448);
@@ -1512,6 +1555,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_wg_sha
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_5ebc620d7dedfe52
+}  // namespace cake_host_shim_0b0177378f9e9882
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_5ebc620d7dedfe52::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_0b0177378f9e9882::Run);

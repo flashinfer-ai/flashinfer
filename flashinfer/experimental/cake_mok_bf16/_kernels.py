@@ -78,6 +78,26 @@ def swiglu_backward_tasks(tiles):
     """Backward SwiGLU tasks covering ``tiles`` 128 x 128 tiles."""
     return (tiles + 2 * SWIGLU_BWD_TILES - 1) // (2 * SWIGLU_BWD_TILES)
 
+def _fast_divmod(divisor):
+    """Three-field carrier ``(divisor, multiplier, shift)`` of a fast-divmod
+    kernel parameter: the launch-invariant divisor with its host-derived
+    CUTLASS ``FastDivmod`` constants, so a task resolves ``n // d`` and
+    ``n % d`` with one ``umulhi`` and a shift instead of an integer division.
+    ``divisor`` must be in ``[1, 2**31 - 1]``; the generated binding checks
+    the three fields."""
+    import tvm_ffi
+
+    divisor = int(divisor)
+    if not 1 <= divisor <= 0x7FFF_FFFF:
+        raise ValueError(
+            f"fast divmod divisor must be in [1, 2147483647], got {divisor}"
+        )
+    if divisor == 1:
+        return tvm_ffi.Shape((1, 0, 0))
+    p = 31 + (divisor - 1).bit_length()
+    multiplier = (((1 << p) + divisor - 1) // divisor) & 0xFFFF_FFFF
+    return tvm_ffi.Shape((divisor, multiplier, p - 32))
+
 
 def expert_layout(module, counts, capacity, schedule_rank):
     """Device expert layout ``[counts | row offsets | real rows | block expert]``.
@@ -270,6 +290,10 @@ class MoKForward:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_tasks_div=_fast_divmod(mini_tasks),
+                minis_per_macro_div=_fast_divmod(macro_size // mini_size),
+                fused_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
+                down_col_blocks_div=_fast_divmod((hidden + 511) // 512),
             )
         return (
             x_routed,
@@ -393,6 +417,8 @@ class MoKRecompute:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_tasks_div=_fast_divmod(mini_tasks),
+                fused_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
             )
         return (
             x_routed,
@@ -578,6 +604,10 @@ class MoKBackward:
             + max(0, minis - macro_size // mini_size) * mini_replay
             + macros * 3 * experts * wgrad_tiles(hidden, intermediate)
         )
+        # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
+        shared_wgrad = wgrad_tiles(hidden, intermediate)
+        weight_tasks = experts * shared_wgrad
+        replay_macro_tasks = (macro_size // mini_size) * (mini_replay + mini_bwd) + 3 * weight_tasks
         layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
         with tvm_ffi.use_torch_stream():
             self.module.launch(
@@ -662,6 +692,15 @@ class MoKBackward:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_size_div=_fast_divmod(mini_size),
+                mini_bwd_div=_fast_divmod(mini_bwd),
+                mini_replay_div=_fast_divmod(mini_replay),
+                replay_macro_tasks_div=_fast_divmod(replay_macro_tasks),
+                weight_tasks_div=_fast_divmod(weight_tasks),
+                shared_wgrad_div=_fast_divmod(shared_wgrad),
+                dh_col_blocks_div=_fast_divmod(ibw),
+                dx_col_blocks_div=_fast_divmod(hbw),
+                replay_col_blocks_div=_fast_divmod(ibw),
             )
             if not self.fp32_wgrad:
                 # Accumulation adds nothing for an empty expert; BF16 outputs are zeroed.
@@ -877,6 +916,10 @@ class MoKForwardMXFP8:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_tasks_div=_fast_divmod(mini_tasks),
+                minis_per_macro_div=_fast_divmod(macro_size // mini_size),
+                gate_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
+                down_col_blocks_div=_fast_divmod((hidden + tile - 1) // tile),
             )
         # Native MXFP8 context: transposed x and activation for the weight
         # gradients, E4M3 gate/up for SwiGLU backward, BF16 shared tensors.
@@ -1049,6 +1092,8 @@ class MoKRecomputeMXFP8:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_tasks_div=_fast_divmod(mini_tasks),
+                gate_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
             )
         return (
             (x_t, x_sc_t),
@@ -1293,6 +1338,11 @@ class MoKBackwardMXFP8:
             + max(0, minis - macro_size // mini_size) * mini_replay
             + macros * 3 * experts * wgrad_tiles(hidden, intermediate, tile_cols=tile)
         )
+        # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
+        shared_wgrad = wgrad_tiles(hidden, intermediate)
+        routed_wgrad = wgrad_tiles(hidden, intermediate, tile_cols=tile)
+        weight_tasks = experts * routed_wgrad
+        replay_macro_tasks = (macro_size // mini_size) * (mini_replay + mini_bwd) + 3 * weight_tasks
         layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
         with tvm_ffi.use_torch_stream():
             self.module.launch(
@@ -1414,6 +1464,16 @@ class MoKBackwardMXFP8:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_size_div=_fast_divmod(mini_size),
+                mini_bwd_div=_fast_divmod(mini_bwd),
+                mini_replay_div=_fast_divmod(mini_replay),
+                replay_macro_tasks_div=_fast_divmod(replay_macro_tasks),
+                weight_tasks_div=_fast_divmod(weight_tasks),
+                shared_wgrad_div=_fast_divmod(shared_wgrad),
+                routed_wgrad_div=_fast_divmod(routed_wgrad),
+                dh_col_blocks_div=_fast_divmod(ibr),
+                dx_col_blocks_div=_fast_divmod(hbr),
+                replay_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
             )
             if not self.fp32_wgrad:
                 self.zero_module.launch(

@@ -22,6 +22,9 @@ typedef short int          int16_t;
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_right; };
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -191,7 +194,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_mok_recompute_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, __nv_bfloat16* __restrict__ x_routed_ptr, unsigned long long* __restrict__ x_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit)
+kernel_cake_mok_recompute_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, __nv_bfloat16* __restrict__ x_routed_ptr, unsigned long long* __restrict__ x_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit, CakeFastDivmod mini_tasks_div, CakeFastDivmod fused_col_blocks_div)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -5233,8 +5236,15 @@ kernel_cake_mok_recompute_clamped(const __grid_constant__ CUtensorMap x_shared, 
                 }
                 gemm_bits = phase_bits;
             } else {
-                int mini = (compute - shared_tasks) / mini_tasks;
-                int task = (compute - shared_tasks) % mini_tasks;
+                int mini = 0;
+                int task = 0;
+                int swiglu = 0;
+                if (compute >= shared_tasks) {
+                    uint32_t _fast_div_q_0 = (mini_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(compute - shared_tasks)), mini_tasks_div.multiplier) >> mini_tasks_div.shift_right) : (uint32_t)((unsigned int)(compute - shared_tasks));
+                    uint32_t _fast_div_r_0 = (uint32_t)((unsigned int)(compute - shared_tasks)) - _fast_div_q_0 * (uint32_t)(mini_tasks_div.divisor);
+                    mini = (int)_fast_div_q_0;
+                    task = (int)_fast_div_r_0;
+                }
                 int col_blocks_2 = (intermediate + 256 - 1) / 256;
                 int x_1 = -1;
                 int y_1 = -1;
@@ -5245,7 +5255,10 @@ kernel_cake_mok_recompute_clamped(const __grid_constant__ CUtensorMap x_shared, 
                 int first_block = mini * (mini_size / 256);
                 int _min_520 = ((first_block + mini_size / 256) < (tokens / 256) ? (first_block + mini_size / 256) : (tokens / 256));
                 int end_block = _min_520;
-                int block_2 = first_block + task / col_blocks_2;
+                int block_2 = first_block;
+                uint32_t _fast_div_q_1 = (fused_col_blocks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)task), fused_col_blocks_div.multiplier) >> fused_col_blocks_div.shift_right) : (uint32_t)((unsigned int)task);
+                uint32_t _fast_div_r_1 = (uint32_t)((unsigned int)task) - _fast_div_q_1 * (uint32_t)(fused_col_blocks_div.divisor);
+                block_2 = first_block + (int)_fast_div_q_1;
                 if (block_2 < end_block) {
                     int index = counts[3 * experts + block_2];
                     int offset_24 = counts[experts + index] / 256;

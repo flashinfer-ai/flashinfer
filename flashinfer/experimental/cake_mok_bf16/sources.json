@@ -12,8 +12,8 @@
           "cake_mok_forward_binding.cu"
         ],
         "sha256": [
-          "52a1128d4a9c2165024fc64f608a116a0d13d1fad6c45f0f18650349956054eb",
-          "b3eaf63b3dd2cbb446745a9d861d018b4dfaf1aa34de521f0b58a4e83543c5d1"
+          "b494203a8c602c702b0946f02b98d1bf463a50b32c28e63f073db02f3021866d",
+          "c939a222de2e7660b97dbe78f7de8cb5b629ef67e9ced44bb141bfc70a85139a"
         ],
         "arguments": [
           [
@@ -171,6 +171,22 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "minis_per_macro_div"
+          ],
+          [
+            "parameter",
+            "fused_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "down_col_blocks_div"
           ],
           [
             "grid",
@@ -204,8 +220,8 @@
           "cake_mok_recompute_binding.cu"
         ],
         "sha256": [
-          "143fdee9809642f5af4ab6f01b17d37bcd9f9eb309a2cf88f7b4138e4698278d",
-          "cd0d6f831b760158ac160aa62e5de27e6e0e00c8d35dafdf4646380794de68ac"
+          "1412291647826250ddeab4cd92465243b6890bfb86f62759a6da4ec6c051fd97",
+          "5d5f486e6daf23ff2d43ced3b83080c00803edc002cbcb5d087c65b973922f62"
         ],
         "arguments": [
           [
@@ -325,6 +341,14 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "fused_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -355,8 +379,8 @@
           "sm_100a/cake_mok_forward_mxfp8_binding.cu"
         ],
         "sha256": [
-          "1f9b50a6fe111b759e4ca0c33cac73a0d170917d58644cca5bcc5337e762a290",
-          "e9fe8d6b2c25edd2719acc07e359685a6a9da4a9b0183ff7f8a04af7d2302242"
+          "e8fba51191840dacd09762e2505b89cec3a2509dd82c54f7c0f5eda45bf8fb6a",
+          "6a2ef61f24b62a2dcad86d00813a741ace441f6d68601a779f616e046109a60f"
         ],
         "arguments": [
           [
@@ -590,6 +614,22 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "minis_per_macro_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "down_col_blocks_div"
           ],
           [
             "grid",
@@ -617,8 +657,8 @@
           "sm_107a/cake_mok_forward_mxfp8_binding.cu"
         ],
         "sha256": [
-          "ab1047aed6a70ad2b795e31e603d852beb3b44900067f2d7162f20dd1837b79f",
-          "1f5e981b6bea98a5b0ce97b14b2d863066e57996ed7a83e19cfd7fa7da798e4f"
+          "056a93297cabae8d10e80d031675edd1665ab30371157aad182ffc5b3298774f",
+          "933ee586f7d9139b91830843a5064dd909baa7eea81be0f57b841b387d8a2529"
         ],
         "arguments": [
           [
@@ -852,6 +892,22 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "minis_per_macro_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "down_col_blocks_div"
           ],
           [
             "grid",
@@ -884,8 +940,8 @@
           "sm_100a/cake_mok_recompute_mxfp8_binding.cu"
         ],
         "sha256": [
-          "d05a98a18f3094f1c03fedacc3ca8a678386737edce5995e0813fd238aaffa1b",
-          "db8c415e2fbd09de99b79451c44fc2cc4cb1340c3fbea30d45be77821576eaeb"
+          "822a2a2e308770830b8712faff9030efa674a7d883a86c7d8d8393b895de6e1e",
+          "3911e94d59a432b4c755109a8a48ff844f23758e103de9457ed48a4ac9cda63e"
         ],
         "arguments": [
           [
@@ -1075,6 +1131,14 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
           ],
           [
             "grid",
@@ -1102,8 +1166,8 @@
           "sm_107a/cake_mok_recompute_mxfp8_binding.cu"
         ],
         "sha256": [
-          "8b6c256cdb03060591a59ce0f9984dba488eb3eb89f30048f457858cb6ea186f",
-          "2c33edc224ee69fdf0e189a8fa709e36fe194b8080238360d3b98fb94252b664"
+          "6063541523166f6ea9ba43fe6b71e17bb936dd3275b615a145be03c9a0ceaa7a",
+          "22bb291478090ecf5e96176e1cb1a414145cac451d728b45e7c374f64dba7fe3"
         ],
         "arguments": [
           [
@@ -1293,6 +1357,14 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
           ],
           [
             "grid",
@@ -1326,8 +1398,8 @@
           "cake_mok_backward_binding.cu"
         ],
         "sha256": [
-          "e9ff35448e73545b650a992fb374c802305aa9104526ae608be8654d0a2d4e75",
-          "952693cfba5146da03235c7d9c61ce45793ed0b82a6f7614ec454aec64ab0c4a"
+          "68d523f4ae1b16b9fd5222c3778d52942f1577af7047d4ffd910b57ebdefeb94",
+          "3bed8f17641aa1da36b663e2b1610284896078ba1ea7c84802416377ff299b3a"
         ],
         "arguments": [
           [
@@ -1651,6 +1723,42 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -1681,8 +1789,8 @@
           "sm_100a/cake_mok_backward_mxfp8_binding.cu"
         ],
         "sha256": [
-          "f4fd68af0f5f97f476d9b9ed63149baa7bafb4932be2d02edf8f5730ea5320c3",
-          "6c382938490d23d12fa810fbc25dbaede172ea928e8dbcbcd51c22b3da8869ab"
+          "208a86969f754c5ffb1426dd3ca6040d4402e2bb04e201fde4d25d699805304c",
+          "e3799f15420c950c75a8d4287d58107ab00464db90d34877c5779f2f84205169"
         ],
         "arguments": [
           [
@@ -2152,6 +2260,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -2179,8 +2327,8 @@
           "sm_107a/cake_mok_backward_mxfp8_binding.cu"
         ],
         "sha256": [
-          "a7e164635d391b0517d0f1e86ab6c127e6613b7e86177a8ef4e044d801b86830",
-          "78e7447212e72f56275605a68535783218c9a3884dedbc2799d379799fb6c234"
+          "7de7137fd22a761300a5fc320465ebb401dd40c2ed4b535e53bf8b13f34c1bb2",
+          "408c0c12aaae9c60d0064305005465a7334463a3464609d36b5bc899c07100f9"
         ],
         "arguments": [
           [
@@ -2650,6 +2798,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -2683,8 +2871,8 @@
           "cake_mok_backward_fp32_binding.cu"
         ],
         "sha256": [
-          "77cafa12defea2f2060c5cb288bf8916d77226431b8ee04b5cfbfe9fcaa15c57",
-          "5415aa05e995c125b0fc2c9db2f2b0dc0be3abf49b9dab0019bc7c1ff75c1b23"
+          "0d348423102d5a8abff5caf342c5ba011170585f74f8b98190993e9fbddf088e",
+          "2688c677f57c355a8b4e218e41afa0168175088e0daed611ed576444675c0964"
         ],
         "arguments": [
           [
@@ -3008,6 +3196,42 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -3038,8 +3262,8 @@
           "sm_100a/cake_mok_backward_mxfp8_fp32_binding.cu"
         ],
         "sha256": [
-          "fefc2eaf1c40e6b16691fcada2b26ef9e47a6ded2f87b7bb7ec9a7e56ff80c12",
-          "8e4a648357a380686a66512e5cf579fb4e09ce7c01fd5c7f61784ddf535c7208"
+          "1fe42efd101c15f3bf3bff293246afb293b1fdd45d09ea1b29d5132114b478c1",
+          "5a5689202ba0f3e134c1aa5e8e7f992461de2b7b848534e08075f73619ad370a"
         ],
         "arguments": [
           [
@@ -3509,6 +3733,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -3536,8 +3800,8 @@
           "sm_107a/cake_mok_backward_mxfp8_fp32_binding.cu"
         ],
         "sha256": [
-          "d8ef4dfc8fc879c77e5a63b6577bc5ecfea9bd8e38b16d6eb609d2acf20e126a",
-          "58a75a270bf4a270667bc5860be028adc5afc92bada4fb30399bd8f989c4e2af"
+          "377a2a8ec85e52967e5021c97e0447decda706681cc53a069e588535dce1bfe2",
+          "8508d9210490eb3b2a7fd3a67571582d4d41f961b92e91a67f85e769eb9f0e80"
         ],
         "arguments": [
           [
@@ -4007,6 +4271,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -4040,8 +4344,8 @@
           "cake_mok_forward_clamped_binding.cu"
         ],
         "sha256": [
-          "92d6e30a35fc5ec287c55ad5793a9e739b226b232f925a82faacdd4801c578fb",
-          "9a49b30ac77b6dd59f36243f9288215c69a5fd1e157c05b9a7f88eac4386f6e6"
+          "016915ebb689fe9f629e13c1ba4d4341ca8e17c26e6cdc117fcefccf01ba6d9c",
+          "960c18b07cf574c8ce95dc65a90fc9ae9b3cdc2145395515be31731b480f7f5a"
         ],
         "arguments": [
           [
@@ -4201,6 +4505,22 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "minis_per_macro_div"
+          ],
+          [
+            "parameter",
+            "fused_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "down_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -4232,8 +4552,8 @@
           "cake_mok_recompute_clamped_binding.cu"
         ],
         "sha256": [
-          "fad196dc4c3a71d01f33c0c2b972bb6afb393f6fab207aa97fcdb4d1feb3fb8d",
-          "3ed18a93ed666994e3f26baf2e468724fa7c426322da0403e52fe6e22e8ca0d6"
+          "302a6ecaad7851505477242a78ec7a2317ae17590a90e8960e5ef146870324f5",
+          "637183521c4d9fb5b8fc5ae352ae4727cec8ad6c0fac36820aa4a2262f838b7b"
         ],
         "arguments": [
           [
@@ -4353,6 +4673,14 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "fused_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -4383,8 +4711,8 @@
           "sm_100a/cake_mok_forward_mxfp8_clamped_binding.cu"
         ],
         "sha256": [
-          "98c8ce0bbc88d9fa2a5730f9116bfc4c154cff79989990fcab6239100a28ffe7",
-          "853a31892a04bfa4c1bfa32812df68b442dd5d55aa14553fc5cd0c4c11b518e6"
+          "810cf8daa742192e2f64162879374dd5a5eb7719cbc21fb6b732139b68dbe81a",
+          "8837e0209311dcdb30649c944cb3438fc3eeb8756420532321dffea3eed44e80"
         ],
         "arguments": [
           [
@@ -4618,6 +4946,22 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "minis_per_macro_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "down_col_blocks_div"
           ],
           [
             "grid",
@@ -4645,8 +4989,8 @@
           "sm_107a/cake_mok_forward_mxfp8_clamped_binding.cu"
         ],
         "sha256": [
-          "ab8f83e3d39d85da94bcf1e29bc521dc9123a00ded1cd648945236a4dfa05490",
-          "5f1ac8b979a79d113caba8309bf422b635319fe998ec188dfe798fd0a66f4bd5"
+          "3c722b40c19899a68bb49d93d5fd3151ca38eefac57e1cc0b8b607e70a4d404f",
+          "4d873eafacba677a707e868207fed7fea4301fb4916285812994f0dfd594c282"
         ],
         "arguments": [
           [
@@ -4880,6 +5224,22 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "minis_per_macro_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "down_col_blocks_div"
           ],
           [
             "grid",
@@ -4912,8 +5272,8 @@
           "sm_100a/cake_mok_recompute_mxfp8_clamped_binding.cu"
         ],
         "sha256": [
-          "ddf3ee9b5ce2007a698e8fc4df88297bf4dd271980bd5a7faf4c29894ebe94ea",
-          "8f41681e87a312fd0d198b8d9b94134166acd646e00567e9cebe5a2a76e51fa6"
+          "69c3171cafc367a685c958bbc658ad122dce765ff13a10222e762a57100b45b3",
+          "8f50c7c53b06c45fcc1cc54fd242af6fe30f16446a86ea9f7e35b4cec05db78a"
         ],
         "arguments": [
           [
@@ -5103,6 +5463,14 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
           ],
           [
             "grid",
@@ -5130,8 +5498,8 @@
           "sm_107a/cake_mok_recompute_mxfp8_clamped_binding.cu"
         ],
         "sha256": [
-          "5920e639b0b1e19cd002694a970979be643bea4764df7506e18a487949b4f961",
-          "df120871ddb20d5940ef4bd30e8a031b7a206a5c61d9d5482ee47a1fa797852b"
+          "a9cb33d9784bd4de361f595c88d13e87be89cfa9f5f7a428893c1218a4dd13d9",
+          "8d77f3a5abb397931bd2a97e90863a1ba351f59546d33788977ead9ed1131e14"
         ],
         "arguments": [
           [
@@ -5321,6 +5689,14 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_tasks_div"
+          ],
+          [
+            "parameter",
+            "gate_col_blocks_div"
           ],
           [
             "grid",
@@ -5354,8 +5730,8 @@
           "cake_mok_backward_clamped_binding.cu"
         ],
         "sha256": [
-          "01dba1356f58053d20d879639566c1dbaec02b80309812ba4e001df32961f4a3",
-          "408815a7372e6337ff09c28edba8f64f95336b1cf8f3134ff1b8303b4d03a923"
+          "2cf6b948146d64509a7fe9343bb28dac51aaac7f80115140700866233b5d8bcd",
+          "a048cb50821b18bef1c523888a061785c1cd908786d035a7fe9d33f52b8d36ff"
         ],
         "arguments": [
           [
@@ -5679,6 +6055,42 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -5709,8 +6121,8 @@
           "sm_100a/cake_mok_backward_mxfp8_clamped_binding.cu"
         ],
         "sha256": [
-          "4e5f158bd1b8c2ce14015457a8c6829c17e47da1e2954ee04518a9ab44d6d653",
-          "37887562cb2d60cef9032a489f5b729a5a20434d5d00c49ee57067f5a2cbda22"
+          "0a3a2e733f8983105ac2757cb3a95fb51e04ba6eaa0c16eda5f303ff560b3d57",
+          "1bdd4e50b7ea2b25b6c6eacd0ccc34da9610b1c8f6732432ad563773995642f3"
         ],
         "arguments": [
           [
@@ -6180,6 +6592,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -6207,8 +6659,8 @@
           "sm_107a/cake_mok_backward_mxfp8_clamped_binding.cu"
         ],
         "sha256": [
-          "0ad02cdac12bba5427a7a88f6e6226e7487547bd888171730daf88f03b0c4c87",
-          "24663d6ea73480304ecc2c9a31adc5ec8b38098063a166d41b97547634293bf3"
+          "ee414ed2716b956e03eba42434af897017ba54ed09e757485da2ba5b6e1b0375",
+          "4557b89b59ca7c1d5a73c132e1e44a0e11ee8cb10b389b86348661d90aadd31f"
         ],
         "arguments": [
           [
@@ -6678,6 +7130,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -6711,8 +7203,8 @@
           "cake_mok_backward_clamped_fp32_binding.cu"
         ],
         "sha256": [
-          "47ac2313fa6f0693b576c836a98fe9f5a5af774f6ee720800f44031c3b5b049d",
-          "58574859f1dcf9eddff96713f9c15c377ceffd81690c0f58abb4ae0ff7b64cfa"
+          "138b90b161eb5b7b881289c4852bb7c2c94adb1a036557f57ed45422a3194fdb",
+          "13e313512754fd7991d3eb0a56bb17805ac46079c8005c87697f38b99a5fdff4"
         ],
         "arguments": [
           [
@@ -7036,6 +7528,42 @@
             "swiglu_limit"
           ],
           [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
+          ],
+          [
             "grid",
             "grid_x"
           ],
@@ -7066,8 +7594,8 @@
           "sm_100a/cake_mok_backward_mxfp8_clamped_fp32_binding.cu"
         ],
         "sha256": [
-          "695842076a855cdb4044455a4fa3e0ad2abd38aba19ec9efe670fd362a8ddaaa",
-          "e8be6426e759771ed8cfd2fb273e7271eeb2c92a255469e014db04c8bcf16da0"
+          "4845b51176883d3ca27c56526f9eb8c7d82291e4bd155d229a09b24b26ecb90b",
+          "b2937e1c84bd4c0c4264aa3f492919fb19f2832e66b0f22ef102e7fd18884376"
         ],
         "arguments": [
           [
@@ -7537,6 +8065,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",
@@ -7564,8 +8132,8 @@
           "sm_107a/cake_mok_backward_mxfp8_clamped_fp32_binding.cu"
         ],
         "sha256": [
-          "d82404d39e6ee65a371d4be9cf4f59f3ca746311748b7f21125f29c86d9f043d",
-          "ced5dd131b4a8cf308ec376f941f0813059f4f5822f957034eae7a7ff2508115"
+          "72fc61809dbc4d2dbcb37822ddd8182558a6d2b8886b0d9a2c928e8e2e443a54",
+          "5106e55584c33d9d9d341ae1b003ba01040f8296b4b14fbe31ed5e6f582b8fbf"
         ],
         "arguments": [
           [
@@ -8035,6 +8603,46 @@
           [
             "parameter",
             "swiglu_limit"
+          ],
+          [
+            "parameter",
+            "mini_size_div"
+          ],
+          [
+            "parameter",
+            "mini_bwd_div"
+          ],
+          [
+            "parameter",
+            "mini_replay_div"
+          ],
+          [
+            "parameter",
+            "replay_macro_tasks_div"
+          ],
+          [
+            "parameter",
+            "weight_tasks_div"
+          ],
+          [
+            "parameter",
+            "shared_wgrad_div"
+          ],
+          [
+            "parameter",
+            "routed_wgrad_div"
+          ],
+          [
+            "parameter",
+            "dh_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "dx_col_blocks_div"
+          ],
+          [
+            "parameter",
+            "replay_col_blocks_div"
           ],
           [
             "grid",

@@ -22,6 +22,9 @@ typedef short int          int16_t;
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_right; };
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -208,7 +211,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit)
+kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit, CakeFastDivmod mini_tasks_div, CakeFastDivmod minis_per_macro_div, CakeFastDivmod fused_col_blocks_div, CakeFastDivmod down_col_blocks_div)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -4654,13 +4657,23 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                 }
                 gemm_bits = phase_bits_3;
             } else {
-                int ordered_mini = (compute - shared_tasks) / mini_tasks;
-                int task_1 = (compute - shared_tasks) % mini_tasks;
-                int macro_1 = macros - 1;
-                int mini_3 = ordered_mini;
-                if (ordered_mini >= last_minis) {
-                    macro_1 = macros - 2 - (ordered_mini - last_minis) / minis_per_macro;
-                    mini_3 = (ordered_mini - last_minis) % minis_per_macro;
+                int task_1 = 0;
+                int macro_1 = 0;
+                int mini_3 = 0;
+                int swiglu = 0;
+                if (compute >= shared_tasks) {
+                    uint32_t _fast_div_q_0 = (mini_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(compute - shared_tasks)), mini_tasks_div.multiplier) >> mini_tasks_div.shift_right) : (uint32_t)((unsigned int)(compute - shared_tasks));
+                    uint32_t _fast_div_r_0 = (uint32_t)((unsigned int)(compute - shared_tasks)) - _fast_div_q_0 * (uint32_t)(mini_tasks_div.divisor);
+                    int ordered_mini = (int)_fast_div_q_0;
+                    task_1 = (int)_fast_div_r_0;
+                    macro_1 = macros - 1;
+                    mini_3 = ordered_mini;
+                    if (ordered_mini >= last_minis) {
+                        uint32_t _fast_div_q_1 = (minis_per_macro_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(ordered_mini - last_minis)), minis_per_macro_div.multiplier) >> minis_per_macro_div.shift_right) : (uint32_t)((unsigned int)(ordered_mini - last_minis));
+                        uint32_t _fast_div_r_1 = (uint32_t)((unsigned int)(ordered_mini - last_minis)) - _fast_div_q_1 * (uint32_t)(minis_per_macro_div.divisor);
+                        macro_1 = macros - 2 - (int)_fast_div_q_1;
+                        mini_3 = (int)_fast_div_r_1;
+                    }
                 }
                 if (task_1 < mini_fused) {
                     int col_blocks_3 = (intermediate + 256 - 1) / 256;
@@ -4673,7 +4686,10 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                     int first_block = (macro_1 * (macro_size / mini_size) + mini_3) * (mini_size / 256);
                     int _min_32 = ((first_block + mini_size / 256) < (tokens / 256) ? (first_block + mini_size / 256) : (tokens / 256));
                     int end_block = _min_32;
-                    int block_5 = first_block + task_1 / col_blocks_3;
+                    int block_5 = first_block;
+                    uint32_t _fast_div_q_2 = (fused_col_blocks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)task_1), fused_col_blocks_div.multiplier) >> fused_col_blocks_div.shift_right) : (uint32_t)((unsigned int)task_1);
+                    uint32_t _fast_div_r_2 = (uint32_t)((unsigned int)task_1) - _fast_div_q_2 * (uint32_t)(fused_col_blocks_div.divisor);
+                    block_5 = first_block + (int)_fast_div_q_2;
                     if (block_5 < end_block) {
                         int index = counts[3 * experts + block_5];
                         int offset_26 = counts[experts + index] / 256;
@@ -8128,7 +8144,10 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                     int first_block_1 = (macro_1 * (macro_size / mini_size) + mini_3) * (mini_size / 256);
                     int _min_35 = ((first_block_1 + mini_size / 256) < (tokens / 256) ? (first_block_1 + mini_size / 256) : (tokens / 256));
                     int end_block_1 = _min_35;
-                    int block_6 = first_block_1 + (task_1 - mini_fused) / col_blocks_4;
+                    int block_6 = first_block_1;
+                    uint32_t _fast_div_q_3 = (down_col_blocks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(task_1 - mini_fused)), down_col_blocks_div.multiplier) >> down_col_blocks_div.shift_right) : (uint32_t)((unsigned int)(task_1 - mini_fused));
+                    uint32_t _fast_div_r_3 = (uint32_t)((unsigned int)(task_1 - mini_fused)) - _fast_div_q_3 * (uint32_t)(down_col_blocks_div.divisor);
+                    block_6 = first_block_1 + (int)_fast_div_q_3;
                     if (block_6 < end_block_1) {
                         int index_1 = counts[3 * experts + block_6];
                         int offset_51 = counts[experts + index_1] / 256;
