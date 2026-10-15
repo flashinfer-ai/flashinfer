@@ -51,6 +51,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import get_compute_capability
 from .utils import (
     check_accuracy,
@@ -4917,3 +4918,121 @@ def test_localized_moe_matches_full_width(
             localized.float(), full.float(), atol=2e-2, rtol=2e-2
         )
     torch.testing.assert_close(tuned.float(), full.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_cute_dsl_pinned_4over6_requires_w4a4_per_token():
+    """A pinned recipe off the W4A4 per-token path is refused before device work."""
+    from flashinfer import cute_dsl_fused_moe
+
+    e, h, i, k, t = 4, 256, 512, 2, 8
+    kwargs = dict(
+        x=torch.empty(t, h // 2, dtype=torch.uint8),
+        x_sf=torch.empty(t, h // 16, dtype=torch.uint8),
+        token_selected_experts=torch.zeros(t, k, dtype=torch.int32),
+        token_final_scales=torch.ones(t, k, dtype=torch.float32),
+        w1_weight=torch.empty(e, 2 * i, h // 2, dtype=torch.uint8),
+        w1_weight_sf=torch.empty(e, 2 * i, h // 16, dtype=torch.uint8),
+        w1_alpha=torch.ones(e, dtype=torch.float32),
+        fc2_input_scale=torch.ones(1, dtype=torch.float32),
+        w2_weight=torch.empty(e, h, i // 2, dtype=torch.uint8),
+        w2_weight_sf=torch.empty(e, h, i // 16, dtype=torch.uint8),
+        w2_alpha=torch.ones(e, dtype=torch.float32),
+        num_experts=e,
+        top_k=k,
+    )
+    with pytest.raises(ValueError, match="per_token_scale"):
+        cute_dsl_fused_moe(**kwargs, nvfp4_4over6=NVFP44Over6Config())
+    with pytest.raises(ValueError, match="w4a4"):
+        cute_dsl_fused_moe(
+            **kwargs,
+            quant_mode="w4a8",
+            per_token_scale=torch.ones(t, dtype=torch.float32),
+            nvfp4_4over6=NVFP44Over6Config(),
+        )
+
+
+@sm100_required
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+def test_cute_dsl_pinned_recipe_matches_env(recipe):
+    """``nvfp4_4over6=`` selects, bit for bit, the per-token GEMM2-input
+    quantizer the environment selects, through both public entry points."""
+    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        nvfp4_per_token_scale_inv,
+    )
+    from .utils import env_var, nvfp4_4over6_env
+
+    num_tokens, hidden_size, intermediate_size = 64, 256, 512
+    num_experts, top_k = 8, 2
+    e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
+    with (
+        env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256),
+        nvfp4_4over6_env(True),
+    ):
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            gated=True,
+            use_per_token_activation=True,
+        )
+    # The GEMM2-input scale is pinned to the recipe for every leg; the kernel
+    # ranks 4over6 candidates against it, so the legs must share it.
+    fc2_input_scale = torch.tensor(
+        [nvfp4_per_token_scale_inv(recipe)], device="cuda", dtype=torch.float32
+    )
+    common = dict(
+        x=tensors["x"],
+        x_sf=tensors["x_sf"],
+        token_selected_experts=tensors["token_selected_experts"],
+        token_final_scales=tensors["token_final_scales"],
+        w1_weight=tensors["w1_weight"],
+        w1_weight_sf=tensors["w1_weight_sf"],
+        w1_alpha=tensors["w1_alpha"],
+        fc2_input_scale=fc2_input_scale,
+        w2_weight=tensors["w2_weight"],
+        w2_weight_sf=tensors["w2_weight_sf"],
+        w2_alpha=tensors["w2_alpha"],
+        per_token_scale=tensors["x_per_token_scale"],
+    )
+    wrapper = CuteDslMoEWrapper(
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        quant_mode="w4a4",
+    )
+
+    def run(**extra):
+        functional = cute_dsl_fused_moe(
+            **common, num_experts=num_experts, top_k=top_k, **extra
+        )
+        wrapped = wrapper.run(**common, **extra)
+        torch.cuda.synchronize()
+        return functional.clone(), wrapped.clone()
+
+    with (
+        env_var("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_use_256),
+        nvfp4_4over6_env(True),
+    ):
+        env_on = run()
+        none_under_env_on = run(nvfp4_4over6=None)
+    with nvfp4_4over6_env(False):
+        env_off = run()
+        pinned_under_env_off = run(nvfp4_4over6=recipe)
+
+    for leg in range(2):  # functional, wrapper
+        # The recipe must change the output, or the equalities are vacuous.
+        assert not torch.equal(env_on[leg], env_off[leg])
+        assert torch.equal(pinned_under_env_off[leg], env_on[leg])
+        assert torch.equal(none_under_env_on[leg], env_off[leg])
