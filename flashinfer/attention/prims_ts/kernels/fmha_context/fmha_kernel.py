@@ -3191,6 +3191,8 @@ class FmhaTs:
                 if cutlass.const_expr(minimum_rows is not None):
                     correct_oob_addressing = q_cute.shape[0] < minimum_rows
                 if correct_oob_addressing:
+                    # Work around the Blackwell driver TMA descriptor issue documented at
+                    # https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-615-71-09/index.html#known-issues
                     # Clear Blackwell descriptor bit 85 on the host when a
                     # contiguous 128 KiB prefix has not been established.
                     descriptor_word1 = (
