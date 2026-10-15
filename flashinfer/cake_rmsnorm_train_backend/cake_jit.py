@@ -40,12 +40,12 @@ from __future__ import annotations
 import functools
 import hashlib
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
 
 import tvm_ffi
 
-from . import env as jit_env
-from .core import (
+from ..jit import env as jit_env
+from ..jit.core import (
     JitSpec,
     gen_jit_spec,
     sm100a_nvcc_flags,
@@ -126,12 +126,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main",
         "select_rule": None,
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_01036297dc6e647b9e56_binding.cu": "92401216c621c08dbba01e613049aeca03d12d969172b0d03286939b201eba3c",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_01036297dc6e647b9e56_kernel.cu": "4ada94254a359a64c527322034ee5d61af41e54910826fcdcf6f1e0c4043e444",
+            "csrc/cake_rmsnorm_train_01036297dc6e647b9e56_binding.cu": "92401216c621c08dbba01e613049aeca03d12d969172b0d03286939b201eba3c",
+            "csrc/cake_rmsnorm_train_01036297dc6e647b9e56_kernel.cu": "4ada94254a359a64c527322034ee5d61af41e54910826fcdcf6f1e0c4043e444",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_01036297dc6e647b9e56_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_01036297dc6e647b9e56_binding.cu",
+            "csrc/cake_rmsnorm_train_01036297dc6e647b9e56_kernel.cu",
+            "csrc/cake_rmsnorm_train_01036297dc6e647b9e56_binding.cu",
         ],
         "workspace_rule": {
             "counters": 16,
@@ -198,12 +198,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_0daf7b50565f2c0846a4_binding.cu": "858eeccab14727f1b08f76a0ae022e4dd5c4b079a317dc909d6ecd5949f76b66",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_0daf7b50565f2c0846a4_kernel.cu": "9ae66263d8863a61742d47b3ab7fa8f9a02f053e67a95b850d989f4ffbae9161",
+            "csrc/cake_rmsnorm_train_0daf7b50565f2c0846a4_binding.cu": "858eeccab14727f1b08f76a0ae022e4dd5c4b079a317dc909d6ecd5949f76b66",
+            "csrc/cake_rmsnorm_train_0daf7b50565f2c0846a4_kernel.cu": "9ae66263d8863a61742d47b3ab7fa8f9a02f053e67a95b850d989f4ffbae9161",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_0daf7b50565f2c0846a4_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_0daf7b50565f2c0846a4_binding.cu",
+            "csrc/cake_rmsnorm_train_0daf7b50565f2c0846a4_kernel.cu",
+            "csrc/cake_rmsnorm_train_0daf7b50565f2c0846a4_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -267,12 +267,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu": "f9b05122b6cf648fb02c3caef52022278adec63e029a4ba582c5454073d81afe",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu": "a68c70a5dbf539619db8771e4d3a04044a13256679369882315dc21abb6d9adb",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu": "f9b05122b6cf648fb02c3caef52022278adec63e029a4ba582c5454073d81afe",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu": "a68c70a5dbf539619db8771e4d3a04044a13256679369882315dc21abb6d9adb",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -336,12 +336,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu": "f9b05122b6cf648fb02c3caef52022278adec63e029a4ba582c5454073d81afe",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu": "a68c70a5dbf539619db8771e4d3a04044a13256679369882315dc21abb6d9adb",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu": "f9b05122b6cf648fb02c3caef52022278adec63e029a4ba582c5454073d81afe",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu": "a68c70a5dbf539619db8771e4d3a04044a13256679369882315dc21abb6d9adb",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_kernel.cu",
+            "csrc/cake_rmsnorm_train_124a3bbdc1d5a6069326_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -407,12 +407,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1af0069a0ec96fb8b742_binding.cu": "6ff64d646383083bbf543fb69c1214e0c940c03ed73c8aefd846ddb0103a06b0",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1af0069a0ec96fb8b742_kernel.cu": "4fde9d1a11b73305f05ffef303c73a3f45cad1eedeac23de4cbf194b2ccae03f",
+            "csrc/cake_rmsnorm_train_1af0069a0ec96fb8b742_binding.cu": "6ff64d646383083bbf543fb69c1214e0c940c03ed73c8aefd846ddb0103a06b0",
+            "csrc/cake_rmsnorm_train_1af0069a0ec96fb8b742_kernel.cu": "4fde9d1a11b73305f05ffef303c73a3f45cad1eedeac23de4cbf194b2ccae03f",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1af0069a0ec96fb8b742_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1af0069a0ec96fb8b742_binding.cu",
+            "csrc/cake_rmsnorm_train_1af0069a0ec96fb8b742_kernel.cu",
+            "csrc/cake_rmsnorm_train_1af0069a0ec96fb8b742_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -478,12 +478,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1fe87dab637f77d6d1ec_binding.cu": "145f3453afa1add9d4180f4f283b0e6d89cd571b794f91fa140eaa4fe4a687d9",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1fe87dab637f77d6d1ec_kernel.cu": "8ffcd8edf0c79ea03b4c69ca3bf7b0a85a7fa6aad57251db87e29f5d4f010112",
+            "csrc/cake_rmsnorm_train_1fe87dab637f77d6d1ec_binding.cu": "145f3453afa1add9d4180f4f283b0e6d89cd571b794f91fa140eaa4fe4a687d9",
+            "csrc/cake_rmsnorm_train_1fe87dab637f77d6d1ec_kernel.cu": "8ffcd8edf0c79ea03b4c69ca3bf7b0a85a7fa6aad57251db87e29f5d4f010112",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1fe87dab637f77d6d1ec_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_1fe87dab637f77d6d1ec_binding.cu",
+            "csrc/cake_rmsnorm_train_1fe87dab637f77d6d1ec_kernel.cu",
+            "csrc/cake_rmsnorm_train_1fe87dab637f77d6d1ec_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -558,12 +558,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main",
         "select_rule": None,
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_209e86d94c24fbe2ad17_binding.cu": "103a81f00e7e66d3796bfa210139fe203c10df3ccc3fcbb7daab687f0f8474ec",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_209e86d94c24fbe2ad17_kernel.cu": "043088fba29bcea7e4b94e08f75d83268cc256a1792439d000b9a78b207a39ad",
+            "csrc/cake_rmsnorm_train_209e86d94c24fbe2ad17_binding.cu": "103a81f00e7e66d3796bfa210139fe203c10df3ccc3fcbb7daab687f0f8474ec",
+            "csrc/cake_rmsnorm_train_209e86d94c24fbe2ad17_kernel.cu": "043088fba29bcea7e4b94e08f75d83268cc256a1792439d000b9a78b207a39ad",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_209e86d94c24fbe2ad17_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_209e86d94c24fbe2ad17_binding.cu",
+            "csrc/cake_rmsnorm_train_209e86d94c24fbe2ad17_kernel.cu",
+            "csrc/cake_rmsnorm_train_209e86d94c24fbe2ad17_binding.cu",
         ],
         "workspace_rule": {
             "counters": 64,
@@ -634,12 +634,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu": "8ec2e7ffbb0b84f35baf58ccc09430f6565602078caeb32620d32294d3ba00bb",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu": "c4b26a1196d07eb9311bc11a850547a361d2f7e55cfe34870a6e73684d90f9e3",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu": "8ec2e7ffbb0b84f35baf58ccc09430f6565602078caeb32620d32294d3ba00bb",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu": "c4b26a1196d07eb9311bc11a850547a361d2f7e55cfe34870a6e73684d90f9e3",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -707,12 +707,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu": "8ec2e7ffbb0b84f35baf58ccc09430f6565602078caeb32620d32294d3ba00bb",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu": "c4b26a1196d07eb9311bc11a850547a361d2f7e55cfe34870a6e73684d90f9e3",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu": "8ec2e7ffbb0b84f35baf58ccc09430f6565602078caeb32620d32294d3ba00bb",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu": "c4b26a1196d07eb9311bc11a850547a361d2f7e55cfe34870a6e73684d90f9e3",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_kernel.cu",
+            "csrc/cake_rmsnorm_train_238d1fcaf82b12cf76ce_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -778,12 +778,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_30aadcc325a2374f6dc7_binding.cu": "e55f930412255605426aebdbe05df24bd8ae77fdc232c9133ea2c285786932f2",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_30aadcc325a2374f6dc7_kernel.cu": "bd53dbec8b818a3d9cf7cb1bd6b666390b45d8a400f83ad7e3803446c5d04ad7",
+            "csrc/cake_rmsnorm_train_30aadcc325a2374f6dc7_binding.cu": "e55f930412255605426aebdbe05df24bd8ae77fdc232c9133ea2c285786932f2",
+            "csrc/cake_rmsnorm_train_30aadcc325a2374f6dc7_kernel.cu": "bd53dbec8b818a3d9cf7cb1bd6b666390b45d8a400f83ad7e3803446c5d04ad7",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_30aadcc325a2374f6dc7_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_30aadcc325a2374f6dc7_binding.cu",
+            "csrc/cake_rmsnorm_train_30aadcc325a2374f6dc7_kernel.cu",
+            "csrc/cake_rmsnorm_train_30aadcc325a2374f6dc7_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -851,12 +851,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_3553c65ba62d5346923c_binding.cu": "76cb94a15f342d08d321ae6cc76bd94eb0f5914b0bfbdc537e1b6c7b67448d71",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_3553c65ba62d5346923c_kernel.cu": "36bbeb3b17c65647b2b4333c03ef452f20fe417ef840c1796fe6a512a80b3663",
+            "csrc/cake_rmsnorm_train_3553c65ba62d5346923c_binding.cu": "76cb94a15f342d08d321ae6cc76bd94eb0f5914b0bfbdc537e1b6c7b67448d71",
+            "csrc/cake_rmsnorm_train_3553c65ba62d5346923c_kernel.cu": "36bbeb3b17c65647b2b4333c03ef452f20fe417ef840c1796fe6a512a80b3663",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_3553c65ba62d5346923c_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_3553c65ba62d5346923c_binding.cu",
+            "csrc/cake_rmsnorm_train_3553c65ba62d5346923c_kernel.cu",
+            "csrc/cake_rmsnorm_train_3553c65ba62d5346923c_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -920,12 +920,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_binding.cu": "a246689717fa8427eed66f3f61411fd5128482892bb0cb98becd6c35ba885bc3",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_kernel.cu": "36359245687c911ff1ef038d2c84807e4f97763646d357adbe9862167926f4b4",
+            "csrc/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_binding.cu": "a246689717fa8427eed66f3f61411fd5128482892bb0cb98becd6c35ba885bc3",
+            "csrc/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_kernel.cu": "36359245687c911ff1ef038d2c84807e4f97763646d357adbe9862167926f4b4",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_binding.cu",
+            "csrc/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_kernel.cu",
+            "csrc/cake_rmsnorm_train_36dcbfe9ce26c2a5d859_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -991,12 +991,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_39325dca02d9cc2ad87d_binding.cu": "c47fe4a24e6e5678b84c0b5601925695ca21d87aadd8d4f6a5758e32f1aad729",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_39325dca02d9cc2ad87d_kernel.cu": "d9a9485486f2947e762b636935ef578453e900304e873fb19e8c005c429da68a",
+            "csrc/cake_rmsnorm_train_39325dca02d9cc2ad87d_binding.cu": "c47fe4a24e6e5678b84c0b5601925695ca21d87aadd8d4f6a5758e32f1aad729",
+            "csrc/cake_rmsnorm_train_39325dca02d9cc2ad87d_kernel.cu": "d9a9485486f2947e762b636935ef578453e900304e873fb19e8c005c429da68a",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_39325dca02d9cc2ad87d_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_39325dca02d9cc2ad87d_binding.cu",
+            "csrc/cake_rmsnorm_train_39325dca02d9cc2ad87d_kernel.cu",
+            "csrc/cake_rmsnorm_train_39325dca02d9cc2ad87d_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1064,12 +1064,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu": "a977268d11bdac3d762bb39b6449bd9eb1869cbd4d1e8db6b41d6c0207fc15be",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu": "173ce36c29c80a87c410fa7070117486bb3b56526162c0289869210f5b869f67",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu": "a977268d11bdac3d762bb39b6449bd9eb1869cbd4d1e8db6b41d6c0207fc15be",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu": "173ce36c29c80a87c410fa7070117486bb3b56526162c0289869210f5b869f67",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1137,12 +1137,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu": "a977268d11bdac3d762bb39b6449bd9eb1869cbd4d1e8db6b41d6c0207fc15be",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu": "173ce36c29c80a87c410fa7070117486bb3b56526162c0289869210f5b869f67",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu": "a977268d11bdac3d762bb39b6449bd9eb1869cbd4d1e8db6b41d6c0207fc15be",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu": "173ce36c29c80a87c410fa7070117486bb3b56526162c0289869210f5b869f67",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_kernel.cu",
+            "csrc/cake_rmsnorm_train_4171ae444c864ce774b5_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1210,12 +1210,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_46d2fd4b879b5c5926a3_binding.cu": "d6f421bbe2e4da538acf6b0c7dbc24faf19fae0102c5b21a2bf9f9363bf74086",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_46d2fd4b879b5c5926a3_kernel.cu": "17ae68bf186e8fb75f57ca11ae79f1d45fad1ca737da3020213fb21a1c8848b3",
+            "csrc/cake_rmsnorm_train_46d2fd4b879b5c5926a3_binding.cu": "d6f421bbe2e4da538acf6b0c7dbc24faf19fae0102c5b21a2bf9f9363bf74086",
+            "csrc/cake_rmsnorm_train_46d2fd4b879b5c5926a3_kernel.cu": "17ae68bf186e8fb75f57ca11ae79f1d45fad1ca737da3020213fb21a1c8848b3",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_46d2fd4b879b5c5926a3_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_46d2fd4b879b5c5926a3_binding.cu",
+            "csrc/cake_rmsnorm_train_46d2fd4b879b5c5926a3_kernel.cu",
+            "csrc/cake_rmsnorm_train_46d2fd4b879b5c5926a3_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1290,12 +1290,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main",
         "select_rule": None,
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_7cbb889e8e3e28efde83_binding.cu": "63efbb5a0cd46de35472e355b63e5173381cd15ff61d42d1d5a0f79ed2952bc0",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_7cbb889e8e3e28efde83_kernel.cu": "4c1153e005a4564c612d75ea71df633460583d4c40a816bac1f5a5bad5609f19",
+            "csrc/cake_rmsnorm_train_7cbb889e8e3e28efde83_binding.cu": "63efbb5a0cd46de35472e355b63e5173381cd15ff61d42d1d5a0f79ed2952bc0",
+            "csrc/cake_rmsnorm_train_7cbb889e8e3e28efde83_kernel.cu": "4c1153e005a4564c612d75ea71df633460583d4c40a816bac1f5a5bad5609f19",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_7cbb889e8e3e28efde83_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_7cbb889e8e3e28efde83_binding.cu",
+            "csrc/cake_rmsnorm_train_7cbb889e8e3e28efde83_kernel.cu",
+            "csrc/cake_rmsnorm_train_7cbb889e8e3e28efde83_binding.cu",
         ],
         "workspace_rule": {
             "counters": 192,
@@ -1373,12 +1373,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main_residual",
         "select_rule": None,
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_842800c4a5e2c849515e_binding.cu": "6bc04f8db5d5a988f3de999b7e5070d1e6a87c54a7e3b963e707a5665032ec2b",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_842800c4a5e2c849515e_kernel.cu": "b0dfb7e7f9212b4f0b0f6130ddcc4961de1c4a819accfc8ec056b2de48552366",
+            "csrc/cake_rmsnorm_train_842800c4a5e2c849515e_binding.cu": "6bc04f8db5d5a988f3de999b7e5070d1e6a87c54a7e3b963e707a5665032ec2b",
+            "csrc/cake_rmsnorm_train_842800c4a5e2c849515e_kernel.cu": "b0dfb7e7f9212b4f0b0f6130ddcc4961de1c4a819accfc8ec056b2de48552366",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_842800c4a5e2c849515e_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_842800c4a5e2c849515e_binding.cu",
+            "csrc/cake_rmsnorm_train_842800c4a5e2c849515e_kernel.cu",
+            "csrc/cake_rmsnorm_train_842800c4a5e2c849515e_binding.cu",
         ],
         "workspace_rule": {
             "counters": 96,
@@ -1447,12 +1447,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_a4c187b2830114c1a279_binding.cu": "86abb016c0a67901556d9742c90121e34c858660baef2522fa07fbf23204dc18",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_a4c187b2830114c1a279_kernel.cu": "7baf13320a67e546e551fb61c69e9e54a4e4e7fdb0797ccee7d1c8394fb01edd",
+            "csrc/cake_rmsnorm_train_a4c187b2830114c1a279_binding.cu": "86abb016c0a67901556d9742c90121e34c858660baef2522fa07fbf23204dc18",
+            "csrc/cake_rmsnorm_train_a4c187b2830114c1a279_kernel.cu": "7baf13320a67e546e551fb61c69e9e54a4e4e7fdb0797ccee7d1c8394fb01edd",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_a4c187b2830114c1a279_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_a4c187b2830114c1a279_binding.cu",
+            "csrc/cake_rmsnorm_train_a4c187b2830114c1a279_kernel.cu",
+            "csrc/cake_rmsnorm_train_a4c187b2830114c1a279_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1520,12 +1520,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu": "186c4f9f262d3ab791a95963ffc648983e6a34cb91c2bb7c4f194882033fd370",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu": "386dcb4aa914c4251201224e6079de8f40affc08e3f7ef9cca4afa8ee6d32a5c",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu": "186c4f9f262d3ab791a95963ffc648983e6a34cb91c2bb7c4f194882033fd370",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu": "386dcb4aa914c4251201224e6079de8f40affc08e3f7ef9cca4afa8ee6d32a5c",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1593,12 +1593,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu": "186c4f9f262d3ab791a95963ffc648983e6a34cb91c2bb7c4f194882033fd370",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu": "386dcb4aa914c4251201224e6079de8f40affc08e3f7ef9cca4afa8ee6d32a5c",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu": "186c4f9f262d3ab791a95963ffc648983e6a34cb91c2bb7c4f194882033fd370",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu": "386dcb4aa914c4251201224e6079de8f40affc08e3f7ef9cca4afa8ee6d32a5c",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1666,12 +1666,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu": "186c4f9f262d3ab791a95963ffc648983e6a34cb91c2bb7c4f194882033fd370",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu": "386dcb4aa914c4251201224e6079de8f40affc08e3f7ef9cca4afa8ee6d32a5c",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu": "186c4f9f262d3ab791a95963ffc648983e6a34cb91c2bb7c4f194882033fd370",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu": "386dcb4aa914c4251201224e6079de8f40affc08e3f7ef9cca4afa8ee6d32a5c",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_kernel.cu",
+            "csrc/cake_rmsnorm_train_b6ac896edca3b49b37a9_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1735,12 +1735,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_d44010e821a6c74587a6_binding.cu": "af86b0f9d16e87d1648b1fbaf6b3ca92561e41a7a6c7ba70387e782cfda10f42",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_d44010e821a6c74587a6_kernel.cu": "d101c553bc43bdef213df05d516a459b4ae61e6d6cdfc59f1bac031d89c08cf8",
+            "csrc/cake_rmsnorm_train_d44010e821a6c74587a6_binding.cu": "af86b0f9d16e87d1648b1fbaf6b3ca92561e41a7a6c7ba70387e782cfda10f42",
+            "csrc/cake_rmsnorm_train_d44010e821a6c74587a6_kernel.cu": "d101c553bc43bdef213df05d516a459b4ae61e6d6cdfc59f1bac031d89c08cf8",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_d44010e821a6c74587a6_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_d44010e821a6c74587a6_binding.cu",
+            "csrc/cake_rmsnorm_train_d44010e821a6c74587a6_kernel.cu",
+            "csrc/cake_rmsnorm_train_d44010e821a6c74587a6_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1804,12 +1804,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1873,12 +1873,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -1942,12 +1942,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -2011,12 +2011,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -2080,12 +2080,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu": "f789c352cdfa302bd878486205919354920c9f7a748ccf65ffa43f21b97905bc",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu": "72fc1d0e79fae488390da3cdd62f4b601a6175d54612c1bdd98e1624fd93231d",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_kernel.cu",
+            "csrc/cake_rmsnorm_train_e19d033974aaa63cfbe2_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -2153,12 +2153,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_binding.cu": "72f8b5388e14a0a9d45269c6c6329d96810104b60e85770469072cf77d2f3bb5",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu": "91920641b20a90f92d94c2682f4dc8e8b21a8fbc9e1185b571d9b47c1ac1b7a5",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_binding.cu": "72f8b5388e14a0a9d45269c6c6329d96810104b60e85770469072cf77d2f3bb5",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu": "91920641b20a90f92d94c2682f4dc8e8b21a8fbc9e1185b571d9b47c1ac1b7a5",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_binding.cu",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -2226,12 +2226,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_binding.cu": "72f8b5388e14a0a9d45269c6c6329d96810104b60e85770469072cf77d2f3bb5",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu": "91920641b20a90f92d94c2682f4dc8e8b21a8fbc9e1185b571d9b47c1ac1b7a5",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_binding.cu": "72f8b5388e14a0a9d45269c6c6329d96810104b60e85770469072cf77d2f3bb5",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu": "91920641b20a90f92d94c2682f4dc8e8b21a8fbc9e1185b571d9b47c1ac1b7a5",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_e6b2419224108211616a_binding.cu",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_kernel.cu",
+            "csrc/cake_rmsnorm_train_e6b2419224108211616a_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -2295,12 +2295,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "source_sha256": {
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_f9a6840d24c353c6303a_binding.cu": "64cf1ce9c110ca8e86617df511e2d9d6639b6ffd472c5bd0ead9bc324a7946f6",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_f9a6840d24c353c6303a_kernel.cu": "c9b7c23733537a5de7c4e843dd9ab35259141607cea19897f8c28f6757168ae9",
+            "csrc/cake_rmsnorm_train_f9a6840d24c353c6303a_binding.cu": "64cf1ce9c110ca8e86617df511e2d9d6639b6ffd472c5bd0ead9bc324a7946f6",
+            "csrc/cake_rmsnorm_train_f9a6840d24c353c6303a_kernel.cu": "c9b7c23733537a5de7c4e843dd9ab35259141607cea19897f8c28f6757168ae9",
         },
         "sources": [
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_f9a6840d24c353c6303a_kernel.cu",
-            "csrc/cake_rmsnorm_train/cake_rmsnorm_train_f9a6840d24c353c6303a_binding.cu",
+            "csrc/cake_rmsnorm_train_f9a6840d24c353c6303a_kernel.cu",
+            "csrc/cake_rmsnorm_train_f9a6840d24c353c6303a_binding.cu",
         ],
         "workspace_rule": None,
     },
@@ -2695,25 +2695,40 @@ def workspace_layout(
 
 
 def _source_dir() -> Path:
-    installed = jit_env.FLASHINFER_CSRC_DIR / SOURCE_PACKAGE
-    if installed.is_dir():
+    """The package's own CUDA sources: ``csrc/`` next to this module."""
+    package = Path(__file__).parent / "csrc"
+    if package.is_dir():
+        return package
+    raise FileNotFoundError(
+        f"Cake RMSNorm training CUDA sources were not found at {package}"
+    )
+
+
+def _header_dirs() -> list[Path]:
+    """Include directories of the FlashInfer binding helpers (``tvm_ffi_utils.h``
+    and the ``flashinfer/`` headers it includes): the installed data tree, or
+    the source checkout."""
+    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
+    if (installed[0] / "tvm_ffi_utils.h").is_file():
         return installed
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / SOURCE_PACKAGE
-    if checkout.is_dir():
+    root = Path(__file__).resolve().parents[2]
+    checkout = [root / "csrc", root / "include"]
+    if (checkout[0] / "tvm_ffi_utils.h").is_file():
         return checkout
     raise FileNotFoundError(
-        "Cake RMSNorm training CUDA sources were not found. Checked:\n"
-        f"  - {installed}\n  - {checkout}"
+        "FlashInfer binding headers (csrc/tvm_ffi_utils.h) were not found. Checked:\n"
+        f"  - {installed[0]}\n  - {checkout[0]}"
     )
 
 
 def _source_path(relative: str) -> Path:
+    """Package-relative recorded source (``csrc/<unit>.cu``) -> file next to this module."""
     parts = Path(relative).parts
-    if parts[:2] != ("csrc", SOURCE_PACKAGE) or len(parts) != 3:
+    if parts[:1] != ("csrc",) or len(parts) != 2:
         raise ValueError(
             f"exported source path is outside the RMSNorm training package: {relative!r}"
         )
-    return _source_dir().joinpath(*parts[2:])
+    return _source_dir() / parts[1]
 
 
 @functools.cache
@@ -2775,11 +2790,14 @@ def spec(name: str, arch: str) -> JitSpec:
     """JIT spec of one module built for ``arch`` (its own cache identity per architecture)."""
 
     record = MODULES[name]
+    # ``gen_jit_spec`` takes ``List[Union[str, Path]]``; ``list`` is invariant, so give the
+    # header directories that element type explicitly (mypy).
+    include_paths: list[Union[str, Path]] = list(_header_dirs())
     return gen_jit_spec(
         name=record["cache_names"][arch],
         sources=list(verified_sources(name)),
         extra_cuda_cflags=module_cuda_cflags(name, arch),
-        extra_include_paths=[_source_dir().parent],
+        extra_include_paths=include_paths,
         use_fast_math=False,
     )
 
