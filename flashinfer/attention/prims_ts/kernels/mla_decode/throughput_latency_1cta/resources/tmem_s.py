@@ -84,6 +84,7 @@ from ...helpers.ops import (
 )
 from ...helpers.stage import MlaStage
 from ...helpers.tile import (
+    local_kv_tile_idx,
     batch_idx_for_stage_cfg,
     cta_idx_kv_for_stage,
     cta_idx_q_for_stage,
@@ -93,6 +94,11 @@ from ...helpers.tile import (
     softmax_kv_tile_idx,
 )
 
+# Column-split max exchange: [parity 2][half 2][64 head rows] words after the
+# softmax scratch.
+XBAR_ROWS = 64
+XBAR_WORDS = 2 * 2 * XBAR_ROWS
+XBAR_BARRIER_ID = 2
 from .common import (
     MlaResource,
 )
@@ -112,6 +118,7 @@ class TmemSResource(MlaResource):
         ("new_max_arr", cutlass.Array, None, "Current running softmax maxima."),
         ("local_sum_arr", cutlass.Array, None, "Local denominator contributions."),
         ("s_arr", cutlass.Array, None, "Loaded S scores for the current tile."),
+        ("regs_p", cutlass.Array, None, "Packed P registers (compute_p_s)."),
     )
     inst_id: cutlass.Constexpr[int] = 0
     scale_softmax_log2: Float32 = None
@@ -125,8 +132,18 @@ class TmemSResource(MlaResource):
     cta_idx_q: object = None
     cta_idx_kv: object = None
     sync_barrier_id: cutlass.Constexpr[int] = 0
+    # Token-sparse: the page-offset resource whose allocation carries the
+    # per-tile validity ring (see ``SPARSE_MASK_SLOTS`` in smem_resources).
+    page_offsets_kv: object = None
+    _sparse_mask_words: object = None
     q_desc_current: object = None
     q_desc_rope_current: object = None
+    # Native FP4 QK: NVFP4 Q descriptors and the SFA / SFB TMEM resources.
+    q_desc_fp4_lat0: object = None
+    q_desc_fp4_lat1: object = None
+    q_desc_fp4_rope: object = None
+    qfp4_ref: Optional[MemoryResource] = None
+    raw_ref: Optional[MemoryResource] = None
     new_max_state: object = None
     sum_state: object = None
     _scratch_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
@@ -143,6 +160,7 @@ class TmemSResource(MlaResource):
         TaskLocalVariable.uninitialized()
     )
     s_arr: cutlass.Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    regs_p: cutlass.Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     @cute.jit
     def _reset_softmax_state(self):
@@ -165,12 +183,22 @@ class TmemSResource(MlaResource):
     def get_smem_requirements(self):
         """Return the softmax scratch SMEM allocation."""
         if self._scratch_alloc is None:
+            # Native FP4 QK: the column-split max exchange words follow the scratch.
+            xbar_bytes = (
+                XBAR_WORDS * SMEM_WORD_BYTES
+                if self.cfg.is_dynamic_token_sparse_nvfp4
+                else 0
+            )
             self._scratch_alloc = SmemAllocation(
                 name=f"{self.name}_softmaxScratch",
-                size_bytes=softmax_scratch_words(self.cfg) * SMEM_WORD_BYTES,
+                size_bytes=softmax_scratch_words(self.cfg) * SMEM_WORD_BYTES
+                + xbar_bytes,
                 alignment=16,
             )
         return [self._scratch_alloc]
+
+    def _s_tmem_offset(self) -> int:
+        return self._tmem_alloc.offset
 
     def get_tmem_requirements(self):
         """Return the TMEM allocation for score tiles."""
@@ -239,10 +267,18 @@ class TmemSResource(MlaResource):
             context,
             self._scratch_alloc,
             Uint32,
-            softmax_scratch_words(self.cfg),
+            softmax_scratch_words(self.cfg)
+            + (XBAR_WORDS if self.cfg.is_dynamic_token_sparse_nvfp4 else 0),
         )
         self.q_desc_current = Int64(0)
         self.q_desc_rope_current = Int64(0)
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            self._sparse_mask_words = smem_array(
+                context,
+                self.page_offsets_kv._alloc,
+                Int32,
+                self.page_offsets_kv.total_words,
+            )
         if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
             thread_idx = cute.arch.thread_idx()[0]
             state_ptr = self._softmax_scratch.data_ptr(thread_idx)
@@ -289,6 +325,137 @@ class TmemSResource(MlaResource):
         del stage_info
         self.q_desc_current = q_desc
         self.q_desc_rope_current = q_desc_rope
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def set_q_desc_fp4(
+        self, stage_info: StageInfo, *, q_desc_lat0, q_desc_lat1, q_desc_rope
+    ):
+        """Cache the three NVFP4 Q descriptors (native FP4 QK) for the work tile."""
+        del stage_info
+        self.q_desc_fp4_lat0 = q_desc_lat0
+        self.q_desc_fp4_lat1 = q_desc_lat1
+        self.q_desc_fp4_rope = q_desc_rope
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_native_qk_state(self, stage_info: StageInfo) -> None:
+        """MMA-side views of the raw K ring and the SF TMEM blocks (native FP4 QK)."""
+        self.raw_ref._init_smem_state(stage_info)
+        self.qfp4_ref._init_tmem_state(stage_info)
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def stage_sfb(self, stage_info: StageInfo, *, section: cutlass.Constexpr[MlaStage]):
+        """Native FP4 QK: wait for this K tile's raw stage to land (observer spin).
+
+        The MMA is not a registered consumer of the raw K ring (the dequant
+        warps are); the tile's token block scales (SFB) are written into TMEM
+        by the dequant warps (``SfbReadyResource``), which the MMA waits on
+        right after this.  Issued ahead of PV(n) so the wait overlaps the PV
+        MMAs instead of sitting between PV(n) and BMM1(n + 1).
+        """
+        cfg = self.cfg
+        tile = local_kv_tile_idx(cfg, stage_info, self.inst_id, 0, section=section)
+        self.raw_ref.observe_k_tile_full(tile)
+
+    @producer_work
+    @cute.jit
+    def qk_mma_fp4(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+    ):
+        """Native FP4 QK: ten ``kind::mxf4nvf4`` M128 N128 K64 MMAs for one K tile.
+
+        Chunks 0-3 / 4-7 read the two SW128 latent segments, chunk 8 the rope
+        main half and chunk 9 the rope residual half of the SW64 segment against
+        the same Q rope (Q rope is stored twice).  Block scales come from TMEM,
+        4 columns per chunk: SFA (Q, staged once per work tile by ``q_desc``)
+        and SFB (tokens, written by the dequant warps with ``tcgen05.st`` and
+        made visible through ``SfbReadyResource.sfb_visible``).
+        """
+        cfg = self.cfg
+        task_cache = decode_gen_task_cache(stage_info)
+        tmem_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+        tmem_ptr = prims.make_tmem_ptr(
+            tmem_base
+            + Int32(self._tmem_alloc.offset)
+            + stage_info.stage_idx * Int32(cfg.tmem_s_cols),
+            Float32,
+        )
+        sfa_col = tmem_base + Int32(self.qfp4_ref._tmem_alloc.offset)
+        sfb_col = sfa_col + Int32(cfg.tmem_sf_cols)
+        idesc = prims.Tcgen05MxOmmaInstrDesc.build(
+            a_dtype=cutlass.Float4E2M1FN,
+            b_dtype=cutlass.Float4E2M1FN,
+            scale_format=0,  # UE4M3 block scales
+            a_major=0,
+            b_major=0,
+            n_dim=cfg.tile_size_kv,
+            m_dim=128,
+            sparsity_version=0,
+        )
+        q_descs = (
+            freeze_smem_descriptor(self.q_desc_fp4_lat0),
+            freeze_smem_descriptor(self.q_desc_fp4_lat1),
+            freeze_smem_descriptor(self.q_desc_fp4_rope),
+        )
+        # The MMA is not a registered consumer of the raw K ring (the dequant
+        # warps are; they release a stage only after this tile's BMM1 completed):
+        # ``stage_sfb`` observed the tile's full barrier; address its stage directly.
+        tile = local_kv_tile_idx(cfg, stage_info, self.inst_id, 0, section=section)
+        raw = self.raw_ref
+        seg_bytes = cfg.tile_size_kv * 128
+        k_base = raw.smem_byte_address(
+            (tile % Int32(cfg.kv_raw_stages)) * Int32(cfg.kv_raw_stage_bytes)
+        )
+        k_descs = (
+            freeze_smem_descriptor(
+                prims.Tcgen05SmemDesc.build(
+                    k_base,
+                    leading_byte_offset=seg_bytes,
+                    stride_byte_offset=1024,
+                    layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+                )
+            ),
+            freeze_smem_descriptor(
+                prims.Tcgen05SmemDesc.build(
+                    k_base + Int32(seg_bytes),
+                    leading_byte_offset=seg_bytes,
+                    stride_byte_offset=1024,
+                    layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+                )
+            ),
+            freeze_smem_descriptor(
+                prims.Tcgen05SmemDesc.build(
+                    k_base + Int32(2 * seg_bytes),
+                    leading_byte_offset=cfg.tile_size_kv * 64,
+                    stride_byte_offset=512,
+                    layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B,
+                )
+            ),
+        )
+        if prims.elect_sync():
+            for c in cutlass.range_constexpr(10):
+                seg = 0 if c < 4 else (1 if c < 8 else 2)
+                blk = c - 4 * seg
+                # +32 B per K64 block inside the swizzled row (16-byte units).
+                a_desc = q_descs[seg] + Int64(2 * blk)
+                b_desc = k_descs[seg] + Int64(2 * blk)
+                prims.tcgen05_mma_block_scale(
+                    prims.Tcgen05MMAKind.MXF4NVF4,
+                    prims.CTAGroup.CTA_1,
+                    tmem_ptr,
+                    a_desc,
+                    b_desc,
+                    idesc,
+                    Boolean(c != 0),
+                    prims.make_tmem_ptr(sfa_col + Int32(4 * c), Int32),
+                    prims.make_tmem_ptr(sfb_col + Int32(4 * c), Int32),
+                    scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
+                )
 
     @producer_work
     @cute.jit
@@ -446,14 +613,21 @@ class TmemSResource(MlaResource):
             stage_col_offset = stage_info.stage_idx * Int32(cfg.tmem_s_cols)
         base_addr = (
             task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-            + Int32(self._tmem_alloc.offset)
+            + Int32(self._s_tmem_offset())
             + stage_col_offset
+            # Native FP4 QK column split: this 128-thread half's 64 columns.
+            + (
+                (task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] >> Int32(7))
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4)
+                else Int32(0)
+            )
+            * Int32(cfg.tile_size_kv // 2)
         )
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
             loaded = tcgen05_ld_16x32bx2_f32(
                 prims.make_tmem_ptr(base_addr, Float32),
-                num=cfg.tile_size_kv // 2,
-                offset=Int32(cfg.tile_size_kv // 2),
+                num=num_s_regs_per_thread(cfg),
+                offset=Int32(num_s_regs_per_thread(cfg)),
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
@@ -491,13 +665,24 @@ class TmemSResource(MlaResource):
             self.cu_seqlens_q,
             batch_idx,
         )
-        local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+            # Head / Loop sections on the K cadence (tile inst, then
+            # n * num_insts_kv + num_insts_kv + inst).
+            local_tile_idx = local_kv_tile_idx(
+                cfg, stage_info, self.inst_id, 0, section=section
+            )
+        else:
+            local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
         tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # Every tile may carry -1 (empty) slots; the validity ring is
+            # consulted unconditionally.
+            should_apply_dense_mask = cutlass.Boolean(True)
         needs_row_causal_mask = cutlass.const_expr(
             cfg.mask_type == MaskType.CAUSAL.value and cfg.logical_seq_len_q > 1
         )
@@ -519,8 +704,16 @@ class TmemSResource(MlaResource):
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
-                local_col_base = (lane_idx >> Int32(4)) * Int32(cfg.tile_size_kv // 2)
-                local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
+                local_col_base = (lane_idx >> Int32(4)) * Int32(
+                    num_s_regs_per_thread(cfg)
+                ) + (
+                    (task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] >> Int32(7))
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4)
+                    else Int32(0)
+                ) * Int32(cfg.tile_size_kv // 2)
+                local_row_idx = (warp_idx & Int32(3)) * Int32(16) + (
+                    lane_idx & Int32(0xF)
+                )
                 row_seq_len_kv = seq_len_kv
                 if cutlass.const_expr(needs_row_causal_mask):
                     row_seq_len_kv = runtime_seq_len_kv_for_query_row(
@@ -531,10 +724,68 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
-                for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
-                    token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
-                    if token_idx >= row_seq_len_kv:
-                        s_vals[reg_idx] = neg_max_f32()
+                if cutlass.const_expr(
+                    not (
+                        cfg.is_dynamic_token_sparse_nvfp4 and not needs_row_causal_mask
+                    )
+                ):
+                    # NVFP4: the loader folds this test into the validity nibble.
+                    for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
+                        token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
+                        if token_idx >= row_seq_len_kv:
+                            s_vals[reg_idx] = neg_max_f32()
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                    from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
+
+                    half_cols = cfg.tile_size_kv // 2
+                    hi_half = local_col_base >= Int32(half_cols)
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+                        # Loader-owned indices: one byte per quad (bit = token & 3),
+                        # 32 bytes = 8 words per tile slot; this thread's row span
+                        # is words (local_col_base >> 4) + {0 .. words - 1}.
+                        words_per_thread = num_s_regs_per_thread(cfg) // 16
+                        mask_base = (
+                            Int32(self.page_offsets_kv.sparse_mask_word_base)
+                            + (tile_idx % Int32(SPARSE_MASK_SLOTS)) * Int32(8)
+                            + (local_col_base >> Int32(4))
+                        )
+                        mask_sel = []
+                        for w in cutlass.range_constexpr(words_per_thread):
+                            mask_sel.append(
+                                Int32(self._sparse_mask_words[mask_base + Int32(w)])
+                            )
+                        # Every quad byte holds its 4 validity bits in the low
+                        # nibble (bit = token & 3 of quad (token >> 2) & 3).
+                        for reg_idx in cutlass.range_constexpr(
+                            num_s_regs_per_thread(cfg)
+                        ):
+                            mask_word = mask_sel[reg_idx >> 4]
+                            bit = (reg_idx & 3) | (((reg_idx >> 2) & 3) << 3)
+                            if ((mask_word >> Int32(bit)) & Int32(1)) == Int32(0):
+                                s_vals[reg_idx] = neg_max_f32()
+                    else:
+                        mask_base = Int32(
+                            self.page_offsets_kv.sparse_mask_word_base
+                        ) + (tile_idx % Int32(SPARSE_MASK_SLOTS)) * Int32(
+                            SPARSE_MASK_WORDS
+                        )
+                        mask_w0 = Int32(self._sparse_mask_words[mask_base])
+                        mask_w1 = Int32(self._sparse_mask_words[mask_base + Int32(1)])
+                        mask_w2 = Int32(self._sparse_mask_words[mask_base + Int32(2)])
+                        mask_w3 = Int32(self._sparse_mask_words[mask_base + Int32(3)])
+                        # Word w covers tokens 32w .. 32w+31 (bit = token & 31).
+                        # ``local_col_base`` is 0 or 64, so this thread's 64 tokens
+                        # use words (local_col_base >> 5) + {0, 1}.
+                        word_a = mask_w2 if hi_half else mask_w0
+                        word_b = mask_w3 if hi_half else mask_w1
+                        for reg_idx in cutlass.range_constexpr(
+                            num_s_regs_per_thread(cfg)
+                        ):
+                            mask_word = word_b if reg_idx >= 32 else word_a
+                            if ((mask_word >> Int32(reg_idx & 31)) & Int32(1)) == Int32(
+                                0
+                            ):
+                                s_vals[reg_idx] = neg_max_f32()
             else:
                 local_idx_k0 = warp_idx * Int32(WARP_LANES) + (
                     lane_idx >> Int32(QUAD_LANE_SHIFT)
@@ -606,7 +857,13 @@ class TmemSResource(MlaResource):
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
             # Keeps-MMA-AB keeps the softmax state in scratch words indexed by
             # CTA thread, so only a warp-level max is needed here.
-            local_max = old_max_vals[0]
+            # Column split (native FP4 QK): the tile's raw half-row max only;
+            # the exchange below folds in the running max and applies the
+            # threshold freeze.
+            max_seed = old_max_vals[0]
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+                max_seed = neg_max_f32()
+            local_max = max_seed
             for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                 local_max = cute.math.max(local_max, s_vals[reg_idx], ftz=True)
             local_max = cute.math.max(
@@ -622,7 +879,35 @@ class TmemSResource(MlaResource):
                 ),
                 ftz=True,
             )
-            local_max = self._freeze_row_max(old_max_vals[0], local_max)
+            if cutlass.const_expr(not cfg.is_dynamic_token_sparse_nvfp4):
+                local_max = self._freeze_row_max(old_max_vals[0], local_max)
+            else:
+                # Both 128-thread halves publish their half-row max for this
+                # tile in a parity-double-buffered SMEM slot and meet at one
+                # 256-thread named barrier; each then merges prev / own / peer
+                # with the same threshold freeze.
+                xb = Int32(softmax_scratch_words(cfg)) + (
+                    local_tile_idx & Int32(1)
+                ) * Int32(2 * XBAR_ROWS)
+                # Task-local thread index (0..255): warp_grp_thread_idx is the
+                # global thread index in the keeps-MMA-AB variant.
+                xt = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+                row = ((xt & Int32(127)) >> Int32(5)) * Int32(16) + (xt & Int32(15))
+                own_ptr = self._softmax_scratch.data_ptr(
+                    xb + (xt >> Int32(7)) * Int32(XBAR_ROWS) + row
+                )
+                own_ptr.store(
+                    float_to_u32_bits(local_max), is_volatile=True, alignment=4
+                )
+                prims.barrier_cta_sync(barrier_id=XBAR_BARRIER_ID, thread_count=256)
+                peer_ptr = self._softmax_scratch.data_ptr(
+                    xb + (Int32(1) - (xt >> Int32(7))) * Int32(XBAR_ROWS) + row
+                )
+                peer = u32_bits_to_float(peer_ptr.load(is_volatile=True, alignment=4))
+                cand = cute.math.max(
+                    cute.math.max(old_max_vals[0], local_max, ftz=True), peer, ftz=True
+                )
+                local_max = self._freeze_row_max(old_max_vals[0], cand)
             new_max_vals[0] = local_max
             self.new_max_state[0] = local_max
         else:
@@ -745,6 +1030,20 @@ class TmemSResource(MlaResource):
                     if new_max - old_max <= self.adjusted_skip_corr_threshold:
                         frozen = old_max
         return frozen
+
+    @consumer_work(returns=regs_p)
+    @cute.jit
+    def compute_p_s(self, stage_info: StageInfo, *, new_max_arr, s_arr, local_sum_arr):
+        """Native FP4 QK: exp / pack this half's P into registers inside the S
+        consumer section (right after the merged max is known), before the
+        single P stage is acquired; the S stage is released afterwards.
+        ``local_sum_arr`` is updated in place."""
+        return self.p_ref._compute_p_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            local_sum_arr=local_sum_arr,
+        )
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,

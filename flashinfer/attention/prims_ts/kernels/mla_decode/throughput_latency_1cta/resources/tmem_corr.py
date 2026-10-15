@@ -59,12 +59,18 @@ from ...helpers.layout import (
 )
 from ...helpers.math import (
     ceil_div,
+    neg_max_f32,
     fadd2,
     ffma2,
     fmul2,
     output_dtype,
     pack_float2_to_bf16,
     partial_output_dtype,
+)
+from ...helpers.nvfp4 import (
+    ld_shared_v4,
+    st_shared_v4,
+    warp_sync_all,
 )
 from ...helpers.ops import (
     fp8_p_scale_rcp,
@@ -110,6 +116,9 @@ class TmemCorrResource(MlaResource):
     """
 
     inst_id: cutlass.Constexpr[int] = 0
+    # O TMEM resource (its allocation offset is the O column base).
+    o_tmem_ref: object = None
+    kv_ref: object = None
     scale_softmax_log2: Float32 = None
     output_scale: Float32 = None
     o_tensor: object = None
@@ -137,6 +146,19 @@ class TmemCorrResource(MlaResource):
         """Return correction/output SMEM scratch and optional cluster buffers."""
         if self.inst_id != 1:
             return []
+        if self.cfg.is_dynamic_token_sparse_nvfp4:
+            # Native FP4 QK: the bf16 output is stored straight from TMEM
+            # (staged through the idle V ring), so no O staging tile; the two
+            # column halves of the softmax task exchange (max, sum) at the
+            # tail through the sum scratch (256 threads x 8 B = its 2 KB).
+            assert self.cfg.use_fp8_output == 0 and self.cfg.use_cluster_reduction != 1
+            if self._sum_alloc is None:
+                self._sum_alloc = SmemAllocation(
+                    name=f"{self.name}_sumScratch",
+                    size_bytes=self.cfg.corr_scratch_bytes,
+                    alignment=16,
+                )
+            return [self._sum_alloc]
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}_oStage",
@@ -239,6 +261,10 @@ class TmemCorrResource(MlaResource):
     def _o_base_col(self):
         """Return the first TMEM column owned by the O accumulator."""
 
+        if cutlass.const_expr(self.o_tmem_ref is not None):
+            # Authoritative: the O resource's own TMEM allocation (the native
+            # FP4 QK map places O first, before S / P / scale factors).
+            return Int32(self.o_tmem_ref._tmem_alloc.offset)
         if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
             return Int32(2 * self.cfg.tmem_s_cols)
         return Int32(2 * self.cfg.tmem_s_cols + 2 * self.cfg.tmem_stats_cols)
@@ -487,7 +513,7 @@ class TmemCorrResource(MlaResource):
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
             should_store_lse = lane_idx < Int32(16)
-            local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
+            local_row_idx = (warp_idx & Int32(3)) * Int32(16) + (lane_idx & Int32(0xF))
             head_idx = head_base_idx + local_row_idx
             scale_idx = Int32(0)
         else:
@@ -956,6 +982,78 @@ class TmemCorrResource(MlaResource):
             tail_o_stage_idx_1=tail_o_stage_idx_1,
         )
 
+    @producer_work
+    @cute.jit
+    def correct_tail_cs8(self, stage_info: StageInfo, *, new_max_arr, sum_arr):
+        """Tail of the 8-warp column-split softmax task: the two column halves
+        exchange their (max, sum) through the sum scratch, merge the
+        denominators, then each half normalizes and stores the two V stages
+        of its TMEM panel; half 0 stores LSE."""
+        cfg = self.cfg
+        task_cache = decode_gen_task_cache(stage_info)
+        xt = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        half = xt >> Int32(7)
+        slot = (xt & Int32(127)) * Int32(2)
+        own = half * Int32(256) + slot
+        peer = (Int32(1) - half) * Int32(256) + slot
+        self._sum_scratch.data_ptr(own).store(
+            new_max_arr[0], is_volatile=True, alignment=4
+        )
+        self._sum_scratch.data_ptr(own + Int32(1)).store(
+            sum_arr[0], is_volatile=True, alignment=4
+        )
+        prims.barrier_cta_sync(barrier_id=self.sum_barrier_id, thread_count=256)
+        peer_max_arr = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
+        peer_sum_arr = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
+        peer_max_arr[0] = self._sum_scratch.data_ptr(peer).load(
+            is_volatile=True, alignment=4
+        )
+        peer_sum_arr[0] = self._sum_scratch.data_ptr(peer + Int32(1)).load(
+            is_volatile=True, alignment=4
+        )
+        tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+        cta_idx_head_dim_v = cta_idx_head_dim_v_for_stage(
+            self.cta_idx_head_dim_v, stage_info
+        )
+        head_dim_offset = head_dim_cta_offset_v(cfg, cta_idx_head_dim_v)
+        final_max, reduced_sum, final_scale0, final_scale1 = (
+            self._compute_tail_softmax_scales(
+                task_cache,
+                new_max_arr=new_max_arr,
+                sum_arr=sum_arr,
+                inst0_new_max_arr=peer_max_arr,
+                inst0_sum_arr=peer_sum_arr,
+                inst1_new_max_arr=new_max_arr,
+                inst1_sum_arr=sum_arr,
+            )
+        )
+        if half == Int32(0):
+            self._store_lse_to_gmem(stage_info, task_cache, final_max, reduced_sum)
+        # The V ring is idle once every PV completed (all_pv_done): it stages
+        # the output rows.
+        stage_buf = (
+            smem_array(stage_info.context, self.kv_ref._alloc, Int32, 1)
+            .data_ptr(Int32(0))
+            .toint(Int32)
+        )
+        for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
+            if half == Int32(v_stage_idx // 2):
+                base_addr0 = (
+                    tmem_row_base
+                    + self._o_base_col()
+                    + o_stage_tmem_col_offset(cfg, Int32(0), v_stage_idx)
+                )
+                self._store_keeps_tail_o_stage_smem(
+                    stage_info,
+                    task_cache,
+                    base_addr0=base_addr0,
+                    final_scale0=final_scale0,
+                    v_stage_idx=v_stage_idx,
+                    head_dim_offset=head_dim_offset,
+                    stage_buf=stage_buf,
+                )
+        self._reduce_cluster_partials_and_store(stage_info, task_cache, head_dim_offset)
+
     @cute.jit
     def _apply_loop_correction_in_tmem(
         self,
@@ -974,38 +1072,45 @@ class TmemCorrResource(MlaResource):
         num_o_tmem_loads = num_o_tmem_loads_per_stage(cfg)
 
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
+            cs8_half = Int32(0)
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+                cs8_half = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] >> Int32(7)
             for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
-                base_addr = (
-                    tmem_row_base
-                    + self._o_base_col()
-                    + o_stage_tmem_col_offset(cfg, o_stage_idx, v_stage_idx)
-                )
-                loaded = tcgen05_ld_16x32bx2_f32(
-                    prims.make_tmem_ptr(base_addr, Float32),
-                    num=cfg.head_dim_per_stage_v // 2,
-                    offset=Int32(cfg.head_dim_per_stage_v // 2),
-                )
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                cute.arch.fence_view_async_tmem_load()
-                scaled = cutlass.Array(
-                    Float32,
-                    cfg.head_dim_per_stage_v // 2,
-                    space=cutlass.AddressSpace.rmem,
-                )
-                for reg_idx in cutlass.range_constexpr(cfg.head_dim_per_stage_v // 2):
-                    scaled[reg_idx] = loaded[reg_idx] * scale_vals[0]
-                scaled_vec = vector_from_scalars(
-                    tuple(
-                        scaled[reg_idx]
-                        for reg_idx in range(cfg.head_dim_per_stage_v // 2)
-                    ),
-                    Float32,
-                )
-                tcgen05_st_16x32bx2_f32(
-                    prims.make_tmem_ptr(base_addr, Float32),
-                    scaled_vec,
-                    offset=Int32(cfg.head_dim_per_stage_v // 2),
-                )
+                # Native FP4 QK column split: each 128-thread half of the
+                # softmax task rescales the two V stages of its panel.
+                do_stage = cutlass.Boolean(True)
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+                    do_stage = cs8_half == Int32(v_stage_idx // 2)
+                if do_stage:
+                    base_addr = (
+                        tmem_row_base
+                        + self._o_base_col()
+                        + o_stage_tmem_col_offset(cfg, o_stage_idx, v_stage_idx)
+                    )
+                    half_cols = cfg.head_dim_per_stage_v // 2
+                    loaded = tcgen05_ld_16x32bx2_f32(
+                        prims.make_tmem_ptr(base_addr, Float32),
+                        num=half_cols,
+                        offset=Int32(half_cols),
+                    )
+                    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                    cute.arch.fence_view_async_tmem_load()
+                    scaled = cutlass.Array(
+                        Float32,
+                        half_cols,
+                        space=cutlass.AddressSpace.rmem,
+                    )
+                    for reg_idx in cutlass.range_constexpr(half_cols):
+                        scaled[reg_idx] = loaded[reg_idx] * scale_vals[0]
+                    scaled_vec = vector_from_scalars(
+                        tuple(scaled[reg_idx] for reg_idx in range(half_cols)),
+                        Float32,
+                    )
+                    tcgen05_st_16x32bx2_f32(
+                        prims.make_tmem_ptr(base_addr, Float32),
+                        scaled_vec,
+                        offset=Int32(half_cols),
+                    )
             return
 
         for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):
@@ -1243,7 +1348,39 @@ class TmemCorrResource(MlaResource):
         col_group_idx = warp_grp_thread_idx & Int32(0x3)
 
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
-            if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
+            if cutlass.const_expr(
+                cfg.kernel_variant == "keeps_mma_ab"
+                and cfg.is_dynamic_token_sparse_nvfp4
+            ):
+                # Column split, one O: both halves end on the same merged
+                # running max, so O is relative to m1 >= m0 (the shared max is
+                # monotone).  Merge the denominators onto m1; O itself only
+                # needs the normalization.
+                m0 = inst0_new_max_arr[scale_idx]
+                m1 = new_max_arr[scale_idx]
+                final_max[scale_idx] = cute.math.max(m0, m1, ftz=True)
+                e0 = Float32(0.0)
+                if m0 != neg_max_f32():
+                    e0 = cute.math.exp2(
+                        self.scale_softmax_log2 * (m0 - final_max[scale_idx]),
+                        fastmath=True,
+                    )
+                exp_scale0[scale_idx] = Float32(1.0)
+                exp_scale1[scale_idx] = Float32(0.0)
+                final_sum[scale_idx] = (
+                    sum_arr[scale_idx] + inst0_sum_arr[scale_idx] * e0
+                )
+                final_sum[scale_idx] += Float32(
+                    cprims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=final_sum[scale_idx],
+                        offset=16,
+                        mask_and_clamp=0x1F,
+                        kind=cprims.Shfl.BFLY,
+                    )
+                )
+                reduced_sum[scale_idx] = final_sum[scale_idx]
+            elif cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                 inst_sum = sum_arr[scale_idx]
                 inst_max = new_max_arr[scale_idx]
                 final_max[scale_idx] = inst_max
@@ -1351,6 +1488,108 @@ class TmemCorrResource(MlaResource):
         return final_max, reduced_sum, final_scale0, final_scale1
 
     @cute.jit
+    def _store_keeps_tail_o_stage_smem(
+        self,
+        stage_info: StageInfo,
+        task_cache,
+        *,
+        base_addr0,
+        final_scale0,
+        v_stage_idx: int,
+        head_dim_offset,
+        stage_buf,
+    ):
+        """Normalize one keeps-MMA-AB O stage and store it through SMEM (native FP4 QK tail).
+
+        Phase 1: each thread (row ``lane & 15`` of its warp's 16 heads, column
+        half ``lane >> 4``) writes its 64 bf16 of the stage into a warp-private
+        row-major buffer (272-byte pitch).  Phase 2: lane ``l`` stores 16-byte
+        chunk ``l & 15`` of rows ``2 i + (l >> 4)``: every store instruction
+        writes two full 256-byte row segments instead of 32 scattered ones.
+        BF16 direct output only (no fp8 output, no split-KV partials).
+        """
+        cfg = self.cfg
+        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        pitch = 272
+        half_cols = cfg.head_dim_per_stage_v // 2
+        buf = stage_buf + warp_idx * Int32(16 * pitch)
+        wrow = lane_idx & Int32(15)
+        whalf = lane_idx >> Int32(4)
+        # Phase 1: TMEM -> bf16 -> warp-private SMEM rows.
+        for chunk0 in cutlass.range_constexpr(0, half_cols, 32):
+            o_loaded = tcgen05_ld_16x32bx2_f32(
+                prims.make_tmem_ptr(base_addr0 + Int32(chunk0), Float32),
+                num=32,
+                offset=Int32(half_cols),
+            )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            cute.arch.fence_view_async_tmem_load()
+            for sub in cutlass.range_constexpr(4):
+                words = []
+                for pair_idx in cutlass.range_constexpr(4):
+                    reg_base = sub * 8 + pair_idx * 2
+                    final_pair = fmul2(
+                        (final_scale0[0], final_scale0[0]),
+                        (o_loaded[reg_base], o_loaded[reg_base + 1]),
+                    )
+                    words.append(pack_float2_to_bf16(final_pair[0], final_pair[1]))
+                col = whalf * Int32(half_cols) + Int32(chunk0 + sub * 8)
+                st_shared_v4(
+                    buf + wrow * Int32(pitch) + col * Int32(2),
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
+        warp_sync_all()
+        # Phase 2: coalesced 256-byte row segments.
+        q = lane_idx & Int32(15)
+        rsel = lane_idx >> Int32(4)
+        o_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+        for i in cutlass.range_constexpr(8):
+            row = Int32(2 * i) + rsel
+            w0, w1, w2, w3 = ld_shared_v4(buf + row * Int32(pitch) + q * Int32(16))
+            local_row_idx = (warp_idx & Int32(3)) * Int32(16) + row
+            global_head_idx = head_base_idx + local_row_idx
+            storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
+                local_row_idx,
+                cta_idx_q,
+                cfg.tile_size_q,
+                cfg.logical_num_heads_q,
+                cfg.logical_seq_len_q,
+                cu_seqlens_q=self.cu_seqlens_q,
+                batch_idx=batch_idx,
+            )
+            if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
+                output_query_row = public_query_flat_row(
+                    cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
+                )
+                store_col_offset = (
+                    head_dim_offset
+                    + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
+                    + q * Int32(8)
+                )
+                base_elem_offset = Int64(output_query_row) * Int64(
+                    cfg.head_dim_v
+                ) + Int64(store_col_offset)
+                dst_ptr = cutlass.inttoptr(
+                    o_ptr + base_elem_offset * Int64(cfg.o_dtype_bytes),
+                    mem_space=1,
+                    dtype=Int32,
+                )
+                packed_o = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                packed_o[0] = w0
+                packed_o[1] = w1
+                packed_o[2] = w2
+                packed_o[3] = w3
+                dst_ptr.store(packed_o.load(0, 4), alignment=16)
+        warp_sync_all()
+
+    @cute.jit
     def _store_keeps_tail_o_stage(
         self,
         stage_info: StageInfo,
@@ -1371,7 +1610,7 @@ class TmemCorrResource(MlaResource):
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         # Keeps-MMA-AB stores one head row per half-warp.  The low 16 lanes own
         # the row index; the upper lane bit selects the head-dim half.
-        local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
+        local_row_idx = (warp_idx & Int32(3)) * Int32(16) + (lane_idx & Int32(0xF))
         global_head_idx = head_base_idx + local_row_idx
         storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
             global_head_idx,
@@ -1389,100 +1628,112 @@ class TmemCorrResource(MlaResource):
         # ``tcgen05.ld.sync.aligned`` must remain convergent across the warp.
         # Padded query rows still own valid physical TMEM rows, so load and
         # normalize every row and predicate only the externally visible store.
-        for chunk_idx in cutlass.range_constexpr(0, cfg.head_dim_per_stage_v // 2, 8):
+        # One TMEM round trip per 32 columns (native FP4 QK) or 8, then the
+        # 16-byte stores of the 8-column groups.
+        tail_chunk = 32 if cfg.is_dynamic_token_sparse_nvfp4 else 8
+        for chunk0 in cutlass.range_constexpr(
+            0, cfg.head_dim_per_stage_v // 2, tail_chunk
+        ):
             o_loaded = tcgen05_ld_16x32bx2_f32(
-                prims.make_tmem_ptr(base_addr0 + Int32(chunk_idx), Float32),
-                num=8,
+                prims.make_tmem_ptr(base_addr0 + Int32(chunk0), Float32),
+                num=tail_chunk,
                 offset=Int32(cfg.head_dim_per_stage_v // 2),
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             cute.arch.fence_view_async_tmem_load()
-            if cutlass.const_expr(
-                cfg.use_fp8_output == 1
-                and self.acc_o_tensor is None
-                and cfg.use_cluster_reduction != 1
-            ):
-                final_vals = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-                packed_o = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
-            else:
-                packed_o = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-            for pair_idx in cutlass.range_constexpr(4):
-                reg_base = pair_idx * 2
-                final_pair = fmul2(
-                    (final_scale0[0], final_scale0[0]),
-                    (o_loaded[reg_base], o_loaded[reg_base + 1]),
-                )
+            for sub in cutlass.range_constexpr(tail_chunk // 8):
+                chunk_idx = chunk0 + sub * 8
                 if cutlass.const_expr(
                     cfg.use_fp8_output == 1
                     and self.acc_o_tensor is None
                     and cfg.use_cluster_reduction != 1
                 ):
-                    final_vals[reg_base] = final_pair[0]
-                    final_vals[reg_base + 1] = final_pair[1]
+                    final_vals = cutlass.Array(
+                        Float32, 8, space=cutlass.AddressSpace.rmem
+                    )
+                    packed_o = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
                 else:
-                    packed_o[pair_idx] = pack_float2_to_bf16(
-                        final_pair[0], final_pair[1]
+                    packed_o = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                for pair_idx in cutlass.range_constexpr(4):
+                    reg_base = pair_idx * 2
+                    final_pair = fmul2(
+                        (final_scale0[0], final_scale0[0]),
+                        (
+                            o_loaded[sub * 8 + reg_base],
+                            o_loaded[sub * 8 + reg_base + 1],
+                        ),
                     )
-            if cutlass.const_expr(
-                cfg.use_fp8_output == 1
-                and self.acc_o_tensor is None
-                and cfg.use_cluster_reduction != 1
-            ):
-                packed_o[0] = pack_float4_to_fp8_e4m3(
-                    final_vals[0],
-                    final_vals[1],
-                    final_vals[2],
-                    final_vals[3],
-                )
-                packed_o[1] = pack_float4_to_fp8_e4m3(
-                    final_vals[4],
-                    final_vals[5],
-                    final_vals[6],
-                    final_vals[7],
-                )
-            store_col_offset = (
-                head_dim_offset
-                + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
-                + half_warp_col_offset
-                + Int32(chunk_idx)
-            )
-            if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                if cutlass.const_expr(self.acc_o_tensor is not None):
-                    base_elem_offset = split_o_element_offset(
-                        cfg,
-                        batch_idx,
-                        cta_idx_q,
-                        global_head_idx,
-                        cta_idx_kv,
-                        store_col_offset,
-                    )
-                    base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
-                    element_bytes = cfg.partial_o_dtype_bytes
-                else:
-                    output_query_row = public_query_flat_row(
-                        cfg,
-                        storage_flat_query_row,
-                        batch_idx,
-                        self.cu_seqlens_q,
-                    )
-                    base_elem_offset = Int64(output_query_row) * Int64(
-                        cfg.head_dim_v
-                    ) + Int64(store_col_offset)
-                    base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
-                    element_bytes = cfg.o_dtype_bytes
-                dst_ptr = cutlass.inttoptr(
-                    base_ptr + Int64(base_elem_offset) * Int64(element_bytes),
-                    mem_space=1,
-                    dtype=Int32,
-                )
+                    if cutlass.const_expr(
+                        cfg.use_fp8_output == 1
+                        and self.acc_o_tensor is None
+                        and cfg.use_cluster_reduction != 1
+                    ):
+                        final_vals[reg_base] = final_pair[0]
+                        final_vals[reg_base + 1] = final_pair[1]
+                    else:
+                        packed_o[pair_idx] = pack_float2_to_bf16(
+                            final_pair[0], final_pair[1]
+                        )
                 if cutlass.const_expr(
                     cfg.use_fp8_output == 1
                     and self.acc_o_tensor is None
                     and cfg.use_cluster_reduction != 1
                 ):
-                    dst_ptr.store(packed_o.load(0, 2), alignment=8)
-                else:
-                    dst_ptr.store(packed_o.load(0, 4), alignment=16)
+                    packed_o[0] = pack_float4_to_fp8_e4m3(
+                        final_vals[0],
+                        final_vals[1],
+                        final_vals[2],
+                        final_vals[3],
+                    )
+                    packed_o[1] = pack_float4_to_fp8_e4m3(
+                        final_vals[4],
+                        final_vals[5],
+                        final_vals[6],
+                        final_vals[7],
+                    )
+                store_col_offset = (
+                    head_dim_offset
+                    + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
+                    + half_warp_col_offset
+                    + Int32(chunk_idx)
+                )
+                if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
+                    if cutlass.const_expr(self.acc_o_tensor is not None):
+                        base_elem_offset = split_o_element_offset(
+                            cfg,
+                            batch_idx,
+                            cta_idx_q,
+                            global_head_idx,
+                            cta_idx_kv,
+                            store_col_offset,
+                        )
+                        base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
+                        element_bytes = cfg.partial_o_dtype_bytes
+                    else:
+                        output_query_row = public_query_flat_row(
+                            cfg,
+                            storage_flat_query_row,
+                            batch_idx,
+                            self.cu_seqlens_q,
+                        )
+                        base_elem_offset = Int64(output_query_row) * Int64(
+                            cfg.head_dim_v
+                        ) + Int64(store_col_offset)
+                        base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+                        element_bytes = cfg.o_dtype_bytes
+                    dst_ptr = cutlass.inttoptr(
+                        base_ptr + Int64(base_elem_offset) * Int64(element_bytes),
+                        mem_space=1,
+                        dtype=Int32,
+                    )
+                    if cutlass.const_expr(
+                        cfg.use_fp8_output == 1
+                        and self.acc_o_tensor is None
+                        and cfg.use_cluster_reduction != 1
+                    ):
+                        dst_ptr.store(packed_o.load(0, 2), alignment=8)
+                    else:
+                        dst_ptr.store(packed_o.load(0, 4), alignment=16)
 
     @cute.jit
     def _stage_tile32_tail_o_to_smem(

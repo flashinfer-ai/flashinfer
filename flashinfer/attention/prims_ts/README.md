@@ -29,6 +29,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
 | DSV4 sparse MLA (CSA/HCA share one kernel) | — | `prims_ts_dsv4_sparse_mla`, `prims_ts_dsv4_sparse_mla_rope_quant`, `prims_ts_dsv4_sparse_mla_rope_quant_ue8m0` |
+| DSA sparse MLA (GLM-5.3 / DeepSeek-V3.2 token routing, 1CTA) | [below](#dsa-sparse-mla) | `prims_ts_dsa_sparse_mla_fp8`, `prims_ts_dsa_sparse_mla_nvfp4` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
@@ -98,6 +99,38 @@ dequant-scale format: `prims_ts_dsv4_sparse_mla_rope_quant` writes one FP32
 `scale = 2 ** (byte - 127)` and `exp2(ceil(log2(max(amax, 1e-10) / 448)))`
 rounding; its `out_scale.permute(2, 0, 1)[:T]` view is the `[T, 16, 8]` scale
 tensor consumed by UE8M0 block-scaled GEMMs.
+
+### DSA sparse MLA
+
+`prims_ts_dsa_sparse_mla_fp8` and `prims_ts_dsa_sparse_mla_nvfp4` run GLM-5.3 /
+DeepSeek-V3.2 decode over token-level routing: every packed E4M3 query token
+(`[T, H, 576]`, H in {64, 128}) attends to the `sparse_mla_top_k` KV rows its
+indexer selected, given as flat row indices in `block_tables` (`[T, top_k]`
+INT32, `-1` = empty slot anywhere in the row; `sparse_mla_top_k_lens` limits
+the scanned prefix per token).  The argument names and the `seq_lens` /
+`cum_seq_lens_q` / `max_q_len` placeholders follow
+`trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k > 0)`; the kernel does
+not read the placeholders.  Both entries return BF16 `[T, H, 512]` (optional
+caller-owned `out` and base-2 `lse`), accept `skip_corr_threshold` in `[0, 8]`,
+and use one CTA per query token (64 heads = 64 query rows; 128 heads run as
+two row tiles of the same token), so a decode step with `T` tokens takes
+`ceil(T / 148)` waves on B200 (`ceil(2 T / 148)` with 128 heads) and no
+split-KV.  Both need SM100 / SM103; the NVFP4 entry additionally needs
+CUDA 13.4+ / `nvidia-cutlass-dsl` 4.8+ (PTX ISA 9.4 packed E2M1 x E4M3
+multiply).  The kernel trusts the routing values: `block_tables` entries must
+be `-1` or address a pool row and `sparse_mla_top_k_lens` must lie in
+`[0, top_k]`; `FLASHINFER_VALIDATE_INPUTS=1` checks both (synchronizing, not
+under CUDA-graph capture).  The FP8 entry reads an E4M3
+`[.., 576]` cache addressed as flat rows.  The NVFP4 entry reads the TRT-LLM
+NVFP4 MLA cache (`quantizeAndWriteMlaFp4`: `[N, 320]` uint8 data + `[N, 40]`
+E4M3 block scales, the last 64 dims stored as main + residual pairs) with
+`kv_global_dequant_scale = amax / (448 * 6)`: QK runs natively on the E2M1 rows
+(`tcgen05.mma.kind::mxf4nvf4`, Q quantized to NVFP4 on chip with the
+per-16-block `amax / 6` E4M3 scale), and eight dequant warps convert the
+resident rows to E4M3 for the FP8 PV MMA, so no gather / up-convert pass
+touches HBM.  Pool rows are addressed with 32-bit indices; the first call on
+a pool buffer encodes its Gather4 descriptors on the host, so run each pool
+once eagerly before CUDA-graph capture.
 
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
@@ -450,8 +483,9 @@ pytest -q \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
   tests/attention/test_attention_ts_mla_decode.py \
-  tests/attention/test_attention_ts_sage.py
-  tests/attention/test_attention_ts_dsv4.py
+  tests/attention/test_attention_ts_sage.py \
+  tests/attention/test_attention_ts_dsv4.py \
+  tests/attention/test_attention_ts_dsa.py
 ```
 
 The CuTe DSL compiles these kernels with the `ptxas` bundled in the

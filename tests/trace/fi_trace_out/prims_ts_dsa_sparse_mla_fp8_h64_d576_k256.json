@@ -1,0 +1,122 @@
+{
+  "name": "prims_ts_dsa_sparse_mla_fp8_h64_d576_k256",
+  "description": "PrimTS 1CTA DSA sparse MLA decode: packed E4M3 queries attend to the top-k rows of a flat E4M3 [N, 576] KV pool selected per query token; BF16 output.",
+  "op_type": "mla_sparse",
+  "tags": [
+    "fi_api:flashinfer.attention.prims_ts.dsa.prims_ts_dsa_sparse_mla_fp8",
+    "stage:decode",
+    "backend:prims-ts",
+    "status:experimental",
+    "mla",
+    "dsa"
+  ],
+  "axes": {
+    "total_q": {
+      "type": "var",
+      "description": "Packed query-token count T."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 64
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 576
+    },
+    "v_dim": {
+      "type": "const",
+      "value": 512
+    },
+    "pool_rows": {
+      "type": "var",
+      "description": "Token rows in the flat KV pool."
+    },
+    "sparse_mla_top_k": {
+      "type": "const",
+      "value": 256
+    }
+  },
+  "constraints": [
+    "num_heads in (64, 128)",
+    "head_dim == 576",
+    "sparse_mla_top_k >= 4",
+    "sparse_mla_top_k % 4 == 0"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "total_q",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "block_tables": {
+      "shape": [
+        "total_q",
+        "sparse_mla_top_k"
+      ],
+      "dtype": "int32",
+      "description": "Flat token-row indices (page_id * page_size + offset) of the routed KV rows; -1 marks an empty slot anywhere in the row."
+    },
+    "seq_lens": {
+      "shape": [
+        "total_q"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Interface parity with trtllm-gen; not read by the kernel."
+    },
+    "cum_seq_lens_q": {
+      "shape": [
+        "total_q"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Interface parity with trtllm-gen; not read by the kernel."
+    },
+    "sparse_mla_top_k_lens": {
+      "shape": [
+        "total_q"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Active routing prefix per query token (defaults to the full width)."
+    },
+    "bmm1_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "skip_corr_threshold": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "E4M3 skip-correction threshold in log2 units, in [0, 8]."
+    },
+    "kv_cache": {
+      "shape": [
+        "pool_rows",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_q",
+        "num_heads",
+        "v_dim"
+      ],
+      "dtype": "bfloat16",
+      "param": "out"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

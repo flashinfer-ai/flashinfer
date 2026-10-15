@@ -80,6 +80,8 @@ prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32
 prims_ts_dsv4_sparse_mla_h128_d512.json
 prims_ts_dsv4_sparse_mla_rope_quant_h128_d512.json
 prims_ts_dsv4_sparse_mla_rope_quant_ue8m0_h128_d512.json
+prims_ts_dsa_sparse_mla_fp8_h64_d576_k256.json
+prims_ts_dsa_sparse_mla_nvfp4_h64_d576_k256.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_native_sf1d_N256_K1024_K_packed512_block_size16_SF_dim_016384.json
@@ -2955,6 +2957,46 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+
+# PrimTS DSA sparse MLA (GLM-5.3 / DeepSeek-V3.2 token routing, 1CTA): the E4M3
+# row cache and the TRT-LLM NVFP4 MLA cache (SM100/SM103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.attention.prims_ts import (
+        prims_ts_dsa_sparse_mla_fp8 as _dsa_sparse_mla_fp8,
+        prims_ts_dsa_sparse_mla_nvfp4 as _dsa_sparse_mla_nvfp4,
+    )
+
+    _dsa_T, _dsa_H, _dsa_K, _dsa_N = 2, 64, 256, 600
+    _dsa_fp8 = torch.float8_e4m3fn
+    _dsa_q = (0.5 * torch.randn(_dsa_T, _dsa_H, 576, device=device)).to(_dsa_fp8)
+    _dsa_pool = (0.5 * torch.randn(_dsa_N, 576, device=device)).to(_dsa_fp8)
+    _dsa_tables = torch.stack(
+        [torch.randperm(_dsa_N, device=device)[:_dsa_K] for _ in range(_dsa_T)]
+    ).to(torch.int32)
+    _dsa_sparse_mla_fp8(
+        _dsa_q,
+        _dsa_pool,
+        _dsa_tables,
+        None,
+        None,
+        sparse_mla_top_k=_dsa_K,
+        bmm1_scale=1.0 / 16.0,
+    )
+    # NVFP4 data rows: random E2M1 nibbles; block scales: small positive E4M3.
+    _dsa_data = torch.randint(0, 256, (_dsa_N, 320), dtype=torch.uint8, device=device)
+    _dsa_scales = (torch.rand(_dsa_N, 40, device=device) * 0.5 + 0.25).to(_dsa_fp8)
+    _dsa_sparse_mla_nvfp4(
+        _dsa_q,
+        _dsa_data,
+        _dsa_scales,
+        _dsa_tables,
+        None,
+        None,
+        sparse_mla_top_k=_dsa_K,
+        kv_global_dequant_scale=168.0 / (448.0 * 6.0),
+        bmm1_scale=1.0 / 16.0,
+    )
 
 
 # PrimTS DSV4 sparse MLA (CSA/HCA share one kernel): BF16 output and the fused

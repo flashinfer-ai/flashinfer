@@ -153,12 +153,17 @@ def staged_kv_load(
 ):
     """Issue all K/V producer stages for one logical K or V tile."""
     cached_page_ids = page_offsets_consume(smem_page_offsets, cached_page_ids)
+    # Without a page-offset ring (dense, or loader-owned token indices) the
+    # producer works take no page-id token; the schedule builder rejects None.
+    page_kwargs = (
+        {} if cached_page_ids is None else {"cached_page_ids": cached_page_ids}
+    )
     for stage_idx in range(head_dim_stages):
         smem_kv.acquire()
         getattr(smem_kv, producer_label)(
             stage_idx=stage_idx,
             section=section,
-            cached_page_ids=cached_page_ids,
+            **page_kwargs,
         )
         smem_kv.commit()
     page_offsets_release(smem_page_offsets)

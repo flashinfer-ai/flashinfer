@@ -6191,3 +6191,123 @@ prims_ts_dsv4_sparse_mla_rope_quant_ue8m0_trace = TraceTemplate(
     ],
     tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsv4"],
 )
+
+
+# ---------------------------------------------------------------------------
+# PrimTS DSA (GLM-5.3 / DeepSeek-V3.2) token-sparse MLA decode, 1CTA
+# ---------------------------------------------------------------------------
+
+
+def _dsa_sparse_mla_axes() -> dict[str, Var | Const]:
+    return {
+        "total_q": Var(description="Packed query-token count T."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d", value=576),
+        "v_dim": Const(abbrev="", value=512),
+        "pool_rows": Var(description="Token rows in the flat KV pool."),
+        "sparse_mla_top_k": Const(abbrev="k"),
+    }
+
+
+def _dsa_sparse_mla_inputs() -> dict[str, Tensor | Scalar]:
+    return {
+        "query": Tensor(["total_q", "num_heads", "head_dim"]),
+        "block_tables": Tensor(
+            ["total_q", "sparse_mla_top_k"],
+            dtype="int32",
+            description=(
+                "Flat token-row indices (page_id * page_size + offset) of the "
+                "routed KV rows; -1 marks an empty slot anywhere in the row."
+            ),
+        ),
+        "seq_lens": Tensor(
+            ["total_q"],
+            dtype="int32",
+            optional=True,
+            description="Interface parity with trtllm-gen; not read by the kernel.",
+        ),
+        "cum_seq_lens_q": Tensor(
+            ["total_q"],
+            dtype="int32",
+            optional=True,
+            description="Interface parity with trtllm-gen; not read by the kernel.",
+        ),
+        "sparse_mla_top_k_lens": Tensor(
+            ["total_q"],
+            dtype="int32",
+            optional=True,
+            description="Active routing prefix per query token (defaults to the full width).",
+        ),
+        "bmm1_scale": Scalar("float32", optional=True),
+        "bmm2_scale": Scalar("float32", optional=True),
+        "skip_corr_threshold": Scalar(
+            "float32",
+            optional=True,
+            description="E4M3 skip-correction threshold in log2 units, in [0, 8].",
+        ),
+    }
+
+
+_DSA_SPARSE_MLA_CONSTRAINTS = [
+    "num_heads in (64, 128)",
+    "head_dim == 576",
+    "sparse_mla_top_k >= 4",
+    "sparse_mla_top_k % 4 == 0",
+]
+
+prims_ts_dsa_sparse_mla_fp8_trace = TraceTemplate(
+    op_type="mla_sparse",
+    name_prefix="prims_ts_dsa_sparse_mla_fp8",
+    description=(
+        "PrimTS 1CTA DSA sparse MLA decode: packed E4M3 queries attend to the "
+        "top-k rows of a flat E4M3 [N, 576] KV pool selected per query token; "
+        "BF16 output."
+    ),
+    axes=_dsa_sparse_mla_axes(),
+    inputs={
+        **_dsa_sparse_mla_inputs(),
+        "kv_cache": Tensor(["pool_rows", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["total_q", "num_heads", "v_dim"], dtype="bfloat16", param="out"
+        ),
+    },
+    constraints=_DSA_SPARSE_MLA_CONSTRAINTS,
+    tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsa"],
+)
+
+
+def _dsa_nvfp4_axes() -> dict[str, Var | Const]:
+    axes = _dsa_sparse_mla_axes()
+    axes["data_row_bytes"] = Const(abbrev="", value=320)
+    axes["scale_row_bytes"] = Const(abbrev="", value=40)
+    return axes
+
+
+prims_ts_dsa_sparse_mla_nvfp4_trace = TraceTemplate(
+    op_type="mla_sparse",
+    name_prefix="prims_ts_dsa_sparse_mla_nvfp4",
+    description=(
+        "PrimTS 1CTA DSA sparse MLA decode over the TRT-LLM NVFP4 MLA KV cache "
+        "(320 data bytes + 40 E4M3 block-scale bytes per token row): native "
+        "mxf4nvf4 QK on the raw rows, on-chip V dequantization to E4M3 for PV; "
+        "BF16 output."
+    ),
+    axes=_dsa_nvfp4_axes(),
+    inputs={
+        **_dsa_sparse_mla_inputs(),
+        "kv_data_pool": Tensor(["pool_rows", "data_row_bytes"], dtype="uint8"),
+        "kv_scale_pool": Tensor(["pool_rows", "scale_row_bytes"]),
+        "kv_global_dequant_scale": Scalar(
+            "float32", description="TRT-LLM amax / (448 * 6) of the cache."
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["total_q", "num_heads", "v_dim"], dtype="bfloat16", param="out"
+        ),
+    },
+    constraints=_DSA_SPARSE_MLA_CONSTRAINTS,
+    tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsa"],
+)
