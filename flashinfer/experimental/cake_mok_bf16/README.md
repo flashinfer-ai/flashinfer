@@ -196,7 +196,7 @@ to recreate the workspace.
 - Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
   `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
   the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
-  group size) and keeps the factory split where there is none. GB300 (160 SMs)
+  group size) and keeps the factory split where there is none. GB300 (152 SMs)
   MXFP8 EP8 44 / 36 against 40 / 32, two-node EP8 complete training steps (4
   GPUs per node), two rounds on the same nodes, hottest-rank step time: hottest
   rank at 3.0x the mean routed load -2.0 / -2.2 % (full step) and -2.0 / -1.8 %

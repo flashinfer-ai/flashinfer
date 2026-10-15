@@ -37,7 +37,7 @@ IMBALANCE_THRESHOLDS = {"bf16": 4.0, "mxfp8": 2.7}
 # routed precision and EP group size. Only devices and group sizes with a
 # measured gain have a row; "auto" resolves to the factory split (40 / 40)
 # elsewhere, and the factory defaults themselves are unchanged (the row is
-# opt-in). GB300 (compute capability (10, 3), 160 SMs) MXFP8 EP8 row 44 / 36
+# opt-in). GB300 (compute capability (10, 3), 152 SMs) MXFP8 EP8 row 44 / 36
 # against the fixed 40 / 32: EP8 complete training steps on two nodes (4 GPUs
 # each), two rounds on the same nodes, hottest-rank step time. Hottest rank at
 # 3.0x the mean routed load: -2.0 / -2.2 % (full step), -2.0 / -1.8 %
@@ -48,7 +48,7 @@ IMBALANCE_THRESHOLDS = {"bf16": 4.0, "mxfp8": 2.7}
 # no unconditional gain (balanced steps +0.7 ... +1.0 % slower) and has no row;
 # B200 keeps its imbalance switch above.
 COMM_SMS = {
-    (10, 3): {160: {"mxfp8": {8: (44, 36)}}},
+    (10, 3): {152: {"mxfp8": {8: (44, 36)}}},
 }
 _FACTORY_COMM_SMS = (40, 40)
 
