@@ -62,6 +62,8 @@ if TYPE_CHECKING:
 
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+
+
 _SUPPORTED_HEAD_DIMS = (128, 256)
 _DEFAULT_PAGED_KV_PAGE_SIZE = 32
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
@@ -150,6 +152,8 @@ class _ContextPlanGeometry:
     head_dim_vo: int | None = None
     # VC-Attention-QK16 recipe, or ``None`` for a plain plan.
     vc: Optional[VCAttentionConfig] = None
+    # Compile the per-row log2-sum-exp store into the kernel.
+    return_lse: bool = False
 
 
 @dataclass(frozen=True)
@@ -251,6 +255,7 @@ class _ContextCompileSpec:
     head_dim_vo: int | None = None
     two_cta_umma: bool = False
     vc: Optional[VCAttentionConfig] = None
+    has_lse: bool = False
 
 
 @dataclass(frozen=True)
@@ -566,7 +571,8 @@ def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
 
 def _default_exp2_packed_f16x2(device_index: int, cfg) -> bool:
     """Packed f16x2 exp2 in the softmax: one MUFU op per score pair. On for the
-    SM107 fp8-V paths; SM100/SM103 split the packed op into two MUFU ops."""
+    SM107 fp8-V paths; SM100/SM103 split the packed op into two MUFU ops. The
+    VC-Attention-QK8 mean-restoring recipe keeps ExpCast, which is faster there."""
     return (
         torch.cuda.get_device_capability(device_index) == (10, 7)
         and cfg.v_dtype.width == 8
@@ -1836,6 +1842,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         scheduler=_resolve_context_scheduler(geometry),
         two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
         vc=geometry.vc,
+        has_lse=geometry.return_lse,
     )
 
 
@@ -1996,6 +2003,7 @@ def _get_compiled_context(
         static_packed: cutlass.Constexpr[bool],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
+        static_has_lse: cutlass.Constexpr[bool],
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
@@ -2020,7 +2028,7 @@ def _get_compiled_context(
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
                 vc_ctrl=vc_ctrl,
-                lse=lse,
+                lse=lse if static_has_lse else None,
             )
         else:
             fmha(
@@ -2039,7 +2047,7 @@ def _get_compiled_context(
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
                 vc_ctrl=vc_ctrl,
-                lse=lse,
+                lse=lse if static_has_lse else None,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -2128,8 +2136,8 @@ def _get_compiled_context(
     vc_q_scale_fake = fake_compact(cutlass.Float32, vc_q_scale_shape, 16)
     vc_k_scale_fake = fake_compact(cutlass.Float32, vc_k_scale_shape, 16)
     vc_ctrl_fake = fake_compact(cutlass.Int32, (1,), 4)
-    # Per-row log2-sum-exp output ([total_q, H] packed, [B, S_q, H] fixed), or a
-    # zero-row placeholder that the store's row guard turns into a no-op.
+    # Per-row log2-sum-exp output ([total_q, H] packed, [B, S_q, H] fixed); kernels
+    # compiled without it receive a zero-row placeholder and ignore it.
     lse_fake = fake_compact(
         cutlass.Float32,
         (runtime_total_q, num_qo_heads)
@@ -2165,6 +2173,7 @@ def _get_compiled_context(
             packed,
             max_seq_len_q,
             max_seq_len_k,
+            compile_spec.has_lse,
             options=_COMPILE_OPTIONS,
         )
     policy = (
@@ -2748,6 +2757,7 @@ class BatchPrefillTSWrapper:
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         vc_config: Optional[VCAttentionConfig] = None,
+        return_lse: bool = False,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
@@ -2838,7 +2848,7 @@ class BatchPrefillTSWrapper:
         )
         if vc_config is not None and not isinstance(vc_config, VCAttentionConfig):
             raise TypeError("vc_config must be a VCAttentionConfig instance")
-        geometry = replace(geometry, vc=vc_config)
+        geometry = replace(geometry, vc=vc_config, return_lse=return_lse)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -2993,6 +3003,8 @@ class BatchPrefillTSWrapper:
             raise TypeError("validate must be a bool")
         geometry = state.geometry
         if lse is not None and validate:
+            if not geometry.return_lse:
+                raise ValueError("lse requires return_lse=True in plan()")
             lse_shape = (
                 (q.shape[0], geometry.num_qo_heads)
                 if geometry.packed

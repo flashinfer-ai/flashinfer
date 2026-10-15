@@ -67,8 +67,10 @@ _VC_Q_BLOCK_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 # K of the bf16 UMMA mean step, one kind::f16 K step.
 VC_MEAN_MMA_K = 16
 # Mean UMMA steps issued back to back per group of tiles; each tile takes two of a
-# step's 16 K slots (bf16 hi/lo row sum).
-VC_MEAN_OPERANDS = 2
+# step's 16 K slots (bf16 hi/lo row sum). One step per group keeps the softmax
+# warps' carried group row sums at eight; sixteen pushed the SM107 fp8 softmax
+# over its register budget (ptxas serialized the P pack through one register).
+VC_MEAN_OPERANDS = 1
 VC_MEAN_GROUP_TILES = VC_MEAN_OPERANDS * VC_MEAN_MMA_K // 2
 E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 # V-Smooth schedule. The paper groups and demeans on the first quarter of the

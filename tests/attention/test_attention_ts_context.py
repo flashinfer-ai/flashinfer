@@ -870,6 +870,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "sm_scale",
         "output_scale",
         "vc_config",
+        "return_lse",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY

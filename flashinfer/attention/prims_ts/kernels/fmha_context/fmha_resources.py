@@ -91,6 +91,7 @@ from ...vc_attention import VC_MEAN_GROUP_TILES, VC_MEAN_MMA_K, VC_MEAN_OPERANDS
 from .vc_resources import (
     E4M3_CODES_PER_OCTAVE,
     VC_EXPCAST_CODE_BIAS,
+    VC_P_SCALE_LOG2,
     VC_MEAN_TILE_LBO,
     VC_MEAN_TILE_SBO,
     _expcast_e4m3_quad_relu,
@@ -2738,14 +2739,6 @@ class TmemSPResource(MemoryResource):
     vc_pend5: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_pend6: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_pend7: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend8: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend9: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend10: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend11: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend12: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend13: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend14: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    vc_pend15: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
         self,
@@ -2907,46 +2900,6 @@ class TmemSPResource(MemoryResource):
             dtype=Float32,
             default=Float32(0.0),
             docs="VC-Attention-QK16: row sum of tile 7 of the current mean group.",
-        )
-        self.vc_pend8 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 8 of the current mean group.",
-        )
-        self.vc_pend9 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 9 of the current mean group.",
-        )
-        self.vc_pend10 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 10 of the current mean group.",
-        )
-        self.vc_pend11 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 11 of the current mean group.",
-        )
-        self.vc_pend12 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 12 of the current mean group.",
-        )
-        self.vc_pend13 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 13 of the current mean group.",
-        )
-        self.vc_pend14 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 14 of the current mean group.",
-        )
-        self.vc_pend15 = TaskLocalVariable(
-            dtype=Float32,
-            default=Float32(0.0),
-            docs="VC-Attention-QK16: row sum of tile 15 of the current mean group.",
         )
         self.vc_k_scale_next = TaskLocalVariable(
             dtype=Float32,
@@ -3331,14 +3284,6 @@ class TmemSPResource(MemoryResource):
             vc_pend5,
             vc_pend6,
             vc_pend7,
-            vc_pend8,
-            vc_pend9,
-            vc_pend10,
-            vc_pend11,
-            vc_pend12,
-            vc_pend13,
-            vc_pend14,
-            vc_pend15,
             vc_kept_row_sum,
             vc_k_scale_next,
         ),
@@ -3370,7 +3315,11 @@ class TmemSPResource(MemoryResource):
             k_scale_next = self._vc_k_scales.fill(
                 stage_info, self.vc_k_scale, kv_head, k_base
             )
-        return (row_scale, Float32(0.0)) + (Float32(0.0),) * 17 + (k_scale_next,)
+        return (
+            (row_scale, Float32(0.0))
+            + (Float32(0.0),) * (VC_MEAN_GROUP_TILES + 1)
+            + (k_scale_next,)
+        )
 
     @cute.jit
     def _vc_coords(self, stage_info: StageInfo) -> tuple[Int32, Int32, Int32]:
@@ -3826,6 +3775,18 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.vc_attention):
             # The paper's 2^8 P scaling is part of VC_EXPCAST_CODE_BIAS, so
             # p_scale_log2 is not added here.
+            if cutlass.const_expr(self.cfg.exp2_packed_f16x2):
+                # SM107: the f16x2 MUFU exp2 of 2^(u + 8) is faster than ExpCast on
+                # the repair recipes and QK16 means and keeps the 2^8 P scale.
+                return self._exp2_p_store_packed_words(
+                    tmem_p_addr,
+                    scale,
+                    Float32(VC_P_SCALE_LOG2) - row_max,
+                    _tmem_sp_sdata.pop(id(self)),
+                    0,
+                    num_chunks,
+                    None,
+                )
             return self._exp2_p_store_expcast(scale, Float32(0.0) - row_max)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
         if cutlass.const_expr(chunk_hi < num_chunks):
@@ -4778,14 +4739,6 @@ class TmemSPResource(MemoryResource):
             vc_pend5,
             vc_pend6,
             vc_pend7,
-            vc_pend8,
-            vc_pend9,
-            vc_pend10,
-            vc_pend11,
-            vc_pend12,
-            vc_pend13,
-            vc_pend14,
-            vc_pend15,
         )
     )
     @cute.jit
@@ -4806,14 +4759,6 @@ class TmemSPResource(MemoryResource):
         vc_pend5: SoftmaxScalar,
         vc_pend6: SoftmaxScalar,
         vc_pend7: SoftmaxScalar,
-        vc_pend8: SoftmaxScalar,
-        vc_pend9: SoftmaxScalar,
-        vc_pend10: SoftmaxScalar,
-        vc_pend11: SoftmaxScalar,
-        vc_pend12: SoftmaxScalar,
-        vc_pend13: SoftmaxScalar,
-        vc_pend14: SoftmaxScalar,
-        vc_pend15: SoftmaxScalar,
         is_tail: cutlass.Constexpr[bool] = False,
     ) -> tuple[Float32, ...]:
         """VC-Attention-QK16 P store. Writes the P row, rescales the group row sums
@@ -4839,14 +4784,6 @@ class TmemSPResource(MemoryResource):
             vc_pend5,
             vc_pend6,
             vc_pend7,
-            vc_pend8,
-            vc_pend9,
-            vc_pend10,
-            vc_pend11,
-            vc_pend12,
-            vc_pend13,
-            vc_pend14,
-            vc_pend15,
         ]
         for i in cutlass.range_constexpr(VC_MEAN_GROUP_TILES):
             scaled = sums[i] * acc_scale
@@ -4911,14 +4848,6 @@ class TmemSPResource(MemoryResource):
         vc_pend5: SoftmaxScalar,
         vc_pend6: SoftmaxScalar,
         vc_pend7: SoftmaxScalar,
-        vc_pend8: SoftmaxScalar,
-        vc_pend9: SoftmaxScalar,
-        vc_pend10: SoftmaxScalar,
-        vc_pend11: SoftmaxScalar,
-        vc_pend12: SoftmaxScalar,
-        vc_pend13: SoftmaxScalar,
-        vc_pend14: SoftmaxScalar,
-        vc_pend15: SoftmaxScalar,
     ) -> None:
         """VC-Attention-QK16: slot the last tile's row sum into its group and
         store the group operands for the tail mean step."""
@@ -4935,14 +4864,6 @@ class TmemSPResource(MemoryResource):
             vc_pend5,
             vc_pend6,
             vc_pend7,
-            vc_pend8,
-            vc_pend9,
-            vc_pend10,
-            vc_pend11,
-            vc_pend12,
-            vc_pend13,
-            vc_pend14,
-            vc_pend15,
         ]
         for i in cutlass.range_constexpr(VC_MEAN_GROUP_TILES):
             value = sums[i]

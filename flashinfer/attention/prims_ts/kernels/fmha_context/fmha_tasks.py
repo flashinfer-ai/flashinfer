@@ -34,6 +34,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from ..stage import FmhaStage
+from ...vc_attention import VC_MEAN_GROUP_TILES
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
     schedule,
@@ -2464,9 +2465,9 @@ def create_softmax_task(
             if vc_attention:
                 init = sp.vc_init_row_scale()
                 vc_row_scale, vc_state["prev_sum"] = init[0], init[1]
-                vc_state["sums"] = init[2:18]
-                vc_state["kept"] = init[18]
-                vc_state["k_next"] = init[19]
+                vc_state["sums"] = init[2 : 2 + VC_MEAN_GROUP_TILES]
+                vc_state["kept"] = init[2 + VC_MEAN_GROUP_TILES]
+                vc_state["k_next"] = init[3 + VC_MEAN_GROUP_TILES]
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
