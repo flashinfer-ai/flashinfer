@@ -142,6 +142,7 @@ def _combine_partials(
 def _dummy_tensors(device_index: int):
     # Signature fillers for paths that never read them; cached so repeat decode
     # calls do not launch fill kernels.
+    """Dummy inputs used to warm the autotuner on a device."""
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),

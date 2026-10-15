@@ -51,6 +51,7 @@ class MsaSparseDecode:
         # Partials are read in batches whose fragment array stays inside 32
         # registers, so the fused combine never raises the mainloop's
         # allocation.  Eight fp16 per access is one 16-byte vector.
+        """Record the split, ring depth and tile geometry this body is built for."""
         self.mgs = max(1, min(nsplit, 8))
         self.topk = topk
         self.nsplit = nsplit
@@ -82,6 +83,7 @@ class MsaSparseDecode:
         ntok: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Launch the decode grid for one call."""
         st = self.stages
         nc = self.nc
         D = self.d
@@ -233,6 +235,7 @@ class MsaSparseDecode:
         hkv: cutlass.Int32,
         tx_bytes: cutlass.Int32,
     ):
+        """One CTA per (split, query tile): gather selected blocks and reduce."""
         st = self.stages
         tk = self.topk
         ns = self.nsplit
@@ -854,10 +857,15 @@ _WS: dict = {}  # scratch buffers (memory only, never carries results across cal
 _WS_RETIRED = []
 
 
-def _scratch(n, nc, d, device):
+def _scratch(n, nc, d, device, stream):
     """Split-K partial buffers.  Pure scratch: written before it is read on
-    every call, never carries a result from one call to the next."""
-    key = (device, nc, d)
+    every call, never carries a result from one call to the next.
+
+    Keyed by stream as well as device: the buffers are live for the duration of
+    a launch, so two streams running decode concurrently would otherwise share
+    one set of partials and overwrite each other's splits.  Torch reuses stream
+    handles from its pool, so the key set stays small."""
+    key = (device, stream, nc, d)
     buf = _WS.get(key)
     if buf is None or buf[0].shape[0] < n * nc * d:
         if buf is not None:
@@ -951,6 +959,7 @@ def _plan(nc, d, grid, tiles_per_cta):
 
 
 def run(q, kv, q2k_indices, page_table, seqused_k, out):
+    """Run MSA sparse decode attention. Writes ``out``."""
     total_q, Hq, D = q.shape
     num_pages, Hkv, page_size, two_d = kv.shape
     B = seqused_k.numel()
@@ -991,9 +1000,12 @@ def run(q, kv, q2k_indices, page_table, seqused_k, out):
     mPT = _pack32(page_table, 1)
     mSeq = _pack32(seqused_k, 0)
 
-    wO, wL, wM, wC = _scratch(base * nsplit if nsplit > 1 else 1, nc, D, q.device)
+    cu_stream = torch.cuda.current_stream().cuda_stream
+    wO, wL, wM, wC = _scratch(
+        base * nsplit if nsplit > 1 else 1, nc, D, q.device, cu_stream
+    )
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(cu_stream)
     args = (
         mQ,
         mKV,
