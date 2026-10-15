@@ -41,8 +41,8 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     # None preserves the fields above; a dict overrides KNOB_KEYS.
-    # "cache" uses an offline winner or the heuristic fallback. Online "auto"
-    # is unsupported because the kernel fixes its knobs at construction.
+    # "cache" uses an offline winner or heuristic; "auto" also permits a
+    # search during an enabled FlashInfer autotune warmup, before capture.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"

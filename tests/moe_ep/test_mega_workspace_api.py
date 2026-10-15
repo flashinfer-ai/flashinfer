@@ -907,6 +907,75 @@ def test_create_workspace_rejects_mutable_auto_tuning_state():
     layer.destroy()
 
 
+def test_auto_handles_and_default_replacement_retain_old_storage():
+    layer, transformed, _ = _make_layer()
+    layer._megakernel_config = SimpleNamespace(knobs="auto")
+    layer._kernel.supports_auto_workspaces = True
+    first, first_raw, _, _ = _create_workspace(layer, 64)
+    second, second_raw, _, _ = _create_workspace(layer, 64)
+    assert first_raw is not second_raw
+    assert layer._resolve_workspace(first)[1] is first_raw
+    assert layer._resolve_workspace(second)[1] is second_raw
+    layer._bootstrap_validated = True
+    replacement = object()
+    with (
+        mock.patch.object(layer._kernel, "validate_forward"),
+        mock.patch.object(
+            layer._kernel, "needs_workspace_replacement", return_value=True
+        ),
+        mock.patch.object(layer._kernel, "prepare_workspace", return_value=replacement),
+        mock.patch.object(layer._kernel, "destroy") as destroy,
+    ):
+        _, selected, _, _, weights = layer._prepare_inputs(_inputs(8))
+        assert selected is replacement and weights is transformed
+        assert first._backend_workspace is first_raw and not first.is_destroyed
+        assert second._backend_workspace is second_raw and not second.is_destroyed
+        destroy.assert_not_called()
+        first.destroy()
+        destroy.assert_called_once_with(first_raw)
+        assert layer._ensure_workspace() is replacement
+        layer.destroy()
+        assert destroy.call_count == 3
+
+
+@pytest.mark.parametrize("dummy_warmup", [False, True])
+def test_default_replacement_keeps_implicit_workspace_until_layer_destroy(dummy_warmup):
+    import torch
+
+    layer, _, _ = _make_layer()
+    layer._bootstrap_validated = True
+    original, replacement = object(), object()
+    layer._workspace = original
+    with (
+        mock.patch.object(layer._kernel, "validate_forward"),
+        mock.patch.object(
+            layer._kernel, "needs_workspace_replacement", return_value=True
+        ),
+        mock.patch.object(layer._kernel, "prepare_workspace", return_value=replacement),
+        mock.patch.object(layer._kernel, "destroy") as destroy,
+    ):
+        if dummy_warmup:
+            with (
+                mock.patch("torch.cuda.current_device", return_value=0),
+                mock.patch("torch.device", return_value=torch.device("cpu")),
+                mock.patch("torch.cuda.synchronize"),
+                mock.patch.object(
+                    layer,
+                    "forward",
+                    side_effect=lambda t, **kwargs: layer._prepare_inputs(t),
+                ),
+            ):
+                layer.warmup()
+            assert id(replacement) not in layer._forward_signatures
+        else:
+            assert layer._prepare_inputs(_inputs(8))[1] is replacement
+        assert layer._workspace is replacement
+        assert layer._retired_tuning_workspaces == [original]
+        destroy.assert_not_called()
+        layer.destroy()
+        assert destroy.call_args_list == [mock.call(replacement), mock.call(original)]
+
+
 def test_nvfp4_recompiled_workspace_releases_obsolete_launch_scratch(monkeypatch):
     """Recompiling one profile releases its old scratch and preserves its peers."""
     import weakref
