@@ -640,6 +640,78 @@ def _cake_gdn_cp_sm107a_plan_pays(
     return physical >= 4096 or (chunks >= 6 and physical >= 512)
 
 
+# SM100/SM103 band of the automatic (``use_cp="auto"``) Cake GDN CP route.  The
+# same rule is implemented, without sharing code, by the Cake dispatcher
+# (``_should_dispatch_cp_band`` in the Cake dispatcher)
+# and the Cake exporter plan (``exports/gdn/export.py::_prefill_plan``): BF16/FP16
+# rows with FP32 initial+final state, gates, no checkpoints and no state indices
+# whose parallel work leaves most SMs idle in the persistent non-CP kernel (the
+# CP heuristic ``4 * N * Ho < SMs``) and whose longest sequence carries at least
+# 4096 tokens, so the four-stage program's fixed stage costs pay for the shorter
+# per-sequence chain.
+_CAKE_GDN_CP_SM100_BAND_CAPABILITIES = ((10, 0), (10, 3))
+_CAKE_GDN_CP_SM100_BAND_WORK_FACTOR = 4
+_CAKE_GDN_CP_SM100_BAND_MIN_MAX_SEQLEN = 4096
+
+
+def _cake_gdn_cp_band_max_seqlen(
+    max_seqlen: Optional[int], total_seq_len: int, num_seqs: int
+) -> int:
+    """The longest-sequence bound the SM100/SM103 band rule is evaluated on.
+
+    With the caller's ``max_seqlen`` hint the rule sees the exact bound, the
+    quantity the Cake dispatcher and the export plan read from the host
+    sequence lengths.  Without a hint the host cannot read ``cu_seqlens``
+    back, so the band uses the balanced-batch estimate
+    ``ceil(total_seq_len / num_seqs)`` -- the convention the Cake CP program
+    resolves an omitted hint to -- rather than the packed length, which
+    would enter the band for any batch whose total reaches 4096 tokens
+    (``4 x 2048``) although no sequence does.  The CP launch bound
+    (``cp_max_seqlen``) keeps the packed-length fallback, which is correct
+    for every batch.
+    """
+
+    if max_seqlen is not None:
+        return int(max_seqlen)
+    return -(-int(total_seq_len) // int(num_seqs))
+
+
+def _cake_gdn_cp_sm100_band(
+    *,
+    device_capability: tuple[int, int],
+    num_seqs: int,
+    num_sab_heads: int,
+    max_seqlen: int,
+    num_sms: int,
+    io_dtype: torch.dtype,
+    initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_indices: Optional[torch.Tensor],
+) -> bool:
+    """Whether an ``auto`` ``cake_gdn`` request on SM100/SM103 runs the Cake CP route."""
+
+    return bool(
+        device_capability in _CAKE_GDN_CP_SM100_BAND_CAPABILITIES
+        and io_dtype in (torch.bfloat16, torch.float16)
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+        and output_final_state
+        and (output_state is None or output_state.dtype == torch.float32)
+        and g is not None
+        and beta is not None
+        and checkpoint_every_n_tokens == 0
+        and state_indices is None
+        and num_seqs > 0
+        and num_sab_heads > 0
+        and _CAKE_GDN_CP_SM100_BAND_WORK_FACTOR * num_seqs * num_sab_heads < num_sms
+        and max_seqlen >= _CAKE_GDN_CP_SM100_BAND_MIN_MAX_SEQLEN
+    )
+
+
 def _use_gdn_cp_sm100(
     *,
     initial_state: Optional[torch.Tensor],
@@ -1076,9 +1148,32 @@ def chunk_gated_delta_rule(
         routing. Requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
         Cake kernels require an explicit ``cake_gdn``
         request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
-        SM100/SM103; ``use_cp=False`` or ``"auto"`` retains Cake non-CP.
+        SM100/SM103; ``use_cp=False`` retains Cake non-CP, and ``"auto"``
+        enters Cake CP only inside the measured SM100/SM103 band (BF16/FP16
+        I/O, FP32 initial and final state, gates, no checkpoints or state
+        indices, ``4 * num_seqs * max(Hq, Hv) < SMs`` and ``max_seqlen >=
+        4096``; without a ``max_seqlen`` hint the band estimates the longest
+        sequence as ``ceil(total_seq_len / num_seqs)``) or the SM107 band.
         Explicit Cake requests fail for unsupported inputs without falling
         back to another backend.
+        The explicit ``cake_gdn`` non-CP route serves ``head_size == 128``
+        with BF16 or FP16 I/O (one dtype for Q/K/V/output, caller-normalized
+        Q/K, FP32 gates). State dtypes: FP32 with either I/O dtype; BF16,
+        FP16 and FP8 (e4m3/e5m2) with BF16 I/O, the low-precision three only
+        with an initial and a final state on the DV-split schedule. The
+        initial state may be zero (``None``) or given and the final state is
+        optional; ``state_indices`` pools need both. Checkpoints are limited
+        to the frozen FP16-I/O FP32-state packed contract without an initial
+        state and to the SGLang TP4 (H=4, HV=8) BF16-I/O BF16-state indexed
+        DV-split contract at 64-token intervals. The frozen
+        ``(HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2)`` geometry set of each
+        contract is enumerated by
+        :func:`flashinfer.jit.cake_gdn.cake_gdn_prefill_geometries` from
+        ``csrc/gdn/cake/manifest.json``; an unlisted geometry, schedule or
+        architecture raises ``CakeGDNUnsupportedError``. The BF16-I/O
+        FP32-state initial+final contract covers the Qwen3-Next / Qwen3.5
+        per-rank geometries for TP1, TP2, TP4 and TP8 in both physical
+        schedules (DV-split and full-DV).
         ``cudnn`` runs cuDNN's fused SM100 linear-attention engine through
         :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_rule`.
     max_seqlen : int, optional
@@ -1088,7 +1183,10 @@ def chunk_gated_delta_rule(
         back from the GPU. When omitted, CP uses ``_max_seq_len`` if that is
         given and ``total_seq_len`` otherwise, both correct for any batch;
         passing the exact maximum of a batched call lets CP launch smaller
-        grids.
+        grids.  The SM100/SM103 ``use_cp="auto"`` band reads the hint as the
+        longest sequence and, without it, the balanced-batch estimate
+        ``ceil(total_seq_len / num_seqs)``; pass the exact maximum so the band
+        decision matches the Cake dispatcher's.
 
     _max_seq_len : int, optional
         The longest sequence in this batch, from the caller's host-side data.
@@ -1449,8 +1547,9 @@ def chunk_gated_delta_rule(
         and _is_gdn_cp_sm100_supported_shape(q, k, v)
     )
     # SM107 only: ``use_cp="auto"`` enters Cake CP inside an explicit shape
-    # band (fp32 SIMT fixup route).  SM100/SM103 still reach Cake CP only
-    # with ``use_cp=True``.
+    # band (fp32 SIMT fixup route).  SM100/SM103 enter Cake CP through the
+    # measured FP32-state band below (``_cake_gdn_cp_sm100_band``) or with
+    # ``use_cp=True``.
     cake_cp_sm107a_band = (
         cake_cp_domain_matches
         and use_cp == "auto"
@@ -1465,10 +1564,34 @@ def chunk_gated_delta_rule(
             num_sms=_sm_count,
         )
     )
+    # SM100/SM103: ``use_cp="auto"`` enters Cake CP inside the measured band
+    # (long few-sequence FP32-state rows); every other row keeps Cake non-CP.
+    cake_cp_sm100_band = (
+        cake_cp_domain_matches
+        and use_cp == "auto"
+        and _cake_gdn_cp_sm100_band(
+            device_capability=_device_capability,
+            num_seqs=num_seqs,
+            num_sab_heads=num_sab_heads,
+            max_seqlen=_cake_gdn_cp_band_max_seqlen(
+                max_seqlen, total_seq_len, num_seqs
+            ),
+            num_sms=_sm_count,
+            io_dtype=q.dtype,
+            initial_state=initial_state,
+            output_state=output_state,
+            output_final_state=output_final_state,
+            g=g,
+            beta=beta,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_indices=state_indices,
+        )
+    )
     will_use_cp = (
         use_cp is True
         or (backend != "cake_gdn" and use_cp == "auto" and cp_heuristic_matches)
         or cake_cp_sm107a_band
+        or cake_cp_sm100_band
     )
     use_gdn_cp_backend = bool(
         backend == "cake_gdn" and will_use_cp and cake_cp_domain_matches
