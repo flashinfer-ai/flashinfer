@@ -126,9 +126,16 @@ def _canonical_prepare_weights(
     | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
+    scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
-    return _prepare_weights(plan=plan, weights=weights, device=device, staging=staging)
+    return _prepare_weights(
+        plan=plan,
+        weights=weights,
+        device=device,
+        staging=staging,
+        scale_scratch=scale_scratch,
+    )
 
 
 def _canonical_plan_execution(

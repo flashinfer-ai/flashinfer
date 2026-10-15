@@ -98,8 +98,12 @@ class WeightPlanConstraints:
     """Integration requirements that constrain B12X preparation policy."""
 
     required_packing: WeightPacking | None = None
+    # "csf" compresses native FP4 block scales losslessly while preparing them.
+    scale_compression: str | None = None
 
     def __post_init__(self) -> None:
+        if self.scale_compression not in (None, "csf"):
+            raise ValueError("scale_compression must be None or 'csf'")
         if self.required_packing is not None:
             object.__setattr__(
                 self,
@@ -117,6 +121,7 @@ class WeightPlan:
     geometry: MoEGeometry
     prepared_format: PreparedWeightFormat
     _impl: MoEWeightPreparationPlan
+    scale_compression: str | None = None
 
 
 def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
@@ -242,6 +247,24 @@ def plan_weights(
         source = TrellisSource(config=source)
     if activation.rotation_dtype is not None and not isinstance(source, TrellisSource):
         raise ValueError("rotation_dtype is only valid for trellis weights")
+    if constraints.scale_compression is not None and not (
+        isinstance(source, PackedSource)
+        and is_gated_moe_activation(activation.nonlinearity)
+        and (
+            (
+                source.format.value == "fp4_e8m0_k32"
+                and activation.mode in (ActivationMode.A8, ActivationMode.A16)
+            )
+            or (
+                source.format.value == "modelopt_nvfp4"
+                and activation.mode in (ActivationMode.A4, ActivationMode.A16)
+            )
+        )
+        and (not activation.a16_max_tokens or activation.mode is ActivationMode.A16)
+    ):
+        raise ValueError(
+            "CSF scale compression requires gated native MXFP4 A8/A16 or NVFP4 A4/A16"
+        )
 
     if isinstance(source, PackedSource):
         automatic = activation.mode is ActivationMode.AUTO
@@ -379,6 +402,7 @@ def plan_weights(
             constraints=constraints,
         ),
         _impl=raw_plan,
+        scale_compression=constraints.scale_compression,
     )
 
 
@@ -392,8 +416,14 @@ def prepare_weights(
     | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
+    scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PreparedExperts:
-    """Materialize the in-memory representation selected by ``plan_weights``."""
+    """Materialize the in-memory representation selected by ``plan_weights``.
+
+    A plan with ``scale_compression="csf"`` takes native ``PackedWeights`` and
+    two caller-owned ``scale_scratch`` expansion buffers, which serialized layers
+    may share; the prepared experts retain only compressed scales.
+    """
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
@@ -403,6 +433,12 @@ def prepare_weights(
         raise ValueError(
             "device and staging are only supported for trellis preparation"
         )
+    if plan.scale_compression is not None:
+        from ._csf_preparation import prepare_online_csf_weights
+
+        return prepare_online_csf_weights(plan, weights, scale_scratch)
+    if scale_scratch is not None:
+        raise ValueError("scale_scratch requires a scale_compression plan")
     if isinstance(weights, (Nvfp4CsfWeights, Mxfp4CsfWeights)):
         from b12x.loader._csf_source import CsfSource
 

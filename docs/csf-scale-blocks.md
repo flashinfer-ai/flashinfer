@@ -70,6 +70,16 @@ Its fixed slabs and absolute exception records are uploaded verbatim and
 converted on the GPU to the same resident payload. Both checkpoint encodings
 use the same scale-expansion tuner and ordinary native compute kernels.
 
+Native checkpoints can be compressed while their weights are prepared. Plan
+them with `fused_moe.WeightPlanConstraints(scale_compression="csf")` and pass
+the native `PackedWeights` plus two caller-owned `scale_scratch` buffers to
+`fused_moe.prepare_weights`. A GPU encoder chooses each row's most covering
+base and writes the slab encoding with exact exceptions; the result then
+follows the slab path above. The prepared experts keep only the compressed
+scales and the shared scratch. Gated MXFP4 A8/A16 and NVFP4 A4/A16 experts
+are supported. Encoding sizes its exception stream with one host
+synchronization, so it runs during loading, never during graph capture.
+
 Preparation applies the selected native kernel's scale transformations,
 including NVFP4 W4A16 normalization, MXFP4 exponent clamping, and projection
 row order. It permutes compressed fields, row bases, and exception positions

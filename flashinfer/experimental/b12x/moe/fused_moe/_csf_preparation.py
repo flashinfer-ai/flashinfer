@@ -12,7 +12,7 @@ from b12x._lib.quant._csf_prepare import (
 )
 from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
 from b12x.loader._csf_source import CsfSource, upload_csf_planes
-from .weights import CsfBlockPlanes, Nvfp4CsfWeights, PackedWeights
+from .weights import CsfBlockPlanes, Mxfp4CsfWeights, Nvfp4CsfWeights, PackedWeights
 
 
 def prepare_csf_block_weights(plan, weights):
@@ -192,3 +192,74 @@ def prepare_csf_block_weights(plan, weights):
             nvfp4_csf=decoder,
         ),
     )
+
+
+def prepare_online_csf_weights(plan, weights, scale_scratch):
+    """Compress native expert block scales losslessly, then prepare them as CSF.
+
+    The GPU encoder writes the slab checkpoint encoding, so the experts follow
+    the same preparation, expansion plans, and kernels as compressed checkpoint
+    scales. ``scale_scratch`` supplies the two caller-owned expansion buffers;
+    the prepared experts no longer reference the native block-scale tensors.
+    """
+    from b12x._lib.quant.csf_encode import encode_csf_source
+    from ._impl import _unswizzle_block_scale_bytes
+
+    if not isinstance(weights, PackedWeights):
+        raise TypeError("online CSF compression requires native PackedWeights")
+    if scale_scratch is None or len(scale_scratch) != 2:
+        raise ValueError("online CSF compression requires two scale_scratch buffers")
+    nvfp4 = plan.source.format.value == "modelopt_nvfp4"
+    geometry = plan.geometry
+    e, h, n = geometry.num_experts, geometry.hidden_size, geometry.intermediate_size
+    group = 16 if nvfp4 else 32
+    native = (weights.w13_block_scales, weights.w2_block_scales)
+    owners = {t.untyped_storage().data_ptr() for t in native}
+    if (
+        any(
+            not isinstance(t, torch.Tensor)
+            or t.device != weights.w13.device
+            or not t.is_contiguous()
+            for t in scale_scratch
+        )
+        or len({t.untyped_storage().data_ptr() for t in scale_scratch}) != 2
+        or owners & {t.untyped_storage().data_ptr() for t in scale_scratch}
+    ):
+        raise ValueError(
+            "CSF scale scratch must be two contiguous device buffers separate from the native scales"
+        )
+    if not nvfp4 and any(
+        t is not None and not bool(torch.all(t == 1))
+        for t in (weights.w13_global_scales, weights.w2_global_scales)
+    ):
+        raise ValueError("MXFP4-CSF requires unit global weight scales")
+    sources = []
+    for scales, rows, columns in zip(
+        native, (2 * n, h), (h // group, n // group), strict=True
+    ):
+        logical = (
+            _unswizzle_block_scale_bytes(scales, rows, columns)
+            if nvfp4
+            else scales.view(torch.uint8).reshape(e, rows, columns).contiguous()
+        )
+        sources.append(
+            encode_csf_source(logical, quantization="nvfp4" if nvfp4 else "mxfp4")
+        )
+        del logical
+    inner = replace(plan, scale_compression=None)
+    if nvfp4:
+        compressed = Nvfp4CsfWeights(
+            packed=replace(
+                weights,
+                w13_block_scales=scale_scratch[0],
+                w2_block_scales=scale_scratch[1],
+            ),
+            w13_scales=sources[0],
+            w2_scales=sources[1],
+        )
+    else:
+        compressed = Mxfp4CsfWeights(
+            weights.w13, weights.w2, sources[0], sources[1], *scale_scratch
+        )
+    prepared = prepare_csf_block_weights(inner, compressed)
+    return replace(prepared, plan=replace(prepared.plan, scale_compression="csf"))
