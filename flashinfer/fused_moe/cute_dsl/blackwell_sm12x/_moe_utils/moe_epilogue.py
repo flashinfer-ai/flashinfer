@@ -25,7 +25,20 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .....cute_dsl.fp4_common import cvt_f32_to_e4m3, nvfp4_compute_output_scale
+from .sm12x_blockscaled_layout import compute_padded_offset
+
 MXFP8_MAX = 448.0
+
+
+def compute_nvfp4_sf_offset(row, col, padded_cols):
+    return (
+        (col & 3)
+        + (col >> 2) * 512
+        + (row & 31) * 16
+        + ((row & 127) >> 5) * 4
+        + (row >> 7) * 128 * padded_cols
+    )
 
 
 class EpiMethod(enum.Enum):
@@ -352,8 +365,60 @@ class WgScatterEpiConfig(R2GWgEpiConfig):
     STORE_BITS = 128
     S2G_BITS = None
 
+    def __init__(self, out_dtype, mma_threads, store_threads=None, swap_ab=False):
+        self.swap_ab = swap_ab
+        self.DRAINS_SC_IN_WG = not swap_ab
+        super().__init__(out_dtype, mma_threads, store_threads=store_threads)
+
+    @staticmethod
+    def store_threads_for(out_dtype, tile):
+        kind = sm90_utils.get_smem_layout_atom(
+            cutlass.utils.LayoutEnum.COL_MAJOR, out_dtype, tile[0]
+        )
+        return EpiConfig._PERIOD_BYTES[kind] // EpiConfig.STG_BYTES * tile[1]
+
+    def smem_layout_atom_kind(self, tile):
+        if self.swap_ab:
+            return sm90_utils.get_smem_layout_atom(
+                cutlass.utils.LayoutEnum.COL_MAJOR,
+                self.out_dtype,
+                self.epi_tile(tile)[0],
+            )
+        return super().smem_layout_atom_kind(tile)
+
+    def make_smem_layout(self, tile):
+        if not self.swap_ab:
+            return super().make_smem_layout(tile)
+        epi_m, epi_n = self.epi_tile(tile)
+        atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            self.smem_layout_atom_kind(tile), self.out_dtype
+        )
+        return cute.tile_to_shape(
+            atom, (epi_m, epi_n, self.epi_stages), order=(0, 1, 2)
+        )
+
+    def s2r_thr_layout(self, tile):
+        if not self.swap_ab:
+            return super().s2r_thr_layout(tile)
+        threads_m = self.s2g_threads_n(tile)
+        epi_n = self.epi_tile(tile)[1]
+        assert self.num_store_threads % cute.arch.WARP_SIZE == 0
+        threads_n, rem = divmod(self.num_store_threads, threads_m)
+        assert rem == 0 and threads_n == epi_n
+        return cute.make_layout((threads_m, threads_n), stride=(1, threads_m))
+
+    def s2r_value_layout(self):
+        if self.swap_ab:
+            return cute.make_layout((self.s2g_vec, 1))
+        return super().s2r_value_layout()
+
+    @property
+    def num_empty_barriers(self):
+        return 0 if self.swap_ab else super().num_empty_barriers
+
     def aux_smem_bytes(self, tile):
-        return tile[0] * (cutlass.Int32.width + cutlass.Float32.width) // 8
+        rows = tile[1] if self.swap_ab else tile[0]
+        return rows * (cutlass.Int32.width + cutlass.Float32.width) // 8
 
 
 EPI_CONFIGS = {
@@ -612,6 +677,73 @@ def store_wg_scatter(
     )
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     cute.arch.mbarrier_arrive(epi_empty)
+
+
+@cute.jit
+def smem_to_gmem_scatter_swap(
+    thr_s2r, sC, sTok, sWt, gOut, tile_mn, n_base, hidden, tidx, n_store
+):
+    bm, bn = tile_mn
+    f32 = cutlass.Float32
+    tS = thr_s2r.partition_S(sC)
+    tC = thr_s2r.partition_S(cute.make_identity_tensor((bm, bn)))
+    if tidx < n_store:
+        for mi in cutlass.range_constexpr(cute.size(tS, mode=[1])):
+            for ni in cutlass.range_constexpr(cute.size(tS, mode=[2])):
+                src = tS[None, mi, ni]
+                reg = cute.make_fragment_like(src)
+                cute.autovec_copy(src, reg)
+                coord = tC[0, mi, ni]
+                tok = sTok[coord[1]].to(cutlass.Int64)
+                w = sWt[coord[1]].to(f32)
+                col = n_base + coord[0]
+                base = tok * hidden.to(cutlass.Int64) + col.to(cutlass.Int64)
+                v0, v1 = w * reg[0].to(f32), w * reg[1].to(f32)
+                v2, v3 = w * reg[2].to(f32), w * reg[3].to(f32)
+                v4, v5 = w * reg[4].to(f32), w * reg[5].to(f32)
+                v6, v7 = w * reg[6].to(f32), w * reg[7].to(f32)
+                emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7)
+
+
+@cute.jit
+def store_wg_scatter_swap(
+    acc,
+    thr_r2s,
+    thr_s2r,
+    sC,
+    sTok,
+    sWt,
+    gTok,
+    gWt,
+    gOut,
+    tile,
+    tile_mn,
+    hidden,
+    out_dtype,
+    epi_bar_id,
+    mma_threads,
+    tidx,
+    n_store,
+):
+    bm, bn = tile_mn
+    i32 = cutlass.Int32
+    rmem_to_smem(convert_acc(acc, out_dtype), thr_r2s, sC)
+    m_base = tile.m_offset + tile.n_block * bn
+    stage_scatter_meta(
+        sTok,
+        sWt,
+        gTok,
+        gWt,
+        m_base,
+        min(max(tile.m_boundary - m_base, i32(0)), i32(bn)),
+        tidx,
+        bn,
+    )
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
+    smem_to_gmem_scatter_swap(
+        thr_s2r, sC, sTok, sWt, gOut, (bm, bn), tile.m_block * bm, hidden, tidx, n_store
+    )
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
 
 
 @cute.jit
@@ -1044,3 +1176,151 @@ def store_wg_q1_before_r2s(
     )
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     cute.arch.mbarrier_arrive(epi_empty)
+
+
+@cute.jit
+def quantize_nvfp4_store(
+    thr_s2r,
+    sC,
+    gQ_tile,
+    gSF,
+    global_scale,
+    sf_row_base,
+    sf_col_base,
+    m_base,
+    m_boundary,
+    padded_cols,
+    tile_mn,
+    swap,
+):
+    fp4, f32, u8 = cutlass.Float4E2M1FN, cutlass.Float32, cutlass.Uint8
+    bm, bn = tile_mn
+    coords = cute.make_identity_tensor((bm, bn))
+    tS = thr_s2r.partition_S(sC)
+    tD = thr_s2r.partition_D(gQ_tile)
+    tC = thr_s2r.partition_S(coords)
+    scale = global_scale[0].to(f32)
+    for mi in cutlass.range_constexpr(cute.size(tS, mode=[1])):
+        for ni in cutlass.range_constexpr(cute.size(tS, mode=[2])):
+            src = tS[None, mi, ni]
+            vals = src.load().to(f32)
+            amax = cute.math.abs(vals).reduce(
+                cute.ReductionOp.MAX, init_val=f32(0.0), reduction_profile=0
+            )
+            amax = cute.arch.warp_reduction_max(amax, threads_in_group=2)
+            sf_u32 = cvt_f32_to_e4m3(scale * (amax * f32(1.0 / 6.0)))
+            encode = nvfp4_compute_output_scale(sf_u32, scale)
+            frg = cute.make_fragment_like(src, fp4)
+            frg.store((vals * encode).to(fp4))
+            coord = tC[0, mi, ni]
+            if cutlass.const_expr(swap):
+                row, col = coord[1], coord[0] >> 4
+                owns_sf = (coord[0] & 15) == 0
+            else:
+                row, col = coord[0], coord[1] >> 4
+                owns_sf = (coord[1] & 15) == 0
+            if m_base + row < m_boundary:
+                cute.autovec_copy(frg, tD[None, mi, ni])
+                if owns_sf:
+                    index = compute_nvfp4_sf_offset(
+                        sf_row_base + row, sf_col_base + col, padded_cols
+                    )
+                    gSF[index] = u8(sf_u32 & cutlass.Uint32(0xFF))
+
+
+@cute.jit
+def store_wg_nvfp4_q1(
+    acc,
+    thr_r2s,
+    thr_s2r,
+    sC,
+    gQ,
+    gSF,
+    global_scale,
+    tile,
+    tile_mn,
+    padded_cols,
+    epi_empty,
+    epi_bar_id,
+    mma_threads,
+):
+    bm, bn = tile_mn
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
+    rmem_to_smem(convert_acc(acc, cutlass.BFloat16), thr_r2s, sC)
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
+    gQ_tile = cute.local_tile(
+        cute.domain_offset((tile.m_offset, 0), gQ),
+        (bm, bn),
+        (tile.m_block, tile.n_block),
+    )
+    sf_row_base = (
+        compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
+        + tile.m_block * bm
+    )
+    sf_col_base = tile.n_block * (bn >> 4)
+    m_base = tile.m_offset + tile.m_block * bm
+    quantize_nvfp4_store(
+        thr_s2r,
+        sC,
+        gQ_tile,
+        gSF,
+        global_scale,
+        sf_row_base,
+        sf_col_base,
+        m_base,
+        tile.m_boundary,
+        padded_cols,
+        (bm, bn),
+        False,
+    )
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
+    cute.arch.mbarrier_arrive(epi_empty)
+
+
+@cute.jit
+def store_wg_nvfp4_q1_swap(
+    acc,
+    thr_r2s,
+    thr_s2r,
+    sC,
+    gQ_t,
+    gSF,
+    global_scale,
+    tile,
+    tile_mn,
+    padded_cols,
+    epi_bar_id,
+    mma_threads,
+    tidx,
+    n_store,
+):
+    bm, bn = tile_mn
+    rmem_to_smem(convert_acc(acc, cutlass.BFloat16), thr_r2s, sC)
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
+    if tidx < n_store:
+        gQ_tile = cute.local_tile(
+            cute.domain_offset((0, tile.m_offset), gQ_t),
+            (bm, bn),
+            (tile.m_block, tile.n_block),
+        )
+        sf_row_base = (
+            compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
+            + tile.n_block * bn
+        )
+        sf_col_base = tile.m_block * (bm >> 4)
+        m_base = tile.m_offset + tile.n_block * bn
+        quantize_nvfp4_store(
+            thr_s2r,
+            sC,
+            gQ_tile,
+            gSF,
+            global_scale,
+            sf_row_base,
+            sf_col_base,
+            m_base,
+            tile.m_boundary,
+            padded_cols,
+            (bm, bn),
+            True,
+        )
+    cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)

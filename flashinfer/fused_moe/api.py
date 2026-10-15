@@ -2339,6 +2339,48 @@ class SM12xMxfp8Mxfp4Config:
 
 
 @dataclass(frozen=True)
+class SM12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL NVFP4 x NVFP4 backend.
+
+    ``topk_ids == -1`` denotes an inactive padded route; every other ID must be
+    in ``[0, num_experts)``. Validation defaults on and can be disabled with
+    ``FLASHINFER_SM12X_NVFP4_VALIDATE_TOPK_IDS=0`` for CUDA Graphs.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_weight,
+        w1_weight_sf,
+        w1_up_scale,
+        w1_gate_scale,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        q0_global_scale,
+        q1_global_scale,
+    ):
+        """Build the native SM12x NVFP4 view from packed checkpoint tensors."""
+        return {
+            "w1_weight": w1_weight,
+            "w1_weight_sf": w1_weight_sf,
+            "w1_up_scale": w1_up_scale,
+            "w1_gate_scale": w1_gate_scale,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+            "w2_alpha": w2_alpha,
+            "q0_global_scale": q0_global_scale,
+            "q1_global_scale": q1_global_scale,
+        }
+
+    def __repr__(self) -> str:
+        return "SM12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
 class SM12xNvfp4Bf16Config:
     """SM120/SM121 CuTe-DSL NVFP4-weight x BF16-activation backend.
 
@@ -2596,6 +2638,7 @@ BackendConfigType = Union[
     CuteDslConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Config,
     SM12xNvfp4Bf16Config,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -2639,6 +2682,7 @@ ALL_BACKEND_CONFIGS = (
     CuteDslConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Config,
     SM12xNvfp4Bf16Config,
     B12xNvfp4Config,
     B12xW4A16Config,
