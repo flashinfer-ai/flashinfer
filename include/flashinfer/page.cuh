@@ -707,6 +707,107 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
   return cudaSuccess;
 }
 
+template <uint32_t HEAD_DIM, uint32_t VEC_SIZE, typename DType, typename IdType>
+__global__ void AppendPagedKVCacheWithSlotMappingKernel(
+    const DType* __restrict__ append_key, const DType* __restrict__ append_value,
+    const IdType* __restrict__ slot_mapping, uint32_t nnz, uint32_t num_heads, uint32_t page_size,
+    uint32_t max_num_pages, size_t append_k_stride_n, size_t append_k_stride_h,
+    size_t append_v_stride_n, size_t append_v_stride_h, DType* __restrict__ paged_k_cache,
+    DType* __restrict__ paged_v_cache, size_t k_stride_page, size_t k_stride_n, size_t k_stride_h,
+    size_t v_stride_page, size_t v_stride_n, size_t v_stride_h) {
+  const uint32_t token_idx = blockIdx.x;
+  const uint32_t head_idx = blockIdx.y;
+  if (token_idx >= nnz) return;
+
+  const IdType slot = slot_mapping[token_idx];
+  if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(max_num_pages) * page_size) {
+    return;
+  }
+
+  const size_t page_idx = static_cast<size_t>(slot) / page_size;
+  const size_t entry_idx = static_cast<size_t>(slot) % page_size;
+  const size_t append_k_base =
+      static_cast<size_t>(token_idx) * append_k_stride_n + head_idx * append_k_stride_h;
+  const size_t append_v_base =
+      static_cast<size_t>(token_idx) * append_v_stride_n + head_idx * append_v_stride_h;
+
+  DType* k_out = paged_k_cache + page_idx * k_stride_page + entry_idx * k_stride_n +
+                 head_idx * k_stride_h + threadIdx.x * VEC_SIZE;
+  DType* v_out = paged_v_cache + page_idx * v_stride_page + entry_idx * v_stride_n +
+                 head_idx * v_stride_h + threadIdx.x * VEC_SIZE;
+
+  vec_t<DType, VEC_SIZE>::memcpy(k_out, append_key + append_k_base + threadIdx.x * VEC_SIZE);
+  vec_t<DType, VEC_SIZE>::memcpy(v_out, append_value + append_v_base + threadIdx.x * VEC_SIZE);
+}
+
+/*!
+ * \brief Append new FP16/BF16 keys/values to the paged key-value cache using slot mapping.
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of slot_mapping
+ * \param append_key The key tensor to write, shape [nnz, num_kv_heads, head_dim]
+ * \param append_value The value tensor to write, same shape as append_key
+ * \param slot_mapping Flat cache slot for each row, interpreted as page_id * page_size + entry_idx
+ * \param nnz Number of valid tokens to append
+ * \param num_heads Number of KV heads
+ * \param page_size Size of each page
+ * \param max_num_pages Maximum number of pages in the cache
+ * \param head_dim Dimension of each head
+ * \param append_k_stride_n Stride of append_key along token dim
+ * \param append_k_stride_h Stride of append_key along head dim
+ * \param append_v_stride_n Stride of append_value along token dim
+ * \param append_v_stride_h Stride of append_value along head dim
+ * \param paged_k_cache Pointer to paged K cache
+ * \param paged_v_cache Pointer to paged V cache
+ * \param k_stride_page Stride of paged_k_cache along page dim
+ * \param k_stride_n Stride of paged_k_cache along token dim
+ * \param k_stride_h Stride of paged_k_cache along head dim
+ * \param v_stride_page Stride of paged_v_cache along page dim
+ * \param v_stride_n Stride of paged_v_cache along token dim
+ * \param v_stride_h Stride of paged_v_cache along head dim
+ * \param stream CUDA stream
+ * \return cudaSuccess on success
+ */
+template <typename DType, typename IdType>
+cudaError_t AppendPagedKVCacheWithSlotMapping(
+    DType* append_key, DType* append_value, IdType* slot_mapping, uint32_t nnz, uint32_t num_heads,
+    uint32_t page_size, uint32_t max_num_pages, uint32_t head_dim, size_t append_k_stride_n,
+    size_t append_k_stride_h, size_t append_v_stride_n, size_t append_v_stride_h,
+    DType* paged_k_cache, DType* paged_v_cache, size_t k_stride_page, size_t k_stride_n,
+    size_t k_stride_h, size_t v_stride_page, size_t v_stride_n, size_t v_stride_h,
+    cudaStream_t stream = nullptr) {
+  if (nnz == 0 || num_heads == 0) {
+    return cudaSuccess;
+  }
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+    static_assert(HEAD_DIM % vec_size == 0);
+    dim3 nblks(nnz, num_heads);
+    dim3 nthrs(HEAD_DIM / vec_size);
+    auto kernel = AppendPagedKVCacheWithSlotMappingKernel<HEAD_DIM, vec_size, DType, IdType>;
+    void* args[] = {(void*)&append_key,
+                    (void*)&append_value,
+                    (void*)&slot_mapping,
+                    (void*)&nnz,
+                    (void*)&num_heads,
+                    (void*)&page_size,
+                    (void*)&max_num_pages,
+                    (void*)&append_k_stride_n,
+                    (void*)&append_k_stride_h,
+                    (void*)&append_v_stride_n,
+                    (void*)&append_v_stride_h,
+                    (void*)&paged_k_cache,
+                    (void*)&paged_v_cache,
+                    (void*)&k_stride_page,
+                    (void*)&k_stride_n,
+                    (void*)&k_stride_h,
+                    (void*)&v_stride_page,
+                    (void*)&v_stride_n,
+                    (void*)&v_stride_h};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  });
+  return cudaSuccess;
+}
+
 template <typename DType, typename IdType>
 struct paged_kv_mla_t {
   uint_fastdiv page_size;

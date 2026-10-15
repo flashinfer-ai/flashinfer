@@ -287,6 +287,7 @@ try:
 except (ImportError, AttributeError):
     pass  # nvidia-cutlass-dsl not installed
 from .page import append_paged_kv_cache as append_paged_kv_cache
+from .page import append_paged_kv_cache_with_slot_mapping as append_paged_kv_cache_with_slot_mapping
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
