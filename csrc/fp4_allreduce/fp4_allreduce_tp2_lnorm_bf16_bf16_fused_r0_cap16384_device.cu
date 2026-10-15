@@ -3205,14 +3205,15 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         __syncwarp();
                         int zlane = zb_off + 128 * lane_2;
                         int l7 = lane_2 & 7;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 0))), "r"(__as_u32(acc[0])), "r"(__as_u32(acc[1])), "r"(__as_u32(acc[2])), "r"(__as_u32(acc[3])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 1))), "r"(__as_u32(acc[4])), "r"(__as_u32(acc[5])), "r"(__as_u32(acc[6])), "r"(__as_u32(acc[7])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 2))), "r"(__as_u32(acc[8])), "r"(__as_u32(acc[9])), "r"(__as_u32(acc[10])), "r"(__as_u32(acc[11])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 3))), "r"(__as_u32(acc[12])), "r"(__as_u32(acc[13])), "r"(__as_u32(acc[14])), "r"(__as_u32(acc[15])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 4))), "r"(__as_u32(acc[16])), "r"(__as_u32(acc[17])), "r"(__as_u32(acc[18])), "r"(__as_u32(acc[19])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 5))), "r"(__as_u32(acc[20])), "r"(__as_u32(acc[21])), "r"(__as_u32(acc[22])), "r"(__as_u32(acc[23])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 6))), "r"(__as_u32(acc[24])), "r"(__as_u32(acc[25])), "r"(__as_u32(acc[26])), "r"(__as_u32(acc[27])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (l7 ^ 7))), "r"(__as_u32(acc[28])), "r"(__as_u32(acc[29])), "r"(__as_u32(acc[30])), "r"(__as_u32(acc[31])) : "memory");
+                        int rz = ((l7 & 3) << 1) + (l7 >> 2);
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 0))), "r"(__as_u32(acc[0])), "r"(__as_u32(acc[1])), "r"(__as_u32(acc[2])), "r"(__as_u32(acc[3])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 1))), "r"(__as_u32(acc[4])), "r"(__as_u32(acc[5])), "r"(__as_u32(acc[6])), "r"(__as_u32(acc[7])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 2))), "r"(__as_u32(acc[8])), "r"(__as_u32(acc[9])), "r"(__as_u32(acc[10])), "r"(__as_u32(acc[11])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 3))), "r"(__as_u32(acc[12])), "r"(__as_u32(acc[13])), "r"(__as_u32(acc[14])), "r"(__as_u32(acc[15])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 4))), "r"(__as_u32(acc[16])), "r"(__as_u32(acc[17])), "r"(__as_u32(acc[18])), "r"(__as_u32(acc[19])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 5))), "r"(__as_u32(acc[20])), "r"(__as_u32(acc[21])), "r"(__as_u32(acc[22])), "r"(__as_u32(acc[23])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 6))), "r"(__as_u32(acc[24])), "r"(__as_u32(acc[25])), "r"(__as_u32(acc[26])), "r"(__as_u32(acc[27])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane + 16 * (rz ^ 7))), "r"(__as_u32(acc[28])), "r"(__as_u32(acc[29])), "r"(__as_u32(acc[30])), "r"(__as_u32(acc[31])) : "memory");
                     }
                     {
                         unsigned int own_1[4];
@@ -3938,14 +3939,15 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         __syncwarp();
                         int zlane_1 = zb_off + 4096 + 128 * lane_2;
                         int l7_1 = lane_2 & 7;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 0))), "r"(__as_u32(acc_1[0])), "r"(__as_u32(acc_1[1])), "r"(__as_u32(acc_1[2])), "r"(__as_u32(acc_1[3])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 1))), "r"(__as_u32(acc_1[4])), "r"(__as_u32(acc_1[5])), "r"(__as_u32(acc_1[6])), "r"(__as_u32(acc_1[7])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 2))), "r"(__as_u32(acc_1[8])), "r"(__as_u32(acc_1[9])), "r"(__as_u32(acc_1[10])), "r"(__as_u32(acc_1[11])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 3))), "r"(__as_u32(acc_1[12])), "r"(__as_u32(acc_1[13])), "r"(__as_u32(acc_1[14])), "r"(__as_u32(acc_1[15])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 4))), "r"(__as_u32(acc_1[16])), "r"(__as_u32(acc_1[17])), "r"(__as_u32(acc_1[18])), "r"(__as_u32(acc_1[19])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 5))), "r"(__as_u32(acc_1[20])), "r"(__as_u32(acc_1[21])), "r"(__as_u32(acc_1[22])), "r"(__as_u32(acc_1[23])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 6))), "r"(__as_u32(acc_1[24])), "r"(__as_u32(acc_1[25])), "r"(__as_u32(acc_1[26])), "r"(__as_u32(acc_1[27])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (l7_1 ^ 7))), "r"(__as_u32(acc_1[28])), "r"(__as_u32(acc_1[29])), "r"(__as_u32(acc_1[30])), "r"(__as_u32(acc_1[31])) : "memory");
+                        int rz_1 = ((l7_1 & 3) << 1) + (l7_1 >> 2);
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 0))), "r"(__as_u32(acc_1[0])), "r"(__as_u32(acc_1[1])), "r"(__as_u32(acc_1[2])), "r"(__as_u32(acc_1[3])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 1))), "r"(__as_u32(acc_1[4])), "r"(__as_u32(acc_1[5])), "r"(__as_u32(acc_1[6])), "r"(__as_u32(acc_1[7])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 2))), "r"(__as_u32(acc_1[8])), "r"(__as_u32(acc_1[9])), "r"(__as_u32(acc_1[10])), "r"(__as_u32(acc_1[11])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 3))), "r"(__as_u32(acc_1[12])), "r"(__as_u32(acc_1[13])), "r"(__as_u32(acc_1[14])), "r"(__as_u32(acc_1[15])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 4))), "r"(__as_u32(acc_1[16])), "r"(__as_u32(acc_1[17])), "r"(__as_u32(acc_1[18])), "r"(__as_u32(acc_1[19])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 5))), "r"(__as_u32(acc_1[20])), "r"(__as_u32(acc_1[21])), "r"(__as_u32(acc_1[22])), "r"(__as_u32(acc_1[23])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 6))), "r"(__as_u32(acc_1[24])), "r"(__as_u32(acc_1[25])), "r"(__as_u32(acc_1[26])), "r"(__as_u32(acc_1[27])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_1 + 16 * (rz_1 ^ 7))), "r"(__as_u32(acc_1[28])), "r"(__as_u32(acc_1[29])), "r"(__as_u32(acc_1[30])), "r"(__as_u32(acc_1[31])) : "memory");
                     }
                     {
                         unsigned int d_1 = 0;
@@ -5495,14 +5497,15 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         __syncwarp();
                         int zlane_2 = xa_off + 128 * lane_2;
                         int l7_2 = lane_2 & 7;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 0))), "r"(__as_u32(acc_3[0])), "r"(__as_u32(acc_3[1])), "r"(__as_u32(acc_3[2])), "r"(__as_u32(acc_3[3])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 1))), "r"(__as_u32(acc_3[4])), "r"(__as_u32(acc_3[5])), "r"(__as_u32(acc_3[6])), "r"(__as_u32(acc_3[7])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 2))), "r"(__as_u32(acc_3[8])), "r"(__as_u32(acc_3[9])), "r"(__as_u32(acc_3[10])), "r"(__as_u32(acc_3[11])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 3))), "r"(__as_u32(acc_3[12])), "r"(__as_u32(acc_3[13])), "r"(__as_u32(acc_3[14])), "r"(__as_u32(acc_3[15])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 4))), "r"(__as_u32(acc_3[16])), "r"(__as_u32(acc_3[17])), "r"(__as_u32(acc_3[18])), "r"(__as_u32(acc_3[19])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 5))), "r"(__as_u32(acc_3[20])), "r"(__as_u32(acc_3[21])), "r"(__as_u32(acc_3[22])), "r"(__as_u32(acc_3[23])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 6))), "r"(__as_u32(acc_3[24])), "r"(__as_u32(acc_3[25])), "r"(__as_u32(acc_3[26])), "r"(__as_u32(acc_3[27])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (l7_2 ^ 7))), "r"(__as_u32(acc_3[28])), "r"(__as_u32(acc_3[29])), "r"(__as_u32(acc_3[30])), "r"(__as_u32(acc_3[31])) : "memory");
+                        int rz_2 = ((l7_2 & 3) << 1) + (l7_2 >> 2);
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 0))), "r"(__as_u32(acc_3[0])), "r"(__as_u32(acc_3[1])), "r"(__as_u32(acc_3[2])), "r"(__as_u32(acc_3[3])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 1))), "r"(__as_u32(acc_3[4])), "r"(__as_u32(acc_3[5])), "r"(__as_u32(acc_3[6])), "r"(__as_u32(acc_3[7])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 2))), "r"(__as_u32(acc_3[8])), "r"(__as_u32(acc_3[9])), "r"(__as_u32(acc_3[10])), "r"(__as_u32(acc_3[11])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 3))), "r"(__as_u32(acc_3[12])), "r"(__as_u32(acc_3[13])), "r"(__as_u32(acc_3[14])), "r"(__as_u32(acc_3[15])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 4))), "r"(__as_u32(acc_3[16])), "r"(__as_u32(acc_3[17])), "r"(__as_u32(acc_3[18])), "r"(__as_u32(acc_3[19])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 5))), "r"(__as_u32(acc_3[20])), "r"(__as_u32(acc_3[21])), "r"(__as_u32(acc_3[22])), "r"(__as_u32(acc_3[23])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 6))), "r"(__as_u32(acc_3[24])), "r"(__as_u32(acc_3[25])), "r"(__as_u32(acc_3[26])), "r"(__as_u32(acc_3[27])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_2 + 16 * (rz_2 ^ 7))), "r"(__as_u32(acc_3[28])), "r"(__as_u32(acc_3[29])), "r"(__as_u32(acc_3[30])), "r"(__as_u32(acc_3[31])) : "memory");
                     }
                     {
                         unsigned int d_2 = 0;
@@ -6297,14 +6300,15 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         __syncwarp();
                         int zlane_3 = xa_off + 4096 + 128 * lane_2;
                         int l7_3 = lane_2 & 7;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 0))), "r"(__as_u32(acc_4[0])), "r"(__as_u32(acc_4[1])), "r"(__as_u32(acc_4[2])), "r"(__as_u32(acc_4[3])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 1))), "r"(__as_u32(acc_4[4])), "r"(__as_u32(acc_4[5])), "r"(__as_u32(acc_4[6])), "r"(__as_u32(acc_4[7])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 2))), "r"(__as_u32(acc_4[8])), "r"(__as_u32(acc_4[9])), "r"(__as_u32(acc_4[10])), "r"(__as_u32(acc_4[11])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 3))), "r"(__as_u32(acc_4[12])), "r"(__as_u32(acc_4[13])), "r"(__as_u32(acc_4[14])), "r"(__as_u32(acc_4[15])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 4))), "r"(__as_u32(acc_4[16])), "r"(__as_u32(acc_4[17])), "r"(__as_u32(acc_4[18])), "r"(__as_u32(acc_4[19])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 5))), "r"(__as_u32(acc_4[20])), "r"(__as_u32(acc_4[21])), "r"(__as_u32(acc_4[22])), "r"(__as_u32(acc_4[23])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 6))), "r"(__as_u32(acc_4[24])), "r"(__as_u32(acc_4[25])), "r"(__as_u32(acc_4[26])), "r"(__as_u32(acc_4[27])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (l7_3 ^ 7))), "r"(__as_u32(acc_4[28])), "r"(__as_u32(acc_4[29])), "r"(__as_u32(acc_4[30])), "r"(__as_u32(acc_4[31])) : "memory");
+                        int rz_3 = ((l7_3 & 3) << 1) + (l7_3 >> 2);
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 0))), "r"(__as_u32(acc_4[0])), "r"(__as_u32(acc_4[1])), "r"(__as_u32(acc_4[2])), "r"(__as_u32(acc_4[3])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 1))), "r"(__as_u32(acc_4[4])), "r"(__as_u32(acc_4[5])), "r"(__as_u32(acc_4[6])), "r"(__as_u32(acc_4[7])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 2))), "r"(__as_u32(acc_4[8])), "r"(__as_u32(acc_4[9])), "r"(__as_u32(acc_4[10])), "r"(__as_u32(acc_4[11])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 3))), "r"(__as_u32(acc_4[12])), "r"(__as_u32(acc_4[13])), "r"(__as_u32(acc_4[14])), "r"(__as_u32(acc_4[15])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 4))), "r"(__as_u32(acc_4[16])), "r"(__as_u32(acc_4[17])), "r"(__as_u32(acc_4[18])), "r"(__as_u32(acc_4[19])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 5))), "r"(__as_u32(acc_4[20])), "r"(__as_u32(acc_4[21])), "r"(__as_u32(acc_4[22])), "r"(__as_u32(acc_4[23])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 6))), "r"(__as_u32(acc_4[24])), "r"(__as_u32(acc_4[25])), "r"(__as_u32(acc_4[26])), "r"(__as_u32(acc_4[27])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_3 + 16 * (rz_3 ^ 7))), "r"(__as_u32(acc_4[28])), "r"(__as_u32(acc_4[29])), "r"(__as_u32(acc_4[30])), "r"(__as_u32(acc_4[31])) : "memory");
                     }
                     {
                         unsigned int own_5[4];
@@ -7030,14 +7034,15 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         __syncwarp();
                         int zlane_4 = xa_off + 8192 + 128 * lane_2;
                         int l7_4 = lane_2 & 7;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 0))), "r"(__as_u32(acc_5[0])), "r"(__as_u32(acc_5[1])), "r"(__as_u32(acc_5[2])), "r"(__as_u32(acc_5[3])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 1))), "r"(__as_u32(acc_5[4])), "r"(__as_u32(acc_5[5])), "r"(__as_u32(acc_5[6])), "r"(__as_u32(acc_5[7])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 2))), "r"(__as_u32(acc_5[8])), "r"(__as_u32(acc_5[9])), "r"(__as_u32(acc_5[10])), "r"(__as_u32(acc_5[11])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 3))), "r"(__as_u32(acc_5[12])), "r"(__as_u32(acc_5[13])), "r"(__as_u32(acc_5[14])), "r"(__as_u32(acc_5[15])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 4))), "r"(__as_u32(acc_5[16])), "r"(__as_u32(acc_5[17])), "r"(__as_u32(acc_5[18])), "r"(__as_u32(acc_5[19])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 5))), "r"(__as_u32(acc_5[20])), "r"(__as_u32(acc_5[21])), "r"(__as_u32(acc_5[22])), "r"(__as_u32(acc_5[23])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 6))), "r"(__as_u32(acc_5[24])), "r"(__as_u32(acc_5[25])), "r"(__as_u32(acc_5[26])), "r"(__as_u32(acc_5[27])) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (l7_4 ^ 7))), "r"(__as_u32(acc_5[28])), "r"(__as_u32(acc_5[29])), "r"(__as_u32(acc_5[30])), "r"(__as_u32(acc_5[31])) : "memory");
+                        int rz_4 = ((l7_4 & 3) << 1) + (l7_4 >> 2);
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 0))), "r"(__as_u32(acc_5[0])), "r"(__as_u32(acc_5[1])), "r"(__as_u32(acc_5[2])), "r"(__as_u32(acc_5[3])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 1))), "r"(__as_u32(acc_5[4])), "r"(__as_u32(acc_5[5])), "r"(__as_u32(acc_5[6])), "r"(__as_u32(acc_5[7])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 2))), "r"(__as_u32(acc_5[8])), "r"(__as_u32(acc_5[9])), "r"(__as_u32(acc_5[10])), "r"(__as_u32(acc_5[11])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 3))), "r"(__as_u32(acc_5[12])), "r"(__as_u32(acc_5[13])), "r"(__as_u32(acc_5[14])), "r"(__as_u32(acc_5[15])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 4))), "r"(__as_u32(acc_5[16])), "r"(__as_u32(acc_5[17])), "r"(__as_u32(acc_5[18])), "r"(__as_u32(acc_5[19])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 5))), "r"(__as_u32(acc_5[20])), "r"(__as_u32(acc_5[21])), "r"(__as_u32(acc_5[22])), "r"(__as_u32(acc_5[23])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 6))), "r"(__as_u32(acc_5[24])), "r"(__as_u32(acc_5[25])), "r"(__as_u32(acc_5[26])), "r"(__as_u32(acc_5[27])) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(zlane_4 + 16 * (rz_4 ^ 7))), "r"(__as_u32(acc_5[28])), "r"(__as_u32(acc_5[29])), "r"(__as_u32(acc_5[30])), "r"(__as_u32(acc_5[31])) : "memory");
                     }
                     {
                         float one = 1.0f;
@@ -7075,15 +7080,58 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         float one_0 = 1.0f;
                         float2 _f2_817 = make_float2(one_0, one_0);
                         int pp_1 = lane_2 + 64;
-                        unsigned int wc[4];
+                        unsigned int t_6[16];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wc[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc[(0) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp_1)));
-                        float yv[8];
+                            : "=r"(*reinterpret_cast<uint32_t*>(&t_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(0) + 3]))
+                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + (unsigned int)(16 * (f ^ 0))));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&t_6[4])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(4) + 3]))
+                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + (unsigned int)(16 * (f ^ 1))));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&t_6[8])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(8) + 3]))
+                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + (unsigned int)(16 * (f ^ 2))));
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&t_6[12])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&t_6[(12) + 3]))
+                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + (unsigned int)(16 * (f ^ 3))));
+                        unsigned int s_6[16];
+                        unsigned int r_37[16];
+                        s_6[0] = (((f & 1) != 0) ? t_6[4] : t_6[0]);
+                        s_6[4] = (((f & 1) != 0) ? t_6[0] : t_6[4]);
+                        s_6[8] = (((f & 1) != 0) ? t_6[12] : t_6[8]);
+                        s_6[12] = (((f & 1) != 0) ? t_6[8] : t_6[12]);
+                        s_6[1] = (((f & 1) != 0) ? t_6[5] : t_6[1]);
+                        s_6[5] = (((f & 1) != 0) ? t_6[1] : t_6[5]);
+                        s_6[9] = (((f & 1) != 0) ? t_6[13] : t_6[9]);
+                        s_6[13] = (((f & 1) != 0) ? t_6[9] : t_6[13]);
+                        s_6[2] = (((f & 1) != 0) ? t_6[6] : t_6[2]);
+                        s_6[6] = (((f & 1) != 0) ? t_6[2] : t_6[6]);
+                        s_6[10] = (((f & 1) != 0) ? t_6[14] : t_6[10]);
+                        s_6[14] = (((f & 1) != 0) ? t_6[10] : t_6[14]);
+                        s_6[3] = (((f & 1) != 0) ? t_6[7] : t_6[3]);
+                        s_6[7] = (((f & 1) != 0) ? t_6[3] : t_6[7]);
+                        s_6[11] = (((f & 1) != 0) ? t_6[15] : t_6[11]);
+                        s_6[15] = (((f & 1) != 0) ? t_6[11] : t_6[15]);
+                        r_37[0] = (((f & 2) != 0) ? s_6[8] : s_6[0]);
+                        r_37[4] = (((f & 2) != 0) ? s_6[12] : s_6[4]);
+                        r_37[8] = (((f & 2) != 0) ? s_6[0] : s_6[8]);
+                        r_37[12] = (((f & 2) != 0) ? s_6[4] : s_6[12]);
+                        r_37[1] = (((f & 2) != 0) ? s_6[9] : s_6[1]);
+                        r_37[5] = (((f & 2) != 0) ? s_6[13] : s_6[5]);
+                        r_37[9] = (((f & 2) != 0) ? s_6[1] : s_6[9]);
+                        r_37[13] = (((f & 2) != 0) ? s_6[5] : s_6[13]);
+                        r_37[2] = (((f & 2) != 0) ? s_6[10] : s_6[2]);
+                        r_37[6] = (((f & 2) != 0) ? s_6[14] : s_6[6]);
+                        r_37[10] = (((f & 2) != 0) ? s_6[2] : s_6[10]);
+                        r_37[14] = (((f & 2) != 0) ? s_6[6] : s_6[14]);
+                        r_37[3] = (((f & 2) != 0) ? s_6[11] : s_6[3]);
+                        r_37[7] = (((f & 2) != 0) ? s_6[15] : s_6[7]);
+                        r_37[11] = (((f & 2) != 0) ? s_6[3] : s_6[11]);
+                        r_37[15] = (((f & 2) != 0) ? s_6[7] : s_6[15]);
+                        float yv[32];
                         float2 _f2_818 = make_float2(zreg[0], zreg[1]);
                         float2 _mul_f32x2_96;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_96) : "l"(*(const unsigned long long*)&_f2_818), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_819 = make_float2(__uint_as_float(wc[0] << 16), __uint_as_float(wc[0] & 4294901760u));
+                        float2 _f2_819 = make_float2(__uint_as_float(r_37[0] << 16), __uint_as_float(r_37[0] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7100,7 +7148,7 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         float2 _f2_820 = make_float2(zreg[2], zreg[3]);
                         float2 _mul_f32x2_98;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_98) : "l"(*(const unsigned long long*)&_f2_820), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_821 = make_float2(__uint_as_float(wc[1] << 16), __uint_as_float(wc[1] & 4294901760u));
+                        float2 _f2_821 = make_float2(__uint_as_float(r_37[1] << 16), __uint_as_float(r_37[1] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7117,7 +7165,7 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         float2 _f2_822 = make_float2(zreg[4], zreg[5]);
                         float2 _mul_f32x2_100;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_100) : "l"(*(const unsigned long long*)&_f2_822), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_823 = make_float2(__uint_as_float(wc[2] << 16), __uint_as_float(wc[2] & 4294901760u));
+                        float2 _f2_823 = make_float2(__uint_as_float(r_37[2] << 16), __uint_as_float(r_37[2] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7134,7 +7182,7 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         float2 _f2_824 = make_float2(zreg[6], zreg[7]);
                         float2 _mul_f32x2_102;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_102) : "l"(*(const unsigned long long*)&_f2_824), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_825 = make_float2(__uint_as_float(wc[3] << 16), __uint_as_float(wc[3] & 4294901760u));
+                        float2 _f2_825 = make_float2(__uint_as_float(r_37[3] << 16), __uint_as_float(r_37[3] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7148,22 +7196,10 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_103) : "l"(*(const unsigned long long*)&_mul_f32x2_102), "l"(*(const unsigned long long*)&_packed_add_f32x2_99));
                         yv[6] = _mul_f32x2_103.x;
                         yv[7] = _mul_f32x2_103.y;
-                        uint32_t yv_bf16[4];
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 4; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv[_lp*2 + 0], yv[_lp*2+1 + 0]));
-                            yv_bf16[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2))), "r"(yv_bf16[0]), "r"(yv_bf16[1]), "r"(yv_bf16[2]), "r"(yv_bf16[3]) : "memory");
-                        unsigned int wc_1[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wc_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_1[(0) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + 16));
-                        float yv_2[8];
                         float2 _f2_826 = make_float2(zreg[8], zreg[9]);
                         float2 _mul_f32x2_104;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_104) : "l"(*(const unsigned long long*)&_f2_826), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_827 = make_float2(__uint_as_float(wc_1[0] << 16), __uint_as_float(wc_1[0] & 4294901760u));
+                        float2 _f2_827 = make_float2(__uint_as_float(r_37[4] << 16), __uint_as_float(r_37[4] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7175,12 +7211,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_105;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_105) : "l"(*(const unsigned long long*)&_mul_f32x2_104), "l"(*(const unsigned long long*)&_packed_add_f32x2_100));
-                        yv_2[0] = _mul_f32x2_105.x;
-                        yv_2[1] = _mul_f32x2_105.y;
+                        yv[8] = _mul_f32x2_105.x;
+                        yv[9] = _mul_f32x2_105.y;
                         float2 _f2_828 = make_float2(zreg[10], zreg[11]);
                         float2 _mul_f32x2_106;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_106) : "l"(*(const unsigned long long*)&_f2_828), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_829 = make_float2(__uint_as_float(wc_1[1] << 16), __uint_as_float(wc_1[1] & 4294901760u));
+                        float2 _f2_829 = make_float2(__uint_as_float(r_37[5] << 16), __uint_as_float(r_37[5] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7192,12 +7228,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_107;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_107) : "l"(*(const unsigned long long*)&_mul_f32x2_106), "l"(*(const unsigned long long*)&_packed_add_f32x2_101));
-                        yv_2[2] = _mul_f32x2_107.x;
-                        yv_2[3] = _mul_f32x2_107.y;
+                        yv[10] = _mul_f32x2_107.x;
+                        yv[11] = _mul_f32x2_107.y;
                         float2 _f2_830 = make_float2(zreg[12], zreg[13]);
                         float2 _mul_f32x2_108;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_108) : "l"(*(const unsigned long long*)&_f2_830), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_831 = make_float2(__uint_as_float(wc_1[2] << 16), __uint_as_float(wc_1[2] & 4294901760u));
+                        float2 _f2_831 = make_float2(__uint_as_float(r_37[6] << 16), __uint_as_float(r_37[6] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7209,12 +7245,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_109;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_109) : "l"(*(const unsigned long long*)&_mul_f32x2_108), "l"(*(const unsigned long long*)&_packed_add_f32x2_102));
-                        yv_2[4] = _mul_f32x2_109.x;
-                        yv_2[5] = _mul_f32x2_109.y;
+                        yv[12] = _mul_f32x2_109.x;
+                        yv[13] = _mul_f32x2_109.y;
                         float2 _f2_832 = make_float2(zreg[14], zreg[15]);
                         float2 _mul_f32x2_110;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_110) : "l"(*(const unsigned long long*)&_f2_832), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_833 = make_float2(__uint_as_float(wc_1[3] << 16), __uint_as_float(wc_1[3] & 4294901760u));
+                        float2 _f2_833 = make_float2(__uint_as_float(r_37[7] << 16), __uint_as_float(r_37[7] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7226,24 +7262,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_111;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_111) : "l"(*(const unsigned long long*)&_mul_f32x2_110), "l"(*(const unsigned long long*)&_packed_add_f32x2_103));
-                        yv_2[6] = _mul_f32x2_111.x;
-                        yv_2[7] = _mul_f32x2_111.y;
-                        uint32_t yv_2_bf16[4];
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 4; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_2[_lp*2 + 0], yv_2[_lp*2+1 + 0]));
-                            yv_2_bf16[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + 1))), "r"(yv_2_bf16[0]), "r"(yv_2_bf16[1]), "r"(yv_2_bf16[2]), "r"(yv_2_bf16[3]) : "memory");
-                        unsigned int wc_3[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wc_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3[(0) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + 32));
-                        float yv_4[8];
+                        yv[14] = _mul_f32x2_111.x;
+                        yv[15] = _mul_f32x2_111.y;
                         float2 _f2_834 = make_float2(zreg[16], zreg[17]);
                         float2 _mul_f32x2_112;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_112) : "l"(*(const unsigned long long*)&_f2_834), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_835 = make_float2(__uint_as_float(wc_3[0] << 16), __uint_as_float(wc_3[0] & 4294901760u));
+                        float2 _f2_835 = make_float2(__uint_as_float(r_37[8] << 16), __uint_as_float(r_37[8] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7255,12 +7279,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_113;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_113) : "l"(*(const unsigned long long*)&_mul_f32x2_112), "l"(*(const unsigned long long*)&_packed_add_f32x2_104));
-                        yv_4[0] = _mul_f32x2_113.x;
-                        yv_4[1] = _mul_f32x2_113.y;
+                        yv[16] = _mul_f32x2_113.x;
+                        yv[17] = _mul_f32x2_113.y;
                         float2 _f2_836 = make_float2(zreg[18], zreg[19]);
                         float2 _mul_f32x2_114;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_114) : "l"(*(const unsigned long long*)&_f2_836), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_837 = make_float2(__uint_as_float(wc_3[1] << 16), __uint_as_float(wc_3[1] & 4294901760u));
+                        float2 _f2_837 = make_float2(__uint_as_float(r_37[9] << 16), __uint_as_float(r_37[9] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7272,12 +7296,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_115;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_115) : "l"(*(const unsigned long long*)&_mul_f32x2_114), "l"(*(const unsigned long long*)&_packed_add_f32x2_105));
-                        yv_4[2] = _mul_f32x2_115.x;
-                        yv_4[3] = _mul_f32x2_115.y;
+                        yv[18] = _mul_f32x2_115.x;
+                        yv[19] = _mul_f32x2_115.y;
                         float2 _f2_838 = make_float2(zreg[20], zreg[21]);
                         float2 _mul_f32x2_116;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_116) : "l"(*(const unsigned long long*)&_f2_838), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_839 = make_float2(__uint_as_float(wc_3[2] << 16), __uint_as_float(wc_3[2] & 4294901760u));
+                        float2 _f2_839 = make_float2(__uint_as_float(r_37[10] << 16), __uint_as_float(r_37[10] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7289,12 +7313,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_117;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_117) : "l"(*(const unsigned long long*)&_mul_f32x2_116), "l"(*(const unsigned long long*)&_packed_add_f32x2_106));
-                        yv_4[4] = _mul_f32x2_117.x;
-                        yv_4[5] = _mul_f32x2_117.y;
+                        yv[20] = _mul_f32x2_117.x;
+                        yv[21] = _mul_f32x2_117.y;
                         float2 _f2_840 = make_float2(zreg[22], zreg[23]);
                         float2 _mul_f32x2_118;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_118) : "l"(*(const unsigned long long*)&_f2_840), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_841 = make_float2(__uint_as_float(wc_3[3] << 16), __uint_as_float(wc_3[3] & 4294901760u));
+                        float2 _f2_841 = make_float2(__uint_as_float(r_37[11] << 16), __uint_as_float(r_37[11] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7306,24 +7330,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_119;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_119) : "l"(*(const unsigned long long*)&_mul_f32x2_118), "l"(*(const unsigned long long*)&_packed_add_f32x2_107));
-                        yv_4[6] = _mul_f32x2_119.x;
-                        yv_4[7] = _mul_f32x2_119.y;
-                        uint32_t yv_4_bf16[4];
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 4; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_4[_lp*2 + 0], yv_4[_lp*2+1 + 0]));
-                            yv_4_bf16[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + 2))), "r"(yv_4_bf16[0]), "r"(yv_4_bf16[1]), "r"(yv_4_bf16[2]), "r"(yv_4_bf16[3]) : "memory");
-                        unsigned int wc_5[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wc_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_5[(0) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp_1) + 48));
-                        float yv_6[8];
+                        yv[22] = _mul_f32x2_119.x;
+                        yv[23] = _mul_f32x2_119.y;
                         float2 _f2_842 = make_float2(zreg[24], zreg[25]);
                         float2 _mul_f32x2_120;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_120) : "l"(*(const unsigned long long*)&_f2_842), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_843 = make_float2(__uint_as_float(wc_5[0] << 16), __uint_as_float(wc_5[0] & 4294901760u));
+                        float2 _f2_843 = make_float2(__uint_as_float(r_37[12] << 16), __uint_as_float(r_37[12] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7335,12 +7347,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_121;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_121) : "l"(*(const unsigned long long*)&_mul_f32x2_120), "l"(*(const unsigned long long*)&_packed_add_f32x2_108));
-                        yv_6[0] = _mul_f32x2_121.x;
-                        yv_6[1] = _mul_f32x2_121.y;
+                        yv[24] = _mul_f32x2_121.x;
+                        yv[25] = _mul_f32x2_121.y;
                         float2 _f2_844 = make_float2(zreg[26], zreg[27]);
                         float2 _mul_f32x2_122;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_122) : "l"(*(const unsigned long long*)&_f2_844), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_845 = make_float2(__uint_as_float(wc_5[1] << 16), __uint_as_float(wc_5[1] & 4294901760u));
+                        float2 _f2_845 = make_float2(__uint_as_float(r_37[13] << 16), __uint_as_float(r_37[13] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7352,12 +7364,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_123;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_123) : "l"(*(const unsigned long long*)&_mul_f32x2_122), "l"(*(const unsigned long long*)&_packed_add_f32x2_109));
-                        yv_6[2] = _mul_f32x2_123.x;
-                        yv_6[3] = _mul_f32x2_123.y;
+                        yv[26] = _mul_f32x2_123.x;
+                        yv[27] = _mul_f32x2_123.y;
                         float2 _f2_846 = make_float2(zreg[28], zreg[29]);
                         float2 _mul_f32x2_124;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_124) : "l"(*(const unsigned long long*)&_f2_846), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_847 = make_float2(__uint_as_float(wc_5[2] << 16), __uint_as_float(wc_5[2] & 4294901760u));
+                        float2 _f2_847 = make_float2(__uint_as_float(r_37[14] << 16), __uint_as_float(r_37[14] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7369,12 +7381,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_125;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_125) : "l"(*(const unsigned long long*)&_mul_f32x2_124), "l"(*(const unsigned long long*)&_packed_add_f32x2_110));
-                        yv_6[4] = _mul_f32x2_125.x;
-                        yv_6[5] = _mul_f32x2_125.y;
+                        yv[28] = _mul_f32x2_125.x;
+                        yv[29] = _mul_f32x2_125.y;
                         float2 _f2_848 = make_float2(zreg[30], zreg[31]);
                         float2 _mul_f32x2_126;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_126) : "l"(*(const unsigned long long*)&_f2_848), "l"(*(const unsigned long long*)&_f2_816));
-                        float2 _f2_849 = make_float2(__uint_as_float(wc_5[3] << 16), __uint_as_float(wc_5[3] & 4294901760u));
+                        float2 _f2_849 = make_float2(__uint_as_float(r_37[15] << 16), __uint_as_float(r_37[15] & 4294901760u));
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                         #error "Packed FP32x2 arithmetic requires SM100 or newer"
                         #endif
@@ -7386,48 +7398,59 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         }
                         float2 _mul_f32x2_127;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_127) : "l"(*(const unsigned long long*)&_mul_f32x2_126), "l"(*(const unsigned long long*)&_packed_add_f32x2_111));
-                        yv_6[6] = _mul_f32x2_127.x;
-                        yv_6[7] = _mul_f32x2_127.y;
-                        uint32_t yv_6_bf16[4];
+                        yv[30] = _mul_f32x2_127.x;
+                        yv[31] = _mul_f32x2_127.y;
+                        uint32_t yv_bf16[16];
                         #pragma unroll
-                        for (int _lp = 0; _lp < 4; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_6[_lp*2 + 0], yv_6[_lp*2+1 + 0]));
-                            yv_6_bf16[_lp] = *(uint32_t*)&_bf2;
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv[_lp*2 + 0], yv[_lp*2+1 + 0]));
+                            yv_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + 3))), "r"(yv_6_bf16[0]), "r"(yv_6_bf16[1]), "r"(yv_6_bf16[2]), "r"(yv_6_bf16[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 0)))), "r"(yv_bf16[0]), "r"(yv_bf16[1]), "r"(yv_bf16[2]), "r"(yv_bf16[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 1)))), "r"(yv_bf16[4]), "r"(yv_bf16[5]), "r"(yv_bf16[6]), "r"(yv_bf16[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 2)))), "r"(yv_bf16[8]), "r"(yv_bf16[9]), "r"(yv_bf16[10]), "r"(yv_bf16[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 3)))), "r"(yv_bf16[12]), "r"(yv_bf16[13]), "r"(yv_bf16[14]), "r"(yv_bf16[15]) : "memory");
                         __syncwarp();
+                        int c_6 = lane_2;
+                        int l_6 = c_6 >> 2;
                         unsigned int w4_6[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&w4_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_6[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * lane_2)));
-                        long long idx_6 = drow * 3072 + (long long)(4 * (256 + lane_2));
+                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (4 * l_6 + (c_6 & 3 ^ l_6 >> 1 & 3)))));
+                        long long idx_6 = drow * 3072 + (long long)(4 * (256 + c_6));
                         {
                             int4 _iv4 = make_int4(w4_6[0 + 0], w4_6[0 + 1], w4_6[0 + 2], w4_6[0 + 3]);
                             *reinterpret_cast<int4*>(out_i32 + (idx_6)) = _iv4;
                         }
+                        int c_1_1 = lane_2 + 32;
+                        int l_2_1 = c_1_1 >> 2;
+                        unsigned int w4_3_1[4];
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&w4_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_3_1[(0) + 3]))
+                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (4 * l_2_1 + (c_1_1 & 3 ^ l_2_1 >> 1 & 3)))));
+                        long long idx_4_1 = drow * 3072 + (long long)(4 * (256 + c_1_1));
+                        {
+                            int4 _iv4 = make_int4(w4_3_1[0 + 0], w4_3_1[0 + 1], w4_3_1[0 + 2], w4_3_1[0 + 3]);
+                            *reinterpret_cast<int4*>(out_i32 + (idx_4_1)) = _iv4;
+                        }
+                        int c_5_1 = lane_2 + 64;
+                        int l_6_1 = c_5_1 >> 2;
                         unsigned int w4_7[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&w4_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_7[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 32))));
-                        long long idx_8 = drow * 3072 + (long long)(4 * (256 + lane_2 + 32));
+                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (4 * l_6_1 + (c_5_1 & 3 ^ l_6_1 >> 1 & 3)))));
+                        long long idx_8 = drow * 3072 + (long long)(4 * (256 + c_5_1));
                         {
                             int4 _iv4 = make_int4(w4_7[0 + 0], w4_7[0 + 1], w4_7[0 + 2], w4_7[0 + 3]);
                             *reinterpret_cast<int4*>(out_i32 + (idx_8)) = _iv4;
                         }
-                        unsigned int w4_9[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&w4_9[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_9[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_9[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_9[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 64))));
-                        long long idx_10 = drow * 3072 + (long long)(4 * (256 + lane_2 + 64));
-                        {
-                            int4 _iv4 = make_int4(w4_9[0 + 0], w4_9[0 + 1], w4_9[0 + 2], w4_9[0 + 3]);
-                            *reinterpret_cast<int4*>(out_i32 + (idx_10)) = _iv4;
-                        }
+                        int c_9 = lane_2 + 96;
+                        int l_10 = c_9 >> 2;
                         unsigned int w4_11[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&w4_11[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_11[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_11[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_11[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 96))));
-                        long long idx_12 = drow * 3072 + (long long)(4 * (256 + lane_2 + 96));
+                            : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (4 * l_10 + (c_9 & 3 ^ l_10 >> 1 & 3)))));
+                        long long idx_12 = drow * 3072 + (long long)(4 * (256 + c_9));
                         {
                             int4 _iv4 = make_int4(w4_11[0 + 0], w4_11[0 + 1], w4_11[0 + 2], w4_11[0 + 3]);
                             *reinterpret_cast<int4*>(out_i32 + (idx_12)) = _iv4;
@@ -7436,25 +7459,26 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                         #pragma unroll 1
                         for (int j = 0; j < 2; j++) {
                             int l7_5 = lane_2 & 7;
+                            int rz_5 = ((l7_5 & 3) << 1) + (l7_5 >> 2);
                             int pp_0_1 = lane_2 + 32 * j;
                             int zlane_5 = zb_off + 4096 * j + 128 * lane_2;
                             int kw = f ^ 0;
-                            unsigned int wc_2[4];
+                            unsigned int wc[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_2[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc[(0) + 3]))
                                 : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw)));
                             float zc[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&zc[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw))));
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&zc[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw + 1))));
-                            float yv_3[8];
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw + 1))));
+                            float yv_1[8];
                             float2 _f2_850 = make_float2(zc[0], zc[1]);
                             float2 _mul_f32x2_128;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_128) : "l"(*(const unsigned long long*)&_f2_850), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_851 = make_float2(__uint_as_float(wc_2[0] << 16), __uint_as_float(wc_2[0] & 4294901760u));
+                            float2 _f2_851 = make_float2(__uint_as_float(wc[0] << 16), __uint_as_float(wc[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7466,12 +7490,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_129;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_129) : "l"(*(const unsigned long long*)&_mul_f32x2_128), "l"(*(const unsigned long long*)&_packed_add_f32x2_112));
-                            yv_3[0] = _mul_f32x2_129.x;
-                            yv_3[1] = _mul_f32x2_129.y;
+                            yv_1[0] = _mul_f32x2_129.x;
+                            yv_1[1] = _mul_f32x2_129.y;
                             float2 _f2_852 = make_float2(zc[2], zc[3]);
                             float2 _mul_f32x2_130;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_130) : "l"(*(const unsigned long long*)&_f2_852), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_853 = make_float2(__uint_as_float(wc_2[1] << 16), __uint_as_float(wc_2[1] & 4294901760u));
+                            float2 _f2_853 = make_float2(__uint_as_float(wc[1] << 16), __uint_as_float(wc[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7483,12 +7507,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_131;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_131) : "l"(*(const unsigned long long*)&_mul_f32x2_130), "l"(*(const unsigned long long*)&_packed_add_f32x2_113));
-                            yv_3[2] = _mul_f32x2_131.x;
-                            yv_3[3] = _mul_f32x2_131.y;
+                            yv_1[2] = _mul_f32x2_131.x;
+                            yv_1[3] = _mul_f32x2_131.y;
                             float2 _f2_854 = make_float2(zc[4], zc[5]);
                             float2 _mul_f32x2_132;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_132) : "l"(*(const unsigned long long*)&_f2_854), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_855 = make_float2(__uint_as_float(wc_2[2] << 16), __uint_as_float(wc_2[2] & 4294901760u));
+                            float2 _f2_855 = make_float2(__uint_as_float(wc[2] << 16), __uint_as_float(wc[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7500,12 +7524,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_133;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_133) : "l"(*(const unsigned long long*)&_mul_f32x2_132), "l"(*(const unsigned long long*)&_packed_add_f32x2_114));
-                            yv_3[4] = _mul_f32x2_133.x;
-                            yv_3[5] = _mul_f32x2_133.y;
+                            yv_1[4] = _mul_f32x2_133.x;
+                            yv_1[5] = _mul_f32x2_133.y;
                             float2 _f2_856 = make_float2(zc[6], zc[7]);
                             float2 _mul_f32x2_134;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_134) : "l"(*(const unsigned long long*)&_f2_856), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_857 = make_float2(__uint_as_float(wc_2[3] << 16), __uint_as_float(wc_2[3] & 4294901760u));
+                            float2 _f2_857 = make_float2(__uint_as_float(wc[3] << 16), __uint_as_float(wc[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7517,32 +7541,32 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_135;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_135) : "l"(*(const unsigned long long*)&_mul_f32x2_134), "l"(*(const unsigned long long*)&_packed_add_f32x2_115));
-                            yv_3[6] = _mul_f32x2_135.x;
-                            yv_3[7] = _mul_f32x2_135.y;
-                            uint32_t yv_3_bf16[4];
+                            yv_1[6] = _mul_f32x2_135.x;
+                            yv_1[7] = _mul_f32x2_135.y;
+                            uint32_t yv_1_bf16[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_3[_lp*2 + 0], yv_3[_lp*2+1 + 0]));
-                                yv_3_bf16[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_1[_lp*2 + 0], yv_1[_lp*2+1 + 0]));
+                                yv_1_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw))), "r"(yv_3_bf16[0]), "r"(yv_3_bf16[1]), "r"(yv_3_bf16[2]), "r"(yv_3_bf16[3]) : "memory");
-                            int kw_4 = f ^ 1;
-                            unsigned int wc_6[4];
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw))), "r"(yv_1_bf16[0]), "r"(yv_1_bf16[1]), "r"(yv_1_bf16[2]), "r"(yv_1_bf16[3]) : "memory");
+                            int kw_2 = f ^ 1;
+                            unsigned int wc_3[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_6[(0) + 3]))
-                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw_4)));
-                            float zc_7[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3[(0) + 3]))
+                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw_2)));
+                            float zc_4[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw_4))));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4[(0) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw_2))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_7[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw_4 + 1))));
-                            float yv_8[8];
-                            float2 _f2_858 = make_float2(zc_7[0], zc_7[1]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_4[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4[(4) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw_2 + 1))));
+                            float yv_5[8];
+                            float2 _f2_858 = make_float2(zc_4[0], zc_4[1]);
                             float2 _mul_f32x2_136;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_136) : "l"(*(const unsigned long long*)&_f2_858), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_859 = make_float2(__uint_as_float(wc_6[0] << 16), __uint_as_float(wc_6[0] & 4294901760u));
+                            float2 _f2_859 = make_float2(__uint_as_float(wc_3[0] << 16), __uint_as_float(wc_3[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7554,12 +7578,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_137;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_137) : "l"(*(const unsigned long long*)&_mul_f32x2_136), "l"(*(const unsigned long long*)&_packed_add_f32x2_116));
-                            yv_8[0] = _mul_f32x2_137.x;
-                            yv_8[1] = _mul_f32x2_137.y;
-                            float2 _f2_860 = make_float2(zc_7[2], zc_7[3]);
+                            yv_5[0] = _mul_f32x2_137.x;
+                            yv_5[1] = _mul_f32x2_137.y;
+                            float2 _f2_860 = make_float2(zc_4[2], zc_4[3]);
                             float2 _mul_f32x2_138;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_138) : "l"(*(const unsigned long long*)&_f2_860), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_861 = make_float2(__uint_as_float(wc_6[1] << 16), __uint_as_float(wc_6[1] & 4294901760u));
+                            float2 _f2_861 = make_float2(__uint_as_float(wc_3[1] << 16), __uint_as_float(wc_3[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7571,12 +7595,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_139;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_139) : "l"(*(const unsigned long long*)&_mul_f32x2_138), "l"(*(const unsigned long long*)&_packed_add_f32x2_117));
-                            yv_8[2] = _mul_f32x2_139.x;
-                            yv_8[3] = _mul_f32x2_139.y;
-                            float2 _f2_862 = make_float2(zc_7[4], zc_7[5]);
+                            yv_5[2] = _mul_f32x2_139.x;
+                            yv_5[3] = _mul_f32x2_139.y;
+                            float2 _f2_862 = make_float2(zc_4[4], zc_4[5]);
                             float2 _mul_f32x2_140;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_140) : "l"(*(const unsigned long long*)&_f2_862), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_863 = make_float2(__uint_as_float(wc_6[2] << 16), __uint_as_float(wc_6[2] & 4294901760u));
+                            float2 _f2_863 = make_float2(__uint_as_float(wc_3[2] << 16), __uint_as_float(wc_3[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7588,12 +7612,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_141;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_141) : "l"(*(const unsigned long long*)&_mul_f32x2_140), "l"(*(const unsigned long long*)&_packed_add_f32x2_118));
-                            yv_8[4] = _mul_f32x2_141.x;
-                            yv_8[5] = _mul_f32x2_141.y;
-                            float2 _f2_864 = make_float2(zc_7[6], zc_7[7]);
+                            yv_5[4] = _mul_f32x2_141.x;
+                            yv_5[5] = _mul_f32x2_141.y;
+                            float2 _f2_864 = make_float2(zc_4[6], zc_4[7]);
                             float2 _mul_f32x2_142;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_142) : "l"(*(const unsigned long long*)&_f2_864), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_865 = make_float2(__uint_as_float(wc_6[3] << 16), __uint_as_float(wc_6[3] & 4294901760u));
+                            float2 _f2_865 = make_float2(__uint_as_float(wc_3[3] << 16), __uint_as_float(wc_3[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7605,32 +7629,32 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_143;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_143) : "l"(*(const unsigned long long*)&_mul_f32x2_142), "l"(*(const unsigned long long*)&_packed_add_f32x2_119));
-                            yv_8[6] = _mul_f32x2_143.x;
-                            yv_8[7] = _mul_f32x2_143.y;
-                            uint32_t yv_8_bf16[4];
+                            yv_5[6] = _mul_f32x2_143.x;
+                            yv_5[7] = _mul_f32x2_143.y;
+                            uint32_t yv_5_bf16[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_8[_lp*2 + 0], yv_8[_lp*2+1 + 0]));
-                                yv_8_bf16[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_5[_lp*2 + 0], yv_5[_lp*2+1 + 0]));
+                                yv_5_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_4))), "r"(yv_8_bf16[0]), "r"(yv_8_bf16[1]), "r"(yv_8_bf16[2]), "r"(yv_8_bf16[3]) : "memory");
-                            int kw_9 = f ^ 2;
-                            unsigned int wc_10[4];
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_2))), "r"(yv_5_bf16[0]), "r"(yv_5_bf16[1]), "r"(yv_5_bf16[2]), "r"(yv_5_bf16[3]) : "memory");
+                            int kw_6 = f ^ 2;
+                            unsigned int wc_7[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_10[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_10[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_10[(0) + 3]))
-                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw_9)));
-                            float zc_11[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_7[(0) + 3]))
+                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw_6)));
+                            float zc_8[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_11[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw_9))));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_8[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8[(0) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw_6))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_11[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw_9 + 1))));
-                            float yv_12[8];
-                            float2 _f2_866 = make_float2(zc_11[0], zc_11[1]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_8[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8[(4) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw_6 + 1))));
+                            float yv_9[8];
+                            float2 _f2_866 = make_float2(zc_8[0], zc_8[1]);
                             float2 _mul_f32x2_144;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_144) : "l"(*(const unsigned long long*)&_f2_866), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_867 = make_float2(__uint_as_float(wc_10[0] << 16), __uint_as_float(wc_10[0] & 4294901760u));
+                            float2 _f2_867 = make_float2(__uint_as_float(wc_7[0] << 16), __uint_as_float(wc_7[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7642,12 +7666,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_145;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_145) : "l"(*(const unsigned long long*)&_mul_f32x2_144), "l"(*(const unsigned long long*)&_packed_add_f32x2_120));
-                            yv_12[0] = _mul_f32x2_145.x;
-                            yv_12[1] = _mul_f32x2_145.y;
-                            float2 _f2_868 = make_float2(zc_11[2], zc_11[3]);
+                            yv_9[0] = _mul_f32x2_145.x;
+                            yv_9[1] = _mul_f32x2_145.y;
+                            float2 _f2_868 = make_float2(zc_8[2], zc_8[3]);
                             float2 _mul_f32x2_146;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_146) : "l"(*(const unsigned long long*)&_f2_868), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_869 = make_float2(__uint_as_float(wc_10[1] << 16), __uint_as_float(wc_10[1] & 4294901760u));
+                            float2 _f2_869 = make_float2(__uint_as_float(wc_7[1] << 16), __uint_as_float(wc_7[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7659,12 +7683,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_147;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_147) : "l"(*(const unsigned long long*)&_mul_f32x2_146), "l"(*(const unsigned long long*)&_packed_add_f32x2_121));
-                            yv_12[2] = _mul_f32x2_147.x;
-                            yv_12[3] = _mul_f32x2_147.y;
-                            float2 _f2_870 = make_float2(zc_11[4], zc_11[5]);
+                            yv_9[2] = _mul_f32x2_147.x;
+                            yv_9[3] = _mul_f32x2_147.y;
+                            float2 _f2_870 = make_float2(zc_8[4], zc_8[5]);
                             float2 _mul_f32x2_148;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_148) : "l"(*(const unsigned long long*)&_f2_870), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_871 = make_float2(__uint_as_float(wc_10[2] << 16), __uint_as_float(wc_10[2] & 4294901760u));
+                            float2 _f2_871 = make_float2(__uint_as_float(wc_7[2] << 16), __uint_as_float(wc_7[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7676,12 +7700,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_149;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_149) : "l"(*(const unsigned long long*)&_mul_f32x2_148), "l"(*(const unsigned long long*)&_packed_add_f32x2_122));
-                            yv_12[4] = _mul_f32x2_149.x;
-                            yv_12[5] = _mul_f32x2_149.y;
-                            float2 _f2_872 = make_float2(zc_11[6], zc_11[7]);
+                            yv_9[4] = _mul_f32x2_149.x;
+                            yv_9[5] = _mul_f32x2_149.y;
+                            float2 _f2_872 = make_float2(zc_8[6], zc_8[7]);
                             float2 _mul_f32x2_150;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_150) : "l"(*(const unsigned long long*)&_f2_872), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_873 = make_float2(__uint_as_float(wc_10[3] << 16), __uint_as_float(wc_10[3] & 4294901760u));
+                            float2 _f2_873 = make_float2(__uint_as_float(wc_7[3] << 16), __uint_as_float(wc_7[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7693,32 +7717,32 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_151;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_151) : "l"(*(const unsigned long long*)&_mul_f32x2_150), "l"(*(const unsigned long long*)&_packed_add_f32x2_123));
-                            yv_12[6] = _mul_f32x2_151.x;
-                            yv_12[7] = _mul_f32x2_151.y;
-                            uint32_t yv_12_bf16[4];
+                            yv_9[6] = _mul_f32x2_151.x;
+                            yv_9[7] = _mul_f32x2_151.y;
+                            uint32_t yv_9_bf16[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_12[_lp*2 + 0], yv_12[_lp*2+1 + 0]));
-                                yv_12_bf16[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_9[_lp*2 + 0], yv_9[_lp*2+1 + 0]));
+                                yv_9_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_9))), "r"(yv_12_bf16[0]), "r"(yv_12_bf16[1]), "r"(yv_12_bf16[2]), "r"(yv_12_bf16[3]) : "memory");
-                            int kw_13 = f ^ 3;
-                            unsigned int wc_14[4];
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_6))), "r"(yv_9_bf16[0]), "r"(yv_9_bf16[1]), "r"(yv_9_bf16[2]), "r"(yv_9_bf16[3]) : "memory");
+                            int kw_10 = f ^ 3;
+                            unsigned int wc_11[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_14[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_14[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_14[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_14[(0) + 3]))
-                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw_13)));
-                            float zc_15[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_11[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_11[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_11[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_11[(0) + 3]))
+                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_1) + (unsigned int)(16 * kw_10)));
+                            float zc_12[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_15[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw_13))));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_12[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12[(0) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw_10))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_15[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (l7_5 ^ 2 * kw_13 + 1))));
-                            float yv_16[8];
-                            float2 _f2_874 = make_float2(zc_15[0], zc_15[1]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_12[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12[(4) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_5 + (unsigned int)(16 * (rz_5 ^ 2 * kw_10 + 1))));
+                            float yv_13[8];
+                            float2 _f2_874 = make_float2(zc_12[0], zc_12[1]);
                             float2 _mul_f32x2_152;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_152) : "l"(*(const unsigned long long*)&_f2_874), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_875 = make_float2(__uint_as_float(wc_14[0] << 16), __uint_as_float(wc_14[0] & 4294901760u));
+                            float2 _f2_875 = make_float2(__uint_as_float(wc_11[0] << 16), __uint_as_float(wc_11[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7730,12 +7754,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_153;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_153) : "l"(*(const unsigned long long*)&_mul_f32x2_152), "l"(*(const unsigned long long*)&_packed_add_f32x2_124));
-                            yv_16[0] = _mul_f32x2_153.x;
-                            yv_16[1] = _mul_f32x2_153.y;
-                            float2 _f2_876 = make_float2(zc_15[2], zc_15[3]);
+                            yv_13[0] = _mul_f32x2_153.x;
+                            yv_13[1] = _mul_f32x2_153.y;
+                            float2 _f2_876 = make_float2(zc_12[2], zc_12[3]);
                             float2 _mul_f32x2_154;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_154) : "l"(*(const unsigned long long*)&_f2_876), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_877 = make_float2(__uint_as_float(wc_14[1] << 16), __uint_as_float(wc_14[1] & 4294901760u));
+                            float2 _f2_877 = make_float2(__uint_as_float(wc_11[1] << 16), __uint_as_float(wc_11[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7747,12 +7771,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_155;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_155) : "l"(*(const unsigned long long*)&_mul_f32x2_154), "l"(*(const unsigned long long*)&_packed_add_f32x2_125));
-                            yv_16[2] = _mul_f32x2_155.x;
-                            yv_16[3] = _mul_f32x2_155.y;
-                            float2 _f2_878 = make_float2(zc_15[4], zc_15[5]);
+                            yv_13[2] = _mul_f32x2_155.x;
+                            yv_13[3] = _mul_f32x2_155.y;
+                            float2 _f2_878 = make_float2(zc_12[4], zc_12[5]);
                             float2 _mul_f32x2_156;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_156) : "l"(*(const unsigned long long*)&_f2_878), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_879 = make_float2(__uint_as_float(wc_14[2] << 16), __uint_as_float(wc_14[2] & 4294901760u));
+                            float2 _f2_879 = make_float2(__uint_as_float(wc_11[2] << 16), __uint_as_float(wc_11[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7764,12 +7788,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_157;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_157) : "l"(*(const unsigned long long*)&_mul_f32x2_156), "l"(*(const unsigned long long*)&_packed_add_f32x2_126));
-                            yv_16[4] = _mul_f32x2_157.x;
-                            yv_16[5] = _mul_f32x2_157.y;
-                            float2 _f2_880 = make_float2(zc_15[6], zc_15[7]);
+                            yv_13[4] = _mul_f32x2_157.x;
+                            yv_13[5] = _mul_f32x2_157.y;
+                            float2 _f2_880 = make_float2(zc_12[6], zc_12[7]);
                             float2 _mul_f32x2_158;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_158) : "l"(*(const unsigned long long*)&_f2_880), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_881 = make_float2(__uint_as_float(wc_14[3] << 16), __uint_as_float(wc_14[3] & 4294901760u));
+                            float2 _f2_881 = make_float2(__uint_as_float(wc_11[3] << 16), __uint_as_float(wc_11[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7781,76 +7805,77 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_159;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_159) : "l"(*(const unsigned long long*)&_mul_f32x2_158), "l"(*(const unsigned long long*)&_packed_add_f32x2_127));
-                            yv_16[6] = _mul_f32x2_159.x;
-                            yv_16[7] = _mul_f32x2_159.y;
-                            uint32_t yv_16_bf16[4];
+                            yv_13[6] = _mul_f32x2_159.x;
+                            yv_13[7] = _mul_f32x2_159.y;
+                            uint32_t yv_13_bf16[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_16[_lp*2 + 0], yv_16[_lp*2+1 + 0]));
-                                yv_16_bf16[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_13[_lp*2 + 0], yv_13[_lp*2+1 + 0]));
+                                yv_13_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_13))), "r"(yv_16_bf16[0]), "r"(yv_16_bf16[1]), "r"(yv_16_bf16[2]), "r"(yv_16_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_10))), "r"(yv_13_bf16[0]), "r"(yv_13_bf16[1]), "r"(yv_13_bf16[2]), "r"(yv_13_bf16[3]) : "memory");
                             __syncwarp();
-                            unsigned int w4_17[4];
+                            unsigned int w4_14[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_17[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_17[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_17[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_17[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_14[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_14[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_14[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_14[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * lane_2)));
-                            long long idx_18 = drow * 3072 + (long long)(4 * (128 * j + lane_2));
+                            long long idx_15 = drow * 3072 + (long long)(4 * (128 * j + lane_2));
                             {
-                                int4 _iv4 = make_int4(w4_17[0 + 0], w4_17[0 + 1], w4_17[0 + 2], w4_17[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_18)) = _iv4;
+                                int4 _iv4 = make_int4(w4_14[0 + 0], w4_14[0 + 1], w4_14[0 + 2], w4_14[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_15)) = _iv4;
                             }
-                            unsigned int w4_19[4];
+                            unsigned int w4_16[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_19[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_19[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_19[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_19[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_16[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_16[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_16[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_16[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 32))));
-                            long long idx_20 = drow * 3072 + (long long)(4 * (128 * j + lane_2 + 32));
+                            long long idx_17 = drow * 3072 + (long long)(4 * (128 * j + lane_2 + 32));
                             {
-                                int4 _iv4 = make_int4(w4_19[0 + 0], w4_19[0 + 1], w4_19[0 + 2], w4_19[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_20)) = _iv4;
+                                int4 _iv4 = make_int4(w4_16[0 + 0], w4_16[0 + 1], w4_16[0 + 2], w4_16[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_17)) = _iv4;
                             }
-                            unsigned int w4_21[4];
+                            unsigned int w4_18[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_21[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_21[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_21[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_21[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_18[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_18[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_18[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_18[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 64))));
-                            long long idx_22 = drow * 3072 + (long long)(4 * (128 * j + lane_2 + 64));
+                            long long idx_19 = drow * 3072 + (long long)(4 * (128 * j + lane_2 + 64));
                             {
-                                int4 _iv4 = make_int4(w4_21[0 + 0], w4_21[0 + 1], w4_21[0 + 2], w4_21[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_22)) = _iv4;
+                                int4 _iv4 = make_int4(w4_18[0 + 0], w4_18[0 + 1], w4_18[0 + 2], w4_18[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_19)) = _iv4;
                             }
-                            unsigned int w4_23[4];
+                            unsigned int w4_20[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_23[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_23[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_23[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_23[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_20[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_20[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_20[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_20[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 96))));
-                            long long idx_24 = drow * 3072 + (long long)(4 * (128 * j + lane_2 + 96));
+                            long long idx_21 = drow * 3072 + (long long)(4 * (128 * j + lane_2 + 96));
                             {
-                                int4 _iv4 = make_int4(w4_23[0 + 0], w4_23[0 + 1], w4_23[0 + 2], w4_23[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_24)) = _iv4;
+                                int4 _iv4 = make_int4(w4_20[0 + 0], w4_20[0 + 1], w4_20[0 + 2], w4_20[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_21)) = _iv4;
                             }
                             __syncwarp();
                         }
                         #pragma unroll 1
                         for (int j_1 = 3; j_1 < 6; j_1++) {
                             int l7_6 = lane_2 & 7;
+                            int rz_6 = ((l7_6 & 3) << 1) + (l7_6 >> 2);
                             int pp_0_2 = lane_2 + 32 * j_1;
                             int zlane_6 = xa_off + 4096 * (j_1 - 3) + 128 * lane_2;
                             int kw_1 = f ^ 0;
-                            unsigned int wc_2_1[4];
+                            unsigned int wc_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_2_1[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_1[(0) + 3]))
                                 : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_1)));
                             float zc_1[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&zc_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_1[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_1))));
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_1))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&zc_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_1[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_1 + 1))));
-                            float yv_3_1[8];
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_1 + 1))));
+                            float yv_1_1[8];
                             float2 _f2_882 = make_float2(zc_1[0], zc_1[1]);
                             float2 _mul_f32x2_160;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_160) : "l"(*(const unsigned long long*)&_f2_882), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_883 = make_float2(__uint_as_float(wc_2_1[0] << 16), __uint_as_float(wc_2_1[0] & 4294901760u));
+                            float2 _f2_883 = make_float2(__uint_as_float(wc_1[0] << 16), __uint_as_float(wc_1[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7862,12 +7887,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_161;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_161) : "l"(*(const unsigned long long*)&_mul_f32x2_160), "l"(*(const unsigned long long*)&_packed_add_f32x2_128));
-                            yv_3_1[0] = _mul_f32x2_161.x;
-                            yv_3_1[1] = _mul_f32x2_161.y;
+                            yv_1_1[0] = _mul_f32x2_161.x;
+                            yv_1_1[1] = _mul_f32x2_161.y;
                             float2 _f2_884 = make_float2(zc_1[2], zc_1[3]);
                             float2 _mul_f32x2_162;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_162) : "l"(*(const unsigned long long*)&_f2_884), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_885 = make_float2(__uint_as_float(wc_2_1[1] << 16), __uint_as_float(wc_2_1[1] & 4294901760u));
+                            float2 _f2_885 = make_float2(__uint_as_float(wc_1[1] << 16), __uint_as_float(wc_1[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7879,12 +7904,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_163;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_163) : "l"(*(const unsigned long long*)&_mul_f32x2_162), "l"(*(const unsigned long long*)&_packed_add_f32x2_129));
-                            yv_3_1[2] = _mul_f32x2_163.x;
-                            yv_3_1[3] = _mul_f32x2_163.y;
+                            yv_1_1[2] = _mul_f32x2_163.x;
+                            yv_1_1[3] = _mul_f32x2_163.y;
                             float2 _f2_886 = make_float2(zc_1[4], zc_1[5]);
                             float2 _mul_f32x2_164;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_164) : "l"(*(const unsigned long long*)&_f2_886), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_887 = make_float2(__uint_as_float(wc_2_1[2] << 16), __uint_as_float(wc_2_1[2] & 4294901760u));
+                            float2 _f2_887 = make_float2(__uint_as_float(wc_1[2] << 16), __uint_as_float(wc_1[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7896,12 +7921,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_165;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_165) : "l"(*(const unsigned long long*)&_mul_f32x2_164), "l"(*(const unsigned long long*)&_packed_add_f32x2_130));
-                            yv_3_1[4] = _mul_f32x2_165.x;
-                            yv_3_1[5] = _mul_f32x2_165.y;
+                            yv_1_1[4] = _mul_f32x2_165.x;
+                            yv_1_1[5] = _mul_f32x2_165.y;
                             float2 _f2_888 = make_float2(zc_1[6], zc_1[7]);
                             float2 _mul_f32x2_166;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_166) : "l"(*(const unsigned long long*)&_f2_888), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_889 = make_float2(__uint_as_float(wc_2_1[3] << 16), __uint_as_float(wc_2_1[3] & 4294901760u));
+                            float2 _f2_889 = make_float2(__uint_as_float(wc_1[3] << 16), __uint_as_float(wc_1[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7913,32 +7938,32 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_167;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_167) : "l"(*(const unsigned long long*)&_mul_f32x2_166), "l"(*(const unsigned long long*)&_packed_add_f32x2_131));
-                            yv_3_1[6] = _mul_f32x2_167.x;
-                            yv_3_1[7] = _mul_f32x2_167.y;
-                            uint32_t yv_3_bf16_1[4];
+                            yv_1_1[6] = _mul_f32x2_167.x;
+                            yv_1_1[7] = _mul_f32x2_167.y;
+                            uint32_t yv_1_bf16_1[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_3_1[_lp*2 + 0], yv_3_1[_lp*2+1 + 0]));
-                                yv_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_1_1[_lp*2 + 0], yv_1_1[_lp*2+1 + 0]));
+                                yv_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_1))), "r"(yv_3_bf16_1[0]), "r"(yv_3_bf16_1[1]), "r"(yv_3_bf16_1[2]), "r"(yv_3_bf16_1[3]) : "memory");
-                            int kw_4_1 = f ^ 1;
-                            unsigned int wc_6_1[4];
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_1))), "r"(yv_1_bf16_1[0]), "r"(yv_1_bf16_1[1]), "r"(yv_1_bf16_1[2]), "r"(yv_1_bf16_1[3]) : "memory");
+                            int kw_2_1 = f ^ 1;
+                            unsigned int wc_3_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_6_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_6_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_6_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_6_1[(0) + 3]))
-                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_4_1)));
-                            float zc_7_1[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_3_1[(0) + 3]))
+                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_2_1)));
+                            float zc_4_1[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_4_1))));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[(0) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_2_1))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_7_1[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_4_1 + 1))));
-                            float yv_8_1[8];
-                            float2 _f2_890 = make_float2(zc_7_1[0], zc_7_1[1]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_4_1[(4) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_2_1 + 1))));
+                            float yv_5_1[8];
+                            float2 _f2_890 = make_float2(zc_4_1[0], zc_4_1[1]);
                             float2 _mul_f32x2_168;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_168) : "l"(*(const unsigned long long*)&_f2_890), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_891 = make_float2(__uint_as_float(wc_6_1[0] << 16), __uint_as_float(wc_6_1[0] & 4294901760u));
+                            float2 _f2_891 = make_float2(__uint_as_float(wc_3_1[0] << 16), __uint_as_float(wc_3_1[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7950,12 +7975,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_169;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_169) : "l"(*(const unsigned long long*)&_mul_f32x2_168), "l"(*(const unsigned long long*)&_packed_add_f32x2_132));
-                            yv_8_1[0] = _mul_f32x2_169.x;
-                            yv_8_1[1] = _mul_f32x2_169.y;
-                            float2 _f2_892 = make_float2(zc_7_1[2], zc_7_1[3]);
+                            yv_5_1[0] = _mul_f32x2_169.x;
+                            yv_5_1[1] = _mul_f32x2_169.y;
+                            float2 _f2_892 = make_float2(zc_4_1[2], zc_4_1[3]);
                             float2 _mul_f32x2_170;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_170) : "l"(*(const unsigned long long*)&_f2_892), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_893 = make_float2(__uint_as_float(wc_6_1[1] << 16), __uint_as_float(wc_6_1[1] & 4294901760u));
+                            float2 _f2_893 = make_float2(__uint_as_float(wc_3_1[1] << 16), __uint_as_float(wc_3_1[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7967,12 +7992,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_171;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_171) : "l"(*(const unsigned long long*)&_mul_f32x2_170), "l"(*(const unsigned long long*)&_packed_add_f32x2_133));
-                            yv_8_1[2] = _mul_f32x2_171.x;
-                            yv_8_1[3] = _mul_f32x2_171.y;
-                            float2 _f2_894 = make_float2(zc_7_1[4], zc_7_1[5]);
+                            yv_5_1[2] = _mul_f32x2_171.x;
+                            yv_5_1[3] = _mul_f32x2_171.y;
+                            float2 _f2_894 = make_float2(zc_4_1[4], zc_4_1[5]);
                             float2 _mul_f32x2_172;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_172) : "l"(*(const unsigned long long*)&_f2_894), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_895 = make_float2(__uint_as_float(wc_6_1[2] << 16), __uint_as_float(wc_6_1[2] & 4294901760u));
+                            float2 _f2_895 = make_float2(__uint_as_float(wc_3_1[2] << 16), __uint_as_float(wc_3_1[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -7984,12 +8009,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_173;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_173) : "l"(*(const unsigned long long*)&_mul_f32x2_172), "l"(*(const unsigned long long*)&_packed_add_f32x2_134));
-                            yv_8_1[4] = _mul_f32x2_173.x;
-                            yv_8_1[5] = _mul_f32x2_173.y;
-                            float2 _f2_896 = make_float2(zc_7_1[6], zc_7_1[7]);
+                            yv_5_1[4] = _mul_f32x2_173.x;
+                            yv_5_1[5] = _mul_f32x2_173.y;
+                            float2 _f2_896 = make_float2(zc_4_1[6], zc_4_1[7]);
                             float2 _mul_f32x2_174;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_174) : "l"(*(const unsigned long long*)&_f2_896), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_897 = make_float2(__uint_as_float(wc_6_1[3] << 16), __uint_as_float(wc_6_1[3] & 4294901760u));
+                            float2 _f2_897 = make_float2(__uint_as_float(wc_3_1[3] << 16), __uint_as_float(wc_3_1[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8001,32 +8026,32 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_175;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_175) : "l"(*(const unsigned long long*)&_mul_f32x2_174), "l"(*(const unsigned long long*)&_packed_add_f32x2_135));
-                            yv_8_1[6] = _mul_f32x2_175.x;
-                            yv_8_1[7] = _mul_f32x2_175.y;
-                            uint32_t yv_8_bf16_1[4];
+                            yv_5_1[6] = _mul_f32x2_175.x;
+                            yv_5_1[7] = _mul_f32x2_175.y;
+                            uint32_t yv_5_bf16_1[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_8_1[_lp*2 + 0], yv_8_1[_lp*2+1 + 0]));
-                                yv_8_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_5_1[_lp*2 + 0], yv_5_1[_lp*2+1 + 0]));
+                                yv_5_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_4_1))), "r"(yv_8_bf16_1[0]), "r"(yv_8_bf16_1[1]), "r"(yv_8_bf16_1[2]), "r"(yv_8_bf16_1[3]) : "memory");
-                            int kw_9_1 = f ^ 2;
-                            unsigned int wc_10_1[4];
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_2_1))), "r"(yv_5_bf16_1[0]), "r"(yv_5_bf16_1[1]), "r"(yv_5_bf16_1[2]), "r"(yv_5_bf16_1[3]) : "memory");
+                            int kw_6_1 = f ^ 2;
+                            unsigned int wc_7_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_10_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_10_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_10_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_10_1[(0) + 3]))
-                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_9_1)));
-                            float zc_11_1[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_7_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_7_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_7_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_7_1[(0) + 3]))
+                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_6_1)));
+                            float zc_8_1[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_9_1))));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[(0) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_6_1))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_11_1[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_9_1 + 1))));
-                            float yv_12_1[8];
-                            float2 _f2_898 = make_float2(zc_11_1[0], zc_11_1[1]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_8_1[(4) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_6_1 + 1))));
+                            float yv_9_1[8];
+                            float2 _f2_898 = make_float2(zc_8_1[0], zc_8_1[1]);
                             float2 _mul_f32x2_176;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_176) : "l"(*(const unsigned long long*)&_f2_898), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_899 = make_float2(__uint_as_float(wc_10_1[0] << 16), __uint_as_float(wc_10_1[0] & 4294901760u));
+                            float2 _f2_899 = make_float2(__uint_as_float(wc_7_1[0] << 16), __uint_as_float(wc_7_1[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8038,12 +8063,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_177;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_177) : "l"(*(const unsigned long long*)&_mul_f32x2_176), "l"(*(const unsigned long long*)&_packed_add_f32x2_136));
-                            yv_12_1[0] = _mul_f32x2_177.x;
-                            yv_12_1[1] = _mul_f32x2_177.y;
-                            float2 _f2_900 = make_float2(zc_11_1[2], zc_11_1[3]);
+                            yv_9_1[0] = _mul_f32x2_177.x;
+                            yv_9_1[1] = _mul_f32x2_177.y;
+                            float2 _f2_900 = make_float2(zc_8_1[2], zc_8_1[3]);
                             float2 _mul_f32x2_178;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_178) : "l"(*(const unsigned long long*)&_f2_900), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_901 = make_float2(__uint_as_float(wc_10_1[1] << 16), __uint_as_float(wc_10_1[1] & 4294901760u));
+                            float2 _f2_901 = make_float2(__uint_as_float(wc_7_1[1] << 16), __uint_as_float(wc_7_1[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8055,12 +8080,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_179;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_179) : "l"(*(const unsigned long long*)&_mul_f32x2_178), "l"(*(const unsigned long long*)&_packed_add_f32x2_137));
-                            yv_12_1[2] = _mul_f32x2_179.x;
-                            yv_12_1[3] = _mul_f32x2_179.y;
-                            float2 _f2_902 = make_float2(zc_11_1[4], zc_11_1[5]);
+                            yv_9_1[2] = _mul_f32x2_179.x;
+                            yv_9_1[3] = _mul_f32x2_179.y;
+                            float2 _f2_902 = make_float2(zc_8_1[4], zc_8_1[5]);
                             float2 _mul_f32x2_180;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_180) : "l"(*(const unsigned long long*)&_f2_902), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_903 = make_float2(__uint_as_float(wc_10_1[2] << 16), __uint_as_float(wc_10_1[2] & 4294901760u));
+                            float2 _f2_903 = make_float2(__uint_as_float(wc_7_1[2] << 16), __uint_as_float(wc_7_1[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8072,12 +8097,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_181;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_181) : "l"(*(const unsigned long long*)&_mul_f32x2_180), "l"(*(const unsigned long long*)&_packed_add_f32x2_138));
-                            yv_12_1[4] = _mul_f32x2_181.x;
-                            yv_12_1[5] = _mul_f32x2_181.y;
-                            float2 _f2_904 = make_float2(zc_11_1[6], zc_11_1[7]);
+                            yv_9_1[4] = _mul_f32x2_181.x;
+                            yv_9_1[5] = _mul_f32x2_181.y;
+                            float2 _f2_904 = make_float2(zc_8_1[6], zc_8_1[7]);
                             float2 _mul_f32x2_182;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_182) : "l"(*(const unsigned long long*)&_f2_904), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_905 = make_float2(__uint_as_float(wc_10_1[3] << 16), __uint_as_float(wc_10_1[3] & 4294901760u));
+                            float2 _f2_905 = make_float2(__uint_as_float(wc_7_1[3] << 16), __uint_as_float(wc_7_1[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8089,32 +8114,32 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_183;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_183) : "l"(*(const unsigned long long*)&_mul_f32x2_182), "l"(*(const unsigned long long*)&_packed_add_f32x2_139));
-                            yv_12_1[6] = _mul_f32x2_183.x;
-                            yv_12_1[7] = _mul_f32x2_183.y;
-                            uint32_t yv_12_bf16_1[4];
+                            yv_9_1[6] = _mul_f32x2_183.x;
+                            yv_9_1[7] = _mul_f32x2_183.y;
+                            uint32_t yv_9_bf16_1[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_12_1[_lp*2 + 0], yv_12_1[_lp*2+1 + 0]));
-                                yv_12_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_9_1[_lp*2 + 0], yv_9_1[_lp*2+1 + 0]));
+                                yv_9_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_9_1))), "r"(yv_12_bf16_1[0]), "r"(yv_12_bf16_1[1]), "r"(yv_12_bf16_1[2]), "r"(yv_12_bf16_1[3]) : "memory");
-                            int kw_13_1 = f ^ 3;
-                            unsigned int wc_14_1[4];
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_6_1))), "r"(yv_9_bf16_1[0]), "r"(yv_9_bf16_1[1]), "r"(yv_9_bf16_1[2]), "r"(yv_9_bf16_1[3]) : "memory");
+                            int kw_10_1 = f ^ 3;
+                            unsigned int wc_11_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_14_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_14_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_14_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_14_1[(0) + 3]))
-                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_13_1)));
-                            float zc_15_1[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&wc_11_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&wc_11_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wc_11_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wc_11_1[(0) + 3]))
+                                : "r"(wrow_addr + (unsigned int)(64 * pp_0_2) + (unsigned int)(16 * kw_10_1)));
+                            float zc_12_1[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[(0) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_13_1))));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[(0) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_10_1))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_15_1[(4) + 3]))
-                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (l7_6 ^ 2 * kw_13_1 + 1))));
-                            float yv_16_1[8];
-                            float2 _f2_906 = make_float2(zc_15_1[0], zc_15_1[1]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zc_12_1[(4) + 3]))
+                                : "r"(wsm_addr + (unsigned int)zlane_6 + (unsigned int)(16 * (rz_6 ^ 2 * kw_10_1 + 1))));
+                            float yv_13_1[8];
+                            float2 _f2_906 = make_float2(zc_12_1[0], zc_12_1[1]);
                             float2 _mul_f32x2_184;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_184) : "l"(*(const unsigned long long*)&_f2_906), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_907 = make_float2(__uint_as_float(wc_14_1[0] << 16), __uint_as_float(wc_14_1[0] & 4294901760u));
+                            float2 _f2_907 = make_float2(__uint_as_float(wc_11_1[0] << 16), __uint_as_float(wc_11_1[0] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8126,12 +8151,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_185;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_185) : "l"(*(const unsigned long long*)&_mul_f32x2_184), "l"(*(const unsigned long long*)&_packed_add_f32x2_140));
-                            yv_16_1[0] = _mul_f32x2_185.x;
-                            yv_16_1[1] = _mul_f32x2_185.y;
-                            float2 _f2_908 = make_float2(zc_15_1[2], zc_15_1[3]);
+                            yv_13_1[0] = _mul_f32x2_185.x;
+                            yv_13_1[1] = _mul_f32x2_185.y;
+                            float2 _f2_908 = make_float2(zc_12_1[2], zc_12_1[3]);
                             float2 _mul_f32x2_186;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_186) : "l"(*(const unsigned long long*)&_f2_908), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_909 = make_float2(__uint_as_float(wc_14_1[1] << 16), __uint_as_float(wc_14_1[1] & 4294901760u));
+                            float2 _f2_909 = make_float2(__uint_as_float(wc_11_1[1] << 16), __uint_as_float(wc_11_1[1] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8143,12 +8168,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_187;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_187) : "l"(*(const unsigned long long*)&_mul_f32x2_186), "l"(*(const unsigned long long*)&_packed_add_f32x2_141));
-                            yv_16_1[2] = _mul_f32x2_187.x;
-                            yv_16_1[3] = _mul_f32x2_187.y;
-                            float2 _f2_910 = make_float2(zc_15_1[4], zc_15_1[5]);
+                            yv_13_1[2] = _mul_f32x2_187.x;
+                            yv_13_1[3] = _mul_f32x2_187.y;
+                            float2 _f2_910 = make_float2(zc_12_1[4], zc_12_1[5]);
                             float2 _mul_f32x2_188;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_188) : "l"(*(const unsigned long long*)&_f2_910), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_911 = make_float2(__uint_as_float(wc_14_1[2] << 16), __uint_as_float(wc_14_1[2] & 4294901760u));
+                            float2 _f2_911 = make_float2(__uint_as_float(wc_11_1[2] << 16), __uint_as_float(wc_11_1[2] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8160,12 +8185,12 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_189;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_189) : "l"(*(const unsigned long long*)&_mul_f32x2_188), "l"(*(const unsigned long long*)&_packed_add_f32x2_142));
-                            yv_16_1[4] = _mul_f32x2_189.x;
-                            yv_16_1[5] = _mul_f32x2_189.y;
-                            float2 _f2_912 = make_float2(zc_15_1[6], zc_15_1[7]);
+                            yv_13_1[4] = _mul_f32x2_189.x;
+                            yv_13_1[5] = _mul_f32x2_189.y;
+                            float2 _f2_912 = make_float2(zc_12_1[6], zc_12_1[7]);
                             float2 _mul_f32x2_190;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_190) : "l"(*(const unsigned long long*)&_f2_912), "l"(*(const unsigned long long*)&_f2_816));
-                            float2 _f2_913 = make_float2(__uint_as_float(wc_14_1[3] << 16), __uint_as_float(wc_14_1[3] & 4294901760u));
+                            float2 _f2_913 = make_float2(__uint_as_float(wc_11_1[3] << 16), __uint_as_float(wc_11_1[3] & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -8177,51 +8202,51 @@ kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384(__nv_bfloat16* __rest
                             }
                             float2 _mul_f32x2_191;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_191) : "l"(*(const unsigned long long*)&_mul_f32x2_190), "l"(*(const unsigned long long*)&_packed_add_f32x2_143));
-                            yv_16_1[6] = _mul_f32x2_191.x;
-                            yv_16_1[7] = _mul_f32x2_191.y;
-                            uint32_t yv_16_bf16_1[4];
+                            yv_13_1[6] = _mul_f32x2_191.x;
+                            yv_13_1[7] = _mul_f32x2_191.y;
+                            uint32_t yv_13_bf16_1[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
-                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_16_1[_lp*2 + 0], yv_16_1[_lp*2+1 + 0]));
-                                yv_16_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv_13_1[_lp*2 + 0], yv_13_1[_lp*2+1 + 0]));
+                                yv_13_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_13_1))), "r"(yv_16_bf16_1[0]), "r"(yv_16_bf16_1[1]), "r"(yv_16_bf16_1[2]), "r"(yv_16_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + kw_10_1))), "r"(yv_13_bf16_1[0]), "r"(yv_13_bf16_1[1]), "r"(yv_13_bf16_1[2]), "r"(yv_13_bf16_1[3]) : "memory");
                             __syncwarp();
-                            unsigned int w4_17_1[4];
+                            unsigned int w4_14_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_17_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_17_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_17_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_17_1[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_14_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_14_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_14_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_14_1[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * lane_2)));
-                            long long idx_18_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2));
+                            long long idx_15_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2));
                             {
-                                int4 _iv4 = make_int4(w4_17_1[0 + 0], w4_17_1[0 + 1], w4_17_1[0 + 2], w4_17_1[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_18_1)) = _iv4;
+                                int4 _iv4 = make_int4(w4_14_1[0 + 0], w4_14_1[0 + 1], w4_14_1[0 + 2], w4_14_1[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_15_1)) = _iv4;
                             }
-                            unsigned int w4_19_1[4];
+                            unsigned int w4_16_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_19_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_19_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_19_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_19_1[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_16_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_16_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_16_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_16_1[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 32))));
-                            long long idx_20_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2 + 32));
+                            long long idx_17_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2 + 32));
                             {
-                                int4 _iv4 = make_int4(w4_19_1[0 + 0], w4_19_1[0 + 1], w4_19_1[0 + 2], w4_19_1[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_20_1)) = _iv4;
+                                int4 _iv4 = make_int4(w4_16_1[0 + 0], w4_16_1[0 + 1], w4_16_1[0 + 2], w4_16_1[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_17_1)) = _iv4;
                             }
-                            unsigned int w4_21_1[4];
+                            unsigned int w4_18_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_21_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_21_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_21_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_21_1[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_18_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_18_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_18_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_18_1[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 64))));
-                            long long idx_22_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2 + 64));
+                            long long idx_19_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2 + 64));
                             {
-                                int4 _iv4 = make_int4(w4_21_1[0 + 0], w4_21_1[0 + 1], w4_21_1[0 + 2], w4_21_1[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_22_1)) = _iv4;
+                                int4 _iv4 = make_int4(w4_18_1[0 + 0], w4_18_1[0 + 1], w4_18_1[0 + 2], w4_18_1[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_19_1)) = _iv4;
                             }
-                            unsigned int w4_23_1[4];
+                            unsigned int w4_20_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_23_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_23_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_23_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_23_1[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w4_20_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_20_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_20_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_20_1[(0) + 3]))
                                 : "r"(wsm_addr + (unsigned int)stg_off + (unsigned int)(16 * (lane_2 + 96))));
-                            long long idx_24_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2 + 96));
+                            long long idx_21_1 = drow * 3072 + (long long)(4 * (128 * j_1 + lane_2 + 96));
                             {
-                                int4 _iv4 = make_int4(w4_23_1[0 + 0], w4_23_1[0 + 1], w4_23_1[0 + 2], w4_23_1[0 + 3]);
-                                *reinterpret_cast<int4*>(out_i32 + (idx_24_1)) = _iv4;
+                                int4 _iv4 = make_int4(w4_20_1[0 + 0], w4_20_1[0 + 1], w4_20_1[0 + 2], w4_20_1[0 + 3]);
+                                *reinterpret_cast<int4*>(out_i32 + (idx_21_1)) = _iv4;
                             }
                             __syncwarp();
                         }

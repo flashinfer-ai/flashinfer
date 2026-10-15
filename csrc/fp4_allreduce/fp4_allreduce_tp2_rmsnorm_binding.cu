@@ -46,7 +46,8 @@ constexpr int64_t kNvfp4ValueBytes = 3072;
 constexpr int64_t kNvfp4ScalesPerRow = 384;
 constexpr int64_t kMxfp8ValueBytes = 6144;
 constexpr int64_t kMxfp8ScalesPerRow = 192;
-// Threads and dynamic shared memory depend on the input format (six worker warps for bfloat16, five for records).
+// Threads and dynamic shared memory depend on the input format; both values are taken from the generated
+// kernels' launch geometry (the worker-warp count plus the reset warp), so they follow the programs, not this file.
 constexpr unsigned kThreads[kInputFormats] = {256, 256};
 constexpr unsigned kDynamicSmemBytes[kInputFormats] = {219776, 215424};
 
