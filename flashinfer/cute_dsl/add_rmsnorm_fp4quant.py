@@ -1378,7 +1378,7 @@ def add_rmsnorm_fp4quant(
         ``None`` (default) or ``True``, PDL is enabled only if the current
         device supports it (probed via :func:`device_support_pdl`). Pass
         ``False`` to force-disable. See
-        https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
     y_out : torch.Tensor, optional
         Optional output tensor for the normed (pre-quantization) values
         ``y = RMSNorm(input + residual) * weight`` in the input dtype
