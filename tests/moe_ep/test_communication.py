@@ -809,7 +809,7 @@ def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:
     with pytest.raises(ValueError, match="timeout_sec"):
         _one_sided(timeout_sec=0)
     with pytest.raises(ValueError, match="top_k"):
-        _one_sided(_params(num_experts=8, top_k=3))
+        _one_sided(_params(num_experts=8, top_k=5))
     with pytest.raises(ValueError, match="eplb_stats_num_experts"):
         _one_sided(eplb_stats_num_experts=5)
 

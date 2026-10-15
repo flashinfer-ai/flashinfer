@@ -52,6 +52,8 @@ MODELS = {
         ModelShape("deepseek_v4_pro", 7168, 384, 6, "mxfp8"),
         # Kimi K3 communicates its latent MoE width, not the model's 7168.
         ModelShape("kimi_k3", 3584, 896, 16, "mxfp8"),
+        # DeepSeek-V4.1-Flash's DSpark draft layers route 3 of 128 experts.
+        ModelShape("deepseek_v41_flash_dspark", 4096, 128, 3, "mxfp8"),
     )
 }
 
@@ -664,6 +666,7 @@ CASES = [
             (MODELS["deepseek_v4_flash"], 4),
             (MODELS["deepseek_v4_pro"], 8),
             (MODELS["kimi_k3"], 8),
+            (MODELS["deepseek_v41_flash_dspark"], 4),
         )
         for num_tokens in (1, 128, 1024)
     ],

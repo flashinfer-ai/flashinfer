@@ -48,7 +48,7 @@ _CFT_MIN_DRIVER_BRANCH = 615
 # fabric.try_put.counted moves 16-byte chunks.
 _CFT_ALIGNMENT_BYTES = 16
 # Top-k values the kernels are specialized for.
-_SUPPORTED_TOP_K = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 22)
+_SUPPORTED_TOP_K = (1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 22)
 
 
 def _driver_branch() -> Optional[int]:
