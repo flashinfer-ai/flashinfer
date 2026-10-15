@@ -2,11 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import conftest
+from tests import conftest
 from flashinfer.jit import JitSpecCuteDsl, MissingJITCacheError
 
 
 def test_missing_cute_dsl_cache_is_reported_and_skipped(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_STRICT_MOE_EP_TESTS", raising=False)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
     spec = JitSpecCuteDsl("test_module", "test_kernel", lambda: None, "source-hash")
     error = MissingJITCacheError("missing CuTe-DSL artifact", spec=spec)
