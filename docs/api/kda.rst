@@ -36,9 +36,11 @@ BF16 or FP32 state, ``auto`` uses these coarse performance regions:
   long: 8K through 64K. Here K means 1024.
 
 The policy prefers cuDNN when its measured GPU time is within 10% of the
-fastest valid backend. This is an offline tuning target, not a runtime
-benchmark or a guarantee for unmeasured shapes. The measurements used
-8, 12, 64 and 96 local heads on GB200/GB300 at FlashInfer ``fd14b3056d0c``.
+fastest valid backend, except wide-head BF16 calls on GB300, which prefer
+cuDNN despite its measured 14--15% overhead against Cake. This is an offline
+tuning target, not a runtime benchmark or a guarantee for unmeasured shapes.
+The measurements used 8, 12, 64 and 96 local heads on GB200/GB300 at
+FlashInfer ``fd14b3056d0c``.
 
 .. list-table:: Preferred backend
    :header-rows: 1
@@ -72,9 +74,9 @@ benchmark or a guarantee for unmeasured shapes. The measurements used
      - cuDNN
      - cuDNN
    * - 65--96 / BF16, GB300
-     - cake
-     - cake
-     - cake
+     - cuDNN
+     - cuDNN
+     - cuDNN
    * - 65--96 / FP32
      - cute-dsl-persistent
      - cute-dsl-persistent

@@ -62,7 +62,7 @@ def _select_kda_prefill_backend(q, initial_state, cu_seqlens, *, allow_cudnn=Tru
 
     With BF16 state, few heads use small-bh until cuDNN takes over at 4K
     for up to eight heads, or 8K for 9-16 heads. Moderate heads use small-bh.
-    Wide heads use cuDNN on SM100 and Cake on SM103.
+    Wide heads use cuDNN.
 
     When cuDNN is disallowed, use the corresponding native backend:
     cute-dsl or persistent for FP32, and small-bh or Cake for BF16.
@@ -104,7 +104,7 @@ def _select_kda_prefill_backend(q, initial_state, cu_seqlens, *, allow_cudnn=Tru
         return "cudnn" if allow_cudnn and tokens >= threshold else "small-bh"
     if heads <= 64:
         return "small-bh"
-    return "cudnn" if allow_cudnn and cc == (10, 0) else "cake"
+    return "cudnn" if allow_cudnn else "cake"
 
 
 def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
