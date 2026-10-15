@@ -22,7 +22,7 @@ from tests.comm.test_pcie_ipc_all_reduce import (
     multi_process_parallel,
 )
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.node_exclusive
 
 _HIDDEN = 6144
 _BATCH = 64

@@ -41,7 +41,7 @@ tuned answer cannot be used.
 import os
 import warnings
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -410,14 +410,14 @@ TUNE_SURVIVORS = 48
 TUNE_RANK_ROUNDS = 3
 
 
-def _round_order(n: int, round_index: int) -> range:
+def _round_order(n: int, round_index: int) -> Iterable[int]:
     """Candidate indices for one ranking round; odd rounds run backward.
 
     In one fixed order the first copy-engine candidate always followed the last
     SM candidate, so every sample carried that switch and the minimum kept it.
     Depends only on its arguments, so every rank launches in the same order.
     """
-    return range(n - 1, -1, -1) if round_index % 2 else range(n)
+    return reversed(range(n)) if round_index % 2 else range(n)
 
 
 def reduce_timings(times: "torch.Tensor", group) -> "torch.Tensor":

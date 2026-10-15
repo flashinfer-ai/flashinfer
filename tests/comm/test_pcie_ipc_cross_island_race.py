@@ -46,7 +46,7 @@ from tests.comm.test_pcie_ipc_all_reduce import (
 )
 
 pytestmark = [
-    pytest.mark.solo,
+    pytest.mark.node_exclusive,
     pytest.mark.skipif(
         os.environ.get("FLASHINFER_TEST_PCIE_IPC_RACE") != "1",
         reason="opt-in: needs 8 GPUs and builds two extra JIT modules",

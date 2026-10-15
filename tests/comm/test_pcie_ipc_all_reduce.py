@@ -29,7 +29,7 @@ import flashinfer.comm as comm
 from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig, IpcVariant
 from flashinfer.comm.pcie_ipc_topology import PCIE_IPC_PROFILES
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.node_exclusive
 
 # (world_size, hidden, batch, blocks, threads, variant)
 #

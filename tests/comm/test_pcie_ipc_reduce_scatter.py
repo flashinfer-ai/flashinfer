@@ -30,7 +30,7 @@ from tests.comm.test_pcie_ipc_all_reduce import (
     multi_process_parallel,
 )
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.node_exclusive
 
 _DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _TOLERANCE = {
