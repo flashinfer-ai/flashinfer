@@ -80,6 +80,8 @@ def _kernel(
     x64 = cute.recast_ptr(x.iterator, dtype=cutlass.Uint64)
     w64 = cute.recast_ptr(weights.iterator, dtype=cutlass.Uint64)
     ws8 = cute.recast_ptr(weight_scale.iterator, dtype=cutlass.Uint8)
+    sf_gate_stride = weight_scale.stride[0]
+    sf_expert_stride = weight_scale.stride[1]
 
     if expert >= 0:
         if expert < experts:
@@ -110,8 +112,8 @@ def _kernel(
                     xs_bits = x_scale[0, (sc // 4) * 512 + token * 16 + sc % 4]
                 xs = xs_bits.bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
                 sf = row_scale_base + lane_scale_base + lane_group * 4096
-                plane = expert * I * SCALE_COLS + sf
-                gate_plane = experts * I * SCALE_COLS + plane
+                plane = expert * sf_expert_stride + sf
+                gate_plane = sf_gate_stride + plane
                 su0 = ws8[plane].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
                 if cutlass.const_expr(gated):
                     sg0 = (

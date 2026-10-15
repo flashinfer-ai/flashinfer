@@ -36,9 +36,8 @@ inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
   TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
   int configured = 0;
   for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
-        cudaSuccess) {
+    if (cudaKernelSetAttributeForDevice(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        smem_bytes, device) == cudaSuccess) {
       ++configured;
     } else {
       (void)cudaGetLastError();

@@ -46,9 +46,10 @@ def packed_kda_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
-            "packed KDA T=1 requires exact CC 10.0 (SM100a) or CC 10.3 (SM103a)"
+            "packed KDA T=1 requires exact CC 10.0 (SM100a), 10.3 (SM103a) "
+            "or 10.7 (SM107, sm100f family)"
         )
     return device
 
@@ -265,7 +266,6 @@ _BATCH_CASES = [
 ]
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("batch", _BATCH_CASES)
 def test_packed_kda_decode_matches_reference_and_preserves_pool(
     packed_kda_device, batch
@@ -300,7 +300,6 @@ def test_packed_kda_decode_matches_reference_and_preserves_pool(
     _assert_mutation_contract(case, before_storage)
 
 
-@pytest.mark.arch_blackwell
 def test_packed_kda_decode_allocates_canonical_output(packed_kda_device):
     case = _make_case(8, packed_kda_device, seed=20260820)
     _, reference_state = _clone_padded_state(case)
@@ -331,7 +330,6 @@ def test_packed_kda_decode_allocates_canonical_output(packed_kda_device):
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
 def test_packed_kda_decode_all_inactive_is_bitwise_noop(packed_kda_device):
     case = _make_case(1, packed_kda_device, seed=20260821, inactive=False)
     case["indices_host"] = [-1]
@@ -352,7 +350,6 @@ def test_packed_kda_decode_all_inactive_is_bitwise_noop(packed_kda_device):
     )
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("batch", "state_padding"),
     [(8, 17), (8, _PRODUCTION_STATE_PADDING), (64, _PRODUCTION_STATE_PADDING)],
@@ -370,7 +367,6 @@ def test_packed_kda_decode_sanitizer_schedules(packed_kda_device, batch, state_p
     torch.cuda.synchronize(packed_kda_device)
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("batch", [8, 64])
 def test_packed_kda_decode_uses_current_stream(packed_kda_device, batch):
     case = _make_case(batch, packed_kda_device, seed=20260830 + batch)
@@ -396,7 +392,6 @@ def test_packed_kda_decode_uses_current_stream(packed_kda_device, batch):
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("batch", [8, 64])
 def test_packed_kda_decode_cuda_graph_replays_changed_inputs_and_indices(
     packed_kda_device, batch
@@ -476,7 +471,6 @@ def test_packed_kda_decode_cuda_graph_replays_changed_inputs_and_indices(
     _assert_mutation_contract(case, initial_storage)
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.long_running
 def test_packed_kda_decode_512_step_fp64_diagnostic(packed_kda_device):
     steps = 512
@@ -633,6 +627,7 @@ def test_kernel_facade_preserves_legacy_fallback_and_caller_stream_cpu(
     )
     monkeypatch.setattr(packed_module, "torch", fake_torch)
     monkeypatch.setattr(packed_module, "_target_for_device", lambda device: target)
+    monkeypatch.setattr(packed_module, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
         packed_module,
         "_optimized_alignment_flags",
@@ -675,6 +670,7 @@ def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypat
     )
     monkeypatch.setattr(packed_module, "torch", fake_torch)
     monkeypatch.setattr(packed_module, "_target_for_device", lambda device: target)
+    monkeypatch.setattr(packed_module, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
         packed_module,
         "_optimized_alignment_flags",
@@ -703,13 +699,88 @@ def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypat
 
 
 @pytest.mark.parametrize(
+    ("capability", "variant", "expected"),
+    [
+        ((10, 7), "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        ((10, 7), "register_tile16", "sm100f"),
+        ((10, 7), "cpasync_tile128_register_pipeline", "sm100f"),
+        ((10, 7), "cpasync_tile64_ilp4", "sm100f"),
+        ((10, 3), "cpasync_tile64_register_pipeline_early_publish", "sm100f"),
+        ((10, 0), "cpasync_tile64_register_pipeline_early_publish", "sm100f"),
+    ],
+)
+def test_kernel_facade_native_sm107_target_is_variant_keyed_cpu(
+    monkeypatch, capability, variant, expected
+):
+    packed_module = importlib.import_module(
+        "flashinfer.kda_kernels.cake_packed_kda_decode"
+    )
+    monkeypatch.setattr(
+        packed_module, "get_compute_capability", lambda device: capability
+    )
+    monkeypatch.setattr(packed_module, "is_cuda_version_at_least", lambda version: True)
+    assert packed_module._target_for_variant(torch.device("cpu"), variant) == expected
+
+
+@pytest.mark.parametrize(
+    ("batch", "expected_variant", "expected_target"),
+    [
+        (16, "register_tile16", "sm100f"),
+        (19, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        (32, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        (63, "cpasync_tile64_register_pipeline_early_publish", "sm107a"),
+        (64, "cpasync_tile128_register_pipeline", "sm100f"),
+        (128, "cpasync_tile128_register_pipeline", "sm100f"),
+    ],
+)
+def test_kernel_facade_compiles_sm107_tile64_band_natively_cpu(
+    monkeypatch, batch, expected_variant, expected_target
+):
+    packed_module = importlib.import_module(
+        "flashinfer.kda_kernels.cake_packed_kda_decode"
+    )
+    stream_handle = 0x1234
+    fake_torch = SimpleNamespace(
+        Tensor=_FakeCudaTensor,
+        cuda=SimpleNamespace(
+            current_stream=lambda device: SimpleNamespace(cuda_stream=stream_handle)
+        ),
+    )
+    monkeypatch.setattr(packed_module, "torch", fake_torch)
+    monkeypatch.setattr(packed_module, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(packed_module, "is_cuda_version_at_least", lambda version: True)
+    monkeypatch.setattr(
+        packed_module,
+        "_optimized_alignment_flags",
+        lambda *args: (True, True),
+    )
+
+    module_calls = []
+
+    def get_module(selected_variant, selected_target):
+        module_calls.append((selected_variant, selected_target))
+        return SimpleNamespace(run=lambda *args: None)
+
+    monkeypatch.setattr(packed_module, "get_cake_kda_packed_t1_module", get_module)
+    mixed_qkv = _FakeCudaTensor((batch, _MIXED_WIDTH))
+    inputs = [mixed_qkv, *(_FakeCudaTensor((1,)) for _ in range(6))]
+    output = _FakeCudaTensor((batch, 1, _HEADS, _HEAD_DIM))
+
+    packed_module.run_packed_kda_decode(*inputs, output=output)
+
+    assert module_calls == [(expected_variant, expected_target)]
+
+
+@pytest.mark.parametrize(
     ("capability", "cuda_at_least", "expected"),
     [
         ((10, 0), {"12.8": True}, "sm100a"),
         ((10, 0), {"12.8": True, "12.9": True}, "sm100f"),
         ((10, 3), {"12.8": True, "12.9": True}, "sm100f"),
+        ((10, 7), {"12.8": True, "12.9": True, "13.0": True}, "sm100f"),
         ((10, 0), {"12.8": False}, None),
         ((10, 3), {"12.8": True, "12.9": False}, None),
+        ((10, 7), {"12.8": True, "12.9": True, "13.0": False}, None),
         ((10, 1), {"12.8": True, "12.9": True}, None),
     ],
 )
