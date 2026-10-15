@@ -19,7 +19,7 @@ autotuning or trace-apply.
 from flashinfer.experimental.dense_projection_gemm import cake_backend as gemm
 
 # K1: strided-view GEMM  out[l, m, n] = sum_k A[l, m, k] B[l, k, n]
-gemm.dense_projection_gemm(A, B, out, transposed_out=False)
+gemm.dense_projection_gemm(A, B, out, transposed_out=False)   # convenience path (cached plan)
 gemm.projection_forward(X, W, out=None)               # out[T, N] = X[T, K] @ W[N, K].T
 gemm.projection_dgrad(G, W, out=None, out_dtype=None)  # out[T, K] = G[T, N] @ W[N, K]
 gemm.projection_wgrad(G, X, out=None, out_dtype=None)  # out[N, K] = G[T, N].T @ X[T, K]
@@ -28,13 +28,42 @@ prepared = gemm.prepare_projection_wgrad(G, X, out)
 prepared.launch()   # allocation-free; prepared.template / .grid / .module_name / .plan
 
 # K2: FP32 router GEMM through split-BF16x3 emulation
-gemm.router_fp32_gemm(A, B, out, splits=None)
+gemm.router_fp32_gemm(A, B, out, splits=None)                  # convenience path (cached plan)
 gemm.router_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
 gemm.router_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
 gemm.router_wgrad(G, X, out=None, splits=11)           # out[N, K] = G[T, N].T @ X[T, K]
 prepared = gemm.prepare_router_fp32_gemm(A, B, out, splits=None)
 prepared.launch()   # re-splits B, launches, reduces the split-K partials; .splits
 ```
+
+### Host paths
+
+Both paths run the same planner once per binding and bind the same generated
+module; they differ in who owns the plan and the workspace.
+
+| | prepared path (`prepare_*` + `launch()`) | convenience path (`dense_projection_gemm`, `projection_*`, `router_*`) |
+|---|---|---|
+| planning | once, in `prepare_*` | once per cache key, on the first call |
+| workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, scratch, split-K partials) | owned by the prepared object | owned by the cache entry |
+| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), launch; `out` is allocated only when the caller passes none |
+| device queries | none after `prepare_*` | none after the first call |
+| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; `clear_convenience_caches()` |
+| CUDA Graphs | capture `launch()` | do not capture (an evicted entry frees the workspace a graph replays) |
+
+The cache key is `(device index, raw stream, flags / knobs, geometry of A, B,
+out)` where a view's geometry is its shape, strides, dtype, storage offset and
+the 16-byte alignment residue of its first element -- never its address, so new
+tensors of the same geometry hit (a training step with fresh activations) and
+an entry never holds a caller's tensor.  Launches on different streams never
+share a workspace (the stream is in the key); launches of one entry are ordered
+by their stream.  The stream-K slice counters are zero-initialised once and
+reused without a memset: the kernel resets every counter it uses (the last
+arriver of a tail tile's slice writes zero after the fixup), so they are zero
+again when the launch completes -- the same contract the Cake launcher's
+per-device counters rely on.  The caches are plain dicts under the GIL; two
+threads planning one key at once both get a valid launch (the later entry is
+kept).  The device facts a plan depends on (architecture tag, SM count, L2
+size) are read once per device index (`device_facts`).
 
 ### K1 contract
 
@@ -70,8 +99,9 @@ hints); every
 rule is a verbatim copy of the Cake kernel host's (each function names its
 source line range).  Two device facts enter the plan: the SM count (CTA pairs:
 stream-K split, raster group, wave working set) and the L2 size (hint gate);
-`prepare_*` reads both from the device (`device_sm_count`, `device_l2_bytes`
-= `torch.cuda.get_device_properties(...).L2_cache_size`, falling back to
+`prepare_*` and the convenience path read both once per device index
+(`device_facts`: `device_sm_count`, `device_l2_bytes` =
+`torch.cuda.get_device_properties(...).L2_cache_size`, falling back to
 `cuDeviceGetAttribute`), `plan_dense_projection_gemm` takes them as inputs:
 
 | choice | rule |
@@ -118,9 +148,17 @@ launcher's.
 
 ## Layout of this package
 
-* `cake_jit.py` -- `MODULES` (one record per generated program; `arches` lists
-  the architectures its single source pair serves) and `KERNELS` (`arch -> template -> module name`), both
-  filled by the generated-program export, and the JIT specs.
+* `cake_jit.py` -- the registry (schema v2) and the JIT specs.  Three literals
+  filled by the generated-program export, each wrapped in `# fmt: off` /
+  `# fmt: on` and rendered one record per line (the export replaces a literal
+  from its head line up to the next `# fmt: on`): `ARG_PLANS` (the distinct
+  argument plans -- the ordered `[kind, name]` pairs a generated entry takes --
+  keyed by the first 12 hex digits of the SHA-256 of the plan's compact JSON,
+  `arg_plan_key`; one plan serves every K1 program and one every K2 program),
+  `MODULES` (one record per generated program: template, kernel symbol, cache
+  name, sources, compile flags, FFI entry, `arg_plan` key -- `arg_plan_of`
+  resolves it and still accepts an inline list -- launch geometry, `arches`,
+  closure digest) and `KERNELS` (`arch -> template -> module name`).
 * `cake_backend.py` -- view validation, instance selection, stream-K
   planning, argument-plan binding, the prepared launches and the eager entry
   points.
@@ -140,14 +178,16 @@ is exercised.  An entry point raises `NotImplementedError` naming the missing
 instance only for a template that no export has generated.
 
 CUDA Graphs: prepare outside capture and replay the prepared launch
-(`prepare_*` once, `launch` many times).  The eager wrappers
-(`dense_projection_gemm`, `projection_wgrad`, `router_fp32_gemm`) prepare a
-new launch (a new stream-K workspace and counters) on every call; capture a
-prepared launch object rather than the eager wrappers.
+(`prepare_*` once, `launch` many times).  The convenience entry points
+(`dense_projection_gemm`, `projection_*`, `router_*`) reuse a cached planned
+launch and its workspace per (device, stream, geometry) key; capture a
+prepared launch object rather than the convenience entry points (see "Host
+paths").
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered
 instance or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
 `benchmarks/bench_cake_dense_projection_gemm.py` (the 11 GLM-5.2 projection
 rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
-batched MLA rows, paired against `torch.matmul`).
+batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the
+host time per call of the prepared launch and of the convenience entry point).

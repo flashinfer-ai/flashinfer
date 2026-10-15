@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ast
 import re
+from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +28,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     ARCH_RULE_DEFAULTS,
     BLOCK_K,
     BLOCK_N_CHOICES,
+    CONVENIENCE_CACHE_SIZE,
     CTA_GROUP,
     CTA_ROWS_CHOICES,
     EPI_WARPS,
@@ -34,7 +38,9 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     SK_MIN_ITERS,
     SMEM_OPT_IN,
     SUPPORTED_COMPUTE_CAPABILITIES,
+    arch_for,
     bind_launch,
+    convenience_key,
     default_block_n,
     default_group_m,
     default_hints,
@@ -725,7 +731,31 @@ def _l2_bytes() -> int:
 # ---------------------------------------------------------------------------
 
 
+ARG_KINDS = {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
+
+
 def test_registry_records_are_well_formed():
+    # schema v2: the distinct argument plans are stored once, keyed by the digest of their compact JSON
+    assert cake_jit.ARG_PLANS
+    for key, plan in cake_jit.ARG_PLANS.items():
+        assert re.fullmatch(r"[0-9a-f]{12}", key) and key == cake_jit.arg_plan_key(plan)
+        items = [list(item) for item in plan]
+        assert items and all(
+            len(item) == 2 and all(isinstance(s, str) for s in item) for item in items
+        )
+        names = [name for _, name in items]
+        assert len(set(names)) == len(names)
+        assert {kind for kind, _ in items} <= ARG_KINDS
+        assert ["workspace", "tma_descriptor_workspace"] not in items
+        assert {name for kind, name in items if kind == "grid"} == {
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        }
+    # every plan is referenced and every module references exactly one plan by key
+    assert {record["arg_plan"] for record in cake_jit.MODULES.values()} == set(
+        cake_jit.ARG_PLANS
+    )
     for arch, table in cake_jit.KERNELS.items():
         assert arch in cake_jit.ARCH_NVCC_FLAGS
         for template, name in table.items():
@@ -747,13 +777,21 @@ def test_registry_records_are_well_formed():
         assert (
             "tma_workspace_bytes" not in record
         )  # by-value TMA ABI: no descriptor workspace
-        plan_items = [list(item) for item in record["arg_plan"]]
-        kinds = {kind for kind, _ in record["arg_plan"]}
-        assert kinds <= {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
-        assert ["workspace", "tma_descriptor_workspace"] not in plan_items
+        assert isinstance(record["arg_plan"], str)
+        plan_items = [list(item) for item in cake_jit.arg_plan_of(record)]
+        assert plan_items == [
+            list(item) for item in cake_jit.ARG_PLANS[record["arg_plan"]]
+        ]
         if record["template"].startswith("dense_proj_gemm_"):
-            # the raster group width is a launch parameter since round 11
+            # the raster group width is a launch parameter since round 11; the stream-K slabs and the
+            # slice counters are host-owned buffers
             assert ["parameter", "group_m"] in plan_items
+            assert ["buffer", "ws"] in plan_items and [
+                "buffer",
+                "counters",
+            ] in plan_items
+        else:
+            assert ["parameter", "k_iters_split"] in plan_items
         launch = record["launch"]
         # round 19 (Cake W3): the single-CTA form (``_c1`` templates) has no cluster; every other program is a
         # two-CTA cluster (the exporter's registry check)
@@ -762,8 +800,38 @@ def test_registry_records_are_well_formed():
         )
         assert list(launch["cluster"]) == want_cluster, (name, launch)
         assert len(launch["block"]) == 3 and all(int(b) >= 1 for b in launch["block"])
+        assert int(launch["block"][0]) % 32 == 0  # whole warps
     with pytest.raises(NotImplementedError, match="not registered"):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_not_a_template")
+
+
+def test_registry_literals_follow_the_export_contract():
+    """The three registry literals are the text the Cake export replaces: each wrapped in ``# fmt: off`` /
+    ``# fmt: on`` behind its exact head line, one record per line, in the order ARG_PLANS, MODULES, KERNELS,
+    and each evaluates to the object this module imports."""
+    text = Path(cake_jit.__file__).read_text()
+    heads = (
+        ("ARG_PLANS: dict[str, list[list[str]]] = {", cake_jit.ARG_PLANS),
+        ("MODULES: dict[str, dict[str, Any]] = {", cake_jit.MODULES),
+        ("KERNELS: dict[str, dict[str, str]] = {", cake_jit.KERNELS),
+    )
+    positions = []
+    for head, value in heads:
+        assert text.count("\n" + head + "\n") == 1, head
+        start = text.index("\n" + head + "\n") + 1
+        assert text[:start].endswith("# fmt: off\n"), head
+        end = text.index("\n}\n# fmt: on\n", start)
+        body = text[start + len(head) + 1 : end]
+        lines = body.split("\n")
+        assert lines and all(
+            re.fullmatch(r'    "[^"]+": \S.*,', line) for line in lines
+        ), head
+        assert ast.literal_eval("{\n" + body + "\n}") == value, head
+        positions.append(start)
+    assert positions == sorted(positions)
+    assert cake_jit.arg_plan_key([("grid", "grid_x")]) == cake_jit.arg_plan_key(
+        [["grid", "grid_x"]]
+    )
 
 
 def test_epilogue_rules():
@@ -4888,6 +4956,184 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_kk_n256")
         == "cake_dense_projection_gemm_fake"
     )
+    # schema v2: a record names its plan by key and the key resolves through ARG_PLANS; an inline plan
+    # (the record above) is still accepted; an unknown key fails closed
+    plan = record["arg_plan"]
+    key = cake_jit.arg_plan_key(plan)
+    assert re.fullmatch(r"[0-9a-f]{12}", key) and key not in cake_jit.ARG_PLANS
+    monkeypatch.setitem(cake_jit.ARG_PLANS, key, plan)
+    monkeypatch.setitem(
+        cake_jit.MODULES,
+        "cake_dense_projection_gemm_fake_v2",
+        dict(record, arg_plan=key),
+    )
+    assert (
+        cake_jit.arg_plan_of(cake_jit.MODULES["cake_dense_projection_gemm_fake_v2"])
+        == plan
+    )
+    assert cake_jit.arg_plan_of(record) == plan
+    launch_v2 = bind_launch(
+        "cake_dense_projection_gemm_fake_v2", dict(A=A, M=8), (4, 1, 1), "sm_100a"
+    )
+    assert launch_v2.arguments == (A, 8, 4, 1, 1)
+    monkeypatch.setitem(
+        cake_jit.MODULES,
+        "cake_dense_projection_gemm_fake_v2",
+        dict(record, arg_plan="f" * 12),
+    )
+    with pytest.raises(KeyError, match="ARG_PLANS"):
+        bind_launch(
+            "cake_dense_projection_gemm_fake_v2", dict(A=A, M=8), (4, 1, 1), "sm_100a"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Convenience path (CPU): cache key, cache bound, per-call view rebuild, device facts
+# ---------------------------------------------------------------------------
+
+
+def test_convenience_key_follows_the_view_geometry_not_the_address():
+    A = torch.empty(64, 128, dtype=torch.bfloat16)
+    A_again = torch.empty(64, 128, dtype=torch.bfloat16)
+    B = torch.empty(32, 128, dtype=torch.bfloat16).t()
+    buf = torch.empty(2, 64, 32, dtype=torch.bfloat16)
+    out, out_same, out_offset = (
+        torch.empty(64, 32, dtype=torch.bfloat16),
+        buf[0],
+        buf[1],
+    )
+    key = convenience_key(0, 7, (False,), A, B, out)
+    # a new tensor of the same geometry hits (the address is not part of the key)
+    assert key == convenience_key(0, 7, (False,), A_again, B, out_same)
+    assert hash(key) == hash(convenience_key(0, 7, (False,), A_again, B, out_same))
+    others = [
+        convenience_key(1, 7, (False,), A, B, out),  # device index
+        convenience_key(0, 8, (False,), A, B, out),  # stream
+        convenience_key(0, 7, (True,), A, B, out),  # flags (transposed_out)
+        convenience_key(0, 7, (False,), A[:32], B, out[:32]),  # shape
+        convenience_key(0, 7, (False,), A.t().contiguous().t(), B, out),  # strides
+        convenience_key(0, 7, (False,), A, B, out.float()),  # dtype
+        convenience_key(0, 7, (False,), A, B, out_offset),  # storage offset
+        convenience_key(
+            0, 7, (False,), torch.empty(64, 129, dtype=torch.bfloat16)[:, 1:], B, out
+        ),  # alignment
+    ]
+    assert len({key, *others}) == len(others) + 1
+    # the entry points put their knobs into the flags (sorted items): a knob change is a new key
+    assert convenience_key(
+        0, 7, (True, ("cta_rows", 64), ("sk", "auto")), A, B, out
+    ) != convenience_key(0, 7, (True, ("cta_rows", None), ("sk", "auto")), A, B, out)
+
+
+def test_convenience_cache_is_bounded_and_evicts_the_least_recently_used_entry():
+    cache: OrderedDict = OrderedDict()
+    for i in range(5):
+        cake_backend._cache_put(cache, ("k", i), i, bound=4)
+    assert list(cache) == [("k", 1), ("k", 2), ("k", 3), ("k", 4)]
+    assert cake_backend._cache_get(cache, ("k", 1)) == 1  # a hit refreshes the entry
+    assert list(cache)[-1] == ("k", 1)
+    assert cake_backend._cache_get(cache, ("k", 0)) is None
+    cake_backend._cache_put(cache, ("k", 5), 5, bound=4)
+    assert list(cache) == [("k", 3), ("k", 4), ("k", 1), ("k", 5)]
+    assert CONVENIENCE_CACHE_SIZE >= 1
+    assert isinstance(cake_backend._K1_CACHE, OrderedDict) and isinstance(
+        cake_backend._K2_CACHE, OrderedDict
+    )
+    # the argument template keeps constants and fills the per-call slots in plan order
+    template = (cake_backend._Slot("A"), 7, cake_backend._Slot("out3"), 2, 1, 1)
+    assert cake_backend._resolve_arguments(template, dict(A="a", out3="o")) == [
+        "a",
+        7,
+        "o",
+        2,
+        1,
+        1,
+    ]
+
+
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
+def test_convenience_views_match_the_planner_views(sm_count):
+    """The per-call view rebuild of the convenience path (``_k1_views`` under ``_k1_swapped``) returns the
+    planner's operand views for the GPU rows and the MLA rows (swapped, swap-fallback and direct plans) --
+    CPU views, the planner needs no device."""
+    arch = ARCH_OF_SM[sm_count]
+    cases = [("proj", row, op, dt, T) for row, op, dt, T in GPU_ROWS] + [
+        ("mla", row, op, "bf16", T)
+        for row in MLA_ROWS
+        for op in ("fwd", "dgrad", "wgrad")
+        for T in MLA_T
+    ]
+    seen = set()
+    # the registry plan (what the convenience path caches) and the pure mirror (``_fallback=False``: the
+    # batched small-M swap is always taken, whether or not the swapped instance is registered)
+    for fallback in (True, False):
+        for family, row, op, dt, T in cases:
+            v = _views(family, row, op, dt, T)
+            transposed = v.get("transposed", False)
+            plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
+                v["A"],
+                v["B"],
+                v["out"],
+                sm_count=sm_count,
+                l2_bytes=L2_BYTES,
+                transposed_out=transposed,
+                arch=arch,
+                _fallback=fallback,
+            )
+            swapped = cake_backend._k1_swapped(
+                plan, v["A"], v["B"], transposed_out=transposed
+            )
+            rebuilt = cake_backend._k1_views(v["A"], v["B"], v["out"], swapped=swapped)
+            for got, want in zip(rebuilt, (a_desc, b_desc, out3), strict=True):
+                assert cake_backend._same_view(got, want), (family, row, op, dt, T)
+            if swapped:
+                assert plan.transposed_out and not plan.swap_fallback
+            seen.add((swapped, plan.swap_fallback))
+            ldo, out_l = cake_backend._out_strides(out3)
+            assert ldo == out3.stride(1) and out_l == (
+                out3.stride(0) if out3.shape[0] > 1 else 0
+            )
+    # a swapped plan and a direct plan were both exercised
+    assert (True, False) in seen and (False, False) in seen
+
+
+def test_router_convenience_views_match_the_planner():
+    for op, T in (("fwd", 257), ("dgrad", 257), ("wgrad", 1001)):
+        v = _router_inputs(op, T, seed=SEED + 5, device="cpu")
+        plan, A_eff, B_eff = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
+        a_view, split_src = cake_backend._k2_views(v["A"], v["B"], plan)
+        want_split = B_eff if plan.b_mn else B_eff.t()
+        want_a = A_eff.t().unsqueeze(0) if plan.a_mn else A_eff.unsqueeze(0)
+        assert cake_backend._same_view(a_view, want_a), op
+        assert cake_backend._same_view(split_src, want_split), op
+        assert tuple(a_view.shape[1:]) == (
+            (plan.K, plan.M) if plan.a_mn else (plan.M, plan.K)
+        )
+        assert (plan.swapped, plan.splits) == (
+            (op == "wgrad"),
+            ROUTER_SPLITS[plan.layout],
+        )
+    workspace = torch.empty(4, 6, 8)
+    assert cake_backend._k2_workspace_strides(workspace) == (8, 48)
+    out = torch.empty(6, 16)[:, :8]
+    assert cake_backend._k2_out32(out).data_ptr() == out.data_ptr()
+    assert (
+        cake_backend._k2_out32(out).dim() == 1
+        and cake_backend._k2_out32(torch.empty(6, 8)).dim() == 2
+    )
+
+
+def test_device_facts_are_keyed_by_the_device_index():
+    assert cake_backend._cuda_index(torch.device("cuda", 1)) == 1
+    assert cake_backend._cuda_index("cuda:2") == 2 and cake_backend._cuda_index(3) == 3
+    with pytest.raises(ValueError, match="CUDA"):
+        cake_backend._cuda_index(torch.device("cpu"))
+    assert arch_for(torch.device("cpu")) is None
+    facts = cake_backend.DeviceFacts(
+        index=0, arch="sm_100a", sm_count=148, l2_bytes=L2_BYTES
+    )
+    assert (facts.arch, facts.sm_count, facts.l2_bytes) == ("sm_100a", 148, L2_BYTES)
+    assert isinstance(cake_backend._DEVICE_FACTS, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -5084,6 +5330,104 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     assert torch.equal(first, out)
 
 
+def test_convenience_path_reuses_its_planned_launch_without_allocation():
+    if not _device_supported():
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 6)
+    T, K, N = (
+        257,
+        6144,
+        576,
+    )  # the kv_a forward row (register epilogue, K-major operands)
+    X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    W = (torch.randn(N, K, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
+    out = torch.empty(T, N, device=device, dtype=torch.bfloat16)
+    _require_program(_plan_template(dict(A=X, B=W.t(), out=out)))
+    facts = cake_backend.device_facts(device)
+    assert facts is cake_backend.device_facts(torch.device("cuda", facts.index))
+    assert (facts.sm_count, facts.l2_bytes) == (_sm_count(), _l2_bytes())
+    cake_backend.clear_convenience_caches()
+    first = cake_backend.projection_forward(X, W, out).clone()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(X.double(), W.double().t()))
+    assert len(cake_backend._K1_CACHE) == 1
+    # new tensors of the same geometry hit the cached plan: no planning, no allocation (``out`` is given)
+    X2 = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    out2 = torch.empty_like(out)
+    before = torch.cuda.memory_stats()
+    cake_backend.projection_forward(X2, W, out2)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    assert len(cake_backend._K1_CACHE) == 1
+    _check(out2, torch.matmul(X2.double(), W.double().t()))
+    assert torch.equal(cake_backend.projection_forward(X, W, out), first)
+    # another stream never shares an entry (nor its workspace)
+    with torch.cuda.stream(torch.cuda.Stream(device=device)):
+        cake_backend.projection_forward(X, W, out2)
+    torch.cuda.synchronize()
+    assert len(cake_backend._K1_CACHE) == 2 and torch.equal(out2, first)
+    # the prepared path of the same binding gives the same bits
+    prepared = prepare_dense_projection_gemm(X, W.t(), out2)
+    assert (
+        prepared.template == next(iter(cake_backend._K1_CACHE.values())).plan.template
+    )
+    assert torch.equal(prepared.launch(), first)
+
+
+def test_convenience_path_replays_a_stream_k_row_bit_exact():
+    """The cached entry owns the stream-K workspace and the slice counters: the second call of the same
+    geometry reuses them without a memset (the kernel resets every counter it uses), stays allocation-free
+    and reproduces the first result bit for bit."""
+    if not _device_supported():
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 7)
+    T, K, N = (
+        1001,
+        3072,
+        32,
+    )  # the swapped small-N weight gradient of the prepared-launch test
+    X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
+    v = dict(
+        A=X.t(),
+        B=G,
+        out=torch.empty(N, K, device=device, dtype=torch.bfloat16),
+        transposed=True,
+    )
+    knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
+    cake_backend.clear_convenience_caches()
+    out1 = cake_backend.projection_wgrad(G, X, **knobs)  # ``out`` allocated here
+    torch.cuda.synchronize()
+    _check(out1.t(), torch.matmul(X.t().double(), G.double()))
+    assert len(cake_backend._K1_CACHE) == 1
+    entry = next(iter(cake_backend._K1_CACHE.values()))
+    # the weight-gradient swap is the caller's (``wgrad_views`` -> ``transposed_out``); the batched small-M
+    # swap of the planner (``entry.swapped``) does not apply to a 2-D row
+    assert entry.plan.transposed_out and not entry.swapped
+    out2 = torch.empty_like(out1)
+    before = torch.cuda.memory_stats()
+    cake_backend.projection_wgrad(G, X, out2, **knobs)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    assert len(cake_backend._K1_CACHE) == 1 and torch.equal(out1, out2)
+    if entry.plan.sk_units:
+        # the counters the launch used are back at zero when it completes
+        used = entry.counters[: entry.plan.counters_u32].view(
+            torch.int32
+        )  # bitcast: int32 reductions
+        assert int(torch.count_nonzero(used)) == 0
+    # a different knob set is a different entry (``_registered_knobs`` picked the registered family)
+    assert cake_backend.convenience_key(
+        0, 0, (True, ("cta_rows", 64), ("sk", "auto")), G, X, out1
+    ) != cake_backend.convenience_key(
+        0, 0, (True, ("cta_rows", 128), ("sk", "auto")), G, X, out1
+    )
+
+
 def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
     g = torch.Generator(device=device).manual_seed(seed)
     X = torch.randn(T, K, device=device, generator=g)
@@ -5128,10 +5472,20 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
         top = torch.topk(v["out"].double(), 8, dim=1).indices.sort(dim=1).values
         assert int((top != ref_top).any(dim=1).sum()) == 0
     # the eager entry point of the row gives the same bits
-    eager = dict(
+    eager_fn = dict(
         fwd=lambda: cake_backend.router_forward(v["X"], v["W"]),
         dgrad=lambda: cake_backend.router_dgrad(v["G"], v["W"]),
         wgrad=lambda: cake_backend.router_wgrad(v["G"], v["X"]),
-    )[op]()
+    )[op]
+    cake_backend.clear_convenience_caches()
+    eager = eager_fn()
     torch.cuda.synchronize()
     assert torch.equal(eager, v["out"])
+    assert len(cake_backend._K2_CACHE) == 1
+    # the second eager call hits the cached plan: only ``out`` is allocated, the same bits come back
+    before = torch.cuda.memory_stats()
+    again = eager_fn()
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 1
+    assert len(cake_backend._K2_CACHE) == 1 and torch.equal(again, v["out"])

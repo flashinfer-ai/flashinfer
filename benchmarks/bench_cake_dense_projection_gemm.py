@@ -32,18 +32,22 @@ Timing: ``flashinfer.testing.bench_gpu_time`` with CUPTI activity tracing and a 
 between iterations (per-iteration GPU span); medians over ``--steps`` iterations, the
 Cake arm re-timed after the baseline so both figures come from the same clock regime.
 ``--accuracy`` adds the error against an FP64 reference of the same views.
+``--host-overhead`` adds the mean host (CPU) time per call of the prepared launch and of
+the convenience entry point of the row (``host_us_prepared`` / ``host_us_eager``: wall
+time of back-to-back calls on the host, not GPU time).
 
 Usage::
 
     python benchmarks/bench_cake_dense_projection_gemm.py [--rows kv_a_fwd_bf16_t16231 ...]
         [--ops fwd,dgrad,wgrad] [--T 16231,16172] [--f32-grads] [--no-mla] [--no-router]
-        [--steps 20] [--accuracy] [--json out.json]
+        [--steps 20] [--accuracy] [--host-overhead] [--json out.json]
 """
 
 import argparse
 import json
 import statistics
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -196,6 +200,16 @@ def cake_arm(spec, inp):
     return prepared
 
 
+def eager_arm(spec, inp):
+    """The convenience entry point of the row (the cached planned launch; ``out`` is passed, so a cache
+    hit allocates nothing)."""
+    if spec["family"] == "router":
+        return lambda: cake_backend.router_fp32_gemm(inp["A"], inp["B"], inp["out"])
+    if spec["family"] == "proj" and spec["op"] == "wgrad":
+        return lambda: cake_backend.projection_wgrad(inp["G"], inp["X"], inp["out"])
+    return lambda: cake_backend.dense_projection_gemm(inp["A"], inp["B"], inp["out"])
+
+
 def torch_arm(spec, inp):
     """``torch.matmul`` on the same views: cuBLAS for the BF16 rows (bf16 GEMM + cast for
     the fp32-output gradient rows, torch has no native bf16 -> fp32 route), SGEMM with TF32
@@ -227,6 +241,21 @@ def median_ms(fn, steps):
         fn, dry_run_iters=3, repeat_iters=steps, enable_cupti=True, cold_l2_cache=True
     )
     return float(statistics.median(times))
+
+
+def host_us_per_call(fn, steps):
+    """Mean host (CPU) time per call in microseconds: ``steps`` back-to-back calls after one warm-up call
+    (the first call of the convenience path plans and allocates), the device synchronized before the timed
+    calls and after them.  The launches queue asynchronously, so the figure is the host path's cost, not
+    the kernel's."""
+    fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(steps):
+        fn()
+    host = time.perf_counter() - start
+    torch.cuda.synchronize()
+    return host / steps * 1e6
 
 
 def accuracy(inp, out):
@@ -265,6 +294,9 @@ def measure_row(label, spec, args):
         torch.cuda.synchronize()
         if args.accuracy:
             entry["torch_accuracy"] = accuracy(inp, inp["out"])
+        if args.host_overhead:
+            entry["host_us_prepared"] = host_us_per_call(prepared.launch, args.steps)
+            entry["host_us_eager"] = host_us_per_call(eager_arm(spec, inp), args.steps)
         # Equal-sample comparison: both arms are timed twice in alternating order
         # (Cake / torch / Cake / torch) and reduced the same way, so neither arm
         # gets the "best of two medians" advantage.
@@ -285,7 +317,12 @@ def measure_row(label, spec, args):
         )
         print(
             f"{label:34s} {entry['template']:36s} cake {cake_ms:8.4f} ms ({entry['cake_tflops']:7.1f} TFLOPS)"
-            f"  torch {torch_ms:8.4f} ms  x{entry['speedup_vs_torch']:5.2f}",
+            f"  torch {torch_ms:8.4f} ms  x{entry['speedup_vs_torch']:5.2f}"
+            + (
+                f"  host {entry['host_us_prepared']:6.1f} / {entry['host_us_eager']:6.1f} us"
+                if args.host_overhead
+                else ""
+            ),
             flush=True,
         )
     except (
@@ -315,6 +352,11 @@ def main():
     parser.add_argument("--no-router", action="store_true")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--accuracy", action="store_true")
+    parser.add_argument(
+        "--host-overhead",
+        action="store_true",
+        help="add the mean host time per call of the prepared launch and of the convenience entry point",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()

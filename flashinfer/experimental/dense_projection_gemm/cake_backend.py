@@ -70,21 +70,33 @@ operand layouts select the instance and the production split count
 (``kk`` forward 4, ``kn`` input gradient 1, ``nn`` -> the swapped
 transposed-store ``nn_t`` weight gradient 11).
 
-Every allocation happens in :func:`prepare_dense_projection_gemm` /
-:func:`prepare_router_fp32_gemm`; the returned prepared launch replays with no
-CUDA allocation and no host synchronization for new values written into the
-bound tensors.  Every ``launch()`` is launch-only: the generated binding encodes
-the operand tensor maps by value from the bound views on each call (no descriptor
-workspace), so a prepared launch can be captured into a CUDA Graph from its first
-call.  The eager entry points (:func:`dense_projection_gemm`,
-:func:`projection_forward` / :func:`projection_dgrad` / :func:`projection_wgrad`,
-:func:`router_fp32_gemm`, :func:`router_forward` / :func:`router_dgrad` /
-:func:`router_wgrad`) prepare and launch in one call.
+Two host paths share one planner and one binding:
+
+* the prepared path -- :func:`prepare_dense_projection_gemm` /
+  :func:`prepare_router_fp32_gemm` plan once and own their workspace; the
+  returned launch replays with no CUDA allocation and no host synchronization
+  for new values written into the bound tensors.  Every ``launch()`` is
+  launch-only: the generated binding encodes the operand tensor maps by value
+  from the bound views on each call (no descriptor workspace), so a prepared
+  launch can be captured into a CUDA Graph from its first call;
+* the convenience path -- :func:`dense_projection_gemm`,
+  :func:`projection_forward` / :func:`projection_dgrad` / :func:`projection_wgrad`,
+  :func:`router_fp32_gemm`, :func:`router_forward` / :func:`router_dgrad` /
+  :func:`router_wgrad` -- keeps a bounded per-process cache of planned launches
+  keyed by the device, the stream and the geometry of the views (shapes,
+  strides, dtypes, storage offsets, alignment, flags); a call that hits the
+  cache rebinds the caller's views and launches without planning, device
+  queries or allocation (``out`` is allocated only when the caller passes
+  none).  See ``CONVENIENCE_CACHE_SIZE`` and :func:`clear_convenience_caches`.
+
+The device facts a plan depends on (architecture, SM count, L2 size) are read
+once per device index (:func:`device_facts`).
 """
 
 from __future__ import annotations
 
 import dataclasses
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Tuple, Union
 
@@ -95,6 +107,7 @@ from .cake_jit import (
     KERNELS,
     MODULES,
     TRACKING_ISSUE,
+    arg_plan_of,
     load_cake_dense_projection_gemm_module,
     select_module,
 )
@@ -192,13 +205,77 @@ ROUTER_SPLITS = {"kk": 4, "kn": 1, "nn_t": 11}
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class DeviceFacts:
+    """The facts of one CUDA device the host path depends on, read once per device index: the architecture
+    tag (``None`` on an unsupported device), the SM count (CTA pairs: stream-K split, raster group, wave working
+    set) and the L2 size (the TMA eviction-hint working-set gate)."""
+
+    index: int
+    arch: Optional[str]
+    sm_count: int
+    l2_bytes: int
+
+
+_DEVICE_FACTS: dict[int, DeviceFacts] = {}
+
+
+def _cuda_index(device: Any = None) -> int:
+    """Ordinal of a CUDA device (a ``torch.device``, an index or a ``"cuda[:n]"`` string; ``None`` or a bare
+    ``cuda`` is the current device).  ``torch.device`` objects of one device are not interchangeable as dict
+    keys (``cuda`` versus ``cuda:0``), so every per-device cache is keyed by this ordinal."""
+    if device is None:
+        return int(torch.cuda.current_device())
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"expected a CUDA device, got {device}")
+    if device.index is None:
+        return int(torch.cuda.current_device())
+    return int(device.index)
+
+
+def _driver_l2_bytes(index: int) -> int:
+    from cuda.bindings import driver as cuda
+
+    err, l2 = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, index
+    )
+    if err != cuda.CUresult.CUDA_SUCCESS or not l2:
+        raise RuntimeError(
+            f"dense_projection_gemm: cannot resolve the L2 size of cuda:{index} ({err})"
+        )
+    return int(l2)
+
+
+def device_facts(device: Any = None) -> DeviceFacts:
+    """The cached :class:`DeviceFacts` of ``device``: one ``torch.cuda.get_device_properties`` query per
+    device index for the lifetime of the process.  The L2 size is ``L2_cache_size`` of the properties,
+    falling back to ``cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)`` -- the same source as the
+    Cake host's ``_l2_bytes`` (no per-SKU table).  [Cake ``_l2_bytes`` L1377-L1392]"""
+    index = _cuda_index(device)
+    facts = _DEVICE_FACTS.get(index)
+    if facts is None:
+        props = torch.cuda.get_device_properties(index)
+        l2 = getattr(props, "L2_cache_size", None) or _driver_l2_bytes(index)
+        facts = _DEVICE_FACTS[index] = DeviceFacts(
+            index=index,
+            arch=SUPPORTED_COMPUTE_CAPABILITIES.get(
+                (int(props.major), int(props.minor))
+            ),
+            sm_count=int(props.multi_processor_count),
+            l2_bytes=int(l2),
+        )
+    return facts
+
+
 def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
     """Architecture tag of ``device`` (``None`` when unsupported or without CUDA)."""
     if not torch.cuda.is_available():
         return None
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    if device is not None and torch.device(device).type != "cuda":
+        return None
+    return device_facts(device).arch
 
 
 def require_arch(device: torch.device) -> str:
@@ -224,7 +301,8 @@ def generated_program_available(
 
 
 def device_sm_count(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    """SM count of ``device`` (cached per device index, see :func:`device_facts`)."""
+    return device_facts(device).sm_count
 
 
 def sm_pairs(sm_count: int) -> int:
@@ -240,34 +318,10 @@ def sm_units(sm_count: int, cta_group: int = CTA_GROUP) -> int:
     return max(1, int(sm_count))
 
 
-_L2_BYTES: dict[str, int] = {}
-
-
 def device_l2_bytes(device: torch.device) -> int:
-    """L2 size of ``device`` from the driver (no per-SKU table): resolves the hint working-set
-    gate exactly as the Cake host's ``_l2_bytes`` does (``torch.cuda.get_device_properties``
-    ``L2_cache_size``, falling back to ``cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)``).
-    [Cake ``_l2_bytes`` L1377-L1392]"""
-    key = str(device)
-    if key not in _L2_BYTES:
-        l2 = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", None)
-        if not l2:
-            from cuda.bindings import driver as cuda
-
-            dev = (
-                torch.device(device).index
-                if torch.device(device).index is not None
-                else torch.cuda.current_device()
-            )
-            err, l2 = cuda.cuDeviceGetAttribute(
-                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, dev
-            )
-            if err != cuda.CUresult.CUDA_SUCCESS or not l2:
-                raise RuntimeError(
-                    f"dense_projection_gemm: cannot resolve the L2 size of {device} ({err})"
-                )
-        _L2_BYTES[key] = int(l2)
-    return _L2_BYTES[key]
+    """L2 size of ``device`` in bytes (cached per device index, see :func:`device_facts`): resolves the hint
+    working-set gate exactly as the Cake host's ``_l2_bytes`` does."""
+    return device_facts(device).l2_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -2267,24 +2321,25 @@ class _Launch:
         self.entry(*self.arguments)
 
 
-def bind_launch(
-    module_name: str, values: dict[str, Any], grid: tuple[int, int, int], arch: str
-) -> _Launch:
-    """Order ``values`` by the generated argument plan of ``module_name`` and load its entry.
-
-    Fails closed: a keyword the kernel expects that the host does not provide raises
-    ``KeyError`` naming both sides.  The grid must be a multiple of the cluster shape baked
-    into the module.
-    """
-    record = MODULES[module_name]
+def _grid_fits_cluster(
+    module_name: str, record: dict[str, Any], grid: tuple[int, int, int]
+) -> None:
     cluster = record.get("launch", {}).get("cluster")
     if cluster and any(g % c for g, c in zip(grid, cluster, strict=True)):
         raise ValueError(
             f"{module_name}: grid {grid} is not a multiple of the cluster shape {tuple(cluster)} baked into the module"
         )
+
+
+def _order_arguments(
+    module_name: str, plan, values: dict[str, Any], grid: tuple[int, int, int]
+) -> list:
+    """``values`` in the order of the argument plan ``plan`` (``[kind, name]`` pairs); the ``grid`` entries come
+    from ``grid``.  Fails closed: a keyword the kernel expects that the host does not provide raises ``KeyError``
+    naming both sides."""
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, name in plan:
         if kind == "grid":
             arguments.append(grid_values[name])
         elif name in values and values[name] is not None:
@@ -2294,34 +2349,60 @@ def bind_launch(
                 f"generated module {module_name!r} expects argument {name!r} ({kind}); "
                 f"the host binding provides {sorted(k for k, v in values.items() if v is not None)}"
             )
+    return arguments
+
+
+def _bind(
+    module_name: str, values: dict[str, Any], grid: tuple[int, int, int], arch: str
+) -> tuple[Callable[..., Any], tuple]:
+    """``(entry, arguments)`` of ``module_name``: the loaded FFI entry and ``values`` ordered by the module's
+    argument plan (``cake_jit.arg_plan_of``: a key into ``ARG_PLANS`` or an inline list)."""
+    record = MODULES[module_name]
+    _grid_fits_cluster(module_name, record, grid)
+    arguments = _order_arguments(module_name, arg_plan_of(record), values, grid)
     module = load_cake_dense_projection_gemm_module(module_name, arch)
-    return _Launch(
-        module_name, getattr(module, record["ffi_entry"]), tuple(arguments), grid
-    )
+    return getattr(module, record["ffi_entry"]), tuple(arguments)
+
+
+def bind_launch(
+    module_name: str, values: dict[str, Any], grid: tuple[int, int, int], arch: str
+) -> _Launch:
+    """Order ``values`` by the generated argument plan of ``module_name`` and load its entry.
+
+    Fails closed: a keyword the kernel expects that the host does not provide raises
+    ``KeyError`` naming both sides.  The grid must be a multiple of the cluster shape baked
+    into the module.
+    """
+    entry, arguments = _bind(module_name, values, grid, arch)
+    return _Launch(module_name, entry, arguments, grid)
 
 
 _FFI_DEVICES: dict[int, Any] = {}
 
 
-def _ffi_stream_context(index: int):
-    """tvm-ffi environment-stream context for torch's current stream on device ``index``
-    (the caller's downstream ops are stream-ordered after the kernel)."""
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _current_raw_stream(index: int) -> int:
+    """torch's current stream on device ``index`` as a raw ``cudaStream_t`` value."""
+    if _RAW_STREAM is not None:
+        return int(_RAW_STREAM(index))
+    return int(torch.cuda.current_stream(index).cuda_stream)
+
+
+def _ffi_stream_context(index: int, raw: Optional[int] = None):
+    """tvm-ffi environment-stream context for torch's current stream on device ``index`` (``raw`` when the
+    caller already read it): the caller's downstream ops are stream-ordered after the kernel."""
     device = _FFI_DEVICES.get(index)
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
-    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = (
-        getter(index)
-        if getter is not None
-        else torch.cuda.current_stream(index).cuda_stream
-    )
+    if raw is None:
+        raw = _current_raw_stream(index)
     return tvm_ffi.use_raw_stream(device, raw)
 
 
 def _device_index(device: torch.device) -> int:
-    return int(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
+    return _cuda_index(device)
 
 
 # Small tensors an instance never dereferences (the operands of the epilogue path it does not
@@ -2356,6 +2437,91 @@ def flat_alias(t: torch.Tensor) -> torch.Tensor:
         if int(s) > 0
     )
     return torch.as_strided(t, (span,), (1,))
+
+
+# ---------------------------------------------------------------------------
+# Convenience-path cache (shared by K1 and K2)
+# ---------------------------------------------------------------------------
+
+# The convenience entry points keep the planned launches of a process per kind (K1 / K2) in a least-recently-used
+# cache of this many entries.  An entry owns the workspace of its plan (K1: the stream-K partial slabs and the
+# slice counters; K2: the BF16x3 stack, its fp32 scratch and the split-K workspace) and the resolved module entry,
+# never a caller's tensor: the operand views are rebound from the caller's tensors on every call.  The key holds
+# the raw stream, so launches on different streams never share a workspace, and launches of one entry are ordered
+# by their stream.  The caches are plain dicts under the GIL: concurrent threads may plan one key twice (both
+# results are valid; the later one is kept).  A CUDA Graph should capture a prepared launch, not the convenience
+# path: an entry evicted after capture would free the workspace the graph replays.
+CONVENIENCE_CACHE_SIZE = 64
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """A per-call argument of a cached launch (a view of the caller's tensors), filled in at launch time."""
+
+    name: str
+
+
+def _view_key(t: torch.Tensor) -> tuple:
+    """The geometry of a view that fixes its plan and its binding: shape, strides, dtype, storage offset and
+    the 16-byte alignment residue of its first element (the planner's alignment checks); never its address."""
+    return (
+        tuple(int(s) for s in t.shape),
+        tuple(int(s) for s in t.stride()),
+        t.dtype,
+        int(t.storage_offset()),
+        int(t.data_ptr() & 15),
+    )
+
+
+def convenience_key(
+    device_index: int, stream: int, flags: tuple, *views: torch.Tensor
+) -> tuple:
+    """Cache key of a convenience-path launch: the device, the raw stream, the entry point's flags / knobs and
+    the geometry of every view (:func:`_view_key`)."""
+    return (
+        int(device_index),
+        int(stream),
+        tuple(flags),
+        *(_view_key(t) for t in views),
+    )
+
+
+def _cache_get(cache: "OrderedDict[tuple, Any]", key: tuple) -> Any:
+    entry = cache.get(key)
+    if entry is not None:
+        cache.move_to_end(key)
+    return entry
+
+
+def _cache_put(
+    cache: "OrderedDict[tuple, Any]",
+    key: tuple,
+    entry: Any,
+    bound: int = CONVENIENCE_CACHE_SIZE,
+) -> Any:
+    cache[key] = entry
+    cache.move_to_end(key)
+    while len(cache) > bound:
+        cache.popitem(last=False)
+    return entry
+
+
+def _resolve_arguments(template: tuple, views: dict[str, torch.Tensor]) -> list:
+    """The argument list of a cached launch: ``template`` with every ``_Slot`` replaced by the caller's view."""
+    return [views[item.name] if type(item) is _Slot else item for item in template]
+
+
+def _same_cuda_device(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
+) -> torch.device:
+    device = out.device
+    if (
+        not (A.is_cuda and B.is_cuda and out.is_cuda)
+        or A.device != device
+        or B.device != device
+    ):
+        raise ValueError("Expected A, B and out on one CUDA device")
+    return device
 
 
 # ---------------------------------------------------------------------------
@@ -2395,6 +2561,98 @@ class PreparedGemm:
         return self.out
 
     __call__ = launch
+
+
+def _k1_plan(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool,
+    knobs: dict[str, Any],
+) -> tuple[GemmPlan, torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
+    """Plan one K1 binding for its device: ``(plan, a_desc, b_desc, out3, arch, module_name)`` (the device facts
+    come from the per-device cache, the module from the registry; see :func:`plan_dense_projection_gemm`)."""
+    device = _same_cuda_device(A, B, out)
+    facts = device_facts(device)
+    arch = require_arch(device)
+    plan, a_desc, b_desc, O3 = plan_dense_projection_gemm(
+        A,
+        B,
+        out,
+        sm_count=facts.sm_count,
+        l2_bytes=facts.l2_bytes,
+        transposed_out=transposed_out,
+        arch=arch,
+        **knobs,
+    )
+    return plan, a_desc, b_desc, O3, arch, select_module(arch, plan.template)
+
+
+def _k1_workspace(
+    plan: GemmPlan, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The stream-K partial slabs and the slice counters of a plan (the only allocations of the K1 backend).
+    The counters are zero-initialised once: the kernel resets every counter it uses (the last arriver of a tail
+    tile's slice writes zero after the fixup), so a buffer is zero again when its launch completes and is reused
+    across launches without a memset, as the Cake launcher's per-device counters are.  Sized like the Cake host's
+    ``_sk_counters`` so the lane-spread dummy counters above SK_DUMMY_BASE are addressable."""
+    if plan.ws_f32_elems:
+        ws = torch.empty(plan.ws_f32_elems, device=device, dtype=torch.float32)
+    else:
+        ws = _dummy(device, torch.float32)
+    counters = torch.zeros(plan.counters_alloc_u32, device=device, dtype=torch.uint32)
+    return ws, counters
+
+
+def _out_strides(out3: torch.Tensor) -> tuple[int, int]:
+    """``(ldo, out_l)`` of the batched output view: its row stride and its batch stride (0 for a batch of one)."""
+    return int(out3.stride(1)), (int(out3.stride(0)) if out3.shape[0] > 1 else 0)
+
+
+def _k1_values(
+    plan: GemmPlan,
+    device: torch.device,
+    *,
+    A: Any,
+    B: Any,
+    out3: Any,
+    o_alias: Any,
+    ws: torch.Tensor,
+    counters: torch.Tensor,
+    ldo: int,
+    out_l: int,
+) -> dict[str, Any]:
+    """The keyword arguments of a K1 launch (:func:`bind_launch` orders them by the module's plan).  ``A`` /
+    ``B`` / ``out3`` / ``o_alias`` are the operand views -- or :class:`_Slot` markers for a cached launch that
+    rebinds them on every call; the plan decides which of them the instance dereferences."""
+    dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
+    tma_out, out_f32 = plan.tma_out, plan.out_f32
+    return dict(
+        A=A,
+        B=B,
+        OUT32=out3 if (tma_out and out_f32) else _dummy_map(device, torch.float32),
+        OUT16=out3 if (tma_out and not out_f32) else _dummy_map(device, torch.bfloat16),
+        # round 27: the stt program keeps the register-store alias next to the OUT16 descriptor  [Cake launcher]
+        out=o_alias if (not out_f32 and (not tma_out or plan.stt)) else dummy16,
+        out32=o_alias if (out_f32 and not tma_out) else dummy32,
+        ws=ws,
+        counters=counters,
+        M=plan.M,
+        N=plan.N,
+        m_tiles=plan.m_tiles,
+        n_tiles=plan.n_tiles,
+        group_m=plan.group_m,
+        promo_code=L2_PROMOS.index(plan.promo),
+        k_iters=plan.k_blocks,
+        ldo=ldo,
+        out_l=out_l,
+        num_cluster_tiles=plan.num_cluster_tiles,
+        num_l=plan.L,
+        num_full=plan.num_full,
+        iters_per_unit=plan.iters_per_unit,
+        sk_iters=plan.sk_iters,
+    )
 
 
 def prepare_dense_projection_gemm(
@@ -2439,21 +2697,7 @@ def prepare_dense_projection_gemm(
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
     knobs default to the Cake launcher's choices."""
-    device = out.device
-    if (
-        not (A.is_cuda and B.is_cuda and out.is_cuda)
-        or A.device != device
-        or B.device != device
-    ):
-        raise ValueError("Expected A, B and out on one CUDA device")
-    arch = require_arch(device)
-    plan, a_desc, b_desc, O3 = plan_dense_projection_gemm(
-        A,
-        B,
-        out,
-        sm_count=device_sm_count(device),
-        l2_bytes=device_l2_bytes(device),
-        transposed_out=transposed_out,
+    knobs: dict[str, Any] = dict(
         sk=sk,
         block_n=block_n,
         stages=stages,
@@ -2486,46 +2730,28 @@ def prepare_dense_projection_gemm(
         ovr=ovr,
         stt=stt,
         pro=pro,
-        arch=arch,
     )
-    module_name = select_module(arch, plan.template)
-    if plan.ws_f32_elems:
-        ws = torch.empty(plan.ws_f32_elems, device=device, dtype=torch.float32)
-    else:
-        ws = _dummy(device, torch.float32)
-    # Zero-initialised slice counters (the kernel resets every counter it uses); sized like the Cake
-    # host's ``_sk_counters`` so the lane-spread dummy counters above SK_DUMMY_BASE are addressable.
-    counters = torch.zeros(plan.counters_alloc_u32, device=device, dtype=torch.uint32)
-    dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
+    plan, a_desc, b_desc, O3, arch, module_name = _k1_plan(
+        A, B, out, transposed_out=transposed_out, knobs=knobs
+    )
+    device = out.device
+    ws, counters = _k1_workspace(plan, device)
     o_alias = flat_alias(O3)
-    tma_out, out_f32 = plan.tma_out, plan.out_f32
+    ldo, out_l = _out_strides(O3)
     tensors = dict(
         A=a_desc, B=b_desc, out3=O3, ws=ws, counters=counters, o_alias=o_alias
     )
-    values: dict[str, Any] = dict(
+    values = _k1_values(
+        plan,
+        device,
         A=a_desc,
         B=b_desc,
-        OUT32=O3 if (tma_out and out_f32) else _dummy_map(device, torch.float32),
-        OUT16=O3 if (tma_out and not out_f32) else _dummy_map(device, torch.bfloat16),
-        # round 27: the stt program keeps the register-store alias next to the OUT16 descriptor  [Cake launcher]
-        out=o_alias if (not out_f32 and (not tma_out or plan.stt)) else dummy16,
-        out32=o_alias if (out_f32 and not tma_out) else dummy32,
+        out3=O3,
+        o_alias=o_alias,
         ws=ws,
         counters=counters,
-        M=plan.M,
-        N=plan.N,
-        m_tiles=plan.m_tiles,
-        n_tiles=plan.n_tiles,
-        group_m=plan.group_m,
-        promo_code=L2_PROMOS.index(plan.promo),
-        k_iters=plan.k_blocks,
-        ldo=int(O3.stride(1)),
-        out_l=int(O3.stride(0)) if O3.shape[0] > 1 else 0,
-        num_cluster_tiles=plan.num_cluster_tiles,
-        num_l=plan.L,
-        num_full=plan.num_full,
-        iters_per_unit=plan.iters_per_unit,
-        sk_iters=plan.sk_iters,
+        ldo=ldo,
+        out_l=out_l,
     )
     launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedGemm(
@@ -2539,13 +2765,142 @@ def prepare_dense_projection_gemm(
     )
 
 
+# ---------------------------------------------------------------------------
+# K1 convenience path (cached planned launches)
+# ---------------------------------------------------------------------------
+
+
+def _k1_swapped(
+    plan: GemmPlan, A: torch.Tensor, B: torch.Tensor, *, transposed_out: bool
+) -> bool:
+    """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  The
+    launcher's small-M swap rule on the caller's dimensions, unless the registry fallback undid the swap
+    (``plan.swap_fallback``)."""
+    A3, B3 = as_batched(A, "A"), as_batched(B, "B")
+    L, M, N = int(A3.shape[0]), int(A3.shape[1]), int(B3.shape[2])
+    return swap_small_m(L, M, N, transposed_out) and not plan.swap_fallback
+
+
+def _k1_views(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, swapped: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The operand views of a K1 launch for the caller's tensors -- ``(a_desc, b_desc, out3)`` exactly as
+    :func:`plan_dense_projection_gemm` derives them (batched, the operands exchanged and transposed when the plan
+    swapped, the ``[L, outer, inner]`` TMA spans of :func:`operand_view`) -- without planning.  ``operand_view``
+    re-checks the stride and alignment contract of the views."""
+    A3, B3, O3 = as_batched(A, "A"), as_batched(B, "B"), as_batched(out, "out")
+    if swapped:
+        A3, B3 = B3.transpose(1, 2), A3.transpose(1, 2)
+    _, a_desc = operand_view(A3, "A", k_axis=2)
+    _, b_desc = operand_view(B3, "B", k_axis=1)
+    return a_desc, b_desc, O3
+
+
+def _same_view(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+    )
+
+
+@dataclass
+class _CachedGemm:
+    """A planned K1 launch of the convenience path: the plan, the resolved module entry, the argument template
+    (constants and :class:`_Slot` markers in the module's plan order) and the workspace it owns."""
+
+    module_name: str
+    arch: str
+    plan: GemmPlan
+    swapped: bool
+    entry: Callable[..., Any] = field(repr=False)
+    template: tuple = field(repr=False)
+    ws: torch.Tensor = field(repr=False)
+    counters: torch.Tensor = field(repr=False)
+
+
+_K1_CACHE: "OrderedDict[tuple, _CachedGemm]" = OrderedDict()
+
+
+def _prepare_cached_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool,
+    knobs: dict[str, Any],
+) -> _CachedGemm:
+    plan, a_desc, b_desc, O3, arch, module_name = _k1_plan(
+        A, B, out, transposed_out=transposed_out, knobs=knobs
+    )
+    device = out.device
+    swapped = _k1_swapped(plan, A, B, transposed_out=transposed_out)
+    rebuilt = _k1_views(A, B, out, swapped=swapped)
+    if not all(
+        _same_view(got, want)
+        for got, want in zip(rebuilt, (a_desc, b_desc, O3), strict=True)
+    ):
+        raise RuntimeError(
+            "dense_projection_gemm: the per-call operand views differ from the planner's; "
+            "the convenience path cannot cache this binding (use prepare_dense_projection_gemm)"
+        )
+    ws, counters = _k1_workspace(plan, device)
+    ldo, out_l = _out_strides(O3)
+    values = _k1_values(
+        plan,
+        device,
+        A=_Slot("A"),
+        B=_Slot("B"),
+        out3=_Slot("out3"),
+        o_alias=_Slot("o_alias"),
+        ws=ws,
+        counters=counters,
+        ldo=ldo,
+        out_l=out_l,
+    )
+    entry, template = _bind(module_name, values, plan.grid, arch)
+    return _CachedGemm(module_name, arch, plan, swapped, entry, template, ws, counters)
+
+
+def _launch_cached_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool = False,
+    **knobs: Any,
+) -> torch.Tensor:
+    """The convenience path of K1: plan on the first call for a (device, stream, geometry, knobs) key; rebind
+    the caller's views and launch on every call (no planning, no device query, no allocation)."""
+    device = _same_cuda_device(A, B, out)
+    index = _cuda_index(device)
+    stream = _current_raw_stream(index)
+    key = convenience_key(
+        index, stream, (bool(transposed_out), *sorted(knobs.items())), A, B, out
+    )
+    cached = _cache_get(_K1_CACHE, key)
+    if cached is None:
+        cached = _cache_put(
+            _K1_CACHE,
+            key,
+            _prepare_cached_gemm(A, B, out, transposed_out=transposed_out, knobs=knobs),
+        )
+    a_desc, b_desc, O3 = _k1_views(A, B, out, swapped=cached.swapped)
+    arguments = _resolve_arguments(
+        cached.template, dict(A=a_desc, B=b_desc, out3=O3, o_alias=flat_alias(O3))
+    )
+    with _ffi_stream_context(index, stream):
+        cached.entry(*arguments)
+    return out
+
+
 def dense_projection_gemm(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, transposed_out: bool = False
 ) -> torch.Tensor:
-    """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (prepare + launch)."""
-    return prepare_dense_projection_gemm(
-        A, B, out, transposed_out=transposed_out
-    ).launch()
+    """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path:
+    planned once per device, stream and view geometry, then rebound and launched)."""
+    return _launch_cached_gemm(A, B, out, transposed_out=transposed_out)
 
 
 # --- the training operations as thin wrappers (the Cake entry points) ---------------------
@@ -2627,7 +2982,10 @@ def projection_wgrad(
     N, K = int(G.shape[1]), int(X.shape[1])
     if out is None:
         out = torch.empty(N, K, device=G.device, dtype=out_dtype or torch.bfloat16)
-    return prepare_projection_wgrad(G, X, out, sk=sk, cta_rows=cta_rows).launch()
+    A, B, transposed = wgrad_views(G, X)
+    return _launch_cached_gemm(
+        A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2845,47 +3203,67 @@ class PreparedRouterGemm:
     __call__ = launch
 
 
-def prepare_router_fp32_gemm(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    splits: Optional[int] = None,
-) -> PreparedRouterGemm:
-    """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
-    K2 backend: the BF16x3 stack and its fp32 residual scratch and the split-K workspace)."""
-    device = out.device
-    if (
-        not (A.is_cuda and B.is_cuda and out.is_cuda)
-        or A.device != device
-        or B.device != device
-    ):
-        raise ValueError("Expected A, B and out on one CUDA device")
+def _k2_plan(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
+) -> tuple[RouterPlan, torch.Tensor, torch.Tensor, str, str]:
+    """Plan one K2 binding for its device: ``(plan, A_eff, B_eff, arch, module_name)``."""
+    device = _same_cuda_device(A, B, out)
     arch = require_arch(device)
     plan, A_eff, B_eff = plan_router_fp32_gemm(A, B, out, splits=splits)
-    module_name = select_module(arch, plan.template)
-    # the split source in the operand's own layout: K-major parts [3, N, K] come from B.T, MN-major parts [3, K, N] from B
+    return plan, A_eff, B_eff, arch, select_module(arch, plan.template)
+
+
+def _k2_views(
+    A: torch.Tensor, B: torch.Tensor, plan: RouterPlan
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(a_view, split_src)`` of a router launch for the caller's operands: the streamed operand as the
+    ``[1, M, K]`` / ``[1, K, M]`` TMA span and the second operand in its own layout -- the source of the BF16x3
+    split (K-major parts ``[3, N, K]`` come from ``B.T``, MN-major parts ``[3, K, N]`` from ``B``) -- after the
+    weight gradient's swap when the plan swapped (``out.T = B.T A.T``)."""
+    A_eff, B_eff = (B.t(), A.t()) if plan.swapped else (A, B)
     split_src = B_eff if plan.b_mn else B_eff.t()
+    a_view = A_eff.t().unsqueeze(0) if plan.a_mn else A_eff.unsqueeze(0)
+    return a_view, split_src
+
+
+def _k2_workspace(
+    plan: RouterPlan, split_src: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """The retained BF16x3 stack of the second operand, its fp32 residual scratch and the split-K workspace
+    (``None`` for a single split: the kernel writes ``out`` directly)."""
     parts = torch.empty((3, *split_src.shape), device=device, dtype=torch.bfloat16)
     resid = torch.empty(split_src.shape, device=device, dtype=torch.float32)
-    a_view = (
-        A_eff.unsqueeze(0) if not plan.a_mn else A_eff.t().unsqueeze(0)
-    )  # [1, M, K] or [1, K, M]
-    expect = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
-    tensors = dict(A=a_view, split_src=split_src, parts=parts, resid=resid)
+    workspace = None
     if plan.splits > 1:
+        expect = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
         workspace = torch.empty(
             (plan.splits, *expect), device=device, dtype=torch.float32
         )
-        tensors["workspace"] = workspace
-        target = workspace
-        ldo, out_l = expect[1], expect[0] * expect[1]
-    else:
-        target = out
-        ldo, out_l = int(out.stride(0)), 0
-    out32 = target if target.is_contiguous() else flat_alias(target)
-    values: dict[str, Any] = dict(
-        A=a_view,
+    return parts, resid, workspace
+
+
+def _k2_workspace_strides(workspace: torch.Tensor) -> tuple[int, int]:
+    """``(ldo, out_l)`` of the ``[splits, rows, cols]`` split-K workspace: one row-major partial per split."""
+    return int(workspace.shape[2]), int(workspace.shape[1] * workspace.shape[2])
+
+
+def _k2_out32(out: torch.Tensor) -> torch.Tensor:
+    """The pointer argument for a single-split launch that writes ``out`` directly."""
+    return out if out.is_contiguous() else flat_alias(out)
+
+
+def _k2_values(
+    plan: RouterPlan,
+    *,
+    A: Any,
+    parts: torch.Tensor,
+    out32: Any,
+    ldo: int,
+    out_l: int,
+) -> dict[str, Any]:
+    """The keyword arguments of a K2 launch; ``A`` / ``out32`` are views or :class:`_Slot` markers."""
+    return dict(
+        A=A,
         B=parts,
         out32=out32,
         M=plan.M,
@@ -2897,6 +3275,28 @@ def prepare_router_fp32_gemm(
         out_l=out_l,
         num_cluster_tiles=plan.num_cluster_tiles,
     )
+
+
+def prepare_router_fp32_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    splits: Optional[int] = None,
+) -> PreparedRouterGemm:
+    """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
+    K2 backend: the BF16x3 stack and its fp32 residual scratch and the split-K workspace)."""
+    plan, _, _, arch, module_name = _k2_plan(A, B, out, splits=splits)
+    device = out.device
+    a_view, split_src = _k2_views(A, B, plan)
+    parts, resid, workspace = _k2_workspace(plan, split_src, device)
+    tensors = dict(A=a_view, split_src=split_src, parts=parts, resid=resid)
+    if workspace is not None:
+        tensors["workspace"] = workspace
+        out32, ldo, out_l = workspace, *_k2_workspace_strides(workspace)
+    else:
+        out32, ldo, out_l = _k2_out32(out), int(out.stride(0)), 0
+    values = _k2_values(plan, A=a_view, parts=parts, out32=out32, ldo=ldo, out_l=out_l)
     launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedRouterGemm(
         module_name=module_name,
@@ -2909,11 +3309,87 @@ def prepare_router_fp32_gemm(
     )
 
 
+@dataclass
+class _CachedRouter:
+    """A planned K2 launch of the convenience path: the plan, the resolved module entry, the argument template
+    and the workspace it owns (the BF16x3 stack, its scratch and the split-K partials)."""
+
+    module_name: str
+    arch: str
+    plan: RouterPlan
+    entry: Callable[..., Any] = field(repr=False)
+    template: tuple = field(repr=False)
+    parts: torch.Tensor = field(repr=False)
+    resid: torch.Tensor = field(repr=False)
+    workspace: Optional[torch.Tensor] = field(default=None, repr=False)
+
+
+_K2_CACHE: "OrderedDict[tuple, _CachedRouter]" = OrderedDict()
+
+
+def clear_convenience_caches() -> None:
+    """Drop every cached convenience-path launch (K1 and K2) and release their workspaces; a launch in flight
+    keeps a reference to the workspace it was bound with."""
+    _K1_CACHE.clear()
+    _K2_CACHE.clear()
+
+
+def _prepare_cached_router(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
+) -> _CachedRouter:
+    plan, _, _, arch, module_name = _k2_plan(A, B, out, splits=splits)
+    _, split_src = _k2_views(A, B, plan)
+    parts, resid, workspace = _k2_workspace(plan, split_src, out.device)
+    if workspace is not None:
+        out32, (ldo, out_l) = workspace, _k2_workspace_strides(workspace)
+    else:
+        out32, ldo, out_l = _Slot("out32"), int(out.stride(0)), 0
+    values = _k2_values(
+        plan, A=_Slot("A"), parts=parts, out32=out32, ldo=ldo, out_l=out_l
+    )
+    entry, template = _bind(module_name, values, plan.grid, arch)
+    return _CachedRouter(
+        module_name, arch, plan, entry, template, parts, resid, workspace
+    )
+
+
+def _launch_cached_router(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
+) -> torch.Tensor:
+    """The convenience path of K2: plan on the first call for a (device, stream, geometry, splits) key; on every
+    call re-split the second operand into the cached BF16x3 stack, launch and reduce the split-K partials into
+    ``out`` in the fixed order."""
+    device = _same_cuda_device(A, B, out)
+    index = _cuda_index(device)
+    stream = _current_raw_stream(index)
+    key = convenience_key(
+        index, stream, (None if splits is None else int(splits),), A, B, out
+    )
+    cached = _cache_get(_K2_CACHE, key)
+    if cached is None:
+        cached = _cache_put(
+            _K2_CACHE, key, _prepare_cached_router(A, B, out, splits=splits)
+        )
+    a_view, split_src = _k2_views(A, B, cached.plan)
+    split_fp32_to_bf16x3_(split_src, cached.parts, cached.resid)
+    views: dict[str, torch.Tensor] = dict(A=a_view)
+    if cached.workspace is None:
+        views["out32"] = _k2_out32(out)
+    with _ffi_stream_context(index, stream):
+        cached.entry(*_resolve_arguments(cached.template, views))
+    if cached.workspace is not None:
+        torch.sum(
+            cached.workspace, dim=0, out=out
+        )  # fixed-order reduction of the partials
+    return out
+
+
 def router_fp32_gemm(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int] = None
 ) -> torch.Tensor:
-    """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the emulation (prepare + launch)."""
-    return prepare_router_fp32_gemm(A, B, out, splits=splits).launch()
+    """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the emulation (the cached convenience
+    path: planned once per device, stream, view geometry and split count, then re-split and launched)."""
+    return _launch_cached_router(A, B, out, splits=splits)
 
 
 def router_forward(
