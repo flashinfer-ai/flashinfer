@@ -517,6 +517,41 @@ a property of this mainloop's design (A in TMEM so that two accumulator stages a
 operand fit).  Closing it needs an A path that is neither TMEM nor SMEM-bandwidth-bound,
 which this fork does not have.
 
+### Version B22 (design note, not implemented): a third operand path for the weight
+
+What the measurements of Wed 14 Oct 2026 fix as constraints:
+- A in TMEM (every shipped tile): the converted operand's STTM write + MMA read costs ~20%
+  of SM clock on the power-capped rows (probes above); cycles are already 2-6% under cuBLAS.
+- A in SMEM as built today (`kAInSmem`): the fp8 tile is TMA-staged in SMEM, LDS'd by the
+  transform warps, STS'd back as bf16 and read by the MMA, with a 64-deep k-tile to fit:
+  SMEM traffic per k-step roughly doubles and the MMA step halves; 1.24-1.7x.
+- cuBLAS (SS, 128x256x64): 48 KB of SMEM operand reads per 4.2 MFLOP step, 11.4 KB/MFLOP,
+  and it is not SMEM-bound at 1.37 GHz.
+
+The path that fits both: the transform warps fetch the fp8 weight tile straight from
+global / L2 into registers (ld.global.v4 or cp.async to registers is not a thing, so plain
+vectorised loads; the weight band is L2-resident by the swizzle rule), convert, and write
+the bf16 tile into SMEM in the MMA's canonical SW128 layout; the activation keeps its TMA
+path; the MMA runs SS.  Per k-step at 256x192x128: A 64 KB written once and read once by
+the MMA, B 48 KB read: 112 KB per 12.6 MFLOP = 8.9 KB/MFLOP, under cuBLAS's 11.4, and no
+TMEM traffic at all.  SMEM budget: 64 + 48 = 112 KB per stage, two stages in 227 KB (the
+fp8 staging buffer is gone); k-steps are ~0.4 us at this tile, so two stages is one step
+of slack for the transform warps, which is what they have today on the TMEM path.
+Expected: cuBLAS's clock (1.37 GHz class) at today's cycle count, i.e. 0.94-0.97 of cuBLAS
+on the three rows that are 1.02-1.04 now, if the two-stage pipeline holds the tensor pipe
+at the current 97%.  Risks: (1) the transform warps' global loads replace TMA, so their
+latency hiding must come from the second stage alone; (2) writing the SW128 layout from
+registers needs a matching STS pattern (the fork's `kAInSmem` path already has an
+`SmemLayoutAtomACompute` and an R2S copy to copy from); (3) a 2-stage pipeline at K=1024
+(8 steps) may lose the per-tile fill battle that attn.out tp8 already suffers from.
+Effort: new producer role in `collective.hpp` (load_A_from_global for the transform
+warps, drop the A TMA pipeline), builder budget for the two-stage SS config, the
+dispatcher rule for weights >= 64 MB at large M.  Two to three days, measurable in the
+first day with a hard-coded config on mlp.down tp2.  This is what closing the last three
+Blackwell rows costs; the same idea does not transfer to Hopper (wgmma's A from registers
+is the cheap path there, and its clock gap is 2-4% for reasons the agent's probes could not
+pin to the converter).
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
