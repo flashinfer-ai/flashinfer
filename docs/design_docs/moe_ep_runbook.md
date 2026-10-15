@@ -612,6 +612,63 @@ prefill chunks), per-role offline knob caches.
 
 ---
 
+## Blackwell GenPhase decoding (explicit opt-in)
+
+The existing SM100 MXFP8 config can select the independently owned GenPhase
+pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
+the legacy weight layout, workspace pool keys, knob cache and autotuner.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+backend = MegaConfig(
+    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=6,
+        gate_up_clamp=10.0,
+        kernel_variant="genphase",
+        mma_tiler_mnk=(256, 64, 128),
+        cluster_shape_mn=(2, 1),
+    ),
+    quantize_input=True,
+    preprocess_weights=True,
+)
+layer = MoEEpLayer(bootstrap, fleet_params, weights, backend=backend)
+layer.warmup(tensors)  # collective on every EP rank, before CUDA graph capture
+output = layer.forward(tensors)
+```
+
+GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
+capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
+intermediate size must be a multiple of 64. Leaving both geometry fields unset
+selects N128/CGA4; N64 supports CGA2 or CGA4. Pipeline selection happens at
+construction and does not change with the live token count. GenPhase rejects
+legacy `knobs` (including online `"auto"`) and in-kernel FC2 reduction.
+
+`quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
+`False` accepts E4M3 activations and per-32 typed E8M0 scales in
+`MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with
+`-1` for masked slots, unique valid IDs per token and finite valid scores.
+As on the legacy SM100 path, callers provide valid routing; the backend checks
+metadata without scanning routing values on every forward.
+
+With `preprocess_weights=True`, canonical BF16 weights or canonical
+prequantized E4M3 weights plus E8M0 scales are converted to GenPhase's
+16-row gate/up stripes and physical K-major layout. Weight scales may use
+typed `torch.float8_e8m0fnu` or raw `torch.uint8` storage. The exported
+`preprocess_mxfp8_cutedsl_mega_weights(..., kernel_variant="genphase")` helper produces
+the same payload for `preprocess_weights=False` callers. Legacy transformed
+weights cannot be reused. GenPhase workspace pooling is isolated by pipeline
+and resolved configuration. Rubin source and frontend are independent.
+
+Native layer coverage is in the existing
+`test_moe_ep_mxfp8_cutedsl_mega_multirank.py::test_blackwell_genphase_layer_graph_and_weight_formats`
+test, runnable with `torchrun --nproc_per_node=<1|2|4> -m pytest`.
+
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
