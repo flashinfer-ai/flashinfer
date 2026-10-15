@@ -138,25 +138,25 @@ def normalize_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def write_manifest(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically write a normalized catalog, also upgrading legacy v2 inputs."""
+def write_manifest(path: Path, payload: dict[str, Any]) -> dict[str, str]:
+    """Atomically write a catalog and return its input-to-persisted ID mapping."""
     if payload.get("schema_version") != 4 and path.exists():
         current = json.loads(path.read_text())
         if current.get("schema_version") == 4:
             from .dimension_catalog import write_catalog
 
             expanded = expand_manifest(payload)
-            write_catalog(
+            return write_catalog(
                 path,
                 expanded["kernels"],
                 current["dtype"],
                 producer=expanded.get("producer"),
             )
-            return
     if payload.get("schema_version") == 4:
-        expand_manifest(payload)
+        expanded = expand_manifest(payload)
         catalog = payload
     else:
+        expanded = expand_manifest(payload)
         catalog = normalize_manifest(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
@@ -167,3 +167,4 @@ def write_manifest(path: Path, payload: dict[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+    return {record["id"]: record["id"] for record in expanded["kernels"]}

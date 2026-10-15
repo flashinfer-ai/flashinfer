@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
@@ -409,6 +411,7 @@ def write_catalog(
         payload["parameter_bases"][name] = dict(order=list(schema), defaults=defaults)
         bases[schema] = (name, defaults)
     families = {}
+    pending_sources = []
     for (
         key,
         sources,
@@ -430,8 +433,7 @@ def write_catalog(
         template, fragments = _factor_sources(sources)
         relative = f"sources/{tag}.py"
         destination = root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(template)
+        pending_sources.append((destination, template))
         refs: dict[str, list[str]] = {}
         for activation, chunks in fragments.items():
             refs[activation] = []
@@ -466,5 +468,20 @@ def write_catalog(
     expanded = expand_catalog(payload)
     new_ids = {logical_id(r, dtype): r["id"] for r in expanded["kernels"]}
     mapping = {r["id"]: new_ids[logical_id(r, dtype)] for r in records}
+    for destination, template in pending_sources:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            dir=destination.parent, prefix=destination.name, suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as file:
+                file.write(template)
+            os.chmod(
+                temporary,
+                destination.stat().st_mode & 0o777 if destination.exists() else 0o644,
+            )
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
     write_manifest(path, payload)
     return mapping

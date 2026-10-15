@@ -30,7 +30,7 @@ def _checked(result):
     return values[0] if values else None
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=1024)
 def device_facts(index: int) -> DeviceFacts:
     from cuda.bindings import driver as drv
 
@@ -101,9 +101,11 @@ def device_facts(index: int) -> DeviceFacts:
                     attribute.value.clusterDim.z,
                 ) = size, 1, 1
                 launch.attrs, launch.numAttrs = [attribute], 1
-                clusters.append(
-                    int(_checked(drv.cuOccupancyMaxActiveClusters(function, launch)))
-                )
+                result = drv.cuOccupancyMaxActiveClusters(function, launch)
+                if result[0] == drv.CUresult.CUDA_ERROR_INVALID_CLUSTER_SIZE:
+                    clusters.append(0)
+                else:
+                    clusters.append(int(_checked(result)))
         finally:
             if module is not None:
                 _checked(drv.cuModuleUnload(module))

@@ -619,9 +619,26 @@ def export(args, file):
     major, minor = torch.cuda.get_device_capability()
     manifest = args.artifacts / "cudnn_frost_selected_kernels.json"
     payload = dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
+    catalog = {}
     if manifest.exists():
+        catalog = json.loads(manifest.read_text())
         payload = read_manifest(manifest)
     existing = {r["id"] for r in payload["kernels"]}
+    # V4 IDs omit sweep geometry and producer revision. Resolve the same axes
+    # against the existing catalog before comparing the generated sweep ID.
+    existing_axes = {
+        (
+            r["arch"],
+            r["op"],
+            r["tactic"]["tile"],
+            r["tactic"]["cta_group"],
+            r["tactic"]["scheduler"],
+            r["tactic"]["store_mode"],
+        ): r["id"]
+        for r in payload["kernels"]
+        if catalog.get("schema_version") == 4
+        and revision in payload.get("producer", {}).get("revisions", ())
+    }
     failed = set()
     if args.resume:
         for line in args.output.read_text().splitlines():
@@ -680,6 +697,9 @@ def export(args, file):
                 if index % args.num_shards != args.shard_index:
                     continue
                 identity = f"sm{major}{minor}_cudnn_frost_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
+                identity = existing_axes.get(
+                    (f"sm_{major}{minor}a", op, name, cta, "clc", mode), identity
+                )
                 if identity in existing or identity in failed or args.catalog_only:
                     continue
                 opts = argparse.Namespace(
@@ -1188,7 +1208,7 @@ def copy_selected(artifacts, selected_dir, identities, file):
             payload["kernels"].append(record)
             previous[identity] = record
         emit(file, dict(kind="selected", id=identity))
-    write_manifest(target_manifest, payload)
+    return write_manifest(target_manifest, payload)
 
 
 def rank_stage(runs, width):
@@ -1381,15 +1401,7 @@ def shortlist(args, file):
         rank = geometries.index(geometry) if geometry in geometries else len(geometries)
         return activations[entry["activation"]], rank, entry["tokens"]
 
-    for entry in sorted(entries, key=order):
-        existing = index.get(profile(entry))
-        if existing is None:
-            payload["entries"].append(entry)
-        elif payload["entries"][existing] != entry:
-            if not args.replace:
-                raise ValueError(f"Shortlist already differs for {profile(entry)}")
-            payload["entries"][existing] = entry
-    copy_selected(
+    mapping = copy_selected(
         args.artifacts,
         args.selected_dir,
         {
@@ -1400,6 +1412,21 @@ def shortlist(args, file):
         },
         file,
     )
+    for entry in (*payload["entries"], *entries):
+        for stage in ("fc1", "fc2"):
+            entry[stage] = list(
+                dict.fromkeys(
+                    mapping.get(identity, identity) for identity in entry[stage]
+                )
+            )
+    for entry in sorted(entries, key=order):
+        existing = index.get(profile(entry))
+        if existing is None:
+            payload["entries"].append(entry)
+        elif payload["entries"][existing] != entry:
+            if not args.replace:
+                raise ValueError(f"Shortlist already differs for {profile(entry)}")
+            payload["entries"][existing] = entry
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
