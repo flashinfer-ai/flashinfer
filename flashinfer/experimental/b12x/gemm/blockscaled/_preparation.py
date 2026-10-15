@@ -17,11 +17,13 @@ from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from ._tuning import (
+    MXFP8_A16_DEQUANT_MIN_ROWS,
     BlockscaledConfig,
     BlockscaledQuery,
     TUNING,
     effective_a16_config,
     functional_mxfp8_quantization,
+    mxfp8_a16_dequant,
 )
 
 _MXFP8_PREFILL_MIN_ROWS = 2048
@@ -147,6 +149,21 @@ def compile_packed(
                 programs["reduce"] = _reduce.compile_reduce(
                     query.out_features, slices, ordinal
                 )
+            if mxfp8_a16_dequant(query, config):
+                from ._dequant import DEQUANT_BLOCK_K, _dequantize_mxfp8
+
+                k = query.padded_in_features
+                programs["dequant"] = _dequantize_mxfp8.warmup(
+                    torch.float8_e4m3fn,
+                    torch.uint8,
+                    torch.bfloat16,
+                    K=k,
+                    BLOCK_K=DEQUANT_BLOCK_K,
+                    grid=(query.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1),
+                    num_warps=4,
+                    num_stages=1,
+                    enable_fp_fusion=False,
+                )
             return programs
         programs = dict(dense._compile_dense_lowering(dense_payload, ordinal))
         if short_dense_payload is not None:
@@ -225,7 +242,12 @@ def _owned_bytes(query, config):
 def _workspace_bytes(query, config):
     if config.mode == "a16":
         slices = effective_a16_config(query, config)[2]
-        return slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
+        partials = (
+            slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
+        )
+        if mxfp8_a16_dequant(query, config):
+            return max(partials, query.out_features * query.padded_in_features * 2)
+        return partials
     if functional_mxfp8_quantization(query, config):
         return 0
     from ._a16 import _layout
@@ -414,6 +436,28 @@ class _PackedExecutionState:
                     raise ValueError(
                         "workspace must not overlap packed operands/output"
                     )
+            if (
+                config.mode == "a16"
+                and "dequant" in self.programs
+                and m >= MXFP8_A16_DEQUANT_MIN_ROWS
+            ):
+                from ._dequant import DEQUANT_BLOCK_K
+
+                k = q.padded_in_features
+                weight = (
+                    workspace[: q.out_features * k * 2]
+                    .view(torch.bfloat16)
+                    .view(q.out_features, k)
+                )
+                self.programs["dequant"][
+                    (q.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1)
+                ](values, scale_bytes, weight, k, DEQUANT_BLOCK_K)
+                torch.mm(
+                    source.view(m, q.in_features),
+                    weight.t(),
+                    out=out.view(m, q.out_features),
+                )
+                return out
             if config.mode == "a16":
                 import cutlass
                 import cutlass.cute as cute

@@ -699,6 +699,82 @@ def test_mxfp8_prepared_functional_and_provided_forms_match():
         graph.reset()
 
 
+def test_mxfp8_a16_large_m_expands_weight_into_caller_scratch():
+    """Long A16 MXFP8 calls run a BF16 GEMM over the weight expanded in scratch.
+
+    The expansion is exact, so those rows match BF16 weights bitwise; shorter rows
+    in the same capacity plan keep the warp-MMA kernel. Owned scratch and short
+    capacities do not reserve the expanded weight.
+    """
+    from b12x.gemm.blockscaled import _tuning
+
+    require_b12x()
+    capacity, n, k = 256, 384, 512
+    weight, decoded, _ = make_weight("mxfp8", n, k)
+    dense = decoded.to(torch.bfloat16)
+    source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+    workspace = make_workspace(source, weight, activation_mode="a16")
+    assert workspace.numel() == n * k * 2
+    query = blockscaled.query_from_call(source, weight, activation_mode="a16")
+    config = _preparation.TUNING.default_config(
+        query, detect_device(source.device).identity
+    )
+    assert _preparation._workspace_bytes(query, config) == 0
+    short = blockscaled.query_from_call(
+        source[: _tuning.MXFP8_A16_DEQUANT_MIN_ROWS - 1],
+        weight,
+        activation_mode="a16",
+        workspace=workspace,
+    )
+    assert not _tuning.mxfp8_a16_dequant(short, config)
+    huge = replace(
+        short,
+        num_tokens=capacity,
+        out_features=_tuning.MXFP8_A16_DEQUANT_MAX_BYTES // (2 * 8192) + 8,
+        in_features=8192,
+        padded_in_features=8192,
+        workspace_nbytes=None,
+    )
+    assert not _tuning.mxfp8_a16_dequant(huge, config)
+    assert _tuning.mxfp8_a16_dequant(replace(huge, out_features=8), config)
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode="a16",
+        workspace=workspace,
+        name="a16-expanded",
+    ) as (_, plan):
+        assert "dequant" in plan.prepared.state.programs
+        for rows in (16, _tuning.MXFP8_A16_DEQUANT_MIN_ROWS - 1, 128, capacity):
+            workspace.fill_(255)
+            actual = blockscaled.mm(
+                source[:rows], weight, plan=plan, workspace=workspace
+            )
+            if rows >= _tuning.MXFP8_A16_DEQUANT_MIN_ROWS:
+                torch.testing.assert_close(
+                    actual, source[:rows] @ dense.T, atol=0, rtol=0
+                )
+            else:
+                assert_close(actual, source[:rows].float() @ decoded.T)
+        output = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with kernel_resolution_guard("A16 MXFP8 expanded-weight capture"):
+                with torch.cuda.graph(graph):
+                    captured = blockscaled.mm(
+                        source, weight, plan=plan, workspace=workspace
+                    )
+                    output.copy_(captured)
+                source.normal_()
+                workspace.fill_(255)
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+            torch.testing.assert_close(output, source @ dense.T, atol=0, rtol=0)
+        finally:
+            graph.reset()
+
+
 def test_mxfp8_prefill_capacity_owned_and_provided_match():
     """Both scratch contracts retain short and long programs under frozen capture."""
     require_b12x()
