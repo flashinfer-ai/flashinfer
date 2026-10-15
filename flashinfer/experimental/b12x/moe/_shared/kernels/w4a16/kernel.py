@@ -7940,6 +7940,9 @@ class W4A16FusedMoeKernel:
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
             old_sense = ld_global_acquire_i32(sense_addr)
+            # The arrival atomic is relaxed: release this CTA's global writes, which
+            # sync_threads made visible to thread 0, before other CTAs can pass.
+            threadfence()
             old_count = atomic_add_global_i32(count_addr, Int32(1))
             if old_count == grid_x - Int32(1):
                 st_global_i32(count_addr, Int32(0))
