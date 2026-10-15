@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from flashinfer import ActivationType
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.fused_moe import (
     BackendOptions,
@@ -27,7 +28,10 @@ from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_fp4_fc2_finalize import (
 from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_fp4_q0_route_triton import (
     nvfp4_q0_route_triton,
 )
-from flashinfer.fused_moe.runners import SM12xNvfp4Runner
+from flashinfer.fused_moe.runners import (
+    SM12xNvfp4Runner,
+    _sm12x_nvfp4_activation_kwargs,
+)
 from flashinfer.utils import is_sm120a_supported
 
 pytestmark = pytest.mark.skipif(
@@ -71,10 +75,19 @@ def _make_weight(rows, columns, seed):
     return _pack_e2m1(codes), _pack_sf_128x4(sf)
 
 
-@pytest.mark.parametrize("tokens", [8, 129])
-@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    "activation,tokens,enable_pdl",
+    [
+        (SwiGLU(), 8, False),
+        (SwiGLU(), 8, True),
+        (SwiGLU(), 129, False),
+        (SwiGLU(), 129, True),
+        (SwiGLU(limit=10.0), 8, False),
+        (SwiGLU(limit=10.0), 129, True),
+    ],
+)
 def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
-    tokens, enable_pdl, monkeypatch
+    activation, tokens, enable_pdl, monkeypatch
 ):
     if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
         pytest.skip("requires an SM120a device")
@@ -83,6 +96,8 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
     monkeypatch.delenv(validation_env, raising=False)
     experts, top_k, hidden, intermediate = 4, 2, 512, 512
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 10
+    if activation.limit != SwiGLU().limit:
+        x.mul_(16)
     token = torch.arange(tokens, device="cuda")
     ids = torch.stack([token % experts, (token + 1) % experts], dim=1).to(torch.int32)
     ids[-1, :] = -1
@@ -120,7 +135,7 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
         routing=RoutingConfig(num_experts=experts, top_k=top_k),
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate, local_num_experts=experts),
-        activation=SwiGLU(),
+        activation=activation,
         backend=BackendOptions(candidates=(SM12xNvfp4Config(),)),
         execution=ExecutionConfig(enable_pdl=enable_pdl),
     )
@@ -139,7 +154,24 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
         native["w1_gate_scale"],
         q1_scale,
         tune=False,
+        **_sm12x_nvfp4_activation_kwargs(activation),
     )
+    if activation.limit != SwiGLU().limit:
+        q1_unclamped, sf1_unclamped = cute_dsl_sm12x_fc1_act_q1_nvfp4(
+            q0,
+            sf0,
+            native["w1_weight"],
+            native["w1_weight_sf"],
+            offsets,
+            native["w1_up_scale"],
+            native["w1_gate_scale"],
+            q1_scale,
+            tune=False,
+            swiglu_limit=None,
+        )
+        assert not (
+            torch.equal(q1, q1_unclamped) and torch.equal(sf1, sf1_unclamped)
+        )
     ref = cute_dsl_sm12x_fc2_finalize_nvfp4(
         q1,
         sf1,
@@ -181,3 +213,16 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
         captured_ids.copy_(ids)
     graph.replay()
     assert torch.equal(captured_ids, ids)
+
+
+def test_sm12x_nvfp4_swiglu_kwargs():
+    assert _sm12x_nvfp4_activation_kwargs(SwiGLU()) == {
+        "activation": ActivationType.Swiglu,
+        "swiglu_limit": None,
+    }
+    assert _sm12x_nvfp4_activation_kwargs(SwiGLU(limit=10.0)) == {
+        "activation": ActivationType.Swiglu,
+        "swiglu_limit": 10.0,
+    }
+    with pytest.raises(NotImplementedError, match="alpha and beta"):
+        _sm12x_nvfp4_activation_kwargs(SwiGLU(alpha=2.0))
