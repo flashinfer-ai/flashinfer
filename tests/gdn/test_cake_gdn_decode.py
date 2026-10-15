@@ -1145,6 +1145,197 @@ def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> No
             )
 
 
+# Qwen3-Next / Qwen3.5 per-rank linear-attention head splits of the vLLM
+# prefill contract (BF16 I/O, packed FP32 initial+final state) as frozen
+# (HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2) triples: H/HV = 16/32, 8/16,
+# 4/8, 2/4 (Qwen3-Next-80B and Qwen3.5-35B-A3B at TP1/TP2/TP4/TP8) and
+# 16/64, 8/32, 4/16, 2/8 (Qwen3.5-397B-A17B at TP1/TP2/TP4/TP8).
+_QWEN_TP_FP32_STATE_GEOMETRIES = frozenset(
+    {
+        (1, 0, 2),
+        (1, 0, 3),
+        (1, 0, 4),
+        (1, 0, 5),
+        (2, 0, 3),
+        (2, 0, 4),
+        (2, 0, 5),
+        (2, 0, 6),
+    }
+)
+
+
+def _prefill_heads(geometry):
+    """``(num_q_heads, num_k_heads, num_v_heads)`` of one power-of-two geometry triple."""
+
+    head_group_log2, is_gqa, num_o_heads_log2 = geometry
+    num_o_heads = 1 << num_o_heads_log2
+    min_heads = num_o_heads >> head_group_log2
+    if is_gqa:
+        return num_o_heads, min_heads, min_heads
+    return min_heads, min_heads, num_o_heads
+
+
+def _prefill_geometry_of(route):
+    specs = cake_gdn._kernel_record(route.variant_name)["specializations"]
+    return (specs["HEAD_GROUP_LOG2"], specs["IS_GQA"], specs["NUM_O_HEADS_LOG2"])
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_prefill_fp32_state_contract_covers_every_qwen_tp_geometry(arch) -> None:
+    contract = {
+        "arch": arch,
+        "io_dtype": "bfloat16",
+        "state_dtype": "float32",
+        "use_initial_state": True,
+        "store_final_state": True,
+    }
+    for dvsplit in (True, False):
+        geometries = cake_gdn.cake_gdn_prefill_geometries(**contract, dvsplit=dvsplit)
+        missing = _QWEN_TP_FP32_STATE_GEOMETRIES - geometries
+        assert not missing, (dvsplit, sorted(missing))
+    for geometry in sorted(_QWEN_TP_FP32_STATE_GEOMETRIES):
+        num_q_heads, num_k_heads, num_v_heads = _prefill_heads(geometry)
+        # One sequence keeps 2 * num_o_heads <= 128 tiles on the DV-split
+        # schedule; 64 sequences exceed every arch's active-cluster count.
+        for num_seqs, suffix in ((1, ".dvsplit"), (64, ".full_dv")):
+            route = cake_gdn.select_cake_gdn_prefill_variant(
+                arch=arch,
+                io_dtype="bfloat16",
+                state_dtype="float32",
+                num_seqs=num_seqs,
+                total_seq_len=256 * num_seqs,
+                max_seq_len=256,
+                num_q_heads=num_q_heads,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                use_initial_state=True,
+                store_final_state=True,
+                checkpoint_every_n_tokens=0,
+                use_state_indices=False,
+                gates_present=True,
+            )
+            assert route.route_id == f"flashinfer.gdn_prefill.noncp{suffix}"
+            assert _prefill_geometry_of(route) == geometry
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_prefill_geometries_mirror_the_resolver(arch) -> None:
+    # The helper tabulates nothing: every power-of-two triple it lists for a
+    # contract resolves, on that schedule, to a record carrying that triple.
+    for io_dtype, state_dtype in (
+        ("bfloat16", "float32"),
+        ("bfloat16", "bfloat16"),
+        ("float16", "float32"),
+    ):
+        for use_initial_state, store_final_state in (
+            (True, True),
+            (False, True),
+            (False, False),
+        ):
+            for dvsplit in (True, False):
+                geometries = cake_gdn.cake_gdn_prefill_geometries(
+                    arch=arch,
+                    io_dtype=io_dtype,
+                    state_dtype=state_dtype,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    dvsplit=dvsplit,
+                )
+                for geometry in sorted(geometries):
+                    if -1 in geometry:
+                        continue
+                    num_q_heads, num_k_heads, num_v_heads = _prefill_heads(geometry)
+                    # 256 sequences of 128 tokens exceed every arch's cluster
+                    # count at any head count (and are not single-chunk).
+                    num_seqs = 1 if dvsplit else 256
+                    route = cake_gdn.select_cake_gdn_prefill_variant(
+                        arch=arch,
+                        io_dtype=io_dtype,
+                        state_dtype=state_dtype,
+                        num_seqs=num_seqs,
+                        total_seq_len=128 * num_seqs,
+                        max_seq_len=128,
+                        num_q_heads=num_q_heads,
+                        num_k_heads=num_k_heads,
+                        num_v_heads=num_v_heads,
+                        use_initial_state=use_initial_state,
+                        store_final_state=store_final_state,
+                        checkpoint_every_n_tokens=0,
+                        use_state_indices=False,
+                        # FP16-I/O gated calls take the gatepipe4/fullgrid_vhold twins.
+                        gates_present=False,
+                    )
+                    assert route.route_id.endswith(
+                        ".dvsplit" if dvsplit else ".full_dv"
+                    ), route.route_id
+                    assert _prefill_geometry_of(route) == geometry, route
+
+
+def test_variant_resolution_fails_closed_for_an_unlisted_architecture(
+    monkeypatch,
+) -> None:
+    schedule_attr = "flashinfer_blackwell_gdn_prefill_initial"
+    specializations = {
+        "ENABLE_CHECKPOINTS": 0,
+        "HEAD_GROUP_LOG2": 1,
+        "IS_GQA": 0,
+        "NUM_O_HEADS_LOG2": 4,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0,
+    }
+    record = {
+        "name": "prefill_two_architecture_record",
+        "domain": "prefill",
+        "source_schedule": f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}",
+        "tma_abi": "grid_constant",
+        "architectures": ["sm_100a", "sm_103a"],
+        "outputs": [{"architectures": ["sm_100a", "sm_103a"], "path": "cuda/x.cu"}],
+        "specializations": specializations,
+    }
+    monkeypatch.setattr(cake_gdn, "_manifest", lambda: {"variants": [record]})
+
+    def resolve(arch):
+        return cake_gdn._variant_for(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+
+    assert resolve("sm_100a") is record
+    assert resolve("sm_103a") is record
+    # An architecture the row was never exported for fails closed at
+    # resolution (CakeGDNUnsupportedError), not as the loader's ValueError;
+    # the message names the architecture, the schedule and the key.
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="sm_107a") as info:
+        resolve("sm_107a")
+    assert not isinstance(info.value, ValueError)
+    assert schedule_attr in str(info.value)
+    assert repr(specializations) in str(info.value)
+
+    contract = {
+        "io_dtype": "bfloat16",
+        "state_dtype": "float32",
+        "use_initial_state": True,
+        "store_final_state": True,
+        "dvsplit": False,
+    }
+    assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_103a", **contract) == {
+        (1, 0, 4)
+    }
+    assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_107a", **contract) == set()
+
+    # Listing the architecture without a body for it fails closed the same way.
+    record["outputs"] = [{"architectures": ["sm_100a"], "path": "cuda/x.cu"}]
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="sm_103a"):
+        resolve("sm_103a")
+    assert resolve("sm_100a") is record
+    assert cake_gdn.cake_gdn_prefill_geometries(arch="sm_103a", **contract) == set()
+
+
 def test_nvcc_identity_captures_resolved_path_and_exact_version_output(
     tmp_path, monkeypatch
 ) -> None:

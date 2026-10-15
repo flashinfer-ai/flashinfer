@@ -31,6 +31,10 @@ from tests.test_helpers.parametrize import (
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
+# H100 CI peak host RSS: 178.9 GiB.
+pytestmark = pytest.mark.host_memory_heavy
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
