@@ -191,7 +191,7 @@ def test_decode_nh1_matches_gdn_mtp(T):
         a,
         dt_bias,
         b,
-        scale=1.0,
+        scale=K**-0.5,
         disable_state_update=False,
     )
     ref_o, _ = gated_delta_rule_mtp(
@@ -204,7 +204,7 @@ def test_decode_nh1_matches_gdn_mtp(T):
         a,
         dt_bias,
         b.squeeze(2),
-        scale=1.0,
+        scale=K**-0.5,
         disable_state_update=False,
     )
     torch.cuda.synchronize()
@@ -247,7 +247,9 @@ def test_decode_matches_reference(num_householder, T, head_size, num_heads):
     q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device, seed=1
     )
-    ref_o, ref_state = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
+    ref_o, ref_state = _reference(
+        q, k, v, A_log, a, dt_bias, b, pool, idx, scale=K**-0.5
+    )
 
     got_o, got_pool = gated_delta_product_mtp(
         q,
@@ -259,7 +261,7 @@ def test_decode_matches_reference(num_householder, T, head_size, num_heads):
         a,
         dt_bias,
         b,
-        scale=1.0,
+        scale=K**-0.5,
         # no ssm_state_indices: this is the PLAIN continuous-batching path.
         # State moves via initial_state_indices (read) and output_state_indices
         # (write, defaulting to the read slot).
@@ -289,7 +291,9 @@ def test_decode_strided_pool_resize_matches_reference(batch_size):
         state = backing[:, :12]
         state[: pool.shape[0]].copy_(pool)
         expected = backing.clone()
-        ref_o, ref_state = _reference(q, k, v, A_log, a, dt_bias, b, state, idx)
+        ref_o, ref_state = _reference(
+            q, k, v, A_log, a, dt_bias, b, state, idx, scale=128**-0.5
+        )
         expected[idx.long(), :12] = ref_state.transpose(-1, -2)
 
         out, _ = gated_delta_product_mtp(
@@ -302,7 +306,7 @@ def test_decode_strided_pool_resize_matches_reference(batch_size):
             a,
             dt_bias,
             b,
-            scale=1.0,
+            scale=128**-0.5,
             disable_state_update=False,
         )
         torch.testing.assert_close(out, ref_o.to(dtype), atol=1e-2, rtol=5e-3)
@@ -339,7 +343,7 @@ def test_batch_rows_are_independent(num_householder):
         a,
         dt_bias,
         b,
-        scale=1.0,
+        scale=K**-0.5,
         ssm_state_indices=ssm,
         disable_state_update=False,
     )
@@ -361,7 +365,7 @@ def test_batch_rows_are_independent(num_householder):
             a[sl],
             dt_bias,
             b[sl],
-            scale=1.0,
+            scale=K**-0.5,
             ssm_state_indices=ssm[sl].clone(),
             disable_state_update=False,
         )
@@ -400,7 +404,9 @@ def test_reference_bridge_matches_decode_delta_rule(B, num_heads):
     q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, num_q_heads, num_v_heads, K, V, torch.float32, device, seed=0
     )
-    mine_o, mine_state = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
+    mine_o, mine_state = _reference(
+        q, k, v, A_log, a, dt_bias, b, pool, idx, scale=K**-0.5
+    )
 
     ref_o, ref_state = decode_delta_rule(
         q.squeeze(1).float(),
@@ -411,7 +417,7 @@ def test_reference_bridge_matches_decode_delta_rule(B, num_heads):
         a=a.squeeze(1),
         dt_bias=dt_bias,
         b=b.squeeze(1).squeeze(1),
-        scale_factor=1.0,
+        scale_factor=K**-0.5,
         use_l2_norm=True,
     )
 
@@ -467,7 +473,7 @@ def test_per_token_state_snapshots(num_householder, T):
         a,
         dt_bias,
         b,
-        scale=1.0,
+        scale=K**-0.5,
         ssm_state_indices=ssm,
         disable_state_update=False,
     )
@@ -627,11 +633,11 @@ def test_decode_serves_a_single_token_of_a_single_sequence(num_householder):
         a,
         dt_bias,
         b,
-        scale=1.0,
+        scale=K**-0.5,
         ssm_state_indices=ssm,
         disable_state_update=False,
     )
-    ref_o, _ = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
+    ref_o, _ = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx, scale=K**-0.5)
     torch.testing.assert_close(out, ref_o.to(dtype), atol=1e-2, rtol=5e-3)
 
 
