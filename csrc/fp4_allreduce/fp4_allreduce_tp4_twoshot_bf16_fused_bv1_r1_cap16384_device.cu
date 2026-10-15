@@ -2174,21 +2174,21 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long ix64 = row64 / 4;
                     if (owner == 0) {
                         {
-                            void* _cpbulk_dst_120 = reinterpret_cast<void*>(peer_base + (rs_base + (4096 + ix64) * 3072));
+                            void* _cpbulk_dst_120 = reinterpret_cast<void*>(peer_base + ((int)rs_base + (4096 + (int)ix64) * 3072));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_120), "r"(wsm_addr + (unsigned int)ob_off), "r"((uint32_t)(3072))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_121 = reinterpret_cast<void*>(peer_base + (rs_base + 50331648 + (4096 + ix64) * 384));
+                            void* _cpbulk_dst_121 = reinterpret_cast<void*>(peer_base + ((int)rs_base + 50331648 + (4096 + (int)ix64) * 384));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_121), "r"(wsm_addr + (unsigned int)ob_off + 3072), "r"((uint32_t)(384))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_122 = reinterpret_cast<void*>(peer_base + (rs_base + 56623104 + (4096 + ix64) * 16));
+                            void* _cpbulk_dst_122 = reinterpret_cast<void*>(peer_base + ((int)rs_base + 56623104 + (4096 + (int)ix64) * 16));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_122), "r"(wsm_addr + (unsigned int)ob_off + 3072 + 384), "r"((uint32_t)(16))
@@ -2197,21 +2197,21 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     }
                     if (owner == 1) {
                         {
-                            void* _cpbulk_dst_123 = reinterpret_cast<void*>(peer_base_2 + (rs_base + (4096 + ix64) * 3072));
+                            void* _cpbulk_dst_123 = reinterpret_cast<void*>(peer_base_2 + ((int)rs_base + (4096 + (int)ix64) * 3072));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_123), "r"(wsm_addr + (unsigned int)ob_off), "r"((uint32_t)(3072))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_124 = reinterpret_cast<void*>(peer_base_2 + (rs_base + 50331648 + (4096 + ix64) * 384));
+                            void* _cpbulk_dst_124 = reinterpret_cast<void*>(peer_base_2 + ((int)rs_base + 50331648 + (4096 + (int)ix64) * 384));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_124), "r"(wsm_addr + (unsigned int)ob_off + 3072), "r"((uint32_t)(384))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_125 = reinterpret_cast<void*>(peer_base_2 + (rs_base + 56623104 + (4096 + ix64) * 16));
+                            void* _cpbulk_dst_125 = reinterpret_cast<void*>(peer_base_2 + ((int)rs_base + 56623104 + (4096 + (int)ix64) * 16));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_125), "r"(wsm_addr + (unsigned int)ob_off + 3072 + 384), "r"((uint32_t)(16))
@@ -2220,21 +2220,21 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     }
                     if (owner == 2) {
                         {
-                            void* _cpbulk_dst_126 = reinterpret_cast<void*>(peer_base_3 + (rs_base + (4096 + ix64) * 3072));
+                            void* _cpbulk_dst_126 = reinterpret_cast<void*>(peer_base_3 + ((int)rs_base + (4096 + (int)ix64) * 3072));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_126), "r"(wsm_addr + (unsigned int)ob_off), "r"((uint32_t)(3072))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_127 = reinterpret_cast<void*>(peer_base_3 + (rs_base + 50331648 + (4096 + ix64) * 384));
+                            void* _cpbulk_dst_127 = reinterpret_cast<void*>(peer_base_3 + ((int)rs_base + 50331648 + (4096 + (int)ix64) * 384));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_127), "r"(wsm_addr + (unsigned int)ob_off + 3072), "r"((uint32_t)(384))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_128 = reinterpret_cast<void*>(peer_base_3 + (rs_base + 56623104 + (4096 + ix64) * 16));
+                            void* _cpbulk_dst_128 = reinterpret_cast<void*>(peer_base_3 + ((int)rs_base + 56623104 + (4096 + (int)ix64) * 16));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_128), "r"(wsm_addr + (unsigned int)ob_off + 3072 + 384), "r"((uint32_t)(16))
@@ -2243,21 +2243,21 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     }
                     if (owner == 3) {
                         {
-                            void* _cpbulk_dst_129 = reinterpret_cast<void*>(peer_base_4 + (rs_base + (4096 + ix64) * 3072));
+                            void* _cpbulk_dst_129 = reinterpret_cast<void*>(peer_base_4 + ((int)rs_base + (4096 + (int)ix64) * 3072));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_129), "r"(wsm_addr + (unsigned int)ob_off), "r"((uint32_t)(3072))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_130 = reinterpret_cast<void*>(peer_base_4 + (rs_base + 50331648 + (4096 + ix64) * 384));
+                            void* _cpbulk_dst_130 = reinterpret_cast<void*>(peer_base_4 + ((int)rs_base + 50331648 + (4096 + (int)ix64) * 384));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_130), "r"(wsm_addr + (unsigned int)ob_off + 3072), "r"((uint32_t)(384))
                                 : "memory");
                         }
                         {
-                            void* _cpbulk_dst_131 = reinterpret_cast<void*>(peer_base_4 + (rs_base + 56623104 + (4096 + ix64) * 16));
+                            void* _cpbulk_dst_131 = reinterpret_cast<void*>(peer_base_4 + ((int)rs_base + 56623104 + (4096 + (int)ix64) * 16));
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                 :: "l"(_cpbulk_dst_131), "r"(wsm_addr + (unsigned int)ob_off + 3072 + 384), "r"((uint32_t)(16))
@@ -2276,6 +2276,10 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 asm volatile("cp.async.bulk.wait_group.read 0;");
             }
             __syncwarp();
+            int g32 = (int)num_bids;
+            if (rows / g32 <= 8) {
+                asm volatile("barrier.arrive 7, 352;" ::: "memory");
+            }
             int nC = nrows - nB;
             int wB = (warp_0 - nrows % 10 + 10) % 10;
             int wC = (warp_0 - (nrows + nB) % 10 + 10) % 10;
@@ -2297,25 +2301,25 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 asm volatile("bar.sync %0, 64;" :: "r"(1 + t) : "memory");
                 uint32_t _sysv_poll32_group_0[1];
                 do {
-                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + 56623104 + tix64 * 16))) : "memory");
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + 56623104 + (int)tix64 * 16))) : "memory");
                 } while (
                     (_sysv_poll32_group_0[0] == 0x80000000u)
                 );
                 uint32_t _sysv_poll32_group_1[1];
                 do {
-                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_1[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + 56623104 + (4096 + tix64) * 16))) : "memory");
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_1[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + 56623104 + (4096 + (int)tix64) * 16))) : "memory");
                 } while (
                     (_sysv_poll32_group_1[0] == 0x80000000u)
                 );
                 uint32_t _sysv_poll32_group_2[1];
                 do {
-                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_2[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + 56623104 + (8192 + tix64) * 16))) : "memory");
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_2[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + 56623104 + (8192 + (int)tix64) * 16))) : "memory");
                 } while (
                     (_sysv_poll32_group_2[0] == 0x80000000u)
                 );
                 uint32_t _sysv_poll32_group_3[1];
                 do {
-                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_3[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + 56623104 + (12288 + tix64) * 16))) : "memory");
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_3[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + 56623104 + (12288 + (int)tix64) * 16))) : "memory");
                 } while (
                     (_sysv_poll32_group_3[0] == 0x80000000u)
                 );
@@ -2330,31 +2334,31 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 uint32_t _wire_spend_136 = 15u;
                 do {
                     if (_wire_vpend_136 & 1u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[0]), "=r"(_fp4_wire_values_0[1]), "=r"(_fp4_wire_values_0[2]), "=r"(_fp4_wire_values_0[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + tix64 * 3072 + (long long)(16 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[0]), "=r"(_fp4_wire_values_0[1]), "=r"(_fp4_wire_values_0[2]), "=r"(_fp4_wire_values_0[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (int)tix64 * 3072 + 16 * pp_1))) : "memory");
                     }
                     if (_wire_vpend_136 & 2u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[4]), "=r"(_fp4_wire_values_0[5]), "=r"(_fp4_wire_values_0[6]), "=r"(_fp4_wire_values_0[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (4096 + tix64) * 3072 + (long long)(16 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[4]), "=r"(_fp4_wire_values_0[5]), "=r"(_fp4_wire_values_0[6]), "=r"(_fp4_wire_values_0[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (4096 + (int)tix64) * 3072 + 16 * pp_1))) : "memory");
                     }
                     if (_wire_vpend_136 & 4u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[8]), "=r"(_fp4_wire_values_0[9]), "=r"(_fp4_wire_values_0[10]), "=r"(_fp4_wire_values_0[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (8192 + tix64) * 3072 + (long long)(16 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[8]), "=r"(_fp4_wire_values_0[9]), "=r"(_fp4_wire_values_0[10]), "=r"(_fp4_wire_values_0[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (8192 + (int)tix64) * 3072 + 16 * pp_1))) : "memory");
                     }
                     if (_wire_vpend_136 & 8u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[12]), "=r"(_fp4_wire_values_0[13]), "=r"(_fp4_wire_values_0[14]), "=r"(_fp4_wire_values_0[15]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (12288 + tix64) * 3072 + (long long)(16 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_0[12]), "=r"(_fp4_wire_values_0[13]), "=r"(_fp4_wire_values_0[14]), "=r"(_fp4_wire_values_0[15]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (12288 + (int)tix64) * 3072 + 16 * pp_1))) : "memory");
                     }
                     if (_wire_spend_136 & 1u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + tix64 * 384 + (long long)(2 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (int)tix64 * 384 + 2 * pp_1))) : "memory");
                         _fp4_wire_scales_0[0] = (uint32_t)_wire_h16_136_0;
                     }
                     if (_wire_spend_136 & 2u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (4096 + tix64) * 384 + (long long)(2 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (4096 + (int)tix64) * 384 + 2 * pp_1))) : "memory");
                         _fp4_wire_scales_0[1] = (uint32_t)_wire_h16_136_1;
                     }
                     if (_wire_spend_136 & 4u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (8192 + tix64) * 384 + (long long)(2 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (8192 + (int)tix64) * 384 + 2 * pp_1))) : "memory");
                         _fp4_wire_scales_0[2] = (uint32_t)_wire_h16_136_2;
                     }
                     if (_wire_spend_136 & 8u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_3) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (12288 + tix64) * 384 + (long long)(2 * pp_1)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_136_3) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (12288 + (int)tix64) * 384 + 2 * pp_1))) : "memory");
                         _fp4_wire_scales_0[3] = (uint32_t)_wire_h16_136_3;
                     }
                     if (_wire_vpend_136 & 1u) {
@@ -3074,31 +3078,31 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 uint32_t _wire_spend_137 = 15u;
                 do {
                     if (_wire_vpend_137 & 1u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[0]), "=r"(_fp4_wire_values_1[1]), "=r"(_fp4_wire_values_1[2]), "=r"(_fp4_wire_values_1[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + tix64 * 3072 + (long long)(16 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[0]), "=r"(_fp4_wire_values_1[1]), "=r"(_fp4_wire_values_1[2]), "=r"(_fp4_wire_values_1[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (int)tix64 * 3072 + 16 * pp_69))) : "memory");
                     }
                     if (_wire_vpend_137 & 2u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[4]), "=r"(_fp4_wire_values_1[5]), "=r"(_fp4_wire_values_1[6]), "=r"(_fp4_wire_values_1[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (4096 + tix64) * 3072 + (long long)(16 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[4]), "=r"(_fp4_wire_values_1[5]), "=r"(_fp4_wire_values_1[6]), "=r"(_fp4_wire_values_1[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (4096 + (int)tix64) * 3072 + 16 * pp_69))) : "memory");
                     }
                     if (_wire_vpend_137 & 4u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[8]), "=r"(_fp4_wire_values_1[9]), "=r"(_fp4_wire_values_1[10]), "=r"(_fp4_wire_values_1[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (8192 + tix64) * 3072 + (long long)(16 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[8]), "=r"(_fp4_wire_values_1[9]), "=r"(_fp4_wire_values_1[10]), "=r"(_fp4_wire_values_1[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (8192 + (int)tix64) * 3072 + 16 * pp_69))) : "memory");
                     }
                     if (_wire_vpend_137 & 8u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[12]), "=r"(_fp4_wire_values_1[13]), "=r"(_fp4_wire_values_1[14]), "=r"(_fp4_wire_values_1[15]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (12288 + tix64) * 3072 + (long long)(16 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_1[12]), "=r"(_fp4_wire_values_1[13]), "=r"(_fp4_wire_values_1[14]), "=r"(_fp4_wire_values_1[15]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (12288 + (int)tix64) * 3072 + 16 * pp_69))) : "memory");
                     }
                     if (_wire_spend_137 & 1u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + tix64 * 384 + (long long)(2 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (int)tix64 * 384 + 2 * pp_69))) : "memory");
                         _fp4_wire_scales_1[0] = (uint32_t)_wire_h16_137_0;
                     }
                     if (_wire_spend_137 & 2u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (4096 + tix64) * 384 + (long long)(2 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (4096 + (int)tix64) * 384 + 2 * pp_69))) : "memory");
                         _fp4_wire_scales_1[1] = (uint32_t)_wire_h16_137_1;
                     }
                     if (_wire_spend_137 & 4u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (8192 + tix64) * 384 + (long long)(2 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (8192 + (int)tix64) * 384 + 2 * pp_69))) : "memory");
                         _fp4_wire_scales_1[2] = (uint32_t)_wire_h16_137_2;
                     }
                     if (_wire_spend_137 & 8u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_3) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (12288 + tix64) * 384 + (long long)(2 * pp_69)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_137_3) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (12288 + (int)tix64) * 384 + 2 * pp_69))) : "memory");
                         _fp4_wire_scales_1[3] = (uint32_t)_wire_h16_137_3;
                     }
                     if (_wire_vpend_137 & 1u) {
@@ -3818,31 +3822,31 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 uint32_t _wire_spend_138 = 15u;
                 do {
                     if (_wire_vpend_138 & 1u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[0]), "=r"(_fp4_wire_values_2[1]), "=r"(_fp4_wire_values_2[2]), "=r"(_fp4_wire_values_2[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + tix64 * 3072 + (long long)(16 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[0]), "=r"(_fp4_wire_values_2[1]), "=r"(_fp4_wire_values_2[2]), "=r"(_fp4_wire_values_2[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (int)tix64 * 3072 + 16 * pp_143))) : "memory");
                     }
                     if (_wire_vpend_138 & 2u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[4]), "=r"(_fp4_wire_values_2[5]), "=r"(_fp4_wire_values_2[6]), "=r"(_fp4_wire_values_2[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (4096 + tix64) * 3072 + (long long)(16 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[4]), "=r"(_fp4_wire_values_2[5]), "=r"(_fp4_wire_values_2[6]), "=r"(_fp4_wire_values_2[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (4096 + (int)tix64) * 3072 + 16 * pp_143))) : "memory");
                     }
                     if (_wire_vpend_138 & 4u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[8]), "=r"(_fp4_wire_values_2[9]), "=r"(_fp4_wire_values_2[10]), "=r"(_fp4_wire_values_2[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (8192 + tix64) * 3072 + (long long)(16 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[8]), "=r"(_fp4_wire_values_2[9]), "=r"(_fp4_wire_values_2[10]), "=r"(_fp4_wire_values_2[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (8192 + (int)tix64) * 3072 + 16 * pp_143))) : "memory");
                     }
                     if (_wire_vpend_138 & 8u) {
-                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[12]), "=r"(_fp4_wire_values_2[13]), "=r"(_fp4_wire_values_2[14]), "=r"(_fp4_wire_values_2[15]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (rs_base + (12288 + tix64) * 3072 + (long long)(16 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_2[12]), "=r"(_fp4_wire_values_2[13]), "=r"(_fp4_wire_values_2[14]), "=r"(_fp4_wire_values_2[15]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)rs_base + (12288 + (int)tix64) * 3072 + 16 * pp_143))) : "memory");
                     }
                     if (_wire_spend_138 & 1u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + tix64 * 384 + (long long)(2 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (int)tix64 * 384 + 2 * pp_143))) : "memory");
                         _fp4_wire_scales_2[0] = (uint32_t)_wire_h16_138_0;
                     }
                     if (_wire_spend_138 & 2u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (4096 + tix64) * 384 + (long long)(2 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (4096 + (int)tix64) * 384 + 2 * pp_143))) : "memory");
                         _fp4_wire_scales_2[1] = (uint32_t)_wire_h16_138_1;
                     }
                     if (_wire_spend_138 & 4u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (8192 + tix64) * 384 + (long long)(2 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (8192 + (int)tix64) * 384 + 2 * pp_143))) : "memory");
                         _fp4_wire_scales_2[2] = (uint32_t)_wire_h16_138_2;
                     }
                     if (_wire_spend_138 & 8u) {
-                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_3) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (rs_base + 50331648 + (12288 + tix64) * 384 + (long long)(2 * pp_143)))) : "memory");
+                        asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_138_3) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)rs_base + 50331648 + (12288 + (int)tix64) * 384 + 2 * pp_143))) : "memory");
                         _fp4_wire_scales_2[3] = (uint32_t)_wire_h16_138_3;
                     }
                     if (_wire_vpend_138 & 1u) {
@@ -6478,63 +6482,63 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 asm volatile("bar.sync %0, 64;" :: "r"(1 + t) : "memory");
                 if (h == 0 && lane_1 == 0) {
                     {
-                        void* _cpbulk_dst_247 = reinterpret_cast<void*>(peer_base_3 + (ag_base + (4096 + tix64) * 3072));
+                        void* _cpbulk_dst_247 = reinterpret_cast<void*>(peer_base_3 + ((int)ag_base + (4096 + (int)tix64) * 3072));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_247), "r"(wsm_addr + (unsigned int)tob_off), "r"((uint32_t)(3072))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_248 = reinterpret_cast<void*>(peer_base_3 + (ag_base + 50331648 + (4096 + tix64) * 384));
+                        void* _cpbulk_dst_248 = reinterpret_cast<void*>(peer_base_3 + ((int)ag_base + 50331648 + (4096 + (int)tix64) * 384));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_248), "r"(wsm_addr + (unsigned int)tob_off + 3072), "r"((uint32_t)(384))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_249 = reinterpret_cast<void*>(peer_base_3 + (ag_base + 56623104 + (4096 + tix64) * 16));
+                        void* _cpbulk_dst_249 = reinterpret_cast<void*>(peer_base_3 + ((int)ag_base + 56623104 + (4096 + (int)tix64) * 16));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_249), "r"(wsm_addr + (unsigned int)tob_off + 3072 + 384), "r"((uint32_t)(16))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_250 = reinterpret_cast<void*>(peer_base_4 + (ag_base + (4096 + tix64) * 3072));
+                        void* _cpbulk_dst_250 = reinterpret_cast<void*>(peer_base_4 + ((int)ag_base + (4096 + (int)tix64) * 3072));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_250), "r"(wsm_addr + (unsigned int)tob_off), "r"((uint32_t)(3072))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_251 = reinterpret_cast<void*>(peer_base_4 + (ag_base + 50331648 + (4096 + tix64) * 384));
+                        void* _cpbulk_dst_251 = reinterpret_cast<void*>(peer_base_4 + ((int)ag_base + 50331648 + (4096 + (int)tix64) * 384));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_251), "r"(wsm_addr + (unsigned int)tob_off + 3072), "r"((uint32_t)(384))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_252 = reinterpret_cast<void*>(peer_base_4 + (ag_base + 56623104 + (4096 + tix64) * 16));
+                        void* _cpbulk_dst_252 = reinterpret_cast<void*>(peer_base_4 + ((int)ag_base + 56623104 + (4096 + (int)tix64) * 16));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_252), "r"(wsm_addr + (unsigned int)tob_off + 3072 + 384), "r"((uint32_t)(16))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_253 = reinterpret_cast<void*>(peer_base + (ag_base + (4096 + tix64) * 3072));
+                        void* _cpbulk_dst_253 = reinterpret_cast<void*>(peer_base + ((int)ag_base + (4096 + (int)tix64) * 3072));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_253), "r"(wsm_addr + (unsigned int)tob_off), "r"((uint32_t)(3072))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_254 = reinterpret_cast<void*>(peer_base + (ag_base + 50331648 + (4096 + tix64) * 384));
+                        void* _cpbulk_dst_254 = reinterpret_cast<void*>(peer_base + ((int)ag_base + 50331648 + (4096 + (int)tix64) * 384));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_254), "r"(wsm_addr + (unsigned int)tob_off + 3072), "r"((uint32_t)(384))
                             : "memory");
                     }
                     {
-                        void* _cpbulk_dst_255 = reinterpret_cast<void*>(peer_base + (ag_base + 56623104 + (4096 + tix64) * 16));
+                        void* _cpbulk_dst_255 = reinterpret_cast<void*>(peer_base + ((int)ag_base + 56623104 + (4096 + (int)tix64) * 16));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_255), "r"(wsm_addr + (unsigned int)tob_off + 3072 + 384), "r"((uint32_t)(16))
@@ -6558,7 +6562,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                 float rs_2 = 0.0f;
                 uint32_t _sysv_poll32_group_4[1];
                 do {
-                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_4[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (ag_base + 56623104 + (csrc64 * 4096 + cix64) * 16))) : "memory");
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_4[0]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)ag_base + 56623104 + ((int)csrc64 * 4096 + (int)cix64) * 16))) : "memory");
                 } while (
                     (_sysv_poll32_group_4[0] == 0x80000000u)
                 );
@@ -6577,24 +6581,24 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     uint32_t _wire_spend_257 = 7u;
                     do {
                         if (_wire_vpend_257 & 1u) {
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_3[0]), "=r"(_fp4_wire_values_3[1]), "=r"(_fp4_wire_values_3[2]), "=r"(_fp4_wire_values_3[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (ag_base + (csrc64 * 4096 + cix64) * 3072 + (long long)(16 * pp0)))) : "memory");
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_3[0]), "=r"(_fp4_wire_values_3[1]), "=r"(_fp4_wire_values_3[2]), "=r"(_fp4_wire_values_3[3]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)ag_base + ((int)csrc64 * 4096 + (int)cix64) * 3072 + 16 * pp0))) : "memory");
                         }
                         if (_wire_vpend_257 & 2u) {
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_3[4]), "=r"(_fp4_wire_values_3[5]), "=r"(_fp4_wire_values_3[6]), "=r"(_fp4_wire_values_3[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (ag_base + (csrc64 * 4096 + cix64) * 3072 + (long long)(16 * pp1)))) : "memory");
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_3[4]), "=r"(_fp4_wire_values_3[5]), "=r"(_fp4_wire_values_3[6]), "=r"(_fp4_wire_values_3[7]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)ag_base + ((int)csrc64 * 4096 + (int)cix64) * 3072 + 16 * pp1))) : "memory");
                         }
                         if (_wire_vpend_257 & 4u) {
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_3[8]), "=r"(_fp4_wire_values_3[9]), "=r"(_fp4_wire_values_3[10]), "=r"(_fp4_wire_values_3[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + (ag_base + (csrc64 * 4096 + cix64) * 3072 + (long long)(16 * pp2_2)))) : "memory");
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_fp4_wire_values_3[8]), "=r"(_fp4_wire_values_3[9]), "=r"(_fp4_wire_values_3[10]), "=r"(_fp4_wire_values_3[11]) : "l"(reinterpret_cast<unsigned int*>(self_u8 + ((int)ag_base + ((int)csrc64 * 4096 + (int)cix64) * 3072 + 16 * pp2_2))) : "memory");
                         }
                         if (_wire_spend_257 & 1u) {
-                            asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_257_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (ag_base + 50331648 + (csrc64 * 4096 + cix64) * 384 + (long long)(2 * pp0)))) : "memory");
+                            asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_257_0) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)ag_base + 50331648 + ((int)csrc64 * 4096 + (int)cix64) * 384 + 2 * pp0))) : "memory");
                             _fp4_wire_scales_3[0] = (uint32_t)_wire_h16_257_0;
                         }
                         if (_wire_spend_257 & 2u) {
-                            asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_257_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (ag_base + 50331648 + (csrc64 * 4096 + cix64) * 384 + (long long)(2 * pp1)))) : "memory");
+                            asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_257_1) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)ag_base + 50331648 + ((int)csrc64 * 4096 + (int)cix64) * 384 + 2 * pp1))) : "memory");
                             _fp4_wire_scales_3[1] = (uint32_t)_wire_h16_257_1;
                         }
                         if (_wire_spend_257 & 4u) {
-                            asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_257_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + (ag_base + 50331648 + (csrc64 * 4096 + cix64) * 384 + (long long)(2 * pp2_2)))) : "memory");
+                            asm volatile("ld.volatile.global.u16 %0, [%1];" : "=h"(_wire_h16_257_2) : "l"(reinterpret_cast<uint16_t*>(self_u8 + ((int)ag_base + 50331648 + ((int)csrc64 * 4096 + (int)cix64) * 384 + 2 * pp2_2))) : "memory");
                             _fp4_wire_scales_3[2] = (uint32_t)_wire_h16_257_2;
                         }
                         if (_wire_vpend_257 & 1u) {
@@ -7419,6 +7423,10 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
             unsigned int prev_algo = ctl[2];
             unsigned int pbuf = (call_1 + 2) % 3;
             uint8_t* self_u8_1 = reinterpret_cast<uint8_t*>(workspace[1]);
+            int g32_1 = (int)num_bids;
+            if (rows / g32_1 <= 8) {
+                asm volatile("barrier.sync 7, 352;" ::: "memory");
+            }
             if (prev_algo == 2) {
                 long long bid64_1 = (long long)bid;
                 long long g64_1 = (long long)num_bids;
@@ -7440,7 +7448,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem = hi - o;
                     unsigned int nb = (unsigned int)(((rem >= pg) ? pg : rem));
                     {
-                        void* _cpbulk_dst_0 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + o));
+                        void* _cpbulk_dst_0 = reinterpret_cast<void*>(self_u8_1 + ((long long)(int)rs_base_1 + o));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_0), "r"(pat_addr), "r"((uint32_t)(nb))
@@ -7460,7 +7468,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_1 = hi_2 - o_1;
                     unsigned int nb_1 = (unsigned int)(((rem_1 >= pg_5) ? pg_5 : rem_1));
                     {
-                        void* _cpbulk_dst_1 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 50331648 + o_1));
+                        void* _cpbulk_dst_1 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648) + o_1));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_1), "r"(pat_addr + 4096), "r"((uint32_t)(nb_1))
@@ -7480,7 +7488,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_2 = hi_8 - o_2;
                     unsigned int nb_2 = (unsigned int)(((rem_2 >= pg_11) ? pg_11 : rem_2));
                     {
-                        void* _cpbulk_dst_2 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 56623104 + o_2));
+                        void* _cpbulk_dst_2 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104) + o_2));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_2), "r"(pat_addr + 8192), "r"((uint32_t)(nb_2))
@@ -7500,7 +7508,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_3 = hi_14 - o_3;
                     unsigned int nb_3 = (unsigned int)(((rem_3 >= pg_17) ? pg_17 : rem_3));
                     {
-                        void* _cpbulk_dst_3 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 12582912 + o_3));
+                        void* _cpbulk_dst_3 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 12582912) + o_3));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_3), "r"(pat_addr), "r"((uint32_t)(nb_3))
@@ -7520,7 +7528,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_4 = hi_20 - o_4;
                     unsigned int nb_4 = (unsigned int)(((rem_4 >= pg_23) ? pg_23 : rem_4));
                     {
-                        void* _cpbulk_dst_4 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 50331648 + 1572864 + o_4));
+                        void* _cpbulk_dst_4 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648 + 1572864) + o_4));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_4), "r"(pat_addr + 4096), "r"((uint32_t)(nb_4))
@@ -7540,7 +7548,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_5 = hi_26 - o_5;
                     unsigned int nb_5 = (unsigned int)(((rem_5 >= pg_29) ? pg_29 : rem_5));
                     {
-                        void* _cpbulk_dst_5 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 56623104 + 65536 + o_5));
+                        void* _cpbulk_dst_5 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104 + 65536) + o_5));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_5), "r"(pat_addr + 8192), "r"((uint32_t)(nb_5))
@@ -7560,7 +7568,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_6 = hi_32 - o_6;
                     unsigned int nb_6 = (unsigned int)(((rem_6 >= pg_35) ? pg_35 : rem_6));
                     {
-                        void* _cpbulk_dst_6 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 25165824 + o_6));
+                        void* _cpbulk_dst_6 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 25165824) + o_6));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_6), "r"(pat_addr), "r"((uint32_t)(nb_6))
@@ -7580,7 +7588,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_7 = hi_38 - o_7;
                     unsigned int nb_7 = (unsigned int)(((rem_7 >= pg_41) ? pg_41 : rem_7));
                     {
-                        void* _cpbulk_dst_7 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 50331648 + 3145728 + o_7));
+                        void* _cpbulk_dst_7 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648 + 3145728) + o_7));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_7), "r"(pat_addr + 4096), "r"((uint32_t)(nb_7))
@@ -7600,7 +7608,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_8 = hi_44 - o_8;
                     unsigned int nb_8 = (unsigned int)(((rem_8 >= pg_47) ? pg_47 : rem_8));
                     {
-                        void* _cpbulk_dst_8 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 56623104 + 131072 + o_8));
+                        void* _cpbulk_dst_8 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104 + 131072) + o_8));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_8), "r"(pat_addr + 8192), "r"((uint32_t)(nb_8))
@@ -7620,7 +7628,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_9 = hi_50 - o_9;
                     unsigned int nb_9 = (unsigned int)(((rem_9 >= pg_53) ? pg_53 : rem_9));
                     {
-                        void* _cpbulk_dst_9 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 37748736 + o_9));
+                        void* _cpbulk_dst_9 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 37748736) + o_9));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_9), "r"(pat_addr), "r"((uint32_t)(nb_9))
@@ -7640,7 +7648,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_10 = hi_56 - o_10;
                     unsigned int nb_10 = (unsigned int)(((rem_10 >= pg_59) ? pg_59 : rem_10));
                     {
-                        void* _cpbulk_dst_10 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 50331648 + 4718592 + o_10));
+                        void* _cpbulk_dst_10 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648 + 4718592) + o_10));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_10), "r"(pat_addr + 4096), "r"((uint32_t)(nb_10))
@@ -7660,7 +7668,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_11 = hi_62 - o_11;
                     unsigned int nb_11 = (unsigned int)(((rem_11 >= pg_65) ? pg_65 : rem_11));
                     {
-                        void* _cpbulk_dst_11 = reinterpret_cast<void*>(self_u8_1 + (rs_base_1 + 56623104 + 196608 + o_11));
+                        void* _cpbulk_dst_11 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104 + 196608) + o_11));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_11), "r"(pat_addr + 8192), "r"((uint32_t)(nb_11))
@@ -7680,7 +7688,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_12 = hi_68 - o_12;
                     unsigned int nb_12 = (unsigned int)(((rem_12 >= pg_71) ? pg_71 : rem_12));
                     {
-                        void* _cpbulk_dst_12 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + o_12));
+                        void* _cpbulk_dst_12 = reinterpret_cast<void*>(self_u8_1 + ((long long)(int)ag_base_1 + o_12));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_12), "r"(pat_addr), "r"((uint32_t)(nb_12))
@@ -7700,7 +7708,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_13 = hi_74 - o_13;
                     unsigned int nb_13 = (unsigned int)(((rem_13 >= pg_77) ? pg_77 : rem_13));
                     {
-                        void* _cpbulk_dst_13 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 50331648 + o_13));
+                        void* _cpbulk_dst_13 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 50331648) + o_13));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_13), "r"(pat_addr + 4096), "r"((uint32_t)(nb_13))
@@ -7720,7 +7728,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_14 = hi_80 - o_14;
                     unsigned int nb_14 = (unsigned int)(((rem_14 >= pg_83) ? pg_83 : rem_14));
                     {
-                        void* _cpbulk_dst_14 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 56623104 + o_14));
+                        void* _cpbulk_dst_14 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 56623104) + o_14));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_14), "r"(pat_addr + 8192), "r"((uint32_t)(nb_14))
@@ -7740,7 +7748,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_15 = hi_86 - o_15;
                     unsigned int nb_15 = (unsigned int)(((rem_15 >= pg_89) ? pg_89 : rem_15));
                     {
-                        void* _cpbulk_dst_15 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 25165824 + o_15));
+                        void* _cpbulk_dst_15 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 25165824) + o_15));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_15), "r"(pat_addr), "r"((uint32_t)(nb_15))
@@ -7760,7 +7768,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_16 = hi_92 - o_16;
                     unsigned int nb_16 = (unsigned int)(((rem_16 >= pg_95) ? pg_95 : rem_16));
                     {
-                        void* _cpbulk_dst_16 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 50331648 + 3145728 + o_16));
+                        void* _cpbulk_dst_16 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 50331648 + 3145728) + o_16));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_16), "r"(pat_addr + 4096), "r"((uint32_t)(nb_16))
@@ -7780,7 +7788,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_17 = hi_98 - o_17;
                     unsigned int nb_17 = (unsigned int)(((rem_17 >= pg_101) ? pg_101 : rem_17));
                     {
-                        void* _cpbulk_dst_17 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 56623104 + 131072 + o_17));
+                        void* _cpbulk_dst_17 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 56623104 + 131072) + o_17));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_17), "r"(pat_addr + 8192), "r"((uint32_t)(nb_17))
@@ -7800,7 +7808,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_18 = hi_104 - o_18;
                     unsigned int nb_18 = (unsigned int)(((rem_18 >= pg_107) ? pg_107 : rem_18));
                     {
-                        void* _cpbulk_dst_18 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 37748736 + o_18));
+                        void* _cpbulk_dst_18 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 37748736) + o_18));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_18), "r"(pat_addr), "r"((uint32_t)(nb_18))
@@ -7820,7 +7828,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_19 = hi_110 - o_19;
                     unsigned int nb_19 = (unsigned int)(((rem_19 >= pg_113) ? pg_113 : rem_19));
                     {
-                        void* _cpbulk_dst_19 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 50331648 + 4718592 + o_19));
+                        void* _cpbulk_dst_19 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 50331648 + 4718592) + o_19));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_19), "r"(pat_addr + 4096), "r"((uint32_t)(nb_19))
@@ -7840,7 +7848,7 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv1_r1_cap16384(__nv_bfloat16* __res
                     long long rem_20 = hi_116 - o_20;
                     unsigned int nb_20 = (unsigned int)(((rem_20 >= pg_119) ? pg_119 : rem_20));
                     {
-                        void* _cpbulk_dst_20 = reinterpret_cast<void*>(self_u8_1 + (ag_base_1 + 56623104 + 196608 + o_20));
+                        void* _cpbulk_dst_20 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 56623104 + 196608) + o_20));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_20), "r"(pat_addr + 8192), "r"((uint32_t)(nb_20))

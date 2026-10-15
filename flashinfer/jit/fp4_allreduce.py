@@ -291,8 +291,8 @@ PROGRAMS: dict = {
         "family": "rmsnorm",
         "algo": "oneshot",
         "binding": "fp4_allreduce_tp2_rmsnorm_binding.cu",
-        "block": {"bf16": 224, "nvfp4": 192},
-        "dynamic_smem_bytes": {"bf16": 214784, "nvfp4": 198656},
+        "block": {"bf16": 256, "nvfp4": 256},
+        "dynamic_smem_bytes": {"bf16": 219776, "nvfp4": 215424},
         "formats": [
             ["bf16", "bf16"],
             ["nvfp4", "bf16"],

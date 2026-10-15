@@ -2599,7 +2599,9 @@ kernel_fp4_allreduce_tp2_oneshot_bf16_fused_r0_cap16384(__nv_bfloat16* __restric
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("barrier.sync 0, 352;" ::: "memory");
-            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
             unsigned int call_1 = ctl[0];
             unsigned int prev_rows = ctl[1];
             unsigned int prev_algo = ctl[2];

@@ -190,6 +190,7 @@ kernel_fp4_allreduce_tp2_oneshot_nvfp4_fused_r0_cap16384(uint8_t* __restrict__ x
     if (warp <= 9) {
         { // workers_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             float g = gs[0];
             float g_0 = gs[1];
             long long bid64 = (long long)bid;
@@ -215,7 +216,6 @@ kernel_fp4_allreduce_tp2_oneshot_nvfp4_fused_r0_cap16384(uint8_t* __restrict__ x
                 ctl[2] = ctrl[base + 3];
             }
             asm volatile("barrier.sync 0, 352;" ::: "memory");
-            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             unsigned int call = ctl[0];
             unsigned int buf = call % 3;
             int* out_i32 = reinterpret_cast<int*>(out);
@@ -1709,8 +1709,8 @@ kernel_fp4_allreduce_tp2_oneshot_nvfp4_fused_r0_cap16384(uint8_t* __restrict__ x
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             asm volatile("griddepcontrol.wait;" ::: "memory");
-            asm volatile("barrier.sync 0, 352;" ::: "memory");
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            asm volatile("barrier.sync 0, 352;" ::: "memory");
             unsigned int call_1 = ctl[0];
             unsigned int prev_rows = ctl[1];
             unsigned int prev_algo = ctl[2];

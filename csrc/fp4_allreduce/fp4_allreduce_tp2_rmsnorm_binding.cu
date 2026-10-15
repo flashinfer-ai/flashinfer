@@ -47,8 +47,8 @@ constexpr int64_t kNvfp4ScalesPerRow = 384;
 constexpr int64_t kMxfp8ValueBytes = 6144;
 constexpr int64_t kMxfp8ScalesPerRow = 192;
 // Threads and dynamic shared memory depend on the input format (six worker warps for bfloat16, five for records).
-constexpr unsigned kThreads[kInputFormats] = {224, 192};
-constexpr unsigned kDynamicSmemBytes[kInputFormats] = {214784, 198656};
+constexpr unsigned kThreads[kInputFormats] = {256, 256};
+constexpr unsigned kDynamicSmemBytes[kInputFormats] = {219776, 215424};
 
 // [input format][output format][rank]; nullptr marks a pair the family does not deliver (quantised output is
 // specified for bfloat16 input only).

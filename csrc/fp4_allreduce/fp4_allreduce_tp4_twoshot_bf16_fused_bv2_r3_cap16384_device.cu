@@ -2276,6 +2276,9 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv2_r3_cap16384(__nv_bfloat16* __res
                 asm volatile("cp.async.bulk.wait_group.read 0;");
             }
             __syncwarp();
+            {
+                asm volatile("barrier.arrive 7, 352;" ::: "memory");
+            }
             int nC = nrows - nB;
             int wB = (warp_0 - nrows % 10 + 10) % 10;
             int wC = (warp_0 - (nrows + nB) % 10 + 10) % 10;
@@ -6253,6 +6256,9 @@ kernel_fp4_allreduce_tp4_twoshot_bf16_fused_bv2_r3_cap16384(__nv_bfloat16* __res
             unsigned int prev_algo = ctl[2];
             unsigned int pbuf = (call_1 + 2) % 3;
             uint8_t* self_u8_1 = reinterpret_cast<uint8_t*>(workspace[3]);
+            {
+                asm volatile("barrier.sync 7, 352;" ::: "memory");
+            }
             if (prev_algo == 2) {
                 long long bid64_1 = (long long)bid;
                 long long g64_1 = (long long)num_bids;
