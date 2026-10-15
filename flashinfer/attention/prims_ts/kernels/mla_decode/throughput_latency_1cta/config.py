@@ -810,7 +810,12 @@ def resolve_runtime_cluster_reduction_mode(
 
     cluster_shape = cluster_reduction_cluster_shape(cfg)
     cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
-    active_clusters = hardware_info.get_max_active_clusters(cluster_size, stream)
+    if hardware_info is None:
+        from ...._hardware import get_max_active_clusters
+
+        active_clusters = get_max_active_clusters(cluster_size)
+    else:
+        active_clusters = hardware_info.get_max_active_clusters(cluster_size, stream)
     cluster_count = cluster_reduction_cluster_count(cfg)
     if log is not None:
         log(

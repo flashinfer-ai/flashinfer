@@ -3825,44 +3825,21 @@ def _select_auto_launch_mode(
     return "static"
 
 
-_MAX_ACTIVE_CLUSTERS_CACHE: dict[tuple[int | None, int], int] = {}
-
-
 def get_max_active_clusters_for_cluster_size(cluster_size: int) -> int:
-    """Query cluster occupancy after establishing CUDA's primary context.
+    """Query device occupancy, preserving the CPU-only policy fallback."""
+    from ..._hardware import get_max_active_clusters
 
-    ``HardwareInfo`` compiles and retains a tiny occupancy-query module on its
-    first call.  If that first call precedes CUDA context creation, retrying can
-    reuse an invalid module handle.  Establish the context before constructing
-    ``HardwareInfo`` so a fresh Python process is reliable as well.
-    """
-    cuda_context_ready = False
-    device_index = None
     try:
         import torch
 
         if torch.cuda.is_available():
-            torch.cuda.init()
-            torch.empty(0, device="cuda")
-            cuda_context_ready = True
-            device_index = torch.cuda.current_device()
-    except (ImportError, RuntimeError):
+            return get_max_active_clusters(cluster_size)
+    except ImportError:
         pass
-    # Each HardwareInfo query JIT-compiles a probe kernel (~0.2 s), and plans
-    # resolve occupancy on every new shape, so memoize per device.
-    cache_key = (device_index, cluster_size)
-    cached = _MAX_ACTIVE_CLUSTERS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
     try:
-        result = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        return utils.HardwareInfo().get_max_active_clusters(cluster_size)
     except RuntimeError:
-        if cuda_context_ready:
-            raise
         return max(FALLBACK_SM_COUNT_B200 // max(cluster_size, 1), 1)
-    if cuda_context_ready:
-        _MAX_ACTIVE_CLUSTERS_CACHE[cache_key] = result
-    return result
 
 
 def select_one_wave_cluster_split(

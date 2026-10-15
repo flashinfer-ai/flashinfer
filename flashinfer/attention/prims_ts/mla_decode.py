@@ -19,6 +19,9 @@ from dataclasses import dataclass, field
 import functools
 from typing import Any, Literal, Optional, cast
 
+from ._compile_cache import build_and_load_attention_kernel
+from ._hardware import get_max_active_clusters
+
 import torch
 
 from flashinfer.api_logging import flashinfer_experimental_api
@@ -731,8 +734,6 @@ def _resolve_mla_decode_launch_spec(
     max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
 
     import cutlass
-    import cutlass.utils as cutlass_utils
-    from cuda.bindings import driver as cuda_drv
 
     from .kernels.mla_decode.kernel_policy import (
         resolve_mla_kernel_policy,
@@ -768,16 +769,8 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_name = _kernel_dtype_name(output_dtype_key)
 
     with torch.cuda.device(device_index):
-        plan_stream = cuda_drv.CUstream(
-            torch.cuda.current_stream(device_index).cuda_stream
-        )
-        hardware_info = cutlass_utils.HardwareInfo(device_index)
-        max_active_one_cta_clusters = hardware_info.get_max_active_clusters(
-            1, plan_stream
-        )
-        max_active_two_cta_clusters = hardware_info.get_max_active_clusters(
-            2, plan_stream
-        )
+        max_active_one_cta_clusters = get_max_active_clusters(1)
+        max_active_two_cta_clusters = get_max_active_clusters(2)
         one_cta_launch_shape = resolve_auto_flat_query_launch_shape(
             num_heads_q=num_heads,
             seq_len_q=seq_len_q,
@@ -843,8 +836,7 @@ def _resolve_mla_decode_launch_spec(
             reduction_mode = resolve_runtime_cluster_reduction_mode(
                 decision.config,
                 reduction_mode=None,
-                hardware_info=hardware_info,
-                stream=plan_stream,
+                hardware_info=None,
             )
             kernel = ThroughputLatencyMlaDecodeTs(
                 batch_size=batch_size,
@@ -1169,8 +1161,8 @@ def _get_compiled_mla_decode(
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
-    with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+    def compile_kernel():
+        return cute.compile[cute.FrontendNext](
             kernel,
             q_latent_fake,
             q_rope_fake,
@@ -1188,6 +1180,16 @@ def _get_compiled_mla_decode(
             cutlass.Float32(1.0),
             stream_fake,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled = build_and_load_attention_kernel(
+            "mla_decode",
+            "main",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(),
         )
     return compiled
 

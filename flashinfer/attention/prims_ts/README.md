@@ -17,6 +17,20 @@ Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but is not yet signoff-qualified.
 The QToken-KvBlock-Sparse-Attention extension is separately validated on SM103/GB300.
 
+## Compilation cache
+
+Attention adapters use FlashInfer's persistent CuTe DSL object cache across
+processes, including context, paged decode, MLA, sparse/Sage preparation, and
+sparse metadata inspection. Specializations include compile options and static
+kernel configuration; device indices are excluded so ranks on equivalent GPUs
+can share artifacts. Architecture, installed DSL stack, and attention source
+changes invalidate the cache. Device-specific occupancy probes run once per
+device and cluster size in each process.
+
+Set `FLASHINFER_WORKSPACE_BASE` to select the cache location, or
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile without disk persistence.
+Warm up plans before CUDA graph capture as usual.
+
 ## Guides and public APIs
 
 Import all entries below from `flashinfer.attention.prims_ts`.

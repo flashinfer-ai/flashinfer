@@ -589,6 +589,11 @@ Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
 kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
+Task-scheduled attention shares this cache through
+`flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
+options, and embedded device-capacity constants. It hashes the attention source
+tree, including shared preparation, masks, and reductions. Occupancy queries
+are cached per device and cluster size by `_hardware.py`.
 
 ### Dispatch Macros
 

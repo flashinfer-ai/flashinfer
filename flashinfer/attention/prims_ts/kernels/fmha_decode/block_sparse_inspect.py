@@ -31,6 +31,8 @@ from collections.abc import Callable
 
 import cutlass
 import cutlass.cute as cute
+from ..._compile_cache import build_and_load_attention_kernel
+
 import torch
 from cuda.bindings import driver as cuda_drv
 
@@ -480,7 +482,8 @@ def compile_block_sparse_inspection(
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
     )
-    with torch.cuda.device(device_index):
+
+    def compile_kernel():
         return cute.compile(
             kernel,
             _fake_compact(
@@ -493,6 +496,23 @@ def compile_block_sparse_inspection(
             _fake_compact(cutlass.Int64, (_SUMMARY_FIELDS,), alignment=8),
             stream,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        return build_and_load_attention_kernel(
+            "block_sparse",
+            "inspect",
+            (
+                batch_size,
+                num_pattern_heads,
+                seq_len_q,
+                seq_len_kv,
+                q_block_size,
+                kv_block_size,
+            ),
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(),
         )
 
 
@@ -536,7 +556,7 @@ def compile_paged_block_sparse_metadata_inspection(
         inspect_bsr=inspect_bsr,
     )
 
-    with torch.cuda.device(device_index):
+    def compile_kernel():
         return cute.compile(
             inspect_paged_block_sparse_metadata,
             _fake_compact(
@@ -557,6 +577,25 @@ def compile_paged_block_sparse_metadata_inspection(
             _fake_compact(cutlass.Int64, (_SUMMARY_FIELDS,), alignment=8),
             stream,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        return build_and_load_attention_kernel(
+            "block_sparse",
+            "inspect_paged",
+            (
+                batch_size,
+                num_pattern_heads,
+                seq_len_q,
+                minimum_seq_len_kv,
+                max_seq_len_kv,
+                q_block_size,
+                kv_block_size,
+                page_size,
+            ),
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(),
         )
 
 
