@@ -2932,7 +2932,7 @@ class BatchPrefillTSWrapper:
             vc_ctrl_on=torch.ones((1,), dtype=torch.int32, device=geometry.device),
             vc_ctrl_off=torch.zeros((1,), dtype=torch.int32, device=geometry.device),
             empty_lse=torch.empty(
-                (0, num_qo_heads) if packed else (1, 0, num_qo_heads),
+                (0, num_qo_heads) if packed else (geometry.batch_size, 0, num_qo_heads),
                 dtype=torch.float32,
                 device=geometry.device,
             ),
