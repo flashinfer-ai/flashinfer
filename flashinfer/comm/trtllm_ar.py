@@ -95,6 +95,10 @@ class AllReduceFusionPattern:
     kARResidualRMSNormDynamicFP8Quant = 10
     # Dynamic per-token FP8 quantization variant that also materializes norm output
     kARResidualRMSNormOutDynamicFP8Quant = 11
+    # MoE finalize + all-reduce + residual add + RMS norm + static per-tensor FP8
+    # quantization. MNNVL CuTe DSL only; the C++ trtllm_allreduce_fusion kernels
+    # do not define this value.
+    kMoEFinalizeARResidualRMSNormFP8Quant = 12
 
 
 class QuantizationSFLayout:
