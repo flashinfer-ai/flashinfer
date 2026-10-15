@@ -8723,6 +8723,34 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+def _sm12x_nvfp4_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if activation.alpha != default.alpha or activation.beta != default.beta:
+            raise NotImplementedError(
+                "SM12x NVFP4 supports only default SwiGLU alpha and beta."
+            )
+        return {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": (
+                None if activation.limit == default.limit else activation.limit
+            ),
+        }
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None or activation.clamp_limit is not None:
+            raise NotImplementedError(
+                "SM12x NVFP4 requires a finite SiTU linear scale and no clamp limit."
+            )
+        return {
+            "activation": ActivationType.Situ,
+            "situ_beta": activation.gate_scale,
+            "situ_linear_beta": activation.linear_scale,
+        }
+    raise NotImplementedError(
+        f"SM12x NVFP4 does not support {type(activation).__name__}."
+    )
+
+
 # SM12x NVFP4 x BF16 runner - shared cuTile NVFP4 weight view, fixed tactic
 # ---------------------------------------------------------------------------
 
