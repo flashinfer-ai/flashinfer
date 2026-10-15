@@ -424,6 +424,16 @@ So at M=88320 Blackwell ends at 21 of 24 rows at or under 1.02 x cuBLAS and thre
 2.2-4.2% over, all three with fewer SM cycles than cuBLAS and a lower clock under the
 1000 W cap: the energy of converting on the fly.
 
+Checked and closed: putting the weight on the B operand to get a 256-row activation tile
+without the TMEM limit.  The fork's collective sets `SwapAB = !IsATransformed` and swaps
+the roles internally, so the converted operand is always the MMA's A (TMEM or
+SMEM-staged); conversions per flop are 1 / (activation rows per cluster tile) whichever
+way the launcher passes the operands, and the only 256-row-activation configuration is the
+256x256 SMEM-A tile already measured (1.07-1.14 on these rows).  Cutting the conversion
+energy below the 192-row tile therefore needs a different mainloop (a converted B operand
+in SMEM with the activation as a plain TMA A operand, which the fork does not have), not a
+configuration.
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
