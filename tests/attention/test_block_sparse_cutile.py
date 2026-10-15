@@ -15,8 +15,6 @@ from flashinfer.attention.kernels.cutile import (  # noqa: E402
     fmha_prefill_bsr_cutile as _prefill_bsr_cutile,
 )
 
-pytestmark = pytest.mark.solo
-
 _CUTILE_CASES = [
     (R, C, M, N, num_qo_heads, num_kv_heads, head_dim)
     for R in (1, 4, 16, 128)
