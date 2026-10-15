@@ -27,6 +27,7 @@ from .cache_integrity import _mkdir_durable, atomic_write_bytes, valid_object
 from .compile_plan import _RETAINED_PROGRAMS
 from .runtime_patches import apply_cutlass_runtime_patches
 from .program_cache import register_program_cache
+from .race_fuzz import install_from_environment as _install_race_fuzz
 
 apply_cutlass_runtime_patches()
 
@@ -2680,6 +2681,8 @@ def compile(
     **kwargs: Any,
 ) -> Any:
     import cutlass.cute as cute
+
+    _install_race_fuzz()
     from .compile_plan import (
         DeferredCuTeKernel,
         ProgramKey,

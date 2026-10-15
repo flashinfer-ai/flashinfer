@@ -194,7 +194,9 @@ def _initialize_worker(
     import torch
     from triton import knobs
     from . import compiler
+    from .race_fuzz import install_from_environment
 
+    install_from_environment()
     torch.set_num_threads(1)
     if torch.cuda.is_initialized():
         raise RuntimeError("compiler worker inherited an initialized CUDA runtime")
