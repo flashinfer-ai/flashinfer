@@ -4,7 +4,16 @@
 #include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
+
+// Keep the exported descriptor ABI independent of the CUDA header alignment.
+struct alignas(128) FlashInferTensorMap {
+  CUtensorMap value;
+};
+static_assert(sizeof(FlashInferTensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
+static_assert(alignof(FlashInferTensorMap) == 128, "CUtensorMap ABI alignment must remain 128 bytes");
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
@@ -51,7 +60,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 
 extern "C" {
 
-__global__ __launch_bounds__(64) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_prepare_dispatch(int* __restrict__ send_counters, int* __restrict__ local_token_counter, int ep_size, unsigned int* __restrict__ flag_val, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -61,6 +70,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_prepare_dispatch(int* __restrict__ send_cou
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -90,13 +101,16 @@ kernel_flashinfer_mnnvl_moe_alltoall_prepare_dispatch(int* __restrict__ send_cou
 #define SMEM_SMEM_SEND_INDICES_OFF 88
 #define SMEM_SMEM_SEND_INDICES_STAGE_BYTES 88
 #define SMEM_SMEM_SEND_INDICES_STRIDE 88
+#define SMEM_SMEM_LAST_TOKEN_OFF 176
+#define SMEM_SMEM_LAST_TOKEN_STAGE_BYTES 4
+#define SMEM_SMEM_LAST_TOKEN_STRIDE 4
 #define SMEM_TOTAL 256
 #define THREADS 256
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
-kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_experts, uint8_t* __restrict__ payload_0, uint8_t* __restrict__ payload_1, uint8_t* __restrict__ payload_2, uint8_t* __restrict__ payload_3, uint8_t* __restrict__ payload_4, uint8_t* __restrict__ payload_5, uint8_t* __restrict__ workspace, int* __restrict__ eplb_local_stats, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long local_token_counter_offset, unsigned long long send_counters_offset, unsigned long long recv_counters_offset, unsigned long long completion_flags_offset, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long eplb_gathered_stats_offset, unsigned long long payload_0_offset, unsigned long long payload_1_offset, unsigned long long payload_2_offset, unsigned long long payload_3_offset, unsigned long long payload_4_offset, unsigned long long payload_5_offset, int payload_0_bytes, int payload_1_bytes, int payload_2_bytes, int payload_3_bytes, int payload_4_bytes, int payload_5_bytes, int num_payloads, int max_tokens_per_rank, int local_num_tokens, int ep_rank, int ep_size, int num_experts, int top_k, int eplb_stats_num_experts, bool enable_pdl, bool enable_eplb, bool enable_rank_mask, unsigned long long active_rank_mask)
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_experts, uint8_t* __restrict__ payload_0, uint8_t* __restrict__ payload_1, uint8_t* __restrict__ payload_2, uint8_t* __restrict__ payload_3, uint8_t* __restrict__ payload_4, uint8_t* __restrict__ payload_5, uint8_t* __restrict__ workspace, int* __restrict__ eplb_local_stats, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long local_token_counter_offset, unsigned long long send_counters_offset, unsigned long long recv_counters_offset, unsigned long long completion_flags_offset, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long eplb_gathered_stats_offset, unsigned long long payload_0_offset, unsigned long long payload_1_offset, unsigned long long payload_2_offset, unsigned long long payload_3_offset, unsigned long long payload_4_offset, unsigned long long payload_5_offset, int payload_0_bytes, int payload_1_bytes, int payload_2_bytes, int payload_3_bytes, int payload_4_bytes, int payload_5_bytes, int num_payloads, int max_tokens_per_rank, int local_num_tokens, int ep_rank, int ep_size, int num_experts, int top_k, int eplb_stats_num_experts, bool enable_pdl, bool enable_eplb, bool enable_rank_mask, unsigned long long active_rank_mask, int sanitize_payload_index, int invalid_expert_id)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -104,16 +118,25 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
+    const int cta_rank = 0;
+
     // Kernel setup ops
-    int* smem_target_ranks = reinterpret_cast<int*>(smem_raw + 0);
-    const int smem_target_ranks_addr = smem + 0;
-    int* smem_send_indices = reinterpret_cast<int*>(smem_raw + 88);
-    const int smem_send_indices_addr = smem + 88;
+    int* smem_target_ranks = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TARGET_RANKS_OFF);
+    const int smem_target_ranks_addr = smem + SMEM_SMEM_TARGET_RANKS_OFF;
+    int* smem_send_indices = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_SEND_INDICES_OFF);
+    const int smem_send_indices_addr = smem + SMEM_SMEM_SEND_INDICES_OFF;
+    int* smem_last_token = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_LAST_TOKEN_OFF);
+    const int smem_last_token_addr = smem + SMEM_SMEM_LAST_TOKEN_OFF;
 
     // === Task calls (dependency order) ===
     int* workspace_i32 = reinterpret_cast<int*>(workspace);
@@ -243,11 +266,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int byte_offset = tid * 16; byte_offset < payload_0_bytes; byte_offset += 4096) {
                     int _vec_load_0[4];
                     {
-                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32 + (source_base + (unsigned long long)byte_offset) / 4);
-                        _vec_load_0[0 + 0] = _iv4.x;
-                        _vec_load_0[0 + 1] = _iv4.y;
-                        _vec_load_0[0 + 2] = _iv4.z;
-                        _vec_load_0[0 + 3] = _iv4.w;
+                        const int4* _ivptr_0 = reinterpret_cast<const int4*>(payload_i32 + (source_base + (unsigned long long)byte_offset) / 4);
+                        int4 _ivld_0;
+                        _ivld_0 = *_ivptr_0;
+                        _vec_load_0[0 + 0] = _ivld_0.x;
+                        _vec_load_0[0 + 1] = _ivld_0.y;
+                        _vec_load_0[0 + 2] = _ivld_0.z;
+                        _vec_load_0[0 + 3] = _ivld_0.w;
                     }
                     #pragma unroll 1
                     for (int k_1 = 0; k_1 < top_k; k_1++) {
@@ -287,11 +312,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int byte_offset_2 = tid * 16; byte_offset_2 < payload_1_bytes; byte_offset_2 += 4096) {
                     int _vec_load_1[4];
                     {
-                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_1 + (source_base_1 + (unsigned long long)byte_offset_2) / 4);
-                        _vec_load_1[0 + 0] = _iv4.x;
-                        _vec_load_1[0 + 1] = _iv4.y;
-                        _vec_load_1[0 + 2] = _iv4.z;
-                        _vec_load_1[0 + 3] = _iv4.w;
+                        const int4* _ivptr_1 = reinterpret_cast<const int4*>(payload_i32_1 + (source_base_1 + (unsigned long long)byte_offset_2) / 4);
+                        int4 _ivld_1;
+                        _ivld_1 = *_ivptr_1;
+                        _vec_load_1[0 + 0] = _ivld_1.x;
+                        _vec_load_1[0 + 1] = _ivld_1.y;
+                        _vec_load_1[0 + 2] = _ivld_1.z;
+                        _vec_load_1[0 + 3] = _ivld_1.w;
                     }
                     #pragma unroll 1
                     for (int k_3 = 0; k_3 < top_k; k_3++) {
@@ -331,11 +358,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int byte_offset_4 = tid * 16; byte_offset_4 < payload_2_bytes; byte_offset_4 += 4096) {
                     int _vec_load_2[4];
                     {
-                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_2 + (source_base_2 + (unsigned long long)byte_offset_4) / 4);
-                        _vec_load_2[0 + 0] = _iv4.x;
-                        _vec_load_2[0 + 1] = _iv4.y;
-                        _vec_load_2[0 + 2] = _iv4.z;
-                        _vec_load_2[0 + 3] = _iv4.w;
+                        const int4* _ivptr_2 = reinterpret_cast<const int4*>(payload_i32_2 + (source_base_2 + (unsigned long long)byte_offset_4) / 4);
+                        int4 _ivld_2;
+                        _ivld_2 = *_ivptr_2;
+                        _vec_load_2[0 + 0] = _ivld_2.x;
+                        _vec_load_2[0 + 1] = _ivld_2.y;
+                        _vec_load_2[0 + 2] = _ivld_2.z;
+                        _vec_load_2[0 + 3] = _ivld_2.w;
                     }
                     #pragma unroll 1
                     for (int k_5 = 0; k_5 < top_k; k_5++) {
@@ -375,11 +404,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int byte_offset_6 = tid * 16; byte_offset_6 < payload_3_bytes; byte_offset_6 += 4096) {
                     int _vec_load_3[4];
                     {
-                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_3 + (source_base_3 + (unsigned long long)byte_offset_6) / 4);
-                        _vec_load_3[0 + 0] = _iv4.x;
-                        _vec_load_3[0 + 1] = _iv4.y;
-                        _vec_load_3[0 + 2] = _iv4.z;
-                        _vec_load_3[0 + 3] = _iv4.w;
+                        const int4* _ivptr_3 = reinterpret_cast<const int4*>(payload_i32_3 + (source_base_3 + (unsigned long long)byte_offset_6) / 4);
+                        int4 _ivld_3;
+                        _ivld_3 = *_ivptr_3;
+                        _vec_load_3[0 + 0] = _ivld_3.x;
+                        _vec_load_3[0 + 1] = _ivld_3.y;
+                        _vec_load_3[0 + 2] = _ivld_3.z;
+                        _vec_load_3[0 + 3] = _ivld_3.w;
                     }
                     #pragma unroll 1
                     for (int k_7 = 0; k_7 < top_k; k_7++) {
@@ -419,11 +450,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int byte_offset_8 = tid * 16; byte_offset_8 < payload_4_bytes; byte_offset_8 += 4096) {
                     int _vec_load_4[4];
                     {
-                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_4 + (source_base_4 + (unsigned long long)byte_offset_8) / 4);
-                        _vec_load_4[0 + 0] = _iv4.x;
-                        _vec_load_4[0 + 1] = _iv4.y;
-                        _vec_load_4[0 + 2] = _iv4.z;
-                        _vec_load_4[0 + 3] = _iv4.w;
+                        const int4* _ivptr_4 = reinterpret_cast<const int4*>(payload_i32_4 + (source_base_4 + (unsigned long long)byte_offset_8) / 4);
+                        int4 _ivld_4;
+                        _ivld_4 = *_ivptr_4;
+                        _vec_load_4[0 + 0] = _ivld_4.x;
+                        _vec_load_4[0 + 1] = _ivld_4.y;
+                        _vec_load_4[0 + 2] = _ivld_4.z;
+                        _vec_load_4[0 + 3] = _ivld_4.w;
                     }
                     #pragma unroll 1
                     for (int k_9 = 0; k_9 < top_k; k_9++) {
@@ -463,11 +496,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 for (int byte_offset_10 = tid * 16; byte_offset_10 < payload_5_bytes; byte_offset_10 += 4096) {
                     int _vec_load_5[4];
                     {
-                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_5 + (source_base_5 + (unsigned long long)byte_offset_10) / 4);
-                        _vec_load_5[0 + 0] = _iv4.x;
-                        _vec_load_5[0 + 1] = _iv4.y;
-                        _vec_load_5[0 + 2] = _iv4.z;
-                        _vec_load_5[0 + 3] = _iv4.w;
+                        const int4* _ivptr_5 = reinterpret_cast<const int4*>(payload_i32_5 + (source_base_5 + (unsigned long long)byte_offset_10) / 4);
+                        int4 _ivld_5;
+                        _ivld_5 = *_ivptr_5;
+                        _vec_load_5[0 + 0] = _ivld_5.x;
+                        _vec_load_5[0 + 1] = _ivld_5.y;
+                        _vec_load_5[0 + 2] = _ivld_5.z;
+                        _vec_load_5[0 + 3] = _ivld_5.w;
                     }
                     #pragma unroll 1
                     for (int k_11 = 0; k_11 < top_k; k_11++) {
@@ -577,20 +612,73 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
                 if (peer_is_active != 0) {
                     unsigned long long local_flag_index = (local_workspace_base + completion_flags_offset) / 4 + (unsigned long long)peer_rank;
                     {
-                        unsigned int* _sre_ptr_0 = (reinterpret_cast<unsigned int*>(workspace_u32) + (local_flag_index));
-                        const unsigned int _sre_expected_0 = static_cast<unsigned int>(expected_value);
-                        const unsigned long long _sre_start_0 = clock64();
-                        bool _sre_matched_0 = false;
+                        unsigned int* _sre_ptr_6 = (reinterpret_cast<unsigned int*>(workspace_u32) + (local_flag_index));
+                        const unsigned int _sre_expected_6 = static_cast<unsigned int>(expected_value);
+                        const unsigned long long _sre_start_6 = clock64();
+                        bool _sre_matched_6 = false;
                         do {
-                            unsigned int _sre_value_0;
-                            asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_sre_value_0) : "l"(_sre_ptr_0) : "memory");
-                            _sre_matched_0 = (_sre_value_0 == _sre_expected_0);
-                        } while (!_sre_matched_0 && ((clock64() - _sre_start_0) <= static_cast<unsigned long long>(600000000000)));
-                        if (__builtin_expect(!_sre_matched_0, 0)) {
+                            unsigned int _sre_value_6;
+                            asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_sre_value_6) : "l"(_sre_ptr_6) : "memory");
+                            _sre_matched_6 = (_sre_value_6 == _sre_expected_6);
+                        } while (!_sre_matched_6 && ((clock64() - _sre_start_6) <= static_cast<unsigned long long>(600000000000)));
+                        if (__builtin_expect(!_sre_matched_6, 0)) {
                             asm volatile("trap;");
                             return;
                         }
                     }
+                }
+            }
+        }
+        if (sanitize_payload_index >= 0) {
+            if (is_last_token != 0) {
+                asm volatile("fence.acquire.sys;" ::: "memory");
+            }
+            if (lane == 0) {
+                smem_last_token[0] = is_last_token;
+            }
+        }
+    }
+    if (sanitize_payload_index >= 0) {
+        __syncthreads();
+        int cta_owns_sanitize = smem_last_token[0];
+        if (cta_owns_sanitize != 0) {
+            unsigned long long expert_ids_offset = payload_0_offset;
+            int expert_ids_bytes = payload_0_bytes;
+            if (sanitize_payload_index == 1) {
+                expert_ids_offset = payload_1_offset;
+                expert_ids_bytes = payload_1_bytes;
+            }
+            if (sanitize_payload_index == 2) {
+                expert_ids_offset = payload_2_offset;
+                expert_ids_bytes = payload_2_bytes;
+            }
+            if (sanitize_payload_index == 3) {
+                expert_ids_offset = payload_3_offset;
+                expert_ids_bytes = payload_3_bytes;
+            }
+            if (sanitize_payload_index == 4) {
+                expert_ids_offset = payload_4_offset;
+                expert_ids_bytes = payload_4_bytes;
+            }
+            if (sanitize_payload_index == 5) {
+                expert_ids_offset = payload_5_offset;
+                expert_ids_bytes = payload_5_bytes;
+            }
+            int row_words = expert_ids_bytes / 4;
+            int rank_words = max_tokens_per_rank * row_words;
+            unsigned long long expert_ids_base = (local_workspace_base + expert_ids_offset) / 4;
+            unsigned long long recv_counters_base = (local_workspace_base + recv_counters_offset) / 4;
+            #pragma unroll 1
+            for (int source_rank = 0; source_rank < ep_size; source_rank++) {
+                int valid_tokens = workspace_i32[recv_counters_base + (unsigned long long)source_rank];
+                if (valid_tokens < 0) {
+                    valid_tokens = 0;
+                }
+                int first_word = valid_tokens * row_words;
+                unsigned long long rank_base = expert_ids_base + (unsigned long long)source_rank * (unsigned long long)rank_words;
+                #pragma unroll 1
+                for (int word = first_word + tid; word < rank_words; word += 256) {
+                    workspace_i32[rank_base + (unsigned long long)word] = invalid_expert_id;
                 }
             }
         }
@@ -601,6 +689,9 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
 
 #undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
+#undef SMEM_SMEM_LAST_TOKEN_OFF
+#undef SMEM_SMEM_LAST_TOKEN_STAGE_BYTES
+#undef SMEM_SMEM_LAST_TOKEN_STRIDE
 #undef SMEM_SMEM_SEND_INDICES_OFF
 #undef SMEM_SMEM_SEND_INDICES_STAGE_BYTES
 #undef SMEM_SMEM_SEND_INDICES_STRIDE
@@ -609,6 +700,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
 #undef SMEM_SMEM_TARGET_RANKS_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
+#undef smem_last_token_addr
 #undef smem_send_indices_addr
 #undef smem_target_ranks_addr
 
@@ -618,7 +710,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload, uint8_t* __restrict__ workspace, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long destination_offset, unsigned long long payload_bytes, bool advance_generation, int ep_rank, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -628,6 +720,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -652,11 +746,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload
     for (unsigned long long byte_index = linear_thread * 16; byte_index < vector_bytes; byte_index += thread_stride * 16) {
         int _vec_load_0[4];
         {
-            int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32 + byte_index / 4);
-            _vec_load_0[0 + 0] = _iv4.x;
-            _vec_load_0[0 + 1] = _iv4.y;
-            _vec_load_0[0 + 2] = _iv4.z;
-            _vec_load_0[0 + 3] = _iv4.w;
+            const int4* _ivptr_0 = reinterpret_cast<const int4*>(payload_i32 + byte_index / 4);
+            int4 _ivld_0;
+            _ivld_0 = *_ivptr_0;
+            _vec_load_0[0 + 0] = _ivld_0.x;
+            _vec_load_0[0 + 1] = _ivld_0.y;
+            _vec_load_0[0 + 2] = _ivld_0.z;
+            _vec_load_0[0 + 3] = _ivld_0.w;
         }
         {
             int4 _iv4 = make_int4(_vec_load_0[0 + 0], _vec_load_0[0 + 1], _vec_load_0[0 + 2], _vec_load_0[0 + 3]);
@@ -681,7 +777,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload
 
 extern "C" {
 
-__global__ __launch_bounds__(64) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(uint8_t* __restrict__ workspace, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long completion_flags_offset, bool advance_generation, int ep_rank, int ep_size, bool enable_pdl, bool enable_rank_mask, unsigned long long active_rank_mask)
 {
     const int tid = threadIdx.x;
@@ -691,6 +787,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(uint8_t* __restrict__ works
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     unsigned int* workspace_u32 = reinterpret_cast<unsigned int*>(workspace);
@@ -759,7 +857,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(uint8_t* __restrict__ works
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_1(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -769,6 +867,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_1(uint8_t* __restrict__ works
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -832,27 +932,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_1(uint8_t* __restrict__ works
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
-                }
-            }
-            {
-                {
-                    {
-                        {
-                            {
-                                {
-                                    {
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
             float result = contributions[0];
@@ -902,7 +988,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_1(uint8_t* __restrict__ works
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_2(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -912,6 +998,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_2(uint8_t* __restrict__ works
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -975,29 +1063,17 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_2(uint8_t* __restrict__ works
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            {
-                                {
-                                    {
-                                        contributions[0] = contributions[0] + contributions[1];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                contributions[0] = contributions[0] + contributions[1];
             }
             float result = contributions[0];
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
@@ -1046,7 +1122,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_2(uint8_t* __restrict__ works
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_4(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1056,6 +1132,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_4(uint8_t* __restrict__ works
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1119,29 +1197,19 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_4(uint8_t* __restrict__ works
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            {
-                                {
-                                    contributions[0] = contributions[0] + contributions[1];
-                                    contributions[2] = contributions[2] + contributions[3];
-                                    contributions[0] = contributions[0] + contributions[2];
-                                }
-                            }
-                        }
-                    }
-                }
+                contributions[0] = contributions[0] + contributions[1];
+                contributions[2] = contributions[2] + contributions[3];
+                contributions[0] = contributions[0] + contributions[2];
             }
             float result = contributions[0];
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
@@ -1190,7 +1258,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_4(uint8_t* __restrict__ works
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_6(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1200,6 +1268,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_6(uint8_t* __restrict__ works
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1263,29 +1333,21 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_6(uint8_t* __restrict__ works
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            {
-                                contributions[0] = contributions[0] + contributions[1];
-                                contributions[2] = contributions[2] + contributions[3];
-                                contributions[4] = contributions[4] + contributions[5];
-                                contributions[0] = contributions[0] + contributions[2];
-                                contributions[0] = contributions[0] + contributions[4];
-                            }
-                        }
-                    }
-                }
+                contributions[0] = contributions[0] + contributions[1];
+                contributions[2] = contributions[2] + contributions[3];
+                contributions[4] = contributions[4] + contributions[5];
+                contributions[0] = contributions[0] + contributions[2];
+                contributions[0] = contributions[0] + contributions[4];
             }
             float result = contributions[0];
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
@@ -1334,7 +1396,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_6(uint8_t* __restrict__ works
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_8(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1344,6 +1406,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_8(uint8_t* __restrict__ works
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1407,29 +1471,23 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_8(uint8_t* __restrict__ works
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            contributions[0] = contributions[0] + contributions[1];
-                            contributions[2] = contributions[2] + contributions[3];
-                            contributions[4] = contributions[4] + contributions[5];
-                            contributions[6] = contributions[6] + contributions[7];
-                            contributions[0] = contributions[0] + contributions[2];
-                            contributions[4] = contributions[4] + contributions[6];
-                            contributions[0] = contributions[0] + contributions[4];
-                        }
-                    }
-                }
+                contributions[0] = contributions[0] + contributions[1];
+                contributions[2] = contributions[2] + contributions[3];
+                contributions[4] = contributions[4] + contributions[5];
+                contributions[6] = contributions[6] + contributions[7];
+                contributions[0] = contributions[0] + contributions[2];
+                contributions[4] = contributions[4] + contributions[6];
+                contributions[0] = contributions[0] + contributions[4];
             }
             float result = contributions[0];
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
@@ -1478,7 +1536,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_8(uint8_t* __restrict__ works
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_10(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1488,6 +1546,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_10(uint8_t* __restrict__ work
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1551,29 +1611,25 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_10(uint8_t* __restrict__ work
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        contributions[0] = contributions[0] + contributions[1];
-                        contributions[2] = contributions[2] + contributions[3];
-                        contributions[4] = contributions[4] + contributions[5];
-                        contributions[6] = contributions[6] + contributions[7];
-                        contributions[8] = contributions[8] + contributions[9];
-                        contributions[0] = contributions[0] + contributions[2];
-                        contributions[4] = contributions[4] + contributions[6];
-                        contributions[0] = contributions[0] + contributions[4];
-                        contributions[0] = contributions[0] + contributions[8];
-                    }
-                }
+                contributions[0] = contributions[0] + contributions[1];
+                contributions[2] = contributions[2] + contributions[3];
+                contributions[4] = contributions[4] + contributions[5];
+                contributions[6] = contributions[6] + contributions[7];
+                contributions[8] = contributions[8] + contributions[9];
+                contributions[0] = contributions[0] + contributions[2];
+                contributions[4] = contributions[4] + contributions[6];
+                contributions[0] = contributions[0] + contributions[4];
+                contributions[0] = contributions[0] + contributions[8];
             }
             float result = contributions[0];
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
@@ -1622,7 +1678,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_10(uint8_t* __restrict__ work
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_12(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1632,6 +1688,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_12(uint8_t* __restrict__ work
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1695,33 +1753,19 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_12(uint8_t* __restrict__ work
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            {
-                                {
-                                    {
-                                        {
-                                            #pragma unroll
-                                            for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
-                                                contributions[0] = contributions[0] + contributions[route_reduce];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                #pragma unroll
+                for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
+                    contributions[0] = contributions[0] + contributions[route_reduce];
                 }
             }
             float result = contributions[0];
@@ -1771,7 +1815,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_12(uint8_t* __restrict__ work
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_14(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1781,6 +1825,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_14(uint8_t* __restrict__ work
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1844,33 +1890,19 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_14(uint8_t* __restrict__ work
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            {
-                                {
-                                    {
-                                        {
-                                            #pragma unroll
-                                            for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
-                                                contributions[0] = contributions[0] + contributions[route_reduce];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                #pragma unroll
+                for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
+                    contributions[0] = contributions[0] + contributions[route_reduce];
                 }
             }
             float result = contributions[0];
@@ -1920,7 +1952,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_14(uint8_t* __restrict__ work
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_16(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -1930,6 +1962,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_16(uint8_t* __restrict__ work
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -1993,33 +2027,31 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_16(uint8_t* __restrict__ work
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    contributions[0] = contributions[0] + contributions[1];
-                    contributions[2] = contributions[2] + contributions[3];
-                    contributions[4] = contributions[4] + contributions[5];
-                    contributions[6] = contributions[6] + contributions[7];
-                    contributions[8] = contributions[8] + contributions[9];
-                    contributions[10] = contributions[10] + contributions[11];
-                    contributions[12] = contributions[12] + contributions[13];
-                    contributions[14] = contributions[14] + contributions[15];
-                    contributions[0] = contributions[0] + contributions[2];
-                    contributions[4] = contributions[4] + contributions[6];
-                    contributions[8] = contributions[8] + contributions[10];
-                    contributions[12] = contributions[12] + contributions[14];
-                    contributions[0] = contributions[0] + contributions[4];
-                    contributions[8] = contributions[8] + contributions[12];
-                    contributions[0] = contributions[0] + contributions[8];
-                }
+                contributions[0] = contributions[0] + contributions[1];
+                contributions[2] = contributions[2] + contributions[3];
+                contributions[4] = contributions[4] + contributions[5];
+                contributions[6] = contributions[6] + contributions[7];
+                contributions[8] = contributions[8] + contributions[9];
+                contributions[10] = contributions[10] + contributions[11];
+                contributions[12] = contributions[12] + contributions[13];
+                contributions[14] = contributions[14] + contributions[15];
+                contributions[0] = contributions[0] + contributions[2];
+                contributions[4] = contributions[4] + contributions[6];
+                contributions[8] = contributions[8] + contributions[10];
+                contributions[12] = contributions[12] + contributions[14];
+                contributions[0] = contributions[0] + contributions[4];
+                contributions[8] = contributions[8] + contributions[12];
+                contributions[0] = contributions[0] + contributions[8];
             }
             float result = contributions[0];
             unsigned long long output_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
@@ -2068,7 +2100,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_16(uint8_t* __restrict__ work
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_18(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -2078,6 +2110,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_18(uint8_t* __restrict__ work
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -2141,33 +2175,19 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_18(uint8_t* __restrict__ work
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
                 }
             }
             {
-                {
-                    {
-                        {
-                            {
-                                {
-                                    {
-                                        {
-                                            #pragma unroll
-                                            for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
-                                                contributions[0] = contributions[0] + contributions[route_reduce];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                #pragma unroll
+                for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
+                    contributions[0] = contributions[0] + contributions[route_reduce];
                 }
             }
             float result = contributions[0];
@@ -2217,7 +2237,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_18(uint8_t* __restrict__ work
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -2227,6 +2247,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ work
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -2290,10 +2312,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ work
                         float _fp8_rt_0;
                         uint16_t _e4m3x2_1;
                         uint32_t _f16x2_1;
-                        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
-                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                         contribution = _fp8_rt_0;
                     }
                     contributions[route] = contribution;
@@ -2368,7 +2390,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ work
 
 extern "C" {
 
-__global__ __launch_bounds__(32) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long completion_flags_offset, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, int ep_size, bool use_low_precision, bool enable_pdl, bool fuse_publication, bool enable_rank_mask, unsigned long long active_rank_mask)
 {
     const int tid = threadIdx.x;
@@ -2378,6 +2400,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -2444,60 +2468,63 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * 6;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * 6;
+        unsigned long long lane_route_word_base_plus_one = 0;
+        if (lane < 6) {
+            int target_rank_1 = workspace_i32[target_base + (unsigned long long)lane];
+            int send_index = workspace_i32[send_base + (unsigned long long)lane];
+            if (target_rank_1 >= 0 && send_index >= 0) {
+                unsigned long long payload_row = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token;
+                lane_route_word_base_plus_one = ((unsigned long long)target_rank_1 * workspace_stride_bytes + combine_payload_offset + payload_row * (unsigned long long)payload_element_bytes) / 2 + 1;
+            }
+        }
         int column = column_chunk + tid * 8;
-        if (column < elements_per_token) {
-            unsigned int route_carriers[24];
-            route_carriers[0] = 0;
-            route_carriers[1] = 0;
-            route_carriers[2] = 0;
-            route_carriers[3] = 0;
-            route_carriers[4] = 0;
-            route_carriers[5] = 0;
-            route_carriers[6] = 0;
-            route_carriers[7] = 0;
-            route_carriers[8] = 0;
-            route_carriers[9] = 0;
-            route_carriers[10] = 0;
-            route_carriers[11] = 0;
-            route_carriers[12] = 0;
-            route_carriers[13] = 0;
-            route_carriers[14] = 0;
-            route_carriers[15] = 0;
-            route_carriers[16] = 0;
-            route_carriers[17] = 0;
-            route_carriers[18] = 0;
-            route_carriers[19] = 0;
-            route_carriers[20] = 0;
-            route_carriers[21] = 0;
-            route_carriers[22] = 0;
-            route_carriers[23] = 0;
-            #pragma unroll
-            for (int route = 0; route < 6; route++) {
-                int target_rank_1 = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
-                if (target_rank_1 >= 0 && send_index >= 0) {
-                    unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
-                    unsigned long long byte_index = (unsigned long long)target_rank_1 * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
-                    {
-                        const uint4* _vptr_1 = reinterpret_cast<const uint4*>(workspace_bf16 + byte_index / 2);
-                        uint4* _vdst_1 = reinterpret_cast<uint4*>(&route_carriers[route * 4]);
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vdst_1[_blk] = _vptr_1[_blk];
-                        }
+        unsigned int route_carriers[24];
+        route_carriers[0] = 0;
+        route_carriers[1] = 0;
+        route_carriers[2] = 0;
+        route_carriers[3] = 0;
+        route_carriers[4] = 0;
+        route_carriers[5] = 0;
+        route_carriers[6] = 0;
+        route_carriers[7] = 0;
+        route_carriers[8] = 0;
+        route_carriers[9] = 0;
+        route_carriers[10] = 0;
+        route_carriers[11] = 0;
+        route_carriers[12] = 0;
+        route_carriers[13] = 0;
+        route_carriers[14] = 0;
+        route_carriers[15] = 0;
+        route_carriers[16] = 0;
+        route_carriers[17] = 0;
+        route_carriers[18] = 0;
+        route_carriers[19] = 0;
+        route_carriers[20] = 0;
+        route_carriers[21] = 0;
+        route_carriers[22] = 0;
+        route_carriers[23] = 0;
+        #pragma unroll
+        for (int route = 0; route < 6; route++) {
+            unsigned long long _shfl_0 = __shfl_sync(0xFFFFFFFF, lane_route_word_base_plus_one, route);
+            unsigned long long route_word_base_plus_one = _shfl_0;
+            if (column < elements_per_token && route_word_base_plus_one != 0) {
+                unsigned long long word_index = route_word_base_plus_one - 1 + (unsigned long long)column;
+                {
+                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(workspace_bf16 + word_index);
+                    uint4* _vdst_1 = reinterpret_cast<uint4*>(&route_carriers[route * 4]);
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vdst_1[_blk] = _vptr_1[_blk];
                     }
                 }
             }
+        }
+        if (column < elements_per_token) {
             float pair_values[16];
             #pragma unroll
             for (int _pair = 0; _pair < 8; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&pair_values[_pair * 2])[0]), "=f"((&pair_values[_pair * 2])[1])
-                    : "r"(route_carriers[_pair]));
+                (&pair_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(route_carriers[_pair]) << 16);
+                (&pair_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(route_carriers[_pair]) & 0xffff0000u);
             }
             if (use_low_precision) {
                 #pragma unroll
@@ -2505,10 +2532,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
                     float _fp8_rt_0;
                     uint16_t _e4m3x2_2;
                     uint32_t _f16x2_2;
-                    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(pair_values[element]));
-                    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(pair_values[element]));
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
                     uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
-                    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_2));
+                    asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_2));
                     pair_values[element] = _fp8_rt_0;
                 }
             }
@@ -2519,13 +2546,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
             }
             #pragma unroll
             for (int _pair = 0; _pair < 8; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&pair_values[_pair * 2])[0]), "=f"((&pair_values[_pair * 2])[1])
-                    : "r"(route_carriers[8 + _pair]));
+                (&pair_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(route_carriers[8 + _pair]) << 16);
+                (&pair_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(route_carriers[8 + _pair]) & 0xffff0000u);
             }
             if (use_low_precision) {
                 #pragma unroll
@@ -2533,10 +2555,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
                     float _fp8_rt_1;
                     uint16_t _e4m3x2_3;
                     uint32_t _f16x2_3;
-                    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_3) : "f"(0.0f), "f"(pair_values[element_2]));
-                    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_3) : "h"(_e4m3x2_3));
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_3) : "f"(0.0f), "f"(pair_values[element_2]));
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_3) : "h"(_e4m3x2_3));
                     uint16_t _fp8_h0_3 = (uint16_t)(_f16x2_3 & 0xFFFFu);
-                    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_3));
+                    asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_3));
                     pair_values[element_2] = _fp8_rt_1;
                 }
             }
@@ -2546,13 +2568,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
             }
             #pragma unroll
             for (int _pair = 0; _pair < 8; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&pair_values[_pair * 2])[0]), "=f"((&pair_values[_pair * 2])[1])
-                    : "r"(route_carriers[16 + _pair]));
+                (&pair_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(route_carriers[16 + _pair]) << 16);
+                (&pair_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(route_carriers[16 + _pair]) & 0xffff0000u);
             }
             if (use_low_precision) {
                 #pragma unroll
@@ -2560,10 +2577,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
                     float _fp8_rt_2;
                     uint16_t _e4m3x2_4;
                     uint32_t _f16x2_4;
-                    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_4) : "f"(0.0f), "f"(pair_values[element_4]));
-                    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_4) : "h"(_e4m3x2_4));
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_4) : "f"(0.0f), "f"(pair_values[element_4]));
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_4) : "h"(_e4m3x2_4));
                     uint16_t _fp8_h0_4 = (uint16_t)(_f16x2_4 & 0xFFFFu);
-                    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_2) : "h"(_fp8_h0_4));
+                    asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_2) : "h"(_fp8_h0_4));
                     pair_values[element_4] = _fp8_rt_2;
                 }
             }
@@ -2602,7 +2619,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(uint8_t* __restrict__ wo
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -2612,6 +2629,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(uint8_t* __restrict__ wo
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -2709,13 +2728,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(uint8_t* __restrict__ wo
                             uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_0[_pair]));
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
                             }
                         }
                     }
@@ -2726,10 +2740,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(uint8_t* __restrict__ wo
                             float _fp8_rt_0;
                             uint16_t _e4m3x2_1;
                             uint32_t _f16x2_1;
-                            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(value));
-                            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(value));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                             uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                            asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
                             value = _fp8_rt_0;
                         }
                         contributions[route * 8 + element] = value;
@@ -2773,11 +2787,3509 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(uint8_t* __restrict__ wo
 
 #define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 1
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_1(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    __nv_bfloat16* workspace_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+    __nv_bfloat16* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column = tid * 8; column < elements_per_token; column += 2048) {
+            float contributions[TOP_K * 8];
+            #pragma unroll
+            for (int slot_init = 0; slot_init < TOP_K * 8; slot_init++) {
+                contributions[slot_init] = 0.0f;
+            }
+            #pragma unroll
+            for (int route = 0; route < TOP_K; route++) {
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
+                if (target_rank >= 0 && send_index >= 0) {
+                    unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                    unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                    float _vec_load_0[8];
+                    {
+                        const uint4* _vptr_0 = reinterpret_cast<const uint4*>(workspace_bf16 + byte_index / 2);
+                        uint4 _vld_0[1];
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vld_0[_blk] = _vptr_0[_blk];
+                            uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int element = 0; element < 8; element++) {
+                        float value = _vec_load_0[element];
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(value));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            value = _fp8_rt_0;
+                        }
+                        contributions[route * 8 + element] = value;
+                    }
+                }
+            }
+            {
+                __nv_bfloat162 _pk[4];
+                _pk[0] = __floats2bfloat162_rn(contributions[0 + 0], contributions[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(contributions[0 + 2], contributions[0 + 3]);
+                _pk[2] = __floats2bfloat162_rn(contributions[0 + 4], contributions[0 + 5]);
+                _pk[3] = __floats2bfloat162_rn(contributions[0 + 6], contributions[0 + 7]);
+                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(output_bf16 + ((unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 2
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_2(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    __nv_bfloat16* workspace_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+    __nv_bfloat16* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column = tid * 8; column < elements_per_token; column += 2048) {
+            float contributions[TOP_K * 8];
+            #pragma unroll
+            for (int slot_init = 0; slot_init < TOP_K * 8; slot_init++) {
+                contributions[slot_init] = 0.0f;
+            }
+            #pragma unroll
+            for (int route = 0; route < TOP_K; route++) {
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
+                if (target_rank >= 0 && send_index >= 0) {
+                    unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                    unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                    float _vec_load_0[8];
+                    {
+                        const uint4* _vptr_0 = reinterpret_cast<const uint4*>(workspace_bf16 + byte_index / 2);
+                        uint4 _vld_0[1];
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vld_0[_blk] = _vptr_0[_blk];
+                            uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int element = 0; element < 8; element++) {
+                        float value = _vec_load_0[element];
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(value));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            value = _fp8_rt_0;
+                        }
+                        contributions[route * 8 + element] = value;
+                    }
+                }
+            }
+            {
+                #pragma unroll
+                for (int element_1 = 0; element_1 < 8; element_1++) {
+                    contributions[element_1] = contributions[element_1] + contributions[8 + element_1];
+                }
+            }
+            {
+                __nv_bfloat162 _pk[4];
+                _pk[0] = __floats2bfloat162_rn(contributions[0 + 0], contributions[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(contributions[0 + 2], contributions[0 + 3]);
+                _pk[2] = __floats2bfloat162_rn(contributions[0 + 4], contributions[0 + 5]);
+                _pk[3] = __floats2bfloat162_rn(contributions[0 + 6], contributions[0 + 7]);
+                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(output_bf16 + ((unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 4
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_4(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    __nv_bfloat16* workspace_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+    __nv_bfloat16* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column = tid * 8; column < elements_per_token; column += 2048) {
+            float contributions[TOP_K * 8];
+            #pragma unroll
+            for (int slot_init = 0; slot_init < TOP_K * 8; slot_init++) {
+                contributions[slot_init] = 0.0f;
+            }
+            #pragma unroll
+            for (int route = 0; route < TOP_K; route++) {
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
+                if (target_rank >= 0 && send_index >= 0) {
+                    unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                    unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                    float _vec_load_0[8];
+                    {
+                        const uint4* _vptr_0 = reinterpret_cast<const uint4*>(workspace_bf16 + byte_index / 2);
+                        uint4 _vld_0[1];
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vld_0[_blk] = _vptr_0[_blk];
+                            uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int element = 0; element < 8; element++) {
+                        float value = _vec_load_0[element];
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(value));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            value = _fp8_rt_0;
+                        }
+                        contributions[route * 8 + element] = value;
+                    }
+                }
+            }
+            {
+                #pragma unroll
+                for (int element_1 = 0; element_1 < 8; element_1++) {
+                    contributions[element_1] = contributions[element_1] + contributions[8 + element_1];
+                    contributions[16 + element_1] = contributions[16 + element_1] + contributions[24 + element_1];
+                    contributions[element_1] = contributions[element_1] + contributions[16 + element_1];
+                }
+            }
+            {
+                __nv_bfloat162 _pk[4];
+                _pk[0] = __floats2bfloat162_rn(contributions[0 + 0], contributions[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(contributions[0 + 2], contributions[0 + 3]);
+                _pk[2] = __floats2bfloat162_rn(contributions[0 + 4], contributions[0 + 5]);
+                _pk[3] = __floats2bfloat162_rn(contributions[0 + 6], contributions[0 + 7]);
+                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(output_bf16 + ((unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 1
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_1(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 2
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_2(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 4
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_4(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                    contributions[2] = contributions[2] + contributions[3];
+                    contributions[0] = contributions[0] + contributions[2];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 6
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_6(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                    contributions[2] = contributions[2] + contributions[3];
+                    contributions[4] = contributions[4] + contributions[5];
+                    contributions[0] = contributions[0] + contributions[2];
+                    contributions[0] = contributions[0] + contributions[4];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 8
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_8(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                    contributions[2] = contributions[2] + contributions[3];
+                    contributions[4] = contributions[4] + contributions[5];
+                    contributions[6] = contributions[6] + contributions[7];
+                    contributions[0] = contributions[0] + contributions[2];
+                    contributions[4] = contributions[4] + contributions[6];
+                    contributions[0] = contributions[0] + contributions[4];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 10
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_10(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                    contributions[2] = contributions[2] + contributions[3];
+                    contributions[4] = contributions[4] + contributions[5];
+                    contributions[6] = contributions[6] + contributions[7];
+                    contributions[8] = contributions[8] + contributions[9];
+                    contributions[0] = contributions[0] + contributions[2];
+                    contributions[4] = contributions[4] + contributions[6];
+                    contributions[0] = contributions[0] + contributions[4];
+                    contributions[0] = contributions[0] + contributions[8];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 12
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_12(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    #pragma unroll
+                    for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
+                        contributions[0] = contributions[0] + contributions[route_reduce];
+                    }
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 14
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_14(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    #pragma unroll
+                    for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
+                        contributions[0] = contributions[0] + contributions[route_reduce];
+                    }
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 16
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_16(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                    contributions[2] = contributions[2] + contributions[3];
+                    contributions[4] = contributions[4] + contributions[5];
+                    contributions[6] = contributions[6] + contributions[7];
+                    contributions[8] = contributions[8] + contributions[9];
+                    contributions[10] = contributions[10] + contributions[11];
+                    contributions[12] = contributions[12] + contributions[13];
+                    contributions[14] = contributions[14] + contributions[15];
+                    contributions[0] = contributions[0] + contributions[2];
+                    contributions[4] = contributions[4] + contributions[6];
+                    contributions[8] = contributions[8] + contributions[10];
+                    contributions[12] = contributions[12] + contributions[14];
+                    contributions[0] = contributions[0] + contributions[4];
+                    contributions[8] = contributions[8] + contributions[12];
+                    contributions[0] = contributions[0] + contributions[8];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 18
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_18(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    #pragma unroll
+                    for (int route_reduce = 1; route_reduce < TOP_K; route_reduce++) {
+                        contributions[0] = contributions[0] + contributions[route_reduce];
+                    }
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+#define TOP_K 22
+
+extern "C" {
+
+__global__ __launch_bounds__(THREADS) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_22(uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    int block_size = 32;
+    if (quant_mode == 3) {
+        block_size = 16;
+    }
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
+        #pragma unroll 1
+        for (int column_base = 0; column_base < elements_per_token; column_base += 256) {
+            int column = column_base + tid;
+            int active = 0;
+            float carrier_value = 0.0f;
+            if (column < elements_per_token) {
+                active = 1;
+                float contributions[TOP_K];
+                #pragma unroll
+                for (int route_init = 0; route_init < TOP_K; route_init++) {
+                    contributions[route_init] = 0.0f;
+                }
+                #pragma unroll
+                for (int route = 0; route < TOP_K; route++) {
+                    int target_rank = target_ranks[route];
+                    int send_index = send_indices[route];
+                    if (target_rank >= 0 && send_index >= 0) {
+                        unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                        unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                        float value = 0.0f;
+                        if (payload_dtype_code == 0) {
+                            __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+                            value = (float)source_bf16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 1) {
+                            __half* source_f16 = reinterpret_cast<__half*>(workspace);
+                            value = (float)source_f16[byte_index / 2];
+                        }
+                        if (payload_dtype_code == 2) {
+                            uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(workspace);
+                            float _vec_load_0[1];
+                            {
+                                uint8_t _fp8_byte_0 = *reinterpret_cast<const uint8_t*>(source_fp8 + byte_index);
+                                uint16_t _e4m3x2_0 = (uint16_t)_fp8_byte_0;
+                                uint32_t _f16x2_0;
+                                asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
+                            }
+                            value = _vec_load_0[0];
+                        }
+                        if (payload_dtype_code == 3) {
+                            float* source_f32 = reinterpret_cast<float*>(workspace);
+                            value = source_f32[byte_index / 4];
+                        }
+                        float contribution = value;
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(contribution));
+                            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            contribution = _fp8_rt_0;
+                        }
+                        contributions[route] = contribution;
+                    }
+                }
+                {
+                    contributions[0] = contributions[0] + contributions[1];
+                    contributions[2] = contributions[2] + contributions[3];
+                    contributions[4] = contributions[4] + contributions[5];
+                    contributions[6] = contributions[6] + contributions[7];
+                    contributions[8] = contributions[8] + contributions[9];
+                    contributions[10] = contributions[10] + contributions[11];
+                    contributions[12] = contributions[12] + contributions[13];
+                    contributions[14] = contributions[14] + contributions[15];
+                    contributions[16] = contributions[16] + contributions[17];
+                    contributions[18] = contributions[18] + contributions[19];
+                    contributions[20] = contributions[20] + contributions[21];
+                    contributions[0] = contributions[0] + contributions[2];
+                    contributions[4] = contributions[4] + contributions[6];
+                    contributions[8] = contributions[8] + contributions[10];
+                    contributions[12] = contributions[12] + contributions[14];
+                    contributions[16] = contributions[16] + contributions[18];
+                    contributions[0] = contributions[0] + contributions[4];
+                    contributions[8] = contributions[8] + contributions[12];
+                    contributions[16] = contributions[16] + contributions[20];
+                    contributions[0] = contributions[0] + contributions[8];
+                    contributions[0] = contributions[0] + contributions[16];
+                }
+                float result = contributions[0];
+                if (payload_dtype_code == 1) {
+                    carrier_value = (float)(__half)result;
+                } else {
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
+                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+                    carrier_value = _cvt_f32_0;
+                }
+            }
+            int block_column = column / block_size;
+            float scaled_value = carrier_value;
+            float _fabs_0 = fabsf(scaled_value);
+            float block_max = _fabs_0;
+            if (quant_mode == 3) {
+                float _max_0 = max_noftz(block_max, 0.0f);
+                block_max = _max_0;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_1 = max_noftz(block_max, _shfl_xor_0);
+                block_max = _max_1;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_2 = max_noftz(block_max, _shfl_xor_1);
+                block_max = _max_2;
+                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_3 = max_noftz(block_max, _shfl_xor_2);
+                block_max = _max_3;
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_4 = max_noftz(block_max, _shfl_xor_3);
+                block_max = _max_4;
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, block_max, lane & 16);
+                block_max = _shfl_0;
+            } else {
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
+                float _max_5 = max_noftz(block_max, _shfl_xor_4);
+                block_max = _max_5;
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 8);
+                float _max_6 = max_noftz(block_max, _shfl_xor_5);
+                block_max = _max_6;
+                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
+                float _max_7 = max_noftz(block_max, _shfl_xor_6);
+                block_max = _max_7;
+                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, block_max, 2);
+                float _max_8 = max_noftz(block_max, _shfl_xor_7);
+                block_max = _max_8;
+                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
+                float _max_9 = max_noftz(block_max, _shfl_xor_8);
+                block_max = _max_9;
+                float _shfl_1 = __shfl_sync(0xFFFFFFFF, block_max, 0);
+                block_max = _shfl_1;
+            }
+            int scale_byte = 0;
+            float actual_scale = 0.0f;
+            float fp8_scale = 0.0f;
+            if (quant_mode == 3) {
+                float _rcp_0 = approx_rcp(6.0f);
+                float reciprocal_six = _rcp_0;
+                float sf_value = output_scalar_scale * (block_max * reciprocal_six);
+                float _fp8_rt_1;
+                uint16_t _e4m3x2_2;
+                uint32_t _f16x2_2;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_2) : "f"(0.0f), "f"(sf_value));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+                uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_2));
+                fp8_scale = _fp8_rt_1;
+                if (block_max != 0.0f) {
+                    float _rcp_1 = approx_rcp(output_scalar_scale);
+                    float reciprocal_scalar = _rcp_1;
+                    float _rcp_2 = approx_rcp(fp8_scale * reciprocal_scalar);
+                    actual_scale = _rcp_2;
+                }
+            } else {
+                float denominator = 6.0f;
+                if (quant_mode == 1) {
+                    denominator = 448.0f;
+                }
+                float _rcp_3 = approx_rcp(denominator);
+                float raw_scale = block_max * _rcp_3;
+                int raw_bits = 0;
+                raw_bits = reinterpret_cast<int*>(&raw_scale)[0];
+                int exponent = raw_bits >> 23 & 255;
+                int mantissa = raw_bits & 8388607;
+                int round_up = 0;
+                if (mantissa != 0) {
+                    if (exponent != 0) {
+                        round_up = 1;
+                    } else if (mantissa > 4194304) {
+                        round_up = 1;
+                    }
+                }
+                if (raw_scale > 0.0f) {
+                    scale_byte = exponent + round_up;
+                    if (scale_byte > 254) {
+                        scale_byte = 254;
+                    }
+                }
+                if (quant_mode == 1) {
+                    int scale_bits = scale_byte << 23;
+                    if (scale_byte == 0) {
+                        scale_bits = 4194304;
+                    }
+                    float decoded_scale = 0.0f;
+                    decoded_scale = reinterpret_cast<float*>(&scale_bits)[0];
+                    float _rcp_4 = approx_rcp(decoded_scale);
+                    actual_scale = _rcp_4;
+                } else if (block_max != 0.0f) {
+                    if (scale_byte == 0) {
+                        actual_scale = 1.0f;
+                    } else {
+                        float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
+                        actual_scale = _exp2_0;
+                    }
+                }
+            }
+            int scale_index = token * blocks_per_row + block_column;
+            if (scale_layout == 0) {
+                scale_index = block_column % 4 + block_column / 4 * 512 + token % 32 * 16 + token % 128 / 32 * 4 + token / 128 * (128 * padded_scale_cols);
+            }
+            if (scale_layout == 1) {
+                int tiles = padded_scale_cols / 4;
+                scale_index = token / 8 * (tiles * 32) + block_column / 4 * 32 + token % 8 * 4 + block_column % 4;
+            }
+            int block_lane = lane;
+            if (quant_mode == 3) {
+                block_lane = lane & 15;
+            }
+            if (active != 0) {
+                if (block_lane == 0) {
+                    if (quant_mode == 3) {
+                        {
+                            unsigned short _fp8_pair;
+                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(fp8_scale));
+                            *(reinterpret_cast<unsigned char*>(scales_fp8 + scale_index) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                        }
+                    } else {
+                        scales_u8[scale_index] = scale_byte;
+                    }
+                }
+            }
+            float normalized = scaled_value * actual_scale;
+            if (quant_mode == 1) {
+                if (active != 0) {
+                    {
+                        unsigned short _fp8_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(normalized));
+                        *(reinterpret_cast<unsigned char*>(quantized_fp8 + (token * elements_per_token + column)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
+                    }
+                }
+            } else {
+                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
+                float partner_value = _shfl_xor_9;
+                uint32_t _fp4_pair_0;
+                asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+                unsigned int packed_pair = _fp4_pair_0;
+                if (active != 0) {
+                    if ((lane & 1) == 0) {
+                        int packed_column = block_column * (block_size / 2) + block_lane / 2;
+                        quantized_packed[token * (elements_per_token / 2) + packed_column] = packed_pair;
+                    }
+                }
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
 #define THREADS 32
 
 extern "C" {
 
-__global__ __launch_bounds__(32) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accumulated, uint8_t* __restrict__ quantized_fp8, uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, uint8_t* __restrict__ scales_fp8, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int quant_mode, int scale_layout, float output_scalar_scale, int blocks_per_row, int padded_scale_cols, bool enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -2787,6 +6299,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl) {
@@ -2863,10 +6377,10 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
         float _fp8_rt_0;
         uint16_t _e4m3x2_1;
         uint32_t _f16x2_1;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(sf_value));
-        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(sf_value));
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
         uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
         fp8_scale = _fp8_rt_0;
         if (block_max != 0.0f) {
             float _rcp_1 = approx_rcp(output_scalar_scale);
@@ -2912,8 +6426,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
             if (scale_byte == 0) {
                 actual_scale = 1.0f;
             } else {
-                float _cvt_f32_0 = __bfloat162float(scale_byte);
-                float _exp2_0 = approx_exp2(127.0f - _cvt_f32_0);
+                float _exp2_0 = approx_exp2(127.0f - (float)scale_byte);
                 actual_scale = _exp2_0;
             }
         }
@@ -2950,7 +6463,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
         float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, normalized, 1);
         float partner_value = _shfl_xor_5;
         uint32_t _fp4_pair_0;
-        asm volatile("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
+        asm("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(normalized), "f"(partner_value));
         unsigned int packed_pair = _fp4_pair_0;
         if (active_lane != 0) {
             if ((lane & 1) == 0) {
@@ -2980,7 +6493,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_flashinfer_mnnvl_moe_alltoall_sanitize_expert_ids(int* __restrict__ expert_ids, int* __restrict__ recv_counters, int ep_size, int max_tokens_per_rank, int top_k, int invalid_id, int enable_pdl)
 {
     const int tid = threadIdx.x;
@@ -2990,6 +6503,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_sanitize_expert_ids(int* __restrict__ exper
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     if (enable_pdl != 0) {

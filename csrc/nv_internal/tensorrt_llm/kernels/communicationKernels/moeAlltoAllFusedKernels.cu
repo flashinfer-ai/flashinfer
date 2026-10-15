@@ -35,7 +35,8 @@ extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_dispatch(
     int payload_1_bytes, int payload_2_bytes, int payload_3_bytes, int payload_4_bytes,
     int payload_5_bytes, int num_payloads, int max_tokens_per_rank, int local_num_tokens,
     int ep_rank, int ep_size, int num_experts, int top_k, int eplb_stats_num_experts,
-    bool enable_pdl, bool enable_eplb, bool enable_rank_mask, unsigned long long active_rank_mask);
+    bool enable_pdl, bool enable_eplb, bool enable_rank_mask, unsigned long long active_rank_mask,
+    int sanitize_payload_index, int invalid_expert_id);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(
     uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
@@ -63,6 +64,44 @@ DECLARE_COMBINE_TOP_K(18)
 DECLARE_COMBINE_TOP_K(22)
 
 #undef DECLARE_COMBINE_TOP_K
+
+// Exact 16-byte BF16 combine for TOP_K in {1, 2, 4}: same argument list as the
+// generic per-TOP_K combine, same pinned FP32 reduction tree per output element.
+#define DECLARE_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                          \
+  extern "C" __global__ void                                                              \
+      kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K(             \
+          uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long, \
+          unsigned long long, int, int, int, int, int, int, int, bool, bool);
+
+DECLARE_COMBINE_BF16_VECTOR_TOP_K(1)
+DECLARE_COMBINE_BF16_VECTOR_TOP_K(2)
+DECLARE_COMBINE_BF16_VECTOR_TOP_K(4)
+
+#undef DECLARE_COMBINE_BF16_VECTOR_TOP_K
+
+// Fused combine + block quantization (MXFP8/MXFP4/NVFP4) for every exported TOP_K: the
+// generic per-TOP_K combine followed by quantize_combine in one launch. No BF16/FP16 carrier
+// is written, so the argument list carries the quantize_combine outputs in place of the
+// accumulation buffer and has no output_dtype_code.
+#define DECLARE_COMBINE_QUANTIZED_TOP_K(TOP_K)                                                     \
+  extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_##TOP_K( \
+      uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, unsigned long long, unsigned long long,    \
+      unsigned long long, unsigned long long, int, int, int, int, int, int, int, float, int, int,  \
+      int, bool, bool);
+
+DECLARE_COMBINE_QUANTIZED_TOP_K(1)
+DECLARE_COMBINE_QUANTIZED_TOP_K(2)
+DECLARE_COMBINE_QUANTIZED_TOP_K(4)
+DECLARE_COMBINE_QUANTIZED_TOP_K(6)
+DECLARE_COMBINE_QUANTIZED_TOP_K(8)
+DECLARE_COMBINE_QUANTIZED_TOP_K(10)
+DECLARE_COMBINE_QUANTIZED_TOP_K(12)
+DECLARE_COMBINE_QUANTIZED_TOP_K(14)
+DECLARE_COMBINE_QUANTIZED_TOP_K(16)
+DECLARE_COMBINE_QUANTIZED_TOP_K(18)
+DECLARE_COMBINE_QUANTIZED_TOP_K(22)
+
+#undef DECLARE_COMBINE_QUANTIZED_TOP_K
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(
     uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
@@ -115,6 +154,20 @@ enum class PreloadKernelSlot {
   kCombineTopK22,
   kCombineBf16TopK6,
   kCombineBf16TopK8,
+  kCombineBf16VectorTopK1,
+  kCombineBf16VectorTopK2,
+  kCombineBf16VectorTopK4,
+  kCombineQuantizedTopK1,
+  kCombineQuantizedTopK2,
+  kCombineQuantizedTopK4,
+  kCombineQuantizedTopK6,
+  kCombineQuantizedTopK8,
+  kCombineQuantizedTopK10,
+  kCombineQuantizedTopK12,
+  kCombineQuantizedTopK14,
+  kCombineQuantizedTopK16,
+  kCombineQuantizedTopK18,
+  kCombineQuantizedTopK22,
   kQuantizeCombine,
 };
 
@@ -217,6 +270,84 @@ bool useBf16TopK6Combine(MoeA2ACombineParams const& params) {
          params.elements_per_token % 8 == 0;
 }
 
+bool useBf16VectorCombine(MoeA2ACombineParams const& params) {
+  return (params.top_k == 1 || params.top_k == 2 || params.top_k == 4) &&
+         params.dtype == nvinfer1::DataType::kBF16 && params.elements_per_token % 8 == 0;
+}
+
+void preloadBf16VectorCombineKernel(int top_k) {
+#define PRELOAD_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                 \
+  case TOP_K:                                                                    \
+    preloadKernel<PreloadKernelSlot::kCombineBf16VectorTopK##TOP_K>(             \
+        "mnnvl_moe_alltoall_combine_bf16_vector_top_k_" #TOP_K,                  \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K); \
+    return
+  switch (top_k) {
+    PRELOAD_COMBINE_BF16_VECTOR_TOP_K(1);
+    PRELOAD_COMBINE_BF16_VECTOR_TOP_K(2);
+    PRELOAD_COMBINE_BF16_VECTOR_TOP_K(4);
+    default:
+      FLASHINFER_CHECK(false, "unsupported top_k for the BF16 vector moe_a2a_combine: ", top_k);
+  }
+#undef PRELOAD_COMBINE_BF16_VECTOR_TOP_K
+}
+
+// Mirror of the Cake host rule `_select_fused_quantized_combine`: the fused kernel needs every
+// warp to own one MX block or two NVFP4 blocks of a single token (elements_per_token % 32 == 0;
+// NVFP4 rows with a 16-column tail keep the two-kernel path) and never displaces a 16-byte BF16
+// vector carrier variant. Its bytes equal the generic combine followed by quantize_combine. The
+// switch mirrors `_FUSED_QUANTIZED_COMBINE_ENABLED`; false keeps the two-kernel path for every
+// row.
+constexpr bool kFusedQuantizedCombineEnabled = true;
+
+bool useFusedQuantizedCombine(MoeA2ACombineParams const& params) {
+  return kFusedQuantizedCombineEnabled && params.quant_mode != MoeA2ACombineQuantMode::NONE &&
+         params.local_num_tokens > 0 && params.elements_per_token % 32 == 0 &&
+         !useBf16TopK6Combine(params) && !useBf16TopK8Combine(params) &&
+         !useBf16VectorCombine(params);
+}
+
+void preloadFusedQuantizedCombineKernel(int top_k) {
+#define PRELOAD_COMBINE_QUANTIZED_TOP_K(TOP_K)                                 \
+  case TOP_K:                                                                  \
+    preloadKernel<PreloadKernelSlot::kCombineQuantizedTopK##TOP_K>(            \
+        "mnnvl_moe_alltoall_combine_quantized_top_k_" #TOP_K,                  \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_##TOP_K); \
+    return
+  switch (top_k) {
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(1);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(2);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(4);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(6);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(8);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(10);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(12);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(14);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(16);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(18);
+    PRELOAD_COMBINE_QUANTIZED_TOP_K(22);
+    default:
+      FLASHINFER_CHECK(false, "unsupported top_k for the fused quantized moe_a2a_combine: ", top_k);
+  }
+#undef PRELOAD_COMBINE_QUANTIZED_TOP_K
+}
+
+// Scale geometry shared by the fused and the two-kernel quantized routes.
+struct QuantizedCombineLayout {
+  int quant_mode;
+  int blocks_per_row;
+  int padded_scale_cols;
+};
+
+QuantizedCombineLayout quantizedCombineLayout(MoeA2ACombineParams const& params) {
+  int const block_size = params.quant_mode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
+  int const blocks_per_row = ceilDiv(params.elements_per_token, block_size);
+  int const padded_scale_cols = params.swizzle_mode == MoeA2ACombineSwizzleSFMode::LINEAR
+                                    ? blocks_per_row
+                                    : ceilDiv(blocks_per_row, 4) * 4;
+  return {static_cast<int>(params.quant_mode), blocks_per_row, padded_scale_cols};
+}
+
 uint8_t* localWorkspace(uint8_t* workspace, uint64_t stride, int rank) {
   return workspace + static_cast<uint64_t>(rank) * stride;
 }
@@ -280,7 +411,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
       payload_bytes[4], payload_bytes[5], params.num_payloads, params.max_tokens_per_rank,
       params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts, params.top_k,
       params.eplb_stats_num_experts, params.enable_pdl, params.enable_eplb, params.enable_rank_mask,
-      params.active_rank_mask[0]);
+      // The exported dispatch kernel can sanitize the received expert-id payload in its
+      // last-arriving CTA (sanitize_payload_index >= 0). This launcher keeps the public
+      // separate sanitize launch, so the in-kernel fill stays disabled (-1, 0).
+      params.active_rank_mask[0], -1, 0);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -295,7 +429,10 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
     preloadKernel<PreloadKernelSlot::kPublishCombine>(
         "mnnvl_moe_alltoall_publish_combine", kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
   }
-  if (useBf16TopK6Combine(params)) {
+  bool const fused_quantized_combine = useFusedQuantizedCombine(params);
+  if (fused_quantized_combine) {
+    preloadFusedQuantizedCombineKernel(params.top_k);
+  } else if (useBf16TopK6Combine(params)) {
     preloadKernel<PreloadKernelSlot::kCombineBf16TopK6>(
         "mnnvl_moe_alltoall_combine_bf16_topk6",
         kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6);
@@ -303,10 +440,12 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
     preloadKernel<PreloadKernelSlot::kCombineBf16TopK8>(
         "mnnvl_moe_alltoall_combine_bf16_topk8",
         kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8);
+  } else if (useBf16VectorCombine(params)) {
+    preloadBf16VectorCombineKernel(params.top_k);
   } else {
     preloadCombineKernel(params.top_k);
   }
-  if (params.quant_mode != MoeA2ACombineQuantMode::NONE) {
+  if (params.quant_mode != MoeA2ACombineQuantMode::NONE && !fused_quantized_combine) {
     preloadKernel<PreloadKernelSlot::kQuantizeCombine>(
         "mnnvl_moe_alltoall_quantize_combine",
         kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine);
@@ -355,12 +494,54 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   }
 
   bool const quantized = params.quant_mode != MoeA2ACombineQuantMode::NONE;
+  int const grid = std::max(params.local_num_tokens, 1);
+  if (useFusedQuantizedCombine(params)) {
+    // One launch restores source-token order, sums and block-quantizes; no BF16/FP16 carrier
+    // is written, so accumulation_data is neither read nor required.
+    QuantizedCombineLayout const layout = quantizedCombineLayout(params);
+    auto* output_bytes = static_cast<uint8_t*>(params.output_data);
+    auto* scale_bytes = static_cast<uint8_t*>(params.output_scales);
+    FLASHINFER_CHECK(output_bytes != nullptr && scale_bytes != nullptr,
+                     "fused quantized combine output and output_scales must be defined");
+#define LAUNCH_COMBINE_QUANTIZED_TOP_K(TOP_K)                                                     \
+  case TOP_K:                                                                                     \
+    launchWithPdlWhenEnabled(                                                                     \
+        "mnnvl_moe_alltoall_combine_quantized_top_k_" #TOP_K, params.enable_pdl,                  \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_##TOP_K, grid,               \
+        kCombineThreads, 0, params.stream, params.workspace, output_bytes, output_bytes,          \
+        scale_bytes, scale_bytes, params.workspace_stride_bytes,                                  \
+        byteOffset(params.topk_target_ranks, rank_workspace),                                     \
+        byteOffset(params.topk_send_indices, rank_workspace),                                     \
+        byteOffset(params.recv_buffers[params.ep_rank], rank_workspace),                          \
+        params.max_tokens_per_rank, params.local_num_tokens, params.elements_per_token,           \
+        dtypeBytes(params.dtype), dtypeCode(params.dtype), layout.quant_mode,                     \
+        static_cast<int>(params.swizzle_mode), params.output_scalar_scale, layout.blocks_per_row, \
+        layout.padded_scale_cols, params.ep_rank, params.use_low_precision, params.enable_pdl);   \
+    break
+    switch (params.top_k) {
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(1);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(2);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(4);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(6);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(8);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(10);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(12);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(14);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(16);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(18);
+      LAUNCH_COMBINE_QUANTIZED_TOP_K(22);
+      default:
+        FLASHINFER_CHECK(
+            false, "unsupported top_k for the fused quantized moe_a2a_combine: ", params.top_k);
+    }
+#undef LAUNCH_COMBINE_QUANTIZED_TOP_K
+    return;
+  }
   void* accumulation = params.local_num_tokens == 0
                            ? static_cast<void*>(params.workspace)
                            : (quantized ? params.accumulation_data : params.output_data);
   FLASHINFER_CHECK(accumulation != nullptr, "combine accumulation output must be defined");
   int const output_dtype_code = params.use_low_precision ? kDTypeBFloat16 : dtypeCode(params.dtype);
-  int const grid = std::max(params.local_num_tokens, 1);
   if (useBf16TopK6Combine(params)) {
     dim3 const topk6_grid(
         static_cast<unsigned int>(grid),
@@ -388,6 +569,29 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
         params.local_num_tokens, params.elements_per_token, dtypeBytes(params.dtype),
         dtypeCode(params.dtype), output_dtype_code, params.ep_rank, params.use_low_precision,
         params.enable_pdl);
+  } else if (useBf16VectorCombine(params)) {
+#define LAUNCH_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                                   \
+  case TOP_K:                                                                                     \
+    launchWithPdlWhenEnabled(                                                                     \
+        "mnnvl_moe_alltoall_combine_bf16_vector_top_k_" #TOP_K, params.enable_pdl,                \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K, grid,             \
+        kCombineThreads, 0, params.stream, params.workspace, static_cast<uint8_t*>(accumulation), \
+        params.workspace_stride_bytes, byteOffset(params.topk_target_ranks, rank_workspace),      \
+        byteOffset(params.topk_send_indices, rank_workspace),                                     \
+        byteOffset(params.recv_buffers[params.ep_rank], rank_workspace),                          \
+        params.max_tokens_per_rank, params.local_num_tokens, params.elements_per_token,           \
+        dtypeBytes(params.dtype), dtypeCode(params.dtype), output_dtype_code, params.ep_rank,     \
+        params.use_low_precision, params.enable_pdl);                                             \
+    break
+    switch (params.top_k) {
+      LAUNCH_COMBINE_BF16_VECTOR_TOP_K(1);
+      LAUNCH_COMBINE_BF16_VECTOR_TOP_K(2);
+      LAUNCH_COMBINE_BF16_VECTOR_TOP_K(4);
+      default:
+        FLASHINFER_CHECK(false,
+                         "unsupported top_k for the BF16 vector moe_a2a_combine: ", params.top_k);
+    }
+#undef LAUNCH_COMBINE_BF16_VECTOR_TOP_K
   } else {
 #define LAUNCH_COMBINE_TOP_K(TOP_K)                                                           \
   case TOP_K:                                                                                 \
@@ -424,22 +628,22 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
     return;
   }
 
-  int const quant_mode = static_cast<int>(params.quant_mode);
-  int const block_size = params.quant_mode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
-  int const blocks_per_row = ceilDiv(params.elements_per_token, block_size);
-  int const padded_scale_cols = params.swizzle_mode == MoeA2ACombineSwizzleSFMode::LINEAR
-                                    ? blocks_per_row
-                                    : ceilDiv(blocks_per_row, 4) * 4;
-  int const quant_grid = params.local_num_tokens * blocks_per_row;
+  QuantizedCombineLayout const layout = quantizedCombineLayout(params);
+  int const quant_grid = params.local_num_tokens * layout.blocks_per_row;
   auto* output_bytes = static_cast<uint8_t*>(params.output_data);
   auto* scale_bytes = static_cast<uint8_t*>(params.output_scales);
-  launchWithPdlWhenEnabled(
-      "mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
-      kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid, kQuantThreads, 0,
-      params.stream, static_cast<uint8_t*>(params.accumulation_data), output_bytes, output_bytes,
-      scale_bytes, scale_bytes, params.elements_per_token, dtypeBytes(params.dtype),
-      dtypeCode(params.dtype), quant_mode, static_cast<int>(params.swizzle_mode),
-      params.output_scalar_scale, blocks_per_row, padded_scale_cols, params.enable_pdl);
+  launchWithPdlWhenEnabled("mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
+                           kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid,
+                           kQuantThreads, 0, params.stream,
+                           static_cast<uint8_t*>(params.accumulation_data), output_bytes,
+                           output_bytes, scale_bytes, scale_bytes, params.elements_per_token,
+                           dtypeBytes(params.dtype), dtypeCode(params.dtype), layout.quant_mode,
+                           static_cast<int>(params.swizzle_mode), params.output_scalar_scale,
+                           layout.blocks_per_row, layout.padded_scale_cols, params.enable_pdl);
+}
+
+bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params) {
+  return useFusedQuantizedCombine(params);
 }
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters,
