@@ -98,7 +98,8 @@ def scan_trace_definitions(
         name = data.get("name", path.stem)
 
         # Filter to GDN/KDA definitions.
-        matches = op_type in op_types or any(ot in path.stem for ot in op_types)
+        stem_tokens = set(path.stem.split("_"))
+        matches = op_type in op_types or any(ot in stem_tokens for ot in op_types)
         if not matches:
             continue
 
