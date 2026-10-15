@@ -51,11 +51,8 @@ from b12x.attention.dsa_indexer._tuning import (
     FUSED_MERGE_COOPERATIVE,
     FUSED_MERGE_SERIAL,
 )
-from b12x.attention.dsa_indexer.persistent_topk import (
-    _RADIX,
-    _RADIX_THRESHOLD,
-)
 from b12x.attention.dsa_indexer.tiled_topk import (
+    _RADIX,
     _SCAN_UNROLL,
     _SUPPORTED_TOPK,
     _THREADS_PER_CTA as _RADIX_THREADS,
@@ -119,9 +116,7 @@ _DIRECT_K_SCORE_ENABLED = os.environ.get("B12X_INDEXER_DIRECT_K", "1").lower() n
 }
 
 _THREADS_PER_CTA = 1024
-# Per-CTA K-slice cap (cooperative split granularity). Matches persistent_topk's
-# chunking knob; the fused kernel streams this slice through MMA sub-tiles rather
-# than materializing it.
+# Per-CTA K-slice cap; each CTA streams its slice through MMA sub-tiles.
 _MAX_CHUNK_ELEMENTS = 8192
 
 # Constexpr K/V-layout specialization (the ONLY contiguous-vs-paged divergence in the
@@ -292,7 +287,7 @@ def _align_up(value: int, multiple: int) -> int:
 def _resolve_fused_launch_config(
     num_rows: int, width: int, device: torch.device
 ) -> _FusedLaunchConfig:
-    """Row-cooperative split — cloned from persistent_topk._resolve_launch_config.
+    """Split query rows across cooperative CTA groups.
 
     One group owns one query row; ``ctas_per_group`` CTAs split the row's K of
     ``width`` tokens; groups persist grid-stride over rows.

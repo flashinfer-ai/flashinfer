@@ -11,13 +11,16 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.utils import current_cuda_stream
+from b12x.attention.dsa_indexer.fused_indexer import (
+    _COOP_STATE_WORDS,
+    _fused_group_barrier,
+)
 
 from ..conftest import require_b12x
 
@@ -26,31 +29,10 @@ _THREADS = 1024
 _DELAY_CYCLES = 200_000
 
 
-def _barrier(name: str):
-    if name == "fused_indexer":
-        from b12x.attention.dsa_indexer.fused_indexer import (
-            _COOP_STATE_WORDS,
-            _fused_group_barrier,
-        )
-
-        return _fused_group_barrier, _COOP_STATE_WORDS
-    from b12x.attention.dsa_indexer.persistent_topk import (
-        _STATE_WORDS,
-        _group_barrier,
-    )
-
-    return _group_barrier, _STATE_WORDS
-
-
-@pytest.mark.parametrize("name", ["fused_indexer", "persistent_topk"])
-def test_barrier_orders_delayed_warp_writes(name):
+def test_barrier_orders_delayed_warp_writes():
     device = require_b12x()
-    barrier, state_words = _barrier(name)
 
     class DelayedPublish:
-        def __init__(self, barrier):
-            self.barrier = barrier
-
         @cute.jit
         def __call__(
             self,
@@ -75,7 +57,7 @@ def test_barrier_orders_delayed_warp_writes(name):
                     pass
                 if tid == _THREADS - 1:
                     values[cta] = Int32(1)
-            self.barrier(state, Int32(0), Int32(0), Int32(_CTAS), Int32(tid))
+            _fused_group_barrier(state, Int32(0), Int32(0), Int32(_CTAS), Int32(tid))
             if tid == 0:
                 missing = Int32(0)
                 for other in cutlass.range_constexpr(_CTAS):
@@ -83,15 +65,15 @@ def test_barrier_orders_delayed_warp_writes(name):
                 errors[cta] = missing
 
     values = torch.zeros(_CTAS, device=device, dtype=torch.int32)
-    state = torch.zeros(state_words, device=device, dtype=torch.int32)
+    state = torch.zeros(_COOP_STATE_WORDS, device=device, dtype=torch.int32)
     errors = torch.empty(_CTAS, device=device, dtype=torch.int32)
     tensors = tuple(from_dlpack(t, assumed_align=4) for t in (values, state, errors))
     kernel = b12x_compile(
-        DelayedPublish(barrier),
+        DelayedPublish(),
         *tensors,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            f"test.dsa.{name}_barrier", 1, (_CTAS, _THREADS)
+            "test.dsa.fused_indexer_barrier", 1, (_CTAS, _THREADS)
         ),
     )
     for _ in range(8):

@@ -48,7 +48,6 @@ from .tiled_topk import (
     clear_tiled_topk_kernel_cache,
     run_tiled_topk,
 )
-from .persistent_topk import clear_persistent_topk2048_kernel_cache
 
 
 _INDEX_HEAD_DIM = 128
@@ -151,7 +150,6 @@ def clear_indexer_caches() -> None:
     """Clear any cached DSA indexer runtime state."""
     clear_indexer_kernel_cache()
     clear_tiled_topk_kernel_cache()
-    clear_persistent_topk2048_kernel_cache()
     _cached_width_cap_tensor.cache_clear()
     from .mxfp4 import _compile as compile_mxfp4
 

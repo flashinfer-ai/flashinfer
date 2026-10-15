@@ -46,10 +46,6 @@ from b12x.attention.dsa_indexer.contiguous_kernel import (
     _PREFILL_BLOCK_Q,
 )
 from b12x.attention.dsa_indexer.tiled_topk import run_tiled_supertile_topk
-from b12x.attention.dsa_indexer.persistent_topk import (
-    run_persistent_topk2048,
-    supports_persistent_topk2048,
-)
 from b12x.attention.dsa_indexer._impl import (
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
@@ -656,25 +652,8 @@ def _select_paged_topk_from_logits(
     backend: str = "auto",
 ) -> torch.Tensor:
     backend = backend.replace("_", "-")
-    if backend not in {"auto", "sgl", "torch", "cute-persistent"}:
+    if backend not in {"auto", "sgl", "torch"}:
         raise ValueError(f"unsupported decode topk backend {backend!r}")
-
-    if (
-        backend == "cute-persistent"
-        and query_row_to_batch is None
-        and supports_persistent_topk2048(
-            logits,
-            seqlens.reshape(-1),
-            topk=topk,
-            page_table_1=page_table_1,
-        )
-    ):
-        return run_persistent_topk2048(
-            logits,
-            seqlens.reshape(-1),
-            page_table_1=page_table_1,
-            max_seq_len=logits.shape[1],
-        )
 
     if (
         backend in {"auto", "sgl"}
@@ -2347,12 +2326,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--topk-cap", type=int, default=2048)
     parser.add_argument(
         "--decode-topk-backend",
-        choices=("auto", "sgl", "torch", "cute-persistent"),
+        choices=("auto", "sgl", "torch"),
         default=os.getenv(_DSA_DECODE_TOPK_BACKEND_ENV, "auto").replace("_", "-"),
-        help=(
-            "decode topk selector backend; cute-persistent enables the experimental "
-            "large-N CuTe persistent TopK=2048 path"
-        ),
+        help="decode topk selector backend",
     )
     parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
     parser.add_argument("--tp-rank", type=int, default=DEFAULT_TP_RANK)
