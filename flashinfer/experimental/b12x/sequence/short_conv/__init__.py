@@ -3,7 +3,8 @@
 ``plan(Caps(...))`` declares geometry; ``PreparationSession`` compiles and
 primes the pipeline; ``bind`` maps caller-owned tensors and scratch; ``run``
 updates live history slots and writes SiLU outputs without allocation.
-Convolution accumulates in FP32 and rounds to BF16 before SiLU. No projection,
+Weights retain BF16 or FP32 checkpoint precision. Convolution accumulates in
+FP32 and rounds to BF16 before SiLU. No projection,
 normalization, input gate, or residual addition is performed.
 
 Packed device metadata supports decode, prefill, and mixed batches. History is
@@ -40,7 +41,7 @@ META = OpMeta(
         "is_supported",
         "clear_caches",
     ),
-    dtypes=("bf16", "int32", "int64"),
+    dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("decode", "prefill", "mixed"),
     requires=("triton",),
     provenance=Provenance(

@@ -49,6 +49,7 @@ def invocation_from_tensors(*, conv_state, scratch=None, **tensors):
         alignment = _alignment(scratch)
     return FrozenMapping(
         {
+            "weight_dtype": str(tensors["conv_weight"].dtype).removeprefix("torch."),
             "state_strides": tuple(conv_state.stride()),
             "input_row_stride": tensors["x"].stride(0),
             "input_alignments": tuple(
@@ -115,6 +116,8 @@ def compile_pipeline(payload, ordinal):
             if name in _I32
             else torch.int64
             if name == "state_slot_ids"
+            else getattr(torch, q.weight_dtype)
+            if name == "conv_weight"
             else torch.bfloat16,
             alignment,
         )
@@ -364,6 +367,8 @@ class PreparedShortConv:
                 if name in _I32
                 else torch.int64
                 if name == "state_slot_ids"
+                else getattr(torch, q.weight_dtype)
+                if name == "conv_weight"
                 else torch.bfloat16
             )
             _require_tensor(
@@ -546,7 +551,12 @@ def make_plan(caps, *, invocation=None, override=None):
     if not isinstance(caps, Caps):
         raise TypeError("caps must be short_conv.Caps")
     invocation = FrozenMapping(invocation or {})
-    if set(invocation) - {"state_strides", "input_alignments", "input_row_stride"}:
+    if set(invocation) - {
+        "state_strides",
+        "input_alignments",
+        "input_row_stride",
+        "weight_dtype",
+    }:
         raise ValueError("unknown short convolution invocation metadata")
     query = ShortConvQuery(
         **{

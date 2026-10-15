@@ -31,11 +31,14 @@ class ShortConvQuery:
     max_seqs: int
     max_state_slots: int
     max_speculative_tokens: int
+    weight_dtype: str = "bfloat16"
     state_strides: tuple[int, int, int] | None = None
     input_row_stride: int | None = None
     input_alignments: tuple[int, ...] = (16,) * len(OPERANDS)
 
     def __post_init__(self):
+        if self.weight_dtype not in ("bfloat16", "float32"):
+            raise ValueError("short convolution weights require BF16 or FP32")
         if self.mode not in ("decode", "prefill", "mixed"):
             raise ValueError("short convolution mode must be decode, prefill, or mixed")
         if any(

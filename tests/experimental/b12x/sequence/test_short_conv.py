@@ -73,6 +73,7 @@ class _Case:
         speculative_tokens=3,
         kernel_size=4,
         max_tokens=12,
+        weight_dtype=torch.bfloat16,
     ):
         device = require_b12x()
         self.caps = short_conv.Caps(
@@ -100,7 +101,7 @@ class _Case:
         ).to(torch.bfloat16)
         self.x = self.input_storage[:, :channels]
         self.weight = (torch.randn((channels, kernel_size), device=device) * 0.2).to(
-            torch.bfloat16
+            weight_dtype
         )
         self.args = dict(
             x=self.x,
@@ -169,11 +170,11 @@ class _Case:
                 history.zero_()
             sequence = torch.cat((history, self.x[start:end].T), dim=1)
             conv = F.conv1d(
-                sequence.unsqueeze(0),
+                sequence.unsqueeze(0).to(self.weight.dtype),
                 self.weight.unsqueeze(1),
                 groups=self.caps.channels,
                 dilation=self.caps.dilation,
-            )
+            ).to(self.x.dtype)
             expected[start:end] = F.silu(conv).squeeze(0).T
             committed = end - start if prefill else 1
             state[slot, :, : self.length] = sequence[
@@ -214,7 +215,9 @@ def _prepared(case):
 @pytest.mark.parametrize("max_tokens", [12, 300])
 @pytest.mark.parametrize("mode", ["decode", "prefill", "mixed"])
 @pytest.mark.parametrize("input_padding", [0, 6144])
-def test_gdn_width_raw_history_and_device_metadata_replay(mode, input_padding, max_tokens):
+def test_gdn_width_raw_history_and_device_metadata_replay(
+    mode, input_padding, max_tokens
+):
     case = _Case(mode, input_padding=input_padding, max_tokens=max_tokens)
     with _prepared(case) as binding:
         graph = torch.cuda.CUDAGraph()
@@ -298,7 +301,6 @@ def test_prefill_chunks_match_one_canonical_convolution(dilation):
         )
 
 
-
 @pytest.mark.parametrize("dilation", [1, 3])
 def test_tiled_prefill_matches_canonical_convolution_across_tiles(dilation):
     """Capacities that tile tokens keep requests crossing tile boundaries exact."""
@@ -319,6 +321,7 @@ def test_tiled_prefill_matches_canonical_convolution_across_tiles(dilation):
                 binding.out[:live], expected[:live], rtol=0.008, atol=0.002
             )
             torch.testing.assert_close(case.state, state, rtol=0, atol=0)
+
 
 def test_binding_rejects_input_output_aliases_and_unknown_history_layout():
     case = _Case("mixed", channels=64)
@@ -352,6 +355,30 @@ def test_convolution_rounds_bf16_before_silu(speculative_tokens):
         )
         assert not torch.equal(expected, unrounded)
         torch.testing.assert_close(binding.out[:1], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_float32_weights_preserve_precision_and_capture(mode):
+    case = _Case(
+        mode,
+        channels=192,
+        max_tokens=257,
+        speculative_tokens=0,
+        weight_dtype=torch.float32,
+    )
+    with _prepared(case) as binding:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            short_conv.run(binding)
+        lengths = [1, 0, 1] if mode == "decode" else [129, 0, 128]
+        for fresh in (True, False):
+            case.x.normal_()
+            case.batch(lengths, [1, 2, 3], [fresh, False, fresh], [1, 1, 1])
+            expected, state = case.oracle()
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(binding.out, expected, rtol=0.01, atol=0.005)
+            torch.testing.assert_close(case.state, state, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("channels", [65, 6144, 12288])
@@ -403,20 +430,37 @@ def test_single_token_decode_updates_packed_strided_history(
 
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("speculative_tokens", [1, 3, 7])
-def test_speculative_decode_matches_the_staged_kernels_bitwise(dilation, speculative_tokens):
+def test_speculative_decode_matches_the_staged_kernels_bitwise(
+    dilation, speculative_tokens
+):
     """One-launch speculative decode equals mixed mode's gather/convolve/update with all requests decoding."""
     window = speculative_tokens + 1
-    lengths = [window, window - 1, 0, 1][: 4]
-    slots, fresh, accepted = [1, 3, 0, 5], [False, False, False, True], [window, 1, 1, 1]
+    lengths = [window, window - 1, 0, 1][:4]
+    slots, fresh, accepted = (
+        [1, 3, 0, 5],
+        [False, False, False, True],
+        [window, 1, 1, 1],
+    )
     results = {}
     for mode in ("decode", "mixed"):
         torch.manual_seed(7)
-        case = _Case(mode, channels=1000, dilation=dilation, speculative_tokens=speculative_tokens,
-                     max_tokens=4 * window)
+        case = _Case(
+            mode,
+            channels=1000,
+            dilation=dilation,
+            speculative_tokens=speculative_tokens,
+            max_tokens=4 * window,
+        )
         prior = torch.randn_like(case.state)
         with _prepared(case) as binding:
             case.state.copy_(prior)
-            case.batch(lengths, slots, fresh, accepted, [False] * 4 if mode == "mixed" else None)
+            case.batch(
+                lengths,
+                slots,
+                fresh,
+                accepted,
+                [False] * 4 if mode == "mixed" else None,
+            )
             short_conv.run(binding)
             torch.cuda.synchronize()
             results[mode] = (binding.out.clone(), case.state.clone())
