@@ -51,7 +51,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_a34bab1c7b2a8bcc6dc9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_afa2cd185b0ba8050651(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -473,6 +473,17 @@ kernel_cake_stepfun_moe_a34bab1c7b2a8bcc6dc9(const __grid_constant__ CUtensorMap
                     int valid_rows_a = (unsigned int)tile_mn_limit[n_tile_2] - n_tile_2 * 64;
                     if (valid_rows_a > 0) {
                         int expert = tile_expert[n_tile_2];
+                        int sole_reader = 1;
+                        if ((unsigned int)tile_count_2 > n_tile_2 + 1) {
+                            if (tile_expert[n_tile_2 + 1] == expert) {
+                                sole_reader = 0;
+                            }
+                        }
+                        if (n_tile_2 > 0) {
+                            if (tile_expert[n_tile_2 - 1] == expert) {
+                                sole_reader = 0;
+                            }
+                        }
                         if (cta_rank == 0) {
                             mbarrier_wait(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty);
                             mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
@@ -483,11 +494,19 @@ kernel_cake_stepfun_moe_a34bab1c7b2a8bcc6dc9(const __grid_constant__ CUtensorMap
                         for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
                             mbarrier_wait(k_done_addr + (stage_1) * 8, _phase_k_done);
                             if (elect_sync()) {
-                                asm volatile(
-                                    "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
-                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(smem_a_addr + stage_1 * 16384), "l"((&A)), "r"(0), "r"(m_tile_2 * 128), "r"(iter_k_1), "r"(expert),
-                                       "r"(((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask)) : "memory");
+                                if (sole_reader == 1) {
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7, %8;"
+                                        :: "r"(smem_a_addr + stage_1 * 16384), "l"((&A)), "r"(0), "r"(m_tile_2 * 128), "r"(iter_k_1), "r"(expert),
+                                           "r"(((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask)), "l"(0x12F0000000000000ULL) : "memory");
+                                } else {
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                        :: "r"(smem_a_addr + stage_1 * 16384), "l"((&A)), "r"(0), "r"(m_tile_2 * 128), "r"(iter_k_1), "r"(expert),
+                                           "r"(((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(cta_mask)) : "memory");
+                                }
                                 asm volatile(
                                     "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                                     :: "r"((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(16384)) : "memory");
