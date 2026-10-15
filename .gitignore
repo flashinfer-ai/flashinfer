@@ -212,4 +212,3 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 .sqsh_build_logs/
 *.sqsh
 .fi_workspace/
-scripts/test_sharding/.summary.py.swp
