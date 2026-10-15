@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUTLASS_CUH_
-#define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUTLASS_CUH_
+#ifndef FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUH_
+#define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUH_
 
 // W8A16 GEMM for Hopper (sm_90a) on CUTLASS's mixed-input mainloop
 // (sm90_mma_tma_gmma_rs_warpspecialized_mixed_input).  Since version H7 this is the only
@@ -565,17 +565,17 @@ struct W8A16Sm90Gemm {
 enum class W8A16Sm90Algo {
   kAuto = 0,
   kRetiredHand = 1,  // reserved; rejected by the launcher
-  kCutlass128x256 = 2,
-  kCutlass128x192 = 3,
-  kCutlass128x160 = 4,
-  kCutlass128x128 = 5,
-  kCutlass64x256 = 6,
-  kCutlass128x256StreamK = 7,
-  kCutlass128x192StreamK = 8,
-  kCutlass64x128 = 9,
+  k128x256 = 2,
+  k128x192 = 3,
+  k128x160 = 4,
+  k128x128 = 5,
+  k64x256 = 6,
+  k128x256StreamK = 7,
+  k128x192StreamK = 8,
+  k64x128 = 9,
   // Version H7 step 3.1: our split-K (batched K-slices, fp32 partials, own reduce).
-  kCutlass128x128SplitK = 10,
-  kCutlass128x256SplitK = 11,
+  k128x128SplitK = 10,
+  k128x256SplitK = 11,
 };
 constexpr int kW8A16Sm90MaxAlgoCode = 11;
 
@@ -584,25 +584,23 @@ inline W8A16Sm90Algo W8A16Sm90AlgoFromCode(int code) {
                                                       : W8A16Sm90Algo::kAuto;
 }
 
-// FLASHINFER_W8A16_FP8_ALGO_SM90 = "cutlass_128x256" | "cutlass_128x192" |
-// "cutlass_128x160" | "cutlass_128x128" | "cutlass_64x256" | "cutlass_128x256_streamk" |
-// "cutlass_128x192_streamk" pins the variant; read once.
+// FLASHINFER_W8A16_FP8_ALGO_SM90 = "128x256" | "128x192" |
+// "128x160" | "128x128" | "64x256" | "128x256_streamk" |
+// "128x192_streamk" pins the variant; read once.
 inline W8A16Sm90Algo W8A16Sm90AlgoEnv() {
   static const W8A16Sm90Algo algo = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_ALGO_SM90");
     if (s == nullptr || *s == '\0') return W8A16Sm90Algo::kAuto;
-    if (std::strcmp(s, "cutlass_128x256") == 0) return W8A16Sm90Algo::kCutlass128x256;
-    if (std::strcmp(s, "cutlass_128x192") == 0) return W8A16Sm90Algo::kCutlass128x192;
-    if (std::strcmp(s, "cutlass_128x160") == 0) return W8A16Sm90Algo::kCutlass128x160;
-    if (std::strcmp(s, "cutlass_128x128") == 0) return W8A16Sm90Algo::kCutlass128x128;
-    if (std::strcmp(s, "cutlass_64x256") == 0) return W8A16Sm90Algo::kCutlass64x256;
-    if (std::strcmp(s, "cutlass_128x256_streamk") == 0)
-      return W8A16Sm90Algo::kCutlass128x256StreamK;
-    if (std::strcmp(s, "cutlass_64x128") == 0) return W8A16Sm90Algo::kCutlass64x128;
-    if (std::strcmp(s, "cutlass_128x128_splitk") == 0) return W8A16Sm90Algo::kCutlass128x128SplitK;
-    if (std::strcmp(s, "cutlass_128x256_splitk") == 0) return W8A16Sm90Algo::kCutlass128x256SplitK;
-    if (std::strcmp(s, "cutlass_128x192_streamk") == 0)
-      return W8A16Sm90Algo::kCutlass128x192StreamK;
+    if (std::strcmp(s, "128x256") == 0) return W8A16Sm90Algo::k128x256;
+    if (std::strcmp(s, "128x192") == 0) return W8A16Sm90Algo::k128x192;
+    if (std::strcmp(s, "128x160") == 0) return W8A16Sm90Algo::k128x160;
+    if (std::strcmp(s, "128x128") == 0) return W8A16Sm90Algo::k128x128;
+    if (std::strcmp(s, "64x256") == 0) return W8A16Sm90Algo::k64x256;
+    if (std::strcmp(s, "128x256_streamk") == 0) return W8A16Sm90Algo::k128x256StreamK;
+    if (std::strcmp(s, "64x128") == 0) return W8A16Sm90Algo::k64x128;
+    if (std::strcmp(s, "128x128_splitk") == 0) return W8A16Sm90Algo::k128x128SplitK;
+    if (std::strcmp(s, "128x256_splitk") == 0) return W8A16Sm90Algo::k128x256SplitK;
+    if (std::strcmp(s, "128x192_streamk") == 0) return W8A16Sm90Algo::k128x192StreamK;
     return W8A16Sm90Algo::kAuto;
   }();
   return algo;
@@ -826,18 +824,18 @@ inline double W8A16Sm90TileUs(const W8A16Sm90TileCost& t, double k_len) {
 }
 inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
   using A = W8A16Sm90Algo;
-  static constexpr W8A16Sm90TileCost kPlain[] = {{A::kCutlass128x256, 128, 256, 11.37, false},
-                                                 {A::kCutlass128x192, 128, 192, 9.00, false},
-                                                 {A::kCutlass128x128, 128, 128, 7.45, false},
-                                                 {A::kCutlass64x256, 64, 256, 6.15, true},
-                                                 {A::kCutlass64x128, 64, 128, 4.50, true}};
+  static constexpr W8A16Sm90TileCost kPlain[] = {{A::k128x256, 128, 256, 11.37, false},
+                                                 {A::k128x192, 128, 192, 9.00, false},
+                                                 {A::k128x128, 128, 128, 7.45, false},
+                                                 {A::k64x256, 64, 256, 6.15, true},
+                                                 {A::k64x128, 64, 128, 4.50, true}};
   const double sms = std::max(num_sms, 1);
   const int ktiles = K / 64;
   auto tiles_of = [&](const W8A16Sm90TileCost& t) {
     return static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
            static_cast<double>((M + t.tile_a - 1) / t.tile_a);
   };
-  A best = A::kCutlass128x256;
+  A best = A::k128x256;
   double best_us = 1e30;
   auto consider = [&](A a, double us) {
     if (us < best_us) {
@@ -864,14 +862,14 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
       us = dp_waves * per_tile + sk_tiles * ktiles / units * (per_tile / ktiles) * 1.1 + 8.0 +
            2.0 * units / sk_tiles;
     }
-    consider(i == 0 ? A::kCutlass128x256StreamK : A::kCutlass128x192StreamK, us);
+    consider(i == 0 ? A::k128x256StreamK : A::k128x192StreamK, us);
   }
   // Split-K over 128x128 / 128x256.
   for (int i : {2, 0}) {
     const auto& t = kPlain[i];
     for (int s = 2; s <= kW8A16Sm90MaxSplits; ++s) {
       if (W8A16Sm90LegalSplits(K, s) != s) continue;
-      consider(i == 2 ? A::kCutlass128x128SplitK : A::kCutlass128x256SplitK,
+      consider(i == 2 ? A::k128x128SplitK : A::k128x256SplitK,
                W8A16Sm90SplitUs(M, N, K, num_sms, t.tile_w, t.tile_a, s));
     }
   }
@@ -881,9 +879,8 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
 inline double W8A16Sm90SplitUs(int M, int N, int K, int num_sms, int tile_w, int tile_a, int s) {
   if (4LL * M * N * s > kW8A16Sm90MaxPartialsBytes) return 1e30;  // partials capped
   const W8A16Sm90TileCost t =
-      tile_a == 256
-          ? W8A16Sm90TileCost{W8A16Sm90Algo::kCutlass128x256SplitK, 128, 256, 11.37, false}
-          : W8A16Sm90TileCost{W8A16Sm90Algo::kCutlass128x128SplitK, 128, 128, 7.45, false};
+      tile_a == 256 ? W8A16Sm90TileCost{W8A16Sm90Algo::k128x256SplitK, 128, 256, 11.37, false}
+                    : W8A16Sm90TileCost{W8A16Sm90Algo::k128x128SplitK, 128, 128, 7.45, false};
   (void)tile_w;
   const double tiles = static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
                        static_cast<double>((M + t.tile_a - 1) / t.tile_a);
@@ -902,59 +899,59 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   const double frac = waves - std::floor(waves);
   if (M <= 8192) return W8A16Sm90PickByCost(M, N, K, num_sms);
   if (N <= 512) {
-    if (waves < 0.75) return W8A16Sm90Algo::kCutlass128x128;
+    if (waves < 0.75) return W8A16Sm90Algo::k128x128;
     // Version H4: und.kv tp2-8 at M = 44160 / 88320 (2-4 weight tiles, 0.2-0.7 ms): the
     // 128x192 tile is 0.93-1.03 of cuBLAS where 128x256 is 0.97-1.10 (free-running, 3
     // interleaved rounds, Wed 14 Oct 2026).
-    if (M >= 16384) return W8A16Sm90Algo::kCutlass128x192;
-    return W8A16Sm90Algo::kCutlass128x256;
+    if (M >= 16384) return W8A16Sm90Algo::k128x192;
+    return W8A16Sm90Algo::k128x256;
   }
   // Version H4: short K at large M (attn.out tp8, K = 1024: 16 k-tiles per tile) -> the
   // 64x256 ping-pong tile, whose two tiles in flight per SM hide the epilogue behind the
   // short mainloop: 0.94-0.99 / 0.97 of cuBLAS at M = 44160 / 88320 vs 1.00-1.02 for 128x256
   // (5 interleaved rounds).  At K >= 2048 it loses 6-23%.  The weight is small here, so
   // W8A16Sm90PickGroup leaves it ungrouped.
-  if (K <= 1024 && M >= 16384) return W8A16Sm90Algo::kCutlass64x256;
+  if (K <= 1024 && M >= 16384) return W8A16Sm90Algo::k64x256;
   if (waves <= 1.5) {
-    if (K >= 4096 && waves >= 0.7) return W8A16Sm90Algo::kCutlass128x256StreamK;
-    if (N <= 2048 || K <= 3200) return W8A16Sm90Algo::kCutlass64x256;
-    return W8A16Sm90Algo::kCutlass128x256;
+    if (K >= 4096 && waves >= 0.7) return W8A16Sm90Algo::k128x256StreamK;
+    if (N <= 2048 || K <= 3200) return W8A16Sm90Algo::k64x256;
+    return W8A16Sm90Algo::k128x256;
   }
-  if (frac >= 0.8) return W8A16Sm90Algo::kCutlass128x256;
+  if (frac >= 0.8) return W8A16Sm90Algo::k128x256;
   // A sliver of a last wave is worth spreading along K only while it is a visible share
   // of the run (0.1 of 262 waves is not; stream-K's fix-up traffic is).
-  if (frac < 0.15 && K >= 2048 && waves <= 16.0) return W8A16Sm90Algo::kCutlass128x256StreamK;
-  if (waves <= 3.0) return W8A16Sm90Algo::kCutlass64x256;
-  return W8A16Sm90Algo::kCutlass128x256;
+  if (frac < 0.15 && K >= 2048 && waves <= 16.0) return W8A16Sm90Algo::k128x256StreamK;
+  if (waves <= 3.0) return W8A16Sm90Algo::k64x256;
+  return W8A16Sm90Algo::k128x256;
 }
 
 // Workspace bytes of a CUTLASS variant.
 template <typename T>
-size_t W8A16Fp8GemmSm90CutlassWorkspaceBytes(W8A16Sm90Algo algo, int M, int N, int K, int device_id,
-                                             int num_sms) {
+size_t W8A16Fp8GemmSm90WorkspaceBytes(W8A16Sm90Algo algo, int M, int N, int K, int device_id,
+                                      int num_sms) {
   switch (algo) {
-    case W8A16Sm90Algo::kCutlass128x256:
+    case W8A16Sm90Algo::k128x256:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256>::WorkspaceBytes(M, N, K, device_id, num_sms);
-    case W8A16Sm90Algo::kCutlass128x192:
+    case W8A16Sm90Algo::k128x192:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192>::WorkspaceBytes(M, N, K, device_id, num_sms);
-    case W8A16Sm90Algo::kCutlass128x160:
+    case W8A16Sm90Algo::k128x160:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x160>::WorkspaceBytes(M, N, K, device_id, num_sms);
-    case W8A16Sm90Algo::kCutlass128x128:
+    case W8A16Sm90Algo::k128x128:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128>::WorkspaceBytes(M, N, K, device_id, num_sms);
-    case W8A16Sm90Algo::kCutlass64x256:
+    case W8A16Sm90Algo::k64x256:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x256>::WorkspaceBytes(M, N, K, device_id, num_sms);
-    case W8A16Sm90Algo::kCutlass128x256StreamK:
+    case W8A16Sm90Algo::k128x256StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, true>::WorkspaceBytes(M, N, K, device_id,
                                                                          num_sms);
-    case W8A16Sm90Algo::kCutlass64x128:
+    case W8A16Sm90Algo::k64x128:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x128>::WorkspaceBytes(M, N, K, device_id, num_sms);
-    case W8A16Sm90Algo::kCutlass128x128SplitK:
+    case W8A16Sm90Algo::k128x128SplitK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, false, true>::WorkspaceBytes(
           M, N, K, device_id, num_sms, W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 128));
-    case W8A16Sm90Algo::kCutlass128x256SplitK:
+    case W8A16Sm90Algo::k128x256SplitK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, false, true>::WorkspaceBytes(
           M, N, K, device_id, num_sms, W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 256));
-    case W8A16Sm90Algo::kCutlass128x192StreamK:
+    case W8A16Sm90Algo::k128x192StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, true>::WorkspaceBytes(M, N, K, device_id,
                                                                          num_sms);
     default:
@@ -963,54 +960,54 @@ size_t W8A16Fp8GemmSm90CutlassWorkspaceBytes(W8A16Sm90Algo algo, int M, int N, i
 }
 
 template <typename T>
-cudaError_t W8A16Fp8GemmSm90Cutlass(W8A16Sm90Algo algo, const T* act, const __nv_fp8_e4m3* weight,
-                                    const float* scale, const T* bias, T* out, int M, int N, int K,
-                                    void* workspace, size_t workspace_bytes, int device_id,
-                                    int num_sms, cudaStream_t stream) {
+cudaError_t W8A16Fp8GemmSm90(W8A16Sm90Algo algo, const T* act, const __nv_fp8_e4m3* weight,
+                             const float* scale, const T* bias, T* out, int M, int N, int K,
+                             void* workspace, size_t workspace_bytes, int device_id, int num_sms,
+                             cudaStream_t stream) {
   switch (algo) {
-    case W8A16Sm90Algo::kCutlass128x256:
+    case W8A16Sm90Algo::k128x256:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256>::Run(act, weight, scale, bias, out, M, N, K,
                                                         workspace, workspace_bytes, device_id,
                                                         num_sms, stream);
-    case W8A16Sm90Algo::kCutlass128x192:
+    case W8A16Sm90Algo::k128x192:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192>::Run(act, weight, scale, bias, out, M, N, K,
                                                         workspace, workspace_bytes, device_id,
                                                         num_sms, stream);
-    case W8A16Sm90Algo::kCutlass128x160:
+    case W8A16Sm90Algo::k128x160:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x160>::Run(act, weight, scale, bias, out, M, N, K,
                                                         workspace, workspace_bytes, device_id,
                                                         num_sms, stream);
-    case W8A16Sm90Algo::kCutlass128x128:
+    case W8A16Sm90Algo::k128x128:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                         workspace, workspace_bytes, device_id,
                                                         num_sms, stream);
-    case W8A16Sm90Algo::kCutlass64x256:
+    case W8A16Sm90Algo::k64x256:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x256>::Run(act, weight, scale, bias, out, M, N, K,
                                                        workspace, workspace_bytes, device_id,
                                                        num_sms, stream);
-    case W8A16Sm90Algo::kCutlass128x256StreamK:
+    case W8A16Sm90Algo::k128x256StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, true>::Run(act, weight, scale, bias, out, M, N,
                                                               K, workspace, workspace_bytes,
                                                               device_id, num_sms, stream);
-    case W8A16Sm90Algo::kCutlass64x128:
+    case W8A16Sm90Algo::k64x128:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                        workspace, workspace_bytes, device_id,
                                                        num_sms, stream);
-    case W8A16Sm90Algo::kCutlass128x128SplitK: {
+    case W8A16Sm90Algo::k128x128SplitK: {
       const int splits = W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 128);
       if (splits < 2) return cudaErrorNotSupported;
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, false, true>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, splits);
     }
-    case W8A16Sm90Algo::kCutlass128x256SplitK: {
+    case W8A16Sm90Algo::k128x256SplitK: {
       const int splits = W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 256);
       if (splits < 2) return cudaErrorNotSupported;
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, false, true>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, splits);
     }
-    case W8A16Sm90Algo::kCutlass128x192StreamK:
+    case W8A16Sm90Algo::k128x192StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, true>::Run(act, weight, scale, bias, out, M, N,
                                                               K, workspace, workspace_bytes,
                                                               device_id, num_sms, stream);
@@ -1022,4 +1019,4 @@ cudaError_t W8A16Fp8GemmSm90Cutlass(W8A16Sm90Algo algo, const T* act, const __nv
 }  // namespace gemm
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUTLASS_CUH_
+#endif  // FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUH_

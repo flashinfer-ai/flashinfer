@@ -144,16 +144,16 @@ _ALGOS_SM100 = [
     "2sm256x160",
 ]
 _ALGOS_SM90 = [
-    "cutlass_128x256",
-    "cutlass_128x192",
-    "cutlass_128x160",
-    "cutlass_128x128",
-    "cutlass_64x256",
-    "cutlass_128x256_streamk",
-    "cutlass_128x192_streamk",
-    "cutlass_64x128",
-    "cutlass_128x128_splitk",
-    "cutlass_128x256_splitk",
+    "128x256",
+    "128x192",
+    "128x160",
+    "128x128",
+    "64x256",
+    "128x256_streamk",
+    "128x192_streamk",
+    "64x128",
+    "128x128_splitk",
+    "128x256_splitk",
 ]
 
 

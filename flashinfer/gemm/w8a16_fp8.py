@@ -100,20 +100,20 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 # Hopper kernel variants selectable through ``algo``: the variants on CUTLASS's mixed-input
 # mainloop (weight rows x activation rows per CTA tile, plus the stream-K and split-K
 # decompositions).  The codes are the W8A16Sm90Algo enum values in
-# include/flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh; code 1 was the retired
+# include/flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh; code 1 was the retired
 # hand-written kernel and stays reserved.
 W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "auto": 0,
-    "cutlass_128x256": 2,
-    "cutlass_128x192": 3,
-    "cutlass_128x160": 4,
-    "cutlass_128x128": 5,
-    "cutlass_64x256": 6,
-    "cutlass_128x256_streamk": 7,
-    "cutlass_128x192_streamk": 8,
-    "cutlass_64x128": 9,
-    "cutlass_128x128_splitk": 10,
-    "cutlass_128x256_splitk": 11,
+    "128x256": 2,
+    "128x192": 3,
+    "128x160": 4,
+    "128x128": 5,
+    "64x256": 6,
+    "128x256_streamk": 7,
+    "128x192_streamk": 8,
+    "64x128": 9,
+    "128x128_splitk": 10,
+    "128x256_splitk": 11,
 }
 
 

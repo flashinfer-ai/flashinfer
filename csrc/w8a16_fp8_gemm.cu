@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh>
+#include <flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh>
 
 #include "tvm_ffi_utils.h"
 
@@ -88,7 +88,7 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
                               num_sms, static_cast<int>(algo));
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(act.dtype(), c_type, [&] {
-    const cudaError_t status = gemm::W8A16Fp8GemmSm90Cutlass<c_type>(
+    const cudaError_t status = gemm::W8A16Fp8GemmSm90<c_type>(
         variant, static_cast<const c_type*>(act.data_ptr()),
         static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
         static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
@@ -112,7 +112,7 @@ int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t 
       gemm::W8A16Sm90PickAlgo(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                               num_sms, static_cast<int>(algo));
   // Both activation dtypes share the mainloop / epilogue layout; bf16 sizes the workspace.
-  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm90CutlassWorkspaceBytes<__nv_bfloat16>(
+  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm90WorkspaceBytes<__nv_bfloat16>(
       variant, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
       static_cast<int>(device_id), num_sms));
 }

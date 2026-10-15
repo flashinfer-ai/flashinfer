@@ -720,7 +720,7 @@ def parse_args(argv=None):
         nargs="+",
         default=None,
         help="one kernel:<algo> column per listed variant, measured back to back "
-        "(Blackwell: 2sm256x128 ...; Hopper: cutlass_128x256, cutlass_128x192 ...); "
+        "(Blackwell: 2sm256x128 ...; Hopper: 128x256, 128x192 ...); "
         "default: a single kernel column with the launcher's model",
     )
     p.add_argument("--csv", type=str, default=None)

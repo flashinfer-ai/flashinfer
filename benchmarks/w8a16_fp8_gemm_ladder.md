@@ -129,7 +129,7 @@ layout on Blackwell.
 
 ## Hopper, CUTLASS line (versions H1 / H2 / H3, Tue 13 Oct 2026)
 
-`include/flashinfer/gemm/w8a16_fp8_gemm_sm90_cutlass.cuh`: the same op on CUTLASS's sm90
+`include/flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh`: the same op on CUTLASS's sm90
 mixed-input mainloop (`sm90_mma_tma_gmma_rs_warpspecialized_mixed_input`: TMA to smem, each
 consumer warpgroup converts its 64 weight rows in registers, wgmma with A from registers),
 built next to the hand kernel so the two compete per shape through the Python op's `algo`
@@ -424,7 +424,7 @@ at K = 5120, crowds the weight out of L2 again).  The time win is small because 
 kernels run at 720-750 TFLOP/s already and HBM was never the bound; it is the traffic (and
 the HBM energy under the power cap) that moves.
 
-**The scheduler** (`W8A16Sm90GroupedTileScheduler` in `w8a16_fp8_gemm_sm90_cutlass.cuh`,
+**The scheduler** (`W8A16Sm90GroupedTileScheduler` in `w8a16_fp8_gemm_sm90.cuh`,
 selected by a tag through CUTLASS's `TileSchedulerSelector`): a subclass of CUTLASS's sm90
 persistent scheduler that keeps its swizzle at 1 (so grid size, work count and everything
 the kernel asks of the scheduler are CUTLASS's own, no padding) and replaces only the
@@ -995,6 +995,14 @@ model and split-K reduce), the `prepare_w8a16_fp8_weight` / `weight_prepared` pa
 the hand kernel (which then failed with a bare `invalid argument`).  Misaligned K / N are now rejected
 by the Python op with a ValueError before launch.  The rung history above (rungs 0-38, H1-H6) still
 describes that kernel; it is the record of how the CUTLASS menu got here.
+
+**Rename after the hand kernel was retired.**  With one code path left, the header is now
+`include/flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh` (matching `w8a16_fp8_gemm_sm100.cuh`) and the
+`cutlass_` prefix is gone from the Hopper `algo` names (`128x256`, `128x192`, `128x160`, `128x128`,
+`64x256`, `64x128`, `128x256_streamk`, `128x192_streamk`, `128x128_splitk`, `128x256_splitk`), the
+`W8A16Sm90Algo` enum (`k128x256`, ...) and the launcher functions (`W8A16Fp8GemmSm90`,
+`W8A16Fp8GemmSm90WorkspaceBytes`).  Numeric codes unchanged (1 still reserved).  The sections above
+keep the names as they were when measured (`cutlass_128x256` = `128x256`).
 
 ## Why not the Hopper design
 
