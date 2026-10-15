@@ -110,6 +110,9 @@ __device__ __forceinline__ uint32_t prmt_b32(uint32_t a, uint32_t b, uint32_t se
 // Four e4m3 bytes (little-endian in `q`) -> two bf16x2 registers, value order kept.
 __device__ __forceinline__ void e4m3x4_to_bf16x4(uint32_t q, uint32_t& lo, uint32_t& hi) {
 #if W8A16_NATIVE_E4M3_BF16_CVT
+#ifdef W8A16_PROBE_CVT_ZERO
+  q = 0u;  // probe: the cvt instructions execute, the MMA sees zeros (separates instruction energy from data energy)
+#endif
   asm("{\n\t.reg .b16 l, h;\n\t"
       "mov.b32 {l, h}, %2;\n\t"
       "cvt.rn.bf16x2.e4m3x2 %0, l;\n\t"
@@ -504,9 +507,10 @@ enum class W8A16Sm100Tile {
   k2SM256x128SplitK = 5,  // version B12: 256x128 tile, batched K-slices + fp32 reduce
   k2SM256x128StreamK = 6,  // version B13: 256x128 tile under the stream-K scheduler
   k2SM256x160 = 7          // version B14: 160-row tile for wave quantisation
-  // Codes 8-10 were the B16 / B18 experiments (cluster (2,2,1) weight multicast on the
-  // 128 / 192 tiles, a 224-row tile with a 64-deep k-tile); all measured slower than the
-  // tiles above on every row and were removed from the build (ladder doc, "losers").
+  // Codes 8-12 were the B16 / B18 / B20 experiments (cluster (2,2,1) weight multicast on
+  // the 128 / 192 tiles, a 224-row tile with a 64-deep k-tile, SMEM-staged A for the 192 /
+  // 128 tiles); all measured slower than the tiles above on every row and were removed
+  // from the build (ladder doc, "losers").
 };
 constexpr int kW8A16Sm100MaxTileCode = 7;
 constexpr int kW8A16Sm100MaxSplits = 8;

@@ -469,6 +469,48 @@ closes at 21 of 24 rows at or under 1.02 x cuBLAS at M=88320 (mlp.gate_up tp2 an
 tp2 at 1.02-1.03, attn.out tp8 at 1.03-1.04), the Hopper line at 23 of 24 (attn.out tp8 at
 1.03-1.04).  Both residues sit at the energy / per-tile floor of converting on the fly.
 
+### Version B20: where the clock really goes (Wed 14 Oct 2026, night)
+
+Two probes on umb-b200-263, steady state, kernel / cuBLAS at M=88320 (normal build in the
+same session: gate_up tp2 1.041, mlp.down tp2 1.028, und.q tp2 0.968, attn.out tp8 1.020;
+ncu free clock on mlp.down tp2: 1.255 GHz, 9.65 M cycles, 1.98 G instructions):
+- `W8A16_PROBE_NO_CONVERT` (transform warps skip the cvt; the MMA's A operand stays zero;
+  same loads, TMEM stores, pipeline): 0.839 / 0.838 / 0.783 / 0.804; 1.562 GHz, 9.59 M
+  cycles, 1.15 G instructions.
+- `W8A16_PROBE_CVT_ZERO` (cvt instructions execute on zero input, so the MMA still sees
+  zeros): 0.848 / 0.853 / 0.802 / 0.812; 1.513 GHz, 9.62 M cycles, 1.62 G instructions.
+Same cycles in all three builds; the F2FP instructions cost ~3% of clock; the DATA costs
+~20%: real bf16 weight values written to TMEM (STTM), read from TMEM by the MMA and fed
+through the datapath against zeros.  cuBLAS runs the same dequantised bf16 values through
+its MMA at 1.37-1.39 GHz, but from SMEM.  Our 256x256 tile, the one variant with A staged
+in SMEM, ran at 1.315 GHz in the B16 table (cuBLAS 1.333) and lost only on cycles to its
+64-deep k-tile.  So the energy term is the TMEM round trip of the converted operand, not
+the conversion.
+
+Experiment: `kAInSmem` variants of the 192- and 128-row tiles (k-tile 64, the SMEM budget
+allows nothing deeper), steady state, two repeats, kernel / cuBLAS:
+
+| row, M=88320 | auto (A in TMEM) | 192 rows, A in SMEM | 128 rows, A in SMEM |
+|---|---|---|---|
+| mlp.gate_up tp2 | 1.034-1.042 | 1.274-1.275 | 1.662-1.673 |
+| mlp.down tp2 | 1.021 | 1.242-1.243 | 1.619 |
+| und.q tp2 | 0.968 | 1.220-1.222 | 1.588-1.609 |
+| attn.out tp8 | 1.022 | 1.294-1.302 | 1.667-1.671 |
+
+ncu, mlp.down tp2: 192-row SMEM-A 1.502 GHz but 14.1 M cycles (auto: 1.255 GHz, 9.65 M);
+128-row SMEM-A 1.760 GHz but 21.0 M cycles.  The clock comes back exactly as the probes
+predicted and the SMEM path (transform STS of the bf16 operand, SS MMA reads, halved
+k-tile) costs far more cycles than the clock buys.  The 256x256 SMEM-A tile remains the
+best compromise of that family (1.07-1.14).  Both variants removed from the build
+(`W8A16Sm100Cfg<256, {192,128}, 64, 2, true, true>` rebuilds them); the two probe
+macros `W8A16_PROBE_NO_CONVERT` / `W8A16_PROBE_CVT_ZERO` stay (no cost, documented).
+
+Conclusion for the Blackwell line: the 2-4% left on mlp.gate_up tp2, mlp.down tp2 and
+attn.out tp8 at M=88320 is the energy of carrying the converted operand through TMEM,
+a property of this mainloop's design (A in TMEM so that two accumulator stages and the
+operand fit).  Closing it needs an A path that is neither TMEM nor SMEM-bandwidth-bound,
+which this fork does not have.
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
