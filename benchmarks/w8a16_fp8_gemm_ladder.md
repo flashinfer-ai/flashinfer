@@ -505,6 +505,12 @@ best compromise of that family (1.07-1.14).  Both variants removed from the buil
 (`W8A16Sm100Cfg<256, {192,128}, 64, 2, true, true>` rebuilds them); the two probe
 macros `W8A16_PROBE_NO_CONVERT` / `W8A16_PROBE_CVT_ZERO` stay (no cost, documented).
 
+One more for the short-K row (version B21 experiment): the 160-row tile with a 64-deep
+k-tile and A in TMEM (six 32-column A stages), meant to amortise the per-tile pipeline fill
+on attn.out tp8 over 16 k-steps.  Steady state, two repeats: attn.out tp8 1.17 / 1.20 vs
+auto 1.03 / 1.04; attn.out tp4 1.13 / 1.14 vs 1.00; the tp2 rows 1.13-1.15 vs 1.02-1.04.
+The halved MMA step costs more than the deeper buffering saves.  Removed.
+
 Conclusion for the Blackwell line: the 2-4% left on mlp.gate_up tp2, mlp.down tp2 and
 attn.out tp8 at M=88320 is the energy of carrying the converted operand through TMEM,
 a property of this mainloop's design (A in TMEM so that two accumulator stages and the

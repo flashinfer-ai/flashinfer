@@ -507,10 +507,10 @@ enum class W8A16Sm100Tile {
   k2SM256x128SplitK = 5,  // version B12: 256x128 tile, batched K-slices + fp32 reduce
   k2SM256x128StreamK = 6,  // version B13: 256x128 tile under the stream-K scheduler
   k2SM256x160 = 7          // version B14: 160-row tile for wave quantisation
-  // Codes 8-12 were the B16 / B18 / B20 experiments (cluster (2,2,1) weight multicast on
+  // Codes 8-13 were the B16 / B18 / B20 experiments (cluster (2,2,1) weight multicast on
   // the 128 / 192 tiles, a 224-row tile with a 64-deep k-tile, SMEM-staged A for the 192 /
-  // 128 tiles); all measured slower than the tiles above on every row and were removed
-  // from the build (ladder doc, "losers").
+  // 128 tiles, a 160-row tile with a 64-deep k-tile); all measured slower than the tiles
+  // above on every row and were removed from the build (ladder doc, "losers").
 };
 constexpr int kW8A16Sm100MaxTileCode = 7;
 constexpr int kW8A16Sm100MaxSplits = 8;
