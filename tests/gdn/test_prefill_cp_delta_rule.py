@@ -569,7 +569,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     for seq_len in seq_lens:
         cu_values.append(cu_values[-1] + seq_len)
     cu_seqlens = torch.tensor(cu_values, dtype=torch.int64, device=device)
-    scale = 1.0
+    scale = 1.0 / math.sqrt(head_size)
 
     with torch.device(device):
         q, k, v = qkv_factory(
@@ -688,7 +688,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         cu_values.append(cu_values[-1] + seq_len)
     cu_seqlens = torch.tensor(cu_values, dtype=torch.int64, device=device)
     num_sab_heads = max(num_q_heads, num_v_heads)
-    scale = 1.0
+    scale = 1.0 / math.sqrt(head_size)
 
     with torch.device(device):
         q, k, v = qkv_factory(
@@ -855,7 +855,7 @@ def test_cp_delta_rule_e2e_with_initial_state(
     _skip_if_head_sizes_unsupported(head_size, head_size_v)
     total_seqlen = sum(seq_lens)
     cu_seqlens = _make_cu_seqlens(seq_lens, device)
-    scale = 1.0
+    scale = 1.0 / math.sqrt(head_size)
     dtype = getattr(torch, dtype)
     num_heads = 1
 
@@ -937,7 +937,7 @@ def test_cp_delta_rule_e2e(
     _skip_if_head_sizes_unsupported(head_size, head_size_v)
     total_seqlen = sum(seq_lens)
     cu_seqlens = _make_cu_seqlens(seq_lens, device)
-    scale = 1.0
+    scale = 1.0 / math.sqrt(head_size)
     dtype = getattr(torch, dtype)
 
     num_q_heads, num_k_heads, num_v_heads = num_heads
@@ -1041,7 +1041,7 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     num_heads = 1
     total_seqlen = sum(seq_lens)
     cu_seqlens = _make_cu_seqlens(seq_lens, device)
-    scale = 1.0
+    scale = 1.0 / math.sqrt(head_size)
 
     with torch.device(device):
         q, k, v = qkv_factory(
@@ -1128,7 +1128,7 @@ def test_cp_delta_rule_external_state_dtype(
         v,
         alpha,
         beta,
-        1.0,
+        1.0 / math.sqrt(head_size),
         initial_state,
         True,
         cu_seqlens,
@@ -1144,7 +1144,7 @@ def test_cp_delta_rule_external_state_dtype(
         v,
         alpha,
         beta,
-        1.0,
+        1.0 / math.sqrt(head_size),
         initial_state,
         True,
         cu_seqlens,
