@@ -70,8 +70,17 @@ by default (parity with the CuTe decode kernels) and perform the same
 asynchronous fail-closed check only when `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`.
 
 Use the GDN prefill API with `backend="cake_gdn"` to select this backend
-explicitly; automatic prefill dispatch continues to select CuTe. Decode
-requests with `backend="auto"` try the listed decode variants first.
+explicitly; automatic prefill dispatch continues to select CuTe.  Under
+`backend="cake_gdn"` with `use_cp="auto"` (the default), a BF16/FP16-I/O row
+with FP32 initial + final state, gates, no checkpoints and no state indices
+whose work leaves most SMs idle (`4 * num_seqs * max(Hq, Hv) < SMs`) and whose
+longest sequence (`max_seqlen`) has at least 4096 tokens runs the Cake CP
+backend (`csrc/gdn/gdn_cp`, `flashinfer/gdn_kernels/blackwell/cake_gdn_cp_backend.py`)
+on SM100a/SM103a instead of a record of this manifest; every other row keeps
+the non-CP record.  Pass `max_seqlen` when the batch has more than one
+sequence: without it the band estimates the longest sequence as `ceil(total_seq_len / num_seqs)` (the Cake CP
+program's convention for an omitted hint), which matches the Cake dispatcher only for balanced batches.
+Decode requests with `backend="auto"` try the listed decode variants first.
 
 The decode variants include the Qwen3.5-35B-A3B TP=2 speculative-verify
 rows (H=8 / HV=16, BF16 state pool, seven-step BF16 checkpoint cache,

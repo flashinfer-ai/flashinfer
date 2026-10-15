@@ -363,7 +363,7 @@ for i in range(N_LAYERS):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
 #
-# All four kernel pairs - ``gelu_tanh_and_mul``, ``apply_rope``, and local/global variants of both decode and prefill attention - are compiled and registered in a single cell below. Concepts 2 (QK-norm) and 3 (dual RoPE theta) are explained in the sections that follow; they require no additional kernels beyond what Part 1 introduced.
+# All six kernel variants - ``gelu_tanh_and_mul``, ``apply_rope``, and local/global variants of both decode and prefill attention - are compiled and registered in a single cell below. Concepts 2 (QK-norm) and 3 (dual RoPE theta) are explained in the sections that follow; they require no additional kernels beyond what Part 1 introduced.
 
 # %%
 import torch as _torch  # used only for dtype spec in gen_single_*_module

@@ -233,7 +233,7 @@ def test_mega_layer_graph_capture_replay_matches_eager(
 
         # 1) Warmup includes the real collective autotune sweep for knobs="auto".
         # Later eager/capture/replay calls use the selected callable normally.
-        layer.warmup(t if not quantize_input else None)
+        layer.warmup(t if backend_name == "w4a16" else None)
 
         # Eager reference on the real batch after warmup.
         y_eager = layer.forward(control).clone()
@@ -372,9 +372,9 @@ def test_mega_layer_multi_size_graphs_and_eager_interleave(
     layer, problem = _single_rank_layer(backend_name)
     output_view = {"nvfp4": True, "w4a16": False}[backend_name]
     try:
-        layer.warmup()
         t64 = _random_batch(problem, seed=51, num_tokens=64)
         t32 = _random_batch(problem, seed=52, num_tokens=32)
+        layer.warmup(t64 if backend_name == "w4a16" else None)
 
         y64_ref = layer.forward(t64, return_workspace_view=output_view).clone()
         y32_ref = layer.forward(t32, return_workspace_view=output_view).clone()
