@@ -8192,7 +8192,7 @@ def fmha_v2_prefill_sm120(
     """Run SM120 FMHA v2 with contiguous, separate Q/K/V tensors.
 
     Supports FP8 E4M3 MHA, GQA, and MQA self-attention with head dimensions
-    of 64 or 128 and BF16 output. The query head count must be divisible by
+    of 64, 128, or 256 and BF16 output. The query head count must be divisible by
     the K/V head count. ``scale_bmm1`` combines the Q and K
     dequantization scales with the attention scale; ``scale_bmm2`` is the V
     dequantization scale. Set ``causal=False`` for dense / bidirectional
@@ -8255,12 +8255,12 @@ def fmha_v2_prefill_sm120(
     if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         raise ValueError("num_heads must be divisible by a positive KV head count.")
     if (
-        head_dim not in (64, 128)
+        head_dim not in (64, 128, 256)
         or query.shape[3] != head_dim
         or key.shape[3] != head_dim
     ):
         raise ValueError(
-            "standard SM120 self-attention requires Q/K head_dim=64 or 128."
+            "standard SM120 self-attention requires Q/K head_dim=64, 128, or 256."
         )
     if value.shape[3] != head_dim or out.shape[3] != head_dim:
         raise ValueError(
@@ -8315,12 +8315,14 @@ def fmha_v2_prefill_deepseek(
     scale_bmm1_d: Optional[torch.Tensor] = None,
     scale_bmm2_d: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Run causal SM12x FMHA v2 for DeepSeek MLA or 128-dimension GQA.
+    """Run causal SM12x FMHA v2 for MLA context or 128-dimension GQA.
 
     Supports the DeepSeek Q/K=192, V=128 layout and FP8 E4M3 Q/K/V=128
     with BF16 output, including GLM-4.7's 96 query heads and 8 K/V heads.
-    The 128-dimension path accepts MHA, GQA, and MQA with the same
-    requirements as :func:`fmha_v2_prefill_sm120`.
+    GLM-4.7-Flash MLA context uses Q/K/V=256 with 20 heads and supports
+    FP8 E4M3 input with BF16 output. The 128- and 256-dimension paths accept
+    MHA, GQA, and MQA with the same requirements as
+    :func:`fmha_v2_prefill_sm120`.
 
     Parameters
     ----------
@@ -8329,9 +8331,10 @@ def fmha_v2_prefill_deepseek(
     key : torch.Tensor
         key tensor with shape [batch_size, seq_len, num_kv_heads, head_dim]
     value : torch.Tensor
-        value tensor with shape [batch_size, seq_len, num_kv_heads, 128]
+        value tensor with shape [batch_size, seq_len, num_kv_heads, head_dim_v],
+        where head_dim_v is 128 for Q/K=128 or 192, and 256 for Q/K=256.
     out : torch.Tensor
-        output tensor with shape [batch_size, seq_len, num_heads, 128]
+        output tensor with shape [batch_size, seq_len, num_heads, head_dim_v]
     return_lse : bool
         whether to return the log-sum-exp of attention output
     num_heads : int
@@ -8370,7 +8373,7 @@ def fmha_v2_prefill_deepseek(
         raise ValueError("query sequence length must match seq_len.")
     if return_lse and lse is None:
         raise ValueError("lse must be provided when return_lse=True.")
-    if query.shape[3] == 128:
+    if query.shape[3] in (128, 256):
         return fmha_v2_prefill_sm120(
             query,
             key,
@@ -8389,7 +8392,7 @@ def fmha_v2_prefill_deepseek(
             scale_bmm2_d=scale_bmm2_d,
         )
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
-        "supported Q/K and V head dimensions are 192/128 and 128/128"
+        "supported Q/K and V head dimensions are 192/128, 128/128, and 256/256"
     )
     return _fmha_v2_prefill_sm120_run(
         query,

@@ -1472,7 +1472,7 @@ def _fmha_v2_prefill_deepseek_init(
     seed: int = 0,
 ):
     """Build inputs for ``fmha_v2_prefill_deepseek``."""
-    if head_dim == 128:
+    if head_dim in (128, 256):
         inputs = _fmha_v2_prefill_sm120_init(
             batch_size=batch_size,
             seq_len=seq_len,
@@ -1578,7 +1578,8 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="fmha_v2_prefill_deepseek",
     description=(
-        "DeepSeek MLA and 128-dimension GQA FMHA v2 prefill: separate Q/K/V tensors, "
+        "DeepSeek MLA, GLM-4.7-Flash 256-dimension MLA context, and 128-dimension GQA "
+        "FMHA v2 prefill: separate Q/K/V tensors, "
         "fixed seq_len, causal SDPA per batch. Mutates ``out`` in-place."
     ),
     axes={
