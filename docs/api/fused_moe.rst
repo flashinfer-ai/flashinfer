@@ -128,8 +128,12 @@ when both exist, the Frost-named view takes precedence. The public API is:
 The backend requires precomputed routing with contiguous int32 expert IDs and
 FP32 routing weights, and returns finalized BF16 output. It supports the default
 activation contracts; bias, expert parallelism, shared experts, custom activation
-parameters, and routing from logits are unsupported. BF16 uses the measured
-model shortlist. Quantized hidden/intermediate sizes must be divisible by 128.
+parameters, and routing from logits are unsupported. Hidden/intermediate sizes
+must be positive multiples of 128. All four dtypes use measured model shortlists
+where available and a bounded, factorized tactic search for other supported
+shapes. Local expert counts are limited to 1024 and token counts to the configured
+tuning ceiling, at most 2**20. Kernel identities describe implementation content,
+independently of model dimensions.
 
 Quantized FC1 weight scales accept expert-major or branch-major storage and may
 be updated in place. For CUDA Graph replay, keep tensor pointers, shapes and
@@ -167,6 +171,21 @@ FlashInfer cache. The four fixed routing/finalize adapters are also registered
 for SM107 and SM120 AOT builds.
 Geometry-specialized DSL kernels retain source/JIT delivery.
 No runtime cuDNN Frontend installation is required.
+
+Artifact catalogs use schema v4. Each architecture shares tile definitions;
+gated/non-gated activation groups and compatible store policies expand into
+kernel descriptors during preparation. Sources share exact activation fragments.
+Device occupancy, L2 budget, pipeline stages and workspace are derived once from
+the preparation device. Kernels support symbolic problem sizes with explicit
+alignment and bounds; measured shortlists accelerate selection for known shapes,
+and bounded heuristics supply candidates for other shapes.
+
+Kernel IDs identify logical configurations. Source and compiler fingerprints
+qualify compiled kernels and persisted tuning choices. Artifact tooling should use
+``cudnn_frost.manifest.read_manifest`` and ``write_manifest`` to read expanded
+records and preserve existing dimension catalogs. The reader also accepts schema
+v2/v3 exports; ``dimension_catalog.write_catalog`` factors complete exports into
+the dimension format.
 
 Finalized precomputed ``MoELayer`` calls support ``FLASHINFER_TRACE_DUMP=1`` and
 ``MoELayer.__call__.fi_trace(self=layer, act_pack=activations, weight_pack=weights)``.
@@ -699,7 +718,7 @@ These symbols are defined in the backend modules and re-exported from
 Standalone TRT-LLM Gen Routing
 ------------------------------
 
-The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs is
 exposed on its own so expert selection and the permutation/padding bookkeeping
 can be used (and tested) independently of quantization and GEMM configuration.
 

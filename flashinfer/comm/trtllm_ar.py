@@ -95,6 +95,10 @@ class AllReduceFusionPattern:
     kARResidualRMSNormDynamicFP8Quant = 10
     # Dynamic per-token FP8 quantization variant that also materializes norm output
     kARResidualRMSNormOutDynamicFP8Quant = 11
+    # MoE finalize + all-reduce + residual add + RMS norm + static per-tensor FP8
+    # quantization. MNNVL CuTe DSL only; the C++ trtllm_allreduce_fusion kernels
+    # do not define this value.
+    kMoEFinalizeARResidualRMSNormFP8Quant = 12
 
 
 class QuantizationSFLayout:
@@ -813,14 +817,15 @@ def trtllm_allreduce_fusion(
     - residual_out: the residual output tensor. [token_num, hidden_dim]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - quant_out: the quant output tensor. [token_num, hidden_dim]
-    - scale_out: the scale output tensor. Initialization referece: tests/comm/test_trtllm_allreduce_fusion.py
+    - scale_out: the scale output tensor. Initialization reference: tests/comm/test_trtllm_allreduce_fusion.py
     - rms_gamma: the rms gamma tensor. [hidden_dim]
     - rms_eps: the rms epsilon value.
     - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
     - layout_code: the layout code.
     - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
-                If provided, validates that token_num <= max_token_num, world_size == tp_size,
-                and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+                If provided, it validates that world_size == tp_size, the FP32 Lamport mode matches
+                the input dtype, and token_num * hidden_dim does not exceed
+                max_token_num * metadata["hidden_dim"]. Raises ValueError if validation fails.
     - block_quant_group_size: group size (in elements along hidden_dim) for per-token-group
                               block-wise FP8 quantization patterns
                               (e.g. ``kPerTokenGroupFP8Packed`` / DeepSeek-style FP8 with
@@ -1073,7 +1078,7 @@ def trtllm_moe_allreduce_fusion(
     - residual_out: the residual output tensor. [token_num, hidden_dim]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
-    - scale_out: the scale output tensor. Initialization referece: tests/comm/test_trtllm_moe_allreduce_fusion.py
+    - scale_out: the scale output tensor. Initialization reference: tests/comm/test_trtllm_moe_allreduce_fusion.py
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).

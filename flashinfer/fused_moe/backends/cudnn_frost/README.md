@@ -325,13 +325,13 @@ New compilation checks the actual assembler before and after compiling.
 Measure ordinary warm calls separately from CUDA Graph replay, which bypasses
 Python admission and packing.
 
-The SM107 records of `artifacts/mxfp8/` retain 169 selected BF16-output
-configurations in 39 source templates, with 400 measured two-by-two profiles.
-They also include 111 fused FC1 configurations in twenty templates (60 STG and
-51 TMA). The offline SM107 pool covers all 44 families: ten FC1 activations and
-one shared FC2, each with normal/swap-AB and STG/TMA output variants. Only
-families used by the selected profiles ship. The SM120 records are summarized
-under [SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
+The SM107 catalog of `artifacts/mxfp8/` expands to 483 kernels from 15 shared
+templates: 308 BF16-output kernels and 175 fused FC1 kernels (95 STG and 80
+TMA). Its 400 measured two-by-two profiles reference 169 of them. The offline
+SM107 pool covers all 44 families: ten FC1 activations and one shared FC2,
+each with normal/swap-AB and STG/TMA output variants. Only families used by
+the selected profiles ship. The SM120 catalog is summarized under
+[SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
 Geometry records share these templates. CTA/MMA/cluster geometry,
 pipeline stages, scale-factor geometry, and persistent grid parameters live
 in `source.parameters`, not in duplicated Python implementations. At runtime
@@ -564,15 +564,14 @@ its weights can be registered with
 adds no weight copy. Keeping distinct backend layouts consumes additional
 weight memory; Frost does not convert other backends' views.
 
-The SM107 records of `artifacts/nvfp4/` retain 154 selected BF16-output
-configurations in 34 geometry-parameterized source templates and 400 measured
-two-by-two profiles. They also contain 98 fused FC1 configurations (53 STG and
-45 TMA) in twenty additional source templates, using the normal FC1 geometries
-from those profiles. Fused TMA templates retain only the 32-element epilogue
+The SM107 catalog of `artifacts/nvfp4/` expands to 464 kernels from 14 shared
+templates: 289 BF16-output kernels and 175 fused FC1 kernels (95 STG and 80
+TMA) on the normal FC1 geometries. Its 400 measured two-by-two profiles
+reference 154 of them. Fused TMA templates retain only the 32-element epilogue
 drain. The offline SM107 sweep covers all 44 operation/orientation/store
 families, including every default gated and non-gated activation and the
 shared FC2. Only templates referenced by the selected profiles are packaged.
-The SM120 records are summarized under
+The SM120 catalog is summarized under
 [SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
 
 Use `--dtype nvfp4` with the shared exporter; add `--quantize-output` and
@@ -625,11 +624,11 @@ Automatic candidates are added during tuning when a compatible view exists.
 The quantization configuration uses
 `QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)`.
 
-The SM107 records of `artifacts/mxfp8_mxfp4/` retain 169 selected BF16-output
-configurations in 42 geometry-parameterized source templates and 400 measured
-two-by-two profiles. They also include 101 fused FC1 configurations in twenty
-templates (52 STG and 49 TMA). The offline SM107 pool covers all 44
-operation/orientation/store families. The SM120 records are summarized under
+The SM107 catalog of `artifacts/mxfp8_mxfp4/` expands to 434 kernels from 16
+shared templates: 279 BF16-output kernels and 155 fused FC1 kernels (80 STG
+and 75 TMA). Its 400 measured two-by-two profiles reference 169 of them. The
+offline SM107 pool covers all 44 operation/orientation/store families. The
+SM120 catalog is summarized under
 [SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
 
 Use `--dtype mxfp8_mxfp4` with the shared exporter and
@@ -921,10 +920,12 @@ workspace is one 128-byte scheduler-counter slot. There is no CTA pair,
 cluster or TMA-store variant. A swap-AB kernel puts the expert's weight rows on
 the MMA M dimension and its routed tokens on N, so narrow token tiles serve
 the few tokens per expert of decoding; the native adapters exchange operands,
-problem dimensions and output strides exactly as for SM107. Families sit next
-to the SM107 ones as
-`sm120_cudnn_frost_<op>[_quantized]_<dtype>_{normal,swap_ab}_stg.py`, artifact
-ids start with `sm120_cudnn_frost_`, and manifest and shortlist records carry
+problem dimensions and output strides exactly as for SM107. In each dtype's
+schema-v4 catalog, the SM120 templates sit next to the SM107 ones as
+`sm120_{fc1,fc2}_{gated,non_gated}_{normal,swap}_{bf16,quantized}_stg.py`:
+one template per topology, orientation and output, from which every
+activation of the topology expands through its exact source fragments. Kernel
+IDs start with `sm120_cudnn_frost_`, and catalog and shortlist records carry
 `arch: sm_120a`.
 
 All SM120 sources are exported from cuDNN Frontend `89f40871`. Each host
@@ -939,18 +940,18 @@ with only `.reqntid`, ptxas drops `setmaxnreg` and may budget registers for
 several CTAs per SM. This producer revision also emits (empty) reduction hooks
 after the tile constants; `extract_template` keeps their decorators.
 
-Block-scale records use the geometry-generic contracts of the SM107 records:
-the frozen source of a tile does not depend on E, N or K (one tile exported at
-several model geometries renders identical templates and parameters), so a
-record accepts N and K that are multiples of 128 and up to 1024 experts. BF16
-records keep their exact-geometry contracts. MXFP8 and MXFP8 × MXFP4 FC1 also
+The frozen source of a tile does not depend on E, N or K: exports of one tile
+at several model geometries render identical templates and parameters and
+coalesce into one logical kernel. Every SM120 kernel therefore uses the
+catalog's generic contract (N and K multiples of 128, up to 1024 experts), as
+on SM107. MXFP8 and MXFP8 × MXFP4 FC1 also
 fuse the intermediate quantization (E4M3 data and segmented E8M0 scales, both
 through STG) in the normal orientation, for the tiles whose warp tile drains
 whole 32-column quantization blocks. cuDNN Frost cannot store packed FP4 on
 SM120, so NVFP4 plans always use the separate intermediate quantizer.
 
-Admission, token-count shortlists, the heuristic pool for unlisted
-block-scale shapes, the native routing/finalize adapters and the MoELayer
+Admission, token-count shortlists, the heuristic pool for unlisted shapes,
+the native routing/finalize adapters and the MoELayer
 integration are shared with SM107a; the adapters are compiled with the
 `sm_120a` flags. Only CC 12.0 devices are admitted: SM121a sources have not
 been selected. The SM107 assembler minimum does not apply, and the small-token
@@ -958,11 +959,15 @@ FMA tactics remain SM107a-only, so SM120 keeps its Tensor Core candidates at
 those geometries.
 
 Kernels were selected on an RTX PRO 6000 Blackwell Server Edition (188 SMs,
-128 MB L2, 600 W), with PyTorch 2.14.0, CuTe DSL 4.7.1 and CUDA 13.4. The
-persistent grid size, the L2 rasterization budget and the pipeline stage count
-are compile-time constants of each source, as on SM107; other CC 12.0 parts
-run the same kernels correctly, but should be revalidated before relying on
-their performance.
+128 MB L2, 600 W), with PyTorch 2.14.0, CuTe DSL 4.7.1 and CUDA 13.4. As on
+SM107, `device.py` resolves the persistent grid size, the L2 rasterization
+budget and the pipeline stage count from the preparation device. The SM120
+stage count follows cuDNN Frost's SM120 renderer: packed operand tiles plus,
+for block-scale kernels, their scale-factor boxes per stage, after the
+template's reserve and the transposed-STG epilogue staging, and for gated
+kernels the aligned buffer layout. On the RTX PRO 6000 these values reproduce
+every exported kernel's constants and workspace. Other CC 12.0 parts derive
+their own and should be revalidated before relying on their performance.
 
 #### Selection
 
@@ -1022,12 +1027,12 @@ them with `--skip-kernel`. The block-scale SwiGLU screens timed them at a
 median 3-14x the best tile's latency (other gated tiles: at most 2.9x) and
 selected none.
 
-The BF16 search exported all 86 tiles for the 11 operations at the three model
-geometries (2,838 records, exact-geometry contracts). SwiGLU screened 74 tiles
+The BF16 search exported all 86 tiles for the 11 operations at each of the
+three model geometries (2,838 records). SwiGLU screened 74 tiles
 per case, ReLU2 and FC2 all 86, and the other activations 8-16. A swap-AB tile
 was fastest in 53 of the 80 SwiGLU cases and 52 of the 80 ReLU2 cases, at
-every token count. `artifacts/bf16/` also keeps 55 small-shape test records:
-three normal and two swap-AB tiles for every operation at E8/H128/I256.
+every token count. The BF16 catalog also keeps three normal and two swap-AB
+small tiles, exported at E8/H128/I256 for every operation, that the tests run.
 
 The block-scale template steps K by 128 bytes (128 E4M3 or 256 E2M1
 elements). Its catalog has 38 tile shapes per orientation (CTA M 32..256, N
@@ -1045,20 +1050,26 @@ does: routed operands, workspace reset, grouped GEMM and the fused FC1
 activation, without intermediate quantization. The selection keeps the fused
 variants of every selected normal FC1 tile for full-pipeline autotuning.
 
-| Dtype | Profiles | Stage kernels (swap-AB) | Fused FC1 | Templates | Checks | Worst relative L2 |
+| Dtype | Profiles | Shortlisted kernels (swap-AB) | Catalog kernels (fused FC1) | Templates | Checks | Worst relative L2 |
 | --- | --- | --- | --- | --- | --- | --- |
-| BF16 | 400 | 500 (310) | 0 | 22 | 3,200 | 0.0021 |
-| MXFP8 | 400 | 196 (61) | 93 | 32 | 5,160 | 0.0017 |
-| NVFP4 | 400 | 146 (41) | 0 | 22 | 3,200 | 0.0019 |
-| MXFP8 × MXFP4 | 400 | 197 (94) | 46 | 31 | 4,124 | 0.0009 |
+| BF16 | 400 | 327 (220) | 479 (0) | 6 | 3,200 | 0.0020 |
+| MXFP8 | 400 | 196 (61) | 342 (100) | 8 | 5,160 | 0.0017 |
+| NVFP4 | 400 | 146 (41) | 182 (0) | 6 | 3,200 | 0.0019 |
+| MXFP8 × MXFP4 | 400 | 197 (94) | 320 (70) | 8 | 4,124 | 0.0009 |
+
+The catalog offers every tile of a template to each activation of its
+topology, so it holds more kernels than the shortlists reference; the bounded
+heuristic draws from the whole catalog for other shapes. Every activation
+needs its exact fragment in each template, and no selected MXFP8 × MXFP4
+GeGLU tile fuses quantization, so that catalog also takes the fused GeGLU
+exports of its five fused gated tiles from the same pool.
 
 A check runs one complete FC1 x FC2 plan for one profile and routing, eagerly
-and through CUDA Graph replay: every shortlisted BF16 pair, and every compound
-tactic that the packaged block-scale runner exposes (including fused FC1
-variants), against an FP32 reference (of the dequantized operands for the
-block-scale dtypes). A swap-AB kernel is in the FC1 shortlist of 354 BF16, 190
-MXFP8, 123 NVFP4 and 294 MXFP8 × MXFP4 profiles, and in the FC2 shortlist of
-360, 150, 130 and 220.
+and through CUDA Graph replay: every compound tactic that the packaged runner
+exposes, including fused FC1 variants, against an FP32 reference (of the
+dequantized operands for the block-scale dtypes). A swap-AB kernel is in the
+FC1 shortlist of 354 BF16, 190 MXFP8, 123 NVFP4 and 294 MXFP8 × MXFP4
+profiles, and in the FC2 shortlist of 360, 150, 130 and 220.
 
 #### Complete-MoE comparison
 

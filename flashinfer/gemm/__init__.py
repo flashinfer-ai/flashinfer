@@ -73,6 +73,10 @@ from .gemm_svdquant import (
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
     svdquant_linear as svdquant_linear,
 )
+from .cake_quant_lora_gemm import (
+    mm_fp8_lora as mm_fp8_lora,
+    mm_nvfp4_lora as mm_nvfp4_lora,
+)
 
 # Dense PrimsTS FP8/NVFP4 GEMMs are imported lazily enough that installations
 # without the experimental CuTe DSL can still import flashinfer.gemm.  The DSL
@@ -199,6 +203,8 @@ __all__ = (
         "prepare_kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
+        "mm_fp8_lora",
+        "mm_nvfp4_lora",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
         "fp8_linear",

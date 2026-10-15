@@ -5,7 +5,7 @@ import torch
 
 from .....fused_moe.api import QuantFormat, RoutingInputMode
 from ..activations import activation_name
-from ..support import SUPPORTED_ARCH_NUMBERS, quantized_moe_geometry
+from ..support import SUPPORTED_ARCH_NUMBERS, moe_geometry
 
 
 def is_eligible(config, act, arch):
@@ -23,4 +23,4 @@ def is_eligible(config, act, arch):
         activation_name(config.activation)
     except NotImplementedError:
         return False
-    return quantized_moe_geometry(config, act, hidden_size=2 * x.shape[1])
+    return moe_geometry(config, act, hidden_size=2 * x.shape[1])

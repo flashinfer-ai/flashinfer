@@ -132,6 +132,13 @@ def _tma_store(constants: dict[str, str], swap: bool) -> str:
 def render_source(template: str, parameters: dict) -> str:
     if parameters.get("version") != 1 or template.count(_CONSTANTS) != 1:
         raise ValueError("unsupported Frost source template")
+    for index, fragment in enumerate(parameters.get("activation_fragments", ())):
+        marker = f"# @@FROST_ACTIVATION_{index}@@"
+        if template.count(marker) != 1:
+            raise ValueError("invalid Frost activation fragment")
+        template = template.replace(marker + "\n", fragment)
+    if "@@FROST_ACTIVATION_" in template:
+        raise ValueError("missing Frost activation fragment")
     assignments = parameters["constants"]
     lines = []
     for name, expression in assignments:

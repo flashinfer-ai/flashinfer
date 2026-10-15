@@ -187,10 +187,19 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "long_running: front-load this test file at the start of the parallel CI queue",
+        "long_running: prioritize runnable units from this source over normal work",
     )
     config.addinivalue_line(
-        "markers", "solo: run this whole test file alone (memory-heavy)"
+        "markers",
+        "node_exclusive: run this whole file alone across the allocation, after "
+        "parallel work, with all GPUs visible; use only for allocation-wide "
+        "requirements such as multi-GPU execution or host-memory OOM risk",
+    )
+    config.addinivalue_line(
+        "markers", "gpu_exclusive: run this whole test file alone on its assigned GPU"
+    )
+    config.addinivalue_line(
+        "markers", "host_memory_heavy: serialize this file with other host-heavy files"
     )
     config.addinivalue_line(
         "markers",

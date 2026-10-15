@@ -2,6 +2,7 @@
 """Correctness and integration tests for selected cuDNN Frost kernels."""
 
 import ast
+import functools
 import gc
 import weakref
 from collections import OrderedDict
@@ -40,6 +41,10 @@ from flashinfer.fused_moe.backends.cudnn_frost.source_template import (
     extract_template,
     render_source,
 )
+from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+    read_manifest,
+    normalize_manifest,
+)
 from flashinfer.fused_moe import (
     BackendOptions,
     CutlassBf16Config,
@@ -57,9 +62,9 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe import layer as layer_module
 
 MXFP8_ROOT = mxfp8.runtime.artifact_root("mxfp8")
-MXFP8_RECORDS = json.loads(
-    (MXFP8_ROOT / "cudnn_frost_selected_kernels.json").read_text()
-)["kernels"]
+MXFP8_RECORDS = read_manifest(MXFP8_ROOT / "cudnn_frost_selected_kernels.json")[
+    "kernels"
+]
 
 
 # Every dtype packages SM107a sources and SM120a sources of the warp-MMA templates.
@@ -207,7 +212,9 @@ def test_bf16_extended_activation_scalars_are_not_silently_dropped(activation):
 
 
 @pytest.mark.parametrize("capability", [(10, 7), (12, 0)])
-def test_bf16_activation_artifact_pools_are_disjoint(capability, monkeypatch):
+def test_bf16_activation_artifact_pools_are_disjoint(
+    capability, monkeypatch, frost_metadata_only
+):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
     seen = set()
     shared_fc2 = None
@@ -246,9 +253,8 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     inputs = runner.pack_inputs(act, weights)
     expected = _bf16_moe_reference(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    # SM107: normal/swap-AB x STG/TMA per stage. SM120: three normal and two
-    # swap-AB STG geometries per stage.
-    assert len(tactics) == (25 if _sm120() else 16)
+    assert len(tactics) == 4  # Two bounded choices per stage outside tuning mode.
+    # Both architectures retain a swap-AB alternative in the bounded pool.
     first, second = bf16_moe._kernels(129 * topk, 128, 256, 8, torch.device("cuda"))
     assert {k.swap_ab for k in first} == {False, True}
     assert {k.swap_ab for k in second} == {False, True}
@@ -561,12 +567,12 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
         (4096, 7168, 107, True),
         (4095, 7168, 107, True),
         (1, 7168, 107, True),
-        (12289, 7168, 107, False),
+        (12289, 7168, 107, True),
         (4096, 4096, 100, False),
         (4096, 7168, 120, True),
         (1, 7168, 120, True),
-        (12289, 7168, 120, False),
-        (4096, 4096, 120, False),
+        (12289, 7168, 120, True),
+        (4096, 4096, 120, True),
         (4096, 7168, 121, False),  # SM121a sources have not been selected
     ):
         act, _ = bf16_packs(
@@ -593,7 +599,9 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
     assert large_bf16_moe(cfg, act, 120)
 
 
-def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
+def test_bf16_artifact_architecture_and_swap_abi_isolation(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         runtime,
     )
@@ -635,8 +643,8 @@ def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
     )
 
     root = runtime.artifact_root("bf16")
-    manifest = json.loads((root / runtime._MANIFEST).read_text())
-    assert manifest["schema_version"] == 2
+    assert json.loads((root / runtime._MANIFEST).read_text())["schema_version"] == 4
+    manifest = read_manifest(root / runtime._MANIFEST)
     assert not list(root.rglob("*.o"))
     for record in manifest["kernels"]:
         assert "object" not in record and "symbol" not in record
@@ -735,7 +743,7 @@ def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
     )
 
     root = runtime.artifact_root("bf16")
-    manifest = json.loads((root / runtime._MANIFEST).read_text())
+    manifest = read_manifest(root / runtime._MANIFEST)
     record = next(r for r in manifest["kernels"] if r["op"] == "grouped_gemm1_swiglu")
     path = tmp_path / record["source"]["path"]
     path.parent.mkdir()
@@ -766,7 +774,7 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
     root = runtime.artifact_root(dtype)
     records = [
         record
-        for record in json.loads((root / runtime._MANIFEST).read_text())["kernels"]
+        for record in read_manifest(root / runtime._MANIFEST)["kernels"]
         if record["arch"] == "sm_120a"
     ]
     block_scale = dtype != "bf16"
@@ -775,16 +783,21 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
     for record in records:
         entry = record["source"]
         template = (root / entry["path"]).read_text()
+        concrete = render_source(template, entry["parameters"])
         tactic = record["tactic"]
         swap = tactic["swap_ab"]
         quantized = record["contract"]["output_dtype"] != "bfloat16"
         families.setdefault((record["op"], quantized, swap), set()).add(entry["path"])
-        # Kernel names are sm120_cudnn_frost_<op>...
-        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_")
+        # Kernel IDs are sm120_cudnn_frost_<op>_<dtype>_<digest>. The activations
+        # of one topology share a template and differ only in exact fragments.
+        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_{dtype}_")
+        stage = "fc2" if record["op"].endswith("gemm2") else "fc1"
+        gated = (
+            stage == "fc1" and ACTIVATIONS[record["contract"]["activation"]]().is_gated
+        )
         assert entry["path"] == (
-            f"sources/sm120_cudnn_frost_{record['op'].removeprefix(prefix)}"
-            f"{'_quantized' if quantized else ''}_{dtype}"
-            f"_{'swap_ab' if swap else 'normal'}_stg.py"
+            f"sources/sm120_{stage}_{'gated' if gated else 'non_gated'}"
+            f"_{'swap' if swap else 'normal'}_{'quantized' if quantized else 'bf16'}_stg.py"
         )
         # Explicit G+1 group boundaries: no final endpoint inferred from S.
         assert record["abi"] == (
@@ -799,7 +812,7 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
             and node.name.startswith("tcgen05")
             or isinstance(node, ast.Attribute)
             and node.attr.startswith("tcgen05")
-            for node in ast.walk(ast.parse(template))
+            for node in ast.walk(ast.parse(concrete))
         )
         assert "# @@FROST_TMA_STORE@@" not in template
         # PTX setmaxnreg is .sync.aligned over the warpgroup: the producer
@@ -825,8 +838,12 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
         assert constants["frost_compile_options"] == repr(
             "--enable-tvm-ffi --gpu-arch sm_120a"
         )
-        assert int(constants["grid_num_clusters"]) > 0
-        concrete = render_source(template, entry["parameters"])
+        # Occupancy, L2 budget and pipeline depth resolve on the preparation device.
+        assert entry["parameters"]["device_dependent"]
+        assert all(
+            constants[name] == "1"
+            for name in ("grid_num_clusters", "swizzle_l2_budget_bytes", "ab_stages")
+        )
         # The host zeroes the tile-scheduler counter before every launch, so
         # the exported TVM-FFI function needs no caller-side reset.
         assert "_dynamic_scheduler_counter_initialization(" in concrete
@@ -835,9 +852,9 @@ def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
         produced = concrete.replace(
             f"\n{first} = ", f"\n{header} {tactic['tile']}\n{first} = ", 1
         )
-        assert extract_template(produced, swap_ab=swap) == (
-            template,
-            entry["parameters"],
+        extracted, parameters = extract_template(produced, swap_ab=swap)
+        assert ast.dump(ast.parse(render_source(extracted, parameters))) == ast.dump(
+            ast.parse(concrete)
         )
     assert {op for op, _, _ in families} == {
         *(f"{prefix}grouped_gemm1_{name}" for name in ACTIVATIONS),
@@ -933,7 +950,7 @@ def test_bf16_sm120_launches_need_no_workspace_reset(monkeypatch):
 
 
 @pytest.fixture
-def frost_engine_cpu(monkeypatch):
+def frost_engine_cpu(monkeypatch, frost_metadata_only):
     from flashinfer.fused_moe.backends.cudnn_frost import engine
 
     # Host preparation binds device metadata without allocating CUDA tensors.
@@ -1264,7 +1281,9 @@ def test_bf16_moe_shortlist_rejects_more_than_two_stage_candidates(tmp_path):
 
 
 @pytest.mark.parametrize("arch", ["sm_107a", "sm_120a"])
-def test_bf16_packaged_shortlists_resolve_all_profiles(arch, monkeypatch):
+def test_bf16_packaged_shortlists_resolve_all_profiles(
+    arch, monkeypatch, frost_metadata_only
+):
     """Every measured profile maps to two FC1 and two FC2 packaged artifacts."""
     from flashinfer.fused_moe.backends.cudnn_frost import (
         shortlist,
@@ -1279,6 +1298,11 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(arch, monkeypatch):
     assert {key[1] for key in table} == set(ACTIVATIONS)
     assert {key[2:] for key in table} == BF16_SHORTLIST_GEOMETRIES
     monkeypatch.setattr(runtime, "_arch_for", lambda device: arch)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=128),
+    )
     runtime.clear_artifact_cache()
     try:
         for (_, name, experts, hidden, intermediate, topk), profiles in table.items():
@@ -1430,12 +1454,18 @@ def test_bf16_selection_cache_shared_by_admission_and_packing(
         runtime.clear_artifact_cache()
 
 
-def test_bf16_selection_cache_identity_refresh_and_bound(tmp_path, monkeypatch):
+def test_bf16_selection_cache_identity_refresh_and_bound(
+    tmp_path, monkeypatch, frost_metadata_only
+):
     runtime = bf16_moe.runtime
     runtime.clear_artifact_cache()
     roots, arch = (tmp_path,), "sm_107a"
+    compiler_key = "initial-compiler"
+    props = SimpleNamespace(multi_processor_count=128)
     monkeypatch.setattr(runtime, "_artifact_roots", lambda: roots)
     monkeypatch.setattr(runtime, "_arch_for", lambda _: arch)
+    monkeypatch.setattr(runtime, "_tactic_digest", lambda _: compiler_key)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
     calls = []
 
     def match(*args):
@@ -1481,6 +1511,11 @@ def test_bf16_selection_cache_identity_refresh_and_bound(tmp_path, monkeypatch):
         assert runtime._artifact_cache_version != version
         select()
         assert len(calls) == 10
+        compiler_key = "changed-compiler"
+        select()
+        props.multi_processor_count = 80
+        select()
+        assert len(calls) == 12
 
         for tokens in range(1, 130):
             select(tokens=tokens)
@@ -1578,17 +1613,21 @@ def _assert_block_scale_geometry_roundtrip(
     # families. Every retained geometry of one family must share one source;
     # source paths must not accidentally mix activations or launch ABIs.
     assert all(len(paths) == 1 for paths in families.values())
-    assert all(len(variants) == 1 for variants in source_families.values())
-    # SM107: normal/swap-AB x STG/TMA plus fused STG/TMA FC1, and FC2. SM120:
-    # STG normal/swap-AB plus fused normal FC1, and FC2.
-    for arch, per_activation, fc2 in (("sm_107a", 6, 4), ("sm_120a", 3, 2)):
+    # Activations share a topology template; layout/store/output remain fixed.
+    assert all(
+        len({(v[0], v[2], v[3], v[4]) for v in variants}) == 1
+        for variants in source_families.values()
+    )
+    # Per gated/non-gated topology: SM107 normal/swap-AB x STG/TMA plus fused
+    # STG/TMA FC1, SM120 STG normal/swap-AB plus fused normal FC1; then FC2.
+    for arch, per_topology, fc2 in (("sm_107a", 6, 4), ("sm_120a", 3, 2)):
         sources = {
             path
             for family, paths in families.items()
             if family[0] == arch
             for path in paths
         }
-        assert len(sources) <= len(ACTIVATIONS) * per_activation + fc2
+        assert len(sources) <= 2 * per_topology + fc2
     assert sum(len(digests) for digests in by_source.values()) == len(records)
 
 
@@ -1618,7 +1657,7 @@ def test_dtype_directories_are_symmetric_and_isolated():
             f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.support"
         )
         assert Path(support.__file__).parent.name == dtype
-        payload = json.loads((root / dtype / runtime._MANIFEST).read_text())
+        payload = read_manifest(root / dtype / runtime._MANIFEST)
         expected = {
             "bf16": "bfloat16",
             "mxfp8": "float8_e4m3fn",
@@ -1957,7 +1996,13 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
             if isinstance(node, ast.FunctionDef) and node.name == "_host"
         )
         names = [arg.arg for arg in host.args.args]
-        assert len(args) + 1 == len(names)  # stream supplied at launch
+        assert len(args) + 1 == len(names), (
+            kernel.artifact_id,
+            kernel.activation,
+            kernel.gated,
+            kernel.launch_tail,
+            names,
+        )
         assert args[0][:5] == (
             (n, s, k, e, groups) if kernel.swap_ab else (s, n, k, e, groups)
         )
@@ -2005,13 +2050,16 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
         {"global_scale_position": "after_activation"},
     ],
 )
-def test_mxfp8_reject_incompatible_scale_contract(change, tmp_path):
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_mxfp8_reject_incompatible_scale_contract(change, tmp_path, schema_version):
     payload = {
         "schema_version": 2,
         "kernels": [
             MXFP8_RECORDS[0] | {"contract": MXFP8_RECORDS[0]["contract"] | change}
         ],
     }
+    if schema_version == 3:
+        payload = normalize_manifest(payload)
     (tmp_path / "cudnn_frost_selected_kernels.json").write_text(json.dumps(payload))
     with pytest.raises(RuntimeError, match="numerical contract"):
         mxfp8.discover(tmp_path)
@@ -2353,10 +2401,6 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
             for kernel in first
             if kernel.tactic_metadata["store_mode"] == fc1_output.removeprefix("fp8_")
         )
-        if not first and _sm120():
-            # SM120 packages fused variants only for selected normal tiles whose
-            # warp tile drains whole 32-column blocks; an activation may have none.
-            pytest.skip(f"no packaged SM120 fused {name} FC1")
     selected = _pick_stage_pair(first), _pick_stage_pair(second)
     # Test full launch mechanics on small allocations independently of the
     # measured model-size shortlist. Admission is covered separately below.
@@ -2475,7 +2519,9 @@ def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
         test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch, "fp8_stg")
 
 
-def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
+def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
         moe,
     )
@@ -2500,14 +2546,21 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
         ),
     )
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
-    monkeypatch.setattr(moe, "_read", lambda roots: table)
+
+    @functools.lru_cache(maxsize=8)
+    def read(roots):
+        return table
+
+    monkeypatch.setattr(moe, "_read", read)
     from flashinfer.fused_moe.backends.cudnn_frost import (
         shortlist,
     )
 
-    monkeypatch.setattr(shortlist, "_read", lambda roots: table)
+    monkeypatch.setattr(shortlist, "_read", read)
     fallback = ((first[0],), (second[0],))
-    monkeypatch.setattr(moe, "select_stages", lambda *args, **kwargs: fallback)
+    from flashinfer.fused_moe.backends.cudnn_frost import heuristics
+
+    monkeypatch.setattr(heuristics, "select_stages", lambda *args, **kwargs: fallback)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
@@ -2526,14 +2579,16 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     assert moe._selected_kernels(128, 4096, 14336, 9, 2, "cuda", SwiGLU()) == fallback
     table[key][128] = (("first2",), ("second1", "second2"))
     moe._selected_kernels_cached.cache_clear()
-    assert moe._selected_kernels(128, *args) == ((), ())
+    assert moe._selected_kernels(128, *args) == ((first[2],), (second[1], second[2]))
     table.clear()
     moe._selected_kernels_cached.cache_clear()
     assert moe._selected_kernels(128, *args) == fallback
     moe._selected_kernels_cached.cache_clear()
 
 
-def test_mxfp8_packaged_shortlists_resolve_all_profiles(monkeypatch):
+def test_mxfp8_packaged_shortlists_resolve_all_profiles(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
         moe,
     )
@@ -2620,7 +2675,7 @@ def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
 def test_nvfp4_geometry_sharing_and_roundtrip_without_cudnn(monkeypatch):
     monkeypatch.setitem(sys.modules, "cudnn", None)
     root = nvfp4.runtime.artifact_root("nvfp4")
-    records = json.loads((root / nvfp4.runtime._MANIFEST).read_text())["kernels"]
+    records = read_manifest(root / nvfp4.runtime._MANIFEST)["kernels"]
     _assert_block_scale_geometry_roundtrip(
         root, records, "cutlass.Float4E2M1FNx2", "cutlass.Float8E4M3FN", 16
     )
@@ -2657,13 +2712,16 @@ def test_nvfp4_manifest_and_launch_abi_without_cudnn(monkeypatch):
         {"global_scale_position": "after_activation"},
     ],
 )
-def test_nvfp4_reject_incompatible_numerical_contract(change, tmp_path):
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_nvfp4_reject_incompatible_numerical_contract(change, tmp_path, schema_version):
     root = nvfp4.runtime.artifact_root("nvfp4")
-    record = json.loads((root / nvfp4.runtime._MANIFEST).read_text())["kernels"][0]
+    record = read_manifest(root / nvfp4.runtime._MANIFEST)["kernels"][0]
     payload = {
         "schema_version": 2,
         "kernels": [record | {"contract": record["contract"] | change}],
     }
+    if schema_version == 3:
+        payload = normalize_manifest(payload)
     (tmp_path / nvfp4.runtime._MANIFEST).write_text(json.dumps(payload))
     with pytest.raises(RuntimeError, match="numerical contract"):
         nvfp4.discover(tmp_path)
@@ -2678,9 +2736,12 @@ def test_nvfp4_reject_incompatible_numerical_contract(change, tmp_path):
     ],
 )
 @pytest.mark.parametrize("store", ["stg", "tma"])
-def test_nvfp4_fused_manifest_rejects_changed_quantization(change, store, tmp_path):
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_nvfp4_fused_manifest_rejects_changed_quantization(
+    change, store, tmp_path, schema_version
+):
     root = nvfp4.runtime.artifact_root("nvfp4")
-    records = json.loads((root / nvfp4.runtime._MANIFEST).read_text())["kernels"]
+    records = read_manifest(root / nvfp4.runtime._MANIFEST)["kernels"]
     record = next(
         r
         for r in records
@@ -2691,6 +2752,8 @@ def test_nvfp4_fused_manifest_rejects_changed_quantization(change, store, tmp_pa
         "schema_version": 2,
         "kernels": [record | {"contract": record["contract"] | change}],
     }
+    if schema_version == 3:
+        payload = normalize_manifest(payload)
     (tmp_path / nvfp4.runtime._MANIFEST).write_text(json.dumps(payload))
     with pytest.raises(RuntimeError, match="numerical contract"):
         nvfp4.discover(tmp_path, quantized_output=True)
@@ -2938,7 +3001,7 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
 def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
-    name, swizzled, fc1_output, monkeypatch
+    name, swizzled, fc1_output, monkeypatch, geometry=(17, 256, 256, 4, 2)
 ):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
@@ -2950,7 +3013,7 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
     torch.manual_seed(117)
-    t, h, i, e, k = 17, 256, 256, 4, 2
+    t, h, i, e, k = geometry
     activation = ACTIVATIONS[name]()
     quant = QuantConfig(
         QuantFormat.NVFP4, QuantFormat.NVFP4, swizzled_scale_factors=swizzled
@@ -2991,9 +3054,11 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         intermediate_size=i,
         activation=activation,
     )
-    view["fc1_dequant_scale"].copy_(torch.tensor([0.5, 0.75, 1.25, 1.5], device="cuda"))
+    view["fc1_dequant_scale"].copy_(
+        torch.tensor([0.5, 0.75, 1.25, 1.5], device="cuda").repeat(e // 4)
+    )
     view["fc2_dequant_scale"].copy_(
-        torch.tensor([1.0, 0.25, 0.75, 0.125], device="cuda")
+        torch.tensor([1.0, 0.25, 0.75, 0.125], device="cuda").repeat(e // 4)
     )
     view["fc2_act_global_scale"].fill_(2.0)
     ids = torch.randint(0, e // 2, (t, k), device="cuda", dtype=torch.int32)
@@ -3360,7 +3425,9 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
-def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
+def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
     )
@@ -3368,7 +3435,9 @@ def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
 
-def test_nvfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
+def test_nvfp4_packaged_shortlists_resolve_all_profiles(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
     )
@@ -3451,7 +3520,7 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
 def test_mxfp8_mxfp4_geometry_sharing_and_roundtrip_without_cudnn(monkeypatch):
     monkeypatch.setitem(sys.modules, "cudnn", None)
     root = mxfp8_mxfp4.runtime.artifact_root("mxfp8_mxfp4")
-    records = json.loads((root / mxfp8_mxfp4.runtime._MANIFEST).read_text())["kernels"]
+    records = read_manifest(root / mxfp8_mxfp4.runtime._MANIFEST)["kernels"]
     _assert_block_scale_geometry_roundtrip(
         root,
         records,
@@ -3498,15 +3567,18 @@ def test_mxfp8_mxfp4_manifest_and_launch_abi_without_cudnn(monkeypatch):
         {"global_scale_position": "after_activation"},
     ],
 )
-def test_mxfp8_mxfp4_reject_incompatible_numerical_contract(change, tmp_path):
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_mxfp8_mxfp4_reject_incompatible_numerical_contract(
+    change, tmp_path, schema_version
+):
     root = mxfp8_mxfp4.runtime.artifact_root("mxfp8_mxfp4")
-    record = json.loads((root / mxfp8_mxfp4.runtime._MANIFEST).read_text())["kernels"][
-        0
-    ]
+    record = read_manifest(root / mxfp8_mxfp4.runtime._MANIFEST)["kernels"][0]
     payload = {
         "schema_version": 2,
         "kernels": [record | {"contract": record["contract"] | change}],
     }
+    if schema_version == 3:
+        payload = normalize_manifest(payload)
     (tmp_path / mxfp8_mxfp4.runtime._MANIFEST).write_text(json.dumps(payload))
     with pytest.raises(RuntimeError, match="numerical contract"):
         mxfp8_mxfp4.discover(tmp_path)
@@ -3561,7 +3633,9 @@ def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
         )
 
 
-def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
+def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4 import (
         moe,
     )
@@ -3569,7 +3643,9 @@ def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch)
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
 
-def test_mxfp8_mxfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
+def test_mxfp8_mxfp4_packaged_shortlists_resolve_all_profiles(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4 import (
         moe,
     )
@@ -3790,7 +3866,9 @@ def test_frost_moe_forward_accepts_base_runner_kwargs(dtype, runner_name, monkey
     assert calls[0][1] is workspace
 
 
-def test_bf16_clear_artifact_cache_refreshes_fc2_manifest(tmp_path, monkeypatch):
+def test_bf16_clear_artifact_cache_refreshes_fc2_manifest(
+    tmp_path, monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         runtime,
@@ -3799,7 +3877,7 @@ def test_bf16_clear_artifact_cache_refreshes_fc2_manifest(tmp_path, monkeypatch)
     packaged = runtime.artifact_root("bf16") / runtime._MANIFEST
     record = next(
         raw
-        for raw in json.loads(packaged.read_text())["kernels"]
+        for raw in read_manifest(packaged)["kernels"]
         if raw["op"] == "grouped_gemm2"
     )
     manifest = tmp_path / runtime._MANIFEST

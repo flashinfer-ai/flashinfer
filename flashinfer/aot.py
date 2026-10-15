@@ -769,10 +769,10 @@ def gen_all_modules(
                 )
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
-    # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
+    # SM100a module for every frozen body. CUDA 12.9+ builds the 21-body
     # family portfolio once for both CC 10.0 and CC 10.3. GB300 additionally
-    # retains only the two exact-SM103a direct-T1 modules whose family-target
-    # latency regressed in the measured A/B.
+    # retains exact-SM103a modules for the two precomputed direct-T1 variants
+    # and four Kimi-Linear direct-T1 variants.
     if has_flash_kda_decode_sm100a_legacy:
         jit_specs.extend(
             gen_flash_kda_decode_module(variant, "sm100a")
