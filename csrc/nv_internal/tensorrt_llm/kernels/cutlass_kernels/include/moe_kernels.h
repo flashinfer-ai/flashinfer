@@ -474,6 +474,11 @@ class CutlassMoeFCRunnerInterface {
   // Returns 0 if the config is incompatible with the current device.
   virtual int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) = 0;
 
+  /**
+   * @brief Execute the routed expert layers and combine their outputs.
+   * @param expected_m Per-call token estimate for both DeepSeek FP8 block-scale
+   * GEMMs, or -1 for the default estimate. Explicit hints exclude minimum-latency mode.
+   */
   virtual void runMoe(void const* input_activations, void const* input_sf,
                       bool const swizzled_input_sf, int const* token_selected_experts,
                       float const* token_final_scales, void const* fc1_expert_weights,
@@ -701,6 +706,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
     return configs;
   }
 
+  /**
+   * @brief Permute tokens, run both expert GEMMs, and finalize the MoE output.
+   * @param expected_m DeepSeek FP8 token estimate forwarded to both GEMMs for
+   * this call, or -1 to retain their default configuration-selection policy.
+   */
   void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
               int const* token_selected_experts, float const* token_final_scales,
               void const* fc1_expert_weights, void const* fc1_expert_biases,
@@ -716,6 +726,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               int64_t expected_m = -1) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
+  /**
+   * @brief Dispatch the first expert GEMM and its activation processing.
+   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
+   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
+   */
   static void gemm1(
       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
           gemm_runner,
@@ -742,6 +757,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
       bool enable_pdl, int64_t expected_m = -1);
 
+  /**
+   * @brief Dispatch the second expert GEMM and combine routed token outputs.
+   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
+   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
+   */
   static void gemm2(
       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
           gemm_runner,
@@ -983,6 +1003,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   DeepSeekBlockScaleGemmRunner* getDeepSeekBlockScaleGemmRunner() const;
 
+  /**
+   * @brief Run the first FP8 block-scale expert GEMM and apply its activation.
+   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
+   * for the runner's default estimate. The workspace must already be configured.
+   */
   static void BlockScaleFC1(DeepSeekBlockScaleGemmRunner& gemm_runner, T const* const input,
                             T* const output, void* const intermediate_result,
                             int64_t const* const expert_first_token_offset,
@@ -994,6 +1019,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                             ActivationParams fc1_activation_type, QuantParams& quant_params,
                             bool enable_pdl, cudaStream_t stream, int64_t expected_m = -1);
 
+  /**
+   * @brief Run the second FP8 block-scale expert GEMM and finalize token outputs.
+   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
+   * for the runner's default estimate. The workspace must already be configured.
+   */
   static void BlockScaleFC2(
       DeepSeekBlockScaleGemmRunner& gemm_runner, T const* const input, void* const gemm_output,
       OutputType* const final_output, int64_t const* const expert_first_token_offset,

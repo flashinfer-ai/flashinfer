@@ -632,6 +632,12 @@ def _validate_cutlass_moe_expected_m(
     min_latency_mode: bool,
     backend: str,
 ) -> None:
+    """Validate the optional per-call token estimate and supported MoE modes.
+
+    Raise ValueError unless a supplied hint is a positive uint32 integer, and
+    NotImplementedError unless CUTLASS DeepSeek FP8 block scaling is selected
+    without minimum-latency mode. None retains the default estimate.
+    """
     if expected_m is None:
         return
     if type(expected_m) is not int or not 0 < expected_m <= 2**32 - 1:
@@ -644,6 +650,7 @@ def _validate_cutlass_moe_expected_m(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
+    """Build and cache CUTLASS MoE operations and their workspace-size query."""
     if backend in ("120", "121"):
         module = gen_cutlass_fused_moe_sm120_module(use_fast_build).build_and_load()
     elif backend == "103":
@@ -1019,6 +1026,11 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         workspace_buffer: Optional[torch.Tensor] = None,
         expected_m: Optional[int] = None,
     ) -> List[torch.Tensor]:
+        """Execute CUTLASS MoE with the selected tactics and workspace.
+
+        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
+        this call. None uses the native runner's default estimate.
+        """
         if expected_m is not None:
             _validate_cutlass_moe_expected_m(
                 expected_m,
@@ -1212,6 +1224,11 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         workspace_buffer: Optional[torch.Tensor] = None,
         expected_m: Optional[int] = None,
     ) -> List[torch.Tensor]:
+        """Infer output tensors for fake execution of the CUTLASS MoE operation.
+
+        Minimum-latency mode also returns expert-routing metadata. The
+        expected_m scheduling hint does not affect output shapes or dtypes.
+        """
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
 

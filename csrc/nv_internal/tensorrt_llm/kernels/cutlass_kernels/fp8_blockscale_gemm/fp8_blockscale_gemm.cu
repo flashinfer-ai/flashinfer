@@ -93,6 +93,12 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
 #endif  // ENABLE_FP8_BLOCK_SCALE
 }
 
+/**
+ * @brief Run grouped FP8 expert GEMMs using the configured workspace.
+ * @param expected_m Positive uint32 token estimate for DeepGEMM configuration
+ * selection, or -1 to use the stored estimate. Explicit hints require DeepGEMM
+ * and apply only to this invocation, preserving workspace capacity and runner state.
+ */
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
     void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,

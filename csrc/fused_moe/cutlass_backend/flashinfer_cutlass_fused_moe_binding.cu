@@ -337,6 +337,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         << ", Output: " << DLDataTypeToString(mOutputDtype);
   }
 
+  /**
+   * @brief Validate tensor inputs, prepare workspace, and execute fused MoE.
+   * @param expected_m Expected tokens per local expert for both DeepSeek FP8 GEMMs;
+   * -1 uses the default estimate. Explicit hints require the OSS runner without
+   * minimum-latency mode and are validated before dispatch.
+   */
   void runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
               Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
               Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
@@ -785,6 +791,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   const char* kind() const final { return "fused_moe_runner"; }
+  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
     if (name == "run_gemm_profile") {
       return Function::FromTyped(
