@@ -552,6 +552,35 @@ Blackwell rows costs; the same idea does not transfer to Hopper (wgmma's A from 
 is the cheap path there, and its clock gap is 2-4% for reasons the agent's probes could not
 pin to the converter).
 
+**Control, and verdict (Wed 14 Oct 2026, 22:50).**  The probes above lacked the control:
+what does cuBLAS gain from zero weights?  Same session, umb-b200-263, both kernels with
+real and with all-zero weights (cuBLAS on a zero bf16 weight, ours on a zero fp8 weight),
+five interleaved rounds of 500 launches (1500 for attn.out tp8), CUDA events:
+
+| row, M=88320 | ours / cuBLAS, real | ours / cuBLAS, zero | cuBLAS zero / real | ours zero / real |
+|---|---|---|---|---|
+| mlp.gate_up tp2 | 1.044 | 1.022 | 0.824 | 0.806 |
+| mlp.down tp2 | 1.032 | 1.012 | 0.816 | 0.801 |
+| attn.out tp8 | 1.034 | 1.019 | 0.818 | 0.806 |
+| und.q tp2 (control row) | 0.974 | 0.966 | 0.827 | 0.820 |
+
+cuBLAS speeds up 17-18% on zero weights too.  The 20% the probes attributed to "the
+converted operand's TMEM round trip" is the tensor-core datapath toggling real bf16 values,
+and cuBLAS pays it from SMEM exactly as we pay it from TMEM.  Our excess over cuBLAS is
+3-4% with real data and 1-2% with zero data: ~2% is the data-dependent energy of our
+pipeline (fp8 bytes through the converter, the register file and TMEM) and ~1-2% is
+data-independent (instructions, pipeline).  The Hopper agent's identical control (H6) says
+the same there: 17-20% for both kernels, parity on zero data.  So the B22 operand path
+could recover at most the ~2% data-dependent share, and only if its SMEM traffic costs
+less than the TMEM traffic it replaces; the first cut (branch `w8a16-blackwell-b22`, does
+not build yet: the fork's A tile tensor is a TMA coordinate tensor, the global fetch needs
+a pointer-backed tile, started) is parked.  B22 is not worth its days.
+
+Final state of the Blackwell line at M=88320: 21 of 24 rows at or under 1.02 x cuBLAS,
+mlp.gate_up tp2 / mlp.down tp2 / attn.out tp8 at 1.02-1.04, which is the data-dependent
+energy of converting inside the GEMM on a power-capped part.  Hopper: 23 of 24, attn.out
+tp8 at 1.03-1.04, same cause.
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
