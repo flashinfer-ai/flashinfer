@@ -9304,6 +9304,11 @@ kernel_cake_mok_backward_mxfp8_clamped_fp32(const __grid_constant__ CUtensorMap 
                                     int half_index = (tile_row % 32 * 16 + tile_row / 32 * 4 + k_pair * 2) / 2;
                                     smem_v62[sc_base + half_index] = (uint16_t)pair_g;
                                     smem_v63[sc_base + half_index] = (uint16_t)pair_u;
+                                    if (stage_7 > 0) {
+                                        if (tid == 0) {
+                                            asm volatile("cp.async.bulk.wait_group.read 0;");
+                                        }
+                                    }
                                     __syncthreads();
                                     if (tid == 0) {
                                         int local_row_6 = row_31 - macro_row_offset_2;
@@ -9633,11 +9638,15 @@ kernel_cake_mok_backward_mxfp8_clamped_fp32(const __grid_constant__ CUtensorMap 
                                         tma_store_2d((&du_t_store), local_row_7 * 128, col_71 * 128, smem_v67_addr);
                                         tma_store_3d((&du_sc_t_store), 0, 0, col_71 * macro_tiles_5 + local_row_7, smem_v69_addr);
                                         asm volatile("cp.async.bulk.commit_group;");
-                                        asm volatile("cp.async.bulk.wait_group.read 0;");
                                     }
                                     if (half_19 == 0 && peer_11 >= 0) {
                                         router_gradient = router_gradient + smem_v70[stage_7 * 128 + tile_row];
                                         partials[local_token * col_blocks_14 + col_71] = router_gradient;
+                                    }
+                                    if (stage_7 == 1 || tile_end_2 <= first_tile_3 + 1) {
+                                        if (tid == 0) {
+                                            asm volatile("cp.async.bulk.wait_group.read 0;");
+                                        }
                                     }
                                     __syncthreads();
                                 }
