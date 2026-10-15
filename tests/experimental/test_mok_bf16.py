@@ -574,3 +574,64 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
         mok.create_mok_bf16_workspace(imbalance_comm_sms=(24,), **kwargs)
     with pytest.raises(ValueError, match="precision must be one of"):
         mok.create_mok_bf16_workspace(precision="fp8", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "capability,sm_count,precision,ep_size,expected",
+    [
+        ((10, 3), 160, "mxfp8", 8, (44, 36)),  # GB300, EP8 across two nodes
+        ((10, 3), 160, "mxfp8", 4, None),  # GB300 EP4: no unconditional gain
+        ((10, 3), 160, "bf16", 8, None),
+        ((10, 0), 148, "mxfp8", 8, None),  # B200: the imbalance switch instead
+        ((10, 0), 152, "mxfp8", 8, None),  # GB200
+        ((10, 7), 160, "mxfp8", 8, None),
+    ],
+)
+def test_comm_sms_auto_follows_the_device_and_group(
+    monkeypatch, capability, sm_count, precision, ep_size, expected
+):
+    """Host-only: ``"auto"`` for the fixed split resolves through the per-device,
+    per-group-size table; devices, precisions and group sizes without a measured
+    row keep the factory split (``None``)."""
+    from types import SimpleNamespace
+
+    from flashinfer import mok
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=sm_count),
+    )
+    assert mok.resolve_comm_sms(precision, ep_size) == expected
+
+
+def test_comm_sms_factory_defaults_are_unchanged():
+    """Host-only: the factory split stays 40 / 40, the measured rows are the
+    shipped table (a change here is a shipping change) and malformed arguments
+    are rejected before any collective."""
+    import inspect
+
+    from flashinfer import mok
+
+    facade = inspect.signature(mok.create_mok_bf16_workspace).parameters
+    assert facade["fwd_num_comm_sms"].default == 40
+    assert facade["bwd_num_comm_sms"].default == 40
+    assert mok.COMM_SMS == {(10, 3): {160: {"mxfp8": {8: (44, 36)}}}}
+    with pytest.raises(ValueError, match="precision must be one of"):
+        mok.resolve_comm_sms("fp8", 8)
+    with pytest.raises(ValueError, match="ep_size must be a positive"):
+        mok.resolve_comm_sms("mxfp8", 0)
+    with pytest.raises(ValueError, match='both be "auto"'):
+        mok.create_mok_bf16_workspace(
+            group=None,
+            device=None,
+            num_local_tokens=512,
+            hidden_size=512,
+            topk=2,
+            fwd_num_comm_sms="auto",
+            bwd_num_comm_sms=40,
+        )

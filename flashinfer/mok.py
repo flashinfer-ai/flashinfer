@@ -32,6 +32,26 @@ IMBALANCE_COMM_SMS = {
 }
 IMBALANCE_THRESHOLDS = {"bf16": 4.0, "mxfp8": 2.7}
 
+# Fixed (forward, backward) communication-SM split for ``fwd_num_comm_sms="auto"``
+# / ``bwd_num_comm_sms="auto"``, keyed by device compute capability, SM count,
+# routed precision and EP group size. Only devices and group sizes with a
+# measured gain have a row; "auto" resolves to the factory split (40 / 40)
+# elsewhere, and the factory defaults themselves are unchanged (the row is
+# opt-in). GB300 (compute capability (10, 3), 160 SMs) MXFP8 EP8 row 44 / 36
+# against the fixed 40 / 32: EP8 complete training steps on two nodes (4 GPUs
+# each), two rounds on the same nodes, hottest-rank step time. Hottest rank at
+# 3.0x the mean routed load: -2.0 / -2.2 % (full step), -2.0 / -1.8 %
+# (checkpoint step); at 5.6x: -3.1 / -3.2 %; at 7.4x: -3.2 / -3.3 %; balanced
+# steps +0.7 / +0.5 % (full) and +0.1 / +0.2 % (checkpoint) - the balanced
+# full step sits at the edge of the ~0.6 % spread of identical arms, which is
+# why the row is opt-in rather than the default. GB300 EP4 (one node) measured
+# no unconditional gain (balanced steps +0.7 ... +1.0 % slower) and has no row;
+# B200 keeps its imbalance switch above.
+COMM_SMS = {
+    (10, 3): {160: {"mxfp8": {8: (44, 36)}}},
+}
+_FACTORY_COMM_SMS = (40, 40)
+
 
 def resolve_imbalance_comm_sms(precision, device=None):
     """(forward, backward) communication-SM split used under imbalanced routing
@@ -50,6 +70,30 @@ def resolve_imbalance_comm_sms(precision, device=None):
     capability = tuple(torch.cuda.get_device_capability(device))
     sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
     return IMBALANCE_COMM_SMS.get(capability, {}).get(sm_count, {}).get(precision)
+
+
+def resolve_comm_sms(precision, ep_size, device=None):
+    """Fixed (forward, backward) communication-SM split measured for
+    ``precision`` (``"bf16"`` or ``"mxfp8"``) at EP group size ``ep_size`` on
+    ``device``, or ``None`` when the device (compute capability and SM count),
+    precision or group size has no measured row (the factory split is kept).
+    """
+    import torch
+
+    if precision not in MOK_PRECISIONS:
+        raise ValueError(
+            f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
+        )
+    ep_size = int(ep_size)
+    if ep_size < 1:
+        raise ValueError(f"ep_size must be a positive group size, got {ep_size}")
+    if device is None:
+        device = torch.cuda.current_device()
+    capability = tuple(torch.cuda.get_device_capability(device))
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return (
+        COMM_SMS.get(capability, {}).get(sm_count, {}).get(precision, {}).get(ep_size)
+    )
 
 
 def resolve_imbalance_threshold(precision):
@@ -134,6 +178,11 @@ def create_mok_bf16_workspace(
     The same workspace serves BF16 and MXFP8 routed experts.
     Call outside CUDA Graph capture; retain the workspace for every replay.
 
+    ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` are the fixed (forward, backward)
+    communication-SM counts of every launch (factory default 40 / 40). ``"auto"``
+    for both takes the measured row of the device, ``precision`` and EP group
+    size (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 MXFP8 at EP8: 44 / 36,
+    no row elsewhere, so the factory split stays in force there).
     ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
     launches switch to while the hottest rank's routed-row load is at least
     ``imbalance_threshold`` times the mean per-rank load (observed on the
@@ -158,6 +207,19 @@ def create_mok_bf16_workspace(
     if precision not in MOK_PRECISIONS:
         raise ValueError(
             f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
+        )
+    auto = (fwd_num_comm_sms == "auto", bwd_num_comm_sms == "auto")
+    if any(auto):
+        if not all(auto):
+            raise ValueError(
+                'fwd_num_comm_sms and bwd_num_comm_sms must both be "auto" or both '
+                "be communication-SM counts"
+            )
+        import torch.distributed as dist
+
+        fwd_num_comm_sms, bwd_num_comm_sms = (
+            resolve_comm_sms(precision, dist.get_world_size(group), device)
+            or _FACTORY_COMM_SMS
         )
     if isinstance(imbalance_comm_sms, str):
         if imbalance_comm_sms != "auto":

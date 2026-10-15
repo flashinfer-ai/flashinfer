@@ -193,6 +193,18 @@ to recreate the workspace.
   steps switch; with 4 ranks at 2.4x +0.8 % (one screening round). The MXFP8
   threshold sits between the measured 2.4x and 3.0x. No row elsewhere.
   `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
+- Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
+  `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
+  the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
+  group size) and keeps the factory split where there is none. GB300 (160 SMs)
+  MXFP8 EP8 44 / 36 against 40 / 32, two-node EP8 complete training steps (4
+  GPUs per node), two rounds on the same nodes, hottest-rank step time: hottest
+  rank at 3.0x the mean routed load -2.0 / -2.2 % (full step) and -2.0 / -1.8 %
+  (checkpoint step), at 5.6x -3.1 / -3.2 %, at 7.4x -3.2 / -3.3 %; balanced
+  steps +0.7 / +0.5 % (full) and +0.1 / +0.2 % (checkpoint). The balanced full
+  step sits at the edge of the ~0.6 % spread of identical arms, so the row is
+  opt-in. GB300 EP4 on one node measured no unconditional gain (balanced steps
+  +0.7 ... +1.0 % slower) and has no row; B200 uses the imbalance switch above.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the
