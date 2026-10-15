@@ -1007,7 +1007,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "80d7ac59aa962080cc2d62000ab5f8561a9e04ac36949a24fb0ca177af2102fb",
+                "identity": "1e14116a460e05c120b92d83b184f9ab922cec7bc5efc84ed1b015f633d97f56",
                 "sources": [
                     "sm_103a/cake_dsv4_06cdf778054cc6c67dc5_kernel.cu",
                     "sm_103a/cake_dsv4_06cdf778054cc6c67dc5_binding.cu",
@@ -1017,7 +1017,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "9b3bb0f42ab31389b7ef02255ddad92416b75cce0b1cb4b7976d26991a8a3709",
+                "identity": "3826b6dc665765c41b816731c47ef4abfe27e83c06e8d2e54ff1291b39071695",
                 "sources": [
                     "sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_kernel.cu",
                     "sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_binding.cu",
@@ -1027,7 +1027,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_SPLIT_REDUCE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "95ca59e0021b622eb3b961f7200f8eb76d479275e646013e672f9e2a7441d8bb",
+                "identity": "0092534b48dd496fce4f2a12c3bb6c0b447b5ff7ddd8d6803f0f7efa1061e081",
                 "sources": [
                     "sm_103a/cake_dsv4_8b60cfd54a78d36864f4_kernel.cu",
                     "sm_103a/cake_dsv4_8b60cfd54a78d36864f4_binding.cu",
@@ -1036,7 +1036,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h128_swa128": {
                 "arg_plan": _PLAN_BF16_H128_SWA_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "6a3ef5704ad10c1ad5135f5d6d6a6622775ca013b3bb656d3bfcafc5e0689adc",
+                "identity": "60a8c78dba4d200a5f30be65e0f0756b095b73110e24aabc4054ca61b69bdee1",
                 "sources": [
                     "sm_103a/cake_dsv4_f918e4ac3c5b77c4514b_kernel.cu",
                     "sm_103a/cake_dsv4_f918e4ac3c5b77c4514b_binding.cu",
@@ -1046,7 +1046,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "04b97ac830d37ba297280a69668914de33b552314ca2c99d4b9d634c6dfe03d5",
+                "identity": "3eb3212a74d41126e9e210ad337a872f9a2771100cad58beef3d6d19fb09e366",
                 "sources": [
                     "sm_103a/cake_dsv4_8c2cf89e71be1ebbd233_kernel.cu",
                     "sm_103a/cake_dsv4_8c2cf89e71be1ebbd233_binding.cu",
@@ -1056,7 +1056,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_BF16_H128_PERSISTENT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "8f000d053f792f4e4537d7370c6ca6e52579ab1b4cca8d8b4fcfb3070f4fba19",
+                "identity": "1af3aafafd31d3105b34ffecb7531a9208651fb6aa5a84845c35718ad995816f",
                 "sources": [
                     "sm_103a/cake_dsv4_9c1ead828285aaa7f400_kernel.cu",
                     "sm_103a/cake_dsv4_9c1ead828285aaa7f400_binding.cu",
@@ -1066,7 +1066,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "bb0a0f01dbb6e1fe6a736e9f99cfe996ada9e0759cf32bfb40beee8fb23e116d",
+                "identity": "6401fc666ef0b8b4fbedcc2b39f17484d032a4032c71ce29307a5e41a31e6b80",
                 "sources": [
                     "sm_103a/cake_dsv4_6a34a835c2b39424c20c_kernel.cu",
                     "sm_103a/cake_dsv4_6a34a835c2b39424c20c_binding.cu",
@@ -1076,7 +1076,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_BF16_H128_PERSISTENT_TMA_O_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "ddc7f4ed360e21ab8d8d1d2591a3028daeca234fae9c95f9fe848f4e96d0344c",
+                "identity": "c40b850622115acd5c33f6efc0302e76acceab9e4c0178b51472090c1af66824",
                 "sources": [
                     "sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_kernel.cu",
                     "sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_binding.cu",
@@ -1085,7 +1085,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h16_h32_swa128_v44": {
                 "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "de1914156f95e7c127f50257df70d17b0f7b9f0b3cb8697771327e2f7a5dc7c9",
+                "identity": "f1d591f1dda55d6e69f65eb884214ac484c3b2674a1912ddd8004bbd3cc39864",
                 "sources": [
                     "sm_103a/cake_dsv4_a164ee5cbd7fc5b4d14d_kernel.cu",
                     "sm_103a/cake_dsv4_a164ee5cbd7fc5b4d14d_binding.cu",
@@ -1094,7 +1094,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h32_topk128x_early_v47": {
                 "arg_plan": _PLAN_BF16_H32_MERGE_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "7d5fe7a24d8596b5bfd3e87ad74ee7d29ae02c3e8ed95ddd512c81537425a5ea",
+                "identity": "4eb4e4705d906bba3f910bed9982b17c9b49d57e317a15331c076756a06c5fd2",
                 "sources": [
                     "sm_103a/cake_dsv4_ebf2dfc077eb990f64fa_kernel.cu",
                     "sm_103a/cake_dsv4_ebf2dfc077eb990f64fa_binding.cu",
@@ -1103,7 +1103,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h64_compressed_q8_v38": {
                 "arg_plan": _PLAN_BF16_H64_SPLIT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "62fa5a24bc71a7176e077b935144961fb1c9743a2b40030fa4e215430099505a",
+                "identity": "bfcef65f393238ddca3f5820d1d9ce265936416104d6c6d55c86d8d1262da13a",
                 "sources": [
                     "sm_103a/cake_dsv4_584c7f1bfa07e4783b08_kernel.cu",
                     "sm_103a/cake_dsv4_584c7f1bfa07e4783b08_binding.cu",
@@ -1112,7 +1112,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h64_compressed_reduce": {
                 "arg_plan": _PLAN_H64_REDUCE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "534205e2faf86f4ae23f9d02f68774c915960013f4de6eb0b013332956122be7",
+                "identity": "b23d91d08d453704e5a0a409d4765501d3c5583a062ad0509dd8c392d483239d",
                 "sources": [
                     "sm_103a/cake_dsv4_e900f8c37ff1f0974a39_kernel.cu",
                     "sm_103a/cake_dsv4_e900f8c37ff1f0974a39_binding.cu",
@@ -1121,7 +1121,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h64_guard_q_tma_batch_r25": {
                 "arg_plan": _PLAN_BF16_H64_GUARD_TMA_O + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "108a253711ffef47bd770d12b1085673aa9bd1b699899138ed57159bb51f25de",
+                "identity": "cd5cbbee5354e65e06f929402dbb931a25a8a951de821dc7454baed4efbf42e3",
                 "sources": [
                     "sm_103a/cake_dsv4_a293c552f4c6f588106c_kernel.cu",
                     "sm_103a/cake_dsv4_a293c552f4c6f588106c_binding.cu",
@@ -1130,7 +1130,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h64_prefill": {
                 "arg_plan": _PLAN_BF16_H64_PREFILL_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "72671cb08b37e1db7844c856831d79c0a86e17f37a1cee8843fb60f241fe3083",
+                "identity": "6908a57716c6092edc9599c148dcc7feeb72994a113ce446b9cae989da62f680",
                 "sources": [
                     "sm_103a/cake_dsv4_2ada791761e6057628f6_kernel.cu",
                     "sm_103a/cake_dsv4_2ada791761e6057628f6_binding.cu",
@@ -1139,7 +1139,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h8_h16_source_exact": {
                 "arg_plan": _PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "c94422867e63d478cf9cb82d64661a43d499162321b78290f65b65d1ce4b25aa",
+                "identity": "bb52a6ee67f3fedc6d1f33eb212f77aa3b74c7008ec92cfbc6dbc4712228eb1f",
                 "sources": [
                     "sm_103a/cake_dsv4_34c0d39b1248c1010a15_kernel.cu",
                     "sm_103a/cake_dsv4_34c0d39b1248c1010a15_binding.cu",
@@ -1148,7 +1148,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_h8_swa128_v43": {
                 "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "17be1dde22562a78d48fb6120aca8e73e7f4b98f73a38d9d0ea588c0ec3f4ba1",
+                "identity": "adaac9d5879c74c27b7037f850006bf721cc538052dc86e01f30d1812f7f6d39",
                 "sources": [
                     "sm_103a/cake_dsv4_7383588b37366a763e1e_kernel.cu",
                     "sm_103a/cake_dsv4_7383588b37366a763e1e_binding.cu",
@@ -1157,7 +1157,7 @@ _ARCH_REGISTRATIONS = {
             "bf16_swa128_single_cta": {
                 "arg_plan": _PLAN_BF16_SWA_DECODE_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "4b25b98298ef653eae8fc4cce699685abfcc48f8e0e7babd95a3630796225a64",
+                "identity": "db41d760e3ea9a9b191cc026df90398f29e05ceb874661e03c7c3296d68a8355",
                 "sources": [
                     "sm_103a/cake_dsv4_ee00a096a4346bd6ad78_kernel.cu",
                     "sm_103a/cake_dsv4_ee00a096a4346bd6ad78_binding.cu",
@@ -1169,7 +1169,7 @@ _ARCH_REGISTRATIONS = {
                     "--use_fast_math",
                     "-Xptxas=--register-usage-level=10",
                 ],
-                "identity": "a2040d948500253d55ecac75238b4f82e9cd7165ea6d26925e19cabc807208bb",
+                "identity": "3bcfd48e83508093b5bab1d2da8eea7bb707052bb586d8d9aa83f9d992c45e63",
                 "sources": [
                     "sm_103a/cake_dsv4_1dd9f772bf09c995842d_kernel.cu",
                     "sm_103a/cake_dsv4_1dd9f772bf09c995842d_binding.cu",
@@ -1178,7 +1178,7 @@ _ARCH_REGISTRATIONS = {
             "fp8_h128_prefill_source_persistent_uniform": {
                 "arg_plan": _PLAN_FP8_PERSISTENT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "0a4d0fabb8d4c56d064752142761aed7f900e6466adc6ef906cb14cb21e0d1a8",
+                "identity": "40c82e6efd7ff1df1716a14169b773f43f2b1be4716f50cb0bfd27d38792f066",
                 "sources": [
                     "sm_103a/cake_dsv4_25214a8d235e87a9cc33_kernel.cu",
                     "sm_103a/cake_dsv4_25214a8d235e87a9cc33_binding.cu",
@@ -1187,7 +1187,7 @@ _ARCH_REGISTRATIONS = {
             "fp8_h64_prefill_source_persistent_m64": {
                 "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "62abfe11a85b45ca89b9e8d3627def5def3e283bca9ea712c44ddf9e439b5b44",
+                "identity": "b99dd4ccb610b4f9fc9adb50a8547bf186c2cfafd7a3569f6bba718fb8735b42",
                 "sources": [
                     "sm_103a/cake_dsv4_c09af191b368fc936d16_kernel.cu",
                     "sm_103a/cake_dsv4_c09af191b368fc936d16_binding.cu",
@@ -1196,7 +1196,7 @@ _ARCH_REGISTRATIONS = {
             "fp8_h64_prefill_source_persistent_m64_multi_tile": {
                 "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "706de01351b7cd8ceb6888a9427943a99c1fa4cd63a19898ef6faf3f2c750b27",
+                "identity": "75573c82f3736e960fb429c9810c387dc1e14285d619ee55ca1774a9570f59ca",
                 "sources": [
                     "sm_103a/cake_dsv4_14df2e7f409bd2c5c501_kernel.cu",
                     "sm_103a/cake_dsv4_14df2e7f409bd2c5c501_binding.cu",
@@ -1205,25 +1205,25 @@ _ARCH_REGISTRATIONS = {
             "fp8_h64_source_exact": {
                 "arg_plan": _PLAN_FP8_H64_SOURCE_EXACT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "72dfe6f3cc94735c0e04120b256bd9d1ec0620228039bbecd994c6c1406237f1",
+                "identity": "90cba54ab1dfad6ed2629ccd75a0c09c1ddadfd3a428a4080648eaeb63629e73",
                 "sources": [
-                    "sm_103a/cake_dsv4_8543cb10ca15edd3a26b_kernel.cu",
-                    "sm_103a/cake_dsv4_8543cb10ca15edd3a26b_binding.cu",
+                    "sm_103a/cake_dsv4_7682c095a61495bc66df_kernel.cu",
+                    "sm_103a/cake_dsv4_7682c095a61495bc66df_binding.cu",
                 ],
             },
             "fp8_h8_h16_source_exact": {
                 "arg_plan": _PLAN_H8_H16_SOURCE_EXACT_TOKENS_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "4e6224033672232f0d29e1427473fb2d48e8ca8b1ef5c41c9d34c4dc79c59ecd",
+                "identity": "85c5fd217211d6d4d073582e78b8aa37db0895d50c8d118a9bc55d65144ab14f",
                 "sources": [
-                    "sm_103a/cake_dsv4_e875bc1d8a3b3ff27030_kernel.cu",
-                    "sm_103a/cake_dsv4_e875bc1d8a3b3ff27030_binding.cu",
+                    "sm_103a/cake_dsv4_70a0b1ae882054e5c302_kernel.cu",
+                    "sm_103a/cake_dsv4_70a0b1ae882054e5c302_binding.cu",
                 ],
             },
             "fp8_lowhead_h64": {
                 "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "bd0ea36f2b7b1335e2aad245666d9a9d5c264d721724f6b66d4b8b3cc3bb0ca1",
+                "identity": "bdec12e03393c622aa00b8d5912ff6ebd5184e60bdd147207368b9d045a3b967",
                 "sources": [
                     "sm_103a/cake_dsv4_914897d09f87971636b3_kernel.cu",
                     "sm_103a/cake_dsv4_914897d09f87971636b3_binding.cu",
@@ -1232,7 +1232,7 @@ _ARCH_REGISTRATIONS = {
             "fp8_lowhead_one_partition": {
                 "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "4a71a2732a5d5913f09e1bd418d37cc4c0b0b96371c93ccc45d15bb7f4df956a",
+                "identity": "9b15425dcf780f49cc5ceef9428732828f0a56f4169a918dea4a6efa0b384373",
                 "sources": [
                     "sm_103a/cake_dsv4_9c1c6548071b6184d8e3_kernel.cu",
                     "sm_103a/cake_dsv4_9c1c6548071b6184d8e3_binding.cu",
@@ -1241,10 +1241,10 @@ _ARCH_REGISTRATIONS = {
             "fp8_lowhead_prefill": {
                 "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "9f430a079ba1928ab48b460d2c9d74bc427f24211bf39d4241e6522b7f31f99e",
+                "identity": "765b91210fd3d1a4f1f8a83ae541899c4c6b3a9ec95796682dfecd379dde8e5f",
                 "sources": [
-                    "sm_103a/cake_dsv4_3b2807f9cb6acd058bdf_kernel.cu",
-                    "sm_103a/cake_dsv4_3b2807f9cb6acd058bdf_binding.cu",
+                    "sm_103a/cake_dsv4_fc0b78470851912fb4c6_kernel.cu",
+                    "sm_103a/cake_dsv4_fc0b78470851912fb4c6_binding.cu",
                 ],
             },
             "nvfp4_decode_cluster": {
@@ -1473,7 +1473,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_SPLIT_REDUCE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "a17f7b729fe17d899e263d1615cbc2f73fa9b5dcec4d8ac465cd343cbcf9c263",
+                "identity": "aa4a3fef25dc679115e480518d4930db875f3a030ce5d333c97c425d14e05d50",
                 "sources": [
                     "sm_103a/cake_dsv4_aa6dd9bfdbb2d261b462_kernel.cu",
                     "sm_103a/cake_dsv4_aa6dd9bfdbb2d261b462_binding.cu",
