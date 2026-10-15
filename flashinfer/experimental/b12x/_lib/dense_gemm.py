@@ -3794,8 +3794,8 @@ class DenseGemmKernel:
 
                 for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
-                    if cutlass.const_expr(self.a16):
-                        # Order consumer reads before async-proxy stage reuse.
+                    if cutlass.const_expr(self.load_path == "tma"):
+                        # Order consumers' generic-proxy reads before the TMA refill.
                         cute.arch.fence_view_async_shared()
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
