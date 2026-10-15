@@ -434,6 +434,32 @@ energy below the 192-row tile therefore needs a different mainloop (a converted 
 in SMEM with the activation as a plain TMA A operand, which the fork does not have), not a
 configuration.
 
+### Version B19 experiment: the warps that spin (Wed 14 Oct 2026, evening)
+
+Dynamic opcode counts (ncu source page, instructions executed per SASS line, mlp.down tp1
+M=88320, our auto kernel): 5.1 G warp instructions, of which F2FP (the conversion) 0.95 G,
+IMAD 0.68 G, and SYNCS 0.77 G + BRA 0.50 G + NANOSLEEP 0.31 G = 1.58 G (31%) are
+barrier-poll loops.  The hottest single site is one TRYWAIT / NANOSLEEP / BRA loop
+(`barrier.h:419`, CUTLASS's blocking `wait()`) re-polled ~226 M times: the hardware
+suspend inside `mbarrier.try_wait` lasts tens of ns whatever its hint, so a warp that
+waits long keeps issuing.  cuBLAS's warps show 79% of their PC samples suspended on one
+NANOSLEEP.SYNCS.  Hopper does not have this (the agent's opcode table: SYNCS + BRA 4% of
+ours vs 6% of cuBLAS's there).
+
+Peek-and-sleep waits (`__nanosleep` between non-blocking tries, macros
+`W8A16_WAIT_SLEEP_NS` / `W8A16_MMA_WAIT_SLEEP_NS`, default 0):
+- transform warps' two per-k-step waits, 100 / 300 / 1000 ns: instruction count 1.98 G
+  unchanged, ratios unchanged (`b19_sleep`).  They were already suspended.
+- epilogue warps' accumulator wait, 500 / 2000 ns: 1.98 -> 1.92 G, clock unchanged.
+- MMA warp's two per-k-step waits plus the two TMA producers' acquires, 50 ns: the
+  exact-value test kernel deadlocked (63 min at 100% utilisation, 250 W, killed).  The
+  TMA-producer part is reverted; the MMA-warp part is kept behind its macro for one bounded
+  retry.  The remaining ~1.4 G of polls are therefore in the MMA warp and the TMA warps,
+  the two that wait between every k-step.
+What it could be worth, by the Hopper agent's energy-slope probe (+24% instructions ->
+-1.1% clock at equal cycles): removing all 1.5 G poll instructions is ~1.5% of clock,
+enough for mlp.down tp2 and mlp.gate_up tp2 (1.022-1.026), not for attn.out tp8 (1.042).
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.
