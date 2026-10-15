@@ -100,11 +100,12 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
 // MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul.
 // input: [numExperts, m, n], or [numExperts, m, 2 * n] (gate then up) when use_silu_and_mul is
 // set; output: [numExperts, m, padded_n] e4m3; SFOutput: per-expert UE8M0 scales in the 128x4
-// swizzled layout. Only the first min(mask[e], m) rows of expert e are written.
+// swizzled layout. Only the first min(mask[e], m) rows of expert e are written. input must be
+// aligned to sizeof(T) * 16 bytes and output to 32 bytes.
 template <typename T>
 void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_n, T const* input,
                                        int32_t const* mask, bool use_silu_and_mul, uint8_t* output,
-                                       uint8_t* SFOutput, int multiProcessorCount,
+                                       uint32_t* SFOutput, int multiProcessorCount,
                                        bool enable_pdl = false, cudaStream_t stream = 0);
 
 }  // namespace kernels
