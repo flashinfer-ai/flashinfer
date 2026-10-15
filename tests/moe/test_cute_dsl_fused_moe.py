@@ -65,8 +65,8 @@ def _skip_sm107_unimplemented_moe_features(request):
 
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
     Blackwell kernels rather than a port of them: the gather kernel implements
-    SwiGLU (including its SiTU variant) and Relu2 but not GeGLU-tanh or custom
-    SwiGLU alpha/beta/limit constants, its wrapper has no
+    SwiGLU (including its SiTU variant and a clamp limit) and Relu2 but not
+    GeGLU-tanh or custom SwiGLU alpha/beta constants, its wrapper has no
     ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
     path. The wrappers raise ``NotImplementedError`` for these cases, which is
     correct behaviour -- but on Rubin it reports as a test failure on every CI
@@ -2020,7 +2020,7 @@ class TestCuteDslFusedMoeFunctional:
         if is_sm107():
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta/limit)"
+                "SwiGLU constants (swiglu_alpha/beta)"
             )
         from flashinfer import autotune
         from flashinfer import cute_dsl_fused_moe
@@ -2067,7 +2067,7 @@ class TestCuteDslFusedMoeFunctional:
         if is_sm107():
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta/limit)"
+                "SwiGLU constants (swiglu_alpha/beta)"
             )
         from flashinfer import cute_dsl_fused_moe
 
@@ -2119,6 +2119,74 @@ class TestCuteDslFusedMoeFunctional:
             swiglu_limit=7.0,
             **reference_inputs,
         )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("swiglu_limit", [0.05, 0.1])
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_swiglu_limit_accuracy(self, quant_mode: str, swiglu_limit: float):
+        """Accuracy test for plain SwiGLU with only a clamp limit (GLM-5.3)."""
+        from flashinfer import cute_dsl_fused_moe
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
+            tensors, quant_mode
+        )
+
+        result = cute_dsl_fused_moe(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type=ActivationType.Swiglu,
+            swiglu_limit=swiglu_limit,
+            quant_mode=quant_mode,
+            **api_inputs,
+        )
+
+        reference_kwargs = dict(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=ActivationType.Swiglu,
+            **reference_inputs,
+        )
+        ref_output = compute_reference_moe_fp4(
+            swiglu_limit=swiglu_limit, **reference_kwargs
+        )
+        unclamped_ref = compute_reference_moe_fp4(**reference_kwargs)
+
+        def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
+            return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+        # The outputs are small enough that check_accuracy's absolute floor
+        # accepts an unclamped result, so also require the limit to bind and
+        # the result to land far closer to the clamped reference.
+        assert rel_err(ref_output, unclamped_ref) > 0.5
+        assert rel_err(result, ref_output) < 0.5 * rel_err(result, unclamped_ref)
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, (
@@ -2221,7 +2289,7 @@ class TestCuteDslMoEWrapper:
         if is_sm107():
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta/limit)"
+                "SwiGLU constants (swiglu_alpha/beta)"
             )
         from flashinfer import CuteDslMoEWrapper
 
@@ -2303,7 +2371,7 @@ class TestCuteDslMoEWrapper:
         if is_sm107():
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta/limit)"
+                "SwiGLU constants (swiglu_alpha/beta)"
             )
         from flashinfer import CuteDslMoEWrapper
 
@@ -2592,7 +2660,7 @@ class TestCuteDslMoEWrapper:
         if is_sm107():
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta/limit)"
+                "SwiGLU constants (swiglu_alpha/beta)"
             )
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
