@@ -124,8 +124,10 @@ Caveats:
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
 `1e-6` without an epsilon argument. Auto selection also requires CuTe DSL 4.7+.
-The bounded SM100 policies live in `kda.py` and `gdn_prefill.py`. Validate both
-output and final state before changing a policy. Explicit state-pool calls
+The bounded KDA SM100/SM103 and GDN SM100 policies live in `kda.py` and
+`gdn_prefill.py`. KDA's head/length regions are documented in `docs/api/kda.rst`.
+Auto-selected cuDNN ignores the native KDA workspace; native fallback uses it.
+Validate output and final state before changing a policy. Explicit state-pool calls
 require unique, in-range slots; auto keeps pools on their native route.
 
 Use `benchmarks/bench_cudnn_linear_attention.py` for public-call comparisons.
