@@ -947,6 +947,8 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 // dependent loads per thread, which dominates finalize latency at decode batch sizes.
 constexpr int SMALL_BATCH_FINALIZE_THREADS = 256;
 constexpr int SMALL_BATCH_FINALIZE_MAX_LOADS = 4;
+// Cap on topK groups: keeps at least 16 threads per block across the hidden dimension.
+constexpr int SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS = 16;
 
 template <typename KernelParams>
 __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
@@ -1111,8 +1113,13 @@ void run(Data const& data, void* stream) {
     int const elemPerVec = data.mDtypeElt == tg::Dtype::E4m3 ? 16 : 8;
     bool const vecAligned =
         data.hiddenDim % elemPerVec == 0 && data.hiddenDimPadded % elemPerVec == 0;
-    if (numBlocksX * numBlocksY < 1184 && vecAligned &&
-        data.topK <= 16 * SMALL_BATCH_FINALIZE_MAX_LOADS) {
+    // With topK <= SMALL_BATCH_FINALIZE_MAX_LOADS there is a single topK group, and the
+    // shared-memory reduction costs more than the split saves.
+    bool const useSmallBatch =
+        numBlocksX * numBlocksY < 1184 && vecAligned &&
+        data.topK > SMALL_BATCH_FINALIZE_MAX_LOADS &&
+        data.topK <= SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS * SMALL_BATCH_FINALIZE_MAX_LOADS;
+    if (useSmallBatch) {
       // Fewest topK groups that keep each thread at SMALL_BATCH_FINALIZE_MAX_LOADS loads or fewer.
       int kSplit = 1;
       while (kSplit * SMALL_BATCH_FINALIZE_MAX_LOADS < data.topK) {
