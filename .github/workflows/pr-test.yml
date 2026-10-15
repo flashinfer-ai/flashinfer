@@ -757,6 +757,7 @@ jobs:
 
       - name: Comment on PR about skip-all findings
         if: steps.skip-all.outputs.skip_all_found == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -783,7 +784,7 @@ jobs:
           # with our marker.
           EXISTING=$(gh api \
             "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            --paginate --jq '.[] | select(.body | contains("Skip-all detection (IKL-569)")) | .id')
+            --paginate --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("Skip-all detection (IKL-569)")) | .id')
           for ID in $EXISTING; do
             gh api -X DELETE "/repos/${{ github.repository }}/issues/comments/${ID}" || true
           done
