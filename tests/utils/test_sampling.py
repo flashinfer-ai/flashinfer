@@ -24,6 +24,10 @@ from tests.test_helpers.parametrize import (
 )
 
 
+# H100 CI peak GPU memory: 39.5 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 def normal_distribution(std):
     def normal_noise(shape, device):
         return torch.randn(shape, device=device) * std
