@@ -294,7 +294,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
 
             autotune = autotune_hopper_mxfp4_mega_moe
 
-            autotune(
+            self._autotune_winner = autotune(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],

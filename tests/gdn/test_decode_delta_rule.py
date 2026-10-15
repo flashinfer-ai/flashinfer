@@ -24,7 +24,8 @@ import random
 import torch
 import pytest
 
-pytestmark = pytest.mark.long_running
+# H100 CI peak GPU memory: 43.0 GiB.
+pytestmark = [pytest.mark.long_running, pytest.mark.gpu_exclusive]
 
 
 try:

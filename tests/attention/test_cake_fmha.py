@@ -864,10 +864,6 @@ def test_cake_fmha_optimized_context_adapters_require_signed_seq_lens(
         ("jit/cake_fmha_context_fp8_jit_binding.cu", 5),
         ("jit/cake_fmha_context_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_bf16_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_fp8_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_hd64_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_quant_bf16q_jit_binding.cu", 2),
@@ -882,6 +878,32 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
     assert adapter.count("reinterpret_cast<CakeFmhaTensorMap const*>") == (
         descriptor_count
     )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "jit/cake_fmha_decode_balanced_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_balanced_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_fp8_balanced_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_jit_binding.cu",
+    ],
+)
+def test_cake_fmha_balanced_launch_adapters_pass_descriptors_by_value(
+    relative_path,
+) -> None:
+    # The balanced kernels take their TMA descriptors as ``__grid_constant__``
+    # parameters: the adapter encodes each descriptor on the host and hands it
+    # to the launch binding by reference, with no device descriptor slots.
+    adapter = (get_cake_fmha_csrc_dir() / relative_path).read_text(encoding="utf-8")
+    assert adapter.count("CUtensorMap const& p_") == 3
+    assert "CakeFmhaTensorMap" not in adapter
+    assert "TmaDeviceSlot" not in adapter
+    assert "RecordTmaDeviceSlotUses" not in adapter
+    assert "cuMemAlloc" not in adapter
 
 
 @pytest.mark.parametrize(
@@ -904,22 +926,6 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
         ),
         (
             "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}", "{k_slot, v_slot}"),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
             ("{q_slot, k_slot, v_slot}",),
         ),
         (
@@ -3415,7 +3421,12 @@ def test_cake_fmha_balanced_hd64_route_owns_bf16_gqa_decode(monkeypatch) -> None
         page_size=16,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
-    assert cake_api._route_components(route) == (component,)
+    # Two structural instances of one body: eight softmax columns for head
+    # groups 1..8, sixteen for 9..16 (selected by the host from the group).
+    assert cake_api._route_components(route) == (
+        component,
+        "decode_balanced_bf16_hd64_g16",
+    )
 
     # One to sixteen query heads per KV head, at every KV length and tile count.
     for group, batch_size, seq_lens in (
@@ -3689,13 +3700,20 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
             cake_fmha_balanced_fp8_component_name(bad_q_dtype)
 
 
-def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -> None:
+@pytest.mark.parametrize("max_group", [8, 16])
+def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(
+    monkeypatch, max_group
+) -> None:
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    component = "decode_balanced_bf16_hd64"
-    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a")
-    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a")
+    component = (
+        "decode_balanced_bf16_hd64"
+        if max_group == 8
+        else "decode_balanced_bf16_hd64_g16"
+    )
+    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a", max_group)
+    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a", max_group)
     assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
     assert {Path(source).name for source in spec.sources} == {
         "default.cu",
@@ -4334,3 +4352,99 @@ def test_cake_decode_balanced_hd256_matches_reference_and_replays(
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_decode_bf16_hd256_smallm_cuda_graph_without_prewarm() -> None:
+    """Serving-style CUDA graph use of the small-M hd256 route.
+
+    Capture with no eager prewarm and a transient query/output (graph-pool
+    addresses), then replay across growing KV lengths with other GPU work
+    between launches, the way a decode loop interleaves layers. Guards the
+    by-value TMA descriptors, the self-resetting merge tickets kept in
+    ``multi_ctas_kv_counter_buffer`` (no per-launch memset node), and the
+    softmax/correction ``corr_scale`` ordering whose mbarrier parity could
+    alias and deadlock a CTA under exactly this interleaving.
+    """
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
+
+    # Qwen3.5-35B-A3B TP=2 verify: 7 query rows x 8 heads over one KV head.
+    q_len, num_q_heads, head_dim, page_size, max_ctx = 7, 8, 256, 64, 65536
+    gen = torch.Generator(device=device).manual_seed(0)
+    num_pages = max_ctx // page_size + 8
+    key_cache = 0.5 * torch.randn(
+        (num_pages, 1, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    value_cache = torch.randn(
+        (num_pages, 1, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    block_tables = (
+        torch.randperm(num_pages, device=device, generator=gen)[: max_ctx // page_size]
+        .to(torch.int32)
+        .view(1, -1)
+    )
+    seq_lens = torch.tensor([60000], dtype=torch.int32, device=device)
+    q_src = torch.empty(
+        (q_len, num_q_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    workspace = torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+    counter = torch.zeros(
+        get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            1, num_q_heads, get_device_sm_count(device)
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    scale = head_dim**-0.5
+
+    def run():
+        query = q_src * 1.0  # transient tensor, graph-pool address inside capture
+        return decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(key_cache, value_cache),
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_ctx,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            window_left=-1,
+            out_dtype=torch.bfloat16,
+            q_len_per_req=q_len,
+            multi_ctas_kv_counter_buffer=counter,
+            backend="cake",
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):  # no eager call before capture
+        out = run()
+
+    pages = block_tables[0].long()
+    k_all = key_cache[pages, 0].reshape(-1, head_dim).float()
+    v_all = value_cache[pages, 0].reshape(-1, head_dim).float()
+    for kv_len in range(60000, 60000 + 3 * 128, 3):  # crosses page/block edges
+        q_src.normal_(generator=gen)
+        seq_lens.fill_(kv_len)
+        graph.replay()
+        # Dense bottom-right-causal reference; also the interleaved GPU work.
+        scores = (q_src.float() @ k_all[:kv_len].T) * scale
+        pos = torch.arange(kv_len, device=device)
+        limit = kv_len - q_len + torch.arange(q_len, device=device)
+        scores = scores.masked_fill(pos > limit[:, None, None], float("-inf"))
+        ref = torch.softmax(scores, dim=-1) @ v_all[:kv_len]
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+    torch.cuda.synchronize()
+    assert counter.count_nonzero().item() == 0, "merge tickets must self-reset"

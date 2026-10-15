@@ -1,5 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Cheap MXFP8 auto-admission; source and shortlist checks live in the runner."""
+"""Cheap MXFP8 input geometry checks for ordinary MoELayer candidates."""
 
 import torch
 
@@ -24,9 +24,3 @@ def is_eligible(config, act, arch):
     except NotImplementedError:
         return False
     return quantized_moe_geometry(config, act)
-
-
-def create_runner(config, device):
-    from .moe import automatic_candidate
-
-    return automatic_candidate(config, device)

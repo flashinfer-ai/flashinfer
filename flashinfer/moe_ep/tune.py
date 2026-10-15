@@ -1,7 +1,7 @@
 """Offline tuning for CuTe DSL MegaMoE backends.
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
-``sm90_fp8_*`` and ``sm90_mxfp4`` dtypes select the Hopper tuner. BF16 and
+``sm90_fp8_*`` / ``sm90_mxfp4`` / ``sm90_bf16`` dtypes select the Hopper tuners. BF16 and
 mixed BF16/MXFP8 are supported by the SM100 tuner only. MXFP4/MXFP8 is
 wired for SM107.
 
@@ -19,7 +19,16 @@ Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::
         --max-tokens 8 32 64 128 256 512 1024 2048
 
 ``--intermediate`` is the width after activation. Use ``MEGA_NO_DIST=1`` for
-single-rank tuning. Atomic reduction candidates require
+single-rank tuning.
+
+``--dtype sm120_mxfp4_mxfp8`` tunes the transport table of the SM120 Cake MegaMoE
+backend (``transport_table="tuned"``) on the launched topology::
+
+    torchrun --nproc_per_node=8 -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8 \\
+        --hidden 4096 --intermediate 2048 --num-experts 256 --topk 6 \\
+        --max-tokens 512 2048 8192 [--shared-expert]
+
+Atomic reduction candidates require
 ``--allow-nondeterministic`` and an engine configuration that enables IKR.
 """
 
@@ -49,8 +58,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "mxfp8_e4m3",
             "mxfp8_e5m2",
             "mxfp4_mxfp8",
+            "sm120_mxfp4_mxfp8",
             "sm90_fp8_e4m3",
             "sm90_fp8_e5m2",
+            "sm90_bf16",
             "sm90_mxfp4",
             "bf16",
             "bf16_mxfp8_e4m3",
@@ -80,7 +91,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("auto", "sm90", "sm100", "sm107"),
         default="auto",
         help="backend family; auto selects sm107 on Rubin, sm100 otherwise; "
-        "sm90_fp8_* and sm90_mxfp4 dtypes select sm90",
+        "sm90_fp8_* / sm90_mxfp4 / sm90_bf16 dtypes select sm90",
+    )
+    parser.add_argument(
+        "--shared-expert",
+        action="store_true",
+        help="sm120_mxfp4_mxfp8: tune the in-kernel FP8 shared-expert variant",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -157,6 +173,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="also sweep in_kernel_fc2_reduce candidates",
     )
     parser.add_argument(
+        "--do-finalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="finalize expert outputs; disable to leave finalization to the caller "
+        "after EP communication completes (SM100 NVFP4)",
+    )
+    parser.add_argument(
+        "--apply-topk-in-fc1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply routing weights in FC1; disable for post-FC2 weighting (SM100 NVFP4)",
+    )
+    parser.add_argument(
         "--max-candidates",
         type=int,
         default=None,
@@ -168,9 +197,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="live token count to stage and time (default: the bucket size). "
         "Use a decode-like count (e.g. 256) to tune for decode steps while "
-        "keeping the engine's buffer bucket; the cache entry is still keyed "
-        "on --max-tokens, so write decode-tuned winners to a separate cache "
-        "file (FLASHINFER_MOE_EP_KNOB_CACHE). For sm90_mxfp4, an explicit "
+        "keeping the engine's buffer bucket. The measured count is recorded as "
+        "live_tokens in JSON; entries are keyed by capacity and live tokens, so "
+        "multiple workloads can share one cache file. For sm90_mxfp4, an explicit "
         "value must equal every --max-tokens bucket.",
     )
     parser.add_argument(
@@ -284,18 +313,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(error, file=sys.stderr)
         return 2
 
+    if args.dtype == "sm120_mxfp4_mxfp8":
+        if args.arch != "auto":
+            print("sm120_mxfp4_mxfp8 requires --arch auto", file=sys.stderr)
+            return 2
+        tuner = importlib.import_module(
+            ".backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_tuner", __package__
+        )
+        return tuner.run_tuning(args)
     if args.dtype == "sm90_mxfp4":
         if args.arch not in ("auto", "sm90"):
             print("sm90_mxfp4 requires --arch auto or sm90", file=sys.stderr)
             return 2
         family = "sm90"
         backend = "fp8_mxfp4_bf16_pull_cutedsl"
-    elif args.dtype.startswith("sm90_fp8"):
+    elif args.dtype.startswith("sm90_"):
         if args.arch not in ("auto", "sm90"):
-            print("sm90_fp8_* dtypes require --arch auto or sm90", file=sys.stderr)
+            print("sm90_* dtypes require --arch auto or sm90", file=sys.stderr)
             return 2
         family = "sm90"
-        backend = "fp8_fp8_bf16_pull_cutedsl"
+        backend = (
+            "bf16_bf16_bf16_pull_cutedsl"
+            if args.dtype == "sm90_bf16"
+            else "fp8_fp8_bf16_pull_cutedsl"
+        )
     else:
         family = _resolve_arch(args.arch)
         if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
@@ -314,6 +355,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             backend = "bf16_mxfp8_bf16_cutedsl"
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
+
+    if not args.do_finalize or not args.apply_topk_in_fc1:
+        if family != "sm100" or args.dtype != "nvfp4":
+            print(
+                "caller finalization and routing-weight placement require SM100 NVFP4",
+                file=sys.stderr,
+            )
+            return 2
+        if args.allow_nondeterministic:
+            print(
+                "--allow-nondeterministic requires --do-finalize and FC1 routing weights",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.do_finalize and args.combine_dtype != "bf16":
+            print("--no-do-finalize requires --combine-dtype bf16", file=sys.stderr)
+            return 2
 
     if family != "sm107" and args.combine_dtype != "bf16" and args.dtype != "nvfp4":
         print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)

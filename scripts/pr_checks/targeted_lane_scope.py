@@ -1,7 +1,8 @@
 """Narrow a targeted CI scope to what a lane's bare run covers.
 
 A targeted run on a lane never tests more than that lane's bare run. The A10G and
-T4 bare runs are the fixed shard lists in ``scripts/task_jit_run_tests_part*.sh``,
+T4 bare runs use ``scripts/task_jit_run_tests_part*.sh`` and
+``scripts/task_jit_run_tests_t4.sh``, respectively,
 so their targeted scope is the requested paths intersected with the ``pytest``
 targets of those scripts. Reading the scripts keeps them the single source of
 truth: adding a file to a shard covers it on every bare run and makes it eligible

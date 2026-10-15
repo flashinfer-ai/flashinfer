@@ -39,11 +39,21 @@ def _derive(route):
     """Re-derive one registered ``<kind>:...`` route from the inputs it encodes."""
     kind, *fields = route.split(":")
     if kind == "topk_select":
-        # the query-tiled radix select: a wide grid (the LOSS shape T1024 H8 nvp8192)
-        return backend._topk_route(1024, 8, 8192, 8192)
+        # the 16-query radix select, pre-T9 instance: the k16384 row T2 H8 nvp16381 (total_q 2 < TOPK_Q32_MIN_Q keeps
+        # the 16-query program; its slice -- 1024 at S = 16 under the round-6 plan refit, 2048 at S = 8 under the
+        # round-4 rule -- is above _TOPK_KEQ_MAX_SLEN either way)
+        return backend._topk_route(2, 8, 16381, 16384)
+    if kind == "topk_select_keq":
+        # the radix select's lever T9 instance: the tied t256 row T256 H4 nvp782 (round-6 plan S = 2 / slice 391:
+        # streamed, within (_TOPK_CAND_CAP, _TOPK_KEQ_MAX_SLEN]; its 32-query plan slice 391 < _TOPK_Q32_MIN_SLICE
+        # keeps the 16-query program)
+        return backend._topk_route(256, 4, 782, 8192)
     if kind == "topk_select_streaming":
         # small latency-bound multi-pass grid (the tied T64 H4 nvp782 row): 256 rows, slice 98 > cap 64
         return backend._topk_route(64, 4, 782, 8192)
+    if kind == "topk_select_q32":
+        # the 32-query instance (lever T4): the LOSS shape T1024 H8 nvp8192 (32-query plan S = 1, slice 8192)
+        return backend._topk_route(1024, 8, 8192, 8192)
     if kind == "prefill_union":
         q_dtype, kv_dtype, layout, gqa, variant = fields
         causal = variant != "any"
