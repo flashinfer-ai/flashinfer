@@ -1749,6 +1749,39 @@ def test_trtllm_batch_decode_long_sequence_length(
     )
 
 
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp8", "fp8", "bf16"),
+    ],
+)
+def test_trtllm_batch_decode_wave_aware_split(
+    q_dtype: str, kv_dtype: str, o_dtype: str
+) -> None:
+    # 1.25 waves of (request, KV head) CTAs with long sequences: the launcher splits each
+    # sequence so the last wave is not mostly idle, which launches more multi-CTA KV CTAs than
+    # SMs. Checks the partial-result buffers are laid out for that many CTAs.
+    sm_count = get_device_sm_count(torch.device(GPU_DEVICE))
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        sm_count * 5 // 4,  # batch_size
+        1,  # q_len_per_req
+        64,  # page_size
+        1,  # num_kv_heads
+        4,  # head_grp_size
+        -1,  # window_left
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        None,  # enable_pdl
+        False,  # enable_sink
+        9216,  # max_in_kv_len
+        256,  # head_dim
+    )
+
+
 @parametrize_product(
     {
         "page_size": [128, 256, 512, 1024],

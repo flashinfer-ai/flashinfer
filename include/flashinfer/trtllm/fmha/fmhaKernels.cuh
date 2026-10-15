@@ -84,6 +84,12 @@ class TllmGenFmhaKernel {
   // Max KV splits per CGA cluster, and the per-CTA KV length up to which clamping to it pays off.
   static constexpr int kMaxCgaSmemReductionCtasPerSeqKv = 16;
   static constexpr int kMaxSeqLenKvPerCtaForCgaClamp = 4096;
+  // Wave-aware KV split for grids just past one wave (see computeWaveAwareNumCtasPerSeqKv):
+  // the largest split tried, the minimum KV bytes per sequence for splitting to pay off, and the
+  // minimum gain in wave efficiency (launched CTAs / (waves x SMs)) that justifies the reduction.
+  static constexpr int kMaxWaveAwareCtasPerSeqKv = 5;
+  static constexpr int64_t kMinKvBytesPerSeqForWaveAwareSplit = int64_t{4} << 20;
+  static constexpr double kMinWaveEfficiencyGainForSplit = 0.15;
 
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
@@ -409,8 +415,9 @@ class TllmGenFmhaKernel {
     }
 
     // Prepare the kernel parameters.
-    auto kernelParams = KernelParams::setKernelParams(
-        params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+    auto kernelParams =
+        KernelParams::setKernelParams(params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ,
+                                      ctaLaunchParams.mMaxNumCtasKv, getNumCtas(ctaLaunchParams));
 
     // Override SageAttention parameters.
     auto sageParamEncode = [](int blockSize) -> int32_t {
@@ -469,7 +476,8 @@ class TllmGenFmhaKernel {
         // Rebuild kernelParams: setKernelParams uses kernelMeta (TMA descriptors, tile shapes)
         // which changed when switching from CgaSmemReduction to GmemReduction kernel.
         kernelParams = KernelParams::setKernelParams(
-            params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+            params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv,
+            getNumCtas(ctaLaunchParams));
         buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
         setNonPortableClusterIfNeeded(func, ctaLaunchParams);
       }
@@ -568,6 +576,67 @@ class TllmGenFmhaKernel {
     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
     auto const hashId = hashFromRunnerParams(params, selectKernelParams).first;
     return mKernelMetaMap.find(hashId) != mKernelMetaMap.end();
+  }
+
+  static int64_t getNumCtas(CtaLaunchParams const& ctaLaunchParams) {
+    return int64_t{ctaLaunchParams.mNumCtasX} * ctaLaunchParams.mNumCtasY *
+           ctaLaunchParams.mNumCtasZ;
+  }
+
+  // A decode grid just past one wave (e.g. 256 one-KV-head requests on 212 SMs) runs a second,
+  // mostly idle wave in which each CTA still walks its whole KV sequence. Splitting every sequence
+  // into s CTAs fills the waves better. Returns the s in [2, kMaxWaveAwareCtasPerSeqKv] with the
+  // best wave efficiency, or 1 when the grid is not in that band or splitting is not expected to
+  // pay for the extra reduction. Only applied to the shapes it was measured on: one-token dense
+  // decode with SwapsMmaAb generation kernels.
+  int computeWaveAwareNumCtasPerSeqKv(RunnerParams const& params, KernelMeta const& kernelMeta,
+                                      SelectKernelParams const& selectKernelParams,
+                                      int64_t baseNumCtas, int maxAttentionWindow,
+                                      int maxNumCtasPerSeqKv) const {
+    int64_t const numSms = params.mMultiProcessorCount;
+    // Between one and 1.5 waves; beyond that the last wave is mostly full already.
+    if (baseNumCtas <= numSms || 2 * baseNumCtas >= 3 * numSms) {
+      return 1;
+    }
+    if (params.mMaxSeqLenQ != 1 || isSparseMla(params.mSparseMlaType) ||
+        !isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)) {
+      return 1;
+    }
+    // Short sequences finish too quickly for the extra CTAs and the reduction to pay off.
+    int64_t const kvEltsPerToken =
+        isMlaGenKernel(params) ? params.mHeadDimQk : params.mHeadDimQk + params.mHeadDimV;
+    int64_t const kvBytesPerSeq =
+        int64_t{maxAttentionWindow} * kvEltsPerToken * get_size_in_bits(mDtypeK) / 8;
+    if (kvBytesPerSeq < kMinKvBytesPerSeqForWaveAwareSplit) {
+      return 1;
+    }
+    auto waveEfficiency = [numSms, baseNumCtas](int numCtasPerSeqKv) {
+      int64_t const numCtas = numCtasPerSeqKv * baseNumCtas;
+      return static_cast<double>(numCtas) /
+             static_cast<double>(flashinfer::ceil_div(numCtas, numSms) * numSms);
+    };
+    int bestNumCtasPerSeqKv = 1;
+    double bestEfficiency = waveEfficiency(1);
+    for (int numCtasPerSeqKv = 2;
+         numCtasPerSeqKv <= std::min(kMaxWaveAwareCtasPerSeqKv, maxNumCtasPerSeqKv);
+         ++numCtasPerSeqKv) {
+      // Every CTA's partial O and stats must fit in the multi-CTA scratch buffer.
+      int64_t const numCtas = numCtasPerSeqKv * baseNumCtas;
+      int64_t const scratchBytes =
+          numCtas * kernelMeta.mStepQ *
+          (int64_t{sizeof(float2)} + params.mHeadDimV * int64_t{sizeof(float)});
+      if (scratchBytes > static_cast<int64_t>(params.multiCtasKvScratchSize)) {
+        break;
+      }
+      double const efficiency = waveEfficiency(numCtasPerSeqKv);
+      if (efficiency > bestEfficiency) {
+        bestEfficiency = efficiency;
+        bestNumCtasPerSeqKv = numCtasPerSeqKv;
+      }
+    }
+    return bestEfficiency >= waveEfficiency(1) + kMinWaveEfficiencyGainForSplit
+               ? bestNumCtasPerSeqKv
+               : 1;
   }
 
   // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
@@ -684,6 +753,13 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+      // A grid just past one wave gets no split above; split it so the last wave is not mostly
+      // idle.
+      if (numCtasPerSeqKv == 1) {
+        numCtasPerSeqKv = computeWaveAwareNumCtasPerSeqKv(
+            params, kernelMeta, selectKernelParams, int64_t{numCtasX} * numCtasY * numCtasZ,
+            maxAttentionWindow, tunedMaxNumCtasPerSeqKv);
+      }
       // Clamp >16 splits to 16 so small-batch long-KV decode keeps the CGA reduction.
       // Benchmarked: 16-split CGA beats >16-split GMEM while each CTA walks <= 4096 KV tokens;
       // beyond that, the extra CTAs win.

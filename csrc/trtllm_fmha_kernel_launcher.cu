@@ -367,6 +367,7 @@ void trtllm_paged_attention_launcher(
     // scratch takes the rest of the workspace buffer
     runner_params.multiCtasKvScratchPtr =
         float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
+    runner_params.multiCtasKvScratchSize = float_allocator.remaining_space;
   }
 
   // Params for skipping softmax.
@@ -882,6 +883,7 @@ void trtllm_ragged_attention_launcher(
   // scratch takes the rest of the workspace buffer
   runner_params.multiCtasKvScratchPtr =
       float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
+  runner_params.multiCtasKvScratchSize = float_allocator.remaining_space;
 
   runner_params.mSkipsSoftmaxWhenPossible = skips_softmax;
   runner_params.mSkipSoftmaxThresholdScaleFactor = skip_softmax_threshold_scale_factor;
