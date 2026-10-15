@@ -740,7 +740,7 @@ jobs:
           fi
           echo "$REPORT"
 
-          if echo "$REPORT" | grep -q "skip-all"; then
+          if echo "$REPORT" | grep -qF "⚠️ **skip-all**"; then
             echo "skip_all_found=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip_all_found=false" >> "$GITHUB_OUTPUT"

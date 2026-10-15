@@ -355,6 +355,10 @@ def main() -> int:
     if args.github_actions:
         emit_annotations(audits)
 
+    verified_gaps = [a for a in audits if not a.covered and a.status == "verified"]
+    if verified_gaps:
+        return 1
+
     return 0
 
 
