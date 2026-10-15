@@ -195,8 +195,13 @@ def _reference(q, kv, table, lengths, scale, output_scale, lse_scale):
 
 @pytest.mark.parametrize("heads,q_len", [(96, 2), (96, 4), (96, 8), (128, 4)])
 @pytest.mark.parametrize("branch", ["auto", "preferred", "fallback"])
-@pytest.mark.parametrize("splits,page_size", [(1, 64), (13, 128)])
-def test_native_decode_live_graph(native, heads, q_len, branch, splits, page_size):
+@pytest.mark.parametrize(
+    "splits,page_size,reducer_kind",
+    [(1, 64, "shared"), (13, 128, "shared"), (6, 64, "warp"), (13, 128, "warp")],
+)
+def test_native_decode_live_graph(
+    native, heads, q_len, branch, splits, page_size, reducer_kind
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("full native MTP execution requires SM107")
     import tvm_ffi
@@ -224,6 +229,8 @@ def test_native_decode_live_graph(native, heads, q_len, branch, splits, page_siz
         page_size=page_size,
         splits=splits,
         branch=branch,
+        reducer_kind=reducer_kind,
+        correction=8.0 if reducer_kind == "warp" else 0.0,
         clusters=max(get_max_active_clusters(4), get_max_active_clusters(2) // 2),
     )
     scale, output_scale = 192**-0.5, 0.75
@@ -286,3 +293,15 @@ def test_native_decode_live_graph(native, heads, q_len, branch, splits, page_siz
         scratch.fill_(0x7F)
     graph.replay()
     validate()
+
+
+def test_native_rejects_unknown_reducer(native):
+    with pytest.raises(ValueError, match="native reducer"):
+        native.NativeMtpKernel(
+            heads=96,
+            q_len=4,
+            page_size=64,
+            splits=4,
+            clusters=52,
+            reducer_kind="unknown",
+        )

@@ -16,6 +16,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32
 
 from ..monolithic.mla_reducer import MLAReducer
+from .warp_reducer import WarpMLAReducer
 from .kernel import (
     RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo,
     _MixedFallbackPrep,
@@ -85,8 +86,11 @@ class NativeMtpKernel:
         correction=0.0,
         fp16=False,
         prefetch=8,
+        reducer_kind="shared",
         fallback_arch="sm_107",
     ):
+        if reducer_kind not in ("shared", "warp"):
+            raise ValueError("native reducer must be shared or warp")
         rows, _, _ = native_geometry(heads, q_len, splits=splits)
         capacity = max(4, 1 << (splits - 1).bit_length())
         self.inner = RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo(
@@ -108,16 +112,19 @@ class NativeMtpKernel:
         self.inner.causal_num_heads = heads
         self.inner.causal_seq_len_q = q_len
         self.inner.causal_fold_ratio = 2
-        self.inner.reducer = MLAReducer(
-            acc_dtype=Float32,
-            lse_dtype=Float32,
-            qk_tile_shape=(256, 128),
-            num_heads=heads,
-            seq_len_q=q_len,
-            max_splits=capacity,
-            empty_lse_negative_inf=True,
-            max_prefetch_splits=prefetch,
-        )
+        if reducer_kind == "warp":
+            self.inner.reducer = WarpMLAReducer(capacity)
+        else:
+            self.inner.reducer = MLAReducer(
+                acc_dtype=Float32,
+                lse_dtype=Float32,
+                qk_tile_shape=(256, 128),
+                num_heads=heads,
+                seq_len_q=q_len,
+                max_splits=capacity,
+                empty_lse_negative_inf=True,
+                max_prefetch_splits=prefetch,
+            )
         self.inner._fb = _MixedFallbackPrep(
             Float32,
             Float32,
@@ -199,6 +206,7 @@ def compile_native(
     correction=0.0,
     fp16=False,
     prefetch=8,
+    reducer_kind="shared",
     arch="sm_107a",
 ):
     """Compile a private raw launcher; the caller must validate tensor metadata.
@@ -222,6 +230,7 @@ def compile_native(
         correction=correction,
         fp16=fp16,
         prefetch=prefetch,
+        reducer_kind=reducer_kind,
         fallback_arch="sm_107",
     )
     b, q, h, pages, ps, table_pages = (cute.sym_int() for _ in range(6))
