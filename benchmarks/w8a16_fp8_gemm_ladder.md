@@ -689,6 +689,122 @@ free-clock ncu and 5-round pass), `freeH4_r*.csv` /
 `freeH4_dmon_r*.txt` (the plot grid; also packed as `../freeH4.tgz`), under
 `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
+### Version H6: 21 of 24 at M=88320, the converter's energy floor (Wed 14 Oct 2026)
+
+Goal: every one of the 24 rows at M = 88320 at or under 1.02 of cuBLAS (median, two
+independent runs agreeing) and at or under the cast-copy column.  No dispatcher change
+came out of it; the three rows that miss are explained below.
+
+**Measurement first.**  The 5-round short bursts (`--iters 10-20 --rounds 5`) are not good
+enough at this size: the same row flips between 0.98 and 1.05 between runs (e.g.
+mlp.down tp4 1.016 / 1.048 / 1.050, attn.out tp4 1.091 / 1.051 / 1.009).  Launch bursts of
+10-20 back-to-back kernels alternating with other kernels never settle the power state.
+`--iters 200 --warmup 20 --rounds 3` (the Blackwell recipe) gives two runs that agree
+within 1% on 16 of 24 rows and within 2% on the rest (`h6L_*`).  Every number below uses it.
+The bench also got two fixes for this (commit dcf90de64): kernel columns share one output
+buffer (16 columns at M = 88320 ran out of memory), and `--rounds` rotates the column list
+by an even share per round, so every column visits the front, middle and back.
+
+**The 24 rows, auto vs cuBLAS / cast, two runs** (`h6L_p{1,2}_r88320.csv`):
+
+| row | auto / cuBLAS | cast / cuBLAS |
+|---|---|---|
+| und.q tp1 | 1.013 / 1.014 | 1.026 / 1.027 |
+| und.kv tp1 | 0.998 / 1.006 | 1.006 / 1.011 |
+| gen.qkv tp1 | 1.001 / 1.000 | 1.017 / 1.017 |
+| attn.out tp1 | **1.019 / 1.030** | 1.016 / 1.026 |
+| mlp.gate_up tp1 | 1.021 / 1.010 | 1.025 / 1.017 |
+| mlp.down tp1 | 0.992 / 0.995 | 1.016 / 1.015 |
+| und.q tp2 | 0.987 / 0.994 | 1.027 / 1.026 |
+| und.kv tp2 | 0.967 / 0.978 | 1.010 / 0.987 |
+| gen.qkv tp2 | 0.999 / 0.998 | 1.027 / 1.027 |
+| attn.out tp2 | 1.002 / 0.994 | 1.016 / 1.017 |
+| mlp.gate_up tp2 | 1.036 / 1.016 | 1.027 / 1.023 |
+| mlp.down tp2 | 1.003 / 0.997 | 1.027 / 1.024 |
+| und.q tp4 | 1.009 / 1.028 | 1.016 / 1.034 |
+| und.kv tp4 | 0.981 / 0.979 | 1.018 / 1.007 |
+| gen.qkv tp4 | 1.007 / 1.013 | 1.014 / 1.021 |
+| attn.out tp4 | 1.000 / 1.001 | 1.024 / 1.023 |
+| mlp.gate_up tp4 | 1.003 / 1.004 | 1.016 / 1.016 |
+| mlp.down tp4 | **1.031 / 1.030** | 1.027 / 1.026 |
+| und.q tp8 | 1.008 / 1.009 | 1.002 / 1.029 |
+| und.kv tp8 | 1.003 / 1.003 | 1.041 / 1.042 |
+| gen.qkv tp8 | 1.039 / 1.030 | 0.989 / 0.994 |
+| attn.out tp8 | **1.036 / 1.017** | 1.039 / 0.999 |
+| mlp.gate_up tp8 | 0.994 / 1.005 | 1.016 / 1.026 |
+| mlp.down tp8 | 1.012 / 0.992 | 1.026 / 1.015 |
+
+The rows over the bar in either run were re-measured with every variant in the same rounds
+(auto, hand, 128x256 stream-K, 128x256 at G = 1 / 2 / 4, 64x256, 128x192 at G = 1 / 2; long
+recipe, two passes, `h6o_*`):
+
+| row | auto | best other variant | cast | verdict |
+|---|---|---|---|---|
+| mlp.down tp4 (K=6400) | 1.031 / 1.030 | all variants 1.030-1.040 | 1.023 / 1.027 | **fails, nothing helps** |
+| attn.out tp1 (K=8192) | 1.025 / 1.029 | 128x256 G=2 / G=1 1.024 / 1.028 | 1.022 / 1.026 | **fails by 0.5-1%, at cast** |
+| attn.out tp8 (K=1024) | 1.037 / 1.031 | 128x256 G=4 1.002 / 1.039, 128x192 G=2 1.010 / 1.039 | 1.014 / 1.024 | **fails, no variant wins both passes** |
+| gen.qkv tp8 | 1.018 / 1.019 | hand 1.013 / 1.002 | 1.020 / 1.013 | passes |
+| mlp.gate_up tp2 | 1.018 / 1.013 | hand 1.017 / 1.012 | 1.027 / 1.022 | passes |
+| und.q tp4 | 0.998 / 0.988 | 128x256 G=1 0.996 / 0.997 | 1.014 / 1.004 | passes |
+| mlp.gate_up tp1 | 1.018 / 1.009 | hand 1.015 / 1.011 | 1.025 / 1.014 | passes |
+
+So 21 of 24 rows pass; mlp.down tp4, attn.out tp1 and attn.out tp8 sit at 1.025-1.035.
+
+**Why: cycles are fine, the clock is not.**  ncu on our kernel and the cuBLAS kernel at M =
+88320, once at locked base clock and once free-running (`--clock-control none`), counters
+only (`h6n_*`).  Ratios ours / cuBLAS:
+
+| row | locked: time / cycles | free-running: time / cycles / SM clock | DRAM bytes | instructions | issue slots busy (ours / cuBLAS) |
+|---|---|---|---|---|---|
+| mlp.down tp4 | 0.995 / 0.997 | 1.008 / 0.991 / **0.980** | 0.64 | 1.73 | 27.7 / 15.8% |
+| attn.out tp1 | 0.988 / 0.997 | 1.008 / 0.989 / **0.980** | 0.62 | 1.73 | 27.6 / 15.7% |
+| attn.out tp8 | 0.974 / 0.977 | 1.018 / 0.974 / **0.955** | 0.50 | 1.82 | 30.6 / 16.3% |
+| und.q tp2 (passes) | 0.977 / 0.986 | 0.964 / 0.980 / 1.016 | 0.49 | 1.71 | 27.7 / 15.9% |
+| mlp.down tp1 (passes) | 0.982 / 0.990 | 0.980 / 0.991 / 1.012 | 0.73 | 1.72 | 27.5 / 15.8% |
+
+Our kernel takes 1-3% fewer cycles than cuBLAS on every row and is faster on all of them at
+locked clocks.  At free-running clocks the failing rows lose 2-4.5% of SM clock, although
+we read 36-50% fewer DRAM bytes.  So it is not memory energy (the Blackwell B15 effect); it
+is compute energy.  The in-register fp8 -> bf16 conversion (two prmt, two shift-and-mask,
+two bf16x2 multiplies per four weights) makes us issue 1.7-1.8x cuBLAS's instructions, and
+under the 700 W cap that ALU and register-file power is paid in clock.  The same split
+(fewer cycles, lower clock, many more instructions) is what the Blackwell branch measures
+on its three remaining rows.  Rows where we pass are the ones where the tile choice gains
+more cycles than the conversion costs in clock.
+
+**What was rejected:**
+* A shared-memory conversion stage: same number of conversions, plus smem traffic.  It does
+  not reduce the energy per flop.
+* Dropping the bf16x2 multiply in the converter by folding 2^120 into the epilogue scale.
+  That scales every product by 2^-120 before the fp32 accumulate; any act x w below 2^-6
+  becomes an fp32 denormal inside the MMA, which the tensor cores flush to zero.  With
+  weights ~0.02 and activations ~1 that is a large share of the terms.  The every-fp8-value
+  test would not catch it (identity activation, products = weights).
+* Per-row dispatcher picks: none wins on both passes on the three failing rows.
+
+**fp16 as a probe of the converter cost.**  fp16 activations use the native
+`cvt.rn.f16x2.e4m3x2` (one instruction per two weights instead of three).  Long recipe, two
+passes, ratio to the cuBLAS of the same dtype (`h6f16_*`):
+
+| row | bf16 auto / cuBLAS | fp16 auto / cuBLAS | ours fp16 / bf16 (time) | cuBLAS fp16 / bf16 (time) |
+|---|---|---|---|---|
+| mlp.down tp4 | 1.030 / 1.029 | 0.968 / 0.964 | 1.001 | 1.067 |
+| attn.out tp1 | 1.030 / 1.029 | 0.997 / 0.997 | 1.001 | 1.033 |
+| attn.out tp8 | 1.033 / 1.051 | 0.995 / 0.976 | 0.985 | 1.041 |
+| und.q tp2 | 0.986 / 0.986 | 0.951 / 0.944 | 1.006 | 1.047 |
+
+The fp16 ratios pass, but not because our kernel got faster: our time is the same in both
+dtypes (+-1.5%), and it is cuBLAS that is 3-7% slower in fp16 than in bf16.  ncu on
+mlp.down tp4 (free-running): the instruction ratio falls from 1.73 to 1.16 with the native
+convert and our clock rises from 0.980 to 1.025 of cuBLAS's.  But part of that is cuBLAS's own
+clock dropping in fp16 (1.583 -> 1.507 GHz, ours 1.551 -> 1.544 GHz).  So a cheaper bf16
+converter would not, on this evidence, be worth the full 3%; the fp16 run bounds the gain at
+"our clock stops being the lowest", which here means about 1-2%.  Not pursued.
+
+Results: `h6s_*`, `h6s2_*` (short-burst sweeps, superseded), `h6L_*` (24 rows, long recipe),
+`h6o_*` (variants on the offender rows), `h6n_*` (locked vs free-running ncu), `h6f16_*` (the
+fp16 probe), under `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
