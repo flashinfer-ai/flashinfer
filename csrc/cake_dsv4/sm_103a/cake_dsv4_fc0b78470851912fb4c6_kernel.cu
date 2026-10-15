@@ -90,7 +90,7 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_3b2807f9cb6acd058bdf(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_fc0b78470851912fb4c6(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -166,6 +166,48 @@ kernel_cake_dsv4_3b2807f9cb6acd058bdf(const __grid_constant__ CUtensorMap tmap_q
     const int smem_swa_window_addr = smem + SMEM_SMEM_SWA_WINDOW_OFF;
     uint8_t* smem_p_fp8 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_P_FP8_OFF);
     const int smem_p_fp8_addr = smem + SMEM_SMEM_P_FP8_OFF;
+    int k1_pre_rows[4];
+    #pragma unroll
+    for (int k1_pre_row_i = 0; k1_pre_row_i < 4; k1_pre_row_i++) {
+        k1_pre_rows[k1_pre_row_i] = -1;
+    }
+    if (warp >= 9 && warp <= 12 && bid < total_work_items) {
+        int k1_pre_load_warp_rank = warp - 9;
+        int k1_pre_query_idx = bid >> 1;
+        int k1_pre_all_num_kv_tiles = (sparse_topk + 128 - 1) / 128;
+        int k1_pre_sparse_extent = k1_pre_all_num_kv_tiles * 128;
+        int k1_pre_num_index_passes = k1_pre_sparse_extent / 128;
+        if (k1_pre_load_warp_rank < k1_pre_num_index_passes) {
+            int k1_pre_tile_col_base = k1_pre_load_warp_rank * 128;
+            int* k1_pre_row_tile_ptr = ((k1_pre_tile_col_base < 128) ? (swa_indices + (k1_pre_query_idx * swa_index_stride)) : (compressed_indices + (k1_pre_query_idx * compressed_index_stride + (k1_pre_tile_col_base - 128))));
+            int k1_pre_lane_col = k1_pre_tile_col_base + lane * 4;
+            int k1_pre_row_stride = ((k1_pre_tile_col_base < 128) ? swa_index_stride : compressed_index_stride);
+            int k1_pre_row_vec_misaligned = k1_pre_query_idx * k1_pre_row_stride & 3;
+            if (k1_pre_lane_col + 4 <= sparse_topk && k1_pre_row_vec_misaligned == 0) {
+                int _vec_load_0[4];
+                {
+                    const int4* _ivptr_0 = reinterpret_cast<const int4*>(k1_pre_row_tile_ptr + (lane * 4) + 0);
+                    int4 _ivld_0;
+                    _ivld_0 = *_ivptr_0;
+                    _vec_load_0[0 + 0] = _ivld_0.x;
+                    _vec_load_0[0 + 1] = _ivld_0.y;
+                    _vec_load_0[0 + 2] = _ivld_0.z;
+                    _vec_load_0[0 + 3] = _ivld_0.w;
+                }
+                #pragma unroll
+                for (int k1_pre_row_i_1 = 0; k1_pre_row_i_1 < 4; k1_pre_row_i_1++) {
+                    k1_pre_rows[k1_pre_row_i_1] = _vec_load_0[k1_pre_row_i_1];
+                }
+            } else {
+                #pragma unroll
+                for (int k1_pre_row_i_2 = 0; k1_pre_row_i_2 < 4; k1_pre_row_i_2++) {
+                    if (k1_pre_lane_col + k1_pre_row_i_2 < sparse_topk) {
+                        k1_pre_rows[k1_pre_row_i_2] = k1_pre_row_tile_ptr[lane * 4 + k1_pre_row_i_2];
+                    }
+                }
+            }
+        }
+    }
 
     // Mbarrier init (25 pipeline groups, 0 ordered-sequence groups, 53 barriers)
     // Mbarriers at smem_raw[0..424)
@@ -261,7 +303,18 @@ kernel_cake_dsv4_3b2807f9cb6acd058bdf(const __grid_constant__ CUtensorMap tmap_q
         }
     }
 
-    __syncwarp();
+    __syncthreads();
+
+    // Kernel pre-TMEM ops
+    if (warp == 9 && bid < total_work_items) {
+        if (elect_sync()) {
+            mbarrier_arrive_expect_tx(q_full_addr, 65536);
+            #pragma unroll
+            for (int q_stage = 0; q_stage < 4; q_stage++) {
+                tma_4d_gmem2smem(smem_q_addr + (unsigned int)(q_stage * 16384), (&tmap_q), 0, 0, q_stage, bid >> 1, q_full_addr);
+            }
+        }
+    }
 
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 424);
@@ -329,19 +382,23 @@ kernel_cake_dsv4_3b2807f9cb6acd058bdf(const __grid_constant__ CUtensorMap tmap_q
                 int sparse_extent = num_kv_tiles * 128;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
-                if (load_warp_rank == 0) {
+                if (load_warp_rank == 0 && work_idx_1 != (unsigned int)bid) {
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(q_full_addr, 65536);
                         #pragma unroll
-                        for (int q_stage = 0; q_stage < 4; q_stage++) {
-                            tma_4d_gmem2smem(smem_q_addr + (unsigned int)(q_stage * 16384), (&tmap_q), 0, 0, q_stage, query_idx, q_full_addr);
+                        for (int q_stage_1 = 0; q_stage_1 < 4; q_stage_1++) {
+                            tma_4d_gmem2smem(smem_q_addr + (unsigned int)(q_stage_1 * 16384), (&tmap_q), 0, 0, q_stage_1, query_idx, q_full_addr);
                         }
                     }
                 }
                 {
                     int num_index_passes = sparse_extent / 128;
+                    if (work_idx_1 == (unsigned int)bid && load_warp_rank < num_index_passes) {
+                        int k1_pre_index_offset = load_warp_rank * 128 + lane * 4;
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_sparse_indices_addr + (unsigned int)(k1_pre_index_offset * 4)), "r"(k1_pre_rows[0]), "r"(k1_pre_rows[1]), "r"(k1_pre_rows[2]), "r"(k1_pre_rows[3]) : "memory");
+                    }
                     #pragma unroll 1
-                    for (int index_pass = load_warp_rank; index_pass < num_index_passes; index_pass += 4) {
+                    for (int index_pass = ((work_idx_1 == (unsigned int)bid) ? load_warp_rank + 4 : load_warp_rank); index_pass < num_index_passes; index_pass += 4) {
                         int index_offset = index_pass * 128 + lane * 4;
                         int tile_col_base = (first_tile + index_pass) * 128;
                         int* row_tile_ptr = ((tile_col_base < 128) ? (swa_indices + (query_idx * swa_index_stride)) : (compressed_indices + (query_idx * compressed_index_stride + (tile_col_base - 128))));
@@ -354,19 +411,19 @@ kernel_cake_dsv4_3b2807f9cb6acd058bdf(const __grid_constant__ CUtensorMap tmap_q
                         int row_stride = ((tile_col_base < 128) ? swa_index_stride : compressed_index_stride);
                         int row_vec_misaligned = query_idx * row_stride & 3;
                         if (lane_col + 4 <= sparse_topk && row_vec_misaligned == 0) {
-                            int _vec_load_0[4];
+                            int _vec_load_1[4];
                             {
                                 const int4* _ivptr_0 = reinterpret_cast<const int4*>(row_tile_ptr + (lane * 4) + 0);
                                 int4 _ivld_0;
                                 _ivld_0 = *_ivptr_0;
-                                _vec_load_0[0 + 0] = _ivld_0.x;
-                                _vec_load_0[0 + 1] = _ivld_0.y;
-                                _vec_load_0[0 + 2] = _ivld_0.z;
-                                _vec_load_0[0 + 3] = _ivld_0.w;
+                                _vec_load_1[0 + 0] = _ivld_0.x;
+                                _vec_load_1[0 + 1] = _ivld_0.y;
+                                _vec_load_1[0 + 2] = _ivld_0.z;
+                                _vec_load_1[0 + 3] = _ivld_0.w;
                             }
                             #pragma unroll
                             for (int row_i_1 = 0; row_i_1 < 4; row_i_1++) {
-                                sparse_rows[row_i_1] = _vec_load_0[row_i_1];
+                                sparse_rows[row_i_1] = _vec_load_1[row_i_1];
                             }
                         } else {
                             #pragma unroll

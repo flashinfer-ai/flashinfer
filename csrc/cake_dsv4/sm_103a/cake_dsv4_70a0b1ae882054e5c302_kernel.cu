@@ -84,13 +84,13 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_TOTAL 147072
-#define THREADS 640
+#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int ragged_query, int max_q_len, int batch_size, int has_sinks, int num_query_tokens)
+kernel_cake_dsv4_70a0b1ae882054e5c302(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int ragged_query, int max_q_len, int batch_size, int has_sinks, int num_query_tokens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -163,96 +163,57 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
     // Mbarriers at smem_raw[0..416)
 
     if (warp == 0) {
-        uint32_t leader = elect_sync();
-        if (leader) {
-            // --- pipeline 'q_pipe' ---
-            // q_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 0, 1);
-            // q_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 8, 1);
-            // --- pipeline 'kv_pipe' ---
-            // kv_full: 8 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
-            mbarrier_init(smem + 32, 1);
-            mbarrier_init(smem + 40, 1);
-            mbarrier_init(smem + 48, 1);
-            mbarrier_init(smem + 56, 1);
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
-            // kv_empty: 8 barriers, init_count=1
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
-            // --- pipeline 'page_pipe' ---
-            // page_full: 6 barriers, init_count=32
-            mbarrier_init(smem + 144, 32);
-            mbarrier_init(smem + 152, 32);
-            mbarrier_init(smem + 160, 32);
-            mbarrier_init(smem + 168, 32);
-            mbarrier_init(smem + 176, 32);
-            mbarrier_init(smem + 184, 32);
-            // page_empty: 6 barriers, init_count=256
-            mbarrier_init(smem + 192, 256);
-            mbarrier_init(smem + 200, 256);
-            mbarrier_init(smem + 208, 256);
-            mbarrier_init(smem + 216, 256);
-            mbarrier_init(smem + 224, 256);
-            mbarrier_init(smem + 232, 256);
-            // --- pipeline 'score_pipe' ---
-            // score_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 240, 1);
-            mbarrier_init(smem + 248, 1);
-            // score_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 256, 128);
-            mbarrier_init(smem + 264, 128);
-            // --- pipeline 'stats_pipe' ---
-            // stats_full: 2 barriers, init_count=128
-            mbarrier_init(smem + 272, 128);
-            mbarrier_init(smem + 280, 128);
-            // stats_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 288, 128);
-            mbarrier_init(smem + 296, 128);
-            // --- pipeline 'p_pipe' ---
-            // p_full: 2 barriers, init_count=128
-            mbarrier_init(smem + 304, 128);
-            mbarrier_init(smem + 312, 128);
-            // p_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 320, 1);
-            mbarrier_init(smem + 328, 1);
-            // --- pipeline 'o_pipe' ---
-            // o_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 336, 1);
-            // o_empty: 1 barriers, init_count=128
-            mbarrier_init(smem + 344, 128);
-            // --- pipeline 'work_pipe' ---
-            // work_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 352, 1);
-            mbarrier_init(smem + 360, 1);
-            // work_empty: 2 barriers, init_count=640
-            mbarrier_init(smem + 368, 640);
-            mbarrier_init(smem + 376, 640);
-            // --- pipeline 'throttle_pipe' ---
-            // throttle_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 384, 256);
-            mbarrier_init(smem + 392, 256);
-            // throttle_empty: 2 barriers, init_count=32
-            mbarrier_init(smem + 400, 32);
-            mbarrier_init(smem + 408, 32);
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        // --- pipeline 'q_pipe' ---
+        // q_full: 1 barriers, init_count=1
+        // q_empty: 1 barriers, init_count=1
+        // --- pipeline 'kv_pipe' ---
+        // kv_full: 8 barriers, init_count=1
+        // kv_empty: 8 barriers, init_count=1
+        // --- pipeline 'page_pipe' ---
+        // page_full: 6 barriers, init_count=32
+        // page_empty: 6 barriers, init_count=128
+        // --- pipeline 'score_pipe' ---
+        // score_full: 2 barriers, init_count=1
+        // score_empty: 2 barriers, init_count=128
+        // --- pipeline 'stats_pipe' ---
+        // stats_full: 2 barriers, init_count=128
+        // stats_empty: 2 barriers, init_count=128
+        // --- pipeline 'p_pipe' ---
+        // p_full: 2 barriers, init_count=128
+        // p_empty: 2 barriers, init_count=1
+        // --- pipeline 'o_pipe' ---
+        // o_full: 1 barriers, init_count=1
+        // o_empty: 1 barriers, init_count=128
+        // --- pipeline 'work_pipe' ---
+        // work_full: 2 barriers, init_count=1
+        // work_empty: 2 barriers, init_count=512
+        // --- pipeline 'throttle_pipe' ---
+        // throttle_full: 2 barriers, init_count=128
+        // throttle_empty: 2 barriers, init_count=32
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 1;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(30), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(24), "r"((uint32_t)(32)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(18), "r"((uint32_t)(1)));
+        mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
+        uint32_t _mbarrier_init_count_0_32 = 32;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(18), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(16), "r"((uint32_t)(512)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(14), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(12), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(11), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(8), "r"((uint32_t)(128)));
+        if (lane < 20) {
+            mbarrier_init(smem + 256 + lane * 8, _mbarrier_init_count_0_32);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 416);
-    if (warp == 0) {
+    if (warp == 8) {
         int _tmem_hold = smem + 416;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
@@ -268,9 +229,9 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
     const int tmem_source_exact_scratch = taddr;
 
     // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
+    // Inc phase consumes the registers released above.
     if (warp >= 8 && warp <= 11) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 136;");
     }
 
     // ---- Role: softmax ----
@@ -304,8 +265,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                 int tile_neg = 0;
                 if (work_x < (unsigned int)q_len) {
                     int _max_4 = ((sparse_topk_lens[query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx] + sparse_topk_lens_offset) : (0));
-                    int _min_7 = ((_max_4) < (sparse_topk) ? (_max_4) : (sparse_topk));
-                    active_topk = _min_7;
+                    int _min_8 = ((_max_4) < (sparse_topk) ? (_max_4) : (sparse_topk));
+                    active_topk = _min_8;
                     int query_batch = query_idx / max_q_len;
                     int query_offset = query_idx - query_batch * max_q_len;
                     int query_length = max_q_len;
@@ -314,8 +275,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                         #pragma unroll 2
                         for (int chunk = 0; chunk < (batch_size + 31) / 32; chunk++) {
                             int lane_entry = chunk * 32 + lane + 1;
-                            int _min_8 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
-                            int lane_load = _min_8;
+                            int _min_9 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
+                            int lane_load = _min_9;
                             unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, lane_entry <= batch_size && query_idx >= cum_seq_lens_q[lane_load]);
                             unsigned int started = _vote_0;
                             int _popc_0 = __popc(started);
@@ -333,8 +294,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                         visible = 128;
                     }
                     int swa_visible = visible;
-                    int _min_9 = ((active_topk) < (swa_visible) ? (active_topk) : (swa_visible));
-                    tile0_limit = _min_9;
+                    int _min_10 = ((active_topk) < (swa_visible) ? (active_topk) : (swa_visible));
+                    tile0_limit = _min_10;
                     int swa_slot[4];
                     #pragma unroll
                     for (int slot = 0; slot < 4; slot++) {
@@ -739,8 +700,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                 int active_topk_1 = 0;
                 if (work_x_1 < (unsigned int)q_len_1) {
                     int _max_14 = ((sparse_topk_lens[query_idx_1] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_1] + sparse_topk_lens_offset) : (0));
-                    int _min_10 = ((_max_14) < (sparse_topk) ? (_max_14) : (sparse_topk));
-                    active_topk_1 = _min_10;
+                    int _min_11 = ((_max_14) < (sparse_topk) ? (_max_14) : (sparse_topk));
+                    active_topk_1 = _min_11;
                 }
                 int num_steps_1 = (active_topk_1 + 128 - 1) / 128;
                 if (work_x_1 < (unsigned int)q_len_1) {
@@ -1008,8 +969,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                 int active_topk_2 = 0;
                 if (work_x_2 < (unsigned int)q_len_2) {
                     int _max_3 = ((sparse_topk_lens[query_idx_2] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_2] + sparse_topk_lens_offset) : (0));
-                    int _min_6 = ((_max_3) < (sparse_topk) ? (_max_3) : (sparse_topk));
-                    active_topk_2 = _min_6;
+                    int _min_7 = ((_max_3) < (sparse_topk) ? (_max_3) : (sparse_topk));
+                    active_topk_2 = _min_7;
                 }
                 int num_steps_2 = (active_topk_2 + 128 - 1) / 128;
                 if (work_x_2 < (unsigned int)q_len_2) {
@@ -1312,6 +1273,17 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_work_full_3 = 0;
             #pragma unroll 1
             for (unsigned int _work_3 = 0; _work_3 < 120; _work_3++) {
+                #pragma unroll
+                for (int h6_half = 0; h6_half < 2; h6_half++) {
+                    int h6_cand = lane / 4 + h6_half * 8;
+                    int _min_0 = ((h6_cand) < (num_query_tokens - 1) ? (h6_cand) : (num_query_tokens - 1));
+                    int h6_row = _min_0;
+                    int h6_col = lane % 4 * 32;
+                    int* h6_swa = swa_indices + (h6_row * swa_index_stride + h6_col);
+                    int* h6_cmp = compressed_indices + (h6_row * compressed_index_stride + h6_col);
+                    if (h6_cand < 15) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(h6_swa))); }
+                    if (h6_cand < 15 && 128 + h6_col < sparse_topk) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(h6_cmp))); }
+                }
                 int q_begin_3 = cum_seq_lens_q[work_z_3];
                 int q_end_3 = cum_seq_lens_q[work_z_3 + 1];
                 int q_len_3 = q_end_3 - q_begin_3;
@@ -1351,8 +1323,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                         if (pf_col < sparse_topk) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(pf_src))); }
                     }
                     int _max_0 = ((sparse_topk_lens[query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_3] + sparse_topk_lens_offset) : (0));
-                    int _min_0 = ((_max_0) < (sparse_topk) ? (_max_0) : (sparse_topk));
-                    active_topk_3 = _min_0;
+                    int _min_1 = ((_max_0) < (sparse_topk) ? (_max_0) : (sparse_topk));
+                    active_topk_3 = _min_1;
                 }
                 int num_steps_3 = (active_topk_3 + 128 - 1) / 128;
                 if (work_x_3 < (unsigned int)q_len_3) {
@@ -1420,9 +1392,10 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                             :: "r"(smem_page_offsets_addr + page_stage * 1024 + (unsigned int)((128 + lane_base) * 4)), "l"(src1));
                         asm volatile(
                             "{\n\t"
-                            "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
+                            "cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n\t"
                             "}"
                             :: "r"(page_full_addr + (page_stage) * 8) : "memory");
+                        mbarrier_arrive(page_full_addr + (page_stage) * 8);
                         page_stage += 1;
                         if (page_stage == 6) { page_stage = 0; page_phase ^= 1; }
                     }
@@ -1671,8 +1644,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
         }
     }
     // ---- Role: loader ----
-    if (warp >= 12 && warp <= 19) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 72;");
+    if (warp >= 12 && warp <= 15) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // loader_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
             const int load_rank = warp - 12;
@@ -1700,8 +1673,8 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                 int active_topk_4 = 0;
                 if (work_x_5 < (unsigned int)q_len_4) {
                     int _max_2 = ((sparse_topk_lens[query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_4] + sparse_topk_lens_offset) : (0));
-                    int _min_1 = ((_max_2) < (sparse_topk) ? (_max_2) : (sparse_topk));
-                    active_topk_4 = _min_1;
+                    int _min_2 = ((_max_2) < (sparse_topk) ? (_max_2) : (sparse_topk));
+                    active_topk_4 = _min_2;
                 }
                 int num_steps_4 = (active_topk_4 + 128 - 1) / 128;
                 if (work_x_5 < (unsigned int)q_len_4) {
@@ -1729,12 +1702,12 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                     mbarrier_wait(page_full_addr + (page_k_stage) * 8, page_k_phase);
                     int page_base = 0;
                     int warps_tile_idx = 0;
-                    int _min_2 = ((active_topk_4) < (128) ? (active_topk_4) : (128));
-                    int warps_valid_rows = _min_2;
-                    int _min_3 = (((warps_valid_rows + 3) / 4) < (8) ? ((warps_valid_rows + 3) / 4) : (8));
-                    int warps_tile = _min_3;
-                    int warps_ge1 = 8;
-                    int warps_ge2 = 8;
+                    int _min_3 = ((active_topk_4) < (128) ? (active_topk_4) : (128));
+                    int warps_valid_rows = _min_3;
+                    int _min_4 = (((warps_valid_rows + 3) / 4) < (4) ? ((warps_valid_rows + 3) / 4) : (4));
+                    int warps_tile = _min_4;
+                    int warps_ge1 = 4;
+                    int warps_ge2 = 4;
                     if (warps_tile_idx >= 1) {
                         warps_ge1 = warps_tile;
                     }
@@ -1747,23 +1720,23 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                         mbarrier_wait(kv_empty_addr + (kv_stage_1) * 8, kv_phase_1);
                         if (load_rank == 0) {
                             if (elect_sync()) {
-                                mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, ((hs_3 >= 4) ? warps_ge1 : warps_ge2) * 2048);
+                                mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, ((hs_3 >= 4) ? warps_ge1 : warps_ge2) * 4096);
                             }
                         }
-                        asm volatile("barrier.sync 9, 256;" ::: "memory");
+                        asm volatile("barrier.sync 9, 128;" ::: "memory");
                         if (load_rank < ((hs_3 >= 4) ? warps_ge1 : warps_ge2)) {
-                            int rows_all[16];
+                            int rows_all[32];
                             #pragma unroll
-                            for (int group = 0; group < 4; group++) {
+                            for (int group = 0; group < 8; group++) {
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&rows_all[group * 4])), "=r"(*reinterpret_cast<uint32_t*>(&rows_all[(group * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rows_all[(group * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rows_all[(group * 4) + 3]))
-                                    : "r"(smem_page_offsets_addr + page_k_stage * 1024 + (unsigned int)((page_base + load_rank * 4 + group * 32) * 4)));
+                                    : "r"(smem_page_offsets_addr + page_k_stage * 1024 + (unsigned int)((page_base + load_rank * 4 + group * 16) * 4)));
                             }
                             if (elect_sync()) {
                                 {
                                     #pragma unroll
-                                    for (int group_1 = 0; group_1 < 4; group_1++) {
-                                        const int row_base = load_rank * 4 + group_1 * 32;
+                                    for (int group_1 = 0; group_1 < 8; group_1++) {
+                                        const int row_base = load_rank * 4 + group_1 * 16;
                                         int dst_k = smem_kv_addr + kv_stage_1 * 16384 + (unsigned int)(row_base * 128);
                                         tma_gather4_gmem2smem(dst_k, (&tmap_swa_kv), hs_sel_2 * 128, rows_all[group_1 * 4], rows_all[group_1 * 4 + 1], rows_all[group_1 * 4 + 2], rows_all[group_1 * 4 + 3], kv_full_addr + (kv_stage_1) * 8);
                                     }
@@ -1781,12 +1754,12 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                         }
                         int page_base_0 = (next_tile & 1) * 128;
                         int warps_tile_idx_1 = next_tile;
-                        int _min_4 = ((active_topk_4 - next_tile * 128) < (128) ? (active_topk_4 - next_tile * 128) : (128));
-                        int warps_valid_rows_2 = _min_4;
-                        int _min_5 = (((warps_valid_rows_2 + 3) / 4) < (8) ? ((warps_valid_rows_2 + 3) / 4) : (8));
-                        int warps_tile_3 = _min_5;
-                        int warps_ge1_4 = 8;
-                        int warps_ge2_5 = 8;
+                        int _min_5 = ((active_topk_4 - next_tile * 128) < (128) ? (active_topk_4 - next_tile * 128) : (128));
+                        int warps_valid_rows_2 = _min_5;
+                        int _min_6 = (((warps_valid_rows_2 + 3) / 4) < (4) ? ((warps_valid_rows_2 + 3) / 4) : (4));
+                        int warps_tile_3 = _min_6;
+                        int warps_ge1_4 = 4;
+                        int warps_ge2_5 = 4;
                         if (warps_tile_idx_1 >= 1) {
                             warps_ge1_4 = warps_tile_3;
                         }
@@ -1799,30 +1772,30 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
                             mbarrier_wait(kv_empty_addr + (kv_stage_1) * 8, kv_phase_1);
                             if (load_rank == 0) {
                                 if (elect_sync()) {
-                                    mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, ((hs_4 >= 4) ? warps_ge1_4 : warps_ge2_5) * 2048);
+                                    mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, ((hs_4 >= 4) ? warps_ge1_4 : warps_ge2_5) * 4096);
                                 }
                             }
-                            asm volatile("barrier.sync 9, 256;" ::: "memory");
+                            asm volatile("barrier.sync 9, 128;" ::: "memory");
                             if (load_rank < ((hs_4 >= 4) ? warps_ge1_4 : warps_ge2_5)) {
-                                int rows_all_1[16];
+                                int rows_all_1[32];
                                 #pragma unroll
-                                for (int group_2 = 0; group_2 < 4; group_2++) {
+                                for (int group_2 = 0; group_2 < 8; group_2++) {
                                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                         : "=r"(*reinterpret_cast<uint32_t*>(&rows_all_1[group_2 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&rows_all_1[(group_2 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rows_all_1[(group_2 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rows_all_1[(group_2 * 4) + 3]))
-                                        : "r"(smem_page_offsets_addr + page_k_stage * 1024 + (unsigned int)((page_base_0 + load_rank * 4 + group_2 * 32) * 4)));
+                                        : "r"(smem_page_offsets_addr + page_k_stage * 1024 + (unsigned int)((page_base_0 + load_rank * 4 + group_2 * 16) * 4)));
                                 }
                                 if (elect_sync()) {
                                     if (next_tile == 0) {
                                         #pragma unroll
-                                        for (int group_3 = 0; group_3 < 4; group_3++) {
-                                            const int row_base_1 = load_rank * 4 + group_3 * 32;
+                                        for (int group_3 = 0; group_3 < 8; group_3++) {
+                                            const int row_base_1 = load_rank * 4 + group_3 * 16;
                                             int dst_k_1 = smem_kv_addr + kv_stage_1 * 16384 + (unsigned int)(row_base_1 * 128);
                                             tma_gather4_gmem2smem(dst_k_1, (&tmap_swa_kv), hs_sel_3 * 128, rows_all_1[group_3 * 4], rows_all_1[group_3 * 4 + 1], rows_all_1[group_3 * 4 + 2], rows_all_1[group_3 * 4 + 3], kv_full_addr + (kv_stage_1) * 8);
                                         }
                                     } else {
                                         #pragma unroll
-                                        for (int group_4 = 0; group_4 < 4; group_4++) {
-                                            const int row_base_2 = load_rank * 4 + group_4 * 32;
+                                        for (int group_4 = 0; group_4 < 8; group_4++) {
+                                            const int row_base_2 = load_rank * 4 + group_4 * 16;
                                             int dst_k_2 = smem_kv_addr + kv_stage_1 * 16384 + (unsigned int)(row_base_2 * 128);
                                             tma_gather4_gmem2smem(dst_k_2, (&tmap_compressed_kv), hs_sel_3 * 128, rows_all_1[group_4 * 4], rows_all_1[group_4 * 4 + 1], rows_all_1[group_4 * 4 + 2], rows_all_1[group_4 * 4 + 3], kv_full_addr + (kv_stage_1) * 8);
                                         }
