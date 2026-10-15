@@ -71,6 +71,21 @@ class MoeRunnerInputs:
     def to_list(self) -> List[Optional[torch.Tensor]]:
         return [getattr(self, name) for name in MoeRunnerInputs._FIELDS]
 
+    def to_tuning_list(self, output_width: int) -> List[Optional[torch.Tensor]]:
+        """Return ``to_list()`` for ``AutoTuner.choose_one``.
+
+        A zero-width ``do_finalize=False`` placeholder is replaced by a
+        ``(num_tokens, output_width)`` view, so the call uses the cache entry
+        of the finalized call with the same GEMMs. The autotuner only reads
+        the output's shape, dtype and device.
+        """
+        inputs = self.to_list()
+        if self.output.dim() == 2 and self.output.shape[1] == 0:
+            inputs[0] = self.output.new_empty(1).expand(
+                self.output.shape[0], output_width
+            )
+        return inputs
+
     @classmethod
     def from_list(cls, lst: List) -> "MoeRunnerInputs":
         return cls(**{name: lst[i] for i, name in enumerate(cls._FIELDS)})
