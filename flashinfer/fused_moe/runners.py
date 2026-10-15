@@ -9618,6 +9618,15 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
             dtype=self._block_scale_dtype,
             device=self.device,
         )
+        # Native cuDNN block-scale plans need the captured scale address to
+        # remain valid across repeated graph captures. Keep it in the bucket's
+        # workspace instead of replacing it with a new tensor on every call.
+        workspace.permuted_hidden_states_scale = torch.empty(
+            workspace.num_rows,
+            hidden_size // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
         return workspace
 
     def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
@@ -9712,10 +9721,10 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
         from ..quantization.fp4_quantization import block_scale_interleave
 
         scale_rows = workspace.permuted_hidden_states_scale_rows[: workspace.num_rows]
-        workspace.permuted_hidden_states_scale = (
-            block_scale_interleave(scale_rows.view(torch.uint8))
-            .view(scale_rows.shape)
-            .view(self._block_scale_dtype)
+        assert workspace.permuted_hidden_states_scale is not None
+        block_scale_interleave(
+            scale_rows.view(torch.uint8),
+            out=workspace.permuted_hidden_states_scale.view(torch.uint8).view(-1),
         )
         return layout, workspace
 

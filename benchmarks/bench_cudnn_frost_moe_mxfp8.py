@@ -547,6 +547,7 @@ def prepare_problem(args, activation_name, geometry):
     from flashinfer.fused_moe import (
         BackendOptions,
         CutlassMxfp8Config,
+        CudnnGroupedGemmMxfp8Config,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
@@ -562,7 +563,11 @@ def prepare_problem(args, activation_name, geometry):
     quant = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
     major, minor = torch.cuda.get_device_capability()
     eligible, audit = discover_original(major * 10 + minor, quant, activation)
-    unsupported = set(eligible) - {CutlassMxfp8Config, TrtllmFp8BlockConfig}
+    unsupported = set(eligible) - {
+        CutlassMxfp8Config,
+        TrtllmFp8BlockConfig,
+        CudnnGroupedGemmMxfp8Config,
+    }
     if unsupported:
         raise RuntimeError(
             "Missing preparation for applicable backends: "
@@ -595,6 +600,10 @@ def prepare_problem(args, activation_name, geometry):
     )
     # The Frost runner shares this canonical CUTLASS weight view, byte for byte.
     views = {"cutlass_mxfp8": CutlassMxfp8Config.prepare_weights(w1, w2, **kwargs)}
+    if CudnnGroupedGemmMxfp8Config in eligible:
+        views["cudnn_grouped_gemm_mxfp8"] = CudnnGroupedGemmMxfp8Config.prepare_weights(
+            w1, w2, **kwargs
+        )
     if TrtllmFp8BlockConfig in eligible:
         views["trtllm_fp8_block"] = TrtllmFp8BlockConfig.prepare_weights(
             w1, w2, quant=quant, **kwargs
