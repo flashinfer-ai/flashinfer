@@ -732,10 +732,15 @@ def _detect_gpu_name() -> str:
                 "V100",
                 "B100",
                 "B200",
+                "B300",
                 "GB200",
+                "GB300",
             ):
                 if short in full:
                     return short
+                # We can't use a substring to map "NVIDIA Vera Rubin NVL72" → "VR NVL72" because we add a prefix.
+                if "NVL72" in full:
+                    return "VR NVL72"
             return full
     except Exception:
         pass
