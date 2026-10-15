@@ -2973,6 +2973,11 @@ class FmhaTs:
             is_causal and is_clc_dynamic and not cfg.single_qkv_instance
         )
 
+        if head_paired and cfg.vc_attention:
+            raise ValueError(
+                "VC-Attention requires the query-paired context kernel; a positive "
+                "window_left selects the head-paired kernel"
+            )
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
             _configure_head_dim_staging(cfg)

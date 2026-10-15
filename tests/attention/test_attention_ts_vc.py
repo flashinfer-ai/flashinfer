@@ -221,6 +221,13 @@ def test_vc_mean_step():
         pytest.param(
             {"mask_type": "causal"}, ValueError, "dense contiguous", id="causal"
         ),
+        pytest.param({"packed": True}, ValueError, "dense contiguous", id="packed"),
+        pytest.param(
+            {"mask_type": "causal", "window_left": 256, "num_qo_heads": 2},
+            ValueError,
+            "dense contiguous",
+            id="head-paired",
+        ),
         pytest.param({"num_qo_heads": 2}, ValueError, "equal Q and K/V head", id="gqa"),
         pytest.param(
             {"vc_config": {"k_block_size": 128}},
