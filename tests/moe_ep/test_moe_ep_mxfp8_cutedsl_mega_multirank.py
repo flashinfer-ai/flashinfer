@@ -51,6 +51,163 @@ def _launcher_ranks() -> tuple[int, int]:
     return rank, world_size
 
 
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "tile_n,cluster_m,capacity",
+    [(128, 4, 129), (64, 4, 129), (64, 2, 129), (64, 2, 1024)],
+)
+def test_blackwell_genphase_layer_graph_and_weight_formats(
+    tile_n, cluster_m, capacity, monkeypatch
+):
+    """Public layer: both input formats, four weight formats and changing routes."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    _require_cuda()
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires native SM100/103")
+    rank, world = _launcher_ranks()
+    if world not in (1, 2, 4):
+        pytest.skip("qualified at EP1/2/4")
+    if world == 1:
+        monkeypatch.setenv("MEGA_NO_DIST", "1")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    hidden, intermediate, topk, experts = 384, 192, 3, 8 * world
+    generator = torch.Generator(device="cuda").manual_seed(6447 + rank)
+    x = torch.randn(capacity, hidden, generator=generator, device="cuda").bfloat16()
+    w13 = (
+        torch.randn(8, 2 * intermediate, hidden, generator=generator, device="cuda")
+        / hidden**0.5
+    ).bfloat16()
+    w2 = (
+        torch.randn(8, hidden, intermediate, generator=generator, device="cuda")
+        / intermediate**0.5
+    ).bfloat16()
+    qx, sx = pkg.quantize_genphase_mxfp8(x, torch.float8_e4m3fn)
+    q13, s13 = pkg.quantize_genphase_mxfp8(w13, torch.float8_e4m3fn)
+    q2, s2 = pkg.quantize_genphase_mxfp8(w2, torch.float8_e4m3fn)
+    source = MoEWeightPack(w13, w2)
+    packed = MoEWeightPack(q13, q2, s13, s2)
+    byte_packed = MoEWeightPack(q13, q2, s13.view(torch.uint8), s2.view(torch.uint8))
+    ids = (
+        torch.arange(capacity * topk, device="cuda").reshape(capacity, topk) + rank * 7
+    ) % experts
+    scores = torch.full((capacity, topk), 1 / topk, device="cuda")
+    layers = []
+
+    def check(ws, weights, output, count):
+        indices, expected = pkg.sampled_reference(ws, *weights, count, sample_size=32)
+        error = torch.tensor(pkg.output_error(output, indices, expected), device="cuda")
+        if world > 1:
+            dist.all_reduce(error, op=dist.ReduceOp.MAX)
+        assert error.item() < 0.02
+        assert torch.count_nonzero(ws.output_activation[count:]) == 0
+
+    try:
+        baseline = None
+        workspace = None
+        for quantize_input in (True, False):
+            for weight_format, weights in (
+                ("bf16", source),
+                ("prequantized", packed),
+                ("byte_scales", byte_packed),
+                ("transformed", source),
+            ):
+                layer = MoEEpLayer(
+                    BootstrapConfig(world_size=world, rank=rank),
+                    FleetParams(
+                        num_experts=experts,
+                        max_tokens_per_rank=capacity,
+                        token_hidden_size=hidden,
+                    ),
+                    weights,
+                    backend=MegaConfig(
+                        megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                            intermediate_size=intermediate,
+                            top_k=topk,
+                            kernel_variant="genphase",
+                            mma_tiler_mnk=(256, tile_n, 128),
+                            cluster_shape_mn=(cluster_m, 1),
+                        ),
+                        quantize_input=quantize_input,
+                        preprocess_weights=weight_format != "transformed",
+                        transformed_weights=layers[0]._transformed
+                        if weight_format == "transformed"
+                        else None,
+                    ),
+                )
+                layers.append(layer)
+
+                def inputs(count):
+                    return MoEEpTensors(
+                        hidden_states=x[:count] if quantize_input else qx[:count],
+                        scales=None if quantize_input else sx[:count],
+                        topk_ids=ids[:count].clone(),
+                        topk_weights=scores[:count].clone(),
+                    )
+
+                dense = inputs(capacity)
+                layer.warmup(dense)
+                ws = layer._ensure_workspace()
+                if workspace is None:
+                    workspace = ws
+                assert ws is workspace
+                y = layer.forward(dense, return_workspace_view=True).clone()
+                check(ws, layer._transformed, y, capacity)
+                if baseline is None:
+                    baseline = y
+                else:
+                    assert torch.equal(y, baseline)
+                for count in (1, 0, min(65, capacity)):
+                    current = inputs(count)
+                    if count and world > 1 and rank == world - 1:
+                        current.topk_ids.fill_(-1)
+                        current.topk_weights.fill_(float("nan"))
+                    ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+                    y = layer.forward(current, return_workspace_view=True)
+                    check(ws, layer._transformed, y, count)
+
+                current = inputs(min(65, capacity))
+                layer.warmup(current)
+                graph = torch.cuda.CUDAGraph()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = layer.forward(current, return_workspace_view=True)
+                torch.cuda.current_stream().wait_stream(stream)
+                for state in ("empty", "holes", "restore"):
+                    current.topk_ids.copy_(ids[: current.num_tokens])
+                    if state == "empty":
+                        current.topk_ids.fill_(-1)
+                    elif state == "holes":
+                        current.topk_ids[::2, 1:].fill_(-1)
+                    # Grow eagerly before replaying the smaller graph, which
+                    # must conservatively re-mask its entire capacity tail.
+                    layer.forward(dense)
+                    ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    check(ws, layer._transformed, captured, current.num_tokens)
+                for _ in range(64):
+                    graph.replay()
+                torch.cuda.synchronize()
+                check(ws, layer._transformed, captured, current.num_tokens)
+    finally:
+        for layer in reversed(layers):
+            layer.destroy()
+
+
 def _make_inputs(
     rank: int,
     *,
