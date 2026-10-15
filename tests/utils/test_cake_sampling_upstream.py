@@ -19,9 +19,10 @@ limitations under the License.
 Every test below is the corresponding ``flashinfer.sampling`` unit test with the sampler replaced
 by :func:`flashinfer.cake_sampling.top_k_top_p_sampling_from_probs` and the mask written for the
 ``top_k_first`` order that function implements (top-k first, then top-p over the renormalized
-top-k mass).  Parametrizations (batch sizes, vocabularies, ``k``, ``p``, trial counts, similarity
-thresholds) are the upstream ones.  Cases the frozen kernels do not serve (``k >= vocab``) are
-skipped like upstream skips ``k > vocab_size``; the wrapper's fallback route covers them.
+top-k mass).  Parametrizations (batch sizes, vocabularies, ``k``, ``p``, similarity
+thresholds) are the upstream ones. Frequency trial counts use the filtered effective support.
+Cases the frozen kernels do not serve (``k >= vocab``) are skipped like upstream skips
+``k > vocab_size``; the wrapper's fallback route covers them.
 """
 
 import pytest
@@ -33,6 +34,7 @@ from flashinfer.cake_sampling import (
     top_k_top_p_sampling_from_probs,
 )
 from flashinfer.jit.cake_sampling import supported_capability
+from tests.test_helpers.sampling import required_num_trials
 
 
 def _require_supported_device():
@@ -104,10 +106,12 @@ def _freq(probs_row, k, p, num_trials, rows=1000):
     probs = probs_row.expand(rows, vocab).contiguous()
     counter = torch.zeros(vocab, dtype=torch.int32, device=probs.device)
     out = torch.empty(rows, dtype=torch.int32, device=probs.device)
-    for _ in range(num_trials // rows):
+    # Round up so batching never undershoots the statistical trial budget.
+    num_batches = (num_trials + rows - 1) // rows
+    for _ in range(num_batches):
         top_k_top_p_sampling_from_probs(probs, k, p, out=out)
         counter.scatter_add_(0, out.long(), torch.ones_like(out))
-    return counter.float() / (num_trials // rows * rows)
+    return counter.float() / (num_batches * rows)
 
 
 # --- test_top_k_sampling_freq -------------------------------------------------------------------
@@ -134,7 +138,8 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
     mask = _top_k_mask(probs, k)
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
-    freq = _freq(probs, k, 1.0, num_trials=5000000)
+    num_trials = required_num_trials(renorm_probs, compare_two_samples=False)
+    freq = _freq(probs, k, 1.0, num_trials=num_trials)
     assert torch.all(mask[0][freq > 0] == 1)
     similarity = torch.cosine_similarity(freq, renorm_probs[0], dim=0)
     assert similarity > 0.99, f"similarity: {similarity}"
@@ -167,7 +172,8 @@ def test_top_k_top_p_sampling_freq(vocab_size, distribution, p):
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(
         flashinfer.sampling.top_k_renorm_probs(probs, k), p
     )
-    freq = _freq(probs, k, p, num_trials=5000000)
+    num_trials = required_num_trials(renorm_probs, compare_two_samples=False)
+    freq = _freq(probs, k, p, num_trials=num_trials)
     assert torch.all(mask[0][freq > 0] == 1)
     similarity = torch.cosine_similarity(freq, renorm_probs[0], dim=0)
     assert similarity > 0.99, f"similarity: {similarity}"
