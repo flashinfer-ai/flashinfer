@@ -340,6 +340,8 @@ def test_nontranspose_name_varies_with_every_argument(param, alternate):
         ("stride1", 16384),
         ("stride2", 128),
         ("stride3", 1),
+        ("num_stages", 5),
+        ("blocks_per_state", 4),
     ],
 )
 def test_pretranspose_name_varies_with_every_argument(param, alternate):
