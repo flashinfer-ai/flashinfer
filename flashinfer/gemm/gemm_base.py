@@ -9867,13 +9867,94 @@ def _cutile_gemm_fp8_nt_groupwise_requirement(
     return True
 
 
+@supported_compute_capability([107])
+def _cute_dsl_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass", "trtllm"] = "cutlass",
+):
+    from ..cute_dsl.availability import is_rubin_cute_dsl_available
+    from .kernels.gemm_fp8_groupwise_sm107 import check_problem
+
+    if not is_rubin_cute_dsl_available():
+        raise ValueError("The cute-dsl SM107 backend requires CuTe DSL >= 4.8.")
+    check_problem(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        scale_granularity_mnk,
+        out.dtype if out is not None else (out_dtype or torch.bfloat16),
+    )
+    return True
+
+
+def _sm107_groupwise_prefers_cute_dsl(
+    m: int, n: int, k: int, device: torch.device
+) -> bool:
+    """Whether the SM107 cute-dsl kernel beats CUTLASS (measured crossover).
+
+    CUTLASS uses a swap-AB kernel for M <= 32, which wins there unless N <= 8192 and K is
+    short, long, or split at least 4 ways.
+    """
+    if m > 32:
+        return True
+    if n > 8192:
+        return False
+    if k <= 1280 or k >= 14336:
+        return True
+    from .kernels.gemm_fp8_groupwise_sm107 import default_tactic
+
+    return default_tactic(m, n, k, device).split_k >= 4
+
+
+def _heuristic_func_gemm_fp8_nt_groupwise(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: str = "auto",
+):
+    # "trtllm" takes a different scale layout and "cutile" is K-major only, so the
+    # automatic choice is between the two backends that share the cutlass contract.
+    heuristic_backends = []
+    if (
+        "cute-dsl" in suitable_backends
+        and CUTE_DSL_AVAILABLE
+        and _match_sm_version(a.device, ["107"])
+        and _sm107_groupwise_prefers_cute_dsl(
+            a.shape[0], b.shape[0], a.shape[1], a.device
+        )
+    ):
+        heuristic_backends.append("cute-dsl")
+    if "cutlass" in suitable_backends:
+        heuristic_backends.append("cutlass")
+    return heuristic_backends
+
+
 @backend_requirement(
     {
         "cutlass": _cutlass_gemm_fp8_nt_groupwise_requirement,
         "trtllm": _trtllm_gemm_fp8_nt_groupwise_requirement,
         "cutile": _cutile_gemm_fp8_nt_groupwise_requirement,
+        "cute-dsl": _cute_dsl_gemm_fp8_nt_groupwise_requirement,
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
+    heuristic_func=_heuristic_func_gemm_fp8_nt_groupwise,
 )
 @flashinfer_api(trace=gemm_fp8_nt_groupwise_trace)
 def gemm_fp8_nt_groupwise(
@@ -9886,7 +9967,7 @@ def gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
+    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"] = "cutlass",
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
 
@@ -9937,8 +10018,17 @@ def gemm_fp8_nt_groupwise(
         If out is not specified, we will create an output tensor with this dtype.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "trtllm", "cutile"]
+    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
+
+        ``"auto"`` chooses between ``"cutlass"`` and ``"cute-dsl"``: on sm_107 it runs
+        ``"cute-dsl"`` where that is faster (see ``_sm107_groupwise_prefers_cute_dsl``),
+        and ``"cutlass"`` everywhere else.
+
+        ``"cute-dsl"`` (sm_107 only) runs the CuTe-DSL ``SM107BlockwiseGemmKernel`` with
+        split-K. It requires ``scale_major_mode="MN"``,
+        ``scale_granularity_mnk=(1, 128, 128)``, e4m3 inputs, ``n`` and ``k`` multiples of
+        128 and ``m`` a multiple of 4; ``mma_sm`` is ignored.
 
         ``"cutile"`` (sm_100 / sm_103 / sm_110 / sm_120 / sm_121) is a pure
         ``cuda.tile`` Python kernel. v1 restrictions enforced by
@@ -9980,6 +10070,9 @@ def gemm_fp8_nt_groupwise(
             device=a.device,
             dtype=out_dtype,
         )
+
+    if backend == "auto":
+        backend = gemm_fp8_nt_groupwise.suitable_auto_backends[0]
 
     if backend == "cutlass":
         if is_sm12x_supported(a.device):
@@ -10023,6 +10116,10 @@ def gemm_fp8_nt_groupwise(
             False,
             -1,
         )
+    elif backend == "cute-dsl":
+        from .kernels.gemm_fp8_groupwise_sm107 import gemm_fp8_nt_groupwise_sm107
+
+        gemm_fp8_nt_groupwise_sm107(a, b, a_scale, b_scale, out)
     elif backend == "cutile":
         from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
             gemm_fp8_nt_groupwise_cutile,
