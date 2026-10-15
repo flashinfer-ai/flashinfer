@@ -411,8 +411,7 @@ __global__ void activationDeepSeekVectorKernel(KernelParams params) {
   uint32_t const raw1 = *reinterpret_cast<uint32_t const*>(params.inPtr + baseIdx);
   uint32_t const raw2 =
       *reinterpret_cast<uint32_t const*>(params.inPtr + baseIdx + params.innerDim / 2);
-  // gatedSilu with the per-expert parameters loaded once per row (one warp handles one row);
-  // the per-element expressions are those of gatedSilu.
+  // Keep the expert lookup outside the four-channel loop while matching gatedSilu's arithmetic.
   bool const plain = params.gatedActAlphaPtr == nullptr && params.gatedActBetaPtr == nullptr &&
                      params.gatedActClampLimitPtr == nullptr;
   bool const clamp = params.gatedActClampLimitPtr != nullptr;
