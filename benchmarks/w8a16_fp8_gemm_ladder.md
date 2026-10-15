@@ -414,9 +414,15 @@ slower than auto on every row (mlp.gate_up tp2 1.08-1.10 vs 1.03, mlp.down tp2 1
 1.04): the halved k-tile costs more pipeline than the saved conversions buy.  Removed
 from the build together with the cluster-(2,2,1) variants (`W8A16Sm100Cfg<256, 224, 64,
 2, true>` and `W8A16Sm100Cfg<256, {128,192}, 128, 2, true, false, 2>` rebuild them;
-the `kClusterN` template parameter stays).  So at M=88320 Blackwell ends at 21 of 24 rows
-at or under 1.02 x cuBLAS; mlp.down tp2 and mlp.gate_up tp2 at 1.02-1.03, attn.out tp8
-at 1.03-1.1 on a 0.6 ms kernel, all three at the converter's energy floor.
+the `kClusterN` template parameter stays).
+
+Definitive numbers for the three (500 launches per column, 5 rotated rounds, three
+independent repeats; attn.out tp8 with 1500 launches), kernel / cuBLAS at M=88320:
+mlp.gate_up tp2 1.024 / 1.022 / 1.022; mlp.down tp2 1.024 / 1.026 / 1.025; attn.out tp8
+1.042 / 1.042 / 1.042 (the 256x256 tile 1.139 there, the 192-row tile the same as auto).
+So at M=88320 Blackwell ends at 21 of 24 rows at or under 1.02 x cuBLAS and three rows
+2.2-4.2% over, all three with fewer SM cycles than cuBLAS and a lower clock under the
+1000 W cap: the energy of converting on the fly.
 
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
