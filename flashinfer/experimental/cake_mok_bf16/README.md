@@ -155,9 +155,38 @@ to recreate the workspace.
   Scores are already normalized/scaled by the caller.
 - Logical source token counts may differ across ranks and may be zero. Hidden
   and intermediate widths are positive multiples of 256; MXFP8 also requires a
-  hidden width that is a multiple of 512. Common physical source capacity is
+  hidden width that is a multiple of 512, and its forward and recompute roles
+  need an nvcc of CUDA 13.1 or newer (the 13.0 ptxas rejects
+  `cvt.rn.satfinite.e4m3x2.bf16x2`: "Unexpected instruction types specified for
+  'cvt'"; the backward roles carry a guard and compile with 13.0). Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
+- Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`;
+  factory default `imbalance_comm_sms="auto"`, `None` keeps the fixed split): every
+  `build_schedule` counts the gathered expert IDs per owning rank on device (one
+  `torch.histc` pass, linear in the number of ids) and copies the counts into
+  pinned host memory behind a CUDA event (no host synchronization; skipped during
+  graph capture). The gathered IDs and the counts are identical on every rank;
+  each rank applies its own latest completed observation, so with back-to-back
+  steps a launch may use different splits on different ranks for a step - the
+  split is a per-rank launch parameter and the protocol does not require
+  agreement. While the hottest rank's load is at least `imbalance_threshold`
+  (4) x the mean load, the later launches use the (forward, backward) imbalance
+  split; balanced steps are unchanged. Measured row (`IMBALANCE_COMM_SMS`, keyed
+  by compute capability and SM count, so B200 at 148 SMs only - GB200 is also
+  (10, 0) at 152 SMs and keeps the fixed split, where the B200 row measured
+  slower under skew at EP16-64): B200
+  BF16 24 / 28, from EP8 complete training steps, two rounds on one node, step
+  time against the fixed 20 / 24 on this package's backward programs: hottest
+  rank at 5.6x / 7.4x the mean routed load -1.0 / -1.7 % and -1.2 / -1.3 %;
+  hottest rank at 3.0x (one rank's experts at twice the routing probability)
+  +0.4 / +0.7 % (full step), +0.5 / +0.8 % (checkpoint step) and -0.1 ... +1.6 %
+  with ragged source rows (8 cells, 7 slower): no gain, within or just above the
+  ~0.8 % spread of identical arms, so the fixed split is kept there. The
+  threshold sits between the measured 3.0x and 5.6x (the crossover in between is
+  not measured; with 4 ranks the ratio reaches 4 only when one rank carries
+  every routed row). No row elsewhere.
+  `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the
