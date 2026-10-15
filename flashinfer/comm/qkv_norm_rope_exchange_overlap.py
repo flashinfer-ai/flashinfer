@@ -305,6 +305,14 @@ class QkvNormRopeExchangeOverlap:
         architecture default: ``True`` on SM90, SM100 and SM103 (the folded producers are delivered on every
         architecture).  Both paths store identical bits.  Must be uniform across the ranks of the group; not
         accepted with ``backend="nccl"``.
+
+    The Cake backend also applies per-architecture row-count gates to each call's host plan
+    (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``
+    rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
+    destination run; SM90: no gates).  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
+    (``auto`` / ``off`` / ``words_capacity_small_m=N,per_dest_large_m=N``, ``0`` = never) overrides them for a
+    session, rank-uniformly; ``describe()`` reports the resolved gates (``shape_gates``) and every prepared row's
+    verdict (``prepared_row_plans``).  The gates change neither the tile table nor the stored bits.
     """
 
     def __init__(
