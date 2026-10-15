@@ -173,8 +173,6 @@ class PCIeAllReduce:
                 max_concurrent_channels=max_concurrent_channels,
             )
         else:
-            if ipc is not None:
-                raise ValueError("caller-owned shared memory requires the direct all-reduce runtime")
             if int(max_concurrent_channels) != 1:
                 raise ValueError(
                     "hierarchical all-reduce supports exactly one concurrent channel"
@@ -186,6 +184,7 @@ class PCIeAllReduce:
                 device=device,
                 max_elements=max_size // torch.bfloat16.itemsize,
                 ext_module=ext_module,
+                ipc=ipc,
             )
         island_rs = cls._maybe_island_rs(
             exchange_group=exchange_group,
