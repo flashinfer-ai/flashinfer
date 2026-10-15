@@ -1329,6 +1329,48 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
         )
 
 
+@pytest.mark.parametrize("group_size", [1, 2, 4, 8])
+def test_tensor_core_decode_fp8_query(group_size):
+    if get_compute_capability(torch.device("cuda")) != (12, 0):
+        pytest.skip("The e4m3-query tensor-core decode runs on SM120 only.")
+    batch_size, kv_len, page_size, num_kv_heads, head_dim = 7, 300, 16, 8, 256
+    num_qo_heads, q_scale = num_kv_heads * group_size, 0.5
+    pages = (kv_len + page_size - 1) // page_size
+    indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * pages
+    indices = torch.arange(batch_size * pages, dtype=torch.int32, device="cuda:0")
+    last_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+    kv = torch.randn(
+        batch_size * pages, 2, page_size, num_kv_heads, head_dim, device="cuda:0"
+    )
+    kv = kv.to(torch.float8_e4m3fn)
+    q8 = (
+        torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0") / q_scale
+    ).to(torch.float8_e4m3fn)
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    outs = []
+    # The bf16 query holds the same values (q_scale is a power of two).
+    for q, scale in ((q8.to(torch.bfloat16) * q_scale, None), (q8, q_scale)):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", use_tensor_cores=True
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=q.dtype,
+            kv_data_type=kv.dtype,
+            o_data_type=torch.bfloat16,
+        )
+        outs.append(wrapper.run(q, kv, q_scale=scale))
+    torch.testing.assert_close(outs[1], outs[0], rtol=1e-2, atol=3e-2)
+
+
 def test_tensor_core_decode_rejects_mismatched_q_len():
     batch_size = 4
     page_size = 16
