@@ -122,7 +122,6 @@ def sm107_candidates(
         for schedule, work_id in (
             (("grouped", None), "grid_stride"),
             (("grouped", None), "atomic_counter"),
-            (("phase_interleave", None), "atomic_counter"),
         ):
             out.append(
                 {

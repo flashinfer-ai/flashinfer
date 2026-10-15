@@ -134,7 +134,7 @@ def _matching_entries(
     if path is None:
         return []
     key = dict(
-        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v2",
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
@@ -263,7 +263,7 @@ def record_knobs(
     if path is None:
         return None
     entry = dict(
-        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v2",
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,

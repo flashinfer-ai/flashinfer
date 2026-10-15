@@ -275,10 +275,13 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
         is None
     )
     data = json.loads(path.read_text())
-    # The new upstream drop must not reuse tuning results from the old kernel.
-    data["entries"][0]["backend_revision"] = "sm107-block-scaled-v2"
-    path.write_text(json.dumps(data))
-    assert lookup_knobs(**key, allow_nondeterministic=True) is None
+    for revision in (
+        "sm107-block-scaled-v2",
+        "sm107-block-scaled-1667b47a-runtime-options-v1",
+    ):
+        data["entries"][0]["backend_revision"] = revision
+        path.write_text(json.dumps(data))
+        assert lookup_knobs(**key, allow_nondeterministic=True) is None
     del data["entries"][0]["backend_revision"]
     path.write_text(json.dumps(data))
     assert lookup_knobs(**key, allow_nondeterministic=True) is None

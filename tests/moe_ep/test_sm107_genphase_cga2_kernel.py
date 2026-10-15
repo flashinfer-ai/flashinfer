@@ -13,7 +13,7 @@ import torch
     "schedule,work_id",
     [
         (("grouped", None), "grid_stride"),
-        (("phase_interleave", None), "atomic_counter"),
+        (("grouped", None), "atomic_counter"),
     ],
 )
 def test_genphase_n64_cga2(monkeypatch, capacity, early, schedule, work_id):

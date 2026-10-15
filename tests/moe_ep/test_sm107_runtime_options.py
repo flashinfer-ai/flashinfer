@@ -103,7 +103,7 @@ def test_genphase_n64_dtype_and_cluster_admission(kind, cluster, supported):
 def test_genphase_tuner_exposes_only_admitted_n64_candidates(kind):
     candidates = pkg.sm107_candidates(kind, kernel_variant="genphase")
     n64 = [candidate for candidate in candidates if candidate["mma_tiler_mnk"][1] == 64]
-    assert len(n64) == (3 if kind in ("mxfp8_e4m3", "mxfp4_mxfp8") else 0)
+    assert len(n64) == (2 if kind in ("mxfp8_e4m3", "mxfp4_mxfp8") else 0)
     for candidate in n64:
         assert pkg.is_valid_sm107(candidate, _config(quant_kind=kind))
         assert candidate["fc2_tma_stages"] == 1
@@ -116,7 +116,7 @@ def test_genphase_tuner_exposes_only_admitted_n64_candidates(kind):
     "kind, cluster",
     [("mxfp8_e4m3", (2, 1)), ("mxfp8_e4m3", (4, 1)), ("mxfp4_mxfp8", (4, 1))],
 )
-def test_genphase_n64_multirank_schedule_admission(world, kind, cluster):
+def test_genphase_n64_schedule_admission(world, kind, cluster):
     cfg = _config(
         world_size=world,
         quant_kind=kind,
@@ -127,22 +127,15 @@ def test_genphase_n64_multirank_schedule_admission(world, kind, cluster):
         work_id_mode="atomic_counter",
     )
     assert pkg.is_valid_sm107({"schedule_policy": ("grouped", None)}, cfg)
-    for hint in (None, 1):
+    for hint in (None, 1, 4):
         phase = {"schedule_policy": ("phase_interleave", hint)}
-        if world == 1:
-            assert pkg.is_valid_sm107(phase, cfg)
-            assert (
-                dataclasses.replace(cfg, **phase).schedule_policy
-                == phase["schedule_policy"]
-            )
-        else:
-            assert not pkg.is_valid_sm107(phase, cfg)
-            with pytest.raises(ValueError, match="N64 .* requires grouped scheduling"):
-                dataclasses.replace(cfg, **phase)
+        assert not pkg.is_valid_sm107(phase, cfg)
+        with pytest.raises(ValueError, match="N64 requires grouped scheduling"):
+            dataclasses.replace(cfg, **phase)
 
 
-@pytest.mark.parametrize("world", [2, 4, 8])
-def test_genphase_n128_multirank_phase_admission_is_unchanged(world):
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+def test_genphase_n128_phase_admission_is_unchanged(world):
     cfg = _config(world_size=world, quant_kind="mxfp8_e4m3")
     phase = {
         "schedule_policy": ("phase_interleave", None),
