@@ -15,8 +15,9 @@ def get_paged_mqa_logits_metadata(
     (or fills ``out`` with) the int32 ``[num_sms + 1, 2]`` schedule the exported
     logits programs read: per-CTA ``(q_atom_idx, kv_split_idx)`` walk
     boundaries over 128-row KV segments. Not interchangeable with DeepGEMM's
-    buffer; pass it to :func:`fp8_paged_mqa_logits`, which rebuilds it in the
-    same sequence before the logits program reads it.
+    buffer; pass it to :func:`fp8_paged_mqa_logits`, whose single logits launch
+    consumes it. Rebuild it whenever ``context_lens`` changes (once per decode
+    step, as DeepGEMM's callers do); the logits call cannot verify it.
     """
     from .experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa import (
         get_paged_mqa_logits_metadata as _get_paged_mqa_logits_metadata,
@@ -50,10 +51,13 @@ def fp8_paged_mqa_logits(
     ``[pages, block_stride_bytes]`` view with ``page_kv`` given,
     FP32 ``weights [B * next_n, H]``, int32 ``context_lens [B, next_n]``, int32
     ``block_table [B, S]`` with unit column stride, ``schedule_meta`` the
-    buffer from :func:`get_paged_mqa_logits_metadata` (its first dimension
-    fixes the CTA budget; ``None`` = the device's SM count). ONE FFI
-    submission, TWO kernel launches: the scheduler is rebuilt into
-    ``schedule_meta`` and the persistent logits program consumes it.
+    buffer from :func:`get_paged_mqa_logits_metadata`. With a schedule: ONE
+    FFI submission, ONE kernel launch -- the persistent logits program alone
+    consumes it, with its first dimension as the CTA budget (DeepGEMM's
+    per-layer contract). The schedule must have been built for the same
+    ``context_lens``, ``next_n`` and budget; as in DeepGEMM this is not
+    checked on the device. With ``None``: the device's SM count, and the
+    ``(metadata, logits)`` sequence builds the schedule (two launches).
 
     Returns the FP32 ``[B * next_n, max_context_len]`` view of a row-padded
     buffer with DeepGEMM's ``clean_logits=False`` semantics (positions at or

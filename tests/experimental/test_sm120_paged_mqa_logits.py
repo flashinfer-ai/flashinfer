@@ -2,9 +2,11 @@
 
 Covers the exported ``(heads, page_kv, next_n)`` programs against a dequantized
 PyTorch reference and an independent Python mirror of the schedule, the
-``clean_logits=False`` write extent, CUDA Graph replay with changed contents,
-one-shot/plan equivalence, the padded block-stride cache view, and the
-host-only route/target helpers.
+``clean_logits=False`` write extent, CUDA Graph replay with changed contents
+(the prepared sequence and the one-launch entry fed by an eagerly rebuilt
+schedule), one-shot/plan equivalence with the one-shot entry asserted to be a
+single logits launch, the padded block-stride cache view, and the host-only
+route/target helpers.
 
 The GPU tests skip while the installed catalog carries no route for the shape
 or the device is not an exported architecture; the host-only helpers and the
@@ -240,8 +242,10 @@ def test_sm120_paged_mqa_logits(heads, page_kv, next_n, batch, avg_ctx):
     assert meta.dtype == torch.int32
     assert tuple(meta.shape) == _runtime.metadata_shape(plan.num_sms)
     assert torch.equal(meta, plan.schedule_meta)
-    # One-shot entry on the same operands: identical bits where both wrote.
-    one_shot = fp8_paged_mqa_logits(
+    # One-shot entry with the caller's schedule: the logits program ALONE (one
+    # FFI submission, one kernel launch), the very module the sequence runs as
+    # its logits stage, on a grid of schedule_meta.shape[0] - 1 CTAs.
+    one_shot_args = (
         data["q"],
         data["kv_cache"],
         data["weights"],
@@ -250,7 +254,21 @@ def test_sm120_paged_mqa_logits(heads, page_kv, next_n, batch, avg_ctx):
         meta,
         data["max_context_len"],
     )
+    single = _runtime.one_shot_plan(*one_shot_args)
+    assert isinstance(single, _runtime.Sm120PagedLogitsPlan)
+    assert single.launch_count == 1 and single.kernel_launches == 1
+    assert single.route_name == _runtime.logits_route_name(heads, page_kv, next_n)
+    assert single.program_names == [dict(plan.route["stages"])["logits"]]
+    assert single.num_sms == plan.num_sms and single.schedule_meta is meta
+    # Same write extent (both buffers were NaN-poisoned) and identical bits where
+    # the sequence wrote, from the plan and from the public entry.
     written = ~torch.isnan(plan.logical_output)
+    single.output.fill_(float("nan"))
+    single.run()
+    torch.cuda.synchronize()
+    assert torch.equal(torch.isnan(single.output), torch.isnan(plan.output))
+    assert torch.equal(single.logical_output[written], plan.logical_output[written])
+    one_shot = fp8_paged_mqa_logits(*one_shot_args)
     assert torch.equal(one_shot[written], plan.logical_output[written])
 
 
@@ -295,6 +313,142 @@ def test_sm120_paged_graph_replay(heads, page_kv, next_n, batch, avg_ctx):
     stream.synchronize()
     _check(plan.logical_output, _reference(data), data, plan.output)
     assert not torch.equal(plan.logical_output[inside], eager[inside])
+
+
+@pytest.mark.parametrize("heads,page_kv,next_n,batch,avg_ctx", CASES[:1])
+def test_sm120_one_shot_without_schedule_builds_it(
+    heads, page_kv, next_n, batch, avg_ctx
+):
+    """``schedule_meta=None`` runs the two-kernel sequence for the device's SM count."""
+    _skip_unless_route(heads, page_kv, next_n)
+    data = _inputs(heads, page_kv, next_n, batch, avg_ctx, seed=41)
+    args = (
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        None,
+        data["max_context_len"],
+    )
+    plan = _runtime.one_shot_plan(*args)
+    assert isinstance(plan, _runtime.Sm120PagedIndexerPlan)
+    assert plan.launch_count == 1 and plan.kernel_launches == 2
+    _arch, device_sms = _runtime.device_facts(torch.cuda.current_device())
+    assert plan.num_sms == device_sms
+    out = fp8_paged_mqa_logits(*args)
+    torch.cuda.synchronize()
+    reference = _reference(data)
+    inside = (
+        torch.arange(data["max_context_len"], device="cuda")[None, :]
+        < data["context_lens"].reshape(-1)[:, None]
+    )
+    error = (out - reference).abs().masked_fill(~inside, 0.0)
+    assert bool(
+        (error <= ATOL + RTOL * reference.abs().masked_fill(~inside, 0.0)).all()
+    )
+    # The same bits as the one-launch entry fed by the standalone scheduler.
+    meta = get_paged_mqa_logits_metadata(data["context_lens"], page_kv, device_sms)
+    single = fp8_paged_mqa_logits(*args[:5], meta, data["max_context_len"])
+    assert torch.equal(single[inside], out[inside])
+
+
+def test_sm120_one_shot_schedule_contract():
+    """The one-launch entry takes its CTA budget from the schedule and rejects
+    buffers that cannot be a ``get_paged_mqa_logits_metadata`` result."""
+    heads, page_kv, next_n = 32, 128, 1
+    _skip_unless_route(heads, page_kv, next_n)
+    data = _inputs(heads, page_kv, next_n, 2, 512, seed=43)
+    operands = (
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+    )
+    device = data["q"].device
+    # A budget below the device's SM count is a legal grid of that many CTAs.
+    meta = get_paged_mqa_logits_metadata(data["context_lens"], page_kv, 3)
+    plan = _runtime.one_shot_plan(*operands, meta, data["max_context_len"])
+    assert plan.num_sms == 3 and _runtime.schedule_budget(meta) == 3
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    _check(plan.logical_output, _reference(data), data, plan.output)
+    for bad in (
+        torch.zeros((4, 3), dtype=torch.int32, device=device),  # not [n + 1, 2]
+        torch.zeros((1, 2), dtype=torch.int32, device=device),  # zero CTAs
+        torch.zeros((8,), dtype=torch.int32, device=device),  # flat
+        torch.zeros((4, 2), dtype=torch.int64, device=device),  # not int32
+        torch.zeros((4, 4), dtype=torch.int32, device=device)[:, ::2],  # strided
+    ):
+        with pytest.raises(ValueError):
+            _runtime.one_shot_plan(*operands, bad, data["max_context_len"])
+    with pytest.raises(ValueError):
+        fp8_paged_mqa_logits(
+            *operands, meta, data["max_context_len"], clean_logits=True
+        )
+    with pytest.raises(ValueError):
+        fp8_paged_mqa_logits(
+            *operands, meta, data["max_context_len"], indices=data["block_table"]
+        )
+
+
+@pytest.mark.parametrize("heads,page_kv,next_n,batch,avg_ctx", CASES[:1])
+def test_sm120_one_shot_graph_replay(heads, page_kv, next_n, batch, avg_ctx):
+    """The engine pattern: the schedule is rebuilt eagerly into one buffer per
+    decode step, the per-layer one-launch call is captured once and replayed."""
+    _skip_unless_route(heads, page_kv, next_n)
+    data = _inputs(heads, page_kv, next_n, batch, avg_ctx, seed=47)
+    _arch, device_sms = _runtime.device_facts(torch.cuda.current_device())
+    meta = torch.empty(
+        _runtime.metadata_shape(device_sms), dtype=torch.int32, device="cuda"
+    )
+    get_paged_mqa_logits_metadata(data["context_lens"], page_kv, device_sms, out=meta)
+    args = (
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        meta,
+        data["max_context_len"],
+    )
+    eager = fp8_paged_mqa_logits(*args).clone()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = fp8_paged_mqa_logits(*args)
+        graph.replay()
+    stream.synchronize()
+    inside = (
+        torch.arange(data["max_context_len"], device="cuda")[None, :]
+        < data["context_lens"].reshape(-1)[:, None]
+    )
+    assert torch.equal(captured[inside], eager[inside])
+    # Next decode step: new lengths and weights, the schedule rebuilt eagerly
+    # into the captured buffer, then the captured single launch replayed.
+    with torch.cuda.stream(stream):
+        data["weights"].neg_()
+        data["context_lens"].copy_((data["context_lens"] - 3).clamp_min(1))
+        get_paged_mqa_logits_metadata(
+            data["context_lens"], page_kv, device_sms, out=meta
+        )
+        graph.replay()
+    stream.synchronize()
+    reference = _reference(data)
+    inside_new = (
+        torch.arange(data["max_context_len"], device="cuda")[None, :]
+        < data["context_lens"].reshape(-1)[:, None]
+    )
+    error = (captured - reference).abs().masked_fill(~inside_new, 0.0)
+    assert bool(
+        (error <= ATOL + RTOL * reference.abs().masked_fill(~inside_new, 0.0)).all()
+    )
+    assert not torch.equal(captured[inside], eager[inside])
 
 
 def test_sm120_paged_padded_block_stride():
@@ -389,7 +543,7 @@ def test_sm120_cases_cover_every_route():
     exported = {
         (record["num_heads"], record["page_kv"], record["next_n"])
         for record in catalog["routes"].values()
-        if record["sequence"] is not None
+        if record["num_heads"] is not None
     }
     covered = {(heads, page_kv, next_n) for heads, page_kv, next_n, _b, _c in CASES}
     assert exported, "the installed catalog exports no logits route"
@@ -400,6 +554,7 @@ def test_sm120_paged_host_helpers_and_rejections():
     catalog = _runtime._catalog()
     assert catalog["schema"] == _runtime.CATALOG_SCHEMA
     assert _runtime.route_name(64, 64, 2) == "sm120:fp8:h64:p64:n2"
+    assert _runtime.logits_route_name(64, 64, 2) == "sm120:fp8:h64:p64:n2:logits"
     assert _runtime.metadata_shape(84) == (85, 2)
     assert _runtime.split_kv() == 128
     stride = _runtime.paged_logits_stride(1000)
@@ -410,16 +565,32 @@ def test_sm120_paged_host_helpers_and_rejections():
     assert not _runtime.route_available(32, 64, 7)
     with pytest.raises(ValueError):
         _runtime.next_n_atoms(7)
-    # Every logits route is the ordered (metadata, logits) pair behind one
-    # prepared sequence; the metadata route is the standalone scheduler.
+    # Every (heads, page, next_n) ships twice: the ordered (metadata, logits)
+    # pair behind one prepared sequence, and the ":logits" route that launches
+    # the SAME logits program standalone; the metadata route is the scheduler.
     metadata_route = _runtime.metadata_route_name()
-    for name, record in catalog["routes"].items():
-        stages = [stage for stage, _program in record["stages"]]
+    routes = catalog["routes"]
+    for name, record in routes.items():
+        stages = dict(record["stages"])
         if name == metadata_route:
-            assert stages == ["metadata"] and not record["sequence"]
+            assert list(stages) == ["metadata"] and not record["sequence"]
+            assert record["kernel_launches"] == 1
+        elif name.endswith(":logits"):
+            assert list(stages) == ["logits"] and not record["sequence"]
+            assert record["kernel_launches"] == 1
+            sequence_route = routes[name.removesuffix(":logits")]
+            assert stages["logits"] == dict(sequence_route["stages"])["logits"]
+            program = catalog["programs"][stages["logits"]]
+            assert program["kind"] == "module" and program["standalone"]
         else:
-            assert stages == ["metadata", "logits"] and record["sequence"]
+            assert list(stages) == ["metadata", "logits"] and record["sequence"]
             assert record["kernel_launches"] == 2
+            assert (
+                _runtime.logits_route_name(
+                    record["num_heads"], record["page_kv"], record["next_n"]
+                )
+                in routes
+            )
     # The Q-atom rule is a function of next_n only.  One atom per request up to
     # next_n 4: 1 and 2 pair the tokens as DeepGEMM does, 3 and 4 score the whole
     # request from one atom (DeepGEMM: two atoms).  5 and 6 run two atoms of at
@@ -454,8 +625,8 @@ def test_sm120_bindings_cover_every_program_argument():
     """Every argument of every program's launcher contract is bound by name.
 
     Contract-level check that fails before a JIT build or a launch would: the
-    sequence binding addresses its stages as ``"<stage>.<name>"`` and the
-    standalone scheduler by bare argument name.
+    sequence binding addresses its stages as ``"<stage>.<name>"``, the
+    standalone scheduler and logits programs by bare argument name.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
