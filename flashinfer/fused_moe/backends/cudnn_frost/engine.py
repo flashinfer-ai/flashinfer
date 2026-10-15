@@ -9,6 +9,7 @@ Like the surrounding MoE runners, use one engine per thread and stream.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
 from itertools import product
@@ -242,6 +243,15 @@ class FrostEngine:
         self._capture_snapshot()
 
     def _capture_snapshot(self):
+        context = (
+            torch.cuda.device(self.device)
+            if self.device.type == "cuda"
+            else nullcontext()
+        )
+        with context:
+            self._capture_device_snapshot()
+
+    def _capture_device_snapshot(self):
         # Read and validate the new binding before dropping any lookup entries.
         # No tensors, native modules or graph ownership are kept in this key.
         compiler = capture_compiler_snapshot()

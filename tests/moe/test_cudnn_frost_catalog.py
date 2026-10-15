@@ -149,7 +149,9 @@ def test_heuristic_reduction_tiles_use_actual_operand_bytes(
 
 
 @pytest.mark.parametrize("arch", ["sm_107a", "sm_120a"])
-def test_bf16_unmeasured_shapes_have_bounded_candidates(arch, monkeypatch):
+def test_bf16_unmeasured_shapes_have_bounded_candidates(
+    arch, monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.bf16 import moe
     from flashinfer.fused_moe import SwiGLU
 

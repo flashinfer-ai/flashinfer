@@ -10,7 +10,6 @@ cuDNN is needed only by the exporter, never by this runtime.
 
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,7 +78,7 @@ class Mxfp8Mxfp4Kernel:
         )
 
 
-@functools.lru_cache(maxsize=8)
+@runtime.cache_discovery
 def discover(
     root: Path | None = None, *, quantized_output: bool = False
 ) -> tuple[Mxfp8Mxfp4Kernel, ...]:
@@ -170,7 +169,9 @@ def discover(
                 **runtime.source_binding(root, raw, digest),
             )
         )
-    return tuple(runtime.discovery_binding(k) for k in result)
+    return tuple(
+        bound for k in result if (bound := runtime.discovery_binding(k)) is not None
+    )
 
 
 def clear_artifact_cache() -> None:

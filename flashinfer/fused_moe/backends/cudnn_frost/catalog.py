@@ -129,7 +129,16 @@ def select_kernels(
 
     if not first or not second:
         return (), ()
-    if not profiles or tokens > max(profiles):
+    choices = None
+    if profiles and tokens <= max(profiles):
+        bucket = min(n for n in profiles if n >= tokens)
+        choices = profiles[bucket]
+    # A measured tile can be unavailable on this device. Manifest IDs are
+    # validated when reading the shortlist; rank the remaining legal pool.
+    if choices is None or any(
+        not set(identities) <= {kernel.artifact_id for kernel in pool}
+        for pool, identities in zip((first, second), choices, strict=True)
+    ):
         return select_stages(
             first,
             second,

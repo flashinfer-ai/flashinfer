@@ -2,6 +2,7 @@
 """Correctness and integration tests for selected cuDNN Frost kernels."""
 
 import ast
+import functools
 import gc
 import weakref
 from collections import OrderedDict
@@ -205,7 +206,9 @@ def test_bf16_extended_activation_scalars_are_not_silently_dropped(activation):
 
 
 @pytest.mark.parametrize("capability", [(10, 7), (12, 0)])
-def test_bf16_activation_artifact_pools_are_disjoint(capability, monkeypatch):
+def test_bf16_activation_artifact_pools_are_disjoint(
+    capability, monkeypatch, frost_metadata_only
+):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
     seen = set()
     shared_fc2 = None
@@ -591,7 +594,9 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
     assert large_bf16_moe(cfg, act, 120)
 
 
-def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
+def test_bf16_artifact_architecture_and_swap_abi_isolation(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         runtime,
     )
@@ -909,7 +914,7 @@ def test_bf16_sm120_launches_need_no_workspace_reset(monkeypatch):
 
 
 @pytest.fixture
-def frost_engine_cpu(monkeypatch):
+def frost_engine_cpu(monkeypatch, frost_metadata_only):
     from flashinfer.fused_moe.backends.cudnn_frost import engine
 
     # Host preparation binds device metadata without allocating CUDA tensors.
@@ -1240,7 +1245,9 @@ def test_bf16_moe_shortlist_rejects_more_than_two_stage_candidates(tmp_path):
 
 
 @pytest.mark.parametrize("arch", ["sm_107a", "sm_120a"])
-def test_bf16_packaged_shortlists_resolve_all_profiles(arch, monkeypatch):
+def test_bf16_packaged_shortlists_resolve_all_profiles(
+    arch, monkeypatch, frost_metadata_only
+):
     """Every measured profile maps to two FC1 and two FC2 packaged artifacts."""
     from flashinfer.fused_moe.backends.cudnn_frost import (
         shortlist,
@@ -1411,7 +1418,9 @@ def test_bf16_selection_cache_shared_by_admission_and_packing(
         runtime.clear_artifact_cache()
 
 
-def test_bf16_selection_cache_identity_refresh_and_bound(tmp_path, monkeypatch):
+def test_bf16_selection_cache_identity_refresh_and_bound(
+    tmp_path, monkeypatch, frost_metadata_only
+):
     runtime = bf16_moe.runtime
     runtime.clear_artifact_cache()
     roots, arch = (tmp_path,), "sm_107a"
@@ -2452,7 +2461,9 @@ def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
         test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch, "fp8_stg")
 
 
-def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
+def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
         moe,
     )
@@ -2477,12 +2488,17 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
         ),
     )
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
-    monkeypatch.setattr(moe, "_read", lambda roots: table)
+
+    @functools.lru_cache(maxsize=8)
+    def read(roots):
+        return table
+
+    monkeypatch.setattr(moe, "_read", read)
     from flashinfer.fused_moe.backends.cudnn_frost import (
         shortlist,
     )
 
-    monkeypatch.setattr(shortlist, "_read", lambda roots: table)
+    monkeypatch.setattr(shortlist, "_read", read)
     fallback = ((first[0],), (second[0],))
     from flashinfer.fused_moe.backends.cudnn_frost import heuristics
 
@@ -3331,7 +3347,9 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
-def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
+def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
     )
@@ -3339,7 +3357,9 @@ def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
 
-def test_nvfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
+def test_nvfp4_packaged_shortlists_resolve_all_profiles(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
     )
@@ -3528,7 +3548,9 @@ def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
         )
 
 
-def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
+def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4 import (
         moe,
     )
@@ -3536,7 +3558,9 @@ def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch)
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
 
-def test_mxfp8_mxfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
+def test_mxfp8_mxfp4_packaged_shortlists_resolve_all_profiles(
+    monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4 import (
         moe,
     )
@@ -3757,7 +3781,9 @@ def test_frost_moe_forward_accepts_base_runner_kwargs(dtype, runner_name, monkey
     assert calls[0][1] is workspace
 
 
-def test_bf16_clear_artifact_cache_refreshes_fc2_manifest(tmp_path, monkeypatch):
+def test_bf16_clear_artifact_cache_refreshes_fc2_manifest(
+    tmp_path, monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
         fc2,
         runtime,

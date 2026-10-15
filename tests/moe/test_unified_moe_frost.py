@@ -440,7 +440,9 @@ def test_bundled_assembler_is_independent_of_cuda_home(version, accepted, monkey
         ("mxfp8_mxfp4", "CudnnFrostMxfp8Mxfp4MoeRunner"),
     ],
 )
-def test_runner_refresh_rechecks_selected_assembler(dtype, name, monkeypatch):
+def test_runner_refresh_rechecks_selected_assembler(
+    dtype, name, monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost import engine
 
     module = importlib.import_module(
@@ -618,7 +620,7 @@ def test_public_config_graph_and_configured_admission(frost_case, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", ("mxfp8", "nvfp4", "mxfp8_mxfp4"))
-def test_quantized_selection_cache(dtype, monkeypatch):
+def test_quantized_selection_cache(dtype, monkeypatch, frost_metadata_only):
     moe = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )

@@ -28,6 +28,7 @@ from ..runtime import (
     _read_source as _read_source,
     _read_manifest as _read_manifest,
     bind_kernel as bind_kernel,
+    cache_discovery,
     discovery_binding as discovery_binding,
     source_binding as source_binding,
     _tactic_digest as _tactic_digest,
@@ -145,10 +146,10 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
                 **source_binding(root, raw, actual),
             )
         )
-    return [discovery_binding(k) for k in result]
+    return [bound for k in result if (bound := discovery_binding(k)) is not None]
 
 
-@functools.lru_cache(maxsize=8)
+@cache_discovery
 def _discover(
     roots: tuple[Path, ...],
 ) -> tuple[CudnnFrostGroupedGemm1Kernel, ...]:

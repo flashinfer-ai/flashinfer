@@ -137,15 +137,36 @@ def source_binding(root, raw, digest):
 
 
 def discovery_binding(kernel):
-    """Keep CPU discovery query-free; bind matching CUDA metadata when available."""
+    """Bind matching CUDA metadata, omitting unsupported device geometries."""
     if (
         getattr(kernel, "source_parameters", None) is not None
         and torch.cuda.is_available()
     ):
         device = torch.device("cuda", torch.cuda.current_device())
         if kernel.arch == _arch_for(device):
-            return bind_kernel(kernel, device)
+            try:
+                return bind_kernel(kernel, device)
+            except NotImplementedError:
+                return None
     return kernel
+
+
+def cache_discovery(function):
+    """Keep device-specific bindings and candidate filtering in separate caches."""
+
+    @functools.lru_cache(maxsize=8)
+    def cached(index, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    @functools.wraps(function)
+    def discover(*args, **kwargs):
+        index = torch.cuda.current_device() if torch.cuda.is_available() else None
+        return cached(index, *args, **kwargs)
+
+    discover.cache_clear = cached.cache_clear
+    discover.cache_info = cached.cache_info
+    discover.cache_parameters = cached.cache_parameters
+    return discover
 
 
 def _load_kernel(kernel, device: torch.device) -> Any:

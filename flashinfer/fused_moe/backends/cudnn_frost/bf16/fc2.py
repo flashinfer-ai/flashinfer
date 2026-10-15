@@ -7,7 +7,6 @@ belong to the surrounding MoE pipeline. No cuDNN Frost compiler is imported here
 
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,7 @@ import torch
 from .runtime import (
     _arch_for,
     bind_kernel,
+    cache_discovery,
     discovery_binding,
     source_binding,
     _artifact_roots,
@@ -56,7 +56,7 @@ class Fc2Kernel:
         )
 
 
-@functools.lru_cache(maxsize=8)
+@cache_discovery
 def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
     """Read and verify sealed FC2 artifacts, separately from the FC1 pool."""
     result = []
@@ -103,7 +103,7 @@ def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
                     **source_binding(root, raw, digest),
                 )
             )
-    return tuple(discovery_binding(k) for k in result)
+    return tuple(bound for k in result if (bound := discovery_binding(k)) is not None)
 
 
 def matching_kernels(
