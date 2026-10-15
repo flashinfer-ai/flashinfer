@@ -2,6 +2,7 @@
 """Unified Frost MoELayer configuration, admission, and GPU integration tests."""
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import replace
 import importlib
 from types import SimpleNamespace
@@ -34,7 +35,6 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe import api, layer as layer_module
-from flashinfer.fused_moe.auto_candidates import _AUTO_CANDIDATES
 from flashinfer.fused_moe.backends.cudnn_frost import compiler
 from tests.moe.test_cudnn_frost_kernels import (
     _bf16_moe_reference,
@@ -89,7 +89,7 @@ def test_public_config_registration(config, key):
     assert BackendOptions((config(),)).valid_for(121) == []
     assert BackendOptions((config(),)).valid_for(100) == []
     assert layer_module._BACKEND_RUNNERS[config].backend_key == key
-    assert not _AUTO_CANDIDATES[key].experimental
+    assert config() in api._DEFAULT_BACKEND.candidates
 
 
 @pytest.mark.parametrize(
@@ -104,27 +104,198 @@ def test_legacy_import_shares_module_and_caches(module):
     )
 
 
-def test_frost_weight_view_prefers_own_key_and_reuses_canonical():
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_frost_weight_view_prefers_own_key_and_reuses_canonical(dtype):
     from flashinfer.fused_moe.backends.cudnn_frost.support import weight_view
 
+    config, _, _, _ = FORMATS[dtype]
+    runner_cls = layer_module._BACKEND_RUNNERS[config]
+    runner = runner_cls.__new__(runner_cls)
+    runner._accepts_shape = lambda act: True
+    key, canonical_key = runner.backend_key, f"cutlass_{dtype}"
     canonical, own = {"canonical": torch.empty(0)}, {"own": torch.empty(0)}
-    weights = MoEWeightPack({"cutlass_nvfp4": canonical})
-    assert weight_view(weights, "cudnn_frost_nvfp4", "cutlass_nvfp4") is canonical
-    weights.prepare_for("cudnn_frost_nvfp4", own)
-    assert weight_view(weights, "cudnn_frost_nvfp4", "cutlass_nvfp4") is own
+    weights = MoEWeightPack({canonical_key: canonical})
+    assert weight_view(weights, key, canonical_key) is canonical
+    assert runner.accepts(None, weights)
+    weights.prepare_for(key, own)
+    assert weight_view(weights, key, canonical_key) is own
+    assert runner.accepts(None, weights)
+    weights.native_views.clear()
+    assert not runner.accepts(None, weights)
 
 
-def test_explicit_frost_filters_calls_and_separates_exact_shapes(monkeypatch):
+@pytest.mark.parametrize("dtype", FORMATS)
+@pytest.mark.parametrize("tokens", [9, 16384, 16385])
+def test_default_frost_shape_policy(dtype, tokens):
+    config_cls, _, weight_format, act_format = FORMATS[dtype]
+    runner_cls = layer_module._BACKEND_RUNNERS[config_cls]
+    runner = runner_cls.__new__(runner_cls)
+    runner.config = MoEConfig(
+        routing=RoutingConfig(num_experts=64, top_k=6),
+        quant=QuantConfig(weight=weight_format, activation=act_format),
+        experts=ExpertConfig(intermediate_size=1408),
+        execution=ExecutionConfig(tune_max_num_tokens=16384),
+    )
+    runner._engine = SimpleNamespace(arch_number=107)
+    tensor_dtype = {"bf16": torch.bfloat16, "nvfp4": torch.uint8}.get(
+        dtype, torch.float8_e4m3fn
+    )
+    act = MoEActivationPack(
+        torch.empty(
+            tokens,
+            1024 if dtype == "nvfp4" else 2048,
+            dtype=tensor_dtype,
+            device="meta",
+        ),
+        None,
+        torch.empty(tokens, 6, dtype=torch.int32, device="meta"),
+        torch.empty(tokens, 6, dtype=torch.float32, device="meta"),
+    )
+    weights = MoEWeightPack({f"cutlass_{dtype}": {}})
+    assert runner.accepts(act, weights) == (tokens <= 16384)
+    act.hidden_states_q = torch.empty(tokens, 129, dtype=tensor_dtype, device="meta")
+    assert not runner.accepts(act, weights)
+
+
+def test_candidate_cache_tracks_positions_and_weight_views(monkeypatch):
+    from flashinfer.fused_moe.runners import MoERunner
+
+    forwarded = []
+
+    class Runner(MoERunner):
+        supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+
+        def __init__(self, key, name, tokens=None):
+            super().__init__()
+            self.backend_key, self.name, self.tokens = key, name, tokens
+
+        def _accepts_shape(self, act):
+            return self.tokens is None or act.num_tokens == self.tokens
+
+        def get_valid_tactics(self, inputs, profile=None):
+            return [-1]
+
+        def pack_inputs(self, act, weights):
+            if weights.get_view(self.backend_key).get("invalid"):
+                raise ValueError("corrupt weights")
+            return [act.hidden_states_q]
+
+        def launch_kwargs_for(self, inputs):
+            return {}
+
+        def forward(self, inputs, **kwargs):
+            forwarded.append(self.name)
+            return inputs[0]
+
+    fallback = Runner("fallback", "fallback")
+    first, second = Runner("shared", "first", 9), Runner("shared", "second", 10)
+    layer = MoELayer.__new__(MoELayer)
+    layer.config = MoEConfig(
+        routing=RoutingConfig(num_experts=4, top_k=2),
+        quant=QuantConfig(),
+        experts=ExpertConfig(intermediate_size=128),
+    )
+    layer.runners, layer._winners = [fallback, first, second], OrderedDict()
+    selections = []
+
+    def select(act, weights, runners):
+        selections.append(tuple(runner.name for runner in runners))
+        return runners[-1], -1
+
+    monkeypatch.setattr(layer, "_select_winner", select)
+    monkeypatch.setattr(layer_module, "map_to_hybrid_bucket", lambda *_: 16)
+    weights = MoEWeightPack({"fallback": {}})
+
+    def run(tokens):
+        act = MoEActivationPack(
+            torch.empty(tokens, 128, dtype=torch.bfloat16, device="meta"),
+            None,
+            torch.empty(tokens, 2, dtype=torch.int32, device="meta"),
+            torch.empty(tokens, 2, dtype=torch.float32, device="meta"),
+        )
+        return layer(act, weights)
+
+    run(9)
+    weights.prepare_for("shared", {})
+    run(9)
+    run(10)
+    run(9)
+    weights.native_views.pop("shared")
+    run(10)
+    assert forwarded == ["fallback", "first", "second", "first", "fallback"]
+    assert selections == [("fallback",), ("fallback", "first"), ("fallback", "second")]
+    weights.prepare_for("shared", {"invalid": True})
+    with pytest.raises(ValueError, match="corrupt weights"):
+        run(9)
+    assert len(selections) == 3
+
+
+def test_backend_options_are_the_complete_candidate_pool(monkeypatch):
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import moe as frost_moe
+
+    runner = Mock(spec=layer_module._BACKEND_RUNNERS[CutlassBf16Config])
+    runner.backend_key = "cutlass_bf16"
+    runner.supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    runner.accepts.return_value = True
+    runner.pack_inputs.side_effect = lambda act, weights: [act.hidden_states_q]
+    runner.launch_kwargs_for.return_value = {}
+    runner.forward.side_effect = lambda inputs, **kwargs: inputs[0]
+    runner_cls = Mock(return_value=runner)
+    runner_cls.supports_quant.return_value = True
+    frost_cls = Mock(side_effect=AssertionError("Frost was not configured"))
+    monkeypatch.setattr(frost_moe, "CudnnFrostBf16MoeRunner", frost_cls)
+    monkeypatch.setattr(
+        layer_module,
+        "_BACKEND_RUNNERS",
+        {CutlassBf16Config: runner_cls, CudnnFrostBf16Config: frost_cls},
+    )
+    monkeypatch.setattr(layer_module, "get_compute_capability", lambda _: (10, 7))
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=64, top_k=6),
+        quant=QuantConfig(),
+        experts=ExpertConfig(intermediate_size=1408),
+        backend=BackendOptions((CutlassBf16Config(),)),
+    )
+    layer = MoELayer(config, device=torch.device("cpu"))
+    layer.tuner = SimpleNamespace(is_tuning_mode=True)
+
+    def select(act, weights, candidates):
+        assert candidates == [runner]
+        return runner, -1
+
+    monkeypatch.setattr(layer, "_select_winner", select)
+    act = MoEActivationPack(
+        torch.empty(16, 2048, dtype=torch.bfloat16, device="meta"),
+        None,
+        torch.empty(16, 6, dtype=torch.int32, device="meta"),
+        torch.empty(16, 6, dtype=torch.float32, device="meta"),
+    )
+    assert layer(act, MoEWeightPack({"cutlass_bf16": {}})) is act.hidden_states_q
+    runner_cls.assert_called_once()
+    frost_cls.assert_not_called()
+
+
+def test_explicit_frost_uses_standard_packing_and_reuses_token_bucket(monkeypatch):
     class Runner:
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
 
-        def __init__(self, key, exact):
-            self.backend_key, self.requires_exact_shape = key, exact
+        def __init__(self, key, requires_view):
+            self.backend_key, self.requires_view = key, requires_view
+            self.generation = 0
+            self.validations = 0
+            self.packings = 0
 
         def accepts(self, act, weights):
-            return "cudnn_frost_bf16" in weights.native_views
+            return True
+
+        def refresh(self):
+            self.generation += 1
 
         def pack_inputs(self, act, weights):
+            self.validations += 1
+            if self.requires_view:
+                weights.native_views[self.backend_key]
+            self.packings += 1
             return [act.hidden_states_q]
 
         def launch_kwargs_for(self, inputs):
@@ -142,19 +313,9 @@ def test_explicit_frost_filters_calls_and_separates_exact_shapes(monkeypatch):
     frost = Runner("cudnn_frost_bf16", True)
     fallback = Runner("fallback", False)
     layer = MoELayer.__new__(MoELayer)
-    layer.config, layer.device, layer._arch = config, torch.device("cuda:0"), 107
-    layer.runners, layer._automatic_runners, layer._winners = (
-        [fallback, frost],
-        {},
-        OrderedDict(),
-    )
+    layer.config, layer.device = config, torch.device("cuda:0")
+    layer.runners, layer._winners = [fallback, frost], OrderedDict()
     layer.tuner = SimpleNamespace(is_tuning_mode=True)
-    support = importlib.import_module(
-        _AUTO_CANDIDATES[frost.backend_key].support_module
-    )
-    monkeypatch.setattr(
-        support, "create_runner", lambda *args: pytest.fail("duplicate Frost runner")
-    )
     monkeypatch.setattr(layer_module, "map_to_hybrid_bucket", lambda *args: 16)
     selections = []
 
@@ -185,16 +346,32 @@ def test_explicit_frost_filters_calls_and_separates_exact_shapes(monkeypatch):
     assert layer(a, weights) is a.hidden_states_q
     assert layer(b, weights) is b.hidden_states_q
     assert layer.winner_backend == frost.backend_key
-    assert len(selections) == 2  # Same token bucket, distinct native plans.
+    assert len(selections) == 1  # Same bucket reuses its backend and tactic.
     weights.native_views.clear()
-    layer(a, weights)
-    assert layer.winner_backend == "fallback"
-    assert len(selections) == 3
+    with pytest.raises(KeyError, match="cudnn_frost_bf16"):
+        layer(a, weights)
+    assert len(selections) == 1  # Invalid packs fail at packing, without fallback.
     weights.prepare_for("cudnn_frost_bf16", {})
     layer(a, weights)
     assert layer.winner_backend == frost.backend_key
-    assert len(selections) == 3
-    assert not layer._automatic_runners
+    assert len(selections) == 1
+    assert frost.validations == 4
+    assert frost.packings == 3
+    layer(a, weights)
+    assert len(selections) == 1
+    assert frost.validations == 5
+    assert frost.packings == 4
+    frost.refresh()
+    layer(a, weights)
+    assert len(selections) == 1  # Runner snapshots do not qualify layer winners.
+    assert frost.validations == 6
+    assert frost.packings == 5
+    layer.refresh_backends()
+    assert not layer._winners
+    layer(a, weights)
+    assert len(selections) == 2  # Explicit layer refresh clears bucket winners.
+    assert frost.validations == 7
+    assert frost.packings == 6
 
 
 @pytest.mark.parametrize(
@@ -263,28 +440,63 @@ def test_bundled_assembler_is_independent_of_cuda_home(version, accepted, monkey
         ("mxfp8_mxfp4", "CudnnFrostMxfp8Mxfp4MoeRunner"),
     ],
 )
-def test_existing_runner_rechecks_selected_assembler(dtype, name, monkeypatch):
+def test_runner_refresh_rechecks_selected_assembler(
+    dtype, name, monkeypatch, frost_metadata_only
+):
+    from flashinfer.fused_moe.backends.cudnn_frost import engine
+
     module = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     runner = object.__new__(getattr(module, name))
-    runner.device, runner.config = "cuda", None
-    monkeypatch.setattr(module, "get_compute_capability", lambda _: (10, 7))
+    runner.device, runner.config, runner._built = torch.device("cuda:0"), None, True
+    selected = dict(backend="external_ptxas", version="release 13.5")
+    monkeypatch.setattr(engine.runtime, "_arch_for", lambda _: "sm_107a")
     monkeypatch.setattr(
-        module,
-        "large_bf16_moe" if dtype == "bf16" else "is_eligible",
-        lambda *args: True,
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=1),
     )
-    monkeypatch.setattr(
-        compiler,
-        "compiler_identity",
-        lambda: dict(backend="external_ptxas", version="release 13.3"),
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    reads = Mock(side_effect=lambda: selected.copy())
+    monkeypatch.setattr(compiler, "_read_compiler_identity", reads)
+    kernel = SimpleNamespace(tactic="test")
+    runner._engine = engine.FrostEngine(
+        runner.device,
+        artifact_roots=lambda: (),
+        artifact_version=lambda: 0,
+        refresh_artifacts=lambda: None,
+        policy_version="test",
+        tactic_tag="test",
+        select_kernels=lambda _: ((kernel,), (kernel,)),
+        select_fma=lambda _: None,
+        build_plan=lambda *args: pytest.fail("admission must not build a plan"),
+        require_assembler=True,
     )
-    # Reusing a constructed runner must not bypass the compiler gate. No tensor
-    # access or kernel compilation may happen on this rejected path.
-    assert runner.accepts(None, None) is False
+    validation = Mock(side_effect=ValueError("invalid pack"))
+    monkeypatch.setattr(runner, "pack_inputs", validation)
+    monkeypatch.setattr(runner, "_input_support", lambda *_: True)
+    act = object()
+    weights = MoEWeightPack({runner.backend_key: {}})
+    assert runner.accepts(act, weights)
+    assert not validation.called
+    key = runner._engine._snapshot_key
+    with pytest.raises(ValueError, match="invalid pack"):
+        runner.pack_inputs(act, weights)
+    assert validation.call_count == 1
+
+    selected["version"] = "release 13.3"
+    assert runner.accepts(act, weights)
+    assert runner._engine._snapshot_key == key
+    assert reads.call_count == 1  # Admission leaves the built snapshot unchanged.
     with pytest.raises(NotImplementedError, match="CUDA 13.4"):
-        runner._validate_pack(None, None)
+        runner.refresh()
+    assert runner._engine._snapshot_key == key
+    selected["version"] = "release 13.6"
+    runner.refresh()
+    assert runner._engine._snapshot_key != key
+    assert reads.call_count == 3
 
 
 @pytest.fixture(scope="module", params=FORMATS)
@@ -334,7 +546,7 @@ def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6)):
     return dtype, cls, canonical, config, layer, view
 
 
-def test_public_config_graph_and_automatic_admission(frost_case, monkeypatch):
+def test_public_config_graph_and_configured_admission(frost_case, monkeypatch):
     tokens = 9
     dtype, cls, canonical, config, layer, view = frost_case
     monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
@@ -369,7 +581,6 @@ def test_public_config_graph_and_automatic_admission(frost_case, monkeypatch):
             out = layer(act, own).clone()
         check(out)
         assert layer.winner_backend == key
-        assert not layer._automatic_runners
         torch.testing.assert_close(layer(act, shared), out)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -380,7 +591,18 @@ def test_public_config_graph_and_automatic_admission(frost_case, monkeypatch):
         torch.cuda.synchronize()
         check(graph_out)
 
-        automatic = MoELayer(replace(config, backend=BackendOptions((canonical(),))))
+        layer.refresh_backends()
+        assert not layer._winners
+        assert layer.winner_backend is None
+        check(layer(act, own))
+        graph_out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(graph_out)
+
+        automatic = MoELayer(
+            replace(config, backend=BackendOptions((canonical(), cls())))
+        )
 
         def select_frost(act, weights, runners):
             # Verify admission and real execution independent of performance.
@@ -398,15 +620,17 @@ def test_public_config_graph_and_automatic_admission(frost_case, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", ("mxfp8", "nvfp4", "mxfp8_mxfp4"))
-def test_quantized_selection_cache(dtype, monkeypatch):
+def test_quantized_selection_cache(dtype, monkeypatch, frost_metadata_only):
     moe = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     props = SimpleNamespace(multi_processor_count=128)
     monkeypatch.setattr(moe.common, "_arch_for", lambda _: "sm_107a")
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    selection = Mock(wraps=moe.select_stages)
-    monkeypatch.setattr(moe, "select_stages", selection)
+    from flashinfer.fused_moe.backends.cudnn_frost import heuristics
+
+    selection = Mock(wraps=heuristics.select_stages)
+    monkeypatch.setattr(heuristics, "select_stages", selection)
     args = dict(
         tokens=17,
         hidden=2048,
@@ -478,13 +702,24 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
     from flashinfer.fused_moe.backends.cudnn_frost import tuning
 
     tokens, e, h, i, k = 17, 16, 2048, 1536, 2
-    _, cls, _, config, layer, view = _make_frost_case(dtype, (e, h, i, k))
     moe = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     moe.runtime.clear_artifact_cache()
-    selection = Mock(wraps=moe.select_stages)
-    monkeypatch.setattr(moe, "select_stages", selection)
+    capture_selection = moe._capture_selection
+    selection = Mock()
+
+    def capture(*args):
+        snapshot = capture_selection(*args)
+
+        def select(shape):
+            selection(shape)
+            return snapshot.select_kernels(shape)
+
+        return snapshot._replace(select_kernels=select)
+
+    monkeypatch.setattr(moe, "_capture_selection", capture)
+    _, cls, _, config, layer, view = _make_frost_case(dtype, (e, h, i, k))
     stage_calls = set()
     original_forward = tuning._StageRunner.forward
 
@@ -521,12 +756,18 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
         ref = reference()
         check(out, ref)
         check(layer(act, weights), ref)
-        assert selection.call_count == 1  # Admission and packing share the result.
+        assert selection.call_count == 1  # Packing reuses this bucket's frozen pool.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             graph_out = layer(act, weights)
         ids.copy_(torch.tensor([e - 2, e - 1], device="cuda", dtype=ids.dtype))
         scores.copy_(scores.flip(-1))
+        scale_key = (
+            "fc1_weight_block_scale" if dtype == "nvfp4" else "fc1_expert_scales"
+        )
+        # The captured launch reads caller-owned SF directly; a content update
+        # needs neither a new pack nor graph recapture.
+        view[scale_key].view(torch.uint8).add_(1)
         changed_ref = reference()
         assert not torch.allclose(ref, changed_ref)
         graph_out.fill_(float("nan"))

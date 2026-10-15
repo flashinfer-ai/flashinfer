@@ -547,6 +547,7 @@ def prepare_problem(args, activation_name, geometry):
     from flashinfer.fused_moe import (
         BackendOptions,
         CutlassMxfp8Config,
+        CudnnGroupedGemmMxfp8Config,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
@@ -562,7 +563,11 @@ def prepare_problem(args, activation_name, geometry):
     quant = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
     major, minor = torch.cuda.get_device_capability()
     eligible, audit = discover_original(major * 10 + minor, quant, activation)
-    unsupported = set(eligible) - {CutlassMxfp8Config, TrtllmFp8BlockConfig}
+    unsupported = set(eligible) - {
+        CutlassMxfp8Config,
+        TrtllmFp8BlockConfig,
+        CudnnGroupedGemmMxfp8Config,
+    }
     if unsupported:
         raise RuntimeError(
             "Missing preparation for applicable backends: "
@@ -595,6 +600,10 @@ def prepare_problem(args, activation_name, geometry):
     )
     # The Frost runner shares this canonical CUTLASS weight view, byte for byte.
     views = {"cutlass_mxfp8": CutlassMxfp8Config.prepare_weights(w1, w2, **kwargs)}
+    if CudnnGroupedGemmMxfp8Config in eligible:
+        views["cudnn_grouped_gemm_mxfp8"] = CudnnGroupedGemmMxfp8Config.prepare_weights(
+            w1, w2, **kwargs
+        )
     if TrtllmFp8BlockConfig in eligible:
         views["trtllm_fp8_block"] = TrtllmFp8BlockConfig.prepare_weights(
             w1, w2, quant=quant, **kwargs
@@ -609,6 +618,8 @@ def prepare_problem(args, activation_name, geometry):
 
 
 def benchmark_case(args, config, weights, activation, geometry, routing, tokens, file):
+    from dataclasses import replace
+    from flashinfer.fused_moe import BackendOptions, CudnnFrostMxfp8Config
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import CutlassMxfp8Config, MoEActivationPack, MoELayer
 
@@ -624,9 +635,15 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
     scores = torch.rand(tokens, top_k, device="cuda").softmax(-1)
     act = MoEActivationPack(xq, xsf, ids, scores)
     layers = {"original": MoELayer(config)}
-    layers["original"]._additional_candidates = lambda *unused: []
     if not args.baseline_only:
-        layers["with_cudnn_frost"] = MoELayer(config)
+        layers["with_cudnn_frost"] = MoELayer(
+            replace(
+                config,
+                backend=BackendOptions(
+                    (*config.backend.candidates, CudnnFrostMxfp8Config())
+                ),
+            )
+        )
     expected = set(
         discover_original(
             torch.cuda.get_device_capability()[0] * 10
@@ -640,8 +657,11 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
     native_tactic_counts = {}
     for label, layer in layers.items():
         actual = {runner.backend_key for runner in layer.runners}
-        if actual != expected_keys:
-            raise RuntimeError(f"Original pool mismatch: {actual} != {expected_keys}")
+        allowed = expected_keys | (
+            {_FROST_BACKEND} if label == "with_cudnn_frost" else set()
+        )
+        if actual - {_FROST_BACKEND} != expected_keys or not actual <= allowed:
+            raise RuntimeError(f"Backend pool mismatch: {actual} != {allowed}")
         with autotune():
             layer(act, weights)
         outputs[label] = layer(act, weights).clone()
@@ -651,6 +671,8 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
         tactic_counts[label] = {}
         native_tactic_counts[label] = {}
         for runner in layer.runners:
+            if not runner.accepts(act, weights):
+                continue
             packed = runner.pack_inputs(act, weights)
             packed_keepalive.append(packed)
             tactic_counts[label][runner.backend_key] = len(
@@ -671,7 +693,9 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
     plan_checks = []
     if not args.baseline_only:
         layer = layers["with_cudnn_frost"]
-        runner = layer._automatic_runners.get(_FROST_BACKEND)
+        runner = next(
+            (r for r in layer.runners if r.backend_key == _FROST_BACKEND), None
+        )
         if runner is None or not runner.accepts(act, weights):
             raise RuntimeError(
                 f"Normal automatic admission failed: {activation} {geometry} {tokens}"

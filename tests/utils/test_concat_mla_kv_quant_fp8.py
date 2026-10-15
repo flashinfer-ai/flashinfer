@@ -160,9 +160,7 @@ def _assert_fused_byte_exact(T, H, backend="auto"):
     assert torch.equal(key.view(torch.uint8), ref_key)
     assert torch.equal(value.view(torch.uint8), ref_value)
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    assert stats["specialized_dispatches"] == before["specialized_dispatches"] + 1, (
-        stats
-    )
+    assert stats["fused_dispatches"] == before["fused_dispatches"] + 1, stats
     assert (
         stats["backend_dispatches"][expected]
         == before["backend_dispatches"][expected] + 1
@@ -188,16 +186,16 @@ def _assert_fused_byte_exact(T, H, backend="auto"):
         (1, 12, 2, 1, 3),
         (1536, 12, 2, 576, 3),
         (2048, 12, 2, 768, 3),
-        (2049, 12, 3, 513, 2),  # 6 pairs: three per warp (3 + 3, not 4 + 2)
-        (66048, 12, 3, 16512, 2),
-        (4096, 18, 3, 1536, 3),  # 9 pairs: three per warp over three warps
+        (2049, 12, 4, 513, 2),  # 6 pairs: 4 + 2 (the register budget's maximum first)
+        (66048, 12, 4, 16512, 2),
+        (4096, 18, 4, 1536, 3),  # 9 pairs: 4 + 4 + 1 over three warps
         (1536, 24, 2, 1152, 6),
         (16384, 24, 4, 6144, 3),
         (65536, 96, 4, 98304, 12),
         (1, 128, 2, 4, 32),
         (65536, 128, 4, 131072, 16),
         (131072, 128, 4, 262144, 16),
-        (4096, 10, 3, 1024, 2),  # 5 pairs: three then two per warp (not 4 + 1)
+        (4096, 10, 4, 1024, 2),  # 5 pairs: 4 + 1
         (4096, 13, 4, 1024, 2),  # 7 pairs, odd head count (last pair half predicated)
     ],
 )
@@ -295,7 +293,7 @@ def test_allowlist_guards_are_gpu_free():
         pe = torch.empty(T, ROPE, dtype=torch.bfloat16)
         key = torch.empty(T, H, NOPE + ROPE, dtype=fp8)
         value = torch.empty(T, H, V, dtype=fp8)
-        return mla_kv_pack._specialized_supported(kv, pe, key, value, NOPE)
+        return mla_kv_pack._fused_supported(kv, pe, key, value, NOPE)
 
     assert reason(1024, 12) == "device"  # every GPU-free guard passed
     assert reason(1024, 129) == "num_heads_not_allowlisted"
@@ -304,12 +302,10 @@ def test_allowlist_guards_are_gpu_free():
     pe = torch.empty(8, ROPE, dtype=torch.bfloat16)
     key = torch.empty(8, 12, NOPE + ROPE, dtype=fp8)
     bad_value = torch.empty(8, 12, V, dtype=torch.float8_e5m2)
-    assert mla_kv_pack._specialized_supported(kv, pe, key, bad_value, NOPE) == (
+    assert mla_kv_pack._fused_supported(kv, pe, key, bad_value, NOPE) == (
         "output_dtype"
     )
-    assert mla_kv_pack._specialized_supported(kv, pe, key, key, NOPE) == (
-        "output_geometry"
-    )
+    assert mla_kv_pack._fused_supported(kv, pe, key, key, NOPE) == ("output_geometry")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +321,7 @@ def test_byte_exact(T, H, backend):
     """Both fused backends, and the auto route, are byte-exact. 12 heads is the
     specialized kernel's unrolled variant (and auto's pick); 8 heads its
     runtime-head-count variant (auto picks Cake). Cake: 12 heads is two pairs
-    per warp up to 2048 tokens, three above; 8 heads two, then four."""
+    per warp up to 2048 tokens, 4 + 2 above; 8 heads two, then four."""
     _assert_fused_byte_exact(T, H, backend)
 
 
@@ -369,7 +365,7 @@ def test_explicit_backend_that_cannot_serve_takes_fallback():
     before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
     key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe_view, backend="specialized")
     after = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    assert after["specialized_dispatches"] == before["specialized_dispatches"]
+    assert after["fused_dispatches"] == before["fused_dispatches"]
     assert after["fallback_reasons"]["non_contiguous"] == (
         before["fallback_reasons"].get("non_contiguous", 0) + 1
     )
@@ -438,11 +434,11 @@ def test_all_bf16_patterns_byte_exact():
 def test_kill_switch_takes_fallback(monkeypatch):
     kv, pe = _inputs(2048, 12)
     ref_key, ref_value = _reference(kv, pe)
-    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fused_dispatches"]
     monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
     key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    assert stats["specialized_dispatches"] == before
+    assert stats["fused_dispatches"] == before
     assert stats["fallback_reasons"].get("kill_switch", 0) >= 1
     # Random data: compared where torch's own cast saturates (torch >= 2.13); the
     # fallback's NaN / overflow encoding is pinned on any torch build by
@@ -473,10 +469,10 @@ def test_fallback_encodes_nan_and_overflow_like_the_kernel(monkeypatch):
     kv = edge.repeat(n_kv // edge.numel() + 1)[:n_kv].view(T, H, NOPE + V).clone()
     pe = edge.repeat(n_pe // edge.numel() + 1)[:n_pe].view(T, ROPE).clone()
     monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
-    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fused_dispatches"]
     key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    assert stats["specialized_dispatches"] == before
+    assert stats["fused_dispatches"] == before
     ref_key, ref_value = _reference(kv, pe)
     assert torch.equal(key.view(torch.uint8), ref_key)
     assert torch.equal(value.view(torch.uint8), ref_value)
@@ -521,7 +517,7 @@ def test_strided_k_pe_byte_exact(T, H, row_stride, col_offset):
     kv, pe = _inputs(T, H)
     pe_view = _strided_k_pe(pe, row_stride, col_offset)
     assert (
-        mla_kv_pack._specialized_supported(
+        mla_kv_pack._fused_supported(
             kv,
             pe_view,
             torch.empty(T, H, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda"),
@@ -530,11 +526,10 @@ def test_strided_k_pe_byte_exact(T, H, row_stride, col_offset):
         )
         is None
     )
-    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fused_dispatches"]
     key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe_view)
     assert (
-        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
-        == before + 1
+        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fused_dispatches"] == before + 1
     )
     ref_key, ref_value = _reference(kv, pe)
     assert torch.equal(key.view(torch.uint8), ref_key)
@@ -610,7 +605,7 @@ def test_pre_blackwell_device_takes_fallback(monkeypatch):
     before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
     key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
     after = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    assert after["specialized_dispatches"] == before["specialized_dispatches"]
+    assert after["fused_dispatches"] == before["fused_dispatches"]
     assert after["fallback_reasons"]["compute_capability"] == (
         before["fallback_reasons"].get("compute_capability", 0) + 1
     )
@@ -628,7 +623,7 @@ def test_unbuilt_exact_target_takes_fallback(monkeypatch):
     before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
     key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe, backend="cake")
     after = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
-    assert after["specialized_dispatches"] == before["specialized_dispatches"]
+    assert after["fused_dispatches"] == before["fused_dispatches"]
     assert after["fallback_reasons"]["exact_target"] == (
         before["fallback_reasons"].get("exact_target", 0) + 1
     )
@@ -661,7 +656,7 @@ def test_cuda_graph_capture_after_warmup():
     flashinfer.concat_mla_kv_quant_fp8(kv, pe)  # builds/loads the module
     key = torch.empty(1024, 12, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
     value = torch.empty(1024, 12, V, dtype=torch.float8_e4m3fn, device="cuda")
-    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fused_dispatches"]
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -670,8 +665,7 @@ def test_cuda_graph_capture_after_warmup():
             flashinfer.concat_mla_kv_quant_fp8(kv, pe, key, value)
     torch.cuda.current_stream().wait_stream(s)
     assert (
-        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
-        == before + 1
+        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fused_dispatches"] == before + 1
     )
     key.zero_()
     value.zero_()
@@ -698,7 +692,7 @@ def test_capture_before_jit_takes_fallback():
     target = mla_kv_pack_jit.concat_mla_kv_quant_fp8_target(torch.device("cuda"))
     # Head group 1 (H <= 2) is rarely warmed by the other tests; force the cold state.
     head_group = mla_kv_pack._plan_head_group(256, 1)
-    saved = mla_kv_pack._modules.pop((target, head_group), None)
+    saved = mla_kv_pack._cake_modules.pop((target, head_group), None)
     try:
         kv, pe = _inputs(256, 1)
         key = torch.empty(256, 1, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
@@ -722,4 +716,4 @@ def test_capture_before_jit_takes_fallback():
             assert torch.equal(value.view(torch.uint8), ref_value)
     finally:
         if saved is not None:
-            mla_kv_pack._modules[(target, head_group)] = saved
+            mla_kv_pack._cake_modules[(target, head_group)] = saved

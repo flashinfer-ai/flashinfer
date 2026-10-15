@@ -1,5 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Cheap BF16 auto-admission; source and shortlist checks live in the runner."""
+"""Cheap BF16 input geometry checks for ordinary MoELayer candidates."""
 
 import torch
 
@@ -18,7 +18,8 @@ from .....fused_moe.api import (
     SwiGLUStep,
 )
 
-from ..support import shortlisted_moe_geometry
+from ..support import moe_geometry
+from ..activations import activation_name
 
 
 def large_bf16_moe(config, act, arch):
@@ -37,15 +38,12 @@ def large_bf16_moe(config, act, arch):
         config.activation,
         (SwiGLU, GeGLU, GeGLUTanh, SwiGLUStep, SiTU, GELU, Identity, ReLU, ReLU2, SiLU),
     ):
-        return shortlisted_moe_geometry(config, act)
+        try:
+            activation_name(config.activation)
+        except NotImplementedError:
+            return False
+        return moe_geometry(config, act)
     return False
 
 
 is_eligible = large_bf16_moe
-
-
-def create_runner(config, device):
-    """Load the implementation only after cheap automatic-admission checks."""
-    from .moe import automatic_candidate
-
-    return automatic_candidate(config, device)

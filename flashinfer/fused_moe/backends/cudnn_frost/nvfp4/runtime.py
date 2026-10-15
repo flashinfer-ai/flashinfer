@@ -9,8 +9,6 @@ cuDNN is needed only by the exporter, never by this runtime.
 
 from __future__ import annotations
 
-import functools
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +44,9 @@ class Nvfp4Kernel:
     tactic_metadata: dict
     launch_tail: tuple[str, ...]
     op: str
+    source_parameters: dict | None = None
+    template_path: Path | None = None
+    source_identity: str = ""
 
     @property
     def gated(self):
@@ -72,22 +73,18 @@ class Nvfp4Kernel:
         return (
             "cudnn_frost-nvfp4-v1",
             self.artifact_id,
-            runtime._tactic_digest(self.source_sha256),
+            runtime._tactic_digest(self.source_identity or self.source_sha256),
         )
 
 
-@functools.lru_cache(maxsize=8)
+@runtime.cache_discovery
 def discover(
     root: Path | None = None, *, quantized_output: bool = False
 ) -> tuple[Nvfp4Kernel, ...]:
     """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("nvfp4") if root is None else Path(root)
     path = root / runtime._MANIFEST
-    payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 2 or not isinstance(
-        payload.get("kernels"), list
-    ):
-        raise RuntimeError(f"invalid NVFP4 manifest: {path}")
+    payload = runtime._read_manifest(path)
     result, seen = [], set()
     for raw in payload["kernels"]:
         op, identity = raw.get("op"), raw.get("id")
@@ -165,19 +162,24 @@ def discover(
                 raw["tactic"],
                 tail,
                 op,
+                **runtime.source_binding(root, raw, digest),
             )
         )
-    return tuple(result)
+    return tuple(
+        bound for k in result if (bound := runtime.discovery_binding(k)) is not None
+    )
 
 
 def clear_artifact_cache() -> None:
-    """Refresh artifact metadata shared by selection, admission and packing."""
+    """Clear shared discovery caches for future builds and explicit refreshes."""
     global _artifact_cache_version
 
     from ..shortlist import _read
-    from .moe import _selected_kernels_cached
+    from .moe import _cached_artifact_roots, _selected_kernels_cached
 
     _artifact_cache_version += 1
+    runtime.artifact_root.cache_clear()
+    _cached_artifact_roots.cache_clear()
     discover.cache_clear()
     _selected_kernels_cached.cache_clear()
     _read.cache_clear()
@@ -353,6 +355,7 @@ class PreparedNvfp4GroupedGemm:
             raise ValueError("quantized FC1 kernels are launched by the MoE runner")
         if tokens.device.type != "cuda":
             raise ValueError("NVFP4 grouped GEMM requires CUDA tensors")
+        kernel = runtime.bind_kernel(kernel, tokens.device)
         with torch.cuda.device(tokens.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare NVFP4 grouped GEMM outside capture")

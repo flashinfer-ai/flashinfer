@@ -587,6 +587,7 @@ class MoERunner(TunableRunner):
     """
 
     backend_key: ClassVar[str] = ""
+    weight_view_aliases: ClassVar[tuple[str, ...]] = ()
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ()
     supported_output_formats: ClassVar[tuple[QuantFormat, ...]] = (QuantFormat.BF16,)
@@ -650,7 +651,15 @@ class MoERunner(TunableRunner):
         self._support_checked = True
 
     def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
-        """Return per-call eligibility; override for input-dependent constraints."""
+        """Select candidates with prepared weights and supported input geometry."""
+        if self.backend_key not in weights.native_views and not any(
+            key in weights.native_views for key in self.weight_view_aliases
+        ):
+            return False
+        return self._accepts_shape(act)
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        """Check cheap input-dependent limits before packing and kernel preparation."""
         return True
 
     def _check_support(self) -> None:
@@ -8143,7 +8152,8 @@ class SM12xNvfp4Bf16Runner(MoERunner):
 
     backend_key = "sm12x_nvfp4_bf16"
     # A view prepared for the cuTile NVFP4 runners is the same tensors.
-    weight_view_keys = (backend_key, "cutile_nvfp4")
+    weight_view_aliases = ("cutile_nvfp4",)
+    weight_view_keys = (backend_key, *weight_view_aliases)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     supported_activation_classes = (SwiGLU, ReLU2)
@@ -9608,6 +9618,15 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
             dtype=self._block_scale_dtype,
             device=self.device,
         )
+        # Native cuDNN block-scale plans need the captured scale address to
+        # remain valid across repeated graph captures. Keep it in the bucket's
+        # workspace instead of replacing it with a new tensor on every call.
+        workspace.permuted_hidden_states_scale = torch.empty(
+            workspace.num_rows,
+            hidden_size // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
         return workspace
 
     def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
@@ -9702,10 +9721,10 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
         from ..quantization.fp4_quantization import block_scale_interleave
 
         scale_rows = workspace.permuted_hidden_states_scale_rows[: workspace.num_rows]
-        workspace.permuted_hidden_states_scale = (
-            block_scale_interleave(scale_rows.view(torch.uint8))
-            .view(scale_rows.shape)
-            .view(self._block_scale_dtype)
+        assert workspace.permuted_hidden_states_scale is not None
+        block_scale_interleave(
+            scale_rows.view(torch.uint8),
+            out=workspace.permuted_hidden_states_scale.view(torch.uint8).view(-1),
         )
         return layout, workspace
 

@@ -10,30 +10,37 @@ from __future__ import annotations
 
 import functools
 from itertools import product
-from typing import Any
 
 import torch
 
-from .....autotuner import TuningConfig
 from .....fused_moe.api import QuantFormat, RoutingInputMode
 from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
 from ..support import weight_view
+from .support import is_eligible
 from ..compiler import require_moe_assembler
 from ..cache import (
-    LRUCache,
     require_graph_resource_retention,
-    retain_graph_resources,
     TensorCache,
 )
+from ..engine import (
+    FrostEngine,
+    FrostRunnerMixin,
+    PackedInputs as _Inputs,
+    allocate_workspace,
+    SelectionSnapshot,
+    capture_fma_selection,
+    make_kernel_selector,
+    seal_kernels,
+)
 from ..capabilities import require_compiler
-from ..shortlist import _read, select
-from ..heuristics import POLICY_VERSION, select_stages
+from ..shortlist import _read, capture_profiles
+from ..heuristics import POLICY_VERSION
+from ..catalog import can_implement, select_kernels as select_catalog
 from ..tuning import prepared_state, ranked_tactics
 from . import runtime, fma
-from .support import is_eligible
 
 _WEIGHT_KEYS = (
     "fc1_expert_weights",
@@ -49,9 +56,8 @@ _TAG = "cudnn_frost-nvfp4-moe-v3"
 
 
 def _tensor_version(tensor):
-    # Inference tensors deliberately have no version counter. Like other
-    # prepared-weight caches, those tensors are immutable for the runner's
-    # lifetime; ordinary tensors invalidate preparation on in-place writes.
+    # Only scalar validation uses versions; inference scalars have no counter.
+    # Their values must continue to satisfy the validated numerical contract.
     try:
         return tensor._version
     except RuntimeError:
@@ -66,6 +72,11 @@ def _module(arch):
 
 
 def _artifact_roots():
+    return _cached_artifact_roots()
+
+
+@functools.cache
+def _cached_artifact_roots():
     return (common.artifact_root("nvfp4"),)
 
 
@@ -92,10 +103,7 @@ def _matching_kernels(
         for kernel in runtime.discover(root, quantized_output=quantized_output):
             n, k = (intermediate, hidden) if kernel.fc1 else (hidden, intermediate)
             dims = dict(s=rows, n=n, k=k, experts=experts, groups=experts)
-            if kernel.arch != arch or not all(
-                common._dimension_matches(v, kernel.contract.get(d))
-                for d, v in dims.items()
-            ):
+            if kernel.arch != arch or not can_implement(kernel, dims):
                 continue
             if kernel.fc1:
                 if kernel.activation == name:
@@ -139,42 +147,11 @@ def _selected_kernels_cached(
 ):
     # Admission and packing share metadata only; per-call validation stays outside.
     profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
-    if not profiles or tokens > max(profiles):
-        first, second = _matching_kernels(
-            roots, arch, tokens * topk, hidden, intermediate, experts, name
-        )
-        if not first or not second:
-            return (), ()
-        fused, _ = _matching_kernels(
-            roots,
-            arch,
-            tokens * topk,
-            hidden,
-            intermediate,
-            experts,
-            name,
-            quantized_output=True,
-        )
-        return select_stages(
-            first,
-            second,
-            fused,
-            tokens=tokens,
-            hidden=hidden,
-            intermediate=intermediate,
-            experts=experts,
-            topk=topk,
-            sm_count=sm_count,
-        )
-    bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
-    if any(len(ids) != 2 for ids in profiles[bucket]):
-        return (), ()
     first, second = _matching_kernels(
         roots, arch, tokens * topk, hidden, intermediate, experts, name
     )
-    first, second = select(
-        roots, arch, name, tokens, hidden, intermediate, experts, topk, first, second
-    )
+    if not first or not second:
+        return (), ()
     fused, _ = _matching_kernels(
         roots,
         arch,
@@ -185,14 +162,18 @@ def _selected_kernels_cached(
         name,
         quantized_output=True,
     )
-    tiles = {kernel.tactic_metadata["tile"] for kernel in first}
-    # Retain the measured unfused choices: fusion can trade mainloop overlap
-    # for fewer launches. Include available data-store modes in full-pipeline tuning;
-    # the fused scale output uses STG in both variants.
-    variants = tuple(
-        kernel for kernel in fused if kernel.tactic_metadata["tile"] in tiles
+    return select_catalog(
+        first,
+        second,
+        fused,
+        profiles,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        sm_count=sm_count,
     )
-    return first + variants, second
 
 
 def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
@@ -208,11 +189,28 @@ def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
     return fma.tactic(activation_name(activation))
 
 
-class _Inputs(list):
-    def __init__(self, tensors, state, tuning_config):
-        super().__init__(tensors)
-        self.launch_state = state
-        self.tuning_config = tuning_config
+def _capture_selection(roots, arch, sm_count, activation):
+    name = activation_name(activation)
+    normal = seal_kernels(kernel for root in roots for kernel in runtime.discover(root))
+    fused = seal_kernels(
+        kernel
+        for root in roots
+        for kernel in runtime.discover(root, quantized_output=True)
+    )
+    select_fma, validate_fma_sources = capture_fma_selection(fma, name, arch)
+    return SelectionSnapshot(
+        make_kernel_selector(
+            tuple(kernel for kernel in normal if kernel.fc1),
+            tuple(kernel for kernel in normal if not kernel.fc1),
+            fused,
+            capture_profiles(roots),
+            arch,
+            name,
+            sm_count,
+        ),
+        select_fma,
+        validate_fma_sources,
+    )
 
 
 class _Plans:
@@ -227,75 +225,92 @@ class _Plans:
         first,
         second,
         workspace_pool,
+        executor_cache,
         swizzled=False,
         fma_tactic=None,
+        validate_fma_sources=None,
     ):
         self.plans, self.launches = {}, {}
+        first = tuple(common.bind_kernel(k, device) for k in first)
+        second = tuple(common.bind_kernel(k, device) for k in second)
         self.first, self.second = first, second
         required = 0
         module = _module(common._arch_for(device))
         for a, b in product(first, second):
             key = (_TAG, a.tactic, b.tactic)
-            plan = module.make_plan(
-                common._load_kernel(a, device),
-                common._load_kernel(b, device),
-                tokens,
-                hidden,
-                intermediate,
-                experts,
-                topk,
-                device.index,
-                a.workspace_bytes,
-                b.workspace_bytes,
-                a.gated,
-                [runtime._TAIL_SLOTS[name] for name in a.launch_tail],
-                [runtime._TAIL_SLOTS[name] for name in b.launch_tail],
-                a.swap_ab,
-                b.swap_ab,
-                swizzled,
-                False,
-            )
+            executor_key = (hidden, intermediate, experts, topk, swizzled, key)
+            plan = executor_cache.get(executor_key)
+            if plan is None:
+                plan = module.make_runner(
+                    [common._load_kernel(a, device)],
+                    [common._load_kernel(b, device)],
+                    hidden,
+                    intermediate,
+                    experts,
+                    topk,
+                    device.index,
+                    a.workspace_bytes,
+                    b.workspace_bytes,
+                    a.gated,
+                    [runtime._TAIL_SLOTS[name] for name in a.launch_tail],
+                    [runtime._TAIL_SLOTS[name] for name in b.launch_tail],
+                    a.swap_ab,
+                    b.swap_ab,
+                    swizzled,
+                    False,
+                )
+                executor_cache[executor_key] = plan
+            # Packed states retain Modules whose run Functions borrow them.
             self.plans[key], self.launches[key] = plan, plan["run"]
-            required = max(required, plan["workspace_size"]())
+            required = max(required, plan["workspace_size"](tokens))
         if fma_tactic is not None:
-            fc1, fc2 = fma.build(
-                tokens,
-                hidden,
-                intermediate,
-                experts,
-                topk,
-                device,
-                swizzled,
-                fma_tactic[1],
-            )
-            plan = module.make_plan(
-                fc1,
-                fc2,
-                tokens,
-                hidden,
-                intermediate,
-                experts,
-                topk,
-                device.index,
-                0,
-                0,
-                first[0].gated,
-                [],
-                [],
-                False,
-                False,
-                swizzled,
-                True,
-            )
+            executor_key = (hidden, intermediate, experts, topk, swizzled, fma_tactic)
+            plan = executor_cache.get(executor_key)
+            if plan is None:
+                if validate_fma_sources is not None:
+                    validate_fma_sources()
+                variants = [
+                    fma.build(
+                        t,
+                        hidden,
+                        intermediate,
+                        experts,
+                        topk,
+                        device,
+                        swizzled,
+                        fma_tactic[1],
+                    )
+                    for t in range(1, 5)
+                    if fma.supported(
+                        t, hidden, intermediate, experts, topk, fma_tactic[1]
+                    )
+                ]
+                plan = module.make_runner(
+                    [pair[0] for pair in variants],
+                    [pair[1] for pair in variants],
+                    hidden,
+                    intermediate,
+                    experts,
+                    topk,
+                    device.index,
+                    0,
+                    0,
+                    first[0].gated,
+                    [],
+                    [],
+                    False,
+                    False,
+                    swizzled,
+                    True,
+                )
+                if validate_fma_sources is not None:
+                    validate_fma_sources()
+                executor_cache[executor_key] = plan
             self.plans[fma_tactic], self.launches[fma_tactic] = plan, plan["run"]
-            required = max(required, plan["workspace_size"]())
-        capacity = min((size for size in workspace_pool if size >= required), default=0)
-        if not capacity:
-            capacity = 1 << (max(required, 1) - 1).bit_length()
-            workspace_pool[capacity] = torch.empty(
-                capacity, dtype=torch.uint8, device=device
-            )
-        self.workspace = workspace_pool[capacity][:required]
+            required = max(required, plan["workspace_size"](tokens))
+        # A bucket owns capacity storage; native executors use the call's actual
+        # token count. Older packed calls and graphs retain their allocation.
+        self.workspace = allocate_workspace(required, device, workspace_pool)
 
 
 def prepared_stage_inputs(inputs, *, tactic=None):
@@ -311,7 +326,7 @@ def prepared_stage_inputs(inputs, *, tactic=None):
     state = inputs.launch_state
     plan = state.plans[next(iter(state.plans)) if tactic is None else tactic]
     plan["prepare_stages"](*inputs, state.workspace)
-    xp, mp, qp, sp1, sp2, op, sf_rows = plan["stage_layout"]()
+    xp, mp, qp, sp1, sp2, op, sf_rows = plan["stage_layout"](inputs[1].shape[0])
     t, packed_h = inputs[1].shape
     e, _, packed_i = inputs[5].shape
     h, i = packed_h * 2, packed_i * 2
@@ -334,15 +349,13 @@ def prepared_stage_inputs(inputs, *, tactic=None):
     return result
 
 
-class CudnnFrostNvfp4MoeRunner(MoERunner):
+class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
     """Measured Tensor Core choices and an independent small-token FMA tactic.
 
-    Prepared weight scales are static during CUDA Graph replay. Updating an
-    ordinary block-scale tensor and calling ``pack_inputs`` again refreshes its
-    packed view; recapture graphs after such updates. Weights created inside
-    ``torch.inference_mode`` have no version counter and must remain immutable;
-    replace their tensors to prepare new values. Activations, activation scales,
-    routing IDs and scores may change in place between graph replays. FP32
+    Weight data and block scales are read directly, including inference tensors.
+    Their contents, activations and routing may change in place between graph
+    replays, with updates ordered before execution on the replay stream.
+    Captured graphs require stable tensor pointers, shapes and layouts. FP32
     GEMM descales are applied before activation (FC1) or BF16 output (FC2).
     The FC2 activation global scale controls intermediate NVFP4 quantization.
     As in CUTLASS, FC1's activation global is already represented by the
@@ -352,8 +365,9 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
     it sequentially; concurrent streams must use separate runners or layers.
     """
 
-    requires_exact_shape = True
     backend_key = "cudnn_frost_nvfp4"
+    weight_view_aliases = ("cutlass_nvfp4",)
+    _input_support = staticmethod(is_eligible)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = tuple(ACTIVATIONS.values())
@@ -364,9 +378,9 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
         self.config, self.device = config, torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self._plans, self._workspace_pool = LRUCache(), {}
+        self._engine = None
+        self._plans, self._workspace_pool = {}, {}
         self._validated_scales = TensorCache(maxsize=32)
-        self._fc1_scale_views = TensorCache()
 
     def _check_support(self):
         super()._check_support()
@@ -394,27 +408,55 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
         require_compiler("sm_107a", sources)
 
     def _build(self):
-        pass
+        device, activation = self.device, self.config.activation
+        swizzled = self.config.quant.swizzled_scale_factors is True
+        self._engine = FrostEngine(
+            device,
+            token_ceiling=self.config.execution.tune_max_num_tokens,
+            artifact_roots=_artifact_roots,
+            artifact_version=lambda: runtime._artifact_cache_version,
+            policy_version=POLICY_VERSION,
+            tactic_tag=_TAG,
+            require_assembler=True,
+            refresh_artifacts=runtime.clear_artifact_cache,
+            capture_selection=lambda roots, arch, sm_count: _capture_selection(
+                roots, arch, sm_count, activation
+            ),
+            build_plan=lambda shape, metadata, workspace_pool, executor_cache: _Plans(
+                *shape,
+                device,
+                metadata.first,
+                metadata.second,
+                workspace_pool,
+                executor_cache,
+                swizzled,
+                metadata.fma_tactic,
+                metadata.validate_fma_sources,
+            ),
+        )
+        self._plans = self._engine.plans
+        self._workspace_pool = self._engine.workspace_pool
 
     def _check_scale(self, value, *, positive):
         version = _tensor_version(value)
         if self._validated_scales.get(value, version, context=positive) is not None:
             return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Validate NVFP4 global scales outside CUDA Graph capture"
-            )
-        valid = torch.isfinite(value)
-        if positive:
-            valid = valid & (value > 0)
-        if not bool(valid.all().item()):
-            raise ValueError(
-                "cuDNN Frost NVFP4 requires finite scales and positive quantization globals"
-            )
+        with torch.cuda.device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Validate NVFP4 global scales outside CUDA Graph capture"
+                )
+            valid = torch.isfinite(value)
+            if positive:
+                valid = valid & (value > 0)
+            if not bool(valid.all().item()):
+                raise ValueError(
+                    "cuDNN Frost NVFP4 requires finite scales and positive quantization globals"
+                )
         self._validated_scales.put(value, version, True, context=positive)
 
-    def _validate_pack(self, act, weights):
-        require_moe_assembler()
+    def pack_inputs(self, act, weights):
+        self._require_built()
         self._validate_pack_contract(act)
         x, xsf = act.hidden_states_q, act.hidden_states_scale
         if x.ndim != 2 or x.dtype != torch.uint8:
@@ -455,13 +497,21 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
         expected = (
             (w1, torch.uint8, (e, mult * i, h // 2)),
             (w2, torch.uint8, (e, h, i // 2)),
-            (sf1, torch.uint8, (e, mult * i, h // 16)),
             (sf2, torch.uint8, (e, h, i // 16)),
             (alpha1, torch.float32, (e,)),
             (alpha2, torch.float32, (e,)),
         )
-        if any(
-            v.dtype != dtype or tuple(v.shape) != shape for v, dtype, shape in expected
+        if (
+            any(
+                v.dtype != dtype or tuple(v.shape) != shape
+                for v, dtype, shape in expected
+            )
+            or sf1.dtype != torch.uint8
+            or tuple(sf1.shape)
+            not in (
+                (e, mult * i, h // 16),
+                (mult, e, i, h // 16),
+            )
         ):
             raise ValueError(
                 "cuDNN Frost NVFP4 canonical weight/scale geometry mismatch"
@@ -487,129 +537,22 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
             raise ValueError(
                 "cuDNN Frost NVFP4 requires aligned contiguous tensors on the runner device"
             )
-        with torch.cuda.device(self.device):
-            self._check_scale(a1, positive=True)
-            self._check_scale(a2, positive=True)
-            self._check_scale(alpha1, positive=False)
-            self._check_scale(alpha2, positive=False)
-        return (
-            t,
-            h,
-            i,
-            e,
-            k,
-            w1,
-            w2,
-            sf1,
-            sf2,
-            xsf.view(torch.uint8),
-            a1.reshape(1),
-            alpha1,
-            a2.reshape(1),
-            alpha2,
-        )
-
-    def accepts(self, act, weights):
-        major, minor = get_compute_capability(self.device)
-        if not is_eligible(self.config, act, major * 10 + minor):
-            return False
-        try:
-            t, h, i, e, k, *_ = self._validate_pack(act, weights)
-        except (KeyError, ValueError, TypeError, NotImplementedError):
-            return False
-        first, second = _selected_kernels(
-            t, h, i, e, k, self.device, self.config.activation
-        )
-        return bool(first and second)
-
-    def pack_inputs(self, act, weights):
-        self._require_built()
-        t, h, i, e, k, w1, w2, sf1, sf2, xsf, a1, alpha1, a2, alpha2 = (
-            self._validate_pack(act, weights)
-        )
-        mult = 2 if self.config.activation.is_gated else 1
-        version = _tensor_version(sf1)
-        cached = self._fc1_scale_views.get(sf1, version)
-        if cached is None:
-            with torch.cuda.device(self.device):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "Prepare NVFP4 weight scales outside CUDA Graph capture"
-                    )
-                # Frozen SF descriptors have contiguous expert strides. Data
-                # descriptors accept canonical interleaved up/gate weights.
-                packed_sf1 = (
-                    sf1.reshape(e, mult, i, h // 16).transpose(0, 1).contiguous()
-                )
-            cached = packed_sf1
-            self._fc1_scale_views.put(sf1, version, cached)
-        sf1 = cached
-        first, second = _selected_kernels(
-            t, h, i, e, k, self.device, self.config.activation
-        )
-        if not first or not second:
-            raise ValueError("No legal cuDNN Frost stage candidates for this problem")
-        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation)
-        key = (
-            t,
-            h,
-            i,
-            e,
-            k,
-            tuple(a.tactic for a in first),
-            tuple(b.tactic for b in second),
-            fma_tactic,
-        )
-        if key not in self._plans:
-            with torch.cuda.device(self.device):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "Prepare cuDNN Frost MoE outside CUDA Graph capture"
-                    )
-                self._plans[key] = _Plans(
-                    t,
-                    h,
-                    i,
-                    e,
-                    k,
-                    self.device,
-                    first,
-                    second,
-                    self._workspace_pool,
-                    self.config.quant.swizzled_scale_factors is True,
-                    fma_tactic,
-                )
+        self._check_scale(a1, positive=True)
+        self._check_scale(a2, positive=True)
+        self._check_scale(alpha1, positive=False)
+        self._check_scale(alpha2, positive=False)
+        xsf = xsf.view(torch.uint8)
+        a1 = a1.reshape(1)
+        a2 = a2.reshape(1)
+        shape = (t, h, i, e, k)
+        state = self._engine.state(shape)
         output = torch.empty((t, h), dtype=torch.bfloat16, device=self.device)
         ids, scores = act.topk_ids, act.topk_weights
 
-        def preserve_routing(tensors):
-            # Autotuning must keep valid NVFP4 bytes/scales and the real route
-            # distribution; independently random scale bytes may encode NaN.
-            tensors[1:] = [
-                act.hidden_states_q,
-                ids,
-                scores,
-                w1,
-                w2,
-                sf1,
-                sf2,
-                xsf,
-                a1,
-                alpha1,
-                a2,
-                alpha2,
-            ]
-            return tensors
-
-        tuning = TuningConfig(
-            use_cuda_graph=True,
-            cuda_graph_profile_replays=3,
-            inputs_pre_hook=preserve_routing,
-        )
         return _Inputs(
             [
                 output,
-                act.hidden_states_q,
+                x,
                 ids,
                 scores,
                 w1,
@@ -622,8 +565,7 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
                 a2,
                 alpha2,
             ],
-            self._plans[key],
-            tuning,
+            state,
         )
 
     def get_valid_tactics(self, inputs, profile):
@@ -633,38 +575,38 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
             return ranked_tactics(state, inputs, _TAG)
         tokens, packed_hidden = inputs[1].shape
         hidden = 2 * packed_hidden
-        first, second = _selected_kernels(
-            tokens,
-            hidden,
-            self.config.experts.intermediate_size,
-            self.config.routing.num_experts,
-            self.config.routing.top_k,
-            self.device,
-            self.config.activation,
+        return self._engine.valid_tactics(
+            inputs,
+            shape=(
+                tokens,
+                hidden,
+                self.config.experts.intermediate_size,
+                self.config.routing.num_experts,
+                self.config.routing.top_k,
+            ),
         )
-        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
-        fma_tactic = _fma_tactic(
-            tokens,
-            hidden,
-            self.config.experts.intermediate_size,
-            self.config.routing.num_experts,
-            self.config.routing.top_k,
-            self.config.activation,
-        )
-        if fma_tactic is not None:
-            tactics.append(fma_tactic)
-        return tactics
 
     def _input_cache_key_extras(self, inputs):
         state = prepared_state(self, inputs, hidden_multiplier=2)
-        return (
-            POLICY_VERSION,
-            (
-                tuple(state.launches)
-                if state is not None
-                else tuple(self.get_valid_tactics(inputs, None))
-            ),
-        )
+        if state is not None:
+            key, tactics = state.preparation_key, tuple(state.launches)
+        else:
+            t, packed_h = inputs[1].shape
+            h = packed_h * 2
+            metadata = self._engine.prepare(
+                (
+                    t,
+                    h,
+                    self.config.experts.intermediate_size,
+                    self.config.routing.num_experts,
+                    self.config.routing.top_k,
+                )
+            )
+            key, tactics = (
+                metadata.plan_key,
+                tuple(self.get_valid_tactics(inputs, None)),
+            )
+        return (POLICY_VERSION, key, tactics)
 
     def validate_tactic(self, inputs, tactic):
         state = prepared_state(self, inputs, hidden_multiplier=2)
@@ -673,36 +615,3 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
             if state is not None
             else self.get_valid_tactics(inputs, None)
         )
-
-    def forward(
-        self,
-        inputs,
-        tactic: Any = -1,
-        do_preparation=False,
-        *,
-        launch_state=None,
-        **kwargs: Any,
-    ):
-        self._require_built()
-        state = launch_state or self.launch_state_for(inputs)
-        if state is None:
-            raise ValueError(
-                "Preserve packed cuDNN Frost inputs or pass their launch_state"
-            )
-        if tactic == -1:
-            tactic = next(iter(state.launches))
-        if tactic not in state.launches:
-            raise ValueError(f"Unknown or stale cuDNN Frost MoE tactic: {tactic!r}")
-        retain_graph_resources(state, inputs)
-        state.launches[tactic](*inputs, state.workspace)
-        return inputs[0]
-
-
-def automatic_candidate(config, device):
-    runner = CudnnFrostNvfp4MoeRunner(config, device)
-    try:
-        runner.check_support()
-    except (NotImplementedError, ValueError):
-        return None
-    runner.build()
-    return runner

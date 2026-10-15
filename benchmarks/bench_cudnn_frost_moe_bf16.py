@@ -71,6 +71,8 @@ def configure_source_jit():
 
 
 def benchmark(args):
+    from flashinfer.fused_moe import CudnnFrostBf16Config
+
     gpu_uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
     check_idle_gpu(gpu_uuid)
     torch.manual_seed(args.seed)
@@ -202,10 +204,26 @@ def benchmark(args):
         ids = logits.topk(args.top_k, dim=1).indices.int()
         scores = torch.rand(tokens, args.top_k, device="cuda").softmax(-1)
         act = MoEActivationPack(x, None, ids, scores)
-        layers = {"original": MoELayer(config), "with_cudnn_frost": MoELayer(config)}
+        layers = {
+            "original": MoELayer(config),
+            "with_cudnn_frost": MoELayer(
+                replace(
+                    config,
+                    backend=BackendOptions(
+                        (*config.backend.candidates, CudnnFrostBf16Config())
+                    ),
+                )
+            ),
+        }
         for label, layer in layers.items():
             actual_backends = {runner.backend_key for runner in layer.runners}
-            if actual_backends != expected_backends:
+            allowed = expected_backends | (
+                {"cudnn_frost_bf16"} if label == "with_cudnn_frost" else set()
+            )
+            if (
+                actual_backends - {"cudnn_frost_bf16"} != expected_backends
+                or not actual_backends <= allowed
+            ):
                 raise RuntimeError(
                     f"{label} backend pool mismatch: expected {expected_backends}, "
                     f"got {actual_backends}"
@@ -216,18 +234,14 @@ def benchmark(args):
             ),
             flush=True,
         )
-        # Benchmark-only dispatcher ablation, never a change to an existing runner.
-        layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.fused_moe.backends.cudnn_frost.bf16.moe import (
-                CudnnFrostBf16MoeRunner,
+            # Explicit benchmark-only probe outside the normal model shortlist.
+            probe = next(
+                r
+                for r in layers["with_cudnn_frost"].runners
+                if r.backend_key == "cudnn_frost_bf16"
             )
-
-            probe = CudnnFrostBf16MoeRunner(config, x.device)
-            probe.check_support()
-            probe.build()
-            layers["with_cudnn_frost"]._automatic_runners["cudnn_frost_bf16"] = probe
-            layers["with_cudnn_frost"]._additional_candidates = lambda *args: [probe]
+            probe._accepts_shape = lambda act: True
         outputs, graphs, winners = {}, {}, {}
         for label, layer in layers.items():
             with autotune():
@@ -252,7 +266,9 @@ def benchmark(args):
 
         # Measure the best independent cuDNN Frost candidate even if an original backend wins.
         layer = layers["with_cudnn_frost"]
-        cudnn_frost = layer._automatic_runners.get("cudnn_frost_bf16")
+        cudnn_frost = next(
+            (r for r in layer.runners if r.backend_key == "cudnn_frost_bf16"), None
+        )
         if cudnn_frost is not None and (
             args.probe_cudnn_frost or cudnn_frost.accepts(act, weights)
         ):
@@ -582,6 +598,10 @@ def export_task(opts):
 
 def export(args, file):
     import cudnn
+    from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+        read_manifest,
+        write_manifest,
+    )
 
     source = args.cudnn_frost_source.resolve()
     if not Path(cudnn.__file__).resolve().is_relative_to(source):
@@ -599,13 +619,26 @@ def export(args, file):
     major, minor = torch.cuda.get_device_capability()
     manifest = args.artifacts / "cudnn_frost_selected_kernels.json"
     payload = dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
+    catalog = {}
     if manifest.exists():
-        payload = json.loads(manifest.read_text())
-        if payload.get("schema_version") != 2:
-            raise ValueError(
-                "Re-export legacy object candidates into a new source directory"
-            )
+        catalog = json.loads(manifest.read_text())
+        payload = read_manifest(manifest)
     existing = {r["id"] for r in payload["kernels"]}
+    # V4 IDs omit sweep geometry and producer revision. Resolve the same axes
+    # against the existing catalog before comparing the generated sweep ID.
+    existing_axes = {
+        (
+            r["arch"],
+            r["op"],
+            r["tactic"]["tile"],
+            r["tactic"]["cta_group"],
+            r["tactic"]["scheduler"],
+            r["tactic"]["store_mode"],
+        ): r["id"]
+        for r in payload["kernels"]
+        if catalog.get("schema_version") == 4
+        and revision in payload.get("producer", {}).get("revisions", ())
+    }
     failed = set()
     if args.resume:
         for line in args.output.read_text().splitlines():
@@ -664,6 +697,9 @@ def export(args, file):
                 if index % args.num_shards != args.shard_index:
                     continue
                 identity = f"sm{major}{minor}_cudnn_frost_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
+                identity = existing_axes.get(
+                    (f"sm_{major}{minor}a", op, name, cta, "clc", mode), identity
+                )
                 if identity in existing or identity in failed or args.catalog_only:
                     continue
                 opts = argparse.Namespace(
@@ -691,9 +727,7 @@ def export(args, file):
     args.artifacts.mkdir(parents=True, exist_ok=True)
 
     def save():
-        temporary = manifest.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        temporary.replace(manifest)
+        write_manifest(manifest, payload)
 
     def retain(result):
         if result["kind"] == "exported":
@@ -1138,21 +1172,19 @@ def copy_selected(artifacts, selected_dir, identities, file):
     from flashinfer.fused_moe.backends.cudnn_frost.runtime import (
         _safe_child,
     )
+    from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
+        read_manifest,
+        write_manifest,
+    )
 
-    manifest = json.loads((artifacts / "cudnn_frost_selected_kernels.json").read_text())
-    if manifest.get("schema_version") != 2:
-        raise ValueError(
-            "Selection requires a source manifest; re-export legacy objects"
-        )
+    manifest = read_manifest(artifacts / "cudnn_frost_selected_kernels.json")
     records = {r["id"]: r for r in manifest["kernels"]}
     target_manifest = selected_dir / "cudnn_frost_selected_kernels.json"
     payload = (
-        json.loads(target_manifest.read_text())
+        read_manifest(target_manifest)
         if target_manifest.exists()
         else dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
     )
-    if payload.get("schema_version") != 2:
-        raise ValueError(f"refusing to update unsupported manifest {target_manifest}")
     previous = {r["id"]: r for r in payload["kernels"]}
     for identity in sorted(identities):
         record = records[identity]
@@ -1176,9 +1208,7 @@ def copy_selected(artifacts, selected_dir, identities, file):
             payload["kernels"].append(record)
             previous[identity] = record
         emit(file, dict(kind="selected", id=identity))
-    temporary = target_manifest.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(target_manifest)
+    return write_manifest(target_manifest, payload)
 
 
 def rank_stage(runs, width):
@@ -1371,15 +1401,7 @@ def shortlist(args, file):
         rank = geometries.index(geometry) if geometry in geometries else len(geometries)
         return activations[entry["activation"]], rank, entry["tokens"]
 
-    for entry in sorted(entries, key=order):
-        existing = index.get(profile(entry))
-        if existing is None:
-            payload["entries"].append(entry)
-        elif payload["entries"][existing] != entry:
-            if not args.replace:
-                raise ValueError(f"Shortlist already differs for {profile(entry)}")
-            payload["entries"][existing] = entry
-    copy_selected(
+    mapping = copy_selected(
         args.artifacts,
         args.selected_dir,
         {
@@ -1390,6 +1412,21 @@ def shortlist(args, file):
         },
         file,
     )
+    for entry in (*payload["entries"], *entries):
+        for stage in ("fc1", "fc2"):
+            entry[stage] = list(
+                dict.fromkeys(
+                    mapping.get(identity, identity) for identity in entry[stage]
+                )
+            )
+    for entry in sorted(entries, key=order):
+        existing = index.get(profile(entry))
+        if existing is None:
+            payload["entries"].append(entry)
+        elif payload["entries"][existing] != entry:
+            if not args.replace:
+                raise ValueError(f"Shortlist already differs for {profile(entry)}")
+            payload["entries"][existing] = entry
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
