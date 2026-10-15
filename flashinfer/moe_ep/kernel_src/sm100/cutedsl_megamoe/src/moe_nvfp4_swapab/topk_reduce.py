@@ -179,9 +179,11 @@ class TopkReduce:
         combine_format: CombineFormat,
         *,
         sm_arch: str,
+        num_experts: Optional[int] = None,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
+        self.num_experts = None if num_experts is None else int(num_experts)
         self.combine_format = combine_format
         arch_code = sm_arch.removeprefix("sm_")
         if arch_code[-1:] in ("a", "f"):
@@ -270,7 +272,15 @@ class TopkReduce:
         reduced_output: cute.Tensor,  # (token, hidden)
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
+        topk_indices: Optional[cute.Tensor] = None,
     ):
+        if cutlass.const_expr(topk_indices is not None):
+            if cutlass.const_expr(
+                self.num_experts is None or self.combine_format.is_quantized
+            ):
+                raise ValueError(
+                    "Masked combine requires BF16 storage and a static expert count."
+                )
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
         grid = [(total_workers + threads - 1) // threads, 1, 1]
@@ -298,7 +308,9 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, topk_score, reduced_output).launch(
+            self._reduce_bf16(
+                combine_quant, topk_score, reduced_output, topk_indices
+            ).launch(
                 grid=grid,
                 block=block,
                 stream=stream,
@@ -369,6 +381,7 @@ class TopkReduce:
         combine_output: cute.Tensor,
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        topk_indices: Optional[cute.Tensor] = None,
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
@@ -421,9 +434,20 @@ class TopkReduce:
                     (hidden_per_thread,),
                     cutlass.BFloat16,
                 )
-                cute.copy(load_atom, terms[k, None], term)
+                if cutlass.const_expr(topk_indices is not None):
+                    expert = topk_indices[token_idx, Int32(k)]
+                    valid_route = (expert >= 0) & (expert < self.num_experts)
+                    term.fill(0)
+                    if valid_route:
+                        cute.copy(load_atom, terms[k, None], term)
+                else:
+                    cute.copy(load_atom, terms[k, None], term)
                 if cutlass.const_expr(topk_score is not None and not prefetch):
                     score_reg[k] = topk_score[token_idx, Int32(k)]
+                if cutlass.const_expr(topk_indices is not None):
+                    # Zero both operands: a stale NaN score times zero is NaN.
+                    if not valid_route:
+                        score_reg[k] = score_dtype(0)
                 score = Float32(score_reg[k])
 
                 if cutlass.const_expr(self.use_scalar_math):

@@ -332,6 +332,12 @@ run_mega() {
     tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
 
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mega_cuda_graph_multirank.py -v \
+    -k "tail_reset_multirank_graph or sparse_dispatch_graph or sparse_to_dense_graph or blackwell_genphase_graph" \
+    -m "gpu_2 and arch_blackwell" || rc=1
+
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
