@@ -118,7 +118,9 @@ def _launch(worker, world_size: int, *args) -> None:
     if "LOCAL_RANK" in os.environ:
         if int(os.environ["WORLD_SIZE"]) != world_size:
             pytest.skip("different torchrun world size")
-        _run_env_worker(worker, (int(os.environ["LOCAL_RANK"]), None, world_size, *args))
+        _run_env_worker(
+            worker, (int(os.environ["LOCAL_RANK"]), None, world_size, *args)
+        )
         return
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} GPUs are required")
