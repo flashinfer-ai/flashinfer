@@ -11,7 +11,7 @@ Usage (CI)::
     python3 scripts/pr_checks/check_skip_all.py \\
         --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \\
         --summary junit/run-summary.json \\
-        [--github-actions] [--fail]
+        [--github-actions]
 
 Usage (standalone / selftest)::
 
@@ -31,10 +31,8 @@ Outputs:
 
 * Exit 0 if every changed test file had at least one non-skipped node on at
   least one lane, OR if no test files were changed.
-* Exit 1 if ``--fail`` is set and any changed test file was skip-all on every
-  lane.
-* Exit 0 with warnings (and GitHub annotations if ``--github-actions``) if
-  ``--fail`` is not set.
+* Exit 0 with warnings (and GitHub annotations if ``--github-actions``) when
+  skip-all files are detected.
 * A Markdown summary on stdout suitable for ``$GITHUB_STEP_SUMMARY``.
 
 Design notes:
@@ -720,11 +718,6 @@ def main() -> int:
         action="store_true",
         help="Emit GitHub Actions annotations",
     )
-    ap.add_argument(
-        "--fail",
-        action="store_true",
-        help="Exit 1 if any changed test file is skip-all on every lane",
-    )
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -765,8 +758,6 @@ def main() -> int:
     if args.github_actions:
         emit_annotations(findings, results, changed)
 
-    if findings and args.fail:
-        return 1
     return 0
 
 

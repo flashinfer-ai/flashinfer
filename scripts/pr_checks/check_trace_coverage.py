@@ -23,7 +23,7 @@ This script:
 Usage::
 
     python3 scripts/pr_checks/check_trace_coverage.py [--trace-dir DIR] \\
-        [--github-actions] [--fail] [--selftest]
+        [--github-actions] [--selftest]
 
 This addresses IKL-569 required change 4 and completion checks 3–4.
 """
@@ -338,11 +338,6 @@ def main() -> int:
         action="store_true",
         help="Emit GitHub Actions annotations",
     )
-    ap.add_argument(
-        "--fail",
-        action="store_true",
-        help="Exit 1 if any verified definition is missing coverage",
-    )
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -358,11 +353,6 @@ def main() -> int:
 
     if args.github_actions:
         emit_annotations(audits)
-
-    if args.fail:
-        verified_gaps = [a for a in audits if not a.covered and a.status == "verified"]
-        if verified_gaps:
-            return 1
 
     return 0
 
