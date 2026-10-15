@@ -165,6 +165,7 @@ MTP_BASELINE = {
 }
 
 PREFILL_BASELINE = {
+    "kernel_variant": "sm100",
     "target_key": (0, "sm100a"),
     "io_dtype_str": "torch.bfloat16",
     "state_dtype_str": "torch.float32",
@@ -402,6 +403,7 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
         ("output_state_inner_strides", (16384, 128, 1)),
         ("num_sm", 132),
         ("target_key", (0, "sm90a")),
+        ("kernel_variant", "sm107"),
     ],
 )
 def test_prefill_name_varies_with_every_argument(param, alternate):
