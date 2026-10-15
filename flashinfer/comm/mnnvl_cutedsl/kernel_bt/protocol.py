@@ -117,6 +117,54 @@ BT_ALL_REDUCE_GB300_TP8_H5120_PRESET_1 = BTAllReduceTuning(
     collective=BTCollectiveTuning(reduction_threads=320)
 )
 
+# hidden_size=7168, bf16, top_k=16 (Kimi K3). These use only the existing BT
+# launch knobs. PRESET_0 covers the latency-sensitive end of the BT range;
+# PRESET_1 increases publication/reduction parallelism for larger M.
+BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=8,
+    threads=128,
+    prefetch_group=16,
+    collective=BTCollectiveTuning(reduction_threads=160, rms_threads=896),
+)
+BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1 = BTFinalizeTuning(
+    elements_per_thread=4,
+    threads=128,
+    prefetch_group=4,
+    collective=BTCollectiveTuning(reduction_threads=448, rms_threads=512),
+)
+BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=4,
+    threads=128,
+    prefetch_group=16,
+    collective=BTCollectiveTuning(reduction_threads=192, rms_threads=896),
+)
+BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_1 = BTFinalizeTuning(
+    elements_per_thread=4,
+    threads=64,
+    prefetch_group=16,
+    collective=BTCollectiveTuning(reduction_threads=256, rms_threads=512),
+)
+BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_0 = BTAllReduceTuning(
+    publish_threads=512,
+    publish_vectors_per_thread=4,
+    collective=BTCollectiveTuning(reduction_threads=32, rms_threads=1024),
+)
+BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_1 = BTAllReduceTuning(
+    publish_threads=768,
+    publish_vectors_per_thread=8,
+    collective=BTCollectiveTuning(reduction_threads=320, rms_threads=512),
+)
+BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_0 = BTAllReduceTuning(
+    publish_threads=64,
+    publish_vectors_per_thread=8,
+    collective=BTCollectiveTuning(reduction_threads=128, rms_threads=1024),
+)
+BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_1 = BTAllReduceTuning(
+    publish_threads=768,
+    publish_vectors_per_thread=8,
+    collective=BTCollectiveTuning(reduction_threads=192, rms_threads=448),
+)
+
 
 @dataclass(slots=True)
 class BTProtocolState:

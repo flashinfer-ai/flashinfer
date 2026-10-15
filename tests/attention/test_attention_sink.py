@@ -30,7 +30,8 @@ from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
 from flashinfer.jit.attention.variants import attention_sink_decl
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
 
-pytestmark = pytest.mark.solo
+# Single-GPU tests; H100 CI peaked at 89.2 GiB host RSS and 4.5 GiB GPU memory.
+pytestmark = [pytest.mark.host_memory_heavy, pytest.mark.gpu_exclusive]
 
 
 @pytest.fixture(
