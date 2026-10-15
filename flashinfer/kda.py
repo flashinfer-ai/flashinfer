@@ -49,6 +49,25 @@ def _cudnn_kda_prefill_available() -> bool:
 
 
 def _select_kda_prefill_backend(q, initial_state, cu_seqlens, *, allow_cudnn=True):
+    """Choose a backend for single-sequence BF16 prefill on SM100/SM103.
+
+    The policy covers head dimension 128, 1K-64K tokens, and up to 96 local
+    heads. Few heads means 1-16, moderate means 17-64, and wide means 65-96.
+    K means 1024 tokens. The caller checks backend eligibility.
+
+    With FP32 state, few heads use cute-dsl below 4K and cuDNN from 4K.
+    Moderate heads use persistent below 4K and cuDNN from 4K, except that
+    SM103 keeps persistent from 8K to below 16K. Wide heads use persistent.
+    Moderate and wide FP32 cases require a head count divisible by eight.
+
+    With BF16 state, few heads use small-bh until cuDNN takes over at 4K
+    for up to eight heads, or 8K for 9-16 heads. Moderate heads use small-bh.
+    Wide heads use cuDNN on SM100 and Cake on SM103.
+
+    When cuDNN is disallowed, use the corresponding native backend:
+    cute-dsl or persistent for FP32, and small-bh or Cake for BF16.
+    Return None outside this region to retain the existing policy.
+    """
     if not (
         q.is_cuda
         and q.dtype == torch.bfloat16
