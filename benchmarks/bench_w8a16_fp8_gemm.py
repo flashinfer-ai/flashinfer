@@ -76,10 +76,12 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import math
 import csv
 import os
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable
@@ -137,6 +139,7 @@ DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 # ---------------------------------------------------------------------------
 
 _L2_FLUSH_SIZE = 32 * 1024 * 1024  # float32 elements -> 128 MB
+_HEATED = [False]  # --warmup-seconds runs once per process
 _l2_flush: torch.Tensor | None = None
 
 
@@ -483,6 +486,36 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     # drifts between back-to-back measurements; interleaving keeps that drift out of the
     # per-row ratios.
     names = list(impls)
+    # Steady-state recipe (--warmup-seconds / --burst-seconds): a short burst never reaches
+    # the 700 W power cap and measures the boost clock instead (benchmarks/
+    # w8a16_fp8_gemm_ladder.md, recipe experiment).  Heat the GPU with an untimed burst of the
+    # first column, then size each timed burst by time rather than by launch count.
+    iters_by_name = {name: args.iters for name in names}
+    if args.burst_seconds > 0:
+        for name in names:
+            fn = impls[name]
+            torch.cuda.synchronize()
+            ev0, ev1 = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            ev0.record()
+            for _ in range(5):
+                fn()
+            ev1.record()
+            torch.cuda.synchronize()
+            call_s = max(ev0.elapsed_time(ev1) / 5 * 1e-3, 1e-6)
+            iters_by_name[name] = int(
+                min(5000, max(50, math.ceil(args.burst_seconds / call_s)))
+            )
+    if args.warmup_seconds > 0 and not _HEATED[0]:
+        fn = impls[names[0]]
+        t_end = time.monotonic() + args.warmup_seconds
+        while time.monotonic() < t_end:
+            for _ in range(20):
+                fn()
+            torch.cuda.synchronize()
+        _HEATED[0] = True
     per_round: dict[str, list[float]] = {name: [] for name in names}
     for rnd in range(args.rounds):
         # Rotate by an even share of the column count per round so every column visits the
@@ -494,7 +527,10 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         for name in order:
             fn = impls[name]
             tag = f"w8a16[{layer} tp{tp} M={m} N={n} K={k}] {name}"
+            saved = args.iters
+            args.iters = iters_by_name[name]
             t, _, _ = _time_kernel(args, lambda: fn(), tag)
+            args.iters = saved
             per_round[name].append(t)
     for name in names:
         us[name] = statistics.median(per_round[name])
@@ -699,6 +735,19 @@ def parse_args(argv=None):
         help="interleaved passes over the implementations per row (median across passes)",
     )
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=0.0,
+        help="untimed burst before the first measurement of the process (reach the power cap)",
+    )
+    p.add_argument(
+        "--burst-seconds",
+        type=float,
+        default=0.0,
+        help="size each timed burst by time: iters = clamp(ceil(s / call time), 50, 5000); "
+        "0 = use --iters",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-l2-flush", dest="l2_flush", action="store_false")
     p.add_argument("--no-cupti", dest="cupti", action="store_false")

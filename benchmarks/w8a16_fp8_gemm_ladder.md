@@ -1004,6 +1004,24 @@ describes that kernel; it is the record of how the CUTLASS menu got here.
 `W8A16Fp8GemmSm90WorkspaceBytes`).  Numeric codes unchanged (1 still reserved).  The sections above
 keep the names as they were when measured (`cutlass_128x256` = `128x256`).
 
+**Measurement recipe (Thu 15 Oct 2026).**  A 50-launch burst never reaches the 700 W power cap: the
+whole process runs at boost clock (1965 MHz, 225-360 W), and the capped steady state (1410-1450 MHz
+at 693 W on a 1.4 ms kernel) starts ~0.8 s into a burst on the H100 and ~6.5 s on the H200.  So
+50 x 3 measures a different operating point, and on long kernels the ratio flips (mlp.down tp2
+M = 8192, 128x256: 1.022-1.040 at 50 x 3, 0.983-0.986 at 500 x 3, three repeats each).  The bench
+got `--warmup-seconds` (an untimed burst once per process) and `--burst-seconds` (each timed burst
+sized by time: iters = clamp(ceil(s / call), 50, 5000)); proposed recipe 10 s / 2 s / 3 rounds,
+pending Igor's decision.  Details: `hopper-mail/recipe_experiment.md`.
+
+**Step 3.2b: 64x64 / 64x32 ping-pong split-K tiles, not landed.**  Measured on the narrow-N rows
+(und.kv tp1-8, und.q tp8, gen.qkv tp8) at M = 1024-4096 with the steady-state recipe, auto and
+maxed stage counts, a 128-deep k-slab and a cluster-2 weight-multicast pair.  They win on two
+cells (und.kv tp8, N = 128, at M = 1024 / 2048: about 11% each, 11-15 us kernels) and are 1.3-4.6x
+slower everywhere else.  The register-sourced conversion runs once per activation tile, so a
+64- or 32-row activation tile doubles or quadruples the conversion work per flop.  Stage count
+and multicast change nothing measurable.  Patch kept in `h4-parked/step3_2b_64x64_64x32_probe.patch`;
+table in `hopper-mail/step3_2b_narrow_tiles.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16

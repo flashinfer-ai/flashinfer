@@ -189,7 +189,7 @@ def w8a16_fp8_gemm(
         Pins one kernel variant instead of the launcher's choice (benchmarking):
         a key of ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
         ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
-        (``cutlass_<weight rows>x<activation rows>[_streamk|_splitk]``).
+        (``<weight rows>x<activation rows>[_streamk|_splitk]``).
         ``None`` / ``"auto"`` = the launcher decides.
 
     Returns
