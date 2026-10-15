@@ -52,7 +52,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_84022fd3481dfc5d2c33(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_e59799bea891c819b919(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -173,8 +173,8 @@ kernel_cake_stepfun_moe_84022fd3481dfc5d2c33(const __grid_constant__ CUtensorMap
     if (warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 128;");
         { // epilogue_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
             int tile_count = num_non_exiting_ctas[0];
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             const int warp_0 = warp;
             const int lane_1 = lane;
             unsigned int acc_stage = 0;
@@ -2333,8 +2333,8 @@ kernel_cake_stepfun_moe_84022fd3481dfc5d2c33(const __grid_constant__ CUtensorMap
     // ---- Role: load_b ----
     if (warp == 6) {
         { // load_b_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
             int tile_count_3 = num_non_exiting_ctas[0];
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int stage_2 = 0;
             unsigned int work_stage_3 = 0;
             unsigned int m_tile_3 = blockIdx.x;
@@ -2433,8 +2433,8 @@ kernel_cake_stepfun_moe_84022fd3481dfc5d2c33(const __grid_constant__ CUtensorMap
     // ---- Role: work_id ----
     if (warp == 7) {
         { // work_id_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
             int tile_count_4 = num_non_exiting_ctas[0];
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int work_stage_4 = 0;
             unsigned int throttle_stage_1 = 0;
             unsigned int fast_stage = 0;

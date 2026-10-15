@@ -59,7 +59,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_stepfun_moe_821950b5900919fc7426(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_46aa5251611b491aa290(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -233,18 +233,27 @@ kernel_cake_stepfun_moe_821950b5900919fc7426(const __grid_constant__ CUtensorMap
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
                         for (int token_group = 0; token_group < 8; token_group++) {
                             int token = base_token + token_group * 8;
+                            float tok = token_sf[(int)n_tile * 64 + token];
                             float _mul_0;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(frag[token_group * 4]), "f"(sc));
-                            converted[0] = _mul_0;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(frag[token_group * 4]), "f"(tok));
                             float _mul_1;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(frag[token_group * 4 + 2]), "f"(sc));
-                            converted[1] = _mul_1;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_mul_0), "f"(sc));
+                            converted[0] = _mul_1;
                             float _mul_2;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(frag[32 + token_group * 4]), "f"(sc));
-                            converted[2] = _mul_2;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(frag[token_group * 4 + 2]), "f"(tok));
                             float _mul_3;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(frag[32 + token_group * 4 + 2]), "f"(sc));
-                            converted[3] = _mul_3;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_mul_2), "f"(sc));
+                            converted[1] = _mul_3;
+                            float _mul_4;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(frag[32 + token_group * 4]), "f"(tok));
+                            float _mul_5;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_mul_4), "f"(sc));
+                            converted[2] = _mul_5;
+                            float _mul_6;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(frag[32 + token_group * 4 + 2]), "f"(tok));
+                            float _mul_7;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_mul_6), "f"(sc));
+                            converted[3] = _mul_7;
                             #pragma unroll
                             for (int _lp = 0; _lp < 2; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -258,29 +267,38 @@ kernel_cake_stepfun_moe_821950b5900919fc7426(const __grid_constant__ CUtensorMap
                                 epi_staging_u64[(4096 + token * 64 + (base_feature - 64 ^ swizzle_feature)) / 4] = packed_word;
                             }
                             int token_0 = base_token + token_group * 8 + 1;
-                            float _mul_4;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(frag[token_group * 4 + 1]), "f"(sc));
-                            converted[0] = _mul_4;
-                            float _mul_5;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(frag[token_group * 4 + 1 + 2]), "f"(sc));
-                            converted[1] = _mul_5;
-                            float _mul_6;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(frag[32 + (token_group * 4 + 1)]), "f"(sc));
-                            converted[2] = _mul_6;
-                            float _mul_7;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(frag[32 + (token_group * 4 + 1) + 2]), "f"(sc));
-                            converted[3] = _mul_7;
+                            float tok_1 = token_sf[(int)n_tile * 64 + token_0];
+                            float _mul_8;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(frag[token_group * 4 + 1]), "f"(tok_1));
+                            float _mul_9;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(_mul_8), "f"(sc));
+                            converted[0] = _mul_9;
+                            float _mul_10;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(frag[token_group * 4 + 1 + 2]), "f"(tok_1));
+                            float _mul_11;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(_mul_10), "f"(sc));
+                            converted[1] = _mul_11;
+                            float _mul_12;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_12) : "f"(frag[32 + (token_group * 4 + 1)]), "f"(tok_1));
+                            float _mul_13;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_13) : "f"(_mul_12), "f"(sc));
+                            converted[2] = _mul_13;
+                            float _mul_14;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_14) : "f"(frag[32 + (token_group * 4 + 1) + 2]), "f"(tok_1));
+                            float _mul_15;
+                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_15) : "f"(_mul_14), "f"(sc));
+                            converted[3] = _mul_15;
                             #pragma unroll
                             for (int _lp = 0; _lp < 2; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
                                 packed[_lp] = *(uint32_t*)&_bf2;
                             }
                             packed_word = (unsigned long long)packed[0] | (unsigned long long)packed[1] << 32;
-                            int swizzle_feature_1 = token_0 % 8 * 8;
+                            int swizzle_feature_2 = token_0 % 8 * 8;
                             if (base_feature < 64) {
-                                epi_staging_u64[(token_0 * 64 + (base_feature ^ swizzle_feature_1)) / 4] = packed_word;
+                                epi_staging_u64[(token_0 * 64 + (base_feature ^ swizzle_feature_2)) / 4] = packed_word;
                             } else {
-                                epi_staging_u64[(4096 + token_0 * 64 + (base_feature - 64 ^ swizzle_feature_1)) / 4] = packed_word;
+                                epi_staging_u64[(4096 + token_0 * 64 + (base_feature - 64 ^ swizzle_feature_2)) / 4] = packed_word;
                             }
                         }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -354,6 +372,11 @@ kernel_cake_stepfun_moe_821950b5900919fc7426(const __grid_constant__ CUtensorMap
                 if (valid_0 == 0) {
                     break;
                 }
+            }
+            asm volatile("barrier.sync 11, 128;" ::: "memory");
+            if (warp_0 == 0) {
+                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
             }
         }
     }
@@ -1466,11 +1489,6 @@ kernel_cake_stepfun_moe_821950b5900919fc7426(const __grid_constant__ CUtensorMap
     }
 
     // Cleanup
-    __syncthreads(); // barrier before TMEM dealloc
-
-    if (warp == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-    }
 }
 
 } // extern "C"

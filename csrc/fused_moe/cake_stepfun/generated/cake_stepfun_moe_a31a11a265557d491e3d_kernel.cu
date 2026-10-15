@@ -59,7 +59,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_stepfun_moe_8073da337e4371663c4f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_stepfun_moe_a31a11a265557d491e3d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -331,6 +331,11 @@ kernel_cake_stepfun_moe_8073da337e4371663c4f(const __grid_constant__ CUtensorMap
                 if (valid_0 == 0) {
                     break;
                 }
+            }
+            asm volatile("barrier.sync 11, 128;" ::: "memory");
+            if (warp_0 == 0) {
+                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(64));
             }
         }
     }
@@ -1230,11 +1235,6 @@ kernel_cake_stepfun_moe_8073da337e4371663c4f(const __grid_constant__ CUtensorMap
     }
 
     // Cleanup
-    __syncthreads(); // barrier before TMEM dealloc
-
-    if (warp == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(64));
-    }
 }
 
 } // extern "C"
