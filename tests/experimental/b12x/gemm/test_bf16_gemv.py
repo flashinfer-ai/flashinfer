@@ -136,6 +136,47 @@ def _assert_matches_f32_ref(y: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
 
 
 @cuda_required
+@pytest.mark.parametrize(
+    "rows,tile", [(65535, 1), (65536, 1), (131073, 2), (524289, 8)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_simt_row_grid_boundary_and_graph_replay(rows, tile, dtype):
+    torch.manual_seed(41)
+    source = torch.randint(-2, 3, (rows, 16), device="cuda").to(dtype)[:, :8]
+    weight = torch.randint(-2, 3, (3, 8), device="cuda").to(dtype)
+    backing = torch.full(
+        (rows + 1, 6), float("nan"), device="cuda", dtype=torch.float32
+    )
+    output = backing[:rows, :3]
+    with PreparationSession(
+        device="cuda", autotune=False, compile_workers=0
+    ) as session:
+        plan = _prepare_projection(
+            session,
+            source,
+            weight,
+            out=output,
+            override=bf16_gemv.GemvConfig(backend="simt", rows_per_tile=tile),
+        )
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            bf16_gemv.mm(source, weight, out=output, plan=plan)
+        source.neg_()
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        torch.testing.assert_close(
+            output, source.float() @ weight.float().T, rtol=0, atol=0
+        )
+        assert (
+            torch.isnan(backing[rows:]).all() and torch.isnan(backing[:rows, 3:]).all()
+        )
+        graph.reset()
+
+
+@cuda_required
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize(
     "n,k", [(64, 5120), (96, 5120), (128, 2048), (112, 1024), (1, 5120)]

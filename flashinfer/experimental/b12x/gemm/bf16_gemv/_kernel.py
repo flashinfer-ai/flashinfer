@@ -104,6 +104,11 @@ class SmallNGemvKernel:
         vector_loads: Int32,
         stream: cuda.CUstream,
     ):
+        row_tiles = (Int64(rows) + Int64(self.rows_per_tile - 1)) // Int64(
+            self.rows_per_tile
+        )
+        grid_z = (row_tiles + Int64(65534)) // Int64(65535)
+        grid_y = (row_tiles + grid_z - Int64(1)) // grid_z
         self.kernel(
             _flat(x),
             _flat(weight),
@@ -119,8 +124,8 @@ class SmallNGemvKernel:
         ).launch(
             grid=(
                 self.n,
-                (rows + Int32(self.rows_per_tile - 1)) // Int32(self.rows_per_tile),
-                1,
+                Int32(grid_y),
+                Int32(grid_z),
             ),
             block=(self.block_threads, 1, 1),
             stream=stream,
@@ -142,9 +147,12 @@ class SmallNGemvKernel:
         vector_loads: Int32,
     ):
         thread, _, _ = cute.arch.thread_idx()
-        column, row_tile, _ = cute.arch.block_idx()
+        column, row_tile, row_plane = cute.arch.block_idx()
+        _, tiles_per_plane, _ = cute.arch.grid_dim()
         tid = Int32(thread)
-        first_row = Int64(row_tile) * Int64(self.rows_per_tile)
+        first_row = (
+            Int64(row_plane) * Int64(tiles_per_plane) + Int64(row_tile)
+        ) * Int64(self.rows_per_tile)
         w_base = Int64(column) * weight_stride
         acc = cute.make_rmem_tensor((self.rows_per_tile,), Float32)
         for r in cutlass.range_constexpr(self.rows_per_tile):
