@@ -84,6 +84,15 @@ class MlaResource(MemoryResource):
         return []
 
     @cute.jit
+    def full_barrier_smem_address(self, stage) -> Int32:
+        """32-bit shared address of this resource's pipeline full mbarrier for ``stage``.
+
+        Used by observer spins (``mbarrier.try_wait.parity``) from tasks that are
+        not registered consumers of the pipeline.
+        """
+        return Int32(self.pipeline.sync_object_full.get_barrier(stage).toint())
+
+    @cute.jit
     def _init_tmem_state(self, stage_info: StageInfo) -> None:
         """Initialize shared resource state from the TS allocation context."""
         context = stage_info.context

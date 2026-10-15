@@ -1163,6 +1163,13 @@ def _throughput_2cta_call_args(
     return args
 
 
+def _same_scalar_type(like, value: float):
+    """Return ``value`` as a Python float or as ``like``'s cutlass scalar type."""
+    if isinstance(like, float):
+        return value
+    return type(like)(value)  # type: ignore[call-arg]
+
+
 def _throughput_latency_1cta_call_args(
     *,
     q_latent: object,
@@ -1210,8 +1217,13 @@ def _throughput_latency_1cta_call_args(
         softmax_scale,
         output_scale,
         # The 1CTA kernel takes the runtime skip-correction threshold right
-        # after the two scales.
+        # after the two scales, then the token-sparse raw Gather4 descriptor
+        # tensor (unused by the dense schedule).
         skip_corr_threshold,
+        None,  # raw Gather4 descriptors (token-sparse only)
+        None,  # NVFP4 block-scale pool (token-sparse NVFP4 only)
+        # NVFP4 dequantization scale; a cutlass scalar when compiling.
+        _same_scalar_type(skip_corr_threshold, 1.0),
     ]
     if stream is not _NO_STREAM:
         args.append(stream)

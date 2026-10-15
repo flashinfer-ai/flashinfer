@@ -60,7 +60,9 @@ def num_softmax_scale_groups(cfg: MlaConfig) -> int:
 def num_s_regs_per_thread(cfg: MlaConfig) -> int:
     """Return the number of score registers carried by each softmax thread."""
     if cfg.kernel_variant == "keeps_mma_ab":
-        return cfg.tile_size_kv // 2
+        # Each thread owns half a row; the NVFP4 token-sparse softmax splits
+        # the tile's columns again (each instance owns one 64-column half).
+        return cfg.tile_size_kv // 2 // (2 if cfg.is_dynamic_token_sparse_nvfp4 else 1)
     return num_softmax_scale_groups(cfg) * 4
 
 
@@ -74,7 +76,17 @@ def softmax_scratch_words(cfg: MlaConfig) -> int:
 def num_packed_p_regs(cfg: MlaConfig) -> int:
     """Return the number of packed P registers per softmax thread."""
     q_repeats = max(cfg.tile_size_q // 8, 1)
-    return (2 if cfg.is_fp8_qkv() else 4) * q_repeats
+    count = (2 if cfg.is_fp8_qkv() else 4) * q_repeats
+    if cfg.kernel_variant == "keeps_mma_ab":
+        # Each thread packs half a row of the KV tile (tile_size_kv / 2 scores),
+        # or a quarter with the NVFP4 token-sparse column split.
+        count = (
+            count
+            * cfg.tile_size_kv
+            // 128
+            // (2 if cfg.is_dynamic_token_sparse_nvfp4 else 1)
+        )
+    return count
 
 
 def num_o_reg_pairs(cfg: MlaConfig) -> int:

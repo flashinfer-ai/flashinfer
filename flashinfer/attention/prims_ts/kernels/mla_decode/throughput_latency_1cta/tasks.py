@@ -183,15 +183,14 @@ def create_throughput_latency_softmax_task_impl(
 
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
 
-    @schedule
-    def softmax_schedule(
+    def softmax_body(
         tmem_s,
         tmem_softmax_local,
         p_resource,
         tmem_softmax_global,
         work_queue=None,
     ):
-        """Captured softmax schedule for one of the two interleaved instances."""
+        """Shared softmax schedule body for one of the two interleaved instances."""
         (
             old_max_arr,
             sum_arr,
@@ -277,6 +276,18 @@ def create_throughput_latency_softmax_task_impl(
                 with d.last_iter():
                     store_stats(1)
 
+    @schedule
+    def softmax_schedule(tmem_s, tmem_softmax_local, p_resource, tmem_softmax_global):
+        softmax_body(tmem_s, tmem_softmax_local, p_resource, tmem_softmax_global)
+
+    @schedule
+    def softmax_wq_schedule(
+        tmem_s, tmem_softmax_local, p_resource, tmem_softmax_global, work_queue
+    ):
+        softmax_body(
+            tmem_s, tmem_softmax_local, p_resource, tmem_softmax_global, work_queue
+        )
+
     captured_schedule = (
         softmax_schedule(
             tmem_s,
@@ -285,7 +296,7 @@ def create_throughput_latency_softmax_task_impl(
             tmem_softmax_global,
         )
         if work_queue is None
-        else softmax_schedule(
+        else softmax_wq_schedule(
             tmem_s,
             tmem_softmax_local,
             p_resource,
@@ -296,9 +307,10 @@ def create_throughput_latency_softmax_task_impl(
     src = [tmem_s]
     if work_queue is not None:
         src.append(work_queue)
+    dst = [tmem_softmax_local, p_resource, tmem_softmax_global]
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_softmax_local, p_resource, tmem_softmax_global],
+        dst_resources=dst,
         cfg=cfg,
         warp_idx=cfg.softmax0_warp_idx if inst_id == 0 else cfg.softmax1_warp_idx,
         num_warps=cfg.softmax0_num_warps if inst_id == 0 else cfg.softmax1_num_warps,
@@ -353,8 +365,7 @@ def create_keeps_mma_ab_correction_task(
 
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
 
-    @schedule
-    def correction_schedule(
+    def correction_schedule_body(
         tmem_softmax_local,
         tmem_o,
         tmem_corr,
@@ -561,6 +572,10 @@ def create_keeps_mma_ab_correction_task(
                 tail_o_stage_idx_1,
             ) = correct_tail_o(local_state, tail_o_stage_idx_0, tail_o_stage_idx_1)
 
+    @schedule
+    def correction_schedule(tmem_softmax_local, tmem_o, tmem_corr, work_queue=None):
+        correction_schedule_body(tmem_softmax_local, tmem_o, tmem_corr, work_queue)
+
     schedule_result = (
         correction_schedule(tmem_softmax_local, tmem_o, tmem_corr)
         if work_queue is None
@@ -574,9 +589,10 @@ def create_keeps_mma_ab_correction_task(
     src = [tmem_softmax_local, tmem_o]
     if work_queue is not None:
         src.append(work_queue)
+    dst = [tmem_corr]
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_corr],
+        dst_resources=dst,
         cfg=cfg,
         warp_idx=cfg.correction_warp_idx,
         num_warps=cfg.correction_num_warps,
@@ -1363,7 +1379,7 @@ def create_throughput_latency_load_task(
         warp_idx=cfg.load_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.load_num_warps if num_warps is None else num_warps,
         schedule=captured_schedule,
-        num_registers=cfg.mma_load_regs,
+        num_registers=cfg.load_regs or cfg.mma_load_regs,
         name="LoadTmaTask",
         **kw,
     )
@@ -1706,5 +1722,575 @@ def create_keeps_mma_ab_mma_task(
         schedule=schedule_result,
         num_registers=cfg.mma_load_regs,
         name="MmaTask",
+        **kw,
+    )
+
+
+# =====================================================================
+# NVFP4 token-sparse (native FP4 QK) tasks
+# =====================================================================
+
+
+def create_native_fp4_load_task(
+    smem_raw,
+    work_queue: WorkQueue | None,
+    schedule_token_throttle,
+    cfg,
+    *,
+    domain,
+    sf_landed,
+    task_class=MlaDecodeTask,
+    **kw,
+) -> Task:
+    """Loader for the native FP4 QK path: one raw stage = one gathered K tile.
+
+    Head gathers K(0), loop iteration n gathers K(n + 1); there is no V stream
+    (V is dequantized from the K latent slices) and no Q TMA stage (the softmax
+    warps quantize Q from global memory).  The loader also publishes "token
+    block scales of tile u landed" (``sf_landed``) for the dequant warps.
+    """
+
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
+    num_insts = cfg.num_insts_kv
+
+    def body(smem_raw, work_queue, sf_landed):
+        smem_raw.init_load_state()
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
+            # Every tile but the first runs the Loop path and prefetches ahead.
+            for inst in range(num_insts):
+                smem_raw.acquire()
+                smem_raw.load_k_tile_owned(section=MlaStage.Head, inst=inst)
+                smem_raw.commit()
+                if inst > 0:
+                    smem_raw.prefetch_k_tile_ahead(section=MlaStage.Head, inst=inst)
+            # HEAD staged the scale rows of tiles 0..2 and waited for them;
+            # publish "landed" for tiles 0 and 1 (the loop step that gathers
+            # tile t publishes tile t + 1 after its tail).
+            for _ in range(2):
+                sf_landed.acquire()
+                sf_landed.scales_landed(section=MlaStage.Head)
+                sf_landed.commit()
+            with domain_loop(0, domain, 1):
+                for inst in range(num_insts):
+                    smem_raw.acquire()
+                    smem_raw.load_k_tile_owned(section=MlaStage.Loop, inst=inst)
+                    smem_raw.commit()
+                    smem_raw.prefetch_k_tile_ahead(section=MlaStage.Loop, inst=inst)
+                    # The tail above waited for every older cp.async group before
+                    # staging scales(t + 2) and prefetching rows(t + 3), so the
+                    # scale rows of tile t + 1 have landed: publish them now.
+                    sf_landed.acquire()
+                    sf_landed.scales_landed(section=MlaStage.Loop)
+                    sf_landed.commit()
+
+    @schedule
+    def load_sf_schedule(smem_raw, sf_landed):
+        body(smem_raw, None, sf_landed)
+
+    @schedule
+    def load_sf_wq_schedule(smem_raw, work_queue, sf_landed):
+        body(smem_raw, work_queue, sf_landed)
+
+    assert schedule_token_throttle is None, "NVFP4 loader: no throttle variant"
+    captured = (
+        load_sf_schedule(smem_raw, sf_landed)
+        if work_queue is None
+        else load_sf_wq_schedule(smem_raw, work_queue, sf_landed)
+    )
+    src = []
+    if work_queue is not None:
+        src.append(work_queue)
+    dst = [smem_raw, sf_landed]
+    return task_class(
+        src_resources=src,
+        dst_resources=dst,
+        cfg=cfg,
+        warp_idx=cfg.load_warp_idx,
+        num_warps=cfg.load_num_warps,
+        schedule=captured,
+        num_registers=cfg.load_regs or cfg.mma_load_regs,
+        name="LoadTmaTask",
+        **kw,
+    )
+
+
+def create_native_fp4_dequant_task(
+    smem_raw,
+    smem_kv,
+    bmm1_done,
+    work_queue: WorkQueue | None,
+    cfg,
+    *,
+    domain,
+    sf_landed,
+    sfb_ready,
+    task_class=MlaDecodeTask,
+    **kw,
+) -> Task:
+    """Dequant warps for the native FP4 QK path (sole consumers of the raw K ring).
+
+    Per K tile (Head: tile 0, loop n: tile n + 1): wait for the raw K tile,
+    convert the four V slices from the resident latent slices into the E4M3 V
+    ring, wait for the MMA's "BMM1 done" stage (``bmm1_done``, two stages
+    indexed like the raw ring) and release the raw stage.  The MMA observes the
+    raw ring directly; the token block scales (token-major rows landed by the
+    loader, ``sf_landed``) are written to the TMEM SFB columns by this task
+    (``sfb_ready``).
+    """
+
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
+    num_insts = cfg.num_insts_kv
+
+    def _write_sfb(sfl, sfr, section, inst, ahead):
+        # Write SFB(tile + ahead) with tcgen05.st once its token-major scale
+        # rows landed; the SFB columns are free because this task already
+        # observed BMM1(tile + ahead - 1) complete (bmm1_done).
+        sfl.wait()
+        sfl.landed_ack()
+        sfr.acquire()
+        sfr.write_sfb(section=section, inst=inst, ahead=ahead)
+        sfr.commit()
+        sfl.release()
+
+    def one_tile(raw, kv, done, section, inst, sfl, sfr):
+        raw.wait()
+        # Slices 0..2 into the V ring; the last slice is staged in registers
+        # so the raw stage is released (and the Gather4 of tile t + 2
+        # co-issued) before it waits for the V-ring stage that PV of this
+        # tile frees.
+        for v in range(cfg.v_head_dim_stages - 1):
+            kv.acquire()
+            kv.dequant_v_native(stage_idx=v, section=section, inst=inst)
+            kv.commit()
+            if v == 0:
+                # BMM1(t) has completed by the time slice 0 is converted (its
+                # V-ring slot frees with PV(t - 1), issued after BMM1(t));
+                # write SFB(t + 1) now so BMM1(t + 1) never waits for it,
+                # instead of after the raw release.
+                done.wait()
+                done.bmm1_completed()
+                _write_sfb(sfl, sfr, section, inst, 1)
+                done.release()
+        v3_raw, v3_scale = raw.load_v_slice_regs(section=section, inst=inst)
+        raw.release()
+        raw.issue_gathers_ahead(section=section, inst=inst)
+        kv.acquire()
+        kv.dequant_v_native_regs(
+            section=section, v3_raw=v3_raw, v3_scale=v3_scale, inst=inst
+        )
+        kv.commit()
+
+    def body(raw, kv, done, work_queue, sfl, sfr):
+        raw.init_descriptor_state()
+        kv.init_load_state()
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
+            _write_sfb(sfl, sfr, MlaStage.Head, 0, 0)
+            for inst in range(num_insts):
+                one_tile(raw, kv, done, MlaStage.Head, inst, sfl, sfr)
+            with domain_loop(0, domain, 1):
+                for inst in range(num_insts):
+                    one_tile(raw, kv, done, MlaStage.Loop, inst, sfl, sfr)
+
+    @schedule
+    def dequant_sf_schedule(smem_raw, smem_kv, bmm1_done, sf_landed, sfb_ready):
+        body(smem_raw, smem_kv, bmm1_done, None, sf_landed, sfb_ready)
+
+    @schedule
+    def dequant_sf_wq_schedule(
+        smem_raw, smem_kv, bmm1_done, sf_landed, sfb_ready, work_queue
+    ):
+        body(smem_raw, smem_kv, bmm1_done, work_queue, sf_landed, sfb_ready)
+
+    captured = (
+        dequant_sf_schedule(smem_raw, smem_kv, bmm1_done, sf_landed, sfb_ready)
+        if work_queue is None
+        else dequant_sf_wq_schedule(
+            smem_raw, smem_kv, bmm1_done, sf_landed, sfb_ready, work_queue
+        )
+    )
+    src = [smem_raw, bmm1_done, sf_landed]
+    if work_queue is not None:
+        src.append(work_queue)
+    return task_class(
+        src_resources=src,
+        dst_resources=[smem_kv, sfb_ready],
+        cfg=cfg,
+        warp_idx=cfg.dequant_warp_idx,
+        num_warps=cfg.dequant_num_warps,
+        schedule=captured,
+        num_registers=cfg.dequant_regs,
+        name="DequantNvfp4Task",
+        **kw,
+    )
+
+
+def _native_fp4_colsplit_sfb_bmm1(tmem_s, done, section, sfr):
+    """One K tile's BMM1 of the column-split schedule."""
+    tmem_s.stage_sfb(section=section)
+    # SFB(tile) was written by the dequant warps (tcgen05.st); released after
+    # the BMM1 issue (DMA-order rule of the sfb_ready -> tmem_s edge).
+    sfr.wait()
+    sfr.sfb_visible()
+    done.acquire()
+    tmem_s.acquire()
+    tmem_s.qk_mma_fp4(section=section)
+    tmem_s.commit()
+    done.bmm1_issued()
+    done.commit()
+    sfr.release()
+
+
+def _native_fp4_colsplit_pv(cfg, smem_kv, tmem_p, o_done_0, label):
+    """One tile's PV of the column-split schedule."""
+    tmem_p.wait()
+    p_stage_idx = tmem_p.p_stage()
+    o_done_0.acquire()
+    for v_subtile_idx in range(cfg.v_head_dim_stages):
+        smem_kv.wait()
+        v_desc_0 = smem_kv.v_desc_0(v_subtile_idx=v_subtile_idx)
+        getattr(o_done_0, label)(
+            p_stage_idx=p_stage_idx,
+            v_desc_0=v_desc_0,
+            v_subtile_idx=v_subtile_idx,
+        )
+        smem_kv.release()
+    o_done_0.commit()
+    tmem_p.release()
+
+
+def create_native_fp4_colsplit_mma_task(
+    smem_qfp4,
+    smem_kv,
+    bmm1_done,
+    tmem_s,
+    tmem_p,
+    tmem_o,
+    o_done_0,
+    work_queue: WorkQueue | None,
+    cfg,
+    *,
+    domain,
+    sfb_ready,
+    task_class=MlaDecodeTask,
+    **kw,
+) -> Task:
+    """MMA task of the column-split native FP4 QK schedule (128-key tiles).
+
+    Single-instance order (HEAD: SFB(0) BMM1(0); LOOP n: SFB(n+1) BMM1(n+1)
+    PV(n); TAIL: PV(T-1)) with the S tile handed to the single 8-warp
+    column-split softmax task (one S / P / PV-done pipeline each); the PV MMAs
+    are issued through ``o_done_0``.
+    """
+
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
+    def sfb_bmm1(tmem_s, done, section, sfr):
+        _native_fp4_colsplit_sfb_bmm1(tmem_s, done, section, sfr)
+
+    def pv(smem_kv, tmem_p, o_done_0, label):
+        _native_fp4_colsplit_pv(cfg, smem_kv, tmem_p, o_done_0, label)
+
+    def mma_body(
+        smem_qfp4,
+        smem_kv,
+        bmm1_done,
+        tmem_s,
+        tmem_p,
+        tmem_o,
+        o_done_0,
+        sfb_ready,
+        work_queue=None,
+    ):
+        smem_qfp4.init_descriptor_state()
+        smem_kv.init_descriptor_state()
+        tmem_o.init_mma_state()
+        tmem_p.init_stage_state()
+        tmem_s.init_native_qk_state()
+
+        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
+            if work_queue is not None:
+                tmem_s.reset_softmax_work_tile_state()
+                tmem_p.init_stage_work_tile_state()
+            smem_qfp4.wait()
+            q_desc_lat0, q_desc_lat1, q_desc_rope = smem_qfp4.q_desc()
+            tmem_s.set_q_desc_fp4(
+                q_desc_lat0=q_desc_lat0,
+                q_desc_lat1=q_desc_lat1,
+                q_desc_rope=q_desc_rope,
+            )
+            sfb_bmm1(tmem_s, bmm1_done, MlaStage.Head, sfb_ready)
+            with domain_loop(0, domain, 1):
+                sfb_bmm1(tmem_s, bmm1_done, MlaStage.Loop, sfb_ready)
+                pv(smem_kv, tmem_p, o_done_0, "pv_mma_loop")
+            pv(smem_kv, tmem_p, o_done_0, "pv_mma_tail")
+            # Drain the dequant's SFB(T) publication (no tile T).
+            sfb_ready.wait()
+            sfb_ready.sfb_visible()
+            sfb_ready.release()
+            tmem_o.acquire()
+            tmem_o.all_pv_issued()
+            tmem_o.commit()
+            smem_qfp4.release()
+
+    @schedule
+    def mma_cs8_sf_schedule(
+        smem_qfp4, smem_kv, bmm1_done, tmem_s, tmem_p, tmem_o, o_done_0, sfb_ready
+    ):
+        mma_body(
+            smem_qfp4,
+            smem_kv,
+            bmm1_done,
+            tmem_s,
+            tmem_p,
+            tmem_o,
+            o_done_0,
+            sfb_ready,
+        )
+
+    @schedule
+    def mma_cs8_sf_wq_schedule(
+        smem_qfp4,
+        smem_kv,
+        bmm1_done,
+        tmem_s,
+        tmem_p,
+        tmem_o,
+        o_done_0,
+        sfb_ready,
+        work_queue,
+    ):
+        mma_body(
+            smem_qfp4,
+            smem_kv,
+            bmm1_done,
+            tmem_s,
+            tmem_p,
+            tmem_o,
+            o_done_0,
+            sfb_ready,
+            work_queue,
+        )
+
+    schedule_result = (
+        mma_cs8_sf_schedule(
+            smem_qfp4,
+            smem_kv,
+            bmm1_done,
+            tmem_s,
+            tmem_p,
+            tmem_o,
+            o_done_0,
+            sfb_ready,
+        )
+        if work_queue is None
+        else mma_cs8_sf_wq_schedule(
+            smem_qfp4,
+            smem_kv,
+            bmm1_done,
+            tmem_s,
+            tmem_p,
+            tmem_o,
+            o_done_0,
+            sfb_ready,
+            work_queue,
+        )
+    )
+    src = [smem_qfp4, smem_kv, tmem_p, sfb_ready]
+    if work_queue is not None:
+        src.append(work_queue)
+    dst = [tmem_s, tmem_o, o_done_0, bmm1_done]
+    return task_class(
+        src_resources=src,
+        dst_resources=dst,
+        cfg=cfg,
+        warp_idx=cfg.mma_warp_idx,
+        num_warps=cfg.mma_num_warps,
+        schedule=schedule_result,
+        num_registers=cfg.mma_load_regs,
+        name="MmaTask",
+        **kw,
+    )
+
+
+def create_native_fp4_cs8_softmax_task(
+    tmem_s,
+    tmem_p,
+    o_done,
+    tmem_softmax_global,
+    work_queue: WorkQueue | None,
+    cfg,
+    *,
+    domain,
+    task_class=MlaDecodeTask,
+    smem_qfp4,
+    tmem_o,
+    tmem_corr,
+    **kw,
+) -> Task:
+    """The column-split softmax as ONE 8-warp task.
+
+    Threads 0-127 own the first 64 columns of every 128-key tile and threads
+    128-255 the second 64 (``_col_half``); the half-row maxima meet at a
+    named barrier through SMEM.  One copy of the softmax code per SMSP and a
+    single S / P / PV-done pipeline each.  All 256 threads quantize Q
+    (duplicate, idempotent writes); at the tail the halves exchange
+    (max, sum) through the correction scratch and each normalizes the two V
+    stages of its panel.
+    """
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
+    def tile_step(r, section, state):
+        tmem_s, tmem_p, o_done, tmem_softmax_global = r
+        old_max_arr, sum_arr, new_max_arr, local_sum_arr, s_arr = state
+        tmem_s.wait()
+        (
+            old_max_arr,
+            sum_arr,
+            new_max_arr,
+            local_sum_arr,
+            s_arr,
+        ) = tmem_s.update_softmax(
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            local_sum_arr=local_sum_arr,
+            s_arr=s_arr,
+            section=section,
+        )
+        regs_p = tmem_s.compute_p_s(
+            new_max_arr=new_max_arr, s_arr=s_arr, local_sum_arr=local_sum_arr
+        )
+        tmem_s.release()
+        tmem_p.acquire()
+        tmem_p.store_p(regs_p=regs_p)
+        if section != MlaStage.Head:
+            o_done.wait()
+            # All four V stages are named; the column-half predicate inside
+            # keeps the two of this half's TMEM panel.
+            o_done.rescale_o(old_max_arr=old_max_arr, new_max_arr=new_max_arr)
+            o_done.release()
+        tmem_p.commit()
+        tmem_softmax_global.track_global()
+        return tmem_s.update_softmax_sum(
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            local_sum_arr=local_sum_arr,
+            s_arr=s_arr,
+        )
+
+    def softmax_body(
+        tmem_s,
+        tmem_p,
+        o_done,
+        tmem_softmax_global,
+        smem_qfp4,
+        tmem_o,
+        tmem_corr,
+        work_queue=None,
+    ):
+        r = (tmem_s, tmem_p, o_done, tmem_softmax_global)
+        state = tmem_s.init_softmax_state()
+        tmem_p.init_materialize_state()
+        smem_qfp4.init_quant_state()
+        tmem_corr.init_store_state()
+
+        def init_work_tile_state():
+            return tmem_s.init_softmax_work_tile_state()
+
+        with work_tile_schedule_loop(
+            work_queue,
+            skip_if=work_tile_skip_if,
+            non_skippable_prelude=(
+                init_work_tile_state if work_queue is not None else None
+            ),
+        ) as (_, work_tile_state):
+            if work_queue is not None:
+                state = work_tile_state
+            # Quantize this work tile's Q heads to NVFP4 and stage their block
+            # scales before the first score tile.
+            smem_qfp4.acquire()
+            smem_qfp4.quantize_q()
+            smem_qfp4.commit()
+            state = tile_step(r, MlaStage.Head, state)
+            with domain_loop(0, domain, 1):
+                state = tile_step(r, MlaStage.Loop, state)
+            old_max_arr, sum_arr, new_max_arr, local_sum_arr, s_arr = state
+            # The last PV's completion has no following tile: drain it.
+            o_done.wait()
+            o_done.pv_done_ack()
+            o_done.release()
+            tmem_o.wait()
+            tmem_o.all_pv_done()
+            tmem_corr.correct_tail_cs8(new_max_arr=new_max_arr, sum_arr=sum_arr)
+            tmem_o.release()
+
+    @schedule
+    def cs8_schedule(
+        tmem_s, tmem_p, o_done, tmem_softmax_global, smem_qfp4, tmem_o, tmem_corr
+    ):
+        softmax_body(
+            tmem_s, tmem_p, o_done, tmem_softmax_global, smem_qfp4, tmem_o, tmem_corr
+        )
+
+    @schedule
+    def cs8_wq_schedule(
+        tmem_s,
+        tmem_p,
+        o_done,
+        tmem_softmax_global,
+        smem_qfp4,
+        tmem_o,
+        tmem_corr,
+        work_queue,
+    ):
+        softmax_body(
+            tmem_s,
+            tmem_p,
+            o_done,
+            tmem_softmax_global,
+            smem_qfp4,
+            tmem_o,
+            tmem_corr,
+            work_queue=work_queue,
+        )
+
+    captured = (
+        cs8_schedule(
+            tmem_s,
+            tmem_p,
+            o_done,
+            tmem_softmax_global,
+            smem_qfp4,
+            tmem_o,
+            tmem_corr,
+        )
+        if work_queue is None
+        else cs8_wq_schedule(
+            tmem_s,
+            tmem_p,
+            o_done,
+            tmem_softmax_global,
+            smem_qfp4,
+            tmem_o,
+            tmem_corr,
+            work_queue,
+        )
+    )
+    src = [tmem_s, o_done, tmem_o]
+    if work_queue is not None:
+        src.append(work_queue)
+    dst = [tmem_p, tmem_softmax_global, tmem_corr, smem_qfp4]
+    return task_class(
+        src_resources=src,
+        dst_resources=dst,
+        cfg=cfg,
+        warp_idx=cfg.softmax0_warp_idx,
+        num_warps=8,
+        schedule=captured,
+        num_registers=cfg.softmax_regs,
+        name="SoftmaxCs8Task",
         **kw,
     )

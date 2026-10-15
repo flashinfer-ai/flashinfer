@@ -23,7 +23,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental.task_scheduling.enums import WorkAttr
-from cutlass.experimental.task_scheduling.memory import TmemAllocation
+from cutlass.experimental.task_scheduling.memory import SmemAllocation, TmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
@@ -37,13 +37,18 @@ from ...helpers.constants import (
 
 from ...helpers.layout import (
     _TASK_CACHE_TMEM_BASE_OFFSET,
+    _TASK_CACHE_WARP_GRP_THREAD_IDX,
     decode_gen_task_cache,
     num_softmax_scale_groups,
+    smem_array,
 )
+from ...helpers.nvfp4 import ld_shared_v2, st_shared_v2
 from ...helpers.math import (
     neg_max_f32,
 )
 from ...helpers.ops import (
+    float_to_u32_bits,
+    u32_bits_to_float,
     vector_from_scalars,
 )
 
@@ -99,8 +104,37 @@ class TmemSoftmaxLocalResource(MlaResource):
         TaskLocalVariable.uninitialized()
     )
 
+    def get_smem_requirements(self):
+        """Native FP4 QK: stats live in SMEM (2 stages x 128 threads x 2 floats)."""
+        if not self.cfg.is_dynamic_token_sparse_nvfp4:
+            return []
+        if self._alloc is None:
+            num_stages = (
+                self.pipeline_config.num_stages
+                if self.pipeline_config is not None
+                else 2
+            )
+            self._alloc = SmemAllocation(
+                name=f"{self.name}_stats",
+                size_bytes=num_stages * 128 * 8,
+                alignment=16,
+            )
+        return [self._alloc]
+
+    @cute.jit
+    def _smem_stats_addr(self, stage_info: StageInfo, task_cache) -> Int32:
+        """32-bit SMEM address of this thread's (stage, warpgroup-thread) stats pair."""
+        base = smem_array(stage_info.context, self._alloc, Int32, 1)
+        return (
+            base.data_ptr(Int32(0)).toint(cutlass.Int32)
+            + stage_info.stage_idx * Int32(128 * 8)
+            + task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] * Int32(8)
+        )
+
     def get_tmem_requirements(self):
         """Return the TMEM allocation for local softmax statistics."""
+        if self.cfg.is_dynamic_token_sparse_nvfp4:
+            return []
         if self.tmem_alias_ref is not None:
             return []
         if self._tmem_alloc is None:
@@ -261,13 +295,24 @@ class TmemSoftmaxLocalResource(MlaResource):
         cfg = self.cfg
         num_scale_groups = num_softmax_scale_groups(cfg)
         task_cache = decode_gen_task_cache(stage_info)
-        stats_base = self._stats_base_addr(stage_info, task_cache)
-        stats_ptr = prims.make_tmem_ptr(stats_base, Float32)
+        stats_ptr = None
+        if cutlass.const_expr(not cfg.is_dynamic_token_sparse_nvfp4):
+            stats_base = self._stats_base_addr(stage_info, task_cache)
+            stats_ptr = prims.make_tmem_ptr(stats_base, Float32)
         skip_loop_stats_store = cutlass.const_expr(inst_idx == 0) and (
             stage_info.loop_end == Int32(1)
         )
         if not skip_loop_stats_store:
-            if cutlass.const_expr(inst_idx == 0):
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+                first = (
+                    old_max_arr[0] if cutlass.const_expr(inst_idx == 0) else sum_arr[0]
+                )
+                st_shared_v2(
+                    self._smem_stats_addr(stage_info, task_cache),
+                    float_to_u32_bits(first),
+                    float_to_u32_bits(new_max_arr[0]),
+                )
+            elif cutlass.const_expr(inst_idx == 0):
                 stats = vector_from_scalars(
                     tuple(old_max_arr[idx] for idx in range(num_scale_groups))
                     + tuple(new_max_arr[idx] for idx in range(num_scale_groups)),
@@ -325,6 +370,9 @@ class TmemSoftmaxLocalResource(MlaResource):
         """Load the raw stat payload from the current TMEM stats stage."""
         cfg = self.cfg
         task_cache = decode_gen_task_cache(stage_info)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse_nvfp4):
+            w0, w1 = ld_shared_v2(self._smem_stats_addr(stage_info, task_cache))
+            return [u32_bits_to_float(w0), u32_bits_to_float(w1)]
         stats_base = self._stats_base_addr(stage_info, task_cache)
         stats_ptr = prims.make_tmem_ptr(stats_base, Float32)
         loaded = prims.tcgen05_ld(

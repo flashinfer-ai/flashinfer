@@ -54,9 +54,25 @@ from ...helpers.math import (
     qkv_smem_swizzle,
     qkv_smem_swizzle_for_head_dim,
 )
-from ...helpers.ops import (
-    lane_idx_from_thread,
+from ...helpers.gather4 import issue_gather4_tma_cta
+from ...helpers.ops import warp_ballot_sync
+from ...helpers.nvfp4 import (
+    fence_proxy_async_shared,
+    mbarrier_try_wait_parity_u32,
+    cp_async_commit_group,
+    cp_async_wait_group,
+    st_shared_u8,
+    cp_async_8b_zfill,
+    f32_to_f16x2,
+    ld_shared_v2,
+    ld_shared_v4,
+    qmul4_hi,
+    qmul4_lo,
+    scaled_e4m3_pair_broadcast,
+    st_shared_v4,
+    warp_sync_all,
 )
+from ...helpers.ops import lane_idx_from_thread
 from ...helpers.query import query_batch_bounds
 from ...helpers.stage import MlaStage
 from ...helpers.tile import (
@@ -67,6 +83,7 @@ from ...helpers.tile import (
     global_kv_tile_idx,
     head_idx_for_stage,
     local_kv_tile_idx,
+    runtime_local_kv_tiles,
     runtime_seq_len_kv_from_task_cache,
     staged_kv_head_dim_call_idx,
 )
@@ -77,6 +94,12 @@ from .common import (
     TCGEN05_BF16_SWIZZLE_STRIDE_BYTES,
     MlaResource,
 )
+
+# Token-sparse per-key validity ring: ``SPARSE_MASK_SLOTS`` tiles x four
+# 32-bit words. Word ``j`` bit ``l`` is token ``4 * l + j`` of the 128-token
+# tile (lane ``l`` of the index-producer warp stages tokens ``4l .. 4l + 3``).
+SPARSE_MASK_SLOTS = 16
+SPARSE_MASK_WORDS = 4
 
 # =====================================================================
 # SmemQResource — Q SMEM buffer with TmaUmmaAsync pipeline
@@ -264,6 +287,17 @@ class SmemQResource(MlaResource):
         ):
             return
         cfg = self.cfg
+        if cutlass.const_expr(cfg.load_num_warps > 1):
+            # Multi-warp loader: only the task's first warp issues the Q TMAs.
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            if warp_idx == Int32(cfg.load_warp_idx):
+                self._load_q_all_stages(stage_info)
+            return
+        self._load_q_all_stages(stage_info)
+
+    @cute.jit
+    def _load_q_all_stages(self, stage_info: StageInfo):
+        cfg = self.cfg
         stage_elems = cfg.q_smem_tile_elements
         stage_base = self._smem_q.subview(stage_info.stage_idx * Int32(stage_elems))
         latent_stages = cfg.latent_dim // cfg.head_dim_per_stage_kv
@@ -433,16 +467,24 @@ class SmemPageOffsetsResource(MlaResource):
             consumer_mask=base.consumer_mask,
         )
 
+    @property
+    def sparse_mask_word_base(self) -> int:
+        """Int32 index of the token-sparse validity ring inside this allocation."""
+        return self.cfg.page_offsets_stages * self.cfg.page_offsets_entries_per_stage
+
+    @property
+    def total_words(self) -> int:
+        words = self.sparse_mask_word_base
+        if self.cfg.is_dynamic_token_sparse:
+            words += SPARSE_MASK_SLOTS * SPARSE_MASK_WORDS
+        return words
+
     def get_smem_requirements(self):
-        """Return the SMEM allocation for cached page offsets."""
+        """Return the SMEM allocation for cached page offsets (+ sparse validity ring)."""
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=(
-                    self.cfg.page_offsets_stages
-                    * self.cfg.page_offsets_entries_per_stage
-                    * PAGE_OFFSET_BYTES
-                ),
+                size_bytes=self.total_words * PAGE_OFFSET_BYTES,
                 alignment=128,
             )
         return [self._alloc]
@@ -451,7 +493,7 @@ class SmemPageOffsetsResource(MlaResource):
     def _init_smem_state(self, stage_info: StageInfo) -> None:
         """Create the SMEM page-offset array view."""
         context = stage_info.context
-        count = self.cfg.page_offsets_stages * self.cfg.page_offsets_entries_per_stage
+        count = self.total_words
         self._smem_page_offsets = smem_array(
             context,
             self._alloc,
@@ -477,9 +519,14 @@ class SmemPageOffsetsResource(MlaResource):
         # returns after the page-offset stage is ready.
         self._init_smem_state(stage_info)
         cache_slots = 2 if self.cfg.kernel_variant != "keeps_mma_ab" else 1
+        cache_entries = max(1, cache_slots * self.cfg.pages_per_kv_tile)
+        if self.cfg.is_dynamic_token_sparse:
+            # The Gather4 loader reads its four row indices per lane straight
+            # from the SMEM stage; a 128-entry register cache would not fit.
+            cache_entries = 1
         return cutlass.Array(
             Int32,
-            max(1, cache_slots * self.cfg.pages_per_kv_tile),
+            cache_entries,
             space=cutlass.AddressSpace.rmem,
         )
 
@@ -489,6 +536,14 @@ class SmemPageOffsetsResource(MlaResource):
         offset = self.consumer_work_stage * Int32(
             self.cfg.page_offsets_entries_per_stage
         ) + Int32(page_fragment_idx)
+        return Int32(self._smem_page_offsets[offset])
+
+    @cute.jit
+    def token_row(self, entry_idx):
+        """Return one staged token row index (token-sparse stages, dynamic entry)."""
+        offset = self.consumer_work_stage * Int32(
+            self.cfg.page_offsets_entries_per_stage
+        ) + Int32(entry_idx)
         return Int32(self._smem_page_offsets[offset])
 
     @cute.jit
@@ -503,41 +558,101 @@ class SmemPageOffsetsResource(MlaResource):
         """Load page ids for one K or V producer stage into SMEM."""
         if cutlass.const_expr(self.page_offsets is None):
             return
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            self._producer_load_token_rows(stage_info, inst_id, is_v, section=section)
+            return
         cfg = self.cfg
         lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
         pages_per_tile = Int32(cfg.pages_per_kv_tile)
-        if lane_idx < pages_per_tile:
-            batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
-            cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-            cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
-            seq_len_kv = runtime_seq_len_kv_from_task_cache(
-                cfg,
-                decode_gen_task_cache(stage_info),
-                cta_idx_q,
-                self.cu_seqlens_q,
-                batch_idx,
-            )
-            local_tile_idx = local_kv_tile_idx(
-                cfg, stage_info, inst_id, is_v, section=section
-            )
-            tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
-            last_valid_page = cute.math.max(
-                (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
-                // Int32(cfg.num_tokens_per_page)
-                - Int32(1),
-                Int32(0),
-            )
-            logical_page_idx = cute.math.min(
-                tile_idx * pages_per_tile + lane_idx,
-                last_valid_page,
-            )
-            smem_offset = (
-                stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
-                + lane_idx
-            )
-            page_offsets_batch = self.page_offsets[None, batch_idx]
-            page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
-            gmem_ptr = page_offsets_flat[None, logical_page_idx].iterator.llvm_ptr
+        entries_per_lane = 1
+        for entry_sub in cutlass.range_constexpr(entries_per_lane):
+            entry_idx = lane_idx * Int32(entries_per_lane) + Int32(entry_sub)
+            if entry_idx < pages_per_tile:
+                batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+                cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+                cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+                seq_len_kv = runtime_seq_len_kv_from_task_cache(
+                    cfg,
+                    decode_gen_task_cache(stage_info),
+                    cta_idx_q,
+                    self.cu_seqlens_q,
+                    batch_idx,
+                )
+                local_tile_idx = local_kv_tile_idx(
+                    cfg, stage_info, inst_id, is_v, section=section
+                )
+                tile_idx = global_kv_tile_idx(
+                    cfg, local_tile_idx, seq_len_kv, cta_idx_kv
+                )
+                last_valid_page = cute.math.max(
+                    (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
+                    // Int32(cfg.num_tokens_per_page)
+                    - Int32(1),
+                    Int32(0),
+                )
+                logical_page_idx = cute.math.min(
+                    tile_idx * pages_per_tile + entry_idx,
+                    last_valid_page,
+                )
+                smem_offset = (
+                    stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
+                    + entry_idx
+                )
+                page_offsets_batch = self.page_offsets[None, batch_idx]
+                page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
+                gmem_ptr = page_offsets_flat[None, logical_page_idx].iterator.llvm_ptr
+                smem_ptr = cutlass.inttoptr(
+                    self._smem_page_offsets.data_ptr(smem_offset).toint(cutlass.Int32),
+                    3,
+                    cutlass.Int32,
+                )
+                prims.cp_async_shared_global(
+                    smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                )
+
+    @cute.jit
+    def _producer_load_token_rows(
+        self,
+        stage_info: StageInfo,
+        inst_id: int,
+        is_v: int,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+    ):
+        """Token-sparse stage: lane ``l`` stages row indices of tokens ``4l .. 4l+3``.
+
+        Four independent 4-byte ``cp.async`` copies per lane keep the producer
+        fully asynchronous (a synchronous load per stage would serialize the
+        global-memory latency into the K/V cadence).  Entries past the token's
+        active width are clamped to its last entry; those keys are removed by
+        the KV-length tail mask.  The per-key validity words are published by
+        the Gather4 loader, which already holds the indices in registers.
+        """
+        cfg = self.cfg
+        lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
+        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        seq_len_kv = runtime_seq_len_kv_from_task_cache(
+            cfg,
+            decode_gen_task_cache(stage_info),
+            cta_idx_q,
+            self.cu_seqlens_q,
+            batch_idx,
+        )
+        local_tile_idx = local_kv_tile_idx(
+            cfg, stage_info, inst_id, is_v, section=section
+        )
+        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+        last_valid = cute.math.max(seq_len_kv - Int32(1), Int32(0))
+        stage_base = stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
+        tile_entry_base = tile_idx * Int32(cfg.tile_size_kv) + lane_idx * Int32(4)
+        page_offsets_batch = self.page_offsets[None, batch_idx]
+        page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
+        for entry_sub in cutlass.range_constexpr(4):
+            logical_idx = cute.math.min(tile_entry_base + Int32(entry_sub), last_valid)
+            smem_offset = stage_base + lane_idx * Int32(4) + Int32(entry_sub)
+            gmem_ptr = page_offsets_flat[None, logical_idx].iterator.llvm_ptr
             smem_ptr = cutlass.inttoptr(
                 self._smem_page_offsets.data_ptr(smem_offset).toint(cutlass.Int32),
                 3,
@@ -549,7 +664,12 @@ class SmemPageOffsetsResource(MlaResource):
 
     @producer_work
     @cute.jit
-    def load_k0(self, stage_info: StageInfo, *, section: cutlass.Constexpr[MlaStage]):
+    def load_k0(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+    ):
         """Prefetch page offsets for K instance 0."""
 
         # Producer work for the page-offset stage that feeds K instance 0.
@@ -592,6 +712,8 @@ class SmemPageOffsetsResource(MlaResource):
         # The load task waits on the page-offset stage, snapshots the page ids
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
         del stage_info
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            return cached_page_ids
         cache_base = cache_slot * self.cfg.pages_per_kv_tile
         for page_frag in cutlass.range_constexpr(self.cfg.pages_per_kv_tile):
             cached_page_ids[cache_base + page_frag] = self.page_id(page_frag)
@@ -634,6 +756,17 @@ class SmemKvResource(MlaResource):
     tma_desc_c_rope: object = None
     tma_desc_v: object = None
     c_rope_tensor: object = None
+    # Token-sparse: GMEM tensor holding two encoded CUtensorMaps (128 B each)
+    # over the flat ``[576 B, N]`` KV pool: [0] 128 B box / SWIZZLE_128B for the
+    # latent D128 slices, [1] 64 B box / SWIZZLE_64B for the RoPE slice.
+    raw_gather4_descs: object = None
+    # Token-sparse NVFP4 loader-owned indices: flat ``[N * scale_row_bytes]``
+    # uint8 scale pool staged by the loader lanes.
+    kv_scale_pool: object = None
+    # Token-sparse NVFP4 dequant producer inputs: the raw-KV ring resource and
+    # the per-tensor dequantization factor folded into the block scales.
+    raw_kv: object = None
+    kv_dequant_scale: object = None
     page_offsets_kv: object = None
     page_offsets: object = None
     cache_seqs: object = None
@@ -740,6 +873,289 @@ class SmemKvResource(MlaResource):
         return self._smem_kv.subview(stage_info.stage_idx * Int32(stage_elems))
 
     @cute.jit
+    def _producer_gather_token_rows(
+        self,
+        stage_info: StageInfo,
+        stage_base,
+        *,
+        dim_offset,
+        active_width: cutlass.Constexpr[int],
+        is_rope_stage: cutlass.Constexpr[bool],
+        uses_compact_fp8_rope_stage: cutlass.Constexpr[bool],
+        publish_mask: cutlass.Constexpr[bool] = False,
+        tile_idx=None,
+    ):
+        """Token-sparse K/V stage: 32 lanes x one Gather4 of four token rows each.
+
+        Lane ``l`` owns tokens ``4l .. 4l+3`` of the 128-token tile.  It reads
+        their physical row indices from the staged index ring and issues one
+        Gather4 whose four ``active_width``-byte rows land at consecutive SMEM
+        rows of the stage, so the TMA swizzle (SW128 latent / SW64 RoPE) is the
+        one the UMMA descriptors expect.  Rows addressed by ``-1`` (or any
+        out-of-range index) are zero-filled by the TMA unit and masked in
+        softmax; they still count toward the stage's transaction bytes.
+        """
+        cfg = self.cfg
+        lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
+        ring = self.page_offsets_kv
+        num_load_warps = cfg.load_num_warps
+        warp_in_task = Int32(0)
+        if cutlass.const_expr(num_load_warps > 1):
+            warp_in_task = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+                cfg.load_warp_idx
+            )
+        descriptor = self.raw_gather4_descs.iterator
+        if cutlass.const_expr(is_rope_stage):
+            descriptor = descriptor + Int64(128)
+        row_bytes = active_width
+        if cutlass.const_expr(publish_mask):
+            # First K slice of the tile: warp w publishes the validity word of
+            # tokens 32w .. 32w+31 (bit = token & 31).  With one loader warp
+            # all four words come from that warp.
+            mask_base = Int32(ring.sparse_mask_word_base) + (
+                Int32(tile_idx) % Int32(SPARSE_MASK_SLOTS)
+            ) * Int32(SPARSE_MASK_WORDS)
+            words_per_warp = max(1, SPARSE_MASK_WORDS // num_load_warps)
+            for word_sub in cutlass.range_constexpr(words_per_warp):
+                word_idx = warp_in_task * Int32(words_per_warp) + Int32(word_sub)
+                # With more loader warps than mask words only the first
+                # SPARSE_MASK_WORDS warps publish (one word each).
+                if word_idx < Int32(SPARSE_MASK_WORDS):
+                    row = ring.token_row(word_idx * Int32(32) + lane_idx)
+                    valid = Int32(1) if row >= Int32(0) else Int32(0)
+                    bits = warp_ballot_sync(valid)
+                    if lane_idx == Int32(0):
+                        ring._smem_page_offsets[mask_base + word_idx] = bits
+        quads_per_warp = 32 // num_load_warps
+        # Lane l < quads_per_warp issues quad (warp_in_task * quads_per_warp + l).
+        quad = warp_in_task * Int32(quads_per_warp) + lane_idx
+        q_base = quad * Int32(4)
+        row0 = ring.token_row(q_base)
+        row1 = ring.token_row(q_base + Int32(1))
+        row2 = ring.token_row(q_base + Int32(2))
+        row3 = ring.token_row(q_base + Int32(3))
+        if lane_idx < Int32(quads_per_warp):
+            issue_gather4_tma_cta(
+                descriptor,
+                stage_base.data_ptr(quad * Int32(4 * row_bytes)),
+                stage_info.barrier,
+                Int32(dim_offset),
+                (row0, row1, row2, row3),
+            )
+        if cutlass.const_expr(uses_compact_fp8_rope_stage):
+            if warp_in_task == Int32(0):
+                if prims.elect_sync():
+                    missing_stage_bytes = (
+                        cfg.tile_size_kv
+                        * (cfg.head_dim_per_stage_kv - active_width)
+                        * cfg.qkv_dtype_bytes
+                    )
+                    prims.mbarrier_complete_tx(
+                        stage_info.barrier, Int32(missing_stage_bytes)
+                    )
+
+    @producer_work
+    @cute.jit
+    def dequant_v_native(
+        self,
+        stage_info: StageInfo,
+        *,
+        stage_idx: cutlass.Constexpr[int],
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+    ):
+        """Dequantize V slice ``stage_idx`` of the K tile of this section.
+
+        The tile follows the *K* cadence (Head: tile ``inst``, Loop n: tile
+        ``n * num_insts_kv + num_insts_kv + inst``) because V is converted from
+        the resident K latent slices right after the tile lands.
+        """
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=stage_idx,
+            section=section,
+            native_tile_idx=tile,
+        )
+
+    @producer_work
+    @cute.jit
+    def dequant_v_native_regs(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        v3_raw,
+        v3_scale,
+        inst: cutlass.Constexpr[int] = 0,
+    ):
+        """Convert the last V slice from register-staged raw/scale words.
+
+        The words were loaded by ``SmemRawKvResource.load_v_slice_regs`` before
+        the raw stage was released, so this slice's wait for a free V-ring stage
+        (PV of this tile) no longer holds the raw stage, and the loader can
+        refill it one tile earlier.
+        """
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=self.cfg.v_head_dim_stages - 1,
+            section=section,
+            native_tile_idx=tile,
+            preloaded=(v3_raw, v3_scale),
+        )
+
+    @cute.jit
+    def _dequant_stage(
+        self,
+        stage_info: StageInfo,
+        inst_id: int,
+        is_v: int,
+        *,
+        stage_idx: cutlass.Constexpr[int],
+        section: cutlass.Constexpr[MlaStage],
+        native_tile_idx,
+        preload_only: cutlass.Constexpr[bool] = False,
+        preloaded=None,
+        raw_override=None,
+    ):
+        """Warp ``w`` converts tokens ``w * tpw + 8i + (l >> 2)``, raw chunk ``l & 3``.
+
+        ``tpw = tile_size_kv / dequant_num_warps``.  V slices come from the K
+        tile ring (one 40 KB stage per tile = [lat0 | lat1 | rope]); the dequant
+        is not a registered consumer of that ring, so the stage is addressed by
+        ``native_tile_idx``.
+
+        Latent slices: 32 E2M1 per chunk x E4M3 block scale (x s_dequant) ->
+        32 E4M3 written as two 16-byte chunks of the token's SW128 row.
+
+        ``preload_only`` runs phase 1 only and returns the slice's raw and scale
+        words as two register arrays; ``preloaded=(raw_arr, scale_arr)`` runs
+        phase 2 from such arrays (V slice 3 is converted after the raw stage was
+        released, see ``load_v_slice_regs``).
+        """
+        cfg = self.cfg
+        qk_stage_idx = staged_kv_head_dim_call_idx(
+            cfg, stage_info, inst_id, is_v, stage_idx=stage_idx, section=section
+        )
+        slot = native_tile_idx % Int32(cfg.nvfp4_scale_slots)
+        raw = self.raw_kv if raw_override is None else raw_override
+        raw_base = raw.smem_byte_address(
+            (native_tile_idx % Int32(cfg.kv_raw_stages)) * Int32(cfg.kv_raw_stage_bytes)
+            + Int32((qk_stage_idx // 2) * cfg.tile_size_kv * 128)
+        )
+        scales_base = raw.smem_byte_address(raw.scale_slot_byte_offset(slot))
+        dst_base = self._stage_base(stage_info).data_ptr(Int32(0)).toint(cutlass.Int32)
+        thread_idx = cute.arch.thread_idx()[0] - Int32(cfg.dequant_warp_idx * 32)
+        warp_in_task = thread_idx >> Int32(5)
+        lane_idx = thread_idx & Int32(31)
+        chunk = lane_idx & Int32(3)
+        factor = Int32(0)
+        if cutlass.const_expr(not preload_only):
+            factor = f32_to_f16x2(self.kv_dequant_scale)
+        scale_byte_in_row = 8 * qk_stage_idx
+        # prmt selector for scale bytes 2c and 2c+1 of this stage's 8-byte pair.
+        pair_sel = (chunk * Int32(2)) | ((chunk * Int32(2) + Int32(1)) << Int32(4))
+        tokens_per_warp = cfg.tile_size_kv // cfg.dequant_num_warps
+        num_iters = tokens_per_warp // 8
+        # Phase 1: issue every shared load of the slice up front.  The inline-asm
+        # loads/stores carry memory side effects, so the compiler would otherwise
+        # serialize load -> convert -> store per iteration and expose each LDS
+        # latency (ncu: dequant warps ~10% issue, the rest scoreboard stalls).
+        staged = []
+        # Lane -> token within each 8-token group.  LDS.128 / STS.128 form one
+        # wavefront per quarter-warp (8 lanes = 2 tokens x 4 chunks).  With the
+        # SW128 swizzle (slot = chunk ^ (token & 7)) the two tokens of a quarter
+        # must differ in bit 2 for the raw loads and in bit 0 for the E4M3 stores
+        # to hit 8 distinct 16-byte slots, so quarter q covers tokens q and q ^ 5
+        # (pairs (0,5) (1,4) (2,7) (3,6)); the naive (lane >> 2) mapping made
+        # every dequant LDS/STS a 2-way conflict (ncu: 8 wavefronts, ideal 4).
+        lane_token = (lane_idx >> Int32(3)) ^ (
+            ((lane_idx >> Int32(2)) & Int32(1)) * Int32(5)
+        )
+
+        def _scale_words(token):
+            return ld_shared_v2(
+                scales_base
+                + token * Int32(cfg.nvfp4_scale_row_bytes)
+                + Int32(scale_byte_in_row)
+            )
+
+        if cutlass.const_expr(preloaded is not None):
+            raw_arr, sc_arr = preloaded
+            for it in cutlass.range_constexpr(num_iters):
+                token = (
+                    warp_in_task * Int32(tokens_per_warp) + Int32(it * 8) + lane_token
+                )
+                sc_words = (Int32(sc_arr[2 * it]), Int32(sc_arr[2 * it + 1]))
+                staged.append(
+                    (
+                        token,
+                        (
+                            Int32(raw_arr[4 * it]),
+                            Int32(raw_arr[4 * it + 1]),
+                            Int32(raw_arr[4 * it + 2]),
+                            Int32(raw_arr[4 * it + 3]),
+                        ),
+                        sc_words,
+                    )
+                )
+        for it in cutlass.range_constexpr(0 if preloaded is not None else num_iters):
+            token = warp_in_task * Int32(tokens_per_warp) + Int32(it * 8) + lane_token
+            # 128-byte raw rows (SWIZZLE_128B) hold two slices; this slice
+            # is half (qk_stage_idx & 1), chunk index XOR-swizzled by row.
+            raw_addr = (
+                raw_base
+                + token * Int32(128)
+                + (
+                    ((Int32((qk_stage_idx & 1) * 4) + chunk) ^ (token & Int32(7)))
+                    * Int32(16)
+                )
+            )
+            raw_words = ld_shared_v4(raw_addr)
+            scale_words = _scale_words(token)
+            staged.append((token, raw_words, scale_words))
+        if cutlass.const_expr(preload_only):
+            raw_arr = cutlass.Array(
+                Int32, 4 * num_iters, space=cutlass.AddressSpace.rmem
+            )
+            sc_arr = cutlass.Array(
+                Int32, 2 * num_iters, space=cutlass.AddressSpace.rmem
+            )
+            for it in cutlass.range_constexpr(num_iters):
+                _, (w0, w1, w2, w3), (s_lo, s_hi) = staged[it]
+                raw_arr[4 * it] = w0
+                raw_arr[4 * it + 1] = w1
+                raw_arr[4 * it + 2] = w2
+                raw_arr[4 * it + 3] = w3
+                sc_arr[2 * it] = s_lo
+                sc_arr[2 * it + 1] = s_hi
+            return raw_arr, sc_arr
+        # Phase 2: convert and store.
+        for it in cutlass.range_constexpr(num_iters):
+            token, (w0, w1, w2, w3), (s_lo, s_hi) = staged[it]
+            sc0, sc1 = scaled_e4m3_pair_broadcast(s_lo, s_hi, pair_sel, factor)
+            o0 = qmul4_lo(w0, sc0)
+            o1 = qmul4_hi(w0, sc0)
+            o2 = qmul4_lo(w1, sc0)
+            o3 = qmul4_hi(w1, sc0)
+            o4 = qmul4_lo(w2, sc1)
+            o5 = qmul4_hi(w2, sc1)
+            o6 = qmul4_lo(w3, sc1)
+            o7 = qmul4_hi(w3, sc1)
+            swz = token & Int32(7)
+            row_addr = dst_base + token * Int32(128)
+            c0 = ((chunk * Int32(2)) ^ swz) * Int32(16)
+            c1 = ((chunk * Int32(2) + Int32(1)) ^ swz) * Int32(16)
+            st_shared_v4(row_addr + c0, o0, o1, o2, o3)
+            st_shared_v4(row_addr + c1, o4, o5, o6, o7)
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
     def _producer_copy_rope_stage(
         self,
         stage_info: StageInfo,
@@ -779,7 +1195,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids,
+        cached_page_ids=None,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load one staged K or V tile using the consumed page-id payload."""
@@ -831,7 +1247,7 @@ class SmemKvResource(MlaResource):
         stage_base = self._stage_base(stage_info)
         inner_width = min(tma_inner_dim_elems(cfg), active_width)
         uses_compact_fp8_rope_stage = (
-            cfg.load_num_warps == 1
+            (cfg.load_num_warps == 1 or cfg.is_dynamic_token_sparse)
             and cfg.is_fp8_qkv()
             and not is_v
             and cfg.rope_dim == 64
@@ -839,6 +1255,21 @@ class SmemKvResource(MlaResource):
             and cfg.head_dim_per_stage_kv == 128
         )
 
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            is_rope_stage = (not is_v) and (
+                qk_stage_idx >= cfg.latent_dim // cfg.head_dim_per_stage_kv
+            )
+            self._producer_gather_token_rows(
+                stage_info,
+                stage_base,
+                dim_offset=Int32(cfg.latent_dim) if is_rope_stage else dim_offset,
+                active_width=active_width,
+                is_rope_stage=is_rope_stage,
+                uses_compact_fp8_rope_stage=uses_compact_fp8_rope_stage,
+                publish_mask=(not is_v) and qk_stage_idx == 0,
+                tile_idx=tile_idx,
+            )
+            return
         if cutlass.const_expr(cfg.use_paged_kv == 1):
             if cutlass.const_expr(
                 self.page_offsets_kv is None and self.page_offsets is None
@@ -963,7 +1394,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids,
+        cached_page_ids=None,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load K instance 0 into the acquired K/V SMEM stage."""
@@ -987,7 +1418,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids,
+        cached_page_ids=None,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load K instance 1 into the acquired K/V SMEM stage."""
@@ -1011,7 +1442,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids,
+        cached_page_ids=None,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load deferred V instance 0 into the acquired K/V SMEM stage."""
@@ -1035,7 +1466,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids,
+        cached_page_ids=None,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load deferred V instance 1 into the acquired K/V SMEM stage."""
@@ -1091,6 +1522,7 @@ class SmemKvResource(MlaResource):
                 qk_stage_idx = k_subtile_idx
                 if cutlass.const_expr(
                     self.cfg.rope_dim == 64
+                    and not self.cfg.is_dynamic_token_sparse_nvfp4
                     and qk_stage_idx
                     == self.cfg.latent_dim // self.cfg.head_dim_per_stage_kv
                 ):
@@ -1172,3 +1604,541 @@ class SmemVResource(MlaResource):
 
     inst_id: cutlass.Constexpr[int] = 0
     is_v: cutlass.Constexpr[int] = 1
+
+
+class SmemRawKvResource(SmemKvResource):
+    """Raw NVFP4 K ring: ``kv_raw_stages`` stages of one whole 128-token K tile
+    ([lat0 16 KB | lat1 16 KB | rope 8 KB]) gathered by TMA, followed by
+    ``nvfp4_scale_slots`` per-tile scale slots (token-major 40-byte rows filled
+    by ``cp.async``), the loader-owned validity ring and the index scratch.
+
+    Producer: the Gather4 loader warps (one stage per K tile).  Consumers: the
+    MMA reads the K tile natively (TMA -> UMMA) after observing the full barrier
+    directly (``observe_k_tile_full``); the dequant warps (the registered
+    consumer) convert the resident latent slices into the E4M3 V ring.
+    """
+
+    _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+        SmemKvResource._task_local_specs
+        + (
+            (
+                "v3_raw_var",
+                cutlass.Array,
+                None,
+                "Register-staged raw E2M1 words of the last V slice.",
+                "v3_raw",
+            ),
+            (
+                "v3_scale_var",
+                cutlass.Array,
+                None,
+                "Register-staged block-scale words of the last V slice.",
+                "v3_scale",
+            ),
+        )
+    )
+
+    # Loader-owned indices: after the scale slots the allocation holds the
+    # per-tile validity ring (``SPARSE_MASK_SLOTS`` x 32 quad nibbles, one byte
+    # per quad) and a lane-private index scratch (``load_num_warps`` x 32 lanes
+    # x ``LDIDX_TILE_SLOTS`` tile slots x 4 rows; the rows are prefetched two
+    # tiles ahead, so rows t .. t + 3 are live).
+    LDIDX_MASK_SLOT_BYTES = 32
+    LDIDX_TILE_SLOTS = 4
+
+    # K tiles per work tile (dequant co-issue guard).
+    num_local_tiles: cutlass.Constexpr[int] = 0
+
+    @property
+    def _ring_and_scale_bytes(self) -> int:
+        cfg = self.cfg
+        return (
+            cfg.kv_raw_stages * cfg.kv_raw_stage_bytes
+            + cfg.nvfp4_scale_slots * cfg.nvfp4_scale_slot_bytes
+        )
+
+    @property
+    def _ldidx_mask_bytes(self) -> int:
+        return SPARSE_MASK_SLOTS * self.LDIDX_MASK_SLOT_BYTES
+
+    @property
+    def _ldidx_quads_per_warp(self) -> int:
+        n = self.cfg.load_num_warps
+        return (32 + n - 1) // n
+
+    @property
+    def _ldidx_scratch_bytes(self) -> int:
+        # Only the lanes that own a quad keep index slots (inactive lanes read
+        # an aliased slot and discard the value).
+        return (
+            self.cfg.load_num_warps
+            * self._ldidx_quads_per_warp
+            * self.LDIDX_TILE_SLOTS
+            * 16
+        )
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self._ring_and_scale_bytes
+            + self._ldidx_mask_bytes
+            + self._ldidx_scratch_bytes
+        )
+
+    @property
+    def total_words(self) -> int:
+        """Int32 count of the allocation (softmax maps the validity ring through it)."""
+        return self.total_bytes // 4
+
+    @property
+    def sparse_mask_word_base(self) -> int:
+        """Int32 index of the loader-owned validity ring (mirrors SmemPageOffsetsResource)."""
+        return self._ring_and_scale_bytes // 4
+
+    @property
+    def _ldidx_scratch_word_base(self) -> int:
+        return (self._ring_and_scale_bytes + self._ldidx_mask_bytes) // 4
+
+    def get_smem_requirements(self):
+        if self._alloc is None:
+            self._alloc = SmemAllocation(
+                name=f"{self.name}",
+                size_bytes=self.total_bytes,
+                alignment=1024,
+            )
+        return [self._alloc]
+
+    @cute.jit
+    def _init_smem_state(self, stage_info: StageInfo) -> None:
+        context = stage_info.context
+        self._smem_kv = smem_array(
+            context, self._alloc, cutlass.Uint8, self.total_bytes
+        )
+        self._smem_words = smem_array(context, self._alloc, Int32, self.total_words)
+
+    @cute.jit
+    def _stage_base(self, stage_info: StageInfo):
+        return self._smem_kv.subview(
+            stage_info.stage_idx * Int32(self.cfg.kv_raw_stage_bytes)
+        )
+
+    @cute.jit
+    def smem_byte_address(self, byte_offset) -> Int32:
+        """Return the 32-bit shared address of ``byte_offset`` inside this allocation."""
+        return self._smem_kv.data_ptr(Int32(byte_offset)).toint(cutlass.Int32)
+
+    def scale_slot_byte_offset(self, slot) -> Int32:
+        cfg = self.cfg
+        return Int32(cfg.kv_raw_stages * cfg.kv_raw_stage_bytes) + Int32(slot) * Int32(
+            cfg.nvfp4_scale_slot_bytes
+        )
+
+    @consumer_work(returns=("v3_raw", "v3_scale"))
+    @cute.jit
+    def load_v_slice_regs(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+    ):
+        """Load the last V slice's raw and scale words into registers.
+
+        Issued after the first three V slices were converted and before the raw
+        stage is released; ``SmemKvResource.dequant_v_native_regs`` converts
+        them once PV of this tile frees a V-ring stage.
+        """
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        return self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=self.cfg.v_head_dim_stages - 1,
+            section=section,
+            native_tile_idx=tile,
+            preload_only=True,
+            raw_override=self,
+        )
+
+    @cute.jit
+    def observe_k_tile_full(self, local_tile_idx) -> None:
+        """Spin until the raw stage of ``local_tile_idx`` is full (non-consumer observer).
+
+        The MMA warp is not a registered consumer of the raw ring: the dequant
+        warps are, and they release a stage only after BMM1 of that tile has
+        completed (``Bmm1DoneResource``), so the stage cannot be refilled before
+        the MMA has seen it and the parity below is unambiguous.
+        """
+        num_stages = self.cfg.kv_raw_stages
+        stage = local_tile_idx % Int32(num_stages)
+        parity = (local_tile_idx // Int32(num_stages)) & Int32(1)
+        bar = self.full_barrier_smem_address(stage)
+        while mbarrier_try_wait_parity_u32(bar, parity) == Int32(0):
+            pass
+
+    # Loader-owned indices: producer works without the page-id token (the
+    # schedule builder routes every non-constexpr work argument as a token).
+    @producer_work
+    @cute.jit
+    def load_k_tile_owned(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+    ):
+        """Gather one whole K tile ([lat0 | lat1 | rope]) into one raw stage.
+
+        With two instances per step the per-tile index / scale prefetch cadence
+        is unchanged: only the very first tile of the work tile (Head, instance
+        0) runs the full prefetch; every later tile (Head instance 1 included)
+        runs the Loop path and is followed by ``prefetch_k_tile_ahead``.
+        """
+        cfg = self.cfg
+        local_tile_idx = local_kv_tile_idx(cfg, stage_info, inst, 0, section=section)
+        # Trace-time choice (conditional expression: the DSL frontend would try
+        # to stage a Python enum reassigned inside an ``if``).
+        prefetch_section = (
+            MlaStage.Loop if (section == MlaStage.Head and inst != 0) else section
+        )
+        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        seq_len_kv = runtime_seq_len_kv_from_task_cache(
+            cfg,
+            decode_gen_task_cache(stage_info),
+            cta_idx_q,
+            self.cu_seqlens_q,
+            batch_idx,
+        )
+        self._producer_gather_owned_tile(
+            stage_info,
+            self._stage_base(stage_info),
+            local_tile_idx=local_tile_idx,
+            seq_len_kv=seq_len_kv,
+            batch_idx=batch_idx,
+            section=prefetch_section,
+        )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def prefetch_k_tile_ahead(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+    ):
+        """After a stage commit (every tile but the first): index rows of tile + 3
+        and scale rows of tile + 2 (see ``_producer_gather_owned_tile``)."""
+        cfg = self.cfg
+        local_tile_idx = local_kv_tile_idx(cfg, stage_info, inst, 0, section=section)
+        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        seq_len_kv = runtime_seq_len_kv_from_task_cache(
+            cfg,
+            decode_gen_task_cache(stage_info),
+            cta_idx_q,
+            self.cu_seqlens_q,
+            batch_idx,
+        )
+        self._producer_gather_owned_tile(
+            stage_info,
+            None,
+            local_tile_idx=local_tile_idx,
+            seq_len_kv=seq_len_kv,
+            batch_idx=batch_idx,
+            section=section,
+            mode="prefetch",
+        )
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def issue_gathers_ahead(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+    ):
+        """Dequant warps issue the lat1 and rope Gather4 of tile t + 2 right after
+        releasing tile t's raw stage (the loader itself covers tiles 0 and 1).
+
+        The stage is free (this task is its only consumer and BMM1(t) completed),
+        the row indices of t + 2 are in the loader scratch (prefetched two steps
+        earlier and complete before raw stage t was released), and the stage's
+        full barrier is in the phase of t + 2 (t's phase completed before this
+        step).  The bytes land on that barrier ahead of the loader's
+        arrive.expect_tx, which the mbarrier tx-count allows; the loader still
+        issues lat0, the mask, the proxy fence and the surplus completion.
+        64 gathers over 8 warps: lane l < 8 of warp w issues quad w * 4 + (l & 3),
+        lat1 for l < 4 and rope for 4 <= l < 8.
+        """
+        cfg = self.cfg
+        tile = local_kv_tile_idx(cfg, stage_info, inst, 0, section=section)
+        target = tile + Int32(2)
+        # The loader never loads tiles past this work tile's runtime count
+        # (ragged lengths): gathers for them would land in a stage nobody
+        # waits for (and after the CTA exits), so guard on the runtime count.
+        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        seq_len_kv = runtime_seq_len_kv_from_task_cache(
+            cfg,
+            decode_gen_task_cache(stage_info),
+            cta_idx_q,
+            self.cu_seqlens_q,
+            batch_idx,
+        )
+        runtime_tiles = runtime_local_kv_tiles(cfg, seq_len_kv)
+        words = self._smem_words
+        thread_idx = cute.arch.thread_idx()[0] - Int32(cfg.dequant_warp_idx * 32)
+        if (target < Int32(self.num_local_tiles)) & (target < runtime_tiles):
+            stage = target % Int32(cfg.kv_raw_stages)
+            stage_byte = self.smem_byte_address(stage * Int32(cfg.kv_raw_stage_bytes))
+            bar_ptr = cutlass.inttoptr(
+                self.full_barrier_smem_address(stage), 3, cutlass.Int64
+            )
+            warp_in_task = thread_idx >> Int32(5)
+            lane_idx = thread_idx & Int32(31)
+            # Spread the quads over all dequant warps (the Gather4 issue is
+            # serialized per lane inside a warp, ~45 ns each): every warp
+            # issues 4 quads x 2 boxes on lanes 0-7 (measured 360 ns per tile
+            # with the first four warps carrying 8 issues each).
+            qpw = max(1, (cfg.tile_size_kv // 4) // cfg.dequant_num_warps)
+            quad = warp_in_task * Int32(qpw) + (lane_idx % Int32(qpw))
+            kind = (lane_idx // Int32(qpw)) & Int32(1)
+            active = (lane_idx < Int32(2 * qpw)) & (quad < Int32(cfg.tile_size_kv // 4))
+            word_base = (
+                Int32(self._ldidx_scratch_word_base)
+                + quad * Int32(self.LDIDX_TILE_SLOTS * 4)
+                + (target & Int32(self.LDIDX_TILE_SLOTS - 1)) * Int32(4)
+            )
+            row0 = Int32(words[word_base])
+            row1 = Int32(words[word_base + Int32(1)])
+            row2 = Int32(words[word_base + Int32(2)])
+            row3 = Int32(words[word_base + Int32(3)])
+            seg_bytes = cfg.tile_size_kv * 128
+            desc128 = self.raw_gather4_descs.iterator + Int64(384)
+            desc64 = self.raw_gather4_descs.iterator + Int64(256)
+            if active and kind == Int32(0):
+                issue_gather4_tma_cta(
+                    desc128,
+                    cutlass.inttoptr(
+                        stage_byte + Int32(seg_bytes) + quad * Int32(4 * 128),
+                        3,
+                        cutlass.Int32,
+                    ),
+                    bar_ptr,
+                    Int32(128),
+                    (row0, row1, row2, row3),
+                )
+            if active and kind == Int32(1):
+                issue_gather4_tma_cta(
+                    desc64,
+                    cutlass.inttoptr(
+                        stage_byte + Int32(2 * seg_bytes) + quad * Int32(4 * 64),
+                        3,
+                        cutlass.Int32,
+                    ),
+                    bar_ptr,
+                    Int32(cfg.latent_dim // 2),
+                    (row0, row1, row2, row3),
+                )
+
+    @cute.jit
+    def _producer_gather_owned_tile(
+        self,
+        stage_info: StageInfo,
+        stage_base,
+        *,
+        local_tile_idx,
+        seq_len_kv,
+        batch_idx,
+        section: cutlass.Constexpr[MlaStage],
+        mode: cutlass.Constexpr[str] = "gather",
+    ):
+        """Loader-owned indices, one K tile per raw stage.
+
+        Per tile: lane ``l`` of loader warp ``w`` owns quad ``w*qpw + l``; it
+        prefetches the row indices of tile + 3 (slot ``tile & 3``), stages the
+        scale rows of tile + 2, publishes its validity nibble and issues the
+        latent-0 Gather4 (128 B).  The lat1 / rope boxes are issued here for
+        tiles 0 and 1 only; from tile 2 on the dequant warps issue them
+        (``issue_gathers_ahead``).
+        """
+        cfg = self.cfg
+        num_load_warps = cfg.load_num_warps
+        lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
+        warp_in_task = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+            cfg.load_warp_idx
+        )
+        num_quads = cfg.tile_size_kv // 4
+        qpw = (num_quads + num_load_warps - 1) // num_load_warps
+        quad = (
+            warp_in_task * Int32(qpw)
+            + lane_idx
+            + (Int32(num_quads) if lane_idx >= Int32(qpw) else Int32(0))
+        )
+        lane_active = quad < Int32(num_quads)
+        words = self._smem_words
+        last_valid = cute.math.max(seq_len_kv - Int32(1), Int32(0))
+        page_offsets_batch = self.page_offsets[None, batch_idx]
+        page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
+        scratch_lane_base = Int32(self._ldidx_scratch_word_base) + (
+            warp_in_task * Int32(qpw) + cute.math.min(lane_idx, Int32(qpw - 1))
+        ) * Int32(self.LDIDX_TILE_SLOTS * 4)
+
+        def slot_word(tile):
+            return scratch_lane_base + (
+                tile & Int32(self.LDIDX_TILE_SLOTS - 1)
+            ) * Int32(4)
+
+        def prefetch_rows(tile):
+            base = tile * Int32(cfg.tile_size_kv) + quad * Int32(4)
+            for j in cutlass.range_constexpr(4):
+                logical_idx = cute.math.min(base + Int32(j), last_valid)
+                gmem_ptr = page_offsets_flat[None, logical_idx].iterator.llvm_ptr
+                smem_ptr = cutlass.inttoptr(
+                    words.data_ptr(slot_word(tile) + Int32(j)).toint(cutlass.Int32),
+                    3,
+                    cutlass.Int32,
+                )
+                if lane_active:
+                    prims.cp_async_shared_global(
+                        smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                    )
+            cp_async_commit_group()
+
+        scale_row_bytes = cfg.nvfp4_scale_row_bytes
+
+        def stage_scales(tile):
+            # The 40-byte scale row of each of the lane's four tokens lands
+            # token-major in the slot (40-byte pitch, five 8-byte copies: odd
+            # rows are only 8-byte aligned in the pool).  The dequant reads V
+            # scales as LDS.64 and the dequant warps write SFB with tcgen05.st,
+            # so no block order is needed.  Invalid rows zero-fill.
+            slot_base = self.scale_slot_byte_offset(tile % Int32(cfg.nvfp4_scale_slots))
+            scale_pool_base = self.kv_scale_pool.iterator.toint()
+            for j in cutlass.range_constexpr(4):
+                row = Int32(words[slot_word(tile) + Int32(j)])
+                token = quad * Int32(4) + Int32(j)
+                dst = self.smem_byte_address(slot_base + token * Int32(scale_row_bytes))
+                src = scale_pool_base + Int64(row) * Int64(scale_row_bytes)
+                n8 = Int32(8) if row >= Int32(0) else Int32(0)
+                if lane_active:
+                    for k in cutlass.range_constexpr(scale_row_bytes // 8):
+                        cp_async_8b_zfill(dst + Int32(8 * k), src + Int64(8 * k), n8)
+            cp_async_commit_group()
+
+        tile = local_tile_idx
+        if cutlass.const_expr(mode == "prefetch"):
+            # Tail of a Loop step, after the stage commit: the scale rows of
+            # tile + 2 (slot of tile - 2, whose readers finished before this
+            # step's stage was acquired), then the row indices of tile + 3.
+            # Issued here so the ~44 scattered cp.async per lane do not sit
+            # between the stage acquire and the Gather4 issue.  Both groups
+            # issued at the previous tail (scales(tile + 1), rows(tile + 2)) are
+            # a whole tile old; rows(tile + 2) must have landed before its scale
+            # rows are staged.  Committing the scales before the rows makes the
+            # scale group the older of the two groups in flight, so the
+            # ``scales_landed`` publication at the next loop top completes it
+            # with ``cp.async.wait_group 1`` and leaves only the row prefetch.
+            cp_async_wait_group(0)
+            stage_scales(tile + Int32(2))
+            prefetch_rows(tile + Int32(3))
+            return
+        if cutlass.const_expr(section == MlaStage.Head):
+            prefetch_rows(tile)
+            prefetch_rows(tile + Int32(1))
+            prefetch_rows(tile + Int32(2))
+            prefetch_rows(tile + Int32(3))
+            # Only rows(tile) must have landed to issue the first gather; the
+            # scale rows are staged after it (below).
+            cp_async_wait_group(3)
+        else:
+            # The ``scales_landed`` publication at the top of this loop step
+            # already completed every group but the previous tail's row
+            # prefetch (rows(tile + 2)); this step needs only rows(tile) and the
+            # scale rows of tile, so let that newest group stay in flight
+            # instead of eating its HBM latency here (wait_group 0 measured
+            # +5 us at B=256).
+            cp_async_wait_group(1)
+        # The landed scale rows of this tile are handed to their readers through
+        # the stage barrier once it flips: order the generic-proxy cp.async
+        # writes ahead of the release below.
+        fence_proxy_async_shared()
+        row0 = Int32(words[slot_word(tile)])
+        row1 = Int32(words[slot_word(tile) + Int32(1)])
+        row2 = Int32(words[slot_word(tile) + Int32(2)])
+        row3 = Int32(words[slot_word(tile) + Int32(3)])
+        nibble = (
+            (Int32(1) if row0 >= Int32(0) else Int32(0))
+            | ((Int32(1) if row1 >= Int32(0) else Int32(0)) << Int32(1))
+            | ((Int32(1) if row2 >= Int32(0) else Int32(0)) << Int32(2))
+            | ((Int32(1) if row3 >= Int32(0) else Int32(0)) << Int32(3))
+        )
+        # Tokens at or beyond the KV length (the clamped duplicates of the last
+        # valid index) are invalid too, so the softmax needs no per-score tail
+        # test.
+        tok0 = tile * Int32(cfg.tile_size_kv) + quad * Int32(4)
+        nibble = nibble & (
+            (Int32(1) if tok0 < seq_len_kv else Int32(0))
+            | ((Int32(1) if tok0 + Int32(1) < seq_len_kv else Int32(0)) << Int32(1))
+            | ((Int32(1) if tok0 + Int32(2) < seq_len_kv else Int32(0)) << Int32(2))
+            | ((Int32(1) if tok0 + Int32(3) < seq_len_kv else Int32(0)) << Int32(3))
+        )
+        mask_byte = (
+            Int32(self.sparse_mask_word_base * 4)
+            + (tile % Int32(SPARSE_MASK_SLOTS)) * Int32(self.LDIDX_MASK_SLOT_BYTES)
+            + quad
+        )
+        if lane_active:
+            st_shared_u8(self.smem_byte_address(mask_byte), nibble)
+        desc128 = self.raw_gather4_descs.iterator + Int64(384)
+        desc64 = self.raw_gather4_descs.iterator + Int64(256)
+        seg_bytes = cfg.tile_size_kv * 128
+        if lane_active:
+            issue_gather4_tma_cta(
+                desc128,
+                stage_base.data_ptr(quad * Int32(4 * 128)),
+                stage_info.barrier,
+                Int32(0),
+                (row0, row1, row2, row3),
+            )
+            # The dequant warps issue lat1 / rope of tile t + 2 right after they
+            # release tile t's stage (issue_gathers_ahead), so the loader covers
+            # them only for tiles 0 and 1.
+            if tile < Int32(2):
+                issue_gather4_tma_cta(
+                    desc128,
+                    stage_base.data_ptr(Int32(seg_bytes) + quad * Int32(4 * 128)),
+                    stage_info.barrier,
+                    Int32(128),
+                    (row0, row1, row2, row3),
+                )
+                issue_gather4_tma_cta(
+                    desc64,
+                    stage_base.data_ptr(Int32(2 * seg_bytes) + quad * Int32(4 * 64)),
+                    stage_info.barrier,
+                    Int32(cfg.latent_dim // 2),
+                    (row0, row1, row2, row3),
+                )
+        declared = cfg.nvfp4_raw_stage_tx_bytes
+        gathered = cfg.kv_raw_stage_bytes
+        surplus = declared - gathered
+        warp_sync_all()
+        if lane_idx == Int32(0):
+            share = Int32(surplus // num_load_warps) + (
+                Int32(1) if warp_in_task < Int32(surplus % num_load_warps) else Int32(0)
+            )
+            prims.fence_acq_rel(prims.MemScope.CTA)
+            prims.mbarrier_complete_tx(stage_info.barrier, share)
+        if cutlass.const_expr(section == MlaStage.Head):
+            # Gather mode (the prefetch mode returned above): with the first
+            # gather in flight, complete rows(1..3) and stage the scale rows of
+            # tiles 0 / 1 / 2 (the HEAD publications of sf_landed follow this
+            # call and only fence).
+            cp_async_wait_group(0)
+            stage_scales(tile)
+            stage_scales(tile + Int32(1))
+            stage_scales(tile + Int32(2))
+            cp_async_wait_group(0)

@@ -637,6 +637,45 @@ def tcgen05_store_p_fp8_16x32bx2_x16(tmem_addr, regs_p):
 
 
 @cute.jit
+def tcgen05_store_p_fp8_16x32bx2_x8(tmem_addr, regs_p):
+    """Store 8 packed E4M3 P registers (64-key rows) to a split TMEM-P tile.
+
+    Used when each softmax instance owns 64 keys of a row (the column-split
+    NVFP4 token-sparse softmax at ``tile_size_q == 64``).
+    Threads 16-31 hold the upper half of the 64-key row, which starts 8
+    columns (32 keys x 1 B / 4 B) after the lower half: the column-offset
+    immediate is half the 128-key stride.
+    """
+    inline_ptx(
+        "tcgen05.st.sync.aligned.16x32bx2.x8.b32 "
+        f"[{{$r0}}], {TCGEN05_16X32BX2_FP8_P_STRIDE // 2}, "
+        "{ {$r1}, {$r2}, {$r3}, {$r4}, {$r5}, {$r6}, {$r7}, {$r8} };",
+        read_only_args=[
+            tmem_addr,
+            regs_p[0],
+            regs_p[1],
+            regs_p[2],
+            regs_p[3],
+            regs_p[4],
+            regs_p[5],
+            regs_p[6],
+            regs_p[7],
+        ],
+    )
+
+
+def tcgen05_st_32x32b_x8(tmem_addr, regs):
+    """``tcgen05.st.sync.aligned.32x32b.x8``: lane ``i`` writes 8 consecutive
+    columns of TMEM lane ``32 * (warp % 4) + i`` (token-major SFB chunks of the
+    native FP4 QK)."""
+    inline_ptx(
+        "tcgen05.st.sync.aligned.32x32b.x8.b32 [{$r0}], "
+        "{ {$r1}, {$r2}, {$r3}, {$r4}, {$r5}, {$r6}, {$r7}, {$r8} };",
+        read_only_args=[tmem_addr, *[regs[i] for i in range(8)]],
+    )
+
+
+@cute.jit
 def float_to_u32_bits(val):
     """Return the raw Uint32 bit pattern for a Float32 value."""
     return cprims.mov_b32(val, target_type=Uint32)
@@ -675,3 +714,27 @@ def st_global_u8(addr: Int64, value: Uint32):
     cprims.store_ext(
         Uint8(value), cutlass.inttoptr(addr, cutlass.AddressSpace.gmem, Uint8)
     )
+
+
+@cutlass.dsl_user_op
+def warp_ballot_sync(pred: Int32, *, loc=None, ip=None) -> Int32:
+    """Return the full-warp ``vote.sync.ballot`` of ``pred != 0`` (bit = lane)."""
+
+    result = llvm.inline_asm(
+        mlir_T.i32(),
+        [Int32(pred).ir_value(loc=loc, ip=ip)],
+        """
+        {
+          .reg .pred p;
+          setp.ne.b32 p, $1, 0;
+          vote.sync.ballot.b32 $0, p, 0xffffffff;
+        }
+        """,
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)

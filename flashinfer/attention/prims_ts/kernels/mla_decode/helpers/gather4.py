@@ -148,3 +148,54 @@ def issue_gather4_tma_2cta(
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def issue_gather4_tma_cta(
+    tma_descriptor,
+    dst_smem,
+    completion_mbarrier,
+    head_dim_offset: Int32,
+    page_indices: Sequence,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Issue one CTA-local Gather4 load (no cluster multicast).
+
+    Used by the 1CTA token-sparse loader: the four row coordinates address a
+    flat ``[row_bytes, N]`` pool map and completion lands on this CTA's own
+    stage mbarrier.  ``dst_smem`` / ``completion_mbarrier`` accept a CuTe
+    pointer or a ``cutlass.Array`` view of shared memory; ``tma_descriptor`` is
+    a CuTe descriptor pointer or the GMEM address of an encoded ``CUtensorMap``.
+    """
+    if len(page_indices) != 4:
+        raise ValueError("SM100 Gather4 requires exactly four row coordinates")
+
+    def _smem_addr(obj):
+        if hasattr(obj, "data_ptr") and not hasattr(obj, "toint"):
+            obj = obj.data_ptr()
+        return obj.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+
+    dst_addr = _smem_addr(dst_smem)
+    barrier_addr = _smem_addr(completion_mbarrier)
+    if hasattr(tma_descriptor, "toint"):
+        descriptor_addr = tma_descriptor.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    else:
+        descriptor_addr = Int64(tma_descriptor).ir_value(loc=loc, ip=ip)
+    head_dim = Int32(head_dim_offset).ir_value(loc=loc, ip=ip)
+    coords = [Int32(coord).ir_value(loc=loc, ip=ip) for coord in page_indices]
+    llvm.inline_asm(
+        None,
+        [dst_addr, descriptor_addr, barrier_addr, head_dim, *coords],
+        (
+            "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4."
+            "mbarrier::complete_tx::bytes "
+            "[$0], [$1, {$3, $4, $5, $6, $7}], [$2];"
+        ),
+        "r,l,r,r,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
