@@ -66,7 +66,7 @@
 #define SMEM_SMEM_STG_STAGE_BYTES 26112
 #define SMEM_SMEM_STG_STRIDE 26112
 #define SMEM_TOTAL 229888
-#define THREADS 480
+#define THREADS 736
 
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
@@ -87,7 +87,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(4,1,1) void
-kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+kernel_cake_kimi_k3_fp8_projection_ae66e1c9615449d1921b(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -158,9 +158,9 @@ kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ 
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // tma_full: 2 barriers, init_count=9
-            mbarrier_init(smem + 0, 9);
-            mbarrier_init(smem + 8, 9);
+            // tma_full: 2 barriers, init_count=17
+            mbarrier_init(smem + 0, 17);
+            mbarrier_init(smem + 8, 17);
             // mma_done: 2 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
@@ -168,15 +168,15 @@ kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ 
             // xb_full: 2 barriers, init_count=1
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
-            // xb_empty: 2 barriers, init_count=8
-            mbarrier_init(smem + 48, 8);
-            mbarrier_init(smem + 56, 8);
+            // xb_empty: 2 barriers, init_count=16
+            mbarrier_init(smem + 48, 16);
+            mbarrier_init(smem + 56, 16);
             // xb_full1: 2 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
-            // xb_empty1: 2 barriers, init_count=8
-            mbarrier_init(smem + 80, 8);
-            mbarrier_init(smem + 88, 8);
+            // xb_empty1: 2 barriers, init_count=16
+            mbarrier_init(smem + 80, 16);
+            mbarrier_init(smem + 88, 16);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 1 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
@@ -1574,7 +1574,7 @@ kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ 
         }
     }
     // ---- Role: quant ----
-    if (warp >= 6 && warp <= 13) {
+    if (warp >= 6 && warp <= 21) {
         { // quant_main
             int w0_q = bid;
             int ws_q = num_bids;
@@ -1607,13 +1607,13 @@ kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ 
                     const int grp = lane_q / 8;
                     const int sub = lane_q - grp * 8;
                     const int stag = (grp & 1) * 8;
-                    if (qwarp >= 0 && qwarp < 8) {
+                    if (qwarp >= 0 && qwarp < 16) {
                         mbarrier_wait(xb_full_addr + (xb_q) * 8, _phase_xb_full);
                         unsigned int xb_half = smem_xb0_addr + xb_q * 32768;
                         unsigned int panel_h = x_stage;
                         #pragma unroll
-                        for (int itn = 0; itn < 2; itn++) {
-                            int tok_h = (itn * 8 + qwarp) * 4 + grp;
+                        for (int itn = 0; itn < 1; itn++) {
+                            int tok_h = (itn * 16 + qwarp) * 4 + grp;
                             int tok_gh = tok0_q + tok_h;
                             unsigned int row_h = xb_half + (unsigned int)(tok_h * 256);
                             unsigned int wordsh[8];
@@ -1746,13 +1746,13 @@ kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ 
                             mbarrier_arrive(xb_empty_addr + (xb_q) * 8);
                         }
                     }
-                    if (qwarp >= 0 && qwarp < 8) {
+                    if (qwarp >= 0 && qwarp < 16) {
                         mbarrier_wait(xb_full1_addr + (xb_q) * 8, _phase_xb_full1);
                         unsigned int xb_half_1 = smem_xb1_addr + xb_q * 32768;
                         unsigned int panel_h_1 = x_stage + 8192;
                         #pragma unroll
-                        for (int itn_1 = 0; itn_1 < 2; itn_1++) {
-                            int tok_h_1 = (itn_1 * 8 + qwarp) * 4 + grp;
+                        for (int itn_1 = 0; itn_1 < 1; itn_1++) {
+                            int tok_h_1 = (itn_1 * 16 + qwarp) * 4 + grp;
                             int tok_gh_1 = tok0_q + tok_h_1;
                             unsigned int row_h_1 = xb_half_1 + (unsigned int)(tok_h_1 * 256);
                             unsigned int wordsh_1[8];
@@ -1898,7 +1898,7 @@ kernel_cake_kimi_k3_fp8_projection_9016576da95167ebc80e(const __grid_constant__ 
         }
     }
     // ---- Role: xload ----
-    if (warp == 14) {
+    if (warp == 22) {
         { // xload_main
             unsigned int _phase_xb_empty = 1;
             unsigned int _phase_xb_empty1 = 1;
