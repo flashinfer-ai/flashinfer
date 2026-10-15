@@ -35,6 +35,10 @@ from ..activations import ACTIVATIONS, activation_name
 from ..support import weight_view
 from ..compiler import require_moe_assembler
 from ..shortlist import capture_profiles
+from ..shortlist import _read
+from ..catalog import can_implement, select_kernels as select_catalog
+from ..heuristics import POLICY_VERSION
+from ..tuning import prepared_state, ranked_tactics
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
 _TAG = "cudnn_frost-bf16-moe-v2"
@@ -68,29 +72,24 @@ def _matching_kernels(roots, arch, rows, hidden, intermediate, experts, name):
     first = tuple(
         k
         for k in runtime._discover(roots)
-        if k.arch == arch
-        and k.activation == name
-        and all(
-            runtime._dimension_matches(v, k.contract.get(d)) for d, v in values.items()
-        )
+        if k.arch == arch and k.activation == name and can_implement(k, values)
     )
     values = dict(s=rows, n=hidden, k=intermediate, experts=experts, groups=experts)
     second = tuple(
-        k
-        for k in fc2.discover(roots)
-        if k.arch == arch
-        and all(
-            runtime._dimension_matches(v, k.contract.get(d)) for d, v in values.items()
-        )
+        k for k in fc2.discover(roots) if k.arch == arch and can_implement(k, values)
     )
     return first, second
 
 
 def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activation):
+    if not 0 < tokens <= 1 << 20:
+        return (), ()
     return _selected_kernels_cached(
         runtime._artifact_roots(),
         runtime._artifact_cache_version,
+        runtime._tactic_digest(POLICY_VERSION),
         runtime._arch_for(device),
+        torch.cuda.get_device_properties(device).multi_processor_count,
         tokens,
         hidden,
         intermediate,
@@ -102,26 +101,35 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
 
 @functools.lru_cache(maxsize=128)
 def _selected_kernels_cached(
-    roots, artifact_version, arch, tokens, hidden, intermediate, experts, topk, name
+    roots,
+    artifact_version,
+    compiler_key,
+    arch,
+    sm_count,
+    tokens,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    name,
 ):
     # Admission and packing share sealed artifact metadata, never runtime tensors
     # or pointers. Explicit artifact refresh advances the version in this key.
-    from ..shortlist import select
-
     first, second = _matching_kernels(
         roots, arch, tokens * topk, hidden, intermediate, experts, name
     )
-    return select(
-        roots,
-        arch,
-        name,
-        tokens,
-        hidden,
-        intermediate,
-        experts,
-        topk,
+    profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
+    return select_catalog(
         first,
         second,
+        (),
+        profiles,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        sm_count=sm_count,
     )
 
 
@@ -172,6 +180,9 @@ class _Plans:
         fma_tactic=None,
         validate_fma_sources=None,
     ):
+        first = tuple(runtime.bind_kernel(k, device) for k in first)
+        second = tuple(runtime.bind_kernel(k, device) for k in second)
+        self.first, self.second = first, second
         self.plans = {}
         self.launches = {}
         required = 0
@@ -312,7 +323,7 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
             token_ceiling=self.config.execution.tune_max_num_tokens,
             artifact_roots=runtime._artifact_roots,
             artifact_version=lambda: runtime._artifact_cache_version,
-            policy_version=_TAG,
+            policy_version=POLICY_VERSION,
             tactic_tag=_TAG,
             require_assembler=get_compute_capability(device) == (10, 7),
             refresh_artifacts=runtime.clear_artifact_cache,
@@ -387,9 +398,9 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
-        state = self.launch_state_for(inputs)
+        state = prepared_state(self, inputs)
         if state is not None:
-            return list(state.launches)
+            return ranked_tactics(state, inputs, _TAG)
         # The autotuner synthesizes a plain tensor list for a profile, so the
         # original pack's launch metadata is not available here. Reapply the
         # same shape shortlist without compiling or building any native plans.
@@ -406,7 +417,9 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
         )
 
     def _input_cache_key_extras(self, inputs):
-        state = self.launch_state_for(inputs)
+        # Profiling uses plain lists; keep its key tied to the full prepared
+        # launch pool, just like PackedInputs, rather than the ranked shortlist.
+        state = prepared_state(self, inputs)
         if state is not None:
             key, tactics = state.preparation_key, tuple(state.launches)
         else:
@@ -424,7 +437,12 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
                 metadata.plan_key,
                 tuple(self.get_valid_tactics(inputs, None)),
             )
-        return (key, tactics)
+        return (POLICY_VERSION, key, tactics)
 
     def validate_tactic(self, inputs, tactic):
-        return tactic == -1 or tactic in self.get_valid_tactics(inputs, None)
+        state = prepared_state(self, inputs)
+        return tactic == -1 or tactic in (
+            state.launches
+            if state is not None
+            else self.get_valid_tactics(inputs, None)
+        )

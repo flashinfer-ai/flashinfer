@@ -564,6 +564,7 @@ def prepare_problem(args, activation_name, geometry):
     from flashinfer.fused_moe import (
         BackendOptions,
         CutlassNvfp4Config,
+        CudnnGroupedGemmNvfp4Config,
         CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
@@ -580,7 +581,12 @@ def prepare_problem(args, activation_name, geometry):
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     major, minor = torch.cuda.get_device_capability()
     eligible, audit = discover_original(major * 10 + minor, quant, activation)
-    unsupported = set(eligible) - {CutlassNvfp4Config, TrtllmFp4Config, CuteDslConfig}
+    unsupported = set(eligible) - {
+        CutlassNvfp4Config,
+        TrtllmFp4Config,
+        CuteDslConfig,
+        CudnnGroupedGemmNvfp4Config,
+    }
     if unsupported:
         raise RuntimeError(
             "Missing preparation for applicable backends: "
@@ -613,6 +619,10 @@ def prepare_problem(args, activation_name, geometry):
     )
     # The Frost runner shares this canonical CUTLASS weight view, byte for byte.
     views = {"cutlass_nvfp4": CutlassNvfp4Config.prepare_weights(w1, w2, **kwargs)}
+    if CudnnGroupedGemmNvfp4Config in eligible:
+        views["cudnn_grouped_gemm_nvfp4"] = CudnnGroupedGemmNvfp4Config.prepare_weights(
+            w1, w2, **kwargs
+        )
     if TrtllmFp4Config in eligible:
         views["trtllm_fp4_routed"] = TrtllmFp4Config.prepare_weights(
             w1, w2, quant=quant, **kwargs
