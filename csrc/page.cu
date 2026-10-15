@@ -496,15 +496,13 @@ void append_paged_kv_cache_with_slot_mapping(TensorView append_key, TensorView a
           static_cast<c_type*>(paged_v_cache.data_ptr()), k_stride_page, k_stride_n, k_stride_h,
           v_stride_page, v_stride_n, v_stride_h, stream);
       TVM_FFI_ICHECK(status == cudaSuccess)
-          << "AppendPagedKVCacheWithSlotMapping failed with error: "
-          << cudaGetErrorString(status);
+          << "AppendPagedKVCacheWithSlotMapping failed with error: " << cudaGetErrorString(status);
       return true;
     });
   });
 
-  TVM_FFI_ICHECK(success)
-      << "AppendPagedKVCacheWithSlotMapping failed to dispatch with dtype "
-      << append_key.dtype();
+  TVM_FFI_ICHECK(success) << "AppendPagedKVCacheWithSlotMapping failed to dispatch with dtype "
+                          << append_key.dtype();
 }
 
 void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,

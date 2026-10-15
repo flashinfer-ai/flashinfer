@@ -784,24 +784,15 @@ cudaError_t AppendPagedKVCacheWithSlotMapping(
     dim3 nblks(nnz, num_heads);
     dim3 nthrs(HEAD_DIM / vec_size);
     auto kernel = AppendPagedKVCacheWithSlotMappingKernel<HEAD_DIM, vec_size, DType, IdType>;
-    void* args[] = {(void*)&append_key,
-                    (void*)&append_value,
-                    (void*)&slot_mapping,
-                    (void*)&nnz,
-                    (void*)&num_heads,
-                    (void*)&page_size,
-                    (void*)&max_num_pages,
-                    (void*)&append_k_stride_n,
-                    (void*)&append_k_stride_h,
-                    (void*)&append_v_stride_n,
-                    (void*)&append_v_stride_h,
-                    (void*)&paged_k_cache,
-                    (void*)&paged_v_cache,
-                    (void*)&k_stride_page,
-                    (void*)&k_stride_n,
-                    (void*)&k_stride_h,
-                    (void*)&v_stride_page,
-                    (void*)&v_stride_n,
+    void* args[] = {(void*)&append_key,        (void*)&append_value,
+                    (void*)&slot_mapping,      (void*)&nnz,
+                    (void*)&num_heads,         (void*)&page_size,
+                    (void*)&max_num_pages,     (void*)&append_k_stride_n,
+                    (void*)&append_k_stride_h, (void*)&append_v_stride_n,
+                    (void*)&append_v_stride_h, (void*)&paged_k_cache,
+                    (void*)&paged_v_cache,     (void*)&k_stride_page,
+                    (void*)&k_stride_n,        (void*)&k_stride_h,
+                    (void*)&v_stride_page,     (void*)&v_stride_n,
                     (void*)&v_stride_h};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
