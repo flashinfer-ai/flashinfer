@@ -12,7 +12,7 @@ reduces them locally. The symmetric workspace grows with
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Optional
 
 from .....core.comm.communication import (
     MoEEpCommParams,
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CAKE_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
-_BACKEND = "cake"
+_BACKEND: Final = "cake"
 # Alignment the Cake ops give the workspace regions.
 _ALIGNMENT = 128
 
