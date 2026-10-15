@@ -91,13 +91,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
 
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
@@ -142,7 +135,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ routed, float* __restrict__ scores, unsigned int* __restrict__ output, int tokens, int hidden, int ctas)
 {
     const int tid = threadIdx.x;
@@ -167,10 +160,10 @@ kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfl
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* vectors = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int vectors_addr = smem + 1024;
-    unsigned int* words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
-    const int words_addr = smem + 1024;
+    __nv_bfloat16* vectors = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_VECTORS_OFF);
+    const int vectors_addr = smem + SMEM_VECTORS_OFF;
+    unsigned int* words = reinterpret_cast<unsigned int*>(smem_raw + SMEM_WORDS_OFF);
+    const int words_addr = smem + SMEM_WORDS_OFF;
 
     // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)

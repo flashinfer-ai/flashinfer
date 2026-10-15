@@ -88,13 +88,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
 
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
@@ -116,7 +109,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 
 extern "C" {
 
-__global__ __launch_bounds__(1) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multicast_address, int rank, int numel)
 {
     const int tid = threadIdx.x;
@@ -141,8 +134,8 @@ kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multic
     const int cta_rank = 0;
 
     // Kernel setup ops
-    int* payload = reinterpret_cast<int*>(smem_raw + 1024);
-    const int payload_addr = smem + 1024;
+    int* payload = reinterpret_cast<int*>(smem_raw + SMEM_PAYLOAD_OFF);
+    const int payload_addr = smem + SMEM_PAYLOAD_OFF;
 
     // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
     // Mbarriers at smem_raw[0..8)
