@@ -17,7 +17,8 @@ Tests of the fused QKV projection + norm + RoPE + head exchange.
 
 Host-only tests check the tile plan (every destination element of a rank's
 slab is written exactly once; readiness tickets add up), the plan policy, the
-request validation, the launch-path resolution (``fold_barrier``) and the
+request validation, the launch-path resolution (``fold_barrier``), the row-count
+gates (``shape_gates``) and the
 loader tables.  The multi-GPU tests (two, four or eight devices of one
 supported architecture) check both layouts against an fp32 step-by-step
 reference including a tail row count, CUDA-graph capture and replay with fresh
@@ -38,6 +39,7 @@ references.
 from __future__ import annotations
 
 import math
+import os
 import random
 
 import pytest
@@ -259,6 +261,133 @@ def test_fold_barrier_resolution(monkeypatch):
     ):
         backend.resolve_fold_barrier(arch, True)
     assert backend.resolve_fold_barrier(arch, False) == (False, "keyword")
+
+
+def test_shape_gate_default_table():
+    """The row-count gates per architecture: one readiness word per destination for calls of at most 4096 rows and one
+    producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; both off on SM90."""
+
+    assert plans.SHAPE_GATE_NAMES == ("words_capacity_small_m", "per_dest_large_m")
+    assert plans.SHAPE_GATE_OFF == 0
+    assert plans.SHAPE_GATE_DEFAULT_BY_ARCH == {
+        "sm_90a": {"words_capacity_small_m": 0, "per_dest_large_m": 0},
+        "sm_100a": {"words_capacity_small_m": 4096, "per_dest_large_m": 16384},
+        "sm_103a": {"words_capacity_small_m": 4096, "per_dest_large_m": 16384},
+    }
+    assert set(plans.SHAPE_GATE_DEFAULT_BY_ARCH) == set(loader.ARCH_FLAGS)
+    for arch, table in plans.SHAPE_GATE_DEFAULT_BY_ARCH.items():
+        assert (
+            plans.default_shape_gates(arch) == table
+            and plans.default_shape_gates(arch) is not table
+        )
+        assert plans.check_shape_gates(table) == table
+    with pytest.raises(ValueError, match="no shape gates"):
+        plans.default_shape_gates("sm_120a")
+    for bad in (
+        {"words_capacity_small_m": 1},
+        {"words_capacity_small_m": -1, "per_dest_large_m": 0},
+        {"words_capacity_small_m": True, "per_dest_large_m": 0},
+    ):
+        with pytest.raises(ValueError):
+            plans.check_shape_gates(bad)
+    # Inclusive thresholds; a gate at 0 never fires.
+    blackwell = plans.default_shape_gates("sm_100a")
+    assert plans.gate_rows(blackwell, 4096).fired == ("words_capacity_small_m",)
+    assert plans.gate_rows(blackwell, 4096).words_capacity_per_dest == 1
+    assert (
+        plans.gate_rows(blackwell, 4097).fired
+        == ()
+        == plans.gate_rows(blackwell, 16383).fired
+    )
+    assert plans.gate_rows(blackwell, 16384).fired == ("per_dest_large_m",)
+    assert plans.gate_rows(blackwell, 16384).producer_launches == "per_dest"
+    assert plans.gate_rows(blackwell, 16384).words_capacity_per_dest is None
+    hopper = plans.default_shape_gates("sm_90a")
+    for rows in (128, 4096, 16384, 65536):
+        verdict = plans.gate_rows(hopper, rows)
+        assert verdict.fired == () and verdict.producer_launches == "persistent"
+        assert (
+            verdict.words_capacity_per_dest is None
+            and verdict.summary()["rows"] == rows
+        )
+    with pytest.raises(ValueError, match="positive int"):
+        plans.gate_rows(blackwell, 0)
+
+
+def test_shape_gates_resolution(monkeypatch):
+    """Environment over architecture default: ``auto`` keeps the table, ``off`` switches every gate off, a partial
+    ``gate=value`` list overrides only the named gates; malformed values are errors."""
+
+    env = backend.SHAPE_GATES_ENV
+    for arch in plans.SHAPE_GATE_DEFAULT_BY_ARCH:
+        monkeypatch.delenv(env, raising=False)
+        assert backend.resolve_shape_gates(arch) == (
+            plans.default_shape_gates(arch),
+            "default",
+        )
+        monkeypatch.setenv(env, "auto")
+        assert backend.resolve_shape_gates(arch) == (
+            plans.default_shape_gates(arch),
+            "default",
+        )
+        monkeypatch.setenv(env, "off")
+        assert backend.resolve_shape_gates(arch) == (
+            {"words_capacity_small_m": 0, "per_dest_large_m": 0},
+            "env",
+        )
+        monkeypatch.setenv(env, "per_dest_large_m=0")
+        gates, source = backend.resolve_shape_gates(arch)
+        assert source == "env" and gates["per_dest_large_m"] == 0
+        assert (
+            gates["words_capacity_small_m"]
+            == plans.default_shape_gates(arch)["words_capacity_small_m"]
+        )
+        monkeypatch.setenv(env, "words_capacity_small_m=2048; per_dest_large_m=auto")
+        gates, source = backend.resolve_shape_gates(arch)
+        assert source == "env" and gates == {
+            "words_capacity_small_m": 2048,
+            "per_dest_large_m": plans.default_shape_gates(arch)["per_dest_large_m"],
+        }
+        for bad in (
+            "yes",
+            "words_capacity_small_m",
+            "reserved_sms_large_m=1",
+            "per_dest_large_m=-3",
+            "per_dest_large_m=x",
+        ):
+            monkeypatch.setenv(env, bad)
+            with pytest.raises(ValueError, match=env):
+                backend.resolve_shape_gates(arch)
+    monkeypatch.delenv(env, raising=False)
+    assert backend.shape_gates_from_env() is None
+
+
+def test_dest_parts_cover_the_table_once_per_destination_run():
+    """The launches of a ``per_dest`` call: contiguous destination runs that cover the tile table exactly once; pad
+    rows of a pair plan stay with the run they pad."""
+
+    geometry = plans.Geometry(world_size=2, batch=1, s_local=16384, hidden=1024)
+    for arch in ("sm_100a", "sm_90a"):
+        _policy, plan = plans.plan_for(
+            geometry, "bshd", 1, arch=arch, pair_available=arch in plans.PAIR_ARCHES
+        )
+        parts = plans.dest_parts(plan)
+        assert parts[0][0] == 0 and parts[-1][1] == plan.num_tiles
+        assert all(stop > start for start, stop in parts)
+        assert all(parts[i][1] == parts[i + 1][0] for i in range(len(parts) - 1))
+        assert len(parts) >= geometry.world_size
+        dest_column = plans.TILE_FIELDS.index("dest")
+        for start, stop in parts:
+            dests = {int(d) for d in plan.tiles[start:stop, dest_column].tolist()} - {
+                -1
+            }
+            assert len(dests) == 1
+        # The verdict of this row on each architecture.
+        verdict = plans.gate_rows(plans.default_shape_gates(arch), geometry.rows)
+        assert verdict.producer_launches == (
+            "per_dest" if arch in ("sm_100a", "sm_103a") else "persistent"
+        )
+        assert verdict.words_capacity_per_dest is None
 
 
 def test_loader_tables_are_consistent():
@@ -788,6 +917,33 @@ def _run_worker(rank, world_size, port):
             assert bound == barrier_path.bound_programs(batch, s_local)
             assert "producer_fold0" in bound and "producer_fold1" in bound
             assert "barrier_p0" in bound and "producer" in bound and len(bound) == 6
+            # The row-count gates of the architecture default on this row (``batch * s_local`` = 512 rows): the
+            # resolved table, its source and the prepared row's verdict agree with the plan module.
+            gates = default_path.describe()["shape_gates"]
+            assert (
+                gates["values"] == plans.default_shape_gates(arch) == gates["default"]
+            )
+            assert (
+                gates["source"] == "default" and gates["env"] == backend.SHAPE_GATES_ENV
+            )
+            verdict = plans.gate_rows(gates["values"], batch * s_local)
+            row_plan = default_path.describe()["prepared_row_plans"][
+                f"{batch}x{s_local}"
+            ]
+            assert row_plan["fired"] == list(verdict.fired)
+            assert (
+                row_plan["producer_launches"]
+                == verdict.producer_launches
+                == "persistent"
+            )
+            assert (
+                row_plan["words_capacity_per_dest"] == verdict.words_capacity_per_dest
+            )
+            assert (
+                row_plan["producer_parts"] == 1 and row_plan["launches_per_call"] == 2
+            )
+            if verdict.words_capacity_per_dest == 1:
+                assert row_plan["num_words"] == 1
             for _round in range(3):
                 from_default = tuple(
                     t.clone() for t in default_path(x, w_qkv, q_scale, k_scale, cos_sin)
@@ -813,6 +969,111 @@ def _run_worker(rank, world_size, port):
                 backend="nvlink",
                 device=device,
             )
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
+
+        # 7. Row-count gates at the large-row threshold (16384 rows per rank): the per-destination launch path
+        #    (the architecture default on SM100 / SM103, the explicit environment override elsewhere) against the
+        #    persistent launch (every gate off) -- bitwise-equal outputs, one producer launch per destination run.
+        batch, s_local = 1, 16384
+        x, w_qkv, q_scale, k_scale, cos_sin = _operands(
+            device, batch=batch, s_local=s_local, hidden=hidden, seed=31 + rank
+        )
+        expected = _expected(
+            x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
+        )
+        default_gates = plans.default_shape_gates(arch)
+        default_is_per_dest = (
+            plans.gate_rows(default_gates, batch * s_local).producer_launches
+            == "per_dest"
+        )
+        gated_env = (
+            None
+            if default_is_per_dest
+            else "per_dest_large_m=16384,words_capacity_small_m=0"
+        )
+
+        def _session_under(env_value):
+            previous = os.environ.pop(backend.SHAPE_GATES_ENV, None)
+            if env_value is not None:
+                os.environ[backend.SHAPE_GATES_ENV] = env_value
+            try:
+                return QkvNormRopeExchangeOverlap(
+                    group,
+                    hidden=hidden,
+                    num_heads=heads,
+                    layout="bshd",
+                    max_tokens=batch * s_local,
+                    backend="nvlink",
+                    device=device,
+                )
+            finally:
+                os.environ.pop(backend.SHAPE_GATES_ENV, None)
+                if previous is not None:
+                    os.environ[backend.SHAPE_GATES_ENV] = previous
+
+        per_dest_path = _session_under(gated_env)
+        persistent_path = _session_under("off")
+        try:
+            gated_info = per_dest_path.describe()
+            plain_info = persistent_path.describe()
+            assert gated_info["shape_gates"]["source"] == (
+                "default" if default_is_per_dest else "env"
+            )
+            assert plain_info["shape_gates"]["source"] == "env"
+            assert plain_info["shape_gates"]["values"] == {
+                "words_capacity_small_m": 0,
+                "per_dest_large_m": 0,
+            }
+            per_dest_path.bound_programs(batch, s_local)
+            persistent_path.bound_programs(batch, s_local)
+            gated_row = per_dest_path.describe()["prepared_row_plans"][
+                f"{batch}x{s_local}"
+            ]
+            plain_row = persistent_path.describe()["prepared_row_plans"][
+                f"{batch}x{s_local}"
+            ]
+            assert (
+                gated_row["producer_launches"] == "per_dest"
+                and "per_dest_large_m" in gated_row["fired"]
+            )
+            assert (
+                plain_row["producer_launches"] == "persistent"
+                and plain_row["fired"] == []
+            )
+            geometry = plans.Geometry(
+                world_size=world_size, batch=batch, s_local=s_local, hidden=hidden
+            )
+            block_n = gated_info["block_n"]
+            _policy, plan = plans.plan_for(
+                geometry,
+                "bshd",
+                rank,
+                arch=arch,
+                pair_available=gated_info["pair_available"][block_n],
+            )
+            parts = plans.dest_parts(plan)
+            assert gated_row["producer_parts"] == len(parts) >= world_size
+            assert gated_row["launches_per_call"] == len(parts) + 1
+            assert (
+                plain_row["producer_parts"] == 1 and plain_row["launches_per_call"] == 2
+            )
+            assert gated_row["num_words"] == plain_row["num_words"], (
+                "the large row keeps its readiness words"
+            )
+            for _round in range(3):
+                from_per_dest = tuple(
+                    t.clone()
+                    for t in per_dest_path(x, w_qkv, q_scale, k_scale, cos_sin)
+                )
+                from_persistent = persistent_path(x, w_qkv, q_scale, k_scale, cos_sin)
+                torch.cuda.synchronize(device)
+                _check_outputs(per_dest_path, from_per_dest, expected)
+                for one, other in zip(from_per_dest, from_persistent, strict=True):
+                    assert torch.equal(one, other)
+        finally:
+            per_dest_path.close()
+            persistent_path.close()
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
     finally:

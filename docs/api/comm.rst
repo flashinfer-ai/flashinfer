@@ -530,6 +530,17 @@ paths are delivered on every architecture.  Both paths store identical bits;
 ``describe()`` reports the resolved path (``fold_barrier``) and its launch
 count (``launches_per_call``).
 
+Per-architecture row-count gates shape each call's host plan: on SM100 and
+SM103 a call with at most 4096 rows per rank publishes one readiness word per
+destination, and a call with at least 16384 rows per rank launches the producer
+once per destination run of its tile table (the first launch carrying the
+folded rendezvous); SM90 ships both gates off.  The environment variable
+``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
+``words_capacity_small_m=N,per_dest_large_m=N``) overrides them per session,
+rank-uniformly; ``describe()`` reports the resolved gates (``shape_gates``) and
+every prepared row's verdict (``prepared_row_plans``).  The gates change
+neither the tile table nor the stored bits.
+
 The session is prepared eagerly (symmetric slots, readiness pad, barrier
 flags, JIT programs, the tile plan of ``max_tokens`` rows) and a prepared call
 is CUDA-graph capturable: a captured call allocates nothing, runs no
