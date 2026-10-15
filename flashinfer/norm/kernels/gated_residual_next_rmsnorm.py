@@ -127,7 +127,8 @@ def _dual_norm_kernel(
     gain: cutlass.Constexpr,
     has_post_weight: cutlass.Constexpr,
     post_gain: cutlass.Constexpr,
-    alpha_scalar: cutlass.Constexpr,
+    alpha_value: Float32,
+    alpha_mode: cutlass.Constexpr,
     enable_pdl: cutlass.Constexpr[bool],
     has_router: cutlass.Constexpr,
 ):
@@ -136,12 +137,12 @@ def _dual_norm_kernel(
 
     smem = cu_utils.SmemAllocator()
     if const_expr(CLUSTER_N > 1):
-        mbar = smem.allocate_array(cutlass.Int64, num_elems=1)
+        mbar = smem.allocate_array(cutlass.Int64, num_elems=2)
     else:
         mbar = None
     buf = smem.allocate_tensor(
         Float32,
-        cute.make_layout((4, NSLOT), stride=(1, 4)),
+        cute.make_layout((4, NSLOT * 2), stride=(1, 4)),
         byte_alignment=16,
     )
 
@@ -164,7 +165,7 @@ def _dual_norm_kernel(
 
     cute.autovec_copy(tBr, fBr)
     cute.autovec_copy(tSt, fSt)
-    if const_expr(alpha_scalar is None):
+    if const_expr(alpha_mode == 0):
         tAl = gAl[wc]
         fAl = cute.make_fragment_like(tAl)
         cute.autovec_copy(tAl, fAl)
@@ -178,6 +179,7 @@ def _dual_norm_kernel(
     if const_expr(CLUSTER_N > 1):
         if tidx == 0:
             cute.arch.mbarrier_init(mbar, 1)
+            cute.arch.mbarrier_init(mbar + 1, 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive_relaxed()
 
@@ -191,30 +193,41 @@ def _dual_norm_kernel(
     b = fBr.load().to(Float32)
     if const_expr(has_post_weight):
         b = b * (fPw.load().to(Float32) + post_gain)
-    if const_expr(alpha_scalar is None):
+    if const_expr(alpha_mode == 0):
         u = fAl.load().to(Float32) * fSt.load().to(Float32)
-    elif const_expr(alpha_scalar == 1.0):
+    elif const_expr(alpha_mode == 1):
         u = fSt.load().to(Float32)
     else:
-        u = Float32(alpha_scalar) * fSt.load().to(Float32)
+        u = alpha_value * fSt.load().to(Float32)
     v = fBe.load().to(Float32) * b
 
     pA = (b * b).reduce(cute.ReductionOp.ADD, 0.0, 0)
-    pB = (u * u).reduce(cute.ReductionOp.ADD, 0.0, 0)
-    pC = (u * v).reduce(cute.ReductionOp.ADD, 0.0, 0)
-    pD = (v * v).reduce(cute.ReductionOp.ADD, 0.0, 0)
 
     if const_expr(CLUSTER_N > 1):
         cute.arch.cluster_wait()
 
-    sA, sB, sC, sD = _row_sum4(pA, pB, pC, pD, buf, mbar, tidx, lane, warp, rank)
+    first = cute.make_tensor(buf.iterator, cute.make_layout((4, NSLOT), stride=(1, 4)))
+    second = cute.make_tensor(
+        buf.iterator + 4 * NSLOT, cute.make_layout((4, NSLOT), stride=(1, 4))
+    )
+    zero = Float32(0.0)
+    sA, _, _, _ = _row_sum4(pA, zero, zero, zero, first, mbar, tidx, lane, warp, rank)
 
     r1 = cute.math.rsqrt(sA * INV_H + post_eps, fastmath=True)
     res = u + v * r1
     fRo.store(res)
     cute.autovec_copy(fRo, tRo)
 
-    s2 = cute.arch.fmax(sB + 2.0 * r1 * sC + (r1 * r1) * sD, Float32(0.0))
+    # Reduce the rounded FP32 residual itself: expanding its square loses
+    # the small result when the residual and normalized branch cancel.
+    p2 = (res * res).reduce(cute.ReductionOp.ADD, 0.0, 0)
+    s2, _, _, _ = _row_sum4(
+        p2, zero, zero, zero, second, mbar + 1, tidx, lane, warp, rank
+    )
+    # No CTA may exit while a peer still reads its distributed shared memory.
+    if const_expr(CLUSTER_N > 1):
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
     r2 = cute.math.rsqrt(s2 * INV_H + next_eps, fastmath=True)
 
     w = fWt.load().to(Float32)
@@ -247,7 +260,8 @@ def _launch(
     gain: cutlass.Constexpr,
     has_post_weight: cutlass.Constexpr,
     post_gain: cutlass.Constexpr,
-    alpha_scalar: cutlass.Constexpr,
+    alpha_value: Float32,
+    alpha_mode: cutlass.Constexpr,
     enable_pdl: cutlass.Constexpr[bool],
     has_router: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
@@ -278,7 +292,8 @@ def _launch(
         gain,
         has_post_weight,
         post_gain,
-        alpha_scalar,
+        alpha_value,
+        alpha_mode,
         enable_pdl,
         has_router,
     ).launch(
@@ -302,7 +317,7 @@ def _get_compiled(
     next_gain_center: float,
     has_post_weight: bool,
     post_gain_center: float,
-    alpha_scalar: float | None = None,
+    alpha_mode: int = 0,
     enable_pdl: bool = False,
     has_router: bool = False,
 ):
@@ -345,9 +360,7 @@ def _get_compiled(
             f"gc{_float_key(next_gain_center)}",
             f"pw{int(has_post_weight)}",
             f"pgc{_float_key(post_gain_center)}",
-            "alpha_tensor"
-            if alpha_scalar is None
-            else f"alpha{_float_key(alpha_scalar)}",
+            f"alpha_mode{alpha_mode}",
             f"pdl{int(enable_pdl)}",
             f"router{int(has_router)}",
         )
@@ -371,7 +384,8 @@ def _get_compiled(
             next_gain_center,
             has_post_weight,
             post_gain_center,
-            alpha_scalar,
+            Float32(1.0),
+            alpha_mode,
             enable_pdl,
             has_router,
             cuda_stream,
@@ -415,7 +429,7 @@ def run(
         float(next_gain_center),
         post_weight is not None,
         float(post_gain_center) if post_weight is not None else 0.0,
-        alpha_scalar,
+        0 if alpha_scalar is None else 1 if alpha_scalar == 1.0 else 2,
         enable_pdl,
         router_input is not None,
     )
@@ -429,6 +443,7 @@ def run(
         ffn_input,
         (post_weight if post_weight is not None else next_weight).unsqueeze(0),
         router_input if router_input is not None else residual_out,
+        1.0 if alpha_scalar is None else float(alpha_scalar),
     )
 
 

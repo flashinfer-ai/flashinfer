@@ -32,7 +32,16 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .mnnvl_cutedsl.runtime import is_dense_on, require_mnnvl_multicast_device
+from .mnnvl_cutedsl.runtime import (
+    collective_support,
+    is_dense_on,
+    require_mnnvl_multicast_device,
+)
+from ..api_logging import flashinfer_api
+from ..trace.templates.comm import (
+    all_gather_gated_residual_next_rmsnorm_trace,
+    all_gather_rmsnorm_fp4_quantize_trace,
+)
 from .mnnvl_cutedsl.kernel_ll.all_gather_dual_norm import (
     LLAllGatherDualNorm,
     LLAllGatherDualNormTuning,
@@ -62,6 +71,9 @@ class _AllGatherWorkspace(Generic[_Impl]):
 
     Construction is collective over ``group``. Compile every constant set
     with :meth:`compile` before CUDA graph capture. Calls must not overlap.
+    Before selecting this path, pass each rank's local ``supports_*`` verdict
+    to :meth:`check_support` on every rank. Local checks alone are not a
+    rank-consistent fallback decision.
     """
 
     def __init__(
@@ -83,6 +95,14 @@ class _AllGatherWorkspace(Generic[_Impl]):
         self._group = group
         self._impl: _Impl | None = create()
 
+    def check_support(self, local_supported: bool) -> bool:
+        """Collectively agree on a local ``supports_*`` result before capture.
+
+        Call on every rank during warmup, even when its local result is False.
+        All ranks must use the agreed path and keep valid layouts for replay.
+        """
+        return collective_support(local_supported, self._group, self.device)
+
     @property
     def impl(self) -> _Impl:
         if self._impl is None:
@@ -97,7 +117,7 @@ class _AllGatherWorkspace(Generic[_Impl]):
             self._impl = None
 
     def fits(self, shard: torch.Tensor) -> bool:
-        """Whether a ``[M, H/TP]`` BF16 shard fits; identical on every rank."""
+        """Whether this rank's ``[M, H/TP]`` BF16 shard fits the workspace."""
         m = shard.shape[0] if shard.ndim == 2 else 0
         return (
             1 <= m <= self.max_token_num
@@ -175,7 +195,7 @@ def supports_all_gather_gated_residual_next_rmsnorm(
     next_weight: torch.Tensor,
     post_weight: torch.Tensor | None = None,
 ) -> bool:
-    """Whether this call fits the workspace; identical on every rank for equal M."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
     hidden = workspace.hidden_dim
     device = workspace.device
     vectors = [(alpha, torch.float32, 32), (beta, torch.float32, 32)]
@@ -194,6 +214,7 @@ def supports_all_gather_gated_residual_next_rmsnorm(
     )
 
 
+@flashinfer_api(trace=all_gather_gated_residual_next_rmsnorm_trace)
 def all_gather_gated_residual_next_rmsnorm(
     branch_shard: torch.Tensor,
     residual: torch.Tensor,
@@ -301,7 +322,7 @@ def supports_all_gather_rmsnorm_fp4_quantize(
     weight: torch.Tensor,
     global_scale: torch.Tensor,
 ) -> bool:
-    """Whether this call fits the workspace; identical on every rank for equal M."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
     hidden = workspace.hidden_dim
     device = workspace.device
     return (
@@ -315,6 +336,7 @@ def supports_all_gather_rmsnorm_fp4_quantize(
     )
 
 
+@flashinfer_api(trace=all_gather_rmsnorm_fp4_quantize_trace)
 def all_gather_rmsnorm_fp4_quantize(
     shard: torch.Tensor,
     weight: torch.Tensor,

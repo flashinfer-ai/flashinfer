@@ -614,3 +614,88 @@ decode_cp_a2a_lse_reduce_trace = TraceTemplate(
     reference=_decode_cp_a2a_lse_reduce_reference,
     init=_decode_cp_a2a_lse_reduce_init,
 )
+
+
+all_gather_gated_residual_next_rmsnorm_trace = TraceTemplate(
+    op_type="all_gather_gated_residual_next_rmsnorm",
+    name_prefix="all_gather_gated_residual_next_rmsnorm",
+    description="Gather TP column shards, combine the gated residual, and normalize it.",
+    axes={
+        "num_tokens": Var(),
+        "shard_hidden": Const(abbrev="sh"),
+        "hidden": Const(abbrev="h"),
+    },
+    inputs={
+        "branch_shard": Tensor(["num_tokens", "shard_hidden"]),
+        "residual": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "alpha": Tensor(["hidden"], dtype="float32"),
+        "beta": Tensor(["hidden"], dtype="float32"),
+        "next_weight": Tensor(["hidden"]),
+        "post_weight": Tensor(["hidden"], optional=True),
+        "post_eps": Scalar("float32"),
+        "next_eps": Scalar("float32"),
+        "next_gain_center": Scalar("float32"),
+        "post_gain_center": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "residual_out": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "ffn_input": Tensor(["num_tokens", "hidden"], dtype="bfloat16"),
+    },
+    tags=["stage:comm", "fused"],
+)
+
+all_gather_rmsnorm_fp4_quantize_trace = TraceTemplate(
+    op_type="all_gather_rmsnorm_fp4_quantize",
+    name_prefix="all_gather_rmsnorm_fp4_quantize",
+    description="Gather TP column shards, normalize, and quantize to NVFP4.",
+    axes={
+        "num_tokens": Var(),
+        "shard_hidden": Const(abbrev="sh"),
+        "hidden": Const(abbrev="h"),
+        "packed_hidden": Var(),
+        "scale_hidden": Var(),
+        "one": Const(value=1),
+    },
+    inputs={
+        "shard": Tensor(["num_tokens", "shard_hidden"]),
+        "weight": Tensor(["hidden"]),
+        "global_scale": Tensor(["one"], dtype="float32"),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "packed": Tensor(["num_tokens", "packed_hidden"], dtype="uint8"),
+        "scales": Tensor(["num_tokens", "scale_hidden"], dtype="uint8"),
+    },
+    constraints=["packed_hidden == hidden // 2", "scale_hidden == hidden // 16"],
+    tags=["stage:comm", "fused"],
+)
+
+moe_finalize_rmsnorm_allreduce_trace = TraceTemplate(
+    op_type="moe_finalize_rmsnorm_allreduce",
+    name_prefix="moe_finalize_rmsnorm_allreduce",
+    description="Normalize and weight local expert rows, then all-reduce their BF16 partial sums.",
+    axes={
+        "num_tokens": Var(),
+        "num_rows": Var(),
+        "hidden_padded": Const(abbrev="hp"),
+        "hidden": Const(abbrev="h"),
+        "top_k": Const(abbrev="k"),
+    },
+    inputs={
+        "routed_rows": Tensor(["num_rows", "hidden_padded"]),
+        "route_weights": Tensor(["num_tokens", "top_k"]),
+        "permuted_idx": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "norm_weight": Tensor(["hidden"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "weight_before_norm": Scalar("int32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "hidden"], dtype="bfloat16", param="output")
+    },
+    tags=["stage:comm", "fused"],
+)

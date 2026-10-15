@@ -49,7 +49,7 @@ grid = (S, M): a CTA owns row `row = blockIdx.y` and column segment
   by 32 B, and measured 3.648 against 3.600 on m64-attn.  One CTA per row keeps
   the direct epilogue: the residual planes, not the duplicate read, set its pace.
 
-* The launch carries `cluster = (CX, 1, 1)` with CX = S for S <= 4 and CX = 2
+* The launch carries `cluster = (1, CX, 1)` with CX = S for S <= 4 and CX = 2
   for the eight-way split.  Adjacent segments of a row are exactly the CTAs that
   re-read the same 16 KiB row (32 KiB in MODE 1) for the sum, so co-scheduling
   them inside one GPC keeps those duplicate lines on the near L2 slice instead
@@ -135,7 +135,7 @@ def _gated_residual_rmsnorm_kernel(
     EPS: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    seg, row, _ = cute.arch.block_idx()
+    row, seg, _ = cute.arch.block_idx()
 
     M = cute.size(mBranch, mode=[0])
     # reduction map (segment independent) and segment-major epilogue map
@@ -335,11 +335,11 @@ def _gated_residual_rmsnorm_launch(
             GAIN_CENTER,
             EPS,
         ).launch(
-            grid=[S, M, 1],
+            grid=[M, S, 1],
             block=[T, 1, 1],
             smem=SMEM,
             stream=cuda_stream,
-            cluster=[CX, 1, 1],
+            cluster=[1, CX, 1],
             min_blocks_per_mp=MBPM,
         )
     else:
@@ -358,11 +358,11 @@ def _gated_residual_rmsnorm_launch(
             GAIN_CENTER,
             EPS,
         ).launch(
-            grid=[S, M, 1],
+            grid=[M, S, 1],
             block=[T, 1, 1],
             smem=SMEM,
             stream=cuda_stream,
-            cluster=[CX, 1, 1],
+            cluster=[1, CX, 1],
         )
 
 

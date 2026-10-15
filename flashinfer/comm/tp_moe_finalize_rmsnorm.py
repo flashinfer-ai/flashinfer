@@ -38,7 +38,8 @@ entry and advanced at exit, so a captured graph replays correctly.
 Decomposition: a token is owned by a thread-block *cluster* of ``S`` CTAs that
 split the H axis; every CTA pushes, polls, normalizes and writes only its own H
 band.  The single piece of cross-CTA state is the per-expert sums of
-squares, exchanged through distributed shared memory with one cluster barrier.
+squares, exchanged through distributed shared memory with startup and completion
+cluster barriers.
 ``S`` is a launch parameter: small token counts leave most of the machine idle
 with one CTA per token, so S grows until the grid covers the SM array.
 
@@ -48,7 +49,7 @@ accumulates the experts in FP32, then multicasts the final BF16 row. This moves
 less data than the expert-owner path (the second hop carries BF16 output rows,
 not FP32 partials).
 
-  single launch (padded token count <= SM count): CTA ``(b, g, d)`` covers H
+  single cooperative launch (compiled grid passes a collective residency check): CTA ``(b, g, d)`` covers H
       band ``b`` of token ``g * P + d``. It pushes the token's rows to rank
       ``d``, reduces some experts of the token this rank owns in slot ``g``,
       and copies rank ``d``'s multicast row out. Both hops are Lamport
@@ -79,6 +80,10 @@ from cutlass.cutlass_dsl import dsl_user_op
 from ..api_logging import flashinfer_api
 from ..trace.templates.comm import tp_moe_finalize_rmsnorm_trace
 from ..utils import register_custom_op, register_fake_op
+from .mnnvl_cutedsl.cute_dsl_primitives import (
+    map_shared_to_peer as map_smem_rank,
+    store_shared_cluster_f32 as st_smem_remote_f32,
+)
 
 try:
     import cuda.bindings.driver as _drv
@@ -459,38 +464,6 @@ def atomic_add_acq_rel(ptr: Pointer, value: Int32, *, loc=None, ip=None) -> Int3
     )
 
 
-@dsl_user_op
-def map_smem_rank(smem_ptr: Pointer, rank: Int32, *, loc=None, ip=None) -> Int32:
-    """Translate a local SMEM address to the same slot in a cluster peer."""
-    a = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    return Int32(
-        llvm.inline_asm(
-            MLIR_T.i32(),
-            [a, Int32(rank).ir_value(loc=loc, ip=ip)],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            asm_dialect=0,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def st_smem_remote_f32(addr: Int32, val: Float32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [Int32(addr).ir_value(loc=loc, ip=ip), Float32(val).ir_value(loc=loc, ip=ip)],
-        "st.shared::cluster.f32 [$0], $1;",
-        "r,f",
-        has_side_effects=True,
-        asm_dialect=0,
-        loc=loc,
-        ip=ip,
-    )
-
-
 def _peer_batch(ws):
     """Experts whose peer rows (ws - 1 vectors each) fit one load batch."""
     return max(1, min(K_EXPERTS, _PEER_BATCH_VECS // max(1, ws - 1)))
@@ -510,8 +483,7 @@ def _pick_split(n_tok, nsm):
 # kernel factory
 # --------------------------------------------------------------------------- #
 def _make_program(
-    n_tok,
-    num_rows,
+    token_bucket,
     row_stride,
     grid_y,
     split,
@@ -530,8 +502,6 @@ def _make_program(
     push=None,
 ):
     inv_h = 1.0 / float(H_DIM)
-    tiles = (n_tok + ws - 1) // ws if token_owner else n_tok
-    n_iter = 1 if token_owner else (tiles + grid_y - 1) // grid_y
     comm = ws > 1
     nwarps = nthr // 32
     band = nthr * VEC  # H columns owned by one CTA
@@ -608,6 +578,7 @@ def _make_program(
         slot: Int32,
         h0: Int32,
     ):
+        num_rows = gIn.shape[0]
         pp = _pin(cutlass.BFloat16, a_lam_peers[dest])
         # Rows are loaded push_grp at a time before their stores: a store waits
         # for its data, so a larger group overlaps more load latency, at the
@@ -671,6 +642,7 @@ def _make_program(
         tidx: Int32,
         h0: Int32,
     ):
+        n_tok = gIdx.shape[0]
         # The previous copy waited for every owner, which had consumed all
         # input rows before publishing its output. Input storage is now free.
         for dest in cutlass.range_constexpr(ws):
@@ -694,6 +666,7 @@ def _make_program(
         tidx: Int32,
         h0: Int32,
     ):
+        n_tok = gOut.shape[0]
         wait_phase(slot, 1, gen, tidx)
         pb = _pin(cutlass.BFloat16, a_lam + A_BYTES)
         for src in cutlass.range_constexpr(ws):
@@ -863,6 +836,7 @@ def _make_program(
             # the per-expert partials fold inside the CTA, then scatter into
             # every cluster peer's SMEM; one cluster barrier makes the whole
             # S x n table local everywhere.
+            cute.arch.cluster_wait()
             if tidx < n:
                 v = cutlass.Float32(0.0)
                 for w in cutlass.range_constexpr(nwarps):
@@ -897,9 +871,12 @@ def _make_program(
         gen: Int32,
         h0: Int32,
     ):
+        if cutlass.const_expr(split > 1):
+            cute.arch.cluster_arrive_relaxed()
         lane = tidx % 32
         warp = tidx // 32
 
+        num_rows = gIn.shape[0]
         # Issue the small vector loads first; they overlap the fabric wait.
         # FP32 routing weights occupy two 128-bit vectors, while the original
         # BF16 path remains one vector.
@@ -1086,6 +1063,13 @@ def _make_program(
     ):
         tidx, _, _ = cute.arch.thread_idx()
         sx, cta, _ = cute.arch.block_idx()
+        n_tok = gOut.shape[0]
+        active_grid_y = cutlass.min(n_tok, grid_y)
+        n_iter = (
+            1
+            if cutlass.const_expr(token_owner)
+            else cute.ceil_div(n_tok, active_grid_y)
+        )
 
         smem = cutlass_utils.SmemAllocator()
         sred = smem.allocate_tensor(
@@ -1110,7 +1094,7 @@ def _make_program(
             g0 = ld_gen(_pin(cutlass.Int32, a_gen, 4) + cta)
 
         for it in cutlass.range(n_iter):
-            tok = cta + it * grid_y
+            tok = cta + it * active_grid_y
             if cutlass.const_expr(token_owner):
                 base = tok * ws + start
                 tok = base + my_rank
@@ -1143,7 +1127,7 @@ def _make_program(
         # every CTA of the cluster has read the counter by now (they all passed
         # the cluster barrier inside the first tile), so one writer is safe.
         if cutlass.const_expr(comm and not token_owner) and tidx == 0 and sx == 0:
-            st_gen(_pin(cutlass.Int32, a_gen, 4) + cta, g0 + n_iter)
+            st_gen(_pin(cutlass.Int32, a_gen, 4) + cta, (g0 + n_iter) % NGEN)
 
     # The owned token's experts are spread over XP CTAs of its slot: CTA d < XP
     # reduces experts d, d + XP, ... (NJ of them). XP == 1 keeps every expert in
@@ -1221,6 +1205,8 @@ def _make_program(
         """
         tidx, _, _ = cute.arch.thread_idx()
         sx, slot, d = cute.arch.block_idx()
+        n_tok = gOut.shape[0]
+        num_rows = gIn.shape[0]
         lane = tidx % 32
         warp = tidx // 32
 
@@ -1251,6 +1237,10 @@ def _make_program(
         gen_ptr = _pin(cutlass.Int32, a_gen, 4) + slot
         gen = ld_gen(gen_ptr)
         gm = gen % NGEN
+
+        if cutlass.const_expr(split > 1):
+            if t_own < n_tok and d < XP:
+                cute.arch.cluster_arrive_relaxed()
 
         # ---- A: push this CTA's token band to its owner
         if tok < n_tok:
@@ -1388,7 +1378,7 @@ def _make_program(
             old = atomic_add_acq_rel(done, cutlass.Int32(1))
             if old == ws * split - 1:
                 st_gen(done, cutlass.Int32(0))
-                st_gen(gen_ptr, gen + 1)
+                st_gen(gen_ptr, (gen + 1) % NGEN)
 
     @cute.kernel
     def stage_kernel(gIn: cute.Tensor, gIdx: cute.Tensor, start: Int32):
@@ -1422,12 +1412,15 @@ def _make_program(
         gOut: cute.Tensor,
         stream: _drv.CUstream,
     ):
+        n_tok = gOut.shape[0]
+        tiles = cute.ceil_div(n_tok, ws)
         if cutlass.const_expr(single and split > 1):
             single_kernel(gIn, gW, gIdx, gNw, gOut).launch(
                 grid=(split, tiles, ws),
                 block=(nthr, 1, 1),
                 cluster=(split, 1, 1),
                 min_blocks_per_mp=1,
+                cooperative=True,
                 stream=stream,
             )
         elif cutlass.const_expr(single):
@@ -1435,14 +1428,13 @@ def _make_program(
                 grid=(1, tiles, ws),
                 block=(nthr, 1, 1),
                 min_blocks_per_mp=1,
+                cooperative=True,
                 stream=stream,
             )
         elif cutlass.const_expr(token_owner):
-            for chunk in cutlass.range_constexpr(
-                (n_tok + grid_y * ws - 1) // (grid_y * ws)
-            ):
+            for chunk in cutlass.range(cute.ceil_div(n_tok, grid_y * ws)):
                 start = chunk * grid_y * ws
-                groups = min(grid_y, (n_tok - start + ws - 1) // ws)
+                groups = cutlass.min(grid_y, cute.ceil_div(n_tok - start, ws))
                 stage_kernel(gIn, gIdx, cutlass.Int32(start)).launch(
                     grid=(split, groups * ws, 1),
                     block=(nthr, 1, 1),
@@ -1474,17 +1466,19 @@ def _make_program(
                     )
         elif cutlass.const_expr(split > 1):
             fused_kernel(gIn, gW, gIdx, gNw, gOut, cutlass.Int32(0)).launch(
-                grid=(split, grid_y, 1),
+                grid=(split, cutlass.min(n_tok, grid_y), 1),
                 block=(nthr, 1, 1),
                 cluster=(split, 1, 1),
                 min_blocks_per_mp=1,
+                cooperative=True,
                 stream=stream,
             )
         else:
             fused_kernel(gIn, gW, gIdx, gNw, gOut, cutlass.Int32(0)).launch(
-                grid=(1, grid_y, 1),
+                grid=(1, cutlass.min(n_tok, grid_y), 1),
                 block=(nthr, 1, 1),
                 min_blocks_per_mp=1,
+                cooperative=True,
                 stream=stream,
             )
 
@@ -1593,7 +1587,7 @@ class _WorkspaceAddresses(TypedDict):
     tl_ycnt: int
 
 
-_PROGRAMS: dict[tuple[int, int, int, int, int, float, float, str], "_Program"] = {}
+_PROGRAMS: dict[tuple[int, int, int, int, float, float, str], "_Program"] = {}
 
 
 def _group_all(
@@ -1790,20 +1784,74 @@ class _Program:
             self.fn(a, b, c, d, e, stream)
         else:
             self.fn(
-                from_dlpack(a, assumed_align=16),
-                from_dlpack(b, assumed_align=16),
-                from_dlpack(c, assumed_align=16),
-                from_dlpack(d, assumed_align=16),
-                from_dlpack(e, assumed_align=16),
+                from_dlpack(a, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=a.ndim - 1
+                ),
+                from_dlpack(b, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=b.ndim - 1
+                ),
+                from_dlpack(c, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=c.ndim - 1
+                ),
+                from_dlpack(d, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=d.ndim - 1
+                ),
+                from_dlpack(e, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=e.ndim - 1
+                ),
                 stream,
             )
+
+
+def _grid_fits(compiled, *, split, groups, nthr, smem, stream):
+    """Check the compiled cooperative grid; unknown launch metadata is unsafe."""
+
+    def checked(result):
+        if int(result[0]) != 0:
+            raise RuntimeError(f"CUDA occupancy query failed: {result[0]}")
+        return result[1] if len(result) > 1 else None
+
+    try:
+        compiled.to()
+        modules = getattr(compiled.jit_module, "cuda_modules", ())
+        if len(modules) != 1:
+            return False
+        fn = checked(_drv.cuKernelGetFunction(modules[0].kernel))
+        if split == 1:
+            active = checked(
+                _drv.cuOccupancyMaxActiveBlocksPerMultiprocessor(fn, nthr, smem)
+            )
+            return active * _WS.nsm >= groups
+        checked(
+            _drv.cuFuncSetAttribute(
+                fn,
+                _drv.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                1,
+            )
+        )
+        cluster = _drv.CUlaunchAttribute()
+        cluster.id = _drv.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        cluster.value.clusterDim.x = split
+        cluster.value.clusterDim.y = 1
+        cluster.value.clusterDim.z = 1
+        config = _drv.CUlaunchConfig()
+        config.gridDimX, config.gridDimY, config.gridDimZ = split, groups, 1
+        config.blockDimX, config.blockDimY, config.blockDimZ = nthr, 1, 1
+        config.sharedMemBytes = smem
+        config.hStream = stream
+        config.attrs = [cluster]
+        config.numAttrs = 1
+        return checked(_drv.cuOccupancyMaxActiveClusters(fn, config)) >= groups
+    except (AttributeError, RuntimeError, TypeError) as error:
+        logger.debug("Cannot establish TP finalize cooperative residency: %s", error)
+        return False
 
 
 def _build(key, a, b, c, d, e, stream):
     # The generated program embeds process-local symmetric-memory and multicast
     # addresses. It must therefore remain in the process cache rather than the
     # persistent CuTe-DSL cache, whose objects are reusable across processes.
-    n_tok, num_rows, row_stride, expert_weights_fp32, mode, eps, gain_center, path = key
+    n_tok, row_stride, expert_weights_fp32, mode, eps, gain_center, path = key
     tiles = (n_tok + _WS.ws - 1) // _WS.ws if path != "expert" else n_tok
     if path == "token":
         split = 1
@@ -1824,7 +1872,6 @@ def _build(key, a, b, c, d, e, stream):
     }[path]
     host = factory(
         n_tok,
-        num_rows,
         row_stride,
         grid_y,
         split,
@@ -1840,19 +1887,38 @@ def _build(key, a, b, c, d, e, stream):
     )
     try:
         args = [
-            from_dlpack(x, assumed_align=16, enable_tvm_ffi=True)
+            from_dlpack(x, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
+                leading_dim=x.ndim - 1
+            )
             for x in (a, b, c, d, e)
         ]
         compiled = cute.compile(host, *args, stream, options="--enable-tvm-ffi")
-        return _Program(compiled, True)
+        program = _Program(compiled, True)
     except Exception as error:
         logger.warning(
             "TVM-FFI compilation failed for TP MoE finalize; using the "
             "process-local CuTe callable: %s",
             error,
         )
-        args = [from_dlpack(x, assumed_align=16) for x in (a, b, c, d, e)]
-        return _Program(cute.compile(host, *args, stream), False)
+        args = [
+            from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=x.ndim - 1)
+            for x in (a, b, c, d, e)
+        ]
+        program = _Program(cute.compile(host, *args, stream), False)
+    if path != "token":
+        groups = tiles * _WS.ws if path == "token1" else grid_y
+        experts = K_EXPERTS // (_single_xpar(n_tok) if path == "token1" else _WS.ws)
+        # Conservative padding for the reduction arrays and single-path flag.
+        smem = 4 * experts * (nthr // 32 + 1 + split) + 64
+        local_fits = _grid_fits(
+            program.fn, split=split, groups=groups, nthr=nthr, smem=smem, stream=stream
+        )
+        device = torch.device("cuda", _WS.dev_ord)
+        if not _group_all(local_fits, device, _WS.group):
+            # All ranks choose the staged transport together. Kernel boundaries
+            # remove the requirement that the full grid be resident at once.
+            return _build((*key[:-1], "token"), a, b, c, d, e, stream)
+    return program
 
 
 def _run(
@@ -1870,15 +1936,15 @@ def _run(
         return
     if not _WS.available:
         raise RuntimeError("TP MoE finalize workspace was not initialized")
+    bucket = min(1 << (n_tok - 1).bit_length(), 1 << (_WS.nsm - 1).bit_length())
     key = (
-        n_tok,
-        gemm2_permuted.shape[0],
+        bucket,
         gemm2_permuted.stride(0),
         int(expert_weights.dtype == torch.float32),
         int(weight_before_norm),
         float(eps),
         float(gain_center),
-        _select_path(n_tok, _WS.nsm),
+        _select_path(bucket, _WS.nsm),
     )
     capturing = torch.cuda.is_current_stream_capturing()
     stream = _cur_stream(_WS.dev_ord)

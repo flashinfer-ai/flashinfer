@@ -728,7 +728,6 @@ class _LamportResidualRMSNormDeviceKernel:
         write_residual_output: bool,
         apply_rms_norm: bool = True,
         enable_pdl: bool,
-        write_norm_output: bool = True,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -748,8 +747,7 @@ class _LamportResidualRMSNormDeviceKernel:
         self.weight_bias = weight_bias
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
-        # Preserve the upstream norm-disable switch for existing callers.
-        self.write_norm_output = write_norm_output and apply_rms_norm
+        self.apply_rms_norm = apply_rms_norm
         self.enable_pdl = enable_pdl
         self.fragments = hidden // VEC_BF16
         self.groups_per_cta = threads // rank_lanes
@@ -811,7 +809,7 @@ class _LamportResidualRMSNormDeviceKernel:
         rank_lane = tidx % self.rank_lanes
         group = tidx // self.rank_lanes
         base_fragment = cluster_rank * self.groups_per_cta + group
-        if cutlass.const_expr(self.write_norm_output):
+        if cutlass.const_expr(self.apply_rms_norm):
             # Every peer must have started before the RMS partial sums are
             # stored into its shared memory; the matching wait sits just
             # before that first remote store.
@@ -847,7 +845,7 @@ class _LamportResidualRMSNormDeviceKernel:
             fragment = base_fragment + trip * self.fragment_stride
             if fragment < self.fragments and rank_lane == 0:
                 gamma_element = Int64(fragment) * VEC_BF16
-                if cutlass.const_expr(self.write_norm_output):
+                if cutlass.const_expr(self.apply_rms_norm):
                     gamma_pointer = cute.make_ptr(
                         BFloat16,
                         (gamma.iterator + gamma_element).llvm_ptr,
@@ -966,7 +964,7 @@ class _LamportResidualRMSNormDeviceKernel:
                     )
 
         # Without the norm, the reduced sum in residual_output is the result.
-        if cutlass.const_expr(self.write_norm_output):
+        if cutlass.const_expr(self.apply_rms_norm):
             thread_sum = Float32(0.0)
             for trip in cutlass.range_constexpr(self.trips):
                 fragment = base_fragment + trip * self.fragment_stride

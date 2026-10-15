@@ -265,7 +265,7 @@ class LLMoEFinalizeNormAllReduce:
             weight_bias=0.0,
             add_residual=False,
             write_residual_output=True,
-            write_norm_output=False,
+            apply_rms_norm=False,
             enable_pdl=enable_pdl,
         )
         rows = make_fake_dynamic_compact_tensor(

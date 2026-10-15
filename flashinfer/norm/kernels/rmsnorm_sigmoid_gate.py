@@ -378,6 +378,10 @@ def rmsnorm_sigmoid_gate(
         raise ValueError("x and gate must be on the same device")
     if x.shape[2] != HEAD_DIM:
         raise ValueError(f"expected head size {HEAD_DIM}, got {x.shape[2]}")
+    if x.stride(-1) != 1 or gate.stride(-1) != 1:
+        raise ValueError("head elements must be contiguous")
+    if x.stride(0) % 8 or gate.stride(0) % 8:
+        raise ValueError("token strides must be multiples of 8 BF16 elements")
     if x.stride(1) != HEAD_DIM or gate.stride(1) != HEAD_DIM:
         raise ValueError("head rows must be contiguous")
     if x.data_ptr() % 16 or gate.data_ptr() % 16:

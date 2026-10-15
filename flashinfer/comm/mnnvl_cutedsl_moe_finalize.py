@@ -32,7 +32,15 @@ from torch.distributed import ProcessGroup
 from .mnnvl_cutedsl.kernel_ll.moe_finalize_norm_all_reduce import (
     LLMoEFinalizeNormAllReduce,
 )
-from .mnnvl_cutedsl.runtime import is_dense_on, require_mnnvl_multicast_device
+from .mnnvl_cutedsl.runtime import (
+    collective_support,
+    is_dense_on,
+    require_mnnvl_multicast_device,
+)
+from ..api_logging import flashinfer_api
+from ..trace.templates.comm import (
+    moe_finalize_rmsnorm_allreduce_trace,
+)
 
 __all__ = [
     "MNNVLCuteDSLMoEFinalizeAllReduceWorkspace",
@@ -46,6 +54,9 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
 
     Construction is collective over ``group``. Compile every configuration
     with :meth:`compile` before CUDA graph capture. Calls must not overlap.
+    Before selecting this path, pass each rank's local ``supports_*`` verdict
+    to :meth:`check_support` on every rank. Local checks alone are not a
+    rank-consistent fallback decision.
     """
 
     def __init__(
@@ -63,6 +74,8 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
             raise ValueError("tp_size must be at least 2")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
+        if hidden_dim <= 0 or hidden_dim % 1024:
+            raise ValueError("hidden_dim must be a positive multiple of 1024")
         self.device = require_mnnvl_multicast_device()
         self.max_token_num = max_token_num
         self.hidden_dim = hidden_dim
@@ -77,6 +90,14 @@ class MNNVLCuteDSLMoEFinalizeAllReduceWorkspace:
             group=group,
             enable_pdl=enable_pdl,
         )
+
+    def check_support(self, local_supported: bool) -> bool:
+        """Collectively agree on a local ``supports_*`` result before capture.
+
+        Call on every rank during warmup, even when its local result is False.
+        All ranks must use the agreed path and keep valid layouts for replay.
+        """
+        return collective_support(local_supported, self._group, self.device)
 
     @property
     def impl(self) -> LLMoEFinalizeNormAllReduce:
@@ -118,7 +139,7 @@ def supports_moe_finalize_rmsnorm_allreduce(
     norm_weight: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
-    """Whether this call fits the workspace; identical on every rank for equal M."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
     hidden = workspace.hidden_dim
     device = workspace.device
     m = output.shape[0] if output.ndim == 2 else 0
@@ -145,6 +166,7 @@ def supports_moe_finalize_rmsnorm_allreduce(
     )
 
 
+@flashinfer_api(trace=moe_finalize_rmsnorm_allreduce_trace)
 def moe_finalize_rmsnorm_allreduce(
     routed_rows: torch.Tensor,
     route_weights: torch.Tensor,

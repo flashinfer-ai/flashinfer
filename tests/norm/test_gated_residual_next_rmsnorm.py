@@ -67,7 +67,10 @@ def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
     calls = []
     monkeypatch.setattr(
-        norm, "_gated_residual_next_rmsnorm_cute", lambda *args: calls.append(args)
+        norm,
+        "_gated_residual_next_rmsnorm_cute",
+        lambda *args: calls.append(args),
+        raising=False,
     )
     with FakeTensorMode():
         branch = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")

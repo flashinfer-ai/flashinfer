@@ -580,6 +580,8 @@ def rmsnorm_sigmoid_gate(
         or gate.device != input.device
         or input.stride(-1) != 1
         or gate.stride(-1) != 1
+        or input.stride(0) % 8 != 0
+        or gate.stride(0) % 8 != 0
         or (input.ndim == 3 and input.stride(1) != input.shape[-1])
         or (gate.ndim == 3 and gate.stride(1) != gate.shape[-1])
         or not _is_aligned(input)

@@ -100,3 +100,18 @@ def require_mnnvl_multicast_device() -> torch.device:
 
 def current_cu_stream() -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+def collective_support(local_supported: bool, group, device: torch.device) -> bool:
+    """Agree on a dispatch choice during warmup, before CUDA graph capture.
+
+    Every rank must call this, including ranks whose local check failed.
+    Keep the agreed dispatch for graph replay; this helper synchronizes the CPU.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Agree on collective support before CUDA graph capture")
+    import torch.distributed as dist
+
+    vote = torch.tensor(int(local_supported), dtype=torch.int32, device=device)
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
+    return bool(vote.item())
