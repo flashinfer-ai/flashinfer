@@ -5,7 +5,7 @@ the cases also runs on the Cake backend, which implements the same protocol.
 Each multi-rank case spawns one process per EP rank from this pytest process,
 so a single ``pytest`` run covers every EP size the machine has GPUs for:
 
-    pytest tests/moe_ep/test_nvlink_one_sided_multirank.py
+    pytest tests/moe_ep/test_nvlink_one_sided.py
 
 Ported from TensorRT-LLM's
 ``tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py``, which tests
