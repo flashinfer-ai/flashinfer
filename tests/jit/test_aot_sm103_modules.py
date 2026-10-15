@@ -132,6 +132,14 @@ def test_combined_build_registers_both_variants(monkeypatch):
     assert registered >= SM103_SHARED_MODULES | SM100_ONLY_MODULES | SM103_ONLY_MODULES
 
 
+@pytest.mark.parametrize("arch", ["sm100", "sm103", "sm107", "sm110", "sm120", "sm121"])
+def test_mxfp8_quantization_module_ships_for_every_sm100_plus_arch(monkeypatch, arch):
+    """mxfp8_quantize and mxfp8_grouped_quantize default to this module on any SM100+ GPU."""
+    registered = _registered_generators(monkeypatch, {arch: True})
+
+    assert "gen_mxfp8_quantization_sm100_module" in registered
+
+
 @pytest.mark.parametrize(
     ("sm_capabilities", "expected_use_sm_100f"),
     [

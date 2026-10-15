@@ -96,6 +96,8 @@ void silu_and_mul_mxfp8_experts_quantize(TensorView input, TensorView mask, Tens
   CHECK_INPUT_TYPE(mask, dl_int32);
   CHECK_INPUT_TYPE(valMxFP8, dl_float8_e4m3fn);
   CHECK_INPUT_TYPE(scaleFP8SF, dl_uint8);
+  // Launch on the input's device, which need not be the current one.
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
   static constexpr int SF_VEC_SIZE = 32;
   TVM_FFI_ICHECK_EQ(input.ndim(), 3) << "input must be a 3D [B, M, K] or [B, M, 2K] tensor";
@@ -107,8 +109,8 @@ void silu_and_mul_mxfp8_experts_quantize(TensorView input, TensorView mask, Tens
     k /= 2;
   }
   TVM_FFI_ICHECK_EQ(k % SF_VEC_SIZE, 0) << "K must be divisible by SF_VEC_SIZE = 32";
-  int64_t const padded_k = (k + 127) / 128 * 128;
-  int64_t const padded_m = (m + 127) / 128 * 128;
+  int64_t const padded_k = PadUpFn(k, 128);
+  int64_t const padded_m = PadUpFn(m, 128);
 
   TVM_FFI_ICHECK_EQ(mask.ndim(), 1);
   TVM_FFI_ICHECK_EQ(mask.size(0), b);
@@ -123,12 +125,12 @@ void silu_and_mul_mxfp8_experts_quantize(TensorView input, TensorView mask, Tens
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-#define LAUNCH_SILU_AND_MUL_MXFP8_EXPERTS_QUANTIZE_KERNEL(T)                               \
-  tensorrt_llm::kernels::invokeSiluAndMulMxFP8Quantization(                                \
-      b, m, k, padded_k, reinterpret_cast<T const*>(input.data_ptr()),                     \
-      reinterpret_cast<int32_t const*>(mask.data_ptr()), use_silu_and_mul,                 \
-      reinterpret_cast<uint8_t*>(valMxFP8.data_ptr()),                                     \
-      reinterpret_cast<uint8_t*>(scaleFP8SF.data_ptr()), mMultiProcessorCount, enable_pdl, \
+#define LAUNCH_SILU_AND_MUL_MXFP8_EXPERTS_QUANTIZE_KERNEL(T)                                \
+  tensorrt_llm::kernels::invokeSiluAndMulMxFP8Quantization(                                 \
+      b, m, k, padded_k, reinterpret_cast<T const*>(input.data_ptr()),                      \
+      reinterpret_cast<int32_t const*>(mask.data_ptr()), use_silu_and_mul,                  \
+      reinterpret_cast<uint8_t*>(valMxFP8.data_ptr()),                                      \
+      reinterpret_cast<uint32_t*>(scaleFP8SF.data_ptr()), mMultiProcessorCount, enable_pdl, \
       get_stream(input.device()));
 
   if (input.dtype() == dl_float16) {
@@ -138,7 +140,7 @@ void silu_and_mul_mxfp8_experts_quantize(TensorView input, TensorView mask, Tens
     LAUNCH_SILU_AND_MUL_MXFP8_EXPERTS_QUANTIZE_KERNEL(__nv_bfloat16)
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "BFloat16 must be enabled to quantize an bf16 tensor to mxfp8.";
+        << "BFloat16 must be enabled to quantize a bf16 tensor to mxfp8.";
 #endif
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)

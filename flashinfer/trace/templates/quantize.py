@@ -1012,7 +1012,7 @@ nvfp4_kv_quantize_trace = TraceTemplate(
 )
 
 
-# ── Grouped MXFP8 quantization (cuTile, SM100+) ──────────────────────────────
+# ── Grouped MXFP8 quantization (SM100+) ──────────────────────────────────────
 
 
 def _mxfp8_grouped_quantize_init(
@@ -1091,6 +1091,66 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
     ],
     tags=["status:verified", "quantization:mxfp8"],
     init=_mxfp8_grouped_quantize_init,
+)
+
+
+@torch.no_grad()
+def _quantize_mxfp8_round_up_scale(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize ``[M, K]`` bit for bit as the CUDA kernels do.
+
+    Each 32-element block scale ``amax / 448`` is rounded up to a power of two,
+    so the block maximum fits E4M3 without clamping. The block maximum skips
+    NaN; an all-NaN block gets scale byte 255 and NaN values. The kernels flush
+    float32 subnormals to zero, so a block whose scale is zero or subnormal gets
+    scale byte 0 and zero values, and a block that holds an infinity gets scale
+    byte 254 (whose reciprocal is subnormal): the infinity becomes NaN and the
+    other values zero. Every NaN is written as the positive E4M3 NaN. Returns
+    ``(x_q [M, K] fp8_e4m3fn, sf [M, K // 32] uint8)``.
+    """
+    m, k = x.shape
+    blocks = x.to(torch.float32).reshape(m, k // 32, 32)
+    is_nan = blocks.isnan()
+    block_scale = torch.where(is_nan, 0.0, blocks.abs()).amax(dim=-1) / 448.0
+    scale_bits = block_scale.contiguous().view(torch.int32)
+    exp = (scale_bits >> 23) & 0xFF
+    mantissa = scale_bits & 0x7FFFFF
+    exp = torch.where(exp == 0, 0, (exp + (mantissa != 0).to(exp.dtype)).clamp(max=254))
+    sf = torch.where(is_nan.all(dim=-1), 255, exp).to(torch.uint8)
+    inv_scale = torch.ldexp(torch.ones_like(block_scale), 127 - sf.to(torch.int32))
+    inv_scale.masked_fill_((sf == 0) | (sf == 254), 0)
+    scaled = blocks * inv_scale.unsqueeze(-1)
+    x_q = scaled.masked_fill(scaled.isnan(), float("nan")).to(torch.float8_e4m3fn)
+    return x_q.reshape(m, k), sf
+
+
+@torch.no_grad()
+def _silu_and_mul_mxfp8_experts_quantize_reference(
+    a: torch.Tensor, mask: torch.Tensor, **_unused
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference for silu_and_mul_mxfp8_experts_quantize in a plain layout.
+
+    Rounds ``silu(gate) * up`` to the input dtype, as the kernel does, and
+    quantizes it per 32-element block. Returns ``(x_q, sf)`` with ``x_q`` of
+    shape ``[B, M, K]`` (fp8_e4m3fn) and ``sf`` of shape ``[B, M, K // 32]``
+    (UE8M0 bytes), without the grouped GEMM permutation, the K padding or the
+    scale swizzle. Every row is computed; the kernel writes only the first
+    ``min(mask[i], M)`` rows of expert ``i``, so compare those rows only.
+    """
+    b, m, k_doubled = a.shape
+    k = k_doubled // 2
+    gate = a[..., :k].to(torch.float32)
+    up = a[..., k:].to(torch.float32)
+    y = (gate * torch.sigmoid(gate) * up).to(a.dtype)
+    x_q, sf = _quantize_mxfp8_round_up_scale(y.reshape(b * m, k))
+    return x_q.reshape(b, m, k), sf.reshape(b, m, k // 32)
+
+
+# Inline dependencies so the serialized reference is self-contained.
+_bind_trace_reference_dependencies(
+    _silu_and_mul_mxfp8_experts_quantize_reference,
+    _quantize_mxfp8_round_up_scale,
 )
 
 
@@ -1176,6 +1236,7 @@ silu_and_mul_mxfp8_experts_quantize_trace = TraceTemplate(
         "k4 == 4",
     ],
     tags=["status:verified", "fused", "quantization:mxfp8", "moe"],
+    reference=_silu_and_mul_mxfp8_experts_quantize_reference,
     init=_silu_and_mul_mxfp8_experts_quantize_init,
 )
 

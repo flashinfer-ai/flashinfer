@@ -72,9 +72,9 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
 // input: [B, M, K], fp16/bf16; or [B, M, 2K] with gate values followed by up values per row when
 // use_silu_and_mul is set.
 // mask: [B], int32, number of valid rows per expert.
-// Writes the first mask[b] rows of each expert (silu(gate) * up when use_silu_and_mul is set) as
-// MXFP8: e4m3 values [B, M, round_up(K, 128)] and UE8M0 block scales
-// [B, round_up(M, 128), round_up(K, 128) / 32] in the 128x4 swizzled layout per expert.
+// Writes the first min(mask[b], M) rows of each expert (silu(gate) * up when use_silu_and_mul is
+// set) as MXFP8: e4m3 values [B, M, round_up(K, 128)] and UE8M0 block scales [B, round_up(M, 128),
+// round_up(K, 128) / 32] in the 128x4 swizzled layout per expert.
 void silu_and_mul_mxfp8_experts_quantize(TensorView input, TensorView mask, TensorView valMxFP8,
                                          TensorView scaleFP8SF, bool use_silu_and_mul,
                                          bool enable_pdl);

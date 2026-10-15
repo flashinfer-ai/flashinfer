@@ -60,15 +60,6 @@ constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 16;
 constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 8;
 #endif
-// CVT_FP16_TO_MXFP8_ELTS_PER_THREAD of the SM100+ device pass, for host-side launch sizing: the
-// host pass has no __CUDA_ARCH__, so the value above is 8 there. MXFP8 kernels only run on SM100+,
-// where the device value depends only on the nvcc version.
-#if defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) && \
-    ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) || (__CUDACC_VER_MAJOR__ >= 13))
-constexpr int CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD = 16;
-#else
-constexpr int CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD = 8;
-#endif
 inline int runtimeBlocksPerSM(int blockThreads) {
   int device = -1;
   cudaGetDevice(&device);
@@ -730,76 +721,152 @@ cvt_fp16_to_fp4_expert(
 #endif
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+// Quantizes one MXFP8 block of 32 values held by a single thread (vecs[0] holds values 0-15,
+// vecs[1] values 16-31) and returns its 32 E4M3 bytes; sfByte receives the UE8M0 scale. The result
+// matches cvt_warp_fp16_to_mxfp8 with CLAMP_NAN_TO_MAX off bit for bit, at fewer instructions per
+// value: no cross-thread max, the absolute value folds into the fp32 min/max, the reciprocal scale
+// comes from the exponent instead of MUFU.RCP, and value pairs use packed fp32 multiplies.
+template <class Type>
+__device__ __forceinline__ PackedU32x8 cvt_block32_to_mxfp8(PackedVec<Type, 16> const (&vecs)[2],
+                                                            uint8_t& sfByte) {
+  float2 vals[16];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    auto const& pair = vecs[i / 8].elts[i % 8];
+    if constexpr (std::is_same_v<Type, half>) {
+      vals[i] = __half22float2(pair);
+    } else {
+      uint32_t const bits = reinterpret_cast<uint32_t const&>(pair);
+      vals[i] = make_float2(__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u));
+    }
+  }
+  // fmaxf skips NaN, so only an all-NaN block has a NaN maximum, as with the bf16x2 max.
+  float amax = fabsf(vals[0].x);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    amax = fmaxf(amax, fmaxf(fabsf(vals[i].x), fabsf(vals[i].y)));
+  }
+  __nv_fp8_e8m0 sf;
+  sf.__x = __nv_cvt_float_to_e8m0(amax * reciprocal_approximate_ftz(448.0f), __NV_SATFINITE,
+                                  cudaRoundPosInf);
+  sfByte = sf.__x;
+  // 1 / 2^(e - 127) has exponent field 254 - e. Flush-to-zero in cvt_warp_fp16_to_mxfp8 treats the
+  // scale 2^-127 (e = 0) and the reciprocal of 2^127 (e = 254) as zero, so those blocks get a zero
+  // output scale here too: their finite values quantize to zero, and the infinity that gives a
+  // block e = 254 to NaN. e = 255 (an all-NaN block) gives NaN.
+  uint32_t const e = sf.__x;
+  float const outputScale = e - 1u < 253u ? __uint_as_float((254u - e) << 23)
+                                          : (e == 255u ? __uint_as_float(0x7fffffffu) : 0.f);
+  float2 const scale2 = make_float2(outputScale, outputScale);
+  PackedU32x8 out;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    float2 const lo = __fmul2_rn(vals[2 * j], scale2);
+    float2 const hi = __fmul2_rn(vals[2 * j + 1], scale2);
+    // The E4M3 conversion saturates to +/-448 and keeps NaN.
+    out.d[j] = __nv_fp8x4_e4m3(make_float4(lo.x, lo.y, hi.x, hi.y)).__x;
+  }
+  return out;
+}
+#endif
+
 // MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul.
 //
 // in:    [numExperts, numRows, numCols], or [numExperts, numRows, 2 * numCols] when
-//        use_silu_and_mul is set; each row then holds the gate values followed by the up values
+//        USE_SILU_AND_MUL is set; each row then holds the gate values followed by the up values
 //        and silu(gate) * up is quantized.
 // out:   [numExperts, numRows, numPaddedCols] e4m3; columns [numCols, numPaddedCols) are zero.
 // SFout: per expert, UE8M0 scales of the [numRows, numPaddedCols / 32] SF matrix in the 128x4
 //        swizzled layout, with rows padded to a multiple of 128.
 // mask:  [numExperts]; only the first min(mask[e], numRows) rows of expert e are read and written.
 //
-// blockIdx.x is the expert; blockIdx.y and threadIdx.y stride over its rows. blockDim.x is a
-// multiple of 32 and every lane runs every column iteration, so each warp maps to a single row and
-// the SF reduction in cvt_warp_fp16_to_mxfp8 always sees a full warp.
-template <class Type>
+// blockIdx.x is the expert; blockIdx.y and threadIdx.y stride over its rows, and threadIdx.x over
+// the scale blocks of a row. The plain quantization is bandwidth bound: each thread converts a
+// whole 32-value scale block (cvt_block32_to_mxfp8), which takes the fewest instructions per value.
+// The SiLU makes every value costly, so with SiLU-and-mul two threads share a block (16 values
+// each, cvt_warp_fp16_to_mxfp8): twice the threads hide more of that latency when few rows are
+// valid. That path needs blockDim.x to be a multiple of 32 and every lane to run every column
+// iteration, so each warp maps to a single row and the scale reduction sees a full warp.
+// USE_SILU_AND_MUL is a template parameter, so the plain quantization reserves no registers for the
+// up values.
+template <class Type, bool USE_SILU_AND_MUL>
 __global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32_t numPaddedCols,
-                                         Type const* in, int32_t const* mask, bool use_silu_and_mul,
-                                         uint8_t* out, uint32_t* SFout) {
+                                         Type const* in, int32_t const* mask, uint8_t* out,
+                                         uint32_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static constexpr int SF_VEC_SIZE = 32;
-  static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_MXFP8_ELTS_PER_THREAD;
-  static_assert(ELTS_PER_THREAD == CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD,
-                "The launcher sizes blocks with CVT_FP16_TO_MXFP8_SM100_ELTS_PER_THREAD.");
-  static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
-  using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
-  using RawVecT = std::conditional_t<sizeof(PackedVecT) == 16, PackedU32x4, PackedU32x8>;
-  using MxFp8OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint4, uint64_t>;
+  // Half a scale block, read with one 32-byte load.
+  using HalfBlockT = PackedVec<Type, SF_VEC_SIZE / 2>;
+  static_assert(sizeof(HalfBlockT) == sizeof(PackedU32x8));
 
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 
   int const expertIdx = blockIdx.x;
   int const numValidRows = min(mask[expertIdx], numRows);
-  int const numColThreads = numCols / ELTS_PER_THREAD;
-  int const numInColThreads = use_silu_and_mul ? 2 * numColThreads : numColThreads;
-  int const numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
-  int const numColVecs = numPaddedCols / SF_VEC_SIZE;
+  int const numColBlocks = numCols / SF_VEC_SIZE;
+  int const numPaddedColBlocks = numPaddedCols / SF_VEC_SIZE;
 
   for (int rowIdx = blockIdx.y * blockDim.y + threadIdx.y; rowIdx < numValidRows;
        rowIdx += gridDim.y * blockDim.y) {
+    // Non-negative indices let the scale-offset math use shifts instead of signed division.
+    __builtin_assume(rowIdx >= 0);
     int64_t const rowOffset = static_cast<int64_t>(expertIdx) * numRows + rowIdx;
-    PackedVecT const* inRow = reinterpret_cast<PackedVecT const*>(in) + rowOffset * numInColThreads;
-    MxFp8OutT* outRow = reinterpret_cast<MxFp8OutT*>(out) + rowOffset * numPaddedColThreads;
-
-    for (int colBase = 0; colBase < numPaddedColThreads; colBase += blockDim.x) {
-      int const colIdx = colBase + threadIdx.x;
-      PackedVecT vec;
-      if (colIdx < numColThreads) {
-        loadPackedVec(vec, inRow + colIdx);
-        if (use_silu_and_mul) {
-          PackedVecT upVec;
-          loadPackedVec(upVec, inRow + numColThreads + colIdx);
-          silu_and_mul<Type, ELTS_PER_THREAD>(vec, upVec);
+    if constexpr (USE_SILU_AND_MUL) {
+      int const numHalfBlocks = 2 * numColBlocks;
+      int const numPaddedHalfBlocks = 2 * numPaddedColBlocks;
+      for (int colBase = 0; colBase < numPaddedHalfBlocks; colBase += blockDim.x) {
+        int const colIdx = colBase + threadIdx.x;
+        HalfBlockT vec;
+        if (colIdx < numHalfBlocks) {
+          HalfBlockT const* inRow =
+              reinterpret_cast<HalfBlockT const*>(in) + rowOffset * 2 * numHalfBlocks;
+          HalfBlockT upVec;
+          loadPackedVec(vec, inRow + colIdx);
+          loadPackedVec(upVec, inRow + numHalfBlocks + colIdx);
+          silu_and_mul<Type, SF_VEC_SIZE / 2>(vec, upVec);
+        } else {
+          // Padded columns quantize to zero values with a zero scale.
+          reinterpret_cast<PackedU32x8&>(vec) = PackedU32x8{};
         }
-      } else {
-        // Padded columns quantize to zero values with a zero scale.
-        reinterpret_cast<RawVecT&>(vec) = RawVecT{};
+        uint8_t* sfOut = nullptr;
+        if (colIdx < numPaddedHalfBlocks) {
+          sfOut = cvt_quant_get_sf_out_offset<uint32_t, 2>(expertIdx, rowIdx, colIdx, numRows,
+                                                           numPaddedColBlocks, SFout,
+                                                           QuantizationSFLayout::SWIZZLED_128x4);
+        }
+        // NaN, including the NaN an infinity scales to, stays NaN, as on the plain path.
+        uint4 const outVec =
+            cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, SF_VEC_SIZE / 2, /*CLAMP_NAN_TO_MAX=*/false>(
+                vec, sfOut);
+        if (colIdx < numPaddedHalfBlocks) {
+          reinterpret_cast<uint4*>(out)[rowOffset * numPaddedHalfBlocks + colIdx] = outVec;
+        }
       }
-      uint8_t* sfOut = nullptr;
-      if (colIdx < numPaddedColThreads) {
-        sfOut = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(
-            expertIdx, rowIdx, colIdx, numRows, numColVecs, SFout,
-            QuantizationSFLayout::SWIZZLED_128x4);
-      }
-      MxFp8OutT const outVec =
-          cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(vec, sfOut);
-      if (colIdx < numPaddedColThreads) {
-        outRow[colIdx] = outVec;
+    } else {
+      for (int colIdx = threadIdx.x; colIdx < numPaddedColBlocks; colIdx += blockDim.x) {
+        __builtin_assume(colIdx >= 0);
+        HalfBlockT vecs[2];
+        if (colIdx < numColBlocks) {
+          HalfBlockT const* inRow =
+              reinterpret_cast<HalfBlockT const*>(in) + rowOffset * 2 * numColBlocks;
+          loadPackedVec(vecs[0], inRow + 2 * colIdx);
+          loadPackedVec(vecs[1], inRow + 2 * colIdx + 1);
+        } else {
+          // Padded columns quantize to zero values with a zero scale.
+          reinterpret_cast<PackedU32x8&>(vecs[0]) = PackedU32x8{};
+          reinterpret_cast<PackedU32x8&>(vecs[1]) = PackedU32x8{};
+        }
+        uint8_t sfByte;
+        reinterpret_cast<PackedU32x8*>(out)[rowOffset * numPaddedColBlocks + colIdx] =
+            cvt_block32_to_mxfp8<Type>(vecs, sfByte);
+        int64_t const sfOffset =
+            get_sf_out_offset_128x4(expertIdx, rowIdx, colIdx, numRows, numPaddedColBlocks);
+        reinterpret_cast<uint8_t*>(SFout)[sfOffset] = sfByte;
       }
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
