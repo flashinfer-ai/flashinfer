@@ -4,6 +4,48 @@
 
 from .api_logging import flashinfer_experimental_api
 
+MOK_PRECISIONS = ("bf16", "mxfp8")
+
+# Imbalance-aware communication split, keyed by device compute capability, SM
+# count and routed precision. Only devices with a measured gain have a row;
+# "auto" resolves to None (the fixed split) elsewhere. The SM count separates
+# B200 (148 SMs) from GB200 (152 SMs, also compute capability (10, 0)), where
+# the B200 row measured slower than the fixed split at 8x skew and above on
+# EP16-64 (GB200 NVL72, FlashInfer PR #6439 review). B200 BF16 row 24 / 28: EP8
+# complete training steps, two rounds on one node, step time against the fixed
+# 20 / 24 on this package's backward programs. Hottest rank at 5.6x / 7.4x the
+# mean routed load: -1.0 / -1.7 % and -1.2 / -1.3 %. Hottest rank at 3.0x (one
+# rank's experts at twice the routing probability): +0.4 / +0.7 % (full step),
+# +0.5 / +0.8 % (checkpoint step) and -0.1 ... +1.6 % with ragged source rows
+# (8 cells, 7 slower) - no gain, within or just above the ~0.8 % spread of
+# identical arms, so the fixed split is kept. IMBALANCE_THRESHOLD sits between
+# the measured 3.0x and 5.6x; the crossover in between is not measured, and
+# with 4 ranks the ratio reaches 4 only when one rank carries every routed row.
+# Balanced steps never switch, so the fixed split stays in force for them.
+IMBALANCE_COMM_SMS = {
+    (10, 0): {148: {"bf16": (24, 28)}},
+}
+IMBALANCE_THRESHOLD = 4.0
+
+
+def resolve_imbalance_comm_sms(precision, device=None):
+    """(forward, backward) communication-SM split used under imbalanced routing
+    for ``precision`` (``"bf16"`` or ``"mxfp8"``) on ``device``, or ``None``
+    when the device (compute capability and SM count) has no measured row (the
+    fixed split is kept).
+    """
+    import torch
+
+    if precision not in MOK_PRECISIONS:
+        raise ValueError(
+            f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
+        )
+    if device is None:
+        device = torch.cuda.current_device()
+    capability = tuple(torch.cuda.get_device_capability(device))
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return IMBALANCE_COMM_SMS.get(capability, {}).get(sm_count, {}).get(precision)
+
 
 @flashinfer_experimental_api
 def prepare_mok_bf16(
@@ -61,6 +103,9 @@ def create_mok_bf16_workspace(
     minibatch_size=4096,
     macrobatch_size=32768,
     schedule_capacity_multiplier=3 / 16,
+    precision="bf16",
+    imbalance_comm_sms="auto",
+    imbalance_threshold=IMBALANCE_THRESHOLD,
 ):
     """Collectively create a caller-owned ``(config, workspace)`` pair.
 
@@ -72,13 +117,46 @@ def create_mok_bf16_workspace(
     a small toy ring; see the backend README for capacity and reuse rules.
     The same workspace serves BF16 and MXFP8 routed experts.
     Call outside CUDA Graph capture; retain the workspace for every replay.
+
+    ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
+    launches switch to while the hottest rank's routed-row load is at least
+    ``imbalance_threshold`` times the mean per-rank load (observed on the
+    gathered expert IDs of each step without a host synchronization; the counts
+    are identical on every rank, each rank applies its own latest completed
+    observation). ``"auto"`` (default) takes the measured row of the device
+    for ``precision`` (:func:`resolve_imbalance_comm_sms`, keyed by compute
+    capability and SM count; B200 BF16: 24 / 28, no row elsewhere - GB200 and
+    GB300 included - so the fixed split stays in force there), ``None`` keeps
+    the fixed split and a pair sets it. ``precision`` only selects that row.
+    The default ``imbalance_threshold`` (:data:`IMBALANCE_THRESHOLD`, 4) lies
+    between the measured 3x load ratio, where the imbalance split shows no
+    gain, and 5.6x, where it gains 1-2 %. Balanced steps never switch.
+    ``CAKE_MOK_COMM_SPLIT_LOG=1`` prints each split change.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig
     from .experimental.cake_mok_bf16.backend import create_source_workspace
 
+    if precision not in MOK_PRECISIONS:
+        raise ValueError(
+            f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
+        )
+    if isinstance(imbalance_comm_sms, str):
+        if imbalance_comm_sms != "auto":
+            raise ValueError(
+                'imbalance_comm_sms must be "auto", None or a (forward, backward) pair'
+            )
+        imbalance_comm_sms = resolve_imbalance_comm_sms(precision, device)
+    elif imbalance_comm_sms is not None:
+        imbalance_comm_sms = tuple(imbalance_comm_sms)
+        if len(imbalance_comm_sms) != 2:
+            raise ValueError(
+                "imbalance_comm_sms must be a (forward, backward) pair of counts"
+            )
     config = MoKConfig(
         fwd_num_comm_sms=fwd_num_comm_sms,
         bwd_num_comm_sms=bwd_num_comm_sms,
+        imbalance_comm_sms=imbalance_comm_sms,
+        imbalance_threshold=imbalance_threshold,
         minibatch_size=minibatch_size,
         macrobatch_size=macrobatch_size,
         schedule_capacity_multiplier=schedule_capacity_multiplier,
