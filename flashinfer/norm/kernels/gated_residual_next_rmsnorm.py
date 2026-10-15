@@ -300,7 +300,6 @@ def _launch(
         grid=[mBr.shape[0], CLUSTER_N, 1],
         block=[THREADS, 1, 1],
         cluster=[1, CLUSTER_N, 1] if const_expr(CLUSTER_N > 1) else None,
-        smem=1024,
         stream=stream,
         use_pdl=enable_pdl,
     )

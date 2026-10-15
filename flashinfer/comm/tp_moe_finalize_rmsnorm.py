@@ -49,7 +49,8 @@ accumulates the experts in FP32, then multicasts the final BF16 row. This moves
 less data than the expert-owner path (the second hop carries BF16 output rows,
 not FP32 partials).
 
-  single cooperative launch (compiled grid passes a collective residency check): CTA ``(b, g, d)`` covers H
+  single cooperative launch (padded token count <= SM count and the compiled
+      grid passes a collective residency check): CTA ``(b, g, d)`` covers H
       band ``b`` of token ``g * P + d``. It pushes the token's rows to rank
       ``d``, reduces some experts of the token this rank owns in slot ``g``,
       and copies rank ``d``'s multicast row out. Both hops are Lamport
@@ -64,6 +65,7 @@ not FP32 partials).
 """
 
 import logging
+import tempfile
 from typing import Any, TypedDict
 
 import cutlass
@@ -84,6 +86,7 @@ from .mnnvl_cutedsl.cute_dsl_primitives import (
     map_shared_to_peer as map_smem_rank,
     store_shared_cluster_f32 as st_smem_remote_f32,
 )
+from .mnnvl_cutedsl.runtime import collective_support
 
 try:
     import cuda.bindings.driver as _drv
@@ -483,7 +486,6 @@ def _pick_split(n_tok, nsm):
 # kernel factory
 # --------------------------------------------------------------------------- #
 def _make_program(
-    token_bucket,
     row_stride,
     grid_y,
     split,
@@ -1485,21 +1487,6 @@ def _make_program(
     return host
 
 
-def _make_token_program(*args):
-    return _make_program(*args, token_owner=True)
-
-
-def _make_token1_program(*args):
-    n_tok = args[0]
-    return _make_program(
-        *args,
-        token_owner=True,
-        single=True,
-        xpar=_single_xpar(n_tok),
-        push=_single_push(n_tok),
-    )
-
-
 def _token_crossover(nsm):
     # Below about 64 / P tokens the expert-owner path is faster: each owner
     # reduces only K / P experts, so its single CTA finishes sooner than a token
@@ -1545,6 +1532,27 @@ def _single_ctas(n_tok):
     return (n_tok + _WS.ws - 1) // _WS.ws * _WS.ws
 
 
+def _config(n_tok):
+    """Compile-time ``(path, rows, split, xpar, push)`` for ``n_tok`` tokens.
+
+    Grids are sized for a power-of-two row bucket, so nearby token counts share
+    one program; the kernels read the real count from the tensor shapes. The
+    path and its tuning follow the real count, which they were measured on.
+    """
+    ws, nsm = _WS.ws, _WS.nsm
+    path = _select_path(n_tok, nsm)
+    rows = 1 << (n_tok - 1).bit_length()
+    if path == "expert":
+        return path, rows, _pick_split(n_tok, nsm), 0, 0
+    if path == "token1":
+        # The bucket must keep every padded slot of the single launch, which
+        # the real count fits, inside the SM count and the workspace slots.
+        rows = min(rows, nsm // ws * ws)
+        split = _pick_split(_single_ctas(n_tok), nsm)
+        return path, rows, split, _single_xpar(n_tok), _single_push(n_tok)
+    return path, min(rows, 1 << (nsm - 1).bit_length()), 1, 0, 0
+
+
 # --------------------------------------------------------------------------- #
 # host side
 # --------------------------------------------------------------------------- #
@@ -1587,23 +1595,7 @@ class _WorkspaceAddresses(TypedDict):
     tl_ycnt: int
 
 
-_PROGRAMS: dict[tuple[int, int, int, int, float, float, str], "_Program"] = {}
-
-
-def _group_all(
-    local_ok: bool,
-    device: torch.device,
-    group,
-    flag: torch.Tensor | None = None,
-) -> bool:
-    """Return a rank-consistent logical AND of an initialization verdict."""
-    import torch.distributed as dist
-
-    if flag is None:
-        flag = torch.empty((1,), dtype=torch.int32, device=device)
-    flag.fill_(int(local_ok))
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
-    return bool(flag.item())
+_PROGRAMS: dict[tuple, "_Program"] = {}
 
 
 def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
@@ -1635,7 +1627,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     props = torch.cuda.get_device_properties(device)
     local_supported = (props.major, props.minor) in _COMPUTE_CAPABILITIES
     local_supported = local_supported and props.multi_processor_count <= NSLOT
-    if not _group_all(local_supported, device, group):
+    if not collective_support(local_supported, group, device):
         if not local_supported:
             logger.warning(
                 "TP MoE finalize requires SM100/SM103/SM107 and at most %d SMs; got SM%d%d "
@@ -1694,7 +1686,9 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         )
     except RuntimeError as error:
         allocation_error = error
-    if not _group_all(allocation_error is None, device, group, flag=allocation_flag):
+    if not collective_support(
+        allocation_error is None, group, device, flag=allocation_flag
+    ):
         if allocation_error is not None:
             logger.warning(
                 "TP MoE finalize workspace allocation failed; using the native "
@@ -1722,7 +1716,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     _WS.lam, _WS.hdl = lam, hdl
 
     mc = int(getattr(hdl, "multicast_ptr", 0) or 0)
-    if not _group_all(mc != 0, device, group):
+    if not collective_support(mc != 0, group, device):
         if mc == 0:
             logger.warning(
                 "TP MoE finalize requires NVLink multicast memory; "
@@ -1803,26 +1797,29 @@ class _Program:
             )
 
 
+def _checked(result):
+    if int(result[0]) != 0:
+        raise RuntimeError(f"CUDA driver call failed: {result[0]}")
+    return result[1] if len(result) > 1 else None
+
+
 def _grid_fits(compiled, *, split, groups, nthr, smem, stream):
-    """Check the compiled cooperative grid; unknown launch metadata is unsafe."""
+    """Whether the cooperative grid of a single-kernel program fits the GPU.
 
-    def checked(result):
-        if int(result[0]) != 0:
-            raise RuntimeError(f"CUDA occupancy query failed: {result[0]}")
-        return result[1] if len(result) > 1 else None
-
+    TVM-FFI programs expose no CUDA function handle, so the kept cubin is
+    loaded into the current context for the occupancy query only; the launch
+    still goes through ``compiled``.
+    """
+    (name,) = compiled.kernel_info
+    module = _checked(_drv.cuModuleLoadData(compiled.artifacts.CUBIN))
     try:
-        compiled.to()
-        modules = getattr(compiled.jit_module, "cuda_modules", ())
-        if len(modules) != 1:
-            return False
-        fn = checked(_drv.cuKernelGetFunction(modules[0].kernel))
+        fn = _checked(_drv.cuModuleGetFunction(module, name.encode()))
         if split == 1:
-            active = checked(
+            active = _checked(
                 _drv.cuOccupancyMaxActiveBlocksPerMultiprocessor(fn, nthr, smem)
             )
             return active * _WS.nsm >= groups
-        checked(
+        _checked(
             _drv.cuFuncSetAttribute(
                 fn,
                 _drv.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
@@ -1841,50 +1838,12 @@ def _grid_fits(compiled, *, split, groups, nthr, smem, stream):
         config.hStream = stream
         config.attrs = [cluster]
         config.numAttrs = 1
-        return checked(_drv.cuOccupancyMaxActiveClusters(fn, config)) >= groups
-    except (AttributeError, RuntimeError, TypeError) as error:
-        logger.debug("Cannot establish TP finalize cooperative residency: %s", error)
-        return False
+        return _checked(_drv.cuOccupancyMaxActiveClusters(fn, config)) >= groups
+    finally:
+        _drv.cuModuleUnload(module)
 
 
-def _build(key, a, b, c, d, e, stream):
-    # The generated program embeds process-local symmetric-memory and multicast
-    # addresses. It must therefore remain in the process cache rather than the
-    # persistent CuTe-DSL cache, whose objects are reusable across processes.
-    n_tok, row_stride, expert_weights_fp32, mode, eps, gain_center, path = key
-    tiles = (n_tok + _WS.ws - 1) // _WS.ws if path != "expert" else n_tok
-    if path == "token":
-        split = 1
-    elif path == "token1":
-        # every token gets its own cluster; keep the whole grid co-resident
-        split = _pick_split(_single_ctas(n_tok), _WS.nsm)
-    else:
-        split = _pick_split(tiles, _WS.nsm)
-    nthr = H_DIM // (VEC * split)
-    grid_y = min(tiles, _WS.nsm // split)
-    addrs = _WS.addrs
-    if addrs is None:
-        raise RuntimeError("TP MoE finalize workspace addresses are unavailable")
-    factory = {
-        "expert": _make_program,
-        "token": _make_token_program,
-        "token1": _make_token1_program,
-    }[path]
-    host = factory(
-        n_tok,
-        row_stride,
-        grid_y,
-        split,
-        nthr,
-        mode,
-        eps,
-        gain_center,
-        expert_weights_fp32,
-        _WS.ws,
-        _WS.use_mc,
-        addrs,
-        _WS.rank,
-    )
+def _compile(host, a, b, c, d, e, stream, options):
     try:
         args = [
             from_dlpack(x, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
@@ -1892,8 +1851,10 @@ def _build(key, a, b, c, d, e, stream):
             )
             for x in (a, b, c, d, e)
         ]
-        compiled = cute.compile(host, *args, stream, options="--enable-tvm-ffi")
-        program = _Program(compiled, True)
+        compiled = cute.compile(
+            host, *args, stream, options=f"--enable-tvm-ffi {options}"
+        )
+        return _Program(compiled, True)
     except Exception as error:
         logger.warning(
             "TVM-FFI compilation failed for TP MoE finalize; using the "
@@ -1904,21 +1865,77 @@ def _build(key, a, b, c, d, e, stream):
             from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=x.ndim - 1)
             for x in (a, b, c, d, e)
         ]
-        program = _Program(cute.compile(host, *args, stream), False)
-    if path != "token":
-        groups = tiles * _WS.ws if path == "token1" else grid_y
-        experts = K_EXPERTS // (_single_xpar(n_tok) if path == "token1" else _WS.ws)
-        # Conservative padding for the reduction arrays and single-path flag.
-        smem = 4 * experts * (nthr // 32 + 1 + split) + 64
-        local_fits = _grid_fits(
-            program.fn, split=split, groups=groups, nthr=nthr, smem=smem, stream=stream
+        return _Program(cute.compile(host, *args, stream, options=options), False)
+
+
+def _build(key, a, b, c, d, e, stream):
+    # The generated program embeds process-local symmetric-memory and multicast
+    # addresses. It must therefore remain in the process cache rather than the
+    # persistent CuTe-DSL cache, whose objects are reusable across processes.
+    path, rows, split, xpar, push, row_stride, expert_weights_fp32, mode, eps, gain = (
+        key
+    )
+    tiles = (rows + _WS.ws - 1) // _WS.ws if path != "expert" else rows
+    nthr = H_DIM // (VEC * split)
+    grid_y = min(tiles, _WS.nsm // split)
+    addrs = _WS.addrs
+    if addrs is None:
+        raise RuntimeError("TP MoE finalize workspace addresses are unavailable")
+    # Every rank votes once per specialization, so a local failure (compile,
+    # occupancy query) becomes a group-wide fallback or error instead of
+    # leaving the other ranks waiting in a collective or a kernel.
+    program = None
+    try:
+        host = _make_program(
+            row_stride,
+            grid_y,
+            split,
+            nthr,
+            mode,
+            eps,
+            gain,
+            expert_weights_fp32,
+            _WS.ws,
+            _WS.use_mc,
+            addrs,
+            _WS.rank,
+            token_owner=path != "expert",
+            single=path == "token1",
+            xpar=xpar or None,
+            push=push or None,
         )
-        device = torch.device("cuda", _WS.dev_ord)
-        if not _group_all(local_fits, device, _WS.group):
-            # All ranks choose the staged transport together. Kernel boundaries
-            # remove the requirement that the full grid be resident at once.
-            return _build((*key[:-1], "token"), a, b, c, d, e, stream)
-    return program
+        if path == "token":
+            program = _compile(host, a, b, c, d, e, stream, "")
+            ok = True
+        else:
+            with tempfile.TemporaryDirectory() as dump_dir:
+                program = _compile(
+                    host, a, b, c, d, e, stream, f"--keep-cubin --dump-dir={dump_dir}"
+                )
+            groups = tiles * _WS.ws if path == "token1" else grid_y
+            experts = K_EXPERTS // (xpar if path == "token1" else _WS.ws)
+            # Conservative padding for the reduction arrays and single-path flag.
+            smem = 4 * experts * (nthr // 32 + 1 + split) + 64
+            ok = _grid_fits(
+                program.fn,
+                split=split,
+                groups=groups,
+                nthr=nthr,
+                smem=smem,
+                stream=stream,
+            )
+    except Exception as error:
+        logger.warning("TP MoE finalize %s path failed on this rank: %s", path, error)
+        ok = False
+    device = torch.device("cuda", _WS.dev_ord)
+    if collective_support(ok, _WS.group, device):
+        assert program is not None
+        return program
+    if path == "token":
+        raise RuntimeError("TP MoE finalize compilation failed on at least one rank")
+    # All ranks choose the staged transport together. Kernel boundaries remove
+    # the requirement that the full grid be resident at once.
+    return _build(("token", rows, 1, 0, 0, *key[5:]), a, b, c, d, e, stream)
 
 
 def _run(
@@ -1936,15 +1953,13 @@ def _run(
         return
     if not _WS.available:
         raise RuntimeError("TP MoE finalize workspace was not initialized")
-    bucket = min(1 << (n_tok - 1).bit_length(), 1 << (_WS.nsm - 1).bit_length())
     key = (
-        bucket,
+        *_config(n_tok),
         gemm2_permuted.stride(0),
         int(expert_weights.dtype == torch.float32),
         int(weight_before_norm),
         float(eps),
         float(gain_center),
-        _select_path(bucket, _WS.nsm),
     )
     capturing = torch.cuda.is_current_stream_capturing()
     stream = _cur_stream(_WS.dev_ord)

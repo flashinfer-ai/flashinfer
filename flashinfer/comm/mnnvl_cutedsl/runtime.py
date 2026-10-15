@@ -102,16 +102,26 @@ def current_cu_stream() -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-def collective_support(local_supported: bool, group, device: torch.device) -> bool:
+def collective_support(
+    local_supported: bool,
+    group,
+    device: torch.device,
+    flag: torch.Tensor | None = None,
+) -> bool:
     """Agree on a dispatch choice during warmup, before CUDA graph capture.
 
     Every rank must call this, including ranks whose local check failed.
     Keep the agreed dispatch for graph replay; this helper synchronizes the CPU.
+    ``flag`` is an optional preallocated one-element int32 vote buffer, for
+    votes on whether an allocation succeeded.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Agree on collective support before CUDA graph capture")
     import torch.distributed as dist
 
-    vote = torch.tensor(int(local_supported), dtype=torch.int32, device=device)
+    if flag is None:
+        vote = torch.tensor(int(local_supported), dtype=torch.int32, device=device)
+    else:
+        vote = flag.fill_(int(local_supported))
     dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
     return bool(vote.item())

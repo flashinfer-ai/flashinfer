@@ -9,8 +9,8 @@
     out    = alpha * stream + beta * normed     <- FP32 residual stream
 
 One GPU kernel body, one launch per non-empty invocation, on the caller's stream.
-grid = (S, M): a CTA owns row `row = blockIdx.y` and column segment
-`seg = blockIdx.x`.  (VEC, S) are the shape-dependent tuning parameters.
+grid = (M, S): a CTA owns row `row = blockIdx.x` and column segment
+`seg = blockIdx.y`.  (VEC, S) are the shape-dependent tuning parameters.
 
 * L1 residency is steered by hand.  `norm_weight`, `alpha` and `beta` are the
   three operands whose lines are re-read by *every* CTA of the launch, so they

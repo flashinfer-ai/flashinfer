@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from flashinfer.comm.mnnvl_cutedsl.runtime import collective_support
 from flashinfer.comm import (
     init_tp_moe_finalize_rmsnorm,
     supports_tp_moe_finalize_rmsnorm,
@@ -197,7 +198,7 @@ def _worker(local_rank: int, master_port: int | None, world_size: int) -> None:
     _init_group(local_rank, master_port, world_size)
     device = torch.device("cuda", local_rank)
     finalize_module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
-    assert not finalize_module._group_all(local_rank != 0, device, dist.group.WORLD), (
+    assert not collective_support(local_rank != 0, dist.group.WORLD, device), (
         "one rank's failed initialization verdict must disable every rank"
     )
     assert init_tp_moe_finalize_rmsnorm()
