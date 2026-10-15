@@ -78,6 +78,7 @@ def swiglu_backward_tasks(tiles):
     """Backward SwiGLU tasks covering ``tiles`` 128 x 128 tiles."""
     return (tiles + 2 * SWIGLU_BWD_TILES - 1) // (2 * SWIGLU_BWD_TILES)
 
+
 def _fast_divmod(divisor):
     """Three-field carrier ``(divisor, multiplier, shift)`` of a fast-divmod
     kernel parameter: the launch-invariant divisor with its host-derived
@@ -607,7 +608,9 @@ class MoKBackward:
         # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
         shared_wgrad = wgrad_tiles(hidden, intermediate)
         weight_tasks = experts * shared_wgrad
-        replay_macro_tasks = (macro_size // mini_size) * (mini_replay + mini_bwd) + 3 * weight_tasks
+        replay_macro_tasks = (macro_size // mini_size) * (
+            mini_replay + mini_bwd
+        ) + 3 * weight_tasks
         layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
         with tvm_ffi.use_torch_stream():
             self.module.launch(
@@ -1342,7 +1345,9 @@ class MoKBackwardMXFP8:
         shared_wgrad = wgrad_tiles(hidden, intermediate)
         routed_wgrad = wgrad_tiles(hidden, intermediate, tile_cols=tile)
         weight_tasks = experts * routed_wgrad
-        replay_macro_tasks = (macro_size // mini_size) * (mini_replay + mini_bwd) + 3 * weight_tasks
+        replay_macro_tasks = (macro_size // mini_size) * (
+            mini_replay + mini_bwd
+        ) + 3 * weight_tasks
         layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
         with tvm_ffi.use_torch_stream():
             self.module.launch(
