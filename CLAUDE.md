@@ -41,6 +41,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
+| Log MegaMoE compilation and workspace diagnostics | `export FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC=1` |
 | Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
@@ -157,6 +158,42 @@ Run specific test function:
 ```bash
 pytest tests/attention/test_hopper.py::test_single_prefill
 ```
+
+The sharded test runner defaults to one worker per visible GPU. H100 PR CI opts
+into `--workers-per-gpu 2`: eight workers on four GPUs. Other CI lanes retain
+the default. Locally, `scripts/task_run_unit_tests.sh --workers-per-gpu 2` enables
+sharing; `--workers N` sets the total instead. Workers share the existing JIT
+compilation budget.
+
+Scheduling markers apply to the whole source file:
+
+- `node_exclusive`: run alone across the allocation after parallel work, with
+  all GPUs visible. Use for multi-GPU requirements or host-memory OOM risk.
+- `gpu_exclusive`: run alone on the assigned GPU; other GPUs can keep working.
+- `host_memory_heavy`: prioritize this file and serialize its units with other
+  host-heavy work, while lighter files can overlap.
+
+Host and GPU reservations cover setup, execution, and process cleanup, and are
+acquired together. Blocked units stay queued so workers can take runnable work
+from their own queue or steal from another. Pending GPU-exclusive work can
+drain one GPU without reserving the host-heavy slot or blocking other GPUs.
+`RESOURCE WAIT` reports worker idle time of at least one second while work is
+queued but cannot run on that worker's resources.
+
+These markers enforce overlap rules, not memory limits. Most H100 annotations
+use measured peaks above 128 GiB host RSS or 32 GiB GPU memory. Attention sink
+also uses both narrower markers: its single-GPU H100 run peaked at 89.2 GiB host
+RSS and 4.5 GiB GPU memory, and other GPUs can keep working while it runs.
+Cold JIT compilation and other GPU families can change the peaks. Validate
+completion rate, OOM failures, and repeated wall times with matching scope and
+cache conditions when changing a CI lane's concurrency policy.
+
+Capacity reports include the serial floor from host-heavy and node-exclusive
+work. They remain optimistic about GPU contention because the estimator uses
+worker counts without GPU topology or measured memory capacity.
+
+Run the CPU-only coordinator suite with
+`pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
 ### Skipping Tests Based on CUDA Architecture
 
@@ -735,6 +772,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
+| `FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC` | unset | `flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/shim/runtime.py` | Exactly `1` prints MegaMoE split-kernel compile choices, workspace memory diagnostics, and frontend compile/capture timings; other values leave these diagnostics off. |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
 | `FLASHINFER_PRIMS_TS_DEBUG_CHECKS` | `0` | `flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py`, `batched_gemm_run.py`, `flashinfer/prims_ts/gemm/kernel.py` | `1`/`true`/`yes`/`on` enables exhaustive deadlock/race checks and TaskManager verification in Prims-TS batched GEMM and dense GEMM. Production JIT leaves both off. `tests/prims_ts` turns the variable on for `test_batched_gemm_*` and `test_gemm_*`. |
 | `FLASHINFER_PRIMS_TS_COMPILE_OPTIONS` | `--opt-level 2` | `flashinfer/prims_ts/utils.py`, `batched_gemm_run.py` | Extra CuTe-DSL / nvc compile options passed when building Prims-TS kernels. |

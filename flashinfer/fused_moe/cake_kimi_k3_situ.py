@@ -40,17 +40,35 @@ _N32_CLAIM8_TOKENS = (512, 1024)
 _MID_WORK5FD_TOKENS = (2048, 4096)
 _LARGE_C7_TOKENS = (8192, 16384)
 # Architectures whose single-token route runs the fused quantization + routing
-# FC1 (three kernels: FC1, FC2, finalize); the others launch the separate
-# single-token quantization + router kernel before the FC1 (four kernels).
-_M1_FUSED_ARCHES = ("sm_103a",)
+# FC1 (three kernels: FC1, FC2, finalize) -- both today; an architecture outside
+# this set would launch the separate single-token quantization + router kernel
+# before the FC1 (four kernels, the "m1" selector).
+_M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 8192- and 16384-token route runs the FC2 that stores an
 # 8-bit per-tile partial with per-tile FP32 scales and the finalize that
-# consumes it (eight kernels); the others run the pre-shuffled scale-factor
-# route (nine kernels).
-_LARGE_Q8I_ARCHES = ("sm_103a",)
+# consumes it (eight kernels) -- both today; an architecture outside this set
+# would run the pre-shuffled scale-factor route (nine kernels, the "large_c7"
+# selector).
+_LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
+# and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
+# keeps the BF16 expert output everywhere.
+_MID_Q8I_ARCHES = ("sm_103a",)
+_MID_Q8I_TOKENS = (4096,)
+# Architectures and token counts whose large route runs the routing histogram
+# and scatter kernels that privatize the expert histogram in per-CTA shared
+# memory and reserve a block of rows per CTA (1024 routed pairs per CTA; the
+# "large_q8i_p1024" selector) -- the 16384-token row of sm_100a today.  Every
+# other large row keeps the production routing kernels (256 pairs per CTA).
+_LARGE_P1024_ARCHES = ("sm_100a",)
+_LARGE_P1024_TOKENS = (16384,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
+# Routed (token, expert-slot) pairs one CTA of the routing histogram and
+# scatter kernels handles: 256 for the production kernels, 1024 for the
+# per-CTA privatized kernels of the "large_q8i_p1024" selector.
+_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024}
 # FC2 device-workfeed pools. The 16-token route runs an FC2 program built for
 # two resident CTAs per SM (__launch_bounds__(512, 2)), so its pool holds
 # 2 * SM // (_H // 128) rows (280 CTAs on a 148-SM part); the 32..256-token
@@ -61,7 +79,8 @@ _ROUTE_MC_CLUSTER = 8
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 _M64_CLAIM8_FC2_GRID_N = 12
 _N32_CLAIM8_FC2_GRID_N = 7
-# Pre-shuffled FC1 scale factors (the 16384-token route). The tile-N128 FC1
+# Pre-shuffled FC1 scale factors (the ``large_c7`` route, which no delivered
+# architecture selects today). The tile-N128 FC1
 # consumes K in steps of 512 elements; for every (N-tile, K-step) the writer
 # emits the 4096-byte shared-memory image FC1 expects (128 rows x 32 bytes).
 _FC1_K_STEP = 512
@@ -164,6 +183,16 @@ _SELECTORS = {
         _N32_CLAIM8_FC2_GRID_N,
     ),
     "mid_work5fd": (_GENERIC, _generic(128, fc1="fc1:n128_work5fd"), None),
+    "mid_q8i": (
+        _GENERIC,
+        _generic(
+            128,
+            fc1="fc1:n128_work5fd",
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+        ),
+        None,
+    ),
     "large_c7": (
         _LARGE,
         _generic(
@@ -177,6 +206,19 @@ _SELECTORS = {
     "large_q8i": (
         _GENERIC,
         _generic(128, fc2="fc2:n128_q8i", finalize="finalize:n128_q8i"),
+        None,
+    ),
+    "large_q8i_p1024": (
+        _GENERIC,
+        _generic(
+            128,
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+            extra={
+                "route_histogram": "route_histogram:n128_p1024",
+                "route_scatter": "route_scatter:n128_p1024",
+            },
+        ),
         None,
     ),
     8: (_GENERIC, _generic(8), None),
@@ -213,8 +255,12 @@ def _selector(arch, num_tokens):
     if num_tokens in _N32_CLAIM8_TOKENS:
         return "n32_claim8"
     if num_tokens in _MID_WORK5FD_TOKENS:
+        if arch in _MID_Q8I_ARCHES and num_tokens in _MID_Q8I_TOKENS:
+            return "mid_q8i"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
+        if arch in _LARGE_P1024_ARCHES and num_tokens in _LARGE_P1024_TOKENS:
+            return "large_q8i_p1024"
         return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
     return tile_n
 
@@ -272,8 +318,9 @@ def _workspace_layout(num_tokens, arch=None):
         ("expert_output", torch.bfloat16, (rows, _H), 2),
     )
     # The layout is architecture-independent: a field that any architecture's
-    # selector of this token count needs (the FC2 work counter, the
-    # pre-shuffled scale images) is present on both.
+    # selector of this token count needs (the FC2 work counter; the pre-shuffled
+    # scale images of a ``large_c7`` selector, which no delivered architecture
+    # uses today) is present on both.
     selectors = {_selector(name, num_tokens) for name in ("sm_100a", "sm_103a")}
     if any(_SELECTORS[selector][2] is not None for selector in selectors):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
@@ -351,10 +398,10 @@ def _cake_situ_workspace_size(options):
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
     # that force tile-N16 need more scratch rows than the tile-N8 counts that
-    # follow them, and the pre-shuffled scale-factor route carries
-    # ``sfb_shuffled`` (the 8192-token layout is larger than the ordinary
-    # layout up to 8647 tokens), so a maximum-size buffer covers every forced
-    # and pre-shuffled count at or below ``max_num_tokens`` as well as
+    # follow them, and an architecture whose large route is ``large_c7`` would
+    # carry ``sfb_shuffled`` on the 8192- and 16384-token layouts (none of the
+    # delivered architectures does today), so a maximum-size buffer covers
+    # every forced and large count at or below ``max_num_tokens`` as well as
     # ``max_num_tokens`` itself.
     return max(
         _workspace_layout(num_tokens)[1]
@@ -464,7 +511,8 @@ def _stage_constants(stage, views, prepared, num_tokens):
     max_tiles = prepared["max_tiles"]
     selector = prepared["selector"]
     workfeed = _SELECTORS[selector][2] is not None
-    route_grid = ((total_pairs + 255) // 256, 1, 1)
+    pairs_per_cta = _ROUTE_PAIRS_PER_CTA.get(selector, 256)
+    route_grid = ((total_pairs + pairs_per_cta - 1) // pairs_per_cta, 1, 1)
     route_views = {
         name: views[name]
         for name in (

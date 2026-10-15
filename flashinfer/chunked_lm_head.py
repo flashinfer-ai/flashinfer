@@ -126,6 +126,8 @@ def chunked_lm_head_loss(
         saved-tensor version error).  ``None`` (default) reads
         ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST`` (on unless set to ``0``).
 
+    Notes
+    -----
     The fused dX finalize (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on
     unless set to ``0``) adds the K-slice slabs of a sliced ``dX`` GEMM with one
     fixed-order kernel and, with ``compact_rows``, writes the ``[T, H]`` ``dX`` in
@@ -149,13 +151,6 @@ def chunked_lm_head_loss(
     counting and indexing on the host before the first launch; the same
     kernels per row, so every output is bitwise the same.
 
-    Returns
-    -------
-    loss : torch.Tensor
-        FP32 scalar.
-    logp : torch.Tensor
-        Detached FP32 ``[T]``, only with ``return_logp=True``.
-
     Precision boundary: BF16 GEMM output promoted to FP32 for the max /
     log-sum-exp / loss arithmetic, BF16 ``dlogits``, FP32 ``dW`` accumulation
     with one cast at the output, BF16 ``dX`` (FP32 accumulation, one cast).
@@ -172,6 +167,13 @@ def chunked_lm_head_loss(
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables it).  Peak
     temporary memory is reported separately from the weights, the outputs and
     the FP32 accumulators by ``cake_backend.memory_report``.
+
+    Returns
+    -------
+    loss : torch.Tensor
+        FP32 scalar.
+    logp : torch.Tensor
+        Detached FP32 ``[T]``, only with ``return_logp=True``.
     """
     if backend != "cake":
         raise ValueError(

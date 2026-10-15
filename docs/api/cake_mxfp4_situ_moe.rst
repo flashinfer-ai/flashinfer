@@ -114,9 +114,16 @@ the ``RoutingConfig`` fields for the routing forms); module file names are
 content fingerprints.  ``gate`` names the validation each form went through in
 Cake: ``e2e_registry`` (compile, static analysis and GPU correctness on both
 backends in Cake's kernel registry), ``plan_gate`` (selected by the plan on the
-contract rows and validated end to end through the plan), ``plan_variant`` (a
-routing-mode variant of a plan-gated form, reachable through the public API but
-not on a contract row).
+contract rows; the contract routing mode, BF16 ``topk_weights``, is validated end
+to end through the plan and the contract evaluator, the packed-ids and FP32
+route layouts by this package's tests, in the contract's accumulation class
+against the BF16-weights run of the same routing: bit-identical on tokens with
+at most one local contribution, within the BF16 accumulation budget where the
+finalize's ``red.add.bf16x2`` reduces more).  The routing and route-preprocess forms are carried for
+every route layout the operands select (``contract.routing_modes``).  A form's
+``registry_geometry_gates`` name the registry entries that gate the same module
+at a second problem geometry (the odd weight-tile count of the cluster (1, 2)
+dense GEMM2 forms, which the 19-tile H = 3584 rows launch).
 
 .. list-table:: Generated kernel forms (``route.stage``)
    :header-rows: 1
@@ -429,6 +436,74 @@ not on a contract row).
      - gemm2_swapab
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_packed_c1``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c1_single``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c2``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c2_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c3``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c3_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c4``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c4_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c5``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c5_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c6``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c6_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c7``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c7_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c8``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c8_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c8_split_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``routing_separate_bf16_c1``
      - routing
      - cake, cake_cute
@@ -501,11 +576,95 @@ not on a contract row).
      - routing
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_separate_fp32_c1``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c1_single``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c2``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c2_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c3``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c3_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c4``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c4_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c5``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c5_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c6``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c6_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c7``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c7_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8_split_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_packed_noclear``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``route_preprocess_separate_bf16``
      - route_preprocess
      - cake, cake_cute
      - ``plan_gate``
    * - ``route_preprocess_separate_bf16_noclear``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_separate_fp32``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_separate_fp32_noclear``
      - route_preprocess
      - cake, cake_cute
      - ``plan_gate``

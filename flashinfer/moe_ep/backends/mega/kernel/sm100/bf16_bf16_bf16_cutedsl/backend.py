@@ -210,7 +210,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             from ......kernel_src.sm100.cutedsl_megamoe import autotune_bf16_mega_moe
 
-            autotune_bf16_mega_moe(
+            self._autotune_winner = autotune_bf16_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
