@@ -352,6 +352,7 @@ def make_kernel(
     bias,
     prepared: bool = False,
     algo: str | None = None,
+    out: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor] | None:
     """FlashInfer kernel; ``prepared`` uses the opt-in prepared weight layout
     (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed);
@@ -361,7 +362,10 @@ def make_kernel(
     except ImportError as e:
         print(f"# WARNING: flashinfer.gemm import failed: {e!r}", file=sys.stderr)
         return None
-    out = torch.empty(act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device)
+    if out is None:
+        out = torch.empty(
+            act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
+        )
     w_use = prepare_w8a16_fp8_weight(w_fp8) if prepared else w_fp8
     # "<algo>@g<n>": Hopper L2 group size n for this column (FLASHINFER_W8A16_FP8_SM90_GROUP,
     # read per call; the graph capture bakes it in).
@@ -452,10 +456,18 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         impls["cast"] = make_cast_copy(act, w_fp8, scale, bias)
     if "cublas" in args.impls:
         impls["cublas"] = make_cublas(act, w_deq, bias)
+    kernel_out: torch.Tensor | None = None
     for name, prepared, algo in _kernel_variants(args):
         if prepared and torch.cuda.get_device_capability()[0] != 9:
             continue  # prepared weight layout is Hopper-only
-        fn = make_kernel(act, w_fp8, scale, bias, prepared=prepared, algo=algo)
+        # One output buffer shared by all kernel columns (each column's error is computed
+        # right after its own call, before the next one overwrites it): 16 columns of a
+        # 4.5 GB output do not fit in 80 GB.
+        if kernel_out is None:
+            kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
+        fn = make_kernel(
+            act, w_fp8, scale, bias, prepared=prepared, algo=algo, out=kernel_out
+        )
         if fn is None:
             print(
                 "# WARNING: flashinfer.gemm.w8a16_fp8_gemm not available; "
@@ -480,7 +492,12 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     names = list(impls)
     per_round: dict[str, list[float]] = {name: [] for name in names}
     for rnd in range(args.rounds):
-        order = names[rnd % len(names) :] + names[: rnd % len(names)]
+        # Rotate by an even share of the column count per round so every column visits the
+        # front, middle and back of the order (rotating by rnd alone leaves most of a long
+        # column list at fixed positions, and under the power cap position biases a column
+        # by up to 5%).
+        off = (rnd * len(names)) // max(args.rounds, 1)
+        order = names[off:] + names[:off]
         for name in order:
             fn = impls[name]
             tag = f"w8a16[{layer} tp{tp} M={m} N={n} K={k}] {name}"
