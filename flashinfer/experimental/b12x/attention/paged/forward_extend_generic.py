@@ -3890,6 +3890,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill (as in forward_paged).
+        cute.arch.fence_view_async_shared()
         load_tma0(src_idx=page_id, producer_state=producer_state)
         load_tma1(src_idx=page_id, producer_state=producer_state)
         load_tma2(src_idx=page_id, producer_state=producer_state)
@@ -3914,6 +3916,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill (as in forward_paged).
+        cute.arch.fence_view_async_shared()
         load_tma0(src_idx=page_id, producer_state=producer_state)
         load_tma1(src_idx=page_id, producer_state=producer_state)
 

@@ -255,6 +255,9 @@ def _issue_paged_kv_tma_copy_planes_tma(
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
+    # Consumers read a stage with ldmatrix (generic proxy) before releasing it;
+    # order those reads before the TMA refill (async proxy).
+    cute.arch.fence_view_async_shared()
     load_tma0(src_idx=page_id, producer_state=producer_state)
     load_tma1(src_idx=page_id, producer_state=producer_state)
     load_tma2(src_idx=page_id, producer_state=producer_state)
@@ -279,6 +282,8 @@ def _issue_paged_kv_tma_copy_2planes_tma(
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
+    # Generic-proxy stage reads before the TMA refill.
+    cute.arch.fence_view_async_shared()
     load_tma0(src_idx=page_id, producer_state=producer_state)
     load_tma1(src_idx=page_id, producer_state=producer_state)
 
@@ -3785,6 +3790,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
@@ -3810,6 +3817,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
@@ -3833,6 +3842,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
@@ -3854,6 +3865,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
 
