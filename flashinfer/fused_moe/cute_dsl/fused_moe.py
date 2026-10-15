@@ -615,6 +615,7 @@ def _moe_core_impl(
         # could leave allocator events referencing destroyed green streams.
         # Per-expert/global scales are shared because only N is partitioned.
         def _fc1_die(i):
+            """Compute domain i's FC1 shard on its current CUDA stream."""
             shard = localized_weights[i]
             blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 a=x,
@@ -763,6 +764,7 @@ def _moe_core_impl(
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
         def _fc2_die(i):
+            """Compute domain i's output columns using the full intermediate."""
             shard = localized_weights[i]
             blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 a=intermediate,

@@ -4636,6 +4636,7 @@ if __name__ == "__main__":
 def test_localized_streams_are_joined_on_failure(
     monkeypatch, failed_domain, failed_gemm, use_memset_stream
 ):
+    """Join domain and optional memset streams before propagating a GEMM error."""
     from contextlib import nullcontext
     from unittest.mock import Mock, call
 
@@ -4653,11 +4654,13 @@ def test_localized_streams_are_joined_on_failure(
     visited = []
 
     def launch(gemm, **kwargs):
+        """Record each launch and fail at the selected GEMM and domain."""
         visited.append((gemm, kwargs["domain_id"]))
         if gemm == failed_gemm and kwargs["domain_id"] == failed_domain:
             raise error
 
     def execute(streams, fn, *inputs):
+        """Validate domain inputs and emulate an executor that raises before joining."""
         assert list(inputs[0]) == list(range(len(streams)))
         return [fn(*args) for args in zip(*inputs, strict=True)]
 
@@ -4718,6 +4721,7 @@ def test_localized_streams_are_joined_on_failure(
 
 
 def _quantize_nvfp4_weight(w_bf16: torch.Tensor):
+    """Pack expert weights as NVFP4 and convert scales to the MoE MMA layout."""
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
 
@@ -4851,6 +4855,20 @@ def test_localized_moe_matches_full_width(
     )
     # Default tactic first: same per-column math as the full-width control.
     localized = cute_dsl_fused_moe(**placeholders, **localized_kwargs, **common)
+    if hidden_size == 256:
+        # A 256-column FC2 tile must not write past a 128-column shard.
+        partial_n_tactic = (
+            128,
+            ((128, 128, 256), (128, 128, 128), (1, 1), False),
+            ((128, 256, 256), (128, 256, 128), (1, 1), False),
+        )
+        partial_n = cute_dsl_fused_moe(
+            **placeholders, **localized_kwargs, **common, tactic=partial_n_tactic
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            partial_n.float(), full.float(), atol=2e-2, rtol=2e-2
+        )
     with autotune(True):
         cute_dsl_fused_moe(**placeholders, **localized_kwargs, **common)
     tuned = cute_dsl_fused_moe(**placeholders, **localized_kwargs, **common)
