@@ -26,6 +26,7 @@ from .....core.comm.communication import (
     register_communication,
 )
 from ..nvlink_common import (
+    check_round_owner,
     mnnvl_mapping_and_config,
     nvlink_platform_supported,
     remap_mnnvl_memory,
@@ -269,6 +270,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 "metainfo": metainfo,
                 "views": {},
                 "refcount": 0,
+                # Instance whose dispatch awaits its combine on this workspace.
+                "round_owner": None,
                 "cft_ready": cft_capable
                 and self._bind_cft(key, comm, mnnvl_mem, workspace, size),
             }
@@ -438,8 +441,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
 
         if self._state is None:
             raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
-        if self._round is not None:
-            raise RuntimeError("dispatch called twice without an intervening combine")
+        check_round_owner(self, self._state)
         self._check_rank_mask(active_rank_mask)
         params = self.params
         tokens_per_rank = (
@@ -518,6 +520,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             "local_num_tokens": topk_ids.shape[0],
             "combine_offset": int(combine_offset),
         }
+        self._state["round_owner"] = self
         recv = [t.flatten(0, 1) for t in recv]
         return MoEEpDispatchResult(
             hidden_states=recv[0],
@@ -608,6 +611,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self._enable_pdl,
         )
         self._round = None
+        self._state["round_owner"] = None
         return output
 
     def checkpoint_prepare(self) -> None:
@@ -622,7 +626,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         state = self._state
         if state is None:
             raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
-        if self._round is not None:
+        if state["round_owner"] is not None:
             raise RuntimeError("checkpoint_prepare called between dispatch and combine")
 
         def release_cft() -> None:
@@ -688,6 +692,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             return
         import torch
 
+        if state["round_owner"] is self:
+            state["round_owner"] = None
         self._state = None
         self._round = None
         self.workspace = None

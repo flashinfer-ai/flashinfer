@@ -165,3 +165,23 @@ def remap_mnnvl_memory(memory: "MnnvlMemory", comm_backend: "CommBackend") -> bo
     MnnvlMemory.comm = comm_backend
     record.mapped = True
     return True
+
+
+def check_round_owner(instance: Any, state: dict[str, Any]) -> None:
+    """Reject a dispatch while a round on ``state``'s workspace awaits its combine.
+
+    Instances with the same geometry share one workspace, including its receive
+    buffers, routing metadata and round counters, so each rank must finish a
+    round (dispatch, then combine) before any of them starts the next.
+    Interleaving rounds, e.g. two micro-batches overlapping their dispatches,
+    would overwrite data the earlier round still needs.
+    """
+    owner = state["round_owner"]
+    if owner is instance:
+        raise RuntimeError("dispatch called twice without an intervening combine")
+    if owner is not None:
+        raise RuntimeError(
+            f"another {type(instance).__name__} sharing this workspace has a "
+            "dispatch awaiting its combine; instances that share a workspace "
+            "must run their rounds one after another"
+        )

@@ -329,13 +329,17 @@ def fake_cake(monkeypatch):
     monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", staticmethod(lambda: None))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
 
-    def acquire(self, mapping, workspace_size_per_rank):
+    def acquire(self, mapping, workspace_size_per_rank, dispatch_bytes, combine_bytes):
         ops.calls["acquire"] = workspace_size_per_rank
         return {
             "workspace": torch.zeros(
                 self.ep_size, workspace_size_per_rank, dtype=torch.uint8
             ),
             "metainfo": torch.zeros(1, dtype=torch.int64),
+            "workspace_size_per_rank": workspace_size_per_rank,
+            "payload_offset": 0,
+            "combine_offset": workspace_size_per_rank // 2,
+            "round_owner": None,
             "views": {},
             "refcount": 1,
             "key": None,
@@ -417,7 +421,9 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     comm.combine(buffer)
     payload, local_num_tokens, args, kwargs = fake_cake.calls["combine"]
     assert payload.shape == (2, 2, 8) and local_num_tokens == 2
-    # Positional payload_in_workspace follows the combine payload offset.
+    # Positional payload_in_workspace follows the combine payload offset, which
+    # is the region pinned at allocation, not the offset dispatch returned.
+    assert args[-2] == comm._state["combine_offset"] != 0
     assert args[-1] is True
     assert kwargs["use_low_precision"] is True and kwargs["backend"] == "cake"
 
@@ -436,6 +442,54 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     comm.destroy()
     with pytest.raises(RuntimeError, match="destroyed"):
         comm.dispatch(hidden, ids, weights)
+
+
+def test_cake_rejects_dispatch_into_the_combine_region(fake_cake) -> None:
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        CakeAlltoAllConfig,
+        create_communication,
+    )
+
+    comm = create_communication(
+        BootstrapConfig(world_size=2, rank=0), _params(), CakeAlltoAllConfig()
+    )
+    comm._state["combine_offset"] = 64
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 3], [1, 2]])
+    with pytest.raises(ValueError, match="overlap the combine region"):
+        comm.dispatch(hidden, ids, torch.ones(2, 2), max_tokens_per_rank=2)
+    assert "dispatch" not in fake_cake.calls
+    comm.destroy()
+
+
+def test_cake_instances_sharing_a_workspace_cannot_interleave(fake_cake) -> None:
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        CakeAlltoAllConfig,
+        create_communication,
+    )
+
+    first, second = (
+        create_communication(
+            BootstrapConfig(world_size=2, rank=0), _params(), CakeAlltoAllConfig()
+        )
+        for _ in range(2)
+    )
+    second._state = first._state
+    first._state["refcount"] += 1
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 3], [1, 2]])
+    first.dispatch(hidden, ids, torch.ones(2, 2))
+    with pytest.raises(RuntimeError, match="sharing this workspace"):
+        second.dispatch(hidden, ids, torch.ones(2, 2))
+    with pytest.raises(RuntimeError, match="between dispatch and combine"):
+        second.checkpoint_prepare()
+    first.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+    second.dispatch(hidden, ids, torch.ones(2, 2))
+    # Destroying the owner mid-round releases the workspace for the others.
+    second.destroy()
+    first.dispatch(hidden, ids, torch.ones(2, 2))
 
 
 def test_cake_checkpoint_needs_an_idle_live_instance(fake_cake) -> None:
@@ -525,6 +579,7 @@ def fake_one_sided(monkeypatch):
             "metainfo": metainfo,
             "views": {},
             "refcount": 1,
+            "round_owner": None,
             "cft_ready": cft_capable,
         }
 
@@ -633,6 +688,25 @@ def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
     monkeypatch.setattr(mnnvl, "is_mnnvl_fabric_supported", no_fabric_info)
     reason = one_sided._cft_unsupported_reason(0)
     assert reason is not None and "RuntimeError" in reason
+
+
+def test_nvlink_one_sided_instances_sharing_a_workspace_cannot_interleave(
+    fake_one_sided,
+) -> None:
+    first, second = _one_sided(cft=False), _one_sided(cft=False)
+    second._state = first._state
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 3], [1, 2]])
+    first.dispatch(hidden, ids)
+    with pytest.raises(RuntimeError, match="sharing this workspace"):
+        second.dispatch(hidden, ids)
+    with pytest.raises(RuntimeError, match="twice without an intervening combine"):
+        first.dispatch(hidden, ids)
+    first._round = None
+    first._state["round_owner"] = None
+    second.dispatch(hidden, ids)
+    with pytest.raises(RuntimeError, match="sharing this workspace"):
+        first.dispatch(hidden, ids)
 
 
 def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(

@@ -21,6 +21,7 @@ from .....core.comm.communication import (
     register_communication,
 )
 from ..nvlink_common import (
+    check_round_owner,
     mnnvl_mapping_and_config,
     nvlink_platform_supported,
     remap_mnnvl_memory,
@@ -39,6 +40,12 @@ logger = logging.getLogger(__name__)
 
 _CAKE_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _BACKEND = "cake"
+# Alignment the Cake ops give the workspace regions.
+_ALIGNMENT = 128
+
+
+def _align(nbytes: int) -> int:
+    return (nbytes + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
 
 
 @register_communication("cake")
@@ -99,7 +106,10 @@ class CakeAlltoAll(MoEEpCommunication):
         if mnnvl_config is not None:
             MnnvlMemory.set_comm_from_config(mapping, mnnvl_config)  # type: ignore[attr-defined]
         self._state: Optional[dict[str, Any]] = self._acquire_workspace(
-            mapping, workspace_size_per_rank
+            mapping,
+            workspace_size_per_rank,
+            dispatch_bytes_per_token,
+            combine_bytes_per_token,
         )
         self.workspace = self._state["workspace"]
         self.metainfo = self._state["metainfo"]
@@ -122,18 +132,26 @@ class CakeAlltoAll(MoEEpCommunication):
         return True
 
     def _acquire_workspace(
-        self, mapping: "Mapping", workspace_size_per_rank: int
+        self,
+        mapping: "Mapping",
+        workspace_size_per_rank: int,
+        dispatch_bytes_per_token: int,
+        combine_bytes_per_token: int,
     ) -> dict[str, Any]:
         import torch
 
         from ......comm.mnnvl import MnnvlMemory
-        from ......comm.trtllm_moe_alltoall import moe_a2a_initialize
+        from ......comm.trtllm_moe_alltoall import (
+            get_moe_alltoall_module,
+            moe_a2a_initialize,
+        )
 
         key = (
             self.ep_rank,
             self.ep_size,
             self.params.max_tokens_per_rank,
             workspace_size_per_rank,
+            combine_bytes_per_token,
             self.config.eplb_stats_num_experts,
         )
         state = self._WORKSPACES.get(key)
@@ -151,11 +169,46 @@ class CakeAlltoAll(MoEEpCommunication):
             # No peer may publish into this workspace until every rank has
             # cleared its own slice.
             MnnvlMemory.allocated_map[mnnvl_mem.ptr].comm.barrier()
+            names, values = get_moe_alltoall_module(
+                _BACKEND
+            ).moe_a2a_get_metainfo_index_pairs()
+            payload_index = dict(zip(names, values, strict=True))[
+                "MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX"
+            ]
+            payload_offset = int(metainfo[payload_index])
+            # The ops place the combine payload right after the current round's
+            # dispatch payloads, so it moves with the token count and payload
+            # sizes, and a fast rank's next dispatch could overwrite combine
+            # data a peer is still reading. Pin it to the end of the workspace,
+            # past the largest dispatch the instance can issue.
+            combine_bytes = _align(
+                self.ep_size * self.params.max_tokens_per_rank * combine_bytes_per_token
+            )
+            combine_offset = (
+                (workspace_size_per_rank - combine_bytes) // _ALIGNMENT * _ALIGNMENT
+            )
+            max_dispatch_end = (
+                payload_offset
+                + self.ep_size
+                * self.params.max_tokens_per_rank
+                * dispatch_bytes_per_token
+            )
+            if max_dispatch_end > combine_offset:
+                raise RuntimeError(
+                    f"Cake workspace of {workspace_size_per_rank} bytes cannot "
+                    f"hold {max_dispatch_end - payload_offset} dispatch bytes "
+                    f"before the {combine_bytes}-byte combine region"
+                )
             state = {
                 "key": key,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "workspace_size_per_rank": workspace_size_per_rank,
+                "payload_offset": payload_offset,
+                "combine_offset": combine_offset,
+                # Instance whose dispatch awaits its combine on this workspace.
+                "round_owner": None,
                 # Receive views of the shared workspace, reused across rounds.
                 "views": {},
                 "refcount": 0,
@@ -198,8 +251,7 @@ class CakeAlltoAll(MoEEpCommunication):
         )
 
         state = self._live_state()
-        if self._round is not None:
-            raise RuntimeError("dispatch called twice without an intervening combine")
+        check_round_owner(self, state)
         tokens_per_rank = (
             self.params.max_tokens_per_rank
             if max_tokens_per_rank is None
@@ -229,6 +281,15 @@ class CakeAlltoAll(MoEEpCommunication):
         payloads.append(topk_ids)
         if topk_weights is not None:
             payloads.append(topk_weights)
+        dispatch_end = state["payload_offset"] + self.ep_size * tokens_per_rank * sum(
+            p.shape[1] * p.element_size() for p in payloads
+        )
+        if dispatch_end > state["combine_offset"]:
+            raise ValueError(
+                f"dispatch payloads of {dispatch_end - state['payload_offset']} "
+                "bytes overlap the combine region; size the instance for them "
+                "(MoEEpCommParams.dispatch_format, extra_payload_bytes_per_token)"
+            )
 
         recv, combine_offset, eplb_gathered_stats = moe_a2a_dispatch(
             topk_ids,
@@ -259,9 +320,10 @@ class CakeAlltoAll(MoEEpCommunication):
         self._round = {
             "local_num_tokens": topk_ids.shape[0],
             "tokens_per_rank": tokens_per_rank,
-            "combine_offset": combine_offset,
+            "combine_offset": state["combine_offset"],
             "combine_buffer": None,
         }
+        state["round_owner"] = self
         recv = [t.flatten(0, 1) for t in recv]
         return MoEEpDispatchResult(
             hidden_states=recv[0],
@@ -288,6 +350,11 @@ class CakeAlltoAll(MoEEpCommunication):
         rows = self.ep_size * round_state["tokens_per_rank"]
         start = round_state["combine_offset"]
         end = start + rows * self.params.hidden_size * dtype.itemsize
+        if end > self._state["workspace_size_per_rank"]:
+            raise ValueError(
+                f"a {dtype} combine input of {end - start} bytes exceeds the "
+                "combine region"
+            )
         buffer = moe_a2a_wrap_payload_tensor_in_workspace(
             self.workspace[self.ep_rank, :], [rows], start, end, dtype
         )
@@ -344,6 +411,7 @@ class CakeAlltoAll(MoEEpCommunication):
             backend=_BACKEND,
         )
         self._round = None
+        self._state["round_owner"] = None
         return combined
 
     def checkpoint_prepare(self) -> None:
@@ -356,7 +424,7 @@ class CakeAlltoAll(MoEEpCommunication):
         workspace may call it again, which does nothing.
         """
         state = self._live_state()
-        if self._round is not None:
+        if state["round_owner"] is not None:
             raise RuntimeError("checkpoint_prepare called between dispatch and combine")
         unmap_mnnvl_memory(state["mnnvl_mem"])
 
@@ -403,6 +471,8 @@ class CakeAlltoAll(MoEEpCommunication):
             return
         import torch
 
+        if state["round_owner"] is self:
+            state["round_owner"] = None
         self._state = None
         self._round = None
         self.workspace = None

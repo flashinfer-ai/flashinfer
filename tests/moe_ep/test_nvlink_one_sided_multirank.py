@@ -1,5 +1,6 @@
 """NVLink one-sided dispatch/combine: model-shaped round trips, round sequences
-with changing token counts and rank skew, and the workspace layout.
+with changing token counts and rank skew, and the workspace layout. A subset of
+the cases also runs on the Cake backend, which implements the same protocol.
 
 Each multi-rank case spawns one process per EP rank from this pytest process,
 so a single ``pytest`` run covers every EP size the machine has GPUs for:
@@ -122,8 +123,9 @@ class Case:
     """A workload sharing one communicator across ``rounds``, with no host
     synchronization between rounds.
 
-    ``mode`` maps to ``NVLinkOneSidedConfig.cft``: auto (None), fence (False)
-    or cft (True). ``payload_in_workspace`` writes the expert output into the
+    ``backend`` names the moe_ep communication backend. ``mode`` maps to
+    ``NVLinkOneSidedConfig.cft``: auto (None), fence (False) or cft (True);
+    Cake has no CFT transport and only runs ``auto``. ``payload_in_workspace`` writes the expert output into the
     combine input region before combine. ``fp8_combine`` sends combine payloads
     as FP8. ``graph`` captures the whole round sequence in one CUDA graph and
     replays it.
@@ -137,6 +139,7 @@ class Case:
     graph: bool = False
     pdl: bool = True
     eplb: bool = False
+    backend: Literal["nvlink_one_sided", "cake"] = "nvlink_one_sided"
 
     @property
     def ep_size(self) -> int:
@@ -284,19 +287,16 @@ def _cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 class _RecordingModule:
     """Forwards to the kernel module and records each launch's CFT flag."""
 
-    def __init__(self, module, launches: list, combine_offsets: list) -> None:
+    def __init__(self, module, launches: list) -> None:
         self._module = module
         self._launches = launches
-        self._combine_offsets = combine_offsets
 
     def __getattr__(self, name):
         return getattr(self._module, name)
 
     def moe_a2a_dispatch(self, *args):
         self._launches.append(("dispatch", bool(args[10])))
-        result = self._module.moe_a2a_dispatch(*args)
-        self._combine_offsets.append(int(result[1]))
-        return result
+        return self._module.moe_a2a_dispatch(*args)
 
     def moe_a2a_combine(self, *args):
         self._launches.append(("combine", bool(args[11])))
@@ -309,17 +309,19 @@ def _run_case(case: Case, rank: int) -> dict:
     from flashinfer.fused_moe.api import QuantFormat
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        CakeAlltoAll,
+        CakeAlltoAllConfig,
         MoEEpCommParams,
+        NVLinkOneSidedAlltoAll,
         NVLinkOneSidedConfig,
         create_communication,
     )
-    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
-        communication as one_sided,
-    )
 
     model = case.model
-    if not one_sided.NVLinkOneSidedAlltoAll.is_platform_supported():
-        local = "NVLink one-sided is not supported on this GPU"
+    one_sided = case.backend == "nvlink_one_sided"
+    backend_cls = NVLinkOneSidedAlltoAll if one_sided else CakeAlltoAll
+    if not backend_cls.is_platform_supported():
+        local = f"{case.backend} is not supported on this GPU"
     else:
         local = None
     reasons = [None] * case.ep_size
@@ -338,22 +340,31 @@ def _run_case(case: Case, rank: int) -> dict:
         if dispatch_format is None
         else getattr(QuantFormat, dispatch_format),
     )
-    config = NVLinkOneSidedConfig(
-        cft={"auto": None, "fence": False, "cft": True}[case.mode],
+    options = dict(
         use_low_precision_combine=case.fp8_combine,
         eplb_stats_num_experts=model.num_experts // 2 if case.eplb else 0,
         enable_pdl=case.pdl,
-        timeout_sec=30,
     )
+    if one_sided:
+        config = NVLinkOneSidedConfig(
+            cft={"auto": None, "fence": False, "cft": True}[case.mode],
+            timeout_sec=30,
+            **options,
+        )
+    else:
+        assert case.mode == "auto", "Cake has no CFT transport to select"
+        config = CakeAlltoAllConfig(**options)
     comm = create_communication(
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        if case.mode == "cft" and not comm.cft_enabled:
+        cft_enabled = one_sided and comm.cft_enabled
+        if case.mode == "cft" and not cft_enabled:
             return {"skip": "CFT counted writes are unavailable on this platform"}
         launches: list = []
         combine_offsets: list = []
-        comm._module = _RecordingModule(comm._module, launches, combine_offsets)
+        if one_sided:
+            comm._module = _RecordingModule(comm._module, launches)
         inputs = [_make_inputs(case, rank, i) for i in range(len(case.rounds))]
         stats = None
         if case.eplb:
@@ -376,6 +387,7 @@ def _run_case(case: Case, rank: int) -> dict:
                     max_tokens_per_rank=maximum,
                     eplb_local_stats=stats,
                 )
+                combine_offsets.append(comm._round["combine_offset"])
                 eplb = recv.eplb_gathered_stats.clone() if case.eplb else None
                 if rank == spec.delay_rank:
                     torch.cuda._sleep(200_000)
@@ -434,7 +446,7 @@ def _run_case(case: Case, rank: int) -> dict:
                 for o in outputs
             ],
             "launches": launches,
-            "cft_enabled": comm.cft_enabled,
+            "cft_enabled": cft_enabled,
         }
         dist.barrier()
         return result
@@ -609,7 +621,8 @@ def _assert_results(case: Case, results: list[dict]) -> None:
                 torch.testing.assert_close(
                     result["outputs"][i]["eplb"], expected, rtol=0, atol=0
                 )
-        assert result["launches"] == expected_launches
+        if case.backend == "nvlink_one_sided":
+            assert result["launches"] == expected_launches
 
 
 # ----------------------------------------------------------------------------
@@ -699,6 +712,58 @@ CASES = [
         ),
         id="eplb-statistics",
     ),
+]
+
+
+CASES += [
+    # Cake: the round sequence (the combine region must not move with the token
+    # count), both combine wire formats with workspace input, EPLB and models.
+    *[
+        pytest.param(
+            Case(
+                model=MODELS["deepseek_v3"],
+                rounds=_ROUND_SEQUENCE,
+                payload_in_workspace=True,
+                graph=graph,
+                backend="cake",
+            ),
+            id=f"cake-round-sequence-ep4-{'graph' if graph else 'eager'}",
+        )
+        for graph in (False, True)
+    ],
+    *[
+        pytest.param(
+            Case(
+                model=MODELS["deepseek_v3"],
+                rounds=(Round((9, 5), Routing.SPREAD, -1),),
+                payload_in_workspace=True,
+                fp8_combine=fp8_combine,
+                backend="cake",
+            ),
+            id=f"cake-combine-{'fp8' if fp8_combine else 'bf16'}-workspace",
+        )
+        for fp8_combine in (False, True)
+    ],
+    pytest.param(
+        Case(
+            model=MODELS["deepseek_v3"],
+            rounds=(Round((9, 0, 3, 1), Routing.SPREAD, -1),),
+            eplb=True,
+            backend="cake",
+        ),
+        id="cake-eplb-statistics",
+    ),
+    *[
+        pytest.param(
+            Case(
+                model=MODELS[name],
+                rounds=(Round((128,) * 8, Routing.SPREAD, -1),),
+                backend="cake",
+            ),
+            id=f"cake-model-{name}-ep8-tokens128",
+        )
+        for name in ("deepseek_r1_nvfp4", "kimi_k3", "qwen3_5_397b_a17b")
+    ],
 ]
 
 
