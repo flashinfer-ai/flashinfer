@@ -868,6 +868,56 @@ Results: `h6s_*`, `h6s2_*` (short-burst sweeps, superseded), `h6L_*` (24 rows, l
 `h6o_*` (variants on the offender rows), `h6n_*` (locked vs free-running ncu), `h6f16_*` (the
 fp16 probe), `h6t_*` (the tightest recipe), `h7o_*` (opcode counts), `h7p_*` (the slope probe), under `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
+### Version H7: small M, step 2a, the hand kernel's split-K routed by wave count (Thu 15 Oct 2026)
+
+Small-M goal: every one of the 24 rows at M in {1, 16, 32, 64, 128, 256, 512, 1024, 2048,
+4096} at or under the cast-copy path, and within 1.02 of bare cuBLAS where possible.
+Protocol for every number here: 300 launches, 30 warm-up, 5 rotated rounds, two full passes,
+mean of the per-pass medians; ipp2-0073.  Pass-to-pass agreement of the ratios: median
+0.3%, p90 1.8%.
+
+**Baseline (f8eb255ed, `smallM_all_*`).**  Our kernel was already at or under cast-copy on all
+240 cells (cast-copy is 3.8-8.2x cuBLAS at M <= 256, 1.3-1.5x at 4096).  Against bare
+cuBLAS only 29 of 240 cells were within 1.02.  The hand kernel was the fastest of {auto,
+hand, CUTLASS 128x128, CUTLASS 64x256} on 137 of 240 cells and beat auto by more than 5% on
+133, but the dispatcher sent only the three und.kv N <= 512 rows to it.  The reason: at
+small M the 128x256 grid is a fraction of a wave (mlp.down tp1 at M = 1 is 40 tiles on 132
+SMs) and the CUTLASS tiles leave most SMs idle, while the hand kernel's cost model splits K
+across up to 8 blocks per tile and reduces in fp32 (mlp.down tp1 M = 1: 64x256 229 us,
+hand 82 us, cuBLAS 104 us).  On the three und.kv rows the hand kernel already runs, the
+best CUTLASS tile is 81-141% slower at M <= 512, so CUTLASS cannot retire it as the menu
+stands.
+
+**Rule** (`W8A16Sm90PickAlgo`, M <= 4096; waves = 128x256 tiles / SMs): hand if the grid is
+at most one wave at M <= 512, except short K (<= 3200) at M = 129-256 where there are too
+few K slabs to split and 64x256 wins; or if it is 1.4-1.6 waves (mlp.gate_up), where the
+split evens the half-empty second wave.  Between 1 and 1.4 waves CUTLASS keeps the row
+(gen.qkv tp1 M = 512: hand 1.28x).  On the baseline data: 9 cells more than 2% behind the
+better of auto / hand, worst 1.07 (gen.qkv tp8 M = 2048).
+
+**Result** (`s2a_*`): 108 of 240 cells within 1.02 of cuBLAS (was 29), 240 of 240 at or under
+cast-copy.  Geomean auto / cuBLAS per M:
+
+| M | before | after |
+|---|---|---|
+| 1 | 2.076 | 1.056 |
+| 16 | 2.061 | 1.040 |
+| 32 | 2.012 | 1.019 |
+| 64 | 1.967 | 1.004 |
+| 128 | 1.808 | 0.984 |
+| 256 | 1.498 | 1.077 |
+| 512 | 1.326 | 1.198 |
+| 1024 | 1.144 | 1.138 |
+| 2048 | 1.086 | 1.081 |
+| 4096 | 1.025 | 1.029 |
+
+Three cells measured more than 3% slower than before (gen.qkv tp1 M = 256 and 4096, und.q
+tp2 M = 4096), all on rows whose pick did not change (128x256 before and after; 128x256
+pinned in the same rounds 0.99-1.02): measurement slot.  M = 88320 is untouched by the rule
+and re-measured at the H6 numbers.  Worst cell after: und.kv tp8 M = 1 at 1.73x cuBLAS, on
+the hand kernel; the 30 worst cells are all narrow N (N <= 1280) at M <= 512, where both
+kernels are 1.2-1.7x cuBLAS: next step.  Per-cell table: `hopper-mail/step2a_routing.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16

@@ -687,6 +687,23 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   const long long units = 1LL * ((N + 127) / 128) * ((M + 255) / 256);
   const double waves = static_cast<double>(units) / std::max(num_sms, 1);
   const double frac = waves - std::floor(waves);
+  // Version H7 (small M): the hand kernel's split-K (its own cost model splits K across
+  // up to 8 blocks per tile plus an fp32 reduce) is what fills the machine when the
+  // 128x256 tile grid is at most one wave; the CUTLASS tiles leave most SMs idle there
+  // (mlp.down tp1 M=1: 64x256 229 us, hand 82 us, cuBLAS 104 us).  At M = 129-256 with short
+  // K (<= 3200, attn.out tp4/tp8, mlp.down tp8) there are too few K slabs to split and the
+  // 64x256 ping-pong tile wins instead (hand 1.20-1.26x of it).  At 1.4-1.6 waves
+  // (mlp.gate_up tp1-tp8 at M <= 2048) the hand model's split evens the last wave where
+  // the CUTLASS tiles run two waves with a half-empty tail (hand 0.40-0.97 of auto).
+  // Between 1 and 1.4 waves CUTLASS keeps the rows (gen.qkv tp1 M=512: hand 1.28x).
+  // Fitted to the 240-cell small-M sweep of Thu 15 Oct 2026 (24 rows x M = 1..4096,
+  // 5 rotated rounds x 2 passes): 9 cells more than 2% behind the better of the two
+  // kernels, worst 7% (gen.qkv tp8 M=2048).
+  if (M <= 4096) {
+    const bool one_wave = M <= 512 && waves <= 1.0 && !(K <= 3200 && M > 128 && M <= 256);
+    const bool split_tail = waves >= 1.4 && waves <= 1.6;
+    if (one_wave || split_tail) return W8A16Sm90Algo::kHand;
+  }
   if (N <= 512) {
     if (units <= 32 && M <= 4096) return W8A16Sm90Algo::kHand;
     if (waves < 0.75) return W8A16Sm90Algo::kCutlass128x128;
