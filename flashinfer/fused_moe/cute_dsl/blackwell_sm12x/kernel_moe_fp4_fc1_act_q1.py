@@ -57,6 +57,7 @@ def make_cfg(
     activation=ActivationType.Swiglu,
     fastmath=False,
     enable_pdl=False,
+    swiglu_limit=None,
     situ_beta=SITU_BETA,
     situ_linear_beta=SITU_LINEAR_BETA,
 ):
@@ -94,7 +95,11 @@ def make_cfg(
         union_smem=not swap,
         reg_prod=REG_PROD_BY_TACTIC[tactic],
         activation=moe_activation.make_gated_activation(
-            activation, fastmath, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta
+            activation,
+            fastmath,
+            swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
         ),
         enable_pdl=enable_pdl,
     )
