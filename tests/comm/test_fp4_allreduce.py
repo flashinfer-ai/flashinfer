@@ -774,7 +774,11 @@ def _check_rmsnorm_workspace(workspace, device):
     )
     assert all(int(pointer) != 0 for pointer in workspace.table.tolist())
     assert workspace.variant(NORM_ROWS[-1]) == 0
-    assert workspace.variant(NORM_ROWS[-1], "nvfp4") == 1
+    # 4096 rows stay on the grouped program (27 / 26 / 19 rows per CTA on 148 / 152 / 212 SMs);
+    # 8192 rows run the probe-all program (55 / 53 / 38 rows per CTA > 28)
+    assert workspace.variant(NORM_ROWS[-1], "nvfp4") == 0
+    assert workspace.variant(NORM_PROBE_ROWS, "nvfp4") == 1
+    assert workspace.variant(NORM_PROBE_ROWS, "mxfp8") == 1
     assert workspace.variant(NORM_ROWS[0], "mxfp8") == 0
     assert RMSNORM_EPS == 1e-6
 
