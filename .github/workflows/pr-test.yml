@@ -725,12 +725,19 @@ jobs:
             exit 0
           fi
 
+          SKIP_ALL_EXIT=0
           REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
             $SHARD_ARGS \
             --junit-dir junit-h100 \
-            --github-actions 2>&1) || true
+            --github-actions 2>&1) || SKIP_ALL_EXIT=$?
+          echo "$REPORT"
+
+          if [ "$SKIP_ALL_EXIT" -ne 0 ]; then
+            echo "::error::check_skip_all.py failed with exit code $SKIP_ALL_EXIT"
+            exit "$SKIP_ALL_EXIT"
+          fi
           echo "$REPORT"
 
           if echo "$REPORT" | grep -q "skip-all"; then
@@ -787,8 +794,15 @@ jobs:
         id: trace-coverage
         if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
         run: |
+          TRACE_EXIT=0
           REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
-            --github-actions 2>&1) || true
+            --github-actions 2>&1) || TRACE_EXIT=$?
+          echo "$REPORT"
+
+          if [ "$TRACE_EXIT" -ne 0 ]; then
+            echo "::error::check_trace_coverage.py failed with exit code $TRACE_EXIT"
+            exit "$TRACE_EXIT"
+          fi
           echo "$REPORT"
           {
             echo ""
