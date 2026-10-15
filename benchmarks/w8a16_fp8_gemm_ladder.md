@@ -456,9 +456,18 @@ Peek-and-sleep waits (`__nanosleep` between non-blocking tries, macros
   TMA-producer part is reverted; the MMA-warp part is kept behind its macro for one bounded
   retry.  The remaining ~1.4 G of polls are therefore in the MMA warp and the TMA warps,
   the two that wait between every k-step.
-What it could be worth, by the Hopper agent's energy-slope probe (+24% instructions ->
--1.1% clock at equal cycles): removing all 1.5 G poll instructions is ~1.5% of clock,
-enough for mlp.down tp2 and mlp.gate_up tp2 (1.022-1.026), not for attn.out tp8 (1.042).
+- MMA warp's two per-k-step waits alone, 100 ns, bounded retry on umb-b200-263: builds and
+  passes the exact-value test (the deadlock was the TMA-producer part), steady state vs the
+  0 baseline on the same node: mlp.gate_up tp2 1.041 / 1.041, mlp.down tp2 1.031 / 1.028,
+  und.q tp2 0.973 / 0.967, attn.out tp8 1.030 / 1.039.  Nothing.
+What it could have been worth, by the Hopper agent's energy-slope probe (+24% instructions
+-> -1.1% clock at equal cycles): all 1.5 G poll instructions are ~1.5% of clock, enough for
+the two tp2 rows, not for attn.out tp8.  Measured, none of the three sleeping waits bought
+any of it, so the polls that remain are not where the energy goes, or the sleep costs what
+it saves.  The experimental wait code is reverted; the finding stands as a note.  Blackwell
+closes at 21 of 24 rows at or under 1.02 x cuBLAS at M=88320 (mlp.gate_up tp2 and mlp.down
+tp2 at 1.02-1.03, attn.out tp8 at 1.03-1.04), the Hopper line at 23 of 24 (attn.out tp8 at
+1.03-1.04).  Both residues sit at the energy / per-tile floor of converting on the fly.
 
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
