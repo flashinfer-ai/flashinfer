@@ -14,6 +14,7 @@
 """NVFP4 token-packed FC1 activation and Q1 entry."""
 
 import functools
+import math
 import os
 
 import cutlass
@@ -90,6 +91,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActQ1Op:
         activation: ActivationType,
         epi=None,
         enable_pdl=False,
+        swiglu_limit=None,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     ):
@@ -104,6 +106,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActQ1Op:
         self.n, self.k = n, k
         self.tile, self.out_dtype = tuple(tile), out_dtype
         self.activation, self.enable_pdl = activation, enable_pdl
+        self.swiglu_limit = swiglu_limit
         self.situ_beta, self.situ_linear_beta = (situ_beta, situ_linear_beta)
         if epi is None:
             self.ab_stage, self.epi = resolve_stage_store(self.tile)
@@ -116,6 +119,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActQ1Op:
             epi=self.epi,
             activation=activation,
             enable_pdl=enable_pdl,
+            swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
         )
@@ -215,6 +219,7 @@ def _op(
     activation,
     epi=None,
     enable_pdl=False,
+    swiglu_limit=None,
     situ_beta=SITU_BETA,
     situ_linear_beta=SITU_LINEAR_BETA,
 ):
@@ -226,6 +231,7 @@ def _op(
         activation=activation,
         epi=epi,
         enable_pdl=enable_pdl,
+        swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
@@ -240,6 +246,7 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.activation,
         op.out_dtype,
         op.enable_pdl,
+        op.swiglu_limit,
         op.situ_beta,
         op.situ_linear_beta,
         grid_x,
@@ -310,6 +317,17 @@ def _validate_inputs(
         raise ValueError(f"b_scale shape must be {want_b_scale}")
 
 
+def _normalize_swiglu_limit(activation: ActivationType, swiglu_limit):
+    if swiglu_limit is None:
+        return None
+    if activation is not ActivationType.Swiglu:
+        raise ValueError("swiglu_limit is valid only for SwiGLU")
+    swiglu_limit = float(swiglu_limit)
+    if not math.isfinite(swiglu_limit) or swiglu_limit <= 0:
+        raise ValueError("swiglu_limit must be finite and positive")
+    return swiglu_limit
+
+
 def cute_dsl_sm12x_fc1_act_q1_nvfp4(
     a_q,
     a_scale,
@@ -326,6 +344,7 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
     enable_pdl: bool = False,
     *,
     activation: ActivationType = ActivationType.Swiglu,
+    swiglu_limit: float | None = None,
     situ_beta: float = SITU_BETA,
     situ_linear_beta: float = SITU_LINEAR_BETA,
     out_q: torch.Tensor | None = None,
@@ -341,6 +360,7 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         gate_scale,
         global_scale,
     )
+    swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
     n, k = int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
     assert not enable_pdl or (out_q is not None and out_sf is not None), (
         "PDL requires caller-owned out_q and out_sf"
@@ -369,6 +389,7 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
                             out_dtype,
                             activation,
                             enable_pdl,
+                            swiglu_limit,
                             situ_beta,
                             situ_linear_beta,
                         )
@@ -396,6 +417,7 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         activation,
         epi,
         enable_pdl,
+        swiglu_limit,
         situ_beta,
         situ_linear_beta,
     )
@@ -450,12 +472,14 @@ class _Fc1ActQ1Runner(TunableRunner):
         out_dtype,
         activation,
         enable_pdl=False,
+        swiglu_limit=None,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     ):
         self.out_dtype = out_dtype
         self._out = None
         self.activation, self.enable_pdl = activation, enable_pdl
+        self.swiglu_limit = swiglu_limit
         self.situ_beta, self.situ_linear_beta = (situ_beta, situ_linear_beta)
 
     def __hash__(self) -> int:
@@ -529,6 +553,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             self.activation,
             epi,
             self.enable_pdl,
+            self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
         )
@@ -559,6 +584,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             str(self.out_dtype),
             self.activation,
             self.enable_pdl,
+            self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
             torch.cuda.get_device_capability(),
