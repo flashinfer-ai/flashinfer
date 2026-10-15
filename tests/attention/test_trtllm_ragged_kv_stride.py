@@ -54,6 +54,7 @@ def _run_trtllm_ragged(
     kv_lens_cpu: torch.Tensor | None = None,
     skip_all_rows_active_check: bool | None = None,
     backend: str = "trtllm-gen",
+    is_causal: bool = False,
 ):
     head_dim_qk = q.shape[2]
     row_activity_kwargs = (
@@ -83,7 +84,7 @@ def _run_trtllm_ragged(
         cum_seq_lens_q=q_indptr,
         cum_seq_lens_kv=kv_indptr,
         enable_pdl=False,
-        is_causal=False,
+        is_causal=is_causal,
         return_lse=return_lse,
         out=out,
         lse=lse,
@@ -232,6 +233,70 @@ def test_trtllm_ragged_kv_positive_stride_wrap_matches_cutlass():
     assert torch.isfinite(output).all()
     assert torch.isfinite(lse).all()
     torch.testing.assert_close(output, output_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("layout", ["heads_major", "padded_heads"])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.cuda
+def test_trtllm_ragged_strided_query_matches_packed(layout, is_causal):
+    """A strided query must match the packed query bit for bit."""
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(0)
+
+    num_heads = 16
+    head_dim_qk = 192
+    head_dim_vo = 128
+    q_lens = torch.tensor([17, 64, 33], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor([17, 80, 40], device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+    total_q = int(q_indptr[-1].item())
+    total_kv = int(kv_indptr[-1].item())
+
+    q = torch.randn(
+        total_q, num_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        total_kv, num_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn(
+        total_kv, num_heads, head_dim_vo, device=device, dtype=torch.bfloat16
+    )
+    if layout == "heads_major":
+        q_strided = q.transpose(0, 1).contiguous().transpose(0, 1)
+    else:
+        q_strided = torch.empty(
+            total_q, num_heads + 4, head_dim_qk, device=device, dtype=torch.bfloat16
+        )[:, :num_heads]
+        q_strided.copy_(q)
+    assert torch.equal(q_strided, q) and not q_strided.is_contiguous()
+
+    out_ref, lse_ref = _run_trtllm_ragged(
+        q, k, v, q_indptr, kv_indptr, kv_lens, is_causal=is_causal
+    )
+    out, lse = _run_trtllm_ragged(
+        q_strided, k, v, q_indptr, kv_indptr, kv_lens, is_causal=is_causal
+    )
+
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    torch.testing.assert_close(lse, lse_ref, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_rejects_noncontiguous_query_head_dim():
+    """A non-contiguous query head dimension must raise."""
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+
+    q_lens = torch.tensor([8], device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    q = torch.randn(8, 192, 16, device=device, dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.randn(8, 16, 192, device=device, dtype=torch.bfloat16)
+    v = torch.randn(8, 16, 128, device=device, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="query head dimension must be contiguous"):
+        _run_trtllm_ragged(q, k, v, q_indptr, q_indptr, q_lens)
 
 
 def _empty_kv_case(device: torch.device):
