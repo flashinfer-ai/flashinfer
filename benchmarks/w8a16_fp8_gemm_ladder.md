@@ -801,9 +801,72 @@ clock dropping in fp16 (1.583 -> 1.507 GHz, ours 1.551 -> 1.544 GHz).  So a chea
 converter would not, on this evidence, be worth the full 3%; the fp16 run bounds the gain at
 "our clock stops being the lowest", which here means about 1-2%.  Not pursued.
 
+**The tightest recipe on the three rows** (ipp2-0073, no thermal events, SM clock
+1320-1425 MHz; `--iters 500 --warmup 50 --rounds 5`, attn.out tp8 `--iters 1500 --warmup
+100`, cuBLAS + auto, three independent repeats, `h6t_*`):
+
+| row | rep 1 | rep 2 | rep 3 | cuBLAS us | ours us |
+|---|---|---|---|---|---|
+| mlp.down tp4 | 1.020 | 1.019 | 1.019 | 8224 / 8236 / 8236 | 8390 / 8392 / 8393 |
+| attn.out tp1 | 1.019 | 1.019 | 1.019 | 10488 / 10488 / 10490 | 10685 / 10685 / 10685 |
+| attn.out tp8 | 1.041 | 1.026 | 1.039 | 1410 / 1430 / 1412 | 1467 / 1467 / 1467 |
+
+Our kernel's time repeats to 0.1% on all three rows.  At this length mlp.down tp4 and
+attn.out tp1 sit at the 1.02 bar (1.019-1.020, spread 0.001), so their 1.025-1.031 in the
+200-launch table above was the spread of that recipe.  attn.out tp8 (a 1.4 ms kernel)
+stays at 1.026-1.041; there the spread is cuBLAS's own (1410-1430 us).  So, measured as
+tightly as this bench allows: 23 of 24 rows at or under 1.02, attn.out tp8 at about 1.035.
+
+**Where the extra instructions go** (ncu source page, instructions executed per SASS line
+summed by opcode, mlp.down tp4 M = 88320, `h7o_*`):
+
+| opcode | ours (M warp instr.) | share | cuBLAS (M) | share |
+|---|---|---|---|---|
+| total | 1659 | | 963 | |
+| PRMT | 265 | 16.0% | | |
+| LOP3 | 202 | 12.2% | 11 | 1.1% |
+| LDS | 177 | 10.6% | 9 | 0.9% |
+| HMUL2 | 177 | 10.6% | | |
+| IMAD | 174 | 10.5% | | |
+| WARPGROUP | 88 | 5.3% | 57 | 5.9% |
+| UIADD3 | 79 | 4.7% | 463 | 48.1% |
+| HGMMA | 44 | 2.7% | 177 | 18.3% |
+| SYNCS | 35 | 2.1% | 29 | 3.1% |
+| BRA | 35 | 2.1% | 32 | 3.3% |
+
+(cuBLAS issues 4x the HGMMA instructions because its atom is 64x64x16 where ours is
+64x256x16; same flops.)  Barrier polling (SYNCS + BRA) is 4% of our instructions and 6%
+of cuBLAS's, so the sleeping-poll fix that helped on Blackwell has nothing to work on here.
+The extra ~700 M instructions are the conversion path.  In the SASS of the 128x256 k-loop
+that is 14 instructions per 4 weights, not the 6 of the C++ converter: 4 LDS.U16 + 2 PRMT
+(CUTLASS's mixed-input smem-to-register copy delivers the 8-bit fragment as 16-bit loads
+and packs them), then 2 PRMT (sign replicate), 2 shifts, 2 LOP3 masks, 2 HMUL2.  A byte
+permute cannot place the e4m3 exponent into the bf16 exponent field (that needs a 4-bit
+shift), so the reachable cut in the converter itself is about 2 of those 14.
+
+**What fewer instructions would buy: the slope, measured.**  The converter's 8 ALU ops were
+issued a second time on a dummy value, kept alive by an XOR into the result under a mask
+that is zero at run time (a `__device__` variable, so ptxas cannot fold it; numerics
+unchanged; build-flag-only, not shipped).  That adds about 24% instructions and shows what
+an instruction costs under the power cap.  ncu free-running clock plus the 500-launch
+recipe (2 repeats):
+
+| row | instructions (ours / cuBLAS) | SM clock (ours / cuBLAS) | cycles (ours / cuBLAS) | auto / cuBLAS | our time |
+|---|---|---|---|---|---|
+| mlp.down tp4, as shipped | 1632 M (1.73x) | 0.971 | 0.996 | 1.044 / 1.012 | 8330 / 8337 us |
+| mlp.down tp4, + probe | 2019 M (2.14x) | 0.960 | 0.995 | 1.050 / 1.035 | 8426 / 8499 us (+1.6%) |
+| attn.out tp1, as shipped | 2072 M (1.73x) | 0.975 | 0.996 | 1.019 / 1.019 | 10682 / 10681 us |
+| attn.out tp1, + probe | 2567 M (2.14x) | 0.964 | 0.998 | 1.031 / 1.031 | 10815 / 10815 us (+1.2%) |
+
++24% instructions costs about 1.1% of SM clock and 1.2-1.6% of time, at unchanged cycle
+counts.  Linearised, removing all ~700 M extra instructions (ours at 1.0x cuBLAS) would
+buy about 3%; the reachable 2-of-14 cut about 0.3%.  So no converter change reaches the
+remaining row: it would need each converted weight tile reused across more MMAs than
+wgmma's N = 256 allows.
+
 Results: `h6s_*`, `h6s2_*` (short-burst sweeps, superseded), `h6L_*` (24 rows, long recipe),
 `h6o_*` (variants on the offender rows), `h6n_*` (locked vs free-running ncu), `h6f16_*` (the
-fp16 probe), under `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
+fp16 probe), `h6t_*` (the tightest recipe), `h7o_*` (opcode counts), `h7p_*` (the slope probe), under `/home/scratch.ishovkun_gpu/w8a16-results/hopper/`.
 
 ## Why not the Hopper design
 
