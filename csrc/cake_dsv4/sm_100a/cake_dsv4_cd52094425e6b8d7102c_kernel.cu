@@ -90,7 +90,7 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int ragged_query, int max_q_len, int batch_size, int has_sinks, int num_query_tokens)
+kernel_cake_dsv4_cd52094425e6b8d7102c(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int ragged_query, int max_q_len, int batch_size, int has_sinks, int num_query_tokens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -163,96 +163,57 @@ kernel_cake_dsv4_f98ac384c6e4f7fb86e4(const __grid_constant__ CUtensorMap tmap_q
     // Mbarriers at smem_raw[0..416)
 
     if (warp == 0) {
-        uint32_t leader = elect_sync();
-        if (leader) {
-            // --- pipeline 'q_pipe' ---
-            // q_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 0, 1);
-            // q_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 8, 1);
-            // --- pipeline 'kv_pipe' ---
-            // kv_full: 8 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
-            mbarrier_init(smem + 32, 1);
-            mbarrier_init(smem + 40, 1);
-            mbarrier_init(smem + 48, 1);
-            mbarrier_init(smem + 56, 1);
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
-            // kv_empty: 8 barriers, init_count=1
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
-            // --- pipeline 'page_pipe' ---
-            // page_full: 6 barriers, init_count=32
-            mbarrier_init(smem + 144, 32);
-            mbarrier_init(smem + 152, 32);
-            mbarrier_init(smem + 160, 32);
-            mbarrier_init(smem + 168, 32);
-            mbarrier_init(smem + 176, 32);
-            mbarrier_init(smem + 184, 32);
-            // page_empty: 6 barriers, init_count=256
-            mbarrier_init(smem + 192, 256);
-            mbarrier_init(smem + 200, 256);
-            mbarrier_init(smem + 208, 256);
-            mbarrier_init(smem + 216, 256);
-            mbarrier_init(smem + 224, 256);
-            mbarrier_init(smem + 232, 256);
-            // --- pipeline 'score_pipe' ---
-            // score_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 240, 1);
-            mbarrier_init(smem + 248, 1);
-            // score_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 256, 128);
-            mbarrier_init(smem + 264, 128);
-            // --- pipeline 'stats_pipe' ---
-            // stats_full: 2 barriers, init_count=128
-            mbarrier_init(smem + 272, 128);
-            mbarrier_init(smem + 280, 128);
-            // stats_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 288, 128);
-            mbarrier_init(smem + 296, 128);
-            // --- pipeline 'p_pipe' ---
-            // p_full: 2 barriers, init_count=128
-            mbarrier_init(smem + 304, 128);
-            mbarrier_init(smem + 312, 128);
-            // p_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 320, 1);
-            mbarrier_init(smem + 328, 1);
-            // --- pipeline 'o_pipe' ---
-            // o_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 336, 1);
-            // o_empty: 1 barriers, init_count=128
-            mbarrier_init(smem + 344, 128);
-            // --- pipeline 'work_pipe' ---
-            // work_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 352, 1);
-            mbarrier_init(smem + 360, 1);
-            // work_empty: 2 barriers, init_count=640
-            mbarrier_init(smem + 368, 640);
-            mbarrier_init(smem + 376, 640);
-            // --- pipeline 'throttle_pipe' ---
-            // throttle_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 384, 256);
-            mbarrier_init(smem + 392, 256);
-            // throttle_empty: 2 barriers, init_count=32
-            mbarrier_init(smem + 400, 32);
-            mbarrier_init(smem + 408, 32);
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        // --- pipeline 'q_pipe' ---
+        // q_full: 1 barriers, init_count=1
+        // q_empty: 1 barriers, init_count=1
+        // --- pipeline 'kv_pipe' ---
+        // kv_full: 8 barriers, init_count=1
+        // kv_empty: 8 barriers, init_count=1
+        // --- pipeline 'page_pipe' ---
+        // page_full: 6 barriers, init_count=32
+        // page_empty: 6 barriers, init_count=256
+        // --- pipeline 'score_pipe' ---
+        // score_full: 2 barriers, init_count=1
+        // score_empty: 2 barriers, init_count=128
+        // --- pipeline 'stats_pipe' ---
+        // stats_full: 2 barriers, init_count=128
+        // stats_empty: 2 barriers, init_count=128
+        // --- pipeline 'p_pipe' ---
+        // p_full: 2 barriers, init_count=128
+        // p_empty: 2 barriers, init_count=1
+        // --- pipeline 'o_pipe' ---
+        // o_full: 1 barriers, init_count=1
+        // o_empty: 1 barriers, init_count=128
+        // --- pipeline 'work_pipe' ---
+        // work_full: 2 barriers, init_count=1
+        // work_empty: 2 barriers, init_count=640
+        // --- pipeline 'throttle_pipe' ---
+        // throttle_full: 2 barriers, init_count=256
+        // throttle_empty: 2 barriers, init_count=32
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 1;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(30), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(24), "r"((uint32_t)(32)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(18), "r"((uint32_t)(1)));
+        mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
+        uint32_t _mbarrier_init_count_0_32 = 32;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(18), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(16), "r"((uint32_t)(640)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(14), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(12), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(11), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(8), "r"((uint32_t)(128)));
+        if (lane < 20) {
+            mbarrier_init(smem + 256 + lane * 8, _mbarrier_init_count_0_32);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 416);
-    if (warp == 0) {
+    if (warp == 8) {
         int _tmem_hold = smem + 416;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
