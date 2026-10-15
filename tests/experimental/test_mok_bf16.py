@@ -582,7 +582,7 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
         ((10, 3), 152, "mxfp8", 8, (44, 36)),  # GB300, EP8 across two nodes
         ((10, 3), 152, "mxfp8", 4, None),  # GB300 EP4: no unconditional gain
         ((10, 3), 152, "bf16", 8, None),
-        ((10, 3), 160, "mxfp8", 8, None),  # a GB300 SKU with another SM count keeps the factory split
+        ((10, 3), 160, "mxfp8", 8, None),  # other GB300 SM count: factory split
         ((10, 0), 148, "mxfp8", 8, None),  # B200: the imbalance switch instead
         ((10, 0), 152, "mxfp8", 8, None),  # GB200
         ((10, 7), 160, "mxfp8", 8, None),
