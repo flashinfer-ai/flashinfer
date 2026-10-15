@@ -26,14 +26,20 @@ extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r0_ca
 extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r1_cap16384(uint8_t* xq, float* gs, __nv_bfloat16* residual_in, __nv_bfloat16* weight, __nv_bfloat16* out, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
 extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, float* gs_out, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
 extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r1_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, float* gs_out, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
+extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r0_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, float* gs_out, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
+extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r1_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, float* gs_out, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
 extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r0_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
 extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r1_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
+extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r0_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
+extern "C" __global__ void kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r1_cap16384(__nv_bfloat16* x, __nv_bfloat16* residual_in, __nv_bfloat16* weight, uint8_t* out_q, uint8_t* out_sf, __nv_bfloat16* residual_out, unsigned int* ctrl, int rows, const unsigned long long* workspace);
 
 namespace {
 
 constexpr int kWorldSize = 2;
 constexpr int kInputFormats = 2;   // 0 = bfloat16 activations, 1 = NVFP4 records
 constexpr int kOutputFormats = 3;  // 0 = bfloat16 y, 1 = NVFP4 values + E4M3 scales, 2 = MXFP8 values + UE8M0 scales
+constexpr int kVariants = 2;  // receive-poll forms: 0 = the pair's delivered form, 1 = probe-all (quantised outputs)
+constexpr int64_t kProbeMinRowsPerCta = 28;  // variant 1 when each CTA owns more rows than this
 constexpr int64_t kHidden = 6144;
 constexpr int64_t kRecordBytes = 3456;  // NVFP4 input record: 3072 E2M1 value bytes + 384 E4M3 scale bytes
 constexpr int64_t kCapacity = 16384;  // rows the delivered programs are specialised for
@@ -51,16 +57,30 @@ constexpr int64_t kMxfp8ScalesPerRow = 192;
 constexpr unsigned kThreads[kInputFormats] = {256, 256};
 constexpr unsigned kDynamicSmemBytes[kInputFormats] = {219776, 215424};
 
-// [input format][output format][rank]; nullptr marks a pair the family does not deliver (quantised output is
-// specified for bfloat16 input only).
-const void* const kKernels[kInputFormats][kOutputFormats][kWorldSize] = {
-    {{reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r1_cap16384)},
-     {reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r1_cap16384)},
-     {reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r1_cap16384)}},
-    {{reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r1_cap16384)},
-     {nullptr, nullptr},
-     {nullptr, nullptr}}
+// [input format][output format][receive-poll variant][rank]; nullptr marks a pair the family does not deliver
+// (quantised output is specified for bfloat16 input only) and variant 1 of the bfloat16 output (one program).
+const void* const kKernels[kInputFormats][kOutputFormats][kVariants][kWorldSize] = {
+    {{{reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_bf16_fused_r1_cap16384)},
+      {nullptr, nullptr}},
+     {{reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r1_cap16384)},
+      {reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r1_cap16384)}},
+     {{reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_r1_cap16384)},
+      {reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r1_cap16384)}}},
+    {{{reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r0_cap16384), reinterpret_cast<const void*>(kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r1_cap16384)},
+      {nullptr, nullptr}},
+     {{nullptr, nullptr},
+      {nullptr, nullptr}},
+     {{nullptr, nullptr},
+      {nullptr, nullptr}}}
 };
+
+// Receive-poll variant of one call from the rows each CTA owns: the quantised outputs run the probe-all program when
+// a CTA owns more than kProbeMinRowsPerCta rows (the 8K tier and above on 148 / 152 / 212 SMs), the grouped program
+// otherwise; the bfloat16 output has one program.  Every rank evaluates this rule on the same grid.
+int receive_poll_variant(int64_t rows, int64_t grid, int64_t output_format) {
+  if (output_format == 0) return 0;
+  return rows / grid > kProbeMinRowsPerCta ? 1 : 0;
+}
 
 // Opt a kernel into its dynamic shared memory size once per process.
 void enable_dynamic_smem(const void* kernel, unsigned bytes) {
@@ -101,8 +121,7 @@ void fp4_allreduce_rmsnorm(TensorView input, Optional<TensorView> scales, Tensor
       << "output_format must be 0 (bfloat16), 1 (nvfp4) or 2 (mxfp8), got " << output_format;
   TVM_FFI_CHECK(grid > 0 && grid <= kMaxGrid, ValueError)
       << "grid must be in (0, " << kMaxGrid << "], got " << grid;
-  const void* kernel = kKernels[input_format][output_format][rank];
-  TVM_FFI_CHECK(kernel != nullptr, ValueError)
+  TVM_FFI_CHECK(kKernels[input_format][output_format][0][rank] != nullptr, ValueError)
       << "the fused-norm programs deliver quantised (nvfp4 / mxfp8) output for bfloat16 input only";
   CHECK_INPUT(input);
   CHECK_DIM(2, input);
@@ -197,6 +216,10 @@ void fp4_allreduce_rmsnorm(TensorView input, Optional<TensorView> scales, Tensor
 
   const DLDevice device = input.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
+  const int variant = receive_poll_variant(rows, grid, output_format);
+  const void* kernel = kKernels[input_format][output_format][variant][rank];
+  TVM_FFI_CHECK(kernel != nullptr, RuntimeError)
+      << "no fused-norm program for receive-poll variant " << variant << " of output_format " << output_format;
   enable_dynamic_smem(kernel, kDynamicSmemBytes[input_format]);
 
   void* p_input = input.data_ptr();

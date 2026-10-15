@@ -16,12 +16,13 @@ limitations under the License.
 
 # JIT loader of the NVFP4-transport tensor-parallel all-reduce programs
 # (``csrc/fp4_allreduce``).  The programs are generated: one kernel per
-# (family, world size, input format[, output format], phase-B variant, rank)
-# at a fixed row capacity, listed in ``PROGRAMS`` next to the hand-written
-# binding of each (family, world size).  Two families: ``allreduce`` (the
-# bfloat16 all-reduce, world sizes 2 and 4) and ``rmsnorm`` (world size 2, the
-# all-reduce fused with the residual add and the Gemma RMSNorm; bfloat16,
-# NVFP4 or MXFP8 output; eps and the weight bias are compiled in).  Every
+# (family, world size, input format[, output format], variant, rank) at a
+# fixed row capacity, listed in ``PROGRAMS`` next to the hand-written binding
+# of each (family, world size).  Two families: ``allreduce`` (the bfloat16
+# all-reduce, world sizes 2 and 4; TP4 in three phase-B variants) and
+# ``rmsnorm`` (world size 2, the all-reduce fused with the residual add and the
+# Gemma RMSNorm; bfloat16, NVFP4 or MXFP8 output; the quantised outputs in two
+# receive-poll variants; eps and the weight bias are compiled in).  Every
 # program is compiled for the device it runs on (sm_100a / sm_103a / sm_107a)
 # with the exact flag set below and without fast math.
 
@@ -301,8 +302,8 @@ PROGRAMS: dict = {
         ],
         "eps": 1e-06,
         "weight_bias": 1.0,
-        "variants": 1,
-        "variant_rule": None,
+        "variants": 2,
+        "variant_rule": {"probe_min_rows_per_cta": 28, "outputs": ["nvfp4", "mxfp8"]},
         "ctrl_words": 4,
         "table_entries": 2,
         "row_multiple": 4,
@@ -346,6 +347,22 @@ PROGRAMS: dict = {
                 "variant": 0,
             },
             {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r0_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r0_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "mxfp8",
+                "rank": 0,
+                "variant": 1,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r1_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_mxfp8_fused_pa_r1_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "mxfp8",
+                "rank": 1,
+                "variant": 1,
+            },
+            {
                 "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384",
                 "source": "fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_r0_cap16384_device.cu",
                 "input_format": "bf16",
@@ -360,6 +377,22 @@ PROGRAMS: dict = {
                 "output_format": "nvfp4",
                 "rank": 1,
                 "variant": 0,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r0_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r0_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "nvfp4",
+                "rank": 0,
+                "variant": 1,
+            },
+            {
+                "symbol": "kernel_fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r1_cap16384",
+                "source": "fp4_allreduce_tp2_lnorm_bf16_nvfp4_fused_pa_r1_cap16384_device.cu",
+                "input_format": "bf16",
+                "output_format": "nvfp4",
+                "rank": 1,
+                "variant": 1,
             },
             {
                 "symbol": "kernel_fp4_allreduce_tp2_lnorm_nvfp4_bf16_fused_r0_cap16384",
@@ -483,19 +516,31 @@ def target_arch(device_index: int) -> Fp4AllReduceArch:
 
 
 def phase_b_variant(
-    rows: int, grid: int, world_size: int, family: str = "allreduce"
+    rows: int,
+    grid: int,
+    world_size: int,
+    family: str = "allreduce",
+    output_format: str = "bf16",
 ) -> int:
-    """The phase-B variant the binding selects for ``rows`` on ``grid`` CTAs.
+    """The program variant the binding selects for ``rows`` on ``grid`` CTAs.
 
-    The two-shot (world size 4) kernels come in three variants chosen from the
-    rows each CTA owns; the one-shot kernels (world size 2, both families) have
-    a single program.  Every rank evaluates this rule on the same grid, so every
-    rank runs the same variant.
+    The two-shot (world size 4) all-reduce kernels come in three phase-B
+    variants chosen from the rows each CTA owns; the one-shot all-reduce
+    (world size 2) has a single program.  The fused-norm family runs its
+    probe-all receive-poll program (variant 1) for the NVFP4 / MXFP8 outputs
+    when a CTA owns more than ``probe_min_rows_per_cta`` rows and the grouped
+    program (variant 0) otherwise; its bfloat16 output has one program.  Every
+    rank evaluates this rule on the same grid, so every rank runs the same
+    variant.
     """
     rule = program_table(world_size, family)["variant_rule"]
     if rule is None:
         return 0
     per_cta = int(rows) // int(grid)
+    if family == "rmsnorm":
+        if output_format not in rule["outputs"]:
+            return 0
+        return 1 if per_cta > int(rule["probe_min_rows_per_cta"]) else 0
     if per_cta > int(rule["by_quad_min"]):
         return 2
     if per_cta > int(rule["team_max"]):

@@ -115,8 +115,11 @@ def test_program_table_lists_every_generated_program(world_size: int) -> None:
 
 def test_rmsnorm_program_table_lists_every_generated_program() -> None:
     table = loader.program_table(2, "rmsnorm")
-    assert table["family"] == "rmsnorm" and table["variants"] == 1
-    assert table["variant_rule"] is None
+    assert table["family"] == "rmsnorm" and table["variants"] == 2
+    assert table["variant_rule"] == {
+        "probe_min_rows_per_cta": 28,
+        "outputs": ["nvfp4", "mxfp8"],
+    }
     formats = {tuple(pair) for pair in table["formats"]}
     assert formats == {
         ("bf16", "bf16"),
@@ -125,7 +128,8 @@ def test_rmsnorm_program_table_lists_every_generated_program() -> None:
         ("bf16", "mxfp8"),
     }
     kernels = table["kernels"]
-    assert len(kernels) == 2 * len(formats)
+    # one program per (pair, rank) plus the probe-all variant of the two quantised outputs
+    assert len(kernels) == 2 * len(formats) + 2 * 2
     symbols = [kernel["symbol"] for kernel in kernels]
     assert len(set(symbols)) == len(symbols)
     assert {(k["input_format"], k["output_format"]) for k in kernels} == formats
@@ -134,16 +138,25 @@ def test_rmsnorm_program_table_lists_every_generated_program() -> None:
     assert table["binding"] != loader.program_table(2)["binding"]
     for kernel in kernels:
         assert kernel["symbol"].endswith(f"_r{kernel['rank']}_cap{loader.CAPACITY}")
-        assert kernel["variant"] == 0 and 0 <= kernel["rank"] < 2
+        assert kernel["variant"] in (0, 1) and 0 <= kernel["rank"] < 2
+        assert ("_pa_" in kernel["symbol"]) == (kernel["variant"] == 1)
+        if kernel["variant"] == 1:
+            assert kernel["output_format"] in ("nvfp4", "mxfp8")
         source = (source_dir / kernel["source"]).read_text()
         assert f"{kernel['symbol']}(" in source
         assert f'extern "C" __global__ void {kernel["symbol"]}(' in binding
     assert set(symbols) == set(loader.kernel_names(2, "rmsnorm"))
     assert set(loader.kernel_names(family="rmsnorm")) == set(symbols)
     assert loader.kernel_name(2, "bf16", 1, 0, "rmsnorm", "mxfp8") in symbols
+    assert loader.kernel_name(2, "bf16", 1, 1, "rmsnorm", "mxfp8") in symbols
+    assert loader.kernel_name(2, "bf16", 0, 1, "rmsnorm", "nvfp4") in symbols
     assert loader.kernel_name(2, "nvfp4", 0, 0, "rmsnorm") in symbols
     with pytest.raises(KeyError):
         loader.kernel_name(2, "nvfp4", 0, 0, "rmsnorm", "mxfp8")
+    with pytest.raises(KeyError):
+        loader.kernel_name(2, "bf16", 0, 1, "rmsnorm", "bf16")
+    with pytest.raises(KeyError):
+        loader.kernel_name(2, "nvfp4", 0, 1, "rmsnorm", "bf16")
     with pytest.raises(ValueError):
         loader.program_table(4, "rmsnorm")
     with pytest.raises(ValueError):
@@ -197,6 +210,33 @@ def test_rmsnorm_program_table_lists_every_generated_program() -> None:
 def test_phase_b_variant_rule(rows: int, grid: int, expected: int) -> None:
     assert loader.phase_b_variant(rows, grid, 4) == expected
     assert loader.phase_b_variant(rows, grid, 2) == 0
+    assert loader.phase_b_variant(rows, grid, 2, "rmsnorm") == 0
+
+
+@pytest.mark.parametrize(
+    "rows, grid, expected",
+    [
+        (64, 148, 0),
+        (1024, 148, 0),
+        (2048, 148, 0),
+        (4096, 148, 0),
+        (28 * 148, 148, 0),
+        (29 * 148, 148, 1),
+        (4096, 152, 0),
+        (8192, 152, 1),
+        (2048, 212, 0),
+        (4096, 212, 0),
+        (8192, 212, 1),
+        (8192, 148, 1),
+        (16384, 148, 1),
+    ],
+)
+def test_rmsnorm_receive_poll_variant_rule(rows: int, grid: int, expected: int) -> None:
+    for output_format in ("nvfp4", "mxfp8"):
+        assert (
+            loader.phase_b_variant(rows, grid, 2, "rmsnorm", output_format) == expected
+        )
+    assert loader.phase_b_variant(rows, grid, 2, "rmsnorm", "bf16") == 0
     assert loader.phase_b_variant(rows, grid, 2, "rmsnorm") == 0
 
 

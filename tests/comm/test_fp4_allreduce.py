@@ -30,6 +30,7 @@ from tests.comm import fp4_allreduce_reference as codec
 
 ROWS = {2: (64, 1000, 1001, 4096), 4: (64, 1000, 4096)}
 NORM_ROWS = (64, 1000, 1004, 4096)  # the fused-norm family needs a multiple of 4 rows
+NORM_PROBE_ROWS = 8192  # the smallest measured tier that runs the probe-all receive-poll program (variant 1)
 SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 PROCESS_JOIN_TIMEOUT_S = 2400.0  # the first run compiles up to 24 generated programs
 NORM_PROCESS_JOIN_TIMEOUT_S = (
@@ -461,7 +462,7 @@ def _rmsnorm_quantised_outputs(workspace, rank, device, group):
         Fp4AllReduceFusedNormOutput.NVFP4,
         Fp4AllReduceFusedNormOutput.MXFP8,
     ):
-        for rows in (NORM_ROWS[1], NORM_ROWS[3]):
+        for rows in (NORM_ROWS[1], NORM_ROWS[3], NORM_PROBE_ROWS):
             seed = NORM_SEED + 1000 * len(output.value) + rows
             x, residual, weight = _norm_inputs(rows, rank, seed, device)
             ref = codec.reference_fused_rmsnorm(_gather(x, group), residual, weight)
@@ -487,6 +488,13 @@ def _rmsnorm_quantised_outputs(workspace, rank, device, group):
                 value_dtype, value_bytes = torch.float8_e4m3fn, HIDDEN
             result = fp4_allreduce_rmsnorm(x, residual, spec, workspace)
             torch.cuda.synchronize(device)
+            # receive-poll variant 1 (probe-all program, symbol ``_pa_``) above 28 rows per CTA: 1000 and 4096 rows
+            # run the grouped program, 8192 rows the probe-all program on 148 / 152 / 212 SMs
+            variant = workspace.variant(rows, output.value)
+            assert variant == (1 if rows // workspace.grid > 28 else 0)
+            kernel = workspace.kernel_name("bf16", rows, output.value)
+            assert kernel.startswith("kernel_fp4_allreduce_tp2_lnorm_bf16_")
+            assert ("_pa_" in kernel) == (variant == 1)
             assert result.output == output and result.out is None
             assert result.values.dtype == value_dtype
             assert tuple(result.values.shape) == (rows, value_bytes)
@@ -766,6 +774,8 @@ def _check_rmsnorm_workspace(workspace, device):
     )
     assert all(int(pointer) != 0 for pointer in workspace.table.tolist())
     assert workspace.variant(NORM_ROWS[-1]) == 0
+    assert workspace.variant(NORM_ROWS[-1], "nvfp4") == 1
+    assert workspace.variant(NORM_ROWS[0], "mxfp8") == 0
     assert RMSNORM_EPS == 1e-6
 
 

@@ -358,9 +358,11 @@ class Fp4AllReduceWorkspace:
     def __exit__(self, *exc_info) -> None:
         self.destroy()
 
-    def variant(self, rows: int) -> int:
-        """The phase-B variant a call with ``rows`` rows runs on this workspace's grid."""
-        return phase_b_variant(int(rows), self.grid, self.world_size, self.family)
+    def variant(self, rows: int, output_format: str = "bf16") -> int:
+        """The program variant a call with ``rows`` rows (and, for the fused-norm family, ``output_format``) runs on this workspace's grid."""
+        return phase_b_variant(
+            int(rows), self.grid, self.world_size, self.family, output_format
+        )
 
     def kernel_name(
         self, input_format: str, rows: int, output_format: str = "bf16"
@@ -370,7 +372,7 @@ class Fp4AllReduceWorkspace:
             self.world_size,
             input_format,
             self.rank,
-            self.variant(rows),
+            self.variant(rows, output_format),
             self.family,
             output_format,
         )

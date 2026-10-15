@@ -481,7 +481,9 @@ def main() -> None:
                 "output": args.output if args.family == "rmsnorm" else "bf16",
                 "launch_with_pdl": launch_with_pdl,
                 "kernel": case.kernel,
-                "variant": workspace.variant(rows),
+                "variant": workspace.variant(
+                    rows, args.output if args.family == "rmsnorm" else "bf16"
+                ),
                 "reference_arm": case.reference_arm,
                 "legs": [],
             }
