@@ -5,7 +5,14 @@ from .api_logging import flashinfer_experimental_api
 
 @flashinfer_experimental_api
 def get_paged_mqa_logits_metadata(
-    context_lens, page_kv, num_sms, indices=None, *, num_heads=None, out=None
+    context_lens,
+    page_kv,
+    num_sms,
+    indices=None,
+    *,
+    num_heads=None,
+    max_context_hint=None,
+    out=None,
 ):
     """DeepGEMM's ``get_paged_mqa_logits_metadata`` on SM120a: a real launch.
 
@@ -17,7 +24,12 @@ def get_paged_mqa_logits_metadata(
     exported head counts (32, 64) select different schedules -- ``next_n`` 5
     and 6 above the small-batch class -- in which case the ``ValueError`` says
     so; for ``next_n`` 1-4 and for every small batch it may be omitted, exactly
-    like DeepGEMM's signature. Submits the single-warp scheduler and returns
+    like DeepGEMM's signature. ``max_context_hint`` (keyword-only) is an upper
+    bound of the batch's context lengths in KV tokens known on the host; from
+    16384 up it selects the native-atom schedules at batches 2..8 (``num_heads``
+    is then required for ``next_n`` 5/6 there too), ``None`` keeps the
+    batch-only selection, and the logits call this schedule serves must receive
+    the same value. Submits the single-warp scheduler and returns
     (or fills ``out`` with) the int32 ``[num_sms + 1, 2]`` schedule the exported
     logits programs read: per-CTA ``(q_atom_idx, kv_split_idx)`` walk
     boundaries over 128-row KV segments. Not interchangeable with DeepGEMM's
@@ -29,7 +41,13 @@ def get_paged_mqa_logits_metadata(
     )
 
     return _get_paged_mqa_logits_metadata(
-        context_lens, page_kv, num_sms, indices=indices, num_heads=num_heads, out=out
+        context_lens,
+        page_kv,
+        num_sms,
+        indices=indices,
+        num_heads=num_heads,
+        max_context_hint=max_context_hint,
+        out=out,
     )
 
 
@@ -46,6 +64,7 @@ def fp8_paged_mqa_logits(
     indices=None,
     *,
     page_kv=None,
+    max_context_hint=None,
 ):
     """Paged FP8 MQA lightning-indexer logits with DeepGEMM's signature (SM120a).
 
@@ -65,7 +84,11 @@ def fp8_paged_mqa_logits(
     buffer with DeepGEMM's ``clean_logits=False`` semantics (positions at or
     past a token's own context length are unspecified); ``clean_logits=True``
     and a non-``None`` ``indices`` are rejected. The Q-atom schedule (the
-    generated program behind the route) is selected from ``(H, next_n, B)``;
+    generated program behind the route) is selected from ``(H, next_n, B)`` and
+    the optional ``max_context_hint`` (an upper bound of the batch's context
+    lengths; from 16384 up batches 2..8 take the native-atom programs; it must
+    equal the hint ``schedule_meta`` was built with, and ``max_context_len``
+    never selects the program);
     ``route_available(H, page_kv, next_n[, B])`` in
     ``flashinfer.experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa``
     reports the shipped routes; no fallback is selected for an unsupported
@@ -86,6 +109,7 @@ def fp8_paged_mqa_logits(
         clean_logits=clean_logits,
         indices=indices,
         page_kv=page_kv,
+        max_context_hint=max_context_hint,
     )
 
 
@@ -102,6 +126,7 @@ def prepare_sm120_paged_mqa_logits(
     schedule_meta=None,
     output=None,
     sm_count=None,
+    max_context_hint=None,
 ):
     """Prepare repeated paged MQA logits on caller-provided operands (SM120a).
 
@@ -110,7 +135,8 @@ def prepare_sm120_paged_mqa_logits(
     without allocating (CUDA Graph replay with changed tensor contents is
     supported) and returns ``plan.logical_output``, the ``[B * next_n,
     max_context_len]`` view. ``schedule_meta`` is rebuilt by every run;
-    ``sm_count`` overrides the CTA budget.
+    ``sm_count`` overrides the CTA budget; ``max_context_hint`` selects the
+    Q-atom program as in :func:`fp8_paged_mqa_logits`.
     """
     from .experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa import (
         Sm120PagedIndexerPlan,
@@ -127,4 +153,5 @@ def prepare_sm120_paged_mqa_logits(
         schedule_meta=schedule_meta,
         output=output,
         sm_count=sm_count,
+        max_context_hint=max_context_hint,
     )
