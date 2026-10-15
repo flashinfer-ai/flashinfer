@@ -823,7 +823,10 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_all_negative(
 # Tests for append_paged_kv_cache_with_slot_mapping (FP16/BF16)
 # ============================================================
 
-def _scatter_reference(k_cache, v_cache, k_append, v_append, slot_mapping, page_size, kv_layout):
+
+def _scatter_reference(
+    k_cache, v_cache, k_append, v_append, slot_mapping, page_size, kv_layout
+):
     """PyTorch scatter reference for bit-exact comparison."""
     nnz = slot_mapping.shape[0]
     max_num_pages = k_cache.shape[0]
@@ -834,8 +837,16 @@ def _scatter_reference(k_cache, v_cache, k_append, v_append, slot_mapping, page_
     # Make a flat view of k_cache/v_cache
     if kv_layout == "HND":
         # shape: [max_num_pages, num_heads, page_size, head_dim]
-        flat_k = k_cache.permute(0, 2, 1, 3).reshape(capacity, num_kv_heads, head_dim).clone()
-        flat_v = v_cache.permute(0, 2, 1, 3).reshape(capacity, num_kv_heads, head_dim).clone()
+        flat_k = (
+            k_cache.permute(0, 2, 1, 3)
+            .reshape(capacity, num_kv_heads, head_dim)
+            .clone()
+        )
+        flat_v = (
+            v_cache.permute(0, 2, 1, 3)
+            .reshape(capacity, num_kv_heads, head_dim)
+            .clone()
+        )
     else:
         # shape: [max_num_pages, page_size, num_heads, head_dim]
         flat_k = k_cache.reshape(capacity, num_kv_heads, head_dim).clone()
@@ -849,8 +860,16 @@ def _scatter_reference(k_cache, v_cache, k_append, v_append, slot_mapping, page_
         flat_v[slot] = v_append[i]
 
     if kv_layout == "HND":
-        out_k = flat_k.reshape(max_num_pages, page_size, num_kv_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-        out_v = flat_v.reshape(max_num_pages, page_size, num_kv_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+        out_k = (
+            flat_k.reshape(max_num_pages, page_size, num_kv_heads, head_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        out_v = (
+            flat_v.reshape(max_num_pages, page_size, num_kv_heads, head_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
     else:
         out_k = flat_k.reshape(max_num_pages, page_size, num_kv_heads, head_dim)
         out_v = flat_v.reshape(max_num_pages, page_size, num_kv_heads, head_dim)
@@ -900,9 +919,13 @@ def test_append_paged_kv_cache_with_slot_mapping_bitexact(
     )
 
     ref_k, ref_v = _scatter_reference(
-        torch.zeros_like(k_cache), torch.zeros_like(v_cache),
-        k_append[:nnz_kv], v_append[:nnz_kv],
-        slot_mapping, page_size, kv_layout,
+        torch.zeros_like(k_cache),
+        torch.zeros_like(v_cache),
+        k_append[:nnz_kv],
+        v_append[:nnz_kv],
+        slot_mapping,
+        page_size,
+        kv_layout,
     )
 
     assert torch.equal(k_cache, ref_k), "K cache mismatch"
@@ -919,9 +942,7 @@ def test_append_paged_kv_cache_with_slot_mapping_page_size_one(kv_layout):
     max_num_pages = 8
     dtype = torch.float16
 
-    k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype
-    )
+    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
     v_append = torch.randn_like(k_append)
 
     if kv_layout == "NHD":
@@ -942,9 +963,13 @@ def test_append_paged_kv_cache_with_slot_mapping_page_size_one(kv_layout):
     )
 
     ref_k, ref_v = _scatter_reference(
-        torch.zeros_like(k_cache), torch.zeros_like(v_cache),
-        k_append, v_append,
-        slot_mapping, page_size, kv_layout,
+        torch.zeros_like(k_cache),
+        torch.zeros_like(v_cache),
+        k_append,
+        v_append,
+        slot_mapping,
+        page_size,
+        kv_layout,
     )
 
     assert torch.equal(k_cache, ref_k), "K cache mismatch"
@@ -961,9 +986,7 @@ def test_append_paged_kv_cache_with_slot_mapping_out_of_range(kv_layout, slot_dt
     max_num_pages = 2
     dtype = torch.float16
 
-    k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype
-    )
+    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
     v_append = torch.randn_like(k_append)
 
     if kv_layout == "NHD":
@@ -1004,9 +1027,7 @@ def test_append_paged_kv_cache_with_slot_mapping_all_negative(kv_layout, slot_dt
     max_num_pages = 4
     dtype = torch.float16
 
-    k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype
-    )
+    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
     v_append = torch.randn_like(k_append)
 
     if kv_layout == "NHD":
@@ -1043,14 +1064,18 @@ def test_append_paged_kv_cache_with_slot_mapping_stacked_cache():
     dtype = torch.float16
     kv_layout = "HND"
 
-    k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype
-    )
+    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
     v_append = torch.randn_like(k_append)
 
     # Stacked cache: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
     stacked_cache = torch.zeros(
-        max_num_pages, 2, num_kv_heads, page_size, head_dim, dtype=dtype, device="cuda:0"
+        max_num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=dtype,
+        device="cuda:0",
     )
 
     slot_mapping = torch.randperm(
@@ -1070,9 +1095,13 @@ def test_append_paged_kv_cache_with_slot_mapping_stacked_cache():
     v_cache = stacked_cache[:, 1]
 
     ref_k, ref_v = _scatter_reference(
-        torch.zeros_like(k_cache), torch.zeros_like(v_cache),
-        k_append, v_append,
-        slot_mapping, page_size, kv_layout,
+        torch.zeros_like(k_cache),
+        torch.zeros_like(v_cache),
+        k_append,
+        v_append,
+        slot_mapping,
+        page_size,
+        kv_layout,
     )
 
     assert torch.equal(k_cache, ref_k), "K cache mismatch with stacked input"
@@ -1090,9 +1119,7 @@ def test_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():
     dtype = torch.float16
     kv_layout = "HND"
 
-    k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype
-    )
+    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
     v_append = torch.randn_like(k_append)
 
     cache_shape = (max_num_pages, num_kv_heads, page_size, head_dim)
@@ -1114,7 +1141,9 @@ def test_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():
         )
 
     # Replay with different slot mapping
-    new_slots = torch.randperm(max_num_pages * page_size, device="cuda:0", dtype=torch.int32)[:nnz_kv]
+    new_slots = torch.randperm(
+        max_num_pages * page_size, device="cuda:0", dtype=torch.int32
+    )[:nnz_kv]
     slot_mapping.copy_(new_slots)
     g.replay()
     torch.cuda.synchronize()
@@ -1122,8 +1151,11 @@ def test_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():
     ref_k, ref_v = _scatter_reference(
         torch.zeros(cache_shape, dtype=dtype, device="cuda:0"),
         torch.zeros(cache_shape, dtype=dtype, device="cuda:0"),
-        k_append, v_append,
-        new_slots, page_size, kv_layout,
+        k_append,
+        v_append,
+        new_slots,
+        page_size,
+        kv_layout,
     )
 
     assert torch.equal(k_cache, ref_k), "K cache mismatch after graph replay"
