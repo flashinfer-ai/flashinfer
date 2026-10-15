@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 import torch
 
 from flashinfer.api_logging import flashinfer_experimental_api
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 
 if TYPE_CHECKING:
@@ -53,6 +54,79 @@ if TYPE_CHECKING:
 
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+
+
+def _kernel_source_files() -> tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache."""
+    from .kernels import placeholder_helpers, stage, tcgen05_compat, tensor_map
+    from .kernels.fmha_context import (
+        fmha_kernel,
+        fmha_resources,
+        fmha_tasks,
+        helpers,
+        helpers_paged,
+    )
+
+    return (
+        __file__,
+        fmha_kernel.__file__,
+        fmha_resources.__file__,
+        fmha_tasks.__file__,
+        helpers.__file__,
+        helpers_paged.__file__,
+        placeholder_helpers.__file__,
+        stage.__file__,
+        tcgen05_compat.__file__,
+        tensor_map.__file__,
+    )
+
+
+_CUTE_DSL_MODULE = "prims_ts_fmha_context"
+
+
+def _context_kernel_name(
+    compile_spec: "_ContextCompileSpec",
+    cfg,
+    head_dim_vo: int,
+    max_active_clusters: int,
+) -> str:
+    """Specialization name within the prims_ts_fmha_context module, encoding every
+    parameter that affects codegen.
+    """
+    return (
+        f"ctx_{compile_spec.qk_dtype_key}_{compile_spec.pv_dtype_key}_{compile_spec.output_dtype_key}"
+        f"_sq{compile_spec.max_seq_len_q}_sk{compile_spec.max_seq_len_k}"
+        f"_hq{compile_spec.num_qo_heads}_hkv{compile_spec.num_kv_heads}"
+        f"_d{compile_spec.head_dim}_dvo{head_dim_vo}"
+        f"_{compile_spec.mask_type}_w{compile_spec.window_left}_packed{int(compile_spec.packed)}"
+        f"_hp{int(compile_spec.head_paired)}_upl{int(compile_spec.uniform_packed_lengths)}"
+        f"_qoff{int(compile_spec.has_q_offset)}_cskt{int(compile_spec.causal_single_kv_tile)}"
+        f"_pdkm{int(compile_spec.packed_dense_k_mask)}_{compile_spec.scheduler}"
+        f"_2cta{int(compile_spec.two_cta_umma)}_ldtm{int(cfg.uses_ldtm_stat)}"
+        f"_etok{int(cfg.fp8_psmem_early_token)}_fma{cfg.exp2_fma_pairs}"
+        f"_mac{max_active_clusters}"
+    )
+
+
+def _paged_context_kernel_name(
+    compile_spec: "_PagedContextCompileSpec", cfg, max_active_clusters: int
+) -> str:
+    """Specialization name of a paged context kernel, encoding every parameter
+    that affects codegen.
+    """
+    return (
+        f"paged_{compile_spec.qk_dtype_key}_{compile_spec.pv_dtype_key}_{compile_spec.output_dtype_key}"
+        f"_sq{compile_spec.max_seq_len_q}_kv{compile_spec.max_kv_len}_ps{compile_spec.page_size}"
+        f"_hq{compile_spec.num_qo_heads}_hkv{compile_spec.num_kv_heads}_d{compile_spec.head_dim}"
+        f"_{compile_spec.mask_type}_w{compile_spec.window_left}"
+        f"_hp{int(compile_spec.head_paired)}_upl{int(compile_spec.uniform_packed_lengths)}"
+        f"_qoff{int(compile_spec.has_q_offset)}_vtz{int(compile_spec.paged_v_tail_is_zero)}"
+        f"_pdkm{int(compile_spec.packed_dense_k_mask)}_{compile_spec.scheduler}"
+        f"_ldtm{int(cfg.uses_ldtm_stat)}_etok{int(cfg.fp8_psmem_early_token)}"
+        f"_fma{cfg.exp2_fma_pairs}_mac{max_active_clusters}"
+    )
+
+
 _SUPPORTED_HEAD_DIMS = (128, 256)
 _DEFAULT_PAGED_KV_PAGE_SIZE = 32
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
@@ -1911,28 +1985,35 @@ def _get_compiled_context(
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # Task objects carry loop-local state through generated control flow, so
-    # select the public staged frontend for this compilation.
     with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
-            tensor_adapter,
-            q_fake,
-            k_fake,
-            v_fake,
-            out_fake,
-            scale_fake,
-            output_scale_fake,
-            qo_indptr_fake,
-            kv_indptr_fake,
-            variable_window_starts_fake,
-            variable_window_ends_fake,
-            variable_window_cta_starts_fake,
-            stream_fake,
-            max_active_clusters,
-            packed,
-            max_seq_len_q,
-            max_seq_len_k,
-            options=_COMPILE_OPTIONS,
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _context_kernel_name(
+                compile_spec, fmha.cfg, head_dim_vo, max_active_clusters
+            ),
+            # Task objects carry loop-local state through generated control flow, so
+            # select the public staged frontend for this compilation.
+            lambda: cute.compile[cute.FrontendNext](
+                tensor_adapter,
+                q_fake,
+                k_fake,
+                v_fake,
+                out_fake,
+                scale_fake,
+                output_scale_fake,
+                qo_indptr_fake,
+                kv_indptr_fake,
+                variable_window_starts_fake,
+                variable_window_ends_fake,
+                variable_window_cta_starts_fake,
+                stream_fake,
+                max_active_clusters,
+                packed,
+                max_seq_len_q,
+                max_seq_len_k,
+                options=_COMPILE_OPTIONS,
+            ),
+            extra_key_files=_kernel_source_files(),
         )
     policy = (
         ("scheduler", scheduler),
@@ -2088,22 +2169,27 @@ def _get_compiled_paged_context(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
-            tensor_adapter,
-            q_fake,
-            k_fake,
-            v_fake,
-            out_fake,
-            scale_fake,
-            output_scale_fake,
-            qo_indptr_fake,
-            block_tables_fake,
-            seq_lens_fake,
-            stream_fake,
-            max_active_clusters,
-            max_seq_len_q,
-            max_kv_len,
-            options=_COMPILE_OPTIONS,
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _paged_context_kernel_name(compile_spec, fmha.cfg, max_active_clusters),
+            lambda: cute.compile[cute.FrontendNext](
+                tensor_adapter,
+                q_fake,
+                k_fake,
+                v_fake,
+                out_fake,
+                scale_fake,
+                output_scale_fake,
+                qo_indptr_fake,
+                block_tables_fake,
+                seq_lens_fake,
+                stream_fake,
+                max_active_clusters,
+                max_seq_len_q,
+                max_kv_len,
+                options=_COMPILE_OPTIONS,
+            ),
+            extra_key_files=_kernel_source_files(),
         )
     policy = (
         ("scheduler", scheduler),
