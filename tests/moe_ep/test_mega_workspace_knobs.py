@@ -326,13 +326,20 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
         "compute_unfinalized",
         "set_compile_tokens_per_rank",
         "workspace_output",
+        "needs_workspace_replacement",
     )
     for name in methods:
         monkeypatch.setattr(
             layer._kernel, name, mock.Mock(side_effect=AssertionError(name))
         )
         for handle in (default, other):
-            monkeypatch.setattr(handle._kernel, name, mock.Mock())
+            monkeypatch.setattr(
+                handle._kernel,
+                name,
+                mock.Mock(return_value=False)
+                if name == "needs_workspace_replacement"
+                else mock.Mock(),
+            )
 
     tensors = _inputs(8)
     output = torch.empty(8, 128, dtype=torch.bfloat16)

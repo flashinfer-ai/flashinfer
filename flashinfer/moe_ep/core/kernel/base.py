@@ -83,6 +83,7 @@ class MegaKernelBackend(ABC):
     supports_output_view: bool = False
     supports_unfinalized_output: bool = False
     supports_live_token_tuning: bool = False
+    supports_auto_workspaces: bool = False
     _knob_cache_module: str
 
     def __init__(self, config: object) -> None:
@@ -206,6 +207,10 @@ class MegaKernelBackend(ABC):
 
     def _tuning_key(self, fleet_params: "FleetParams") -> dict[str, Any]:
         raise NotImplementedError
+
+    def needs_workspace_replacement(self, workspace: Any) -> bool:
+        """Whether later selection needs new storage to preserve captured graphs."""
+        return False
 
     def _tuning_cache(self) -> Any:
         return importlib.import_module(self._knob_cache_module)

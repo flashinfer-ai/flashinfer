@@ -151,10 +151,10 @@ upstream field need not become a public knob unless the integration intends to
 support it.
 
 Update heuristic profiles, candidate enumeration and cache keys when kernel
-semantics or legal configurations change. Bump the backend revision in both
-cache lookup and recording when old entries are no longer valid. Require rank
-agreement and numerical qualification of tuning winners; do not reuse a cache
-across incompatible precision, routing-weight or reduction policies.
+semantics or legal configurations change. Bump `BACKEND_REVISION` in
+`shim/knob_cache.py` when old entries are no longer valid; both caches use it.
+Require rank agreement and numerical qualification of tuning winners; do not
+reuse a cache across incompatible precision, routing-weight or reduction policies.
 
 `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"` select quantized combine
 with the generic inference kernel; BF16 remains the default. Preserve payload
