@@ -283,6 +283,10 @@ def _group_barrier(
     state: cute.Tensor, group_id: Int32, phase: Int32, ctas_per_group: Int32, tx: Int32
 ) -> Int32:
     arrival_ptr = _global_state_ptr(state, group_id, Int32(_STATE_ARRIVAL_COUNTER))
+    # Every thread may have published histogram counts or cleared state.
+    # Thread zero may announce this CTA's arrival only after those writes
+    # precede its release operation.
+    cute.arch.sync_threads()
     if tx == Int32(0):
         red_add_global_release_i32(arrival_ptr, Int32(1))
         spin_wait_global_ge_i32(arrival_ptr, (phase + Int32(1)) * ctas_per_group)

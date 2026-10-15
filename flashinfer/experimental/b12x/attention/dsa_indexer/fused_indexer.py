@@ -378,6 +378,9 @@ def _fused_group_barrier(
 ) -> Int32:
     """Grid barrier over the group's CTAs on the arrival counter; returns the next phase."""
     arrival_ptr = _fused_state_ptr(state, group_id, Int32(_FUSED_STATE_ARRIVAL))
+    # Every warp publishes histogram bins. Thread zero may announce this
+    # CTA's arrival only after those writes precede its release operation.
+    cute.arch.sync_threads()
     if tx == Int32(0):
         red_add_global_release_i32(arrival_ptr, Int32(1))
         spin_wait_global_ge_i32(arrival_ptr, (phase + Int32(1)) * ctas_per_group)
