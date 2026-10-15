@@ -400,9 +400,12 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         torch.float32,
     ]
     assert kwargs["backend"] == "cake"
+    # enable_pdl=None leaves the choice to the ops (device_support_pdl).
+    assert kwargs["enable_pdl"] is None
     sanitized_ids, invalid_id, kwargs = fake_cake.calls["sanitize"]
     assert sanitized_ids.dtype == torch.int32 and sanitized_ids.shape == (2, 2, 2)
     assert invalid_id == -1 and kwargs["backend"] == "cake"
+    assert kwargs["enable_pdl"] is None
     assert result.tokens_per_rank == 2
     assert result.hidden_states.shape == (4, 8)
     assert result.hidden_states_scale.shape == (4, 1)
@@ -608,6 +611,12 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     assert fake_one_sided.module.calls["layout"][5] == 6 * 8
     assert comm._use_cft(2, 2) and not comm._use_cft(3, 2)
     assert _one_sided(cft=True)._use_cft(3, 2)
+
+
+def test_nvlink_one_sided_enable_pdl_override(fake_one_sided) -> None:
+    # The fixture reports PDL support; an explicit config value wins.
+    assert _one_sided()._enable_pdl
+    assert not _one_sided(enable_pdl=False)._enable_pdl
 
 
 def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:

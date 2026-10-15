@@ -243,6 +243,7 @@ class CakeAlltoAll(MoEEpCommunication):
             eplb_local_stats=eplb_local_stats,
             enable_rank_mask=self.config.enable_rank_mask,
             active_rank_mask=active_rank_mask,
+            enable_pdl=self.config.enable_pdl,
             backend=_BACKEND,
             recv_view_cache=state["views"],
         )
@@ -252,6 +253,7 @@ class CakeAlltoAll(MoEEpCommunication):
             self.metainfo,
             self.ep_rank,
             self.params.invalid_expert_id,
+            enable_pdl=self.config.enable_pdl,
             backend=_BACKEND,
         )
         self._round = {
@@ -337,6 +339,7 @@ class CakeAlltoAll(MoEEpCommunication):
             use_low_precision=self.config.use_low_precision_combine,
             enable_rank_mask=self.config.enable_rank_mask,
             active_rank_mask=active_rank_mask,
+            enable_pdl=self.config.enable_pdl,
             output=output,
             backend=_BACKEND,
         )

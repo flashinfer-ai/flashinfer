@@ -177,7 +177,11 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         MnnvlMemory.set_comm_from_config(mapping, mnnvl_config)
         comm = MnnvlMemory.get_comm(mapping)
         device = torch.device("cuda", torch.cuda.current_device())
-        self._enable_pdl = device_support_pdl(device)
+        self._enable_pdl = (
+            device_support_pdl(device)
+            if config.enable_pdl is None
+            else config.enable_pdl
+        )
 
         # Every rank must agree on CFT: it changes the workspace layout and
         # the endpoint exchange is collective.

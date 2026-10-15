@@ -40,6 +40,10 @@ class NVLinkOneSidedConfig:
     ``timeout_sec`` bounds every wait on a peer rank, in nominal seconds at a
     2 GHz SM clock; a wait that exceeds it traps the kernel. It is recorded
     into CUDA graphs at capture time.
+
+    ``enable_pdl`` launches the dispatch and combine kernels with programmatic
+    dependent launch; ``None`` (default) enables it on compute capability 9.0
+    and newer.
     """
 
     backend_name: str = "nvlink_one_sided"
@@ -52,3 +56,4 @@ class NVLinkOneSidedConfig:
     cft_max_tokens_for_dispatch: int = 128
     cft_max_tokens_for_combine: int = 128
     timeout_sec: int = 300
+    enable_pdl: Optional[bool] = None

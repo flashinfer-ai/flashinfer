@@ -24,6 +24,8 @@ class CakeAlltoAllConfig:
     rank-mask support for ``active_rank_mask``. ``use_low_precision_combine``
     sends combine payloads as FP8. ``comm_backend`` exchanges the MNNVL memory
     handles and defaults to torch.distributed over the bootstrap process group.
+    ``enable_pdl`` launches the kernels with programmatic dependent launch;
+    ``None`` (default) enables it on compute capability 9.0 and newer.
     """
 
     backend_name: str = "cake"
@@ -32,3 +34,4 @@ class CakeAlltoAllConfig:
     enable_rank_mask: bool = False
     use_low_precision_combine: bool = False
     comm_backend: Optional["CommBackend"] = None
+    enable_pdl: Optional[bool] = None
