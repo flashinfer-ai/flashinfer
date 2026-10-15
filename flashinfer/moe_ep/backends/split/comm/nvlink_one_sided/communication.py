@@ -69,7 +69,18 @@ def _driver_branch() -> Optional[int]:
 
 
 def _cft_unsupported_reason(device_index: int) -> Optional[str]:
-    """Why this rank cannot use CFT counted writes, or ``None`` if it can."""
+    """Why this rank cannot use CFT counted writes, or ``None`` if it can.
+
+    Never raises: every rank must reach the collective CFT agreement, and a
+    rank whose probe fails falls back to the fence path with the others.
+    """
+    try:
+        return _probe_cft_support(device_index)
+    except Exception as exc:  # NVML, CUDA driver or cuda-python errors alike
+        return f"the CFT support probe failed: {type(exc).__name__}: {exc}"
+
+
+def _probe_cft_support(device_index: int) -> Optional[str]:
     import torch
 
     from ......comm.mnnvl import cuda, is_mnnvl_fabric_supported

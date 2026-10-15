@@ -610,6 +610,22 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     assert _one_sided(cft=True)._use_cft(3, 2)
 
 
+def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
+    import flashinfer.comm.mnnvl as mnnvl
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        communication as one_sided,
+    )
+
+    def no_fabric_info(device_index):
+        raise RuntimeError("nvmlDeviceGetGpuFabricInfoV: Not Supported")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (10, 0))
+    monkeypatch.setattr(one_sided, "_driver_branch", lambda: 620)
+    monkeypatch.setattr(mnnvl, "is_mnnvl_fabric_supported", no_fabric_info)
+    reason = one_sided._cft_unsupported_reason(0)
+    assert reason is not None and "RuntimeError" in reason
+
+
 def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(
     fake_one_sided, monkeypatch
 ) -> None:
