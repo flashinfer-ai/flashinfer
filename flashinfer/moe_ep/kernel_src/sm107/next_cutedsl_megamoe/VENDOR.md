@@ -65,11 +65,10 @@ with `kernel_variant="genphase"`. It requires `fc2_use_bulk=True`, at most
 inherited tile-N 128/256 configurations use `(4, 1)` clusters. The local
 `(256, 64, 128)` decode tile additionally admits MXFP8 E4M3 with `(2, 1)` or
 `(4, 1)` clusters, and MXFP4 weights/MXFP8 E4M3 activations with `(4, 1)`
-clusters. N64 requires grouped scheduling at every EP size because
+clusters. GenPhase requires grouped scheduling at every tile and EP size:
 phase-interleave can stall, including at EP1. The shim rejects that schedule
 before allocation or compilation, and `is_valid_sm107` excludes it from tuning.
-The N128/N256 schedule rules are unchanged. Other N64 combinations remain
-rejected. Combine remains BF16.
+Other N64 combinations remain rejected. Combine remains BF16.
 Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
 SiTU requires both beta parameters, matching the exported kernel.
 

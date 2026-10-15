@@ -387,12 +387,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(
                     "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
                 )
-            if n64_decode and mode == "phase_interleave":
+            if mode == "phase_interleave":
                 # This schedule can stall even at EP1. Reject it before
                 # allocation or compilation, including during autotuning.
                 raise ValueError(
-                    "GenPhase N64 requires grouped scheduling; "
-                    "phase_interleave can stall."
+                    "GenPhase requires grouped scheduling; phase_interleave can stall."
                 )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(

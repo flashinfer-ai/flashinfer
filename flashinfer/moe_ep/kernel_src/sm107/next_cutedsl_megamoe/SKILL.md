@@ -189,12 +189,14 @@ source/environment identity. Existing benchmark numerical and configuration
 checks validate measured points. Reuse existing results when the implementation,
 environment, and workload are unchanged. Check links and commands for documentation edits.
 
-Qualify scheduling modes independently at each admitted EP degree. N64
-phase-interleave can stall even at EP1. Keep N64 grouped-only until that mode
-has its own qualified repair. Check both direct config construction and
-`is_valid_sm107` with `test_genphase_n64_schedule_admission`; native grouped
-route transitions must continue to pass at EP1, EP2 and EP4. A timeout is a
-failed gate, not a configuration to include in a performance baseline.
+Qualify scheduling modes independently at each admitted EP degree. GenPhase
+phase-interleave can stall at both N64 and N128, including at EP1. Keep
+GenPhase grouped-only until that mode has its own qualified repair. Check
+direct config construction and `is_valid_sm107` with
+`test_genphase_requires_grouped_scheduling` and
+`test_genphase_n64_schedule_admission`; native grouped route transitions must
+continue to pass at EP1, EP2 and EP4. A timeout is a failed gate, not a
+configuration to include in a performance baseline.
 
 ### 7. Update the record and review the diff
 

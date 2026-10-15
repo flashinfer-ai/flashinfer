@@ -263,11 +263,12 @@ support this N64 tile. N64 is a tile dimension, not the number of live tokens.
 Gather4 issuance follows the live rows in each tile, including partially
 filled tiles, while retaining matching barrier transaction counts.
 
-For N64, use `schedule_policy=("grouped", None)` at every EP size.
-Phase-interleave can stall even at EP1 and is rejected before allocation or
-compilation. `is_valid_sm107` applies the same restriction during tuning.
-The N128/N256 schedule rules are unchanged. Cache entries from before this
-restriction are ignored; retune to populate the current cache revision.
+GenPhase requires `schedule_policy=("grouped", None)` at every tile size and
+EP size. Phase-interleave can stall even at EP1 and is rejected before
+allocation or compilation. `is_valid_sm107` applies the same restriction
+during tuning; the schedule sweep compares grouped grid-stride and atomic
+work IDs. Cache entries from before this restriction are ignored; retune to
+populate the current cache revision. Generic inference schedules are unchanged.
 
 Retune to compare the additional candidates for your workload. The default
 kernel family remains `inference`; these candidates do not automatically
