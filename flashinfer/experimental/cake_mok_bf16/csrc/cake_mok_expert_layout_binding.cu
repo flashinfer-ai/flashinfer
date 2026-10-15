@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_expert_layout(int* __restrict__ counts, int* __restrict__ schedule_rank, int* __restrict__ layout, int experts);
 
 
-namespace cake_host_shim_898bbe3c462d2d7d {
+namespace cake_host_shim_7de573b5d89381d0 {
 
 using tvm::ffi::TensorView;
 
@@ -57,13 +57,18 @@ void Run(TensorView arg_counts, TensorView arg_schedule_rank, TensorView arg_lay
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(256u, 1u, 1u);
 
-  cudaError_t launch_status = cudaLaunchKernel(
-      reinterpret_cast<const void*>(kernel_cake_mok_expert_layout), grid, block, kargs, 0u, stream);
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 0u;
+  config.stream = stream;
+  cudaError_t launch_status = cudaLaunchKernelExC(
+      &config, reinterpret_cast<const void*>(kernel_cake_mok_expert_layout), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernel for kernel_cake_mok_expert_layout failed: "
+      << "cudaLaunchKernelExC for kernel_cake_mok_expert_layout failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_898bbe3c462d2d7d
+}  // namespace cake_host_shim_7de573b5d89381d0
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_898bbe3c462d2d7d::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_7de573b5d89381d0::Run);

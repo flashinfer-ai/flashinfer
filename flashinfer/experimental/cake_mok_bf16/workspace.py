@@ -29,9 +29,10 @@ class MoKConfig:
     # a host synchronization (pinned copy behind a CUDA event); the counts are
     # identical on every rank, the decision is per rank (see
     # ``MoKFunctional._observe_load``). ``None`` keeps the fixed split; see
-    # ``MoKFunctional._comm_split``. The threshold default follows
-    # ``flashinfer.mok.IMBALANCE_THRESHOLD``: on B200 BF16 the imbalance split
-    # pays from about 5.6x the mean load and shows no gain at 3x.
+    # ``MoKFunctional._comm_split``. The threshold default is the BF16 value of
+    # ``flashinfer.mok.IMBALANCE_THRESHOLDS`` (the facade resolves it per
+    # precision): on B200 BF16 the imbalance split pays from about 5.6x the mean
+    # load and shows no gain at 3x; on B200 MXFP8 it pays from 3x.
     imbalance_comm_sms: tuple[int, int] | None = None
     imbalance_threshold: float = 4.0
     minibatch_size: int = 4096
