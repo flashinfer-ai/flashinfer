@@ -23,6 +23,9 @@ from flashinfer.fused_moe.backends.cudnn_frost import (
 from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
     moe as bf16_moe,
 )
+from flashinfer.fused_moe.backends.cudnn_frost.cache import (
+    require_graph_resource_retention,
+)
 from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
     activation_name,
@@ -71,6 +74,21 @@ bf16_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 7), (12, 0)),
     reason="packaged BF16 cuDNN Frost sources target SM107a and SM120a",
+)
+
+
+def _graph_retention_reason():
+    try:
+        require_graph_resource_retention()
+    except NotImplementedError as exc:
+        return str(exc)
+    return None
+
+
+# MoE runners decline admission on PyTorch without CUDAGraph.retain_object (< 2.14).
+_GRAPH_RETENTION_REASON = _graph_retention_reason()
+graph_retention = pytest.mark.skipif(
+    _GRAPH_RETENTION_REASON is not None, reason=str(_GRAPH_RETENTION_REASON)
 )
 BF16_SHORTLIST_GEOMETRIES = {
     (12, 7168, 3072, 1),
@@ -138,6 +156,7 @@ def _bf16_moe_reference(act, weights, activation=None):
 
 
 @bf16_gpu
+@graph_retention
 @pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
 def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeypatch):
@@ -219,6 +238,7 @@ def test_bf16_activation_artifact_pools_are_disjoint(capability, monkeypatch):
 
 
 @bf16_gpu
+@graph_retention
 @pytest.mark.parametrize("topk", [1, 2, 4])
 def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     topk, monkeypatch
@@ -275,6 +295,7 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
 
 
 @bf16_gpu
+@graph_retention
 def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics():
     runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cuda")
     runner.check_support()
@@ -304,6 +325,7 @@ def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics
 
 
 @bf16_gpu
+@graph_retention
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336), (64, 2048, 1408)],
@@ -495,6 +517,7 @@ def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkey
 
 
 @bf16_gpu
+@graph_retention
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336)],
@@ -2215,6 +2238,7 @@ def _pick_stage_pair(pool):
 
 
 @supported_gpu
+@graph_retention
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
@@ -2417,6 +2441,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
 
 
 @supported_gpu
+@graph_retention
 def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
         test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch, "fp8_stg")
@@ -2871,6 +2896,7 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
 
 
 @supported_gpu
+@graph_retention
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
@@ -3021,6 +3047,7 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
 
 
 @supported_gpu
+@graph_retention
 @pytest.mark.parametrize("store", ["stg", "tma"])
 def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
     with torch.inference_mode():
@@ -3030,6 +3057,7 @@ def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
 
 
 @supported_gpu
+@graph_retention
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("store", ["stg", "tma"])
@@ -3178,6 +3206,7 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
 
 
 @supported_gpu
+@graph_retention
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("store", ["stg", "tma"])
 def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
@@ -3464,6 +3493,7 @@ def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
 
 
 @supported_gpu
+@graph_retention
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
@@ -3476,6 +3506,7 @@ def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
 
 
 @supported_gpu
+@graph_retention
 def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
         test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
@@ -3829,9 +3860,9 @@ def test_frost_layer_bounds_token_bucket_winners_and_refreshes_lru(monkeypatch):
 @pytest.mark.parametrize(
     "dtype",
     [
-        pytest.param("bf16", marks=bf16_gpu),
+        pytest.param("bf16", marks=[bf16_gpu, graph_retention]),
         *(
-            pytest.param(dtype, marks=supported_gpu)
+            pytest.param(dtype, marks=[supported_gpu, graph_retention])
             for dtype in ("mxfp8", "nvfp4", "mxfp8_mxfp4")
         ),
     ],
