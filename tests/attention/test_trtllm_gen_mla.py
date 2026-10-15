@@ -1521,15 +1521,20 @@ def test_trtllm_batch_decode_mla_sparse(
 
 
 @pytest.mark.parametrize("batch_size", [1, 3])
-def test_trtllm_batch_decode_mla_sparse_compact_query(batch_size: int):
-    """Test sparse MLA with a 64-wide query and latent rank 512."""
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+def test_trtllm_batch_decode_mla_sparse_compact_query(
+    batch_size: int, dtype: torch.dtype
+):
+    """Compare BF16/FP8 compact-query sparse MLA against the reference."""
     dimensions = compact_query_mla_dimensions
     assert dimensions == core.MLAHeadDimensions(64, 64, 128, 512)
     assert dimensions in core.supported_mla_head_dimensions
     trtllm_batch_decode_mla_sparse(
         batch_size=batch_size,
         scale=1.0,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         q_len_per_request=1,
         topk=2048,
         is_varlen=True,
