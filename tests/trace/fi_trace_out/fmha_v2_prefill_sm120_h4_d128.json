@@ -98,7 +98,7 @@
       "shape": [
         "scale_size"
       ],
-      "dtype": "unknown",
+      "dtype": "float32",
       "optional": true,
       "description": "Persistent FP32 CUDA model weight containing the full fused q_scale * k_scale / sqrt(head_dim) value."
     },
@@ -106,7 +106,7 @@
       "shape": [
         "scale_size"
       ],
-      "dtype": "unknown",
+      "dtype": "float32",
       "optional": true,
       "description": "Persistent FP32 CUDA V dequantization model weight."
     },
