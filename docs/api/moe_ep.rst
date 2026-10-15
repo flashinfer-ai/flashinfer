@@ -208,7 +208,9 @@ Input and weight containers
 ``hidden_states`` has shape ``[num_tokens, hidden]``. ``topk_ids`` and
 ``topk_weights`` contain the routing decision for each token. Optional fields
 in :class:`MoEEpTensors` carry activation scales and backend-specific
-metadata; a backend documents which optional fields it consumes.
+metadata; a backend documents which optional fields it consumes. For Mega
+execution, ``scales`` is required when ``MegaConfig.quantize_input`` is
+``False``.
 
 The canonical weight pack stores one rank's local experts. Unquantized packs
 contain BF16 or FP32 ``w13`` and ``w2`` tensors. Prequantized packs must
