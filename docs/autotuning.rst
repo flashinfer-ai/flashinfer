@@ -428,6 +428,39 @@ with ``torchrun``), you could use separate output files per rank and merge them 
    expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
    semantics.  FlashInfer's cubin caching also relies on this guarantee.
 
+Custom tuning protocols
+-----------------------
+
+Operations that own candidate preparation, measurement and result installation
+can implement ``TuningProtocol.run(context)`` and call
+``AutoTuner.get().choose_with_protocol(namespace, protocol)``. The method uses
+the existing tuner's lock, tuning mode, ``skip_ops`` and statistics. It calls
+the protocol even when tuning is disabled, so collective operations can agree
+on cached results before any rank returns.
+When ``context.skipped`` is true, the protocol must use its built-in fallback
+without selecting from either the managed cache or a compatibility file.
+
+``TuningContext`` provides ``lookup(key)``, ``records()`` and
+``publish(key, value)`` for namespaced JSON records. The protocol defines cache
+identity and compatibility rules; ``records()`` returns a copy for lookups such
+as capacity fallback. With ``autotune_v2()``, winners persist automatically in
+its managed store. Replay contexts load records before serving; an attached
+store remains available after context exit. ``persistent_cache=False`` keeps
+selection in memory. Protocols must honor ``context.disk_cache_enabled`` for
+any compatibility-file I/O and implement or reject ``context.measurement_policy``.
+Protocol records are separate from the older ``autotune(cache=...)`` JSON format.
+Existing ``autotune()`` controls can be nested as specified by v2; they do not
+import or export protocol records. ``context.cache_identity`` changes on a store
+switch or reload, so adapters can invalidate prepared selections.
+
+Return a ``TuningResult`` containing the selected value, whether it was cached,
+and the number of attempted and successful candidates. The protocol owns
+distributed agreement, numerical checks, capture restrictions and allocation
+lifetime. Use one process per device for collective protocols. Designate one
+EP rank to publish a collectively selected winner. Managed records use atomic
+per-record writes. ``force_tune=True`` requests a fresh explicit search regardless
+of the ambient tuning mode or ``skip_ops``; the protocol must honor that flag.
+
 cuTile Autotuning
 -----------------
 

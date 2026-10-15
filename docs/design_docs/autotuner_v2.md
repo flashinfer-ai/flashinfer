@@ -143,6 +143,32 @@ maintaining a migration path for data that is, by construction, an optimization.
   neither the filesystem nor the JSON decoder, and v1/v2 state mixing is impossible by
   construction.
 
+### Custom tuning protocols
+
+`AutoTuner.choose_with_protocol()` delegates collective operations that own their
+candidate enumeration, measurement and installation. `TuningContext.records()`
+reads the active store's protocol records; `publish()` persists a winner while
+tuning is enabled. Replay imports remain in memory. No JSON filename is required.
+
+Protocol records live under `protocols/<namespace_hash>/<key_hash>.json` in the
+same environment directory as tactic entries. Each file contains its namespace,
+key and JSON value. The store validates both hashes and preloads these records
+at attach. Atomic per-record publication preserves unrelated concurrent writes;
+`clear_cache()` and `autotune_v2_reload()` invalidate their lookup memos. The
+protocol retains its own compatibility and bucket selection over these records.
+The additional directory does not change existing tactic entries.
+
+Root and environment switches isolate protocol records. With persistence disabled,
+records use the in-memory measurement-policy partition, and the protocol must
+also disable its compatibility-file reads and writes. Explicit measurement
+policies are passed to the protocol, which must implement or reject them rather
+than silently measure a different boundary. Protocol records are separate from
+v1 JSON import/export. Existing `autotune()` controls still compose with v2 as
+described above. `context.cache_identity` includes store/policy identity, reload
+generation for prepared-result invalidation. Inherited graph replay counts are
+exposed separately for tuning provenance; they do not invalidate serving results.
+Bare serving uses the attached store's measurement policy.
+
 ### 2.5 MeasurementPolicy — tune the way you deploy
 
 ```python
