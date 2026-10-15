@@ -169,6 +169,8 @@ class _ContextPlanState:
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
     vc_ctrl_on: Optional[torch.Tensor] = None
     vc_ctrl_off: Optional[torch.Tensor] = None
+    # Output scale of VC runs: the per-channel V scale times the planned or passed scale.
+    vc_output_scale: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -2584,7 +2586,8 @@ class BatchPrefillTSWrapper:
     all captured runtime tensors alive until every graph using the current
     plan is destroyed. Before running on a CUDA stream that is not already
     ordered after the planning stream, the caller must establish that
-    dependency.
+    dependency. VC plans also own the output-scale buffer that every run
+    refreshes, so launches of one VC plan must not overlap either.
     """
 
     @flashinfer_experimental_api
@@ -2704,6 +2707,11 @@ class BatchPrefillTSWrapper:
         )
         if vc_config is not None and not isinstance(vc_config, VCAttentionConfig):
             raise TypeError("vc_config must be a VCAttentionConfig instance")
+        if vc_config is not None and (packed or mask_type != "dense"):
+            raise ValueError(
+                "vc_config requires a dense contiguous fixed-length plan; VC-Attention "
+                "has no packed, causal or variable-window kernel"
+            )
         geometry = replace(geometry, vc=vc_config)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -2715,6 +2723,7 @@ class BatchPrefillTSWrapper:
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
+        vc_output_scale_buffer = None
         if geometry.vc is not None:
             output_scale_tensor = torch.full(
                 (
@@ -2726,6 +2735,7 @@ class BatchPrefillTSWrapper:
                 dtype=torch.float32,
                 device=geometry.device,
             )
+            vc_output_scale_buffer = torch.empty_like(output_scale_tensor)
         else:
             output_scale_tensor = torch.tensor(
                 [output_scale], dtype=torch.float32, device=geometry.device
@@ -2787,6 +2797,7 @@ class BatchPrefillTSWrapper:
             vc_scale_shapes=vc_shapes,
             vc_ctrl_on=torch.ones((1,), dtype=torch.int32, device=geometry.device),
             vc_ctrl_off=torch.zeros((1,), dtype=torch.int32, device=geometry.device),
+            vc_output_scale=vc_output_scale_buffer,
         )
 
     @flashinfer_experimental_api
@@ -2893,8 +2904,9 @@ class BatchPrefillTSWrapper:
                 )
             if vc.tile_means is not None:
                 vc_mu = vc.tile_means
-            group = geometry.num_qo_heads // geometry.num_kv_heads
-            vc_output_scale = vc.v_scale.repeat_interleave(group, dim=1).reshape(-1)
+            # VC plans have equal Q and K/V head counts, so the [B, H, D] scale is
+            # already in output order.
+            vc_output_scale = vc.v_scale.reshape(-1)
             vc_ctrl = state.vc_ctrl_on if vc.demean else state.vc_ctrl_off
         if validate:
             _validate_runtime_inputs(
@@ -2968,8 +2980,11 @@ class BatchPrefillTSWrapper:
                 device=geometry.device,
             )
         if vc_output_scale is not None:
-            # The per-channel V residual scale multiplies the planned/passed scale.
-            output_scale = (vc_output_scale * output_scale).contiguous()
+            # The per-channel V residual scale multiplies the planned/passed scale
+            # into the plan-owned buffer.
+            output_scale = torch.mul(
+                vc_output_scale, output_scale, out=state.vc_output_scale
+            )
 
         if out is None:
             out = torch.empty(
