@@ -37,9 +37,9 @@ A route whose class is listed in ``CG2_CLASSES`` for the device's architecture
 also compiles the CTA-pair twin of the N256 main (``main_cg2``:
 ``tcgen05.mma.cta_group::2`` over a cluster of two CTAs, each loading its own
 128 A rows and 128 B columns per stage); ``main_form`` selects it per N256 call
-from the frozen region table (``CG2_REGIONS``: per class a padded-row range and
-a column cap, measured per architecture) and the delivered-class
-table, ``main_grid`` sizes its even grid of
+from the frozen region table (``CG2_REGIONS``: per class one or more measured
+rectangles of padded rows x N, pairwise disjoint, per architecture) and the
+delivered-class table, ``main_grid`` sizes its even grid of
 CTA pairs, and the launcher receives the chosen form as the positional
 ``main_cg2`` flag and launches the twin with the cluster-dimension attribute
 ``CG2_CLUSTER_DIMS``.
@@ -63,6 +63,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_06c1f7cb4aa36c5918bd": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_17f60837feb11a634b34": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
         ],
         "arches": ["sm_103a"],
         "block": [192, 1, 1],
@@ -256,6 +264,7 @@ ROUTES: dict[str, str] = {
     "main_bfloat16_ws4_k_major_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
     "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_dba24f495a33b1a179e7",
     "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
+    "main_bfloat16_ws8_k_major_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
     "main_bfloat16_ws8_k_major_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
     "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_f2e488e6c8974711b331",
     "main_bfloat16_ws8_n_major_n128": "cake_all_gather_matmul_ef0a40fd8365adef0679",
@@ -478,6 +487,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a55baa3bdb6ce5b39f7e_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -491,6 +501,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
             "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
+            "main_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
         },
     },
     "bfloat16_ws8_n_major_sm_100a": {
@@ -830,19 +841,26 @@ SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
 # twin only inside this table.
 CG2_CLASSES: dict[str, list[list[Any]]] = {
     "sm_100a": [],
-    "sm_103a": [[2, "bfloat16", "n_major"], [4, "bfloat16", "k_major"]],
+    "sm_103a": [
+        [2, "bfloat16", "n_major"],
+        [4, "bfloat16", "k_major"],
+        [8, "bfloat16", "k_major"],
+    ],
 }
 # Frozen input of the pair selection rule, copied from the kernel module: the
-# measured regions of the twin per architecture, one ``[world_size, dtype,
-# b_layout, min_padded_rows, max_padded_rows, max_cols]`` entry per class with a
-# region (an architecture without one lists nothing); an N256 call runs the twin
-# iff its class has an entry and ``min_padded_rows <= ceil128(rows) <=
-# max_padded_rows`` and ``N <= max_cols``.
+# measured rectangles of the twin per architecture, ``[world_size, dtype,
+# b_layout, min_padded_rows, max_padded_rows, min_cols, max_cols]`` entries (a
+# class may list several, pairwise disjoint; an architecture without one lists
+# nothing); an N256 call runs the twin iff some rectangle of its class satisfies
+# ``min_padded_rows <= ceil128(rows) <= max_padded_rows`` and
+# ``min_cols <= N <= max_cols``.
 CG2_REGIONS: dict[str, list[list[Any]]] = {
     "sm_100a": [],
     "sm_103a": [
-        [2, "bfloat16", "n_major", 2048, 5760, 2048],
-        [4, "bfloat16", "k_major", 1024, 1536, 6058],
+        [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
+        [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
     ],
 }
 
@@ -999,28 +1017,24 @@ def _cg2_classes(arch: str) -> frozenset[tuple[int, str, str]]:
     )
 
 
-def _cg2_region(
+def _cg2_regions(
     arch: str, world_size: int, dtype_name: str, b_layout: str
-) -> tuple[int, int, int] | None:
-    """``(min_padded_rows, max_padded_rows, max_cols)`` of the pair twin's measured
-    region of one class on ``arch`` (the emitted ``CG2_REGIONS`` table), or
-    ``None`` when the class has none there; an unknown arch raises."""
+) -> list[tuple[int, int, int, int]]:
+    """``(min_padded_rows, max_padded_rows, min_cols, max_cols)`` of every measured
+    rectangle of the pair twin for one class on ``arch`` (the emitted
+    ``CG2_REGIONS`` table, in table order); empty when the class has none there.
+    Several rectangles per class are legal; an unknown arch raises."""
 
     if arch not in CG2_REGIONS:
         raise ValueError(
             f"CG2_REGIONS has no entry for arch {arch!r} (known: {sorted(CG2_REGIONS)})"
         )
     key = (int(world_size), str(dtype_name), str(b_layout))
-    hits = [
-        (int(min_rows), int(max_rows), int(max_cols))
-        for ws, dtype, layout, min_rows, max_rows, max_cols in CG2_REGIONS[arch]
-        if (int(ws), str(dtype), str(layout)) == key
+    return [
+        (int(entry[3]), int(entry[4]), int(entry[5]), int(entry[6]))
+        for entry in CG2_REGIONS[arch]
+        if (int(entry[0]), str(entry[1]), str(entry[2])) == key
     ]
-    if len(hits) > 1:
-        raise ValueError(
-            f"CG2_REGIONS[{arch!r}] lists the class {key} {len(hits)} times"
-        )
-    return hits[0] if hits else None
 
 
 def main_block_n(
@@ -1076,13 +1090,14 @@ def main_form(
     """Form (``"cg1"`` or ``"cg2"``) of the main program for one call.
 
     The CTA-pair twin (``cg2``) is selected for an N256 call whose
-    ``(world_size, dtype_name, b_layout)`` class has a measured region on
+    ``(world_size, dtype_name, b_layout)`` class has a measured rectangle on
     ``arch`` (``CG2_REGIONS``) and a delivered ``_cg2`` program there
-    (``CG2_CLASSES``), when ``min_padded_rows <= ceil128(rows) <=
-    max_padded_rows`` and ``n <= max_cols`` of that region. A 128-wide call, a
-    class without a region and a call outside its region run the one-CTA
-    program. The rule mirrors the kernel module's ``main_form`` with its frozen
-    region table; an unknown arch raises, never defaults."""
+    (``CG2_CLASSES``), when some rectangle of the class satisfies
+    ``min_padded_rows <= ceil128(rows) <= max_padded_rows`` and
+    ``min_cols <= n <= max_cols``. A 128-wide call, a class without a rectangle
+    and a call outside every rectangle of its class run the one-CTA program.
+    The rule mirrors the kernel module's ``main_form`` with its frozen region
+    table; an unknown arch raises, never defaults."""
 
     if arch not in CG2_REGIONS:
         raise ValueError(
@@ -1093,11 +1108,13 @@ def main_form(
         return "cg1"
     main_tiles(rows, n, world_size=world_size, block_n=256)
     delivered = (int(world_size), str(dtype_name), str(b_layout)) in _cg2_classes(arch)
-    region = _cg2_region(arch, world_size, dtype_name, b_layout)
-    if region is None:
-        return "cg1"
-    min_rows, max_rows, max_cols = region
-    qualify = min_rows <= padded_rows(rows) <= max_rows and int(n) <= max_cols
+    padded = padded_rows(rows)
+    cols = int(n)
+    rectangles = _cg2_regions(arch, world_size, dtype_name, b_layout)
+    qualify = any(
+        min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
+        for min_rows, max_rows, min_cols, max_cols in rectangles
+    )
     return "cg2" if (qualify and delivered) else "cg1"
 
 
