@@ -19,14 +19,13 @@
 
 using namespace flashinfer;
 
-// Blackwell (sm_100a) launcher: same contract as w8a16_fp8_gemm (csrc/w8a16_fp8_gemm.cu),
-// minus the Hopper-only prepared weight layout.
+// Blackwell (sm_100a) launcher: same contract as w8a16_fp8_gemm (csrc/w8a16_fp8_gemm.cu).
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 // `algo` is the tile code (0 = cost model, 1..4 = W8A16Sm100Tile); see
 // flashinfer.gemm.w8a16_fp8_gemm's `algo` argument.
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
-                    ffi::Optional<TensorView> bias, bool weight_prepared,
-                    ffi::Optional<TensorView> workspace, int64_t algo) {
+                    ffi::Optional<TensorView> bias, ffi::Optional<TensorView> workspace,
+                    int64_t algo) {
   CHECK_INPUT(act);     // [M, K], fp16/bf16, contiguous
   CHECK_INPUT(weight);  // [N, K], fp8 e4m3, contiguous
   CHECK_INPUT(out);     // [M, N], act dtype, contiguous
@@ -37,7 +36,6 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
   CHECK_DIM(2, act);
   CHECK_DIM(2, weight);
   CHECK_DIM(2, out);
-  TVM_FFI_ICHECK(!weight_prepared) << "weight_prepared is a Hopper-only layout";
   TVM_FFI_ICHECK(algo >= 0 && algo <= gemm::kW8A16Sm100MaxTileCode)
       << "algo must be 0 (auto) or a tile code 1.." << gemm::kW8A16Sm100MaxTileCode;
 
@@ -89,8 +87,7 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
         static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
         static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
         static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), ws_ptr, ws_bytes, device_id, num_sms, stream,
-        static_cast<int>(algo));
+        static_cast<int>(K), ws_ptr, ws_bytes, device_id, num_sms, stream, static_cast<int>(algo));
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "w8a16_fp8_gemm (sm100) failed with error code " << cudaGetErrorString(status);
     return true;

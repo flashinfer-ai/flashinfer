@@ -76,10 +76,12 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import math
 import csv
 import os
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable
@@ -137,6 +139,7 @@ DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 # ---------------------------------------------------------------------------
 
 _L2_FLUSH_SIZE = 32 * 1024 * 1024  # float32 elements -> 128 MB
+_HEATED = [False]  # --warmup-seconds runs once per process
 _l2_flush: torch.Tensor | None = None
 
 
@@ -350,19 +353,21 @@ def make_kernel(
     w_fp8: torch.Tensor,
     scale: torch.Tensor,
     bias,
-    prepared: bool = False,
     algo: str | None = None,
+    out: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor] | None:
-    """FlashInfer kernel; ``prepared`` uses the opt-in prepared weight layout
-    (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed);
-    ``algo`` pins a kernel variant (``--algo``; Hopper or Blackwell names)."""
+    """FlashInfer kernel; ``algo`` pins a kernel variant (``--algo``; Hopper or
+    Blackwell names)."""
     try:
-        from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
+        from flashinfer.gemm import w8a16_fp8_gemm
     except ImportError as e:
         print(f"# WARNING: flashinfer.gemm import failed: {e!r}", file=sys.stderr)
         return None
-    out = torch.empty(act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device)
-    w_use = prepare_w8a16_fp8_weight(w_fp8) if prepared else w_fp8
+    if out is None:
+        out = torch.empty(
+            act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
+        )
+    w_use = w_fp8
     # "<algo>@g<n>": Hopper L2 group size n for this column (FLASHINFER_W8A16_FP8_SM90_GROUP,
     # read per call; the graph capture bakes it in).
     # The launcher caches the variable as absent if it is unset at its first read, so it is
@@ -384,7 +389,6 @@ def make_kernel(
                 scale,
                 bias=bias,
                 out=out,
-                weight_prepared=prepared,
                 algo=algo,
             )
         finally:
@@ -452,10 +456,14 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         impls["cast"] = make_cast_copy(act, w_fp8, scale, bias)
     if "cublas" in args.impls:
         impls["cublas"] = make_cublas(act, w_deq, bias)
-    for name, prepared, algo in _kernel_variants(args):
-        if prepared and torch.cuda.get_device_capability()[0] != 9:
-            continue  # prepared weight layout is Hopper-only
-        fn = make_kernel(act, w_fp8, scale, bias, prepared=prepared, algo=algo)
+    kernel_out: torch.Tensor | None = None
+    for name, algo in _kernel_variants(args):
+        # One output buffer shared by all kernel columns (each column's error is computed
+        # right after its own call, before the next one overwrites it): 16 columns of a
+        # 4.5 GB output do not fit in 80 GB.
+        if kernel_out is None:
+            kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
+        fn = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
         if fn is None:
             print(
                 "# WARNING: flashinfer.gemm.w8a16_fp8_gemm not available; "
@@ -478,13 +486,51 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     # drifts between back-to-back measurements; interleaving keeps that drift out of the
     # per-row ratios.
     names = list(impls)
+    # Steady-state recipe (--warmup-seconds / --burst-seconds): a short burst never reaches
+    # the 700 W power cap and measures the boost clock instead (benchmarks/
+    # w8a16_fp8_gemm_ladder.md, recipe experiment).  Heat the GPU with an untimed burst of the
+    # first column, then size each timed burst by time rather than by launch count.
+    iters_by_name = {name: args.iters for name in names}
+    if args.burst_seconds > 0:
+        for name in names:
+            fn = impls[name]
+            torch.cuda.synchronize()
+            ev0, ev1 = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            ev0.record()
+            for _ in range(5):
+                fn()
+            ev1.record()
+            torch.cuda.synchronize()
+            call_s = max(ev0.elapsed_time(ev1) / 5 * 1e-3, 1e-6)
+            iters_by_name[name] = int(
+                min(5000, max(50, math.ceil(args.burst_seconds / call_s)))
+            )
+    if args.warmup_seconds > 0 and not _HEATED[0]:
+        fn = impls[names[0]]
+        t_end = time.monotonic() + args.warmup_seconds
+        while time.monotonic() < t_end:
+            for _ in range(20):
+                fn()
+            torch.cuda.synchronize()
+        _HEATED[0] = True
     per_round: dict[str, list[float]] = {name: [] for name in names}
     for rnd in range(args.rounds):
-        order = names[rnd % len(names) :] + names[: rnd % len(names)]
+        # Rotate by an even share of the column count per round so every column visits the
+        # front, middle and back of the order (rotating by rnd alone leaves most of a long
+        # column list at fixed positions, and under the power cap position biases a column
+        # by up to 5%).
+        off = (rnd * len(names)) // max(args.rounds, 1)
+        order = names[off:] + names[:off]
         for name in order:
             fn = impls[name]
             tag = f"w8a16[{layer} tp{tp} M={m} N={n} K={k}] {name}"
+            saved = args.iters
+            args.iters = iters_by_name[name]
             t, _, _ = _time_kernel(args, lambda: fn(), tag)
+            args.iters = saved
             per_round[name].append(t)
     for name in names:
         us[name] = statistics.median(per_round[name])
@@ -531,27 +577,23 @@ def _ratio(num: float | None, den: float | None) -> str:
     return f"{r:7.3f}" if r < 0.1 else f"{r:7.2f}"
 
 
-def _kernel_variants(args) -> list[tuple[str, bool, str | None]]:
-    """(column name, prepared, algo) for every kernel column requested.  With
+def _kernel_variants(args) -> list[tuple[str, str | None]]:
+    """(column name, algo) for every kernel column requested.  With
     ``--algo a b ...`` the ``kernel`` column becomes one ``kernel:<algo>`` column per
     algo, all measured back to back on the same tensors (the fair way to compare
     variants under free-running clocks)."""
-    out: list[tuple[str, bool, str | None]] = []
+    out: list[tuple[str, str | None]] = []
     if "kernel" in args.impls:
         if args.algo:
-            out += [
-                (f"kernel:{a}", False, None if a == "auto" else a) for a in args.algo
-            ]
+            out += [(f"kernel:{a}", None if a == "auto" else a) for a in args.algo]
         else:
-            out.append(("kernel", False, None))
-    if "kernel_prep" in args.impls:
-        out.append(("kernel_prep", True, None))
+            out.append(("kernel", None))
     return out
 
 
 def _impl_cols(args) -> list[str]:
     cols = [i for i in ("cast", "cublas") if i in args.impls]
-    return cols + [name for name, _, _ in _kernel_variants(args)]
+    return cols + [name for name, _ in _kernel_variants(args)]
 
 
 def table_header(args) -> str:
@@ -594,7 +636,7 @@ def print_table(rows: list[Row], args) -> None:
 
 def write_csv(rows: list[Row], path: str, args) -> None:
     variants = [
-        name for name, _, _ in _kernel_variants(args) if name.startswith("kernel:")
+        name for name, _ in _kernel_variants(args) if name.startswith("kernel:")
     ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -682,8 +724,8 @@ def parse_args(argv=None):
     p.add_argument(
         "--impls",
         nargs="+",
-        default=["cast", "cublas", "kernel", "kernel_prep"],
-        choices=["cast", "cublas", "kernel", "kernel_prep"],
+        default=["cast", "cublas", "kernel"],
+        choices=["cast", "cublas", "kernel"],
     )
     p.add_argument("--iters", type=int, default=50)
     p.add_argument(
@@ -693,6 +735,19 @@ def parse_args(argv=None):
         help="interleaved passes over the implementations per row (median across passes)",
     )
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=0.0,
+        help="untimed burst before the first measurement of the process (reach the power cap)",
+    )
+    p.add_argument(
+        "--burst-seconds",
+        type=float,
+        default=0.0,
+        help="size each timed burst by time: iters = clamp(ceil(s / call time), 50, 5000); "
+        "0 = use --iters",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-l2-flush", dest="l2_flush", action="store_false")
     p.add_argument("--no-cupti", dest="cupti", action="store_false")
@@ -714,7 +769,7 @@ def parse_args(argv=None):
         nargs="+",
         default=None,
         help="one kernel:<algo> column per listed variant, measured back to back "
-        "(Blackwell: 2sm256x128 ...; Hopper: hand, cutlass_128x256, cutlass_128x192 ...); "
+        "(Blackwell: 2sm256x128 ...; Hopper: 128x256, 128x192 ...); "
         "default: a single kernel column with the launcher's model",
     )
     p.add_argument("--csv", type=str, default=None)

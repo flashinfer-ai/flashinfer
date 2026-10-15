@@ -52,12 +52,11 @@ def _w8a16_fp8_gemm_impl(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor],
-    weight_prepared: bool,
     workspace: Optional[torch.Tensor],
     algo: int,
 ) -> None:
     get_w8a16_fp8_gemm_module(act.device).w8a16_fp8_gemm(
-        out, act, weight, weight_scale, bias, weight_prepared, workspace, algo
+        out, act, weight, weight_scale, bias, workspace, algo
     )
 
 
@@ -68,7 +67,6 @@ def _w8a16_fp8_gemm_impl_fake(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor],
-    weight_prepared: bool,
     workspace: Optional[torch.Tensor],
     algo: int,
 ) -> None:
@@ -99,39 +97,40 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 }
 
 
+# Hopper kernel variants selectable through ``algo``: the variants on CUTLASS's mixed-input
+# mainloop (weight rows x activation rows per CTA tile, plus the stream-K and split-K
+# decompositions).  The codes are the W8A16Sm90Algo enum values in
+# include/flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh; code 1 was the retired
+# hand-written kernel and stays reserved.
+W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
+    "auto": 0,
+    "128x256": 2,
+    "128x192": 3,
+    "128x160": 4,
+    "128x128": 5,
+    "64x256": 6,
+    "128x256_streamk": 7,
+    "128x192_streamk": 8,
+    "64x128": 9,
+    "128x128_splitk": 10,
+    "128x256_splitk": 11,
+}
+
+
 def _algo_code(algo: Optional[str], device: torch.device) -> int:
     if algo is None or algo == "auto":
         return 0
-    if get_compute_capability(device)[0] != 10:
-        raise ValueError("algo is only selectable on Blackwell (sm_100a); use algo=None")
+    major = get_compute_capability(device)[0]
+    if major == 10:
+        table = W8A16_FP8_GEMM_ALGOS_SM100
+    elif major == 9:
+        table = W8A16_FP8_GEMM_ALGOS_SM90
+    else:
+        raise ValueError("algo is only selectable on Hopper / Blackwell; use algo=None")
     try:
-        return W8A16_FP8_GEMM_ALGOS_SM100[algo]
+        return table[algo]
     except KeyError:
-        raise ValueError(
-            f"unknown algo {algo!r}; one of {sorted(W8A16_FP8_GEMM_ALGOS_SM100)}"
-        ) from None
-
-
-def prepare_w8a16_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
-    r"""Return a copy of an FP8 ``[N, K]`` weight in the kernel's prepared layout.
-
-    Inside every 16-wide block of K the columns are reordered to
-    ``[2c, 2c+1, 2c+8, 2c+9]`` for ``c = 0..3``, which lets the kernel fetch a
-    whole wgmma A fragment with one ``ldmatrix``.  Shape, dtype and the
-    per-tensor scale are unchanged; the result is only valid with
-    ``w8a16_fp8_gemm(..., weight_prepared=True)``.  Do this once at load time.
-    """
-    if weight.dtype != torch.float8_e4m3fn or weight.dim() != 2:
-        raise ValueError("expected a 2-D float8_e4m3fn weight [N, K]")
-    k = weight.shape[1]
-    if k % 16 != 0:
-        raise ValueError(f"K must be a multiple of 16, got {k}")
-    base = torch.arange(0, k, 16, device=weight.device).repeat_interleave(16)
-    within = torch.tensor(
-        [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15], device=weight.device
-    ).repeat(k // 16)
-    perm = base + within
-    return weight.index_select(1, perm).contiguous()
+        raise ValueError(f"unknown algo {algo!r}; one of {sorted(table)}") from None
 
 
 @flashinfer_api
@@ -141,10 +140,16 @@ def w8a16_fp8_gemm(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    weight_prepared: bool = False,
     algo: Optional[str] = None,
 ) -> torch.Tensor:
-    r"""Linear layer with an FP8 e4m3 weight and a 16-bit activation (W8A16).
+    r"""bf16 / fp16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
+
+    The math is a plain 16-bit GEMM: the tensor cores run bf16 x bf16 or fp16 x
+    fp16 with fp32 accumulation, and the result is in ``act``'s dtype.  Nothing
+    e4m3 reaches an MMA instruction.  "fp8" in the name says how the weight is
+    *stored* (e4m3 plus one per-tensor scale, as opposed to the int8 of a plain
+    W8A16 scheme); the kernel converts it to the activation dtype on the way from
+    memory to the MMA.  Same reading as vLLM's ``CompressedTensorsW8A16Fp8``.
 
     ``out = act @ (weight.float() * weight_scale).T + bias``, computed with the
     weight dequantized inside the kernel; no 16-bit copy of the weight is
@@ -169,23 +174,23 @@ def w8a16_fp8_gemm(
     out: Optional[torch.Tensor]
         Optional output, shape ``(..., N)``, same dtype as ``act``.  Allocated
         when omitted.
-    weight_prepared: bool
-        ``True`` when ``weight`` came from :func:`prepare_w8a16_fp8_weight`
-        (opt-in ldmatrix fragment path).  ``False`` (default) takes the plain
-        checkpoint layout, which is also the faster path on H100 / H200.
 
     Notes
     -----
     Hopper (``sm_90a``: wgmma + TMA) and Blackwell (``sm_100a``: tcgen05 + TMA,
     a FlashInfer fork of CUTLASS's mixed-input mainloop).  ``K`` must be a
-    multiple of 64, ``N`` a multiple of 8, and ``act`` / ``weight`` / ``out``
-    16-byte aligned (the launcher rejects anything else).  On Hopper the
-    launcher picks the tile shape (128x256 or 128x128) and the split-K count
-    from a wave-fill cost model; a split run goes through an fp32 workspace that
-    this function allocates, otherwise one persistent block per SM walks the
-    tiles.  On Blackwell it picks one of three 2SM tiles (256 weight rows by
-    128, 192 or 256 activation rows) from the same kind of model; ``weight_prepared``
-    is Hopper-only there.
+    multiple of 16 and ``N`` a multiple of 8 (16-byte TMA rows), and ``act`` /
+    ``weight`` / ``out`` 16-byte aligned; anything else is rejected with a
+    ValueError before launch.  On Hopper the launcher picks a CUTLASS tile and
+    decomposition (plain, stream-K or split-K) from a cost model; split-K runs
+    go through an fp32 workspace that this function allocates.  On Blackwell it
+    picks one of the 2SM tiles from the same kind of model.
+    algo: Optional[str]
+        Pins one kernel variant instead of the launcher's choice (benchmarking):
+        a key of ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
+        ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
+        (``<weight rows>x<activation rows>[_streamk|_splitk]``).
+        ``None`` / ``"auto"`` = the launcher decides.
 
     Returns
     -------
@@ -204,8 +209,12 @@ def w8a16_fp8_gemm(
         raise ValueError(f"K mismatch: act[..., {k}] vs weight[{n}, {weight.shape[1]}]")
     if weight_scale.numel() != 1:
         raise ValueError("weight_scale is one per-tensor value")
-    if weight_prepared and get_compute_capability(act.device)[0] != 9:
-        raise ValueError("weight_prepared=True is a Hopper-only layout")
+    if k % 16 != 0:
+        raise ValueError(
+            f"K must be a multiple of 16 (16-byte TMA rows of fp8), got K={k}"
+        )
+    if n % 8 != 0:
+        raise ValueError(f"N must be a multiple of 8 (16-byte output rows), got N={n}")
     if weight_scale.dtype != torch.float32:
         weight_scale = weight_scale.to(torch.float32)
     weight_scale = weight_scale.reshape(1)
@@ -229,7 +238,5 @@ def w8a16_fp8_gemm(
         if ws_bytes > 0
         else None
     )
-    _w8a16_fp8_gemm_impl(
-        out2d, act2d, weight, weight_scale, bias, weight_prepared, workspace, algo_code
-    )
+    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, workspace, algo_code)
     return out
