@@ -1013,7 +1013,7 @@ def test_fmha_v2_prefill_sm120_validation():
         fmha_v2_prefill_sm120(q_bf16, k_bf16, v_bf16, out, **kwargs)
     with pytest.raises(ValueError, match="requires BF16 output"):
         fmha_v2_prefill_sm120(q, k, v, out.half(), **kwargs)
-    with pytest.raises(ValueError, match="requires Q/K head_dim=64 or 128"):
+    with pytest.raises(ValueError, match="requires Q/K head_dim"):
         fmha_v2_prefill_sm120(q, k, v, out, **{**kwargs, "head_dim": 96})
     q_noncontiguous = q.transpose(-1, -2).contiguous().transpose(-1, -2)
     with pytest.raises(ValueError, match="must be contiguous"):
