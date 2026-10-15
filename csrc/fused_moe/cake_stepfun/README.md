@@ -263,8 +263,10 @@ router, or fp32 / bf16 pre-computed weights; `expert_weights_dtype` of the
 kernel must match the forward's `mDtypeExpW`) into `output[T, hidden_dim]`,
 skipping `expanded_idx_to_permuted_idx == -1`. Two variants with the native
 dispatcher's rule: the `scalar` kernel (grid `(ceil(hidden_dim / 256),
-min(8192, T))`) when that grid has fewer than 1184 CTAs, the `vector` kernel
-(grid `(T)`, 128-bit loads, `top_k <= max_top_k`) otherwise. DeepSeek FP8
+min(8192, T))`, exactly `top_k == max_top_k` = 8 index / weight slots per
+token) when that grid has fewer than 1184 CTAs, the `vector` kernel (grid
+`(T)`, 128-bit loads, `top_k % 4 == 0` and `top_k <= max_top_k`) otherwise.
+DeepSeek FP8
 (dequantization scales) and an expert-weight dtype without an exported kernel
 are rejected (the error names the variant and dtype).
 

@@ -684,9 +684,19 @@ void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
                    expertWeightsName, " expert weights (hidden_dim=", data.hiddenDim,
                    ", num_tokens=", data.numTokens,
                    "; the generated inventory has no finalize variant for that dtype)");
-  FLASHINFER_CHECK(spec->max_top_k <= 0 || data.topK <= spec->max_top_k,
-                   "Cake StepFun finalize kernel ", spec->symbol,
-                   " supports top_k <= ", spec->max_top_k, ", got ", data.topK);
+  // The scalar kernel keeps exactly max_top_k index / weight slots per token in registers and
+  // carries no device-side check, so its record names the exact top_k it serves; the vector
+  // kernel unrolls top_k by four up to max_top_k (the source's asserts).
+  if (variant == generated::FinalizeVariant::kScalar) {
+    FLASHINFER_CHECK(data.topK == spec->max_top_k, "Cake StepFun scalar finalize kernel ",
+                     spec->symbol, " serves exactly top_k == ", spec->max_top_k, ", got ",
+                     data.topK);
+  } else {
+    FLASHINFER_CHECK(data.topK % 4 == 0 && data.topK <= spec->max_top_k,
+                     "Cake StepFun vector finalize kernel ", spec->symbol,
+                     " supports top_k % 4 == 0 and top_k <= ", spec->max_top_k, ", got ",
+                     data.topK);
+  }
   FLASHINFER_CHECK(variant == generated::FinalizeVariant::kScalar || data.hiddenDim % 8 == 0,
                    "Cake StepFun vector finalize needs an output row width that is a whole number "
                    "of 16-byte chunks, got hidden_dim=",

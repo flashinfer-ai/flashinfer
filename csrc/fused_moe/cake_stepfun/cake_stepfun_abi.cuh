@@ -269,7 +269,9 @@ struct FinalizeKernelSpec {
   // bf16; pre-computed top-k weights arrive in either dtype). The host selects the kernel whose
   // variant and dtype match the forward.
   int expert_weights_dtype;
-  int max_top_k;  // kVector: largest top_k the unit supports; kScalar: 0 (unbounded)
+  // kVector: largest top_k the unit supports (top_k % 4 == 0); kScalar: the exact top_k the unit
+  // serves (it keeps that many index / weight slots per token in registers).
+  int max_top_k;
   uint32_t block[3];
   size_t dynamic_smem_bytes;
   ConfigureFn configure;
