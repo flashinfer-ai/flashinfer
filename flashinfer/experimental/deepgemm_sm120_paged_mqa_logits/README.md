@@ -25,15 +25,39 @@ real schedule.
 
 ## Shipped programs and routes
 
-Routes are selected from host-known scalars only — head count, page size and
-`next_n` — and named `sm120:fp8:h<H>:p<page_kv>:n<next_n>`:
+Routes are selected from host-known scalars only — head count, page size,
+`next_n` and the batch `B = context_lens.shape[0]` — and named
+`sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>`, where `a<atom>` is the Q-atom
+variant (tokens per Q atom) the catalog's `atom_rule` selects from
+`(H, next_n, B)`:
 
 | heads | page_kv | next_n | model |
 |---|---|---|---|
 | 32 | 128, 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V4.1-Flash decode |
 | 64 | 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V3.2 decode |
 
-`route_available(num_heads, page_kv, next_n)` answers on the host; there is no
+Q-atom variant per batch class (`atom_rule.batch_class_min = [1, 2, 9, 128]`:
+`B = 1`, `2 <= B <= 8`, `9 <= B < 128`, `B >= 128`; a request is scored from
+`ceil(next_n / atom)` atoms, each atom streaming the KV once):
+
+| next_n | heads | `B = 1` | `2 <= B <= 8` | `9 <= B < 128` | `B >= 128` |
+|---|---|---|---|---|---|
+| 1 | 32, 64 | `a1` (1 atom) | `a1` | `a1` | `a1` |
+| 2 | 32, 64 | `a2` (1 atom) | `a2` | `a2` | `a2` |
+| 3 | 32, 64 | `a3` (1 atom) | `a2` (2 atoms) | `a3` (1 atom) | `a3` |
+| 4 | 32, 64 | `a2` (2 atoms) | `a2` (2 atoms) | `a4` (1 atom) | `a4` |
+| 5, 6 | 32 | `a2` (3 atoms) | `a2` (3 atoms) | `a5` / `a6` (1 atom) | `a5` / `a6` |
+| 5, 6 | 64 | `a2` (3 atoms) | `a2` (3 atoms) | `a2` (3 atoms) | `a3` (2 atoms) |
+
+Small batches keep DeepGEMM's 2-token atomization (work-item balance across
+the SMs), except a single 3-token request, whose one native atom streams the
+KV once with nothing left to balance; the 64-head 5-/6-token atom exceeds the
+256-row TMA Q box, so those geometries run two 3-token atoms from batch 128 up.
+The table is data in the catalog, derived by the exporter from the kernel's
+own rule.
+
+`route_available(num_heads, page_kv, next_n[, batch])` answers on the host
+(without `batch`: whether any variant of the geometry ships); there is no
 fallback for an unsupported configuration. The scheduler program is shared by
 every route (route `sm120:metadata`).
 
@@ -88,7 +112,9 @@ from flashinfer.sm120_paged_mqa_logits import (
     get_paged_mqa_logits_metadata,
 )
 
-meta = get_paged_mqa_logits_metadata(context_lens_2d, page_kv, num_sms)  # int32 [num_sms + 1, 2], real launch
+meta = get_paged_mqa_logits_metadata(
+    context_lens_2d, page_kv, num_sms, num_heads=q.shape[2]
+)  # int32 [num_sms + 1, 2], real launch
 logits = fp8_paged_mqa_logits(
     q, kv_cache, weights, context_lens_2d, block_table, meta, max_context_len
 )  # FP32 [B * next_n, max_context_len]
@@ -98,10 +124,15 @@ These mirror the `deep_gemm` calls a DeepSeek-V3.2 serving engine makes, so a
 caller switches backends without re-shaping its tensors. `schedule_meta` fixes
 the CTA budget through its first dimension (`None` selects the device's SM
 count) and is rebuilt in the same sequence before the logits program reads it,
-so the one-shot entry is self-contained. `clean_logits=True` is rejected for
-two-dimensional context lengths exactly as DeepGEMM does, and `indices`
-(variable-length request selection) must be `None` — that scheduling branch is
-not ported.
+so the one-shot entry is self-contained. `num_heads` is optional on the
+metadata entry: the schedule's item count is the Q-atom count of
+`(num_heads, next_n, B)`, and the head count is required only where the two
+exported head counts select different schedules — `next_n` 5 and 6 at
+`B > 8` — in which case the `ValueError` names it; for `next_n` 1–4 and for
+every `B <= 8` the DeepGEMM-shaped call without `num_heads` is exact.
+`clean_logits=True` is rejected for two-dimensional context lengths exactly as
+DeepGEMM does, and `indices` (variable-length request selection) must be
+`None` — that scheduling branch is not ported.
 
 ## Architecture targets
 
@@ -114,6 +145,32 @@ capability to pick targets. FlashInfer normalises capability 12.0 to the `f`
 suffix on CUDA >= 12.9 and to `a` on 12.8, so either entry admits the family.
 `sm_121a` (DGX Spark / GB10) has the same instruction surface but needs its own
 cubin and its own measured denominator; it is not shipped yet.
+
+## Measured against DeepGEMM (2026-10-15, Cake `32a558c2`)
+
+Cake / DeepGEMM kernel time (`bench_gpu_time`, CUPTI, cold L2, interleaved pairs; DeepGEMM `yyihuang/DeepGEMM@79a4ef3b` on the same device and clocks), geometric mean over the 12 (batch, context) rows of each program ((batch, average context) = (1, 16K), (8, 4K), (8, 16K), (8, 64K), (32, 16K), (32, 64K), (64, 4K), (64, 16K), (128, 16K), (128, 64K), (256, 4K), (256, 16K); 216 rows per device). `faster` counts rows with ratio < 1 and a bootstrap 95 % CI upper bound <= 1; `tie` counts rows within 0.5 % whose CI contains 1 (all of them on the DeepGEMM-identical schedules). Logits are bitwise-identical to DeepGEMM on every row of both devices.
+
+| program | RTX 5090 Cake/DG | RTX 5090 faster / tie / slower | RTX PRO 6000 Cake/DG | RTX PRO 6000 faster / tie / slower |
+|---|---:|---:|---:|---:|
+| `h32p128n1` | 0.995 | 9 / 3 / 0 | 0.997 | 10 / 0 / 2 |
+| `h32p128n2` | 0.991 | 11 / 0 / 1 | 0.995 | 11 / 1 / 0 |
+| `h32p128n3` | 0.726 | 12 / 0 / 0 | 0.775 | 12 / 0 / 0 |
+| `h32p128n4` | 0.745 | 11 / 0 / 1 | 0.781 | 12 / 0 / 0 |
+| `h32p128n5` | 0.649 | 12 / 0 / 0 | 0.712 | 12 / 0 / 0 |
+| `h32p128n6` | 0.688 | 12 / 0 / 0 | 0.713 | 12 / 0 / 0 |
+| `h32p64n1` | 0.996 | 9 / 2 / 1 | 0.998 | 11 / 1 / 0 |
+| `h32p64n2` | 0.991 | 10 / 0 / 2 | 0.993 | 12 / 0 / 0 |
+| `h32p64n3` | 0.729 | 12 / 0 / 0 | 0.774 | 12 / 0 / 0 |
+| `h32p64n4` | 0.753 | 11 / 0 / 1 | 0.783 | 12 / 0 / 0 |
+| `h32p64n5` | 0.646 | 12 / 0 / 0 | 0.697 | 12 / 0 / 0 |
+| `h32p64n6` | 0.686 | 12 / 0 / 0 | 0.707 | 12 / 0 / 0 |
+| `h64p64n1` | 0.988 | 11 / 1 / 0 | 0.994 | 11 / 0 / 1 |
+| `h64p64n2` | 0.993 | 10 / 1 / 1 | 0.995 | 7 / 3 / 2 |
+| `h64p64n3` | 0.763 | 12 / 0 / 0 | 0.763 | 12 / 0 / 0 |
+| `h64p64n4` | 0.921 | 11 / 0 / 1 | 0.801 | 10 / 1 / 1 |
+| `h64p64n5` | 0.888 | 12 / 0 / 0 | 0.889 | 12 / 0 / 0 |
+| `h64p64n6` | 0.949 | 10 / 0 / 2 | 0.919 | 8 / 0 / 4 |
+| **all 18 programs** | 0.828 | 199 / 7 / 10 | 0.841 | 200 / 6 / 10 |
 
 ## Layout
 
@@ -128,28 +185,33 @@ pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
 python benchmarks/bench_sm120_paged_mqa_logits.py
 ```
 
-The test covers every shipped `next_n`, both head counts and both page sizes
-against a dequantized PyTorch reference and an independent Python mirror of the
-schedule,
-the `clean_logits=False` write extent, the padded block-stride cache view, CUDA
-Graph replay with changed contents, one-shot/plan equivalence and the
-architecture-target gate. It skips on devices without catalogued programs.
+The test covers every shipped `(heads, page_kv, next_n, atom)` program — both
+variants of a geometry through a small-batch and a large-batch case — against
+a dequantized PyTorch reference and an independent Python mirror of the
+schedule, the `clean_logits=False` write extent, the padded block-stride cache
+view, CUDA Graph replay with changed contents, one-shot/plan equivalence, the
+head-count rule of the metadata entry and the architecture-target gate. It
+skips on devices without catalogued programs.
 
 ## Catalog schema `sm120_paged_mqa.v1`
 
 `sm120_paged_mqa_catalog.json` carries `arches`, `policy`, `programs` and
 `routes`. Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
-`next_n`, `split_kv` (128 for every exported program, which is why the metadata
-entry keeps DeepGEMM's head-count-free signature), `next_n_atoms` (the Q-atom
-rule, a function of `next_n` only: one atom per request for `next_n` 1–4 — 1
-and 2 pair the tokens as DeepGEMM does, 3 and 4 score the whole request from
-one atom where DeepGEMM runs two — and DeepGEMM's three 2-token atoms for 5
-and 6), `max_batch` (the scheduler's shared-memory request
+`next_n`, `split_kv` (128 for every exported program, so the metadata entry
+needs no page size), `atom_rule` (the Q-atom selection rule as data:
+`batch_class_min` — the first batch of every batch class, the last class open
+up to `max_batch` —, `selection["h<H>:n<N>"]` — the variant `a<atom>` per
+class — and `num_atoms["n<N>:a<A>"]` — the schedule's `num_next_n_atoms` per
+variant; the runtime evaluates it with `atom_variant` / `next_n_atoms` and
+never needs the producer), `max_batch` (the scheduler's shared-memory request
 ceiling), `logits_stride_alignment` (`[128, 256]`), `clean_logits` (`"raw"`),
 `metadata_program`, `metadata_route`, `threads` and per-program `programs`
-records (tile size, group count, KV stages, atoms, shared-memory bytes). A
-program record carries `kind` (`"module"` or `"sequence"`), `role`, `sources`,
-`standalone`, `compile_flags`, `ffi_entry`, `arg_plan` and the per-architecture
+records keyed `h<H>:p<P>:n<N>:a<A>` (`atom_variant`, `atom_tokens`,
+`next_n_atom`, `num_atoms`, `last_atom_tokens`, `num_q_stages`, `hoist_b`,
+tile size, group count, KV stages, shared-memory bytes). A program record
+carries `kind` (`"module"` or `"sequence"`), `role`, `sources`, `standalone`,
+`compile_flags`, `ffi_entry`, `arg_plan` and the per-architecture
 `closure_sha256`. Every route record has `stages` (`[[stage, program], ...]`),
 `sequence` (the prepared-sequence binding, `null` for the metadata route),
-`kernel_launches`, `num_heads`, `page_kv`, `next_n` and `clean_logits`.
+`kernel_launches`, `num_heads`, `page_kv`, `next_n`, `next_n_atom`,
+`atom_variant` and `clean_logits`.
