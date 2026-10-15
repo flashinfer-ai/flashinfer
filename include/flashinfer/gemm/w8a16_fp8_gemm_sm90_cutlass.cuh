@@ -771,23 +771,11 @@ inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
 // The hand kernel is left with 8 of the 144 rows.  128x192 / 128x160 never win a row (the
 // register-sourced mainloop converts the weight once per activation tile, so narrower
 // tiles convert more per flop); they stay `algo`-only.
-// Version H7 step 3.1: split count of the CUTLASS split-K variants, the hand kernel's cost
-// model ported as-is (w8a16_fp8_gemm.cuh, W8A16Fp8GemmModelTime / W8A16Fp8GemmSplits): time
-// of a tile = waves of (tiles x splits) blocks, each a tile x K/splits mainloop at the tile's
-// relative efficiency, plus, when it splits, a fixed launch-and-tail term and a bandwidth
-// term per fp32 partial element.  Splits are a whole number of 64-deep k-tiles, at least
-// 8 per split, at most 8 splits.  FLASHINFER_W8A16_FP8_SM90_SPLITS pins a count (read once).
+// Split-K slicing: a whole number of 64-deep k-tiles per slice, all slices equal, at least
+// 8 k-tiles each, at most 8 slices.  FLASHINFER_W8A16_FP8_SM90_SPLITS pins a count (read
+// once).  The count itself comes from the cost model (W8A16Sm90SplitUs).
 constexpr int kW8A16Sm90MaxSplits = 8;
 constexpr int kW8A16Sm90MinKTilesPerSplit = 8;
-inline double W8A16Sm90SplitModelTime(int M, int N, int K, int num_sms, int tile_w, int tile_a,
-                                      double eff, int splits) {
-  const double tiles = static_cast<double>((M + tile_a - 1) / tile_a) * ((N + tile_w - 1) / tile_w);
-  const double waves = std::ceil(tiles * splits / std::max(num_sms, 1));
-  double t = waves * tile_w * tile_a * (static_cast<double>(K) / splits) / eff;
-  if (splits > 1) t += 24.0e6 + 8.0 * static_cast<double>(M) * N * splits;
-  return t;
-}
-
 inline int W8A16Sm90SplitsEnv() {
   static const int v = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_SPLITS");
@@ -808,16 +796,18 @@ inline int W8A16Sm90LegalSplits(int K, int want) {
   return 1;
 }
 
+// Split count for a split-K variant over tile (tile_w x tile_a): the s with the smallest
+// cost-model time (see W8A16Sm90PickByCost for the terms), partials capped.
+inline double W8A16Sm90SplitUs(int M, int N, int K, int num_sms, int tile_w, int tile_a, int s);
 inline int W8A16Sm90PickSplits(int M, int N, int K, int num_sms, int tile_w, int tile_a) {
-  const double eff = tile_a == 256 ? 0.70 : 0.65;  // the hand model's 128x256 / 128x128
   if (const int e = W8A16Sm90SplitsEnv()) return W8A16Sm90LegalSplits(K, e);
   int best = 1;
-  double best_t = W8A16Sm90SplitModelTime(M, N, K, num_sms, tile_w, tile_a, eff, 1);
+  double best_us = 1e30;
   for (int s = 2; s <= kW8A16Sm90MaxSplits; ++s) {
     if (W8A16Sm90LegalSplits(K, s) != s) continue;
-    const double t = W8A16Sm90SplitModelTime(M, N, K, num_sms, tile_w, tile_a, eff, s);
-    if (t < best_t) {
-      best_t = t;
+    const double us = W8A16Sm90SplitUs(M, N, K, num_sms, tile_w, tile_a, s);
+    if (us < best_us) {
+      best_us = us;
       best = s;
     }
   }
@@ -834,6 +824,105 @@ inline int W8A16Sm90SplitsFor(int M, int N, int K, int num_sms, int tile_w, int 
   return 1;
 }
 
+// Version H7 step 3.2: ONE cost model for M <= 8192 over the CUTLASS menu (the hand kernel
+// is no longer a candidate).  Each candidate's time, in us, from three terms fitted to the
+// Cosmos3 grid at M = 1024 / 2048 / 4096 / 8192 (all 9 variants pinned, 50 launches x 3
+// rotated rounds, two runs, ipp2-0073, Thu 15 Oct 2026):
+//  * per tile: c_tile * K (+ an epilogue of 2 us x activation rows / 256 for the cooperative
+//    tiles; the ping-pong 64-row tiles overlap it with the sibling tile's mainloop).  c_tile is
+//    the measured time per K of one tile alone on an SM: 128x256 11.37 ns, 128x192 9.00,
+//    128x128 7.45, 64x256 6.15, 64x128 4.50 (a ping-pong SM runs two of its tiles in that
+//    time, so its tile count is still divided by the SM count, not twice it).
+//  * plain tiles: ceil(tiles / SMs) waves of that.
+//  * stream-K: CUTLASS's own decomposition (get_num_sk_tiles / get_num_sk_units): data-
+//    parallel when there is no quantisation, K has <= 8 k-tiles, or the tail is >= half a
+//    wave; else the last up-to-two waves of tiles are cut into equal k-iteration units over
+//    min(SMs, sk k-tiles / 8) CTAs, at 1.1x the per-iteration cost, + 8 us fixed + 2 us per
+//    peer per tile (the fix-up).
+//  * split-K s (equal slices of >= 8 k-tiles, <= 8): ceil(tiles x s / SMs) waves of a K/s
+//    tile + 2 us + 2e-6 us per fp32 partial element (write + reduce read); the partials are
+//    capped at kW8A16Sm90MaxPartialsBytes.
+// Picks within 2% of the per-cell best variant (8% above 300 us, the bench's measured run-to-
+// run spread there) on 94 of 96 cells; geomean pick / best 1.0055.
+constexpr long long kW8A16Sm90MaxPartialsBytes = 64LL << 20;
+struct W8A16Sm90TileCost {
+  W8A16Sm90Algo algo;
+  int tile_w, tile_a;
+  double ns_per_k;
+  bool pingpong;
+};
+inline double W8A16Sm90TileUs(const W8A16Sm90TileCost& t, double k_len) {
+  const double epi = t.pingpong ? 0.0 : 2.0 * t.tile_a / 256.0;
+  return t.ns_per_k * 1e-3 * k_len + epi;
+}
+inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
+  using A = W8A16Sm90Algo;
+  static constexpr W8A16Sm90TileCost kPlain[] = {{A::kCutlass128x256, 128, 256, 11.37, false},
+                                                 {A::kCutlass128x192, 128, 192, 9.00, false},
+                                                 {A::kCutlass128x128, 128, 128, 7.45, false},
+                                                 {A::kCutlass64x256, 64, 256, 6.15, true},
+                                                 {A::kCutlass64x128, 64, 128, 4.50, true}};
+  const double sms = std::max(num_sms, 1);
+  const int ktiles = K / 64;
+  auto tiles_of = [&](const W8A16Sm90TileCost& t) {
+    return static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
+           static_cast<double>((M + t.tile_a - 1) / t.tile_a);
+  };
+  A best = A::kCutlass128x256;
+  double best_us = 1e30;
+  auto consider = [&](A a, double us) {
+    if (us < best_us) {
+      best_us = us;
+      best = a;
+    }
+  };
+  for (const auto& t : kPlain)
+    consider(t.algo, std::ceil(tiles_of(t) / sms) * W8A16Sm90TileUs(t, K));
+  // Stream-K over 128x256 / 128x192.
+  for (int i = 0; i < 2; ++i) {
+    const auto& t = kPlain[i];
+    const double tiles = tiles_of(t);
+    const double per_tile = W8A16Sm90TileUs(t, K);
+    const double full = std::floor(tiles / sms), total = std::ceil(tiles / sms);
+    const double tail = tiles - full * sms;
+    double us;
+    if (full == total || ktiles <= 8 || (full >= 1 && 2 * tail >= sms)) {
+      us = total * per_tile;
+    } else {
+      const double dp_waves = full > 1 ? full - 1 : 0;
+      const double sk_tiles = tiles - dp_waves * sms;
+      const double units = std::max(1.0, std::min(sms, std::floor(sk_tiles * ktiles / 8.0)));
+      us = dp_waves * per_tile + sk_tiles * ktiles / units * (per_tile / ktiles) * 1.1 + 8.0 +
+           2.0 * units / sk_tiles;
+    }
+    consider(i == 0 ? A::kCutlass128x256StreamK : A::kCutlass128x192StreamK, us);
+  }
+  // Split-K over 128x128 / 128x256.
+  for (int i : {2, 0}) {
+    const auto& t = kPlain[i];
+    for (int s = 2; s <= kW8A16Sm90MaxSplits; ++s) {
+      if (W8A16Sm90LegalSplits(K, s) != s) continue;
+      consider(i == 2 ? A::kCutlass128x128SplitK : A::kCutlass128x256SplitK,
+               W8A16Sm90SplitUs(M, N, K, num_sms, t.tile_w, t.tile_a, s));
+    }
+  }
+  return best;
+}
+
+inline double W8A16Sm90SplitUs(int M, int N, int K, int num_sms, int tile_w, int tile_a, int s) {
+  if (4LL * M * N * s > kW8A16Sm90MaxPartialsBytes) return 1e30;  // partials capped
+  const W8A16Sm90TileCost t =
+      tile_a == 256
+          ? W8A16Sm90TileCost{W8A16Sm90Algo::kCutlass128x256SplitK, 128, 256, 11.37, false}
+          : W8A16Sm90TileCost{W8A16Sm90Algo::kCutlass128x128SplitK, 128, 128, 7.45, false};
+  (void)tile_w;
+  const double tiles = static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
+                       static_cast<double>((M + t.tile_a - 1) / t.tile_a);
+  return std::ceil(tiles * s / std::max(num_sms, 1)) *
+             W8A16Sm90TileUs(t, static_cast<double>(K) / s) +
+         2.0 + 2e-6 * static_cast<double>(M) * N * s;
+}
+
 inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int algo = 0) {
   const W8A16Sm90Algo forced = W8A16Sm90AlgoFromCode(algo);
   if (forced != W8A16Sm90Algo::kAuto) return forced;
@@ -843,49 +932,8 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   const long long units = 1LL * ((N + 127) / 128) * ((M + 255) / 256);
   const double waves = static_cast<double>(units) / std::max(num_sms, 1);
   const double frac = waves - std::floor(waves);
-  // Version H7 (small M, M <= 4096), refitted with the 64x128 ping-pong tile on the menu
-  // (Thu 15 Oct 2026: 24 rows x M = 1..2048, 5 rotated rounds x 2 passes, plus every
-  // 1-2 wave cell of the 24 rows at M = 256..4096 with all variants pinned; 267 cells, none
-  // more than 3% behind the per-cell best).  Mechanisms, in order:
-  //  * 64x128 when its grid (64-row weight tiles x 128-row activation tiles) is 80-128
-  //    tiles, i.e. 0.6-1.0 of a wave, with M >= 128 and K <= 5120, or any M at K <= 1024:
-  //    one tile per SM, no split overhead (und.kv tp1 / und.q tp8 at M = 1024: 0.80 of hand,
-  //    attn.out tp4 at M = 128: 0.66).  Long K and M < 128 go to split-K instead.
-  //  * hand (split-K over up to 8 blocks per tile + fp32 reduce) when the 128x256 grid is at
-  //    most one wave at M <= 512: the CUTLASS tiles leave most SMs idle there (mlp.down tp1
-  //    M = 1: 64x256 229 us, hand 82 us, cuBLAS 104 us).  Short K (<= 3200) at M = 129-256
-  //    has too few K slabs to split and falls through to 64x256.  At M <= 128 the same
-  //    holds up to 2 waves (mlp.gate_up tp1).
-  //  * 1-2 waves: K <= 1024 -> 64x256 (two tiles in flight hide the short mainloop's
-  //    epilogue); a last 128x256 wave >= 0.8 full -> 128x256; else 64x256 when its own last
-  //    wave is >= 0.6 full; else, up to 1.3 waves, stream-K for K >= 4096 (64x256 below);
-  //    else 128x256.  The hand kernel no longer wins anywhere in 1-2 waves: its split model
-  //    picks no split there and it runs as a plain 128x256 (the 1.4-1.6 window of the first
-  //    H7 fit was within 1% of 128x256 on every edge and in-band cell re-measured).
-  if (M <= 4096) {
-    const long long tiles_64x128 = 1LL * ((N + 63) / 64) * ((M + 127) / 128);
-    const double tw = static_cast<double>(tiles_64x128) / std::max(num_sms, 1);
-    if (M <= 2048 && tw >= 0.6 && tw <= 1.0 && ((M >= 128 && K <= 5120) || K <= 1024))
-      return W8A16Sm90Algo::kCutlass64x128;
-    if (M <= 512 && waves <= 1.0 && !(K <= 3200 && M > 128 && M <= 256))
-      return W8A16Sm90Algo::kHand;
-    // At M <= 128 the activation tile is mostly empty and the time is the weight stream;
-    // splitting K wins at any wave count up to 2 (mlp.gate_up tp1, 1.5 waves at M = 1-128:
-    // hand 0.74-1.15 of cuBLAS, 128x256 1.20-1.38).
-    if (M <= 128 && waves < 2.0) return W8A16Sm90Algo::kHand;
-    if (N <= 512 && units <= 32) return W8A16Sm90Algo::kHand;
-    if (waves > 1.0 && waves < 2.0) {
-      const double frac64 = 2.0 * waves - std::floor(2.0 * waves);
-      if (K <= 1024) return W8A16Sm90Algo::kCutlass64x256;
-      if (frac >= 0.8) return W8A16Sm90Algo::kCutlass128x256;
-      if (frac64 >= 0.6) return W8A16Sm90Algo::kCutlass64x256;
-      if (waves <= 1.3)
-        return K >= 4096 ? W8A16Sm90Algo::kCutlass128x256StreamK : W8A16Sm90Algo::kCutlass64x256;
-      return W8A16Sm90Algo::kCutlass128x256;
-    }
-  }
+  if (M <= 8192) return W8A16Sm90PickByCost(M, N, K, num_sms);
   if (N <= 512) {
-    if (units <= 32 && M <= 4096) return W8A16Sm90Algo::kHand;
     if (waves < 0.75) return W8A16Sm90Algo::kCutlass128x128;
     // Version H4: und.kv tp2-8 at M = 44160 / 88320 (2-4 weight tiles, 0.2-0.7 ms): the
     // 128x192 tile is 0.93-1.03 of cuBLAS where 128x256 is 0.97-1.10 (free-running, 3

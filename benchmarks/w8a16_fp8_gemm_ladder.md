@@ -958,6 +958,33 @@ hand model picks 3 splits there and 400 / 200 k-tiles do not divide by 3, so the
 cannot run it; the next step is unequal slices or a (tile, k-range) work-unit scheduler.
 Details: `hopper-mail/step3_1_splitk.md`.
 
+**Scope change (Thu 15 Oct 2026):** Cosmos shapes at M in {1024, 2048, 4096, 8192, 44160, 88320}
+only; everything below M = 1024 is out of scope, and the bench recipe is 50 launches x 3 rotated
+rounds, one pass, all columns.  The narrow-activation tiles of the first step-3.2 plan (128x16 /
+32 / 64, 64x16 / 32, a 128-deep k-slab and a weight-multicast pair, all split-K) were instanced and
+matched the hand kernel's numerics on five shapes, but are not landed: they target M <= 64.  The
+probe patch is kept in `h4-parked/step3_2_narrow_tiles_probe.patch`.
+
+**Step 3.2: one cost model for auto at M <= 8192** (`W8A16Sm90PickByCost`, replacing the twelve
+threshold branches; the hand kernel is no longer an `auto` candidate).  Each candidate (5 plain
+tiles, 2 stream-K, 2 split-K x splits) gets a time from: c_tile x K per tile (measured ns per K of
+one tile alone on an SM: 128x256 11.37, 128x192 9.00, 128x128 7.45, 64x256 6.15, 64x128 4.50) plus a
+2 us x A/256 epilogue for the cooperative tiles; plain tiles in ceil(tiles / SMs) waves; stream-K
+with CUTLASS's own decomposition (data-parallel unless the last wave is under half full, then the
+last up-to-two waves in equal k-iteration units over min(SMs, k-tiles / 8) CTAs) at 1.1x per
+iteration + 8 us + 2 us per peer; split-K s in ceil(tiles x s / SMs) waves of a K/s tile + 2 us +
+2e-6 us per fp32 partial element, partials capped at 64 MB.  The split-K variants take their split
+count from the same model.  Fit (two runs, 96 cells, all 9 variants pinned, `s32m_*` / `s32m2_*`):
+the pick is within noise of the per-cell best variant on 94 of 96.
+
+Result (`s32c_*`): auto within 1.02 of cuBLAS on 41 of 96 cells (was 31); at or under cast-copy on
+96 of 96.  The 1.02 bar is not reachable with this menu: a perfect per-cell pick gets 36-42 of 96.
+The remaining classes are narrow N under a wave (und.kv / und.q tp8 / gen.qkv tp8: 1.07-1.24 with
+the best variant; cuBLAS uses a 64 x 16-64 tile with clusters there), the 1-2 wave band at M = 1024
+(1.08-1.19), and the big rows at 2-6 waves (1.05-1.15).  At this recipe the same pinned variant on a
+300+ us kernel moves 5-15% between runs, so single-cell differences of that size are not read as
+regressions.  M >= 44160 runs the H6 rules unchanged.  Table: `hopper-mail/step3_2_costmodel.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
