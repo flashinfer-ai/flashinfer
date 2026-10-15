@@ -31,6 +31,9 @@ IMBALANCE_COMM_SMS = {
     (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}},
 }
 IMBALANCE_THRESHOLDS = {"bf16": 4.0, "mxfp8": 2.7}
+# The BF16 threshold under the single-precision name of the first imbalance
+# split revision; kept so callers written against that name keep working.
+IMBALANCE_THRESHOLD = IMBALANCE_THRESHOLDS["bf16"]
 
 # Fixed (forward, backward) communication-SM split for ``fwd_num_comm_sms="auto"``
 # / ``bwd_num_comm_sms="auto"``, keyed by device compute capability, SM count,

@@ -557,6 +557,7 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
         (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}}
     }
     assert mok.IMBALANCE_THRESHOLDS == {"bf16": 4.0, "mxfp8": 2.7}
+    assert mok.IMBALANCE_THRESHOLD == mok.IMBALANCE_THRESHOLDS["bf16"]
     assert mok.resolve_imbalance_threshold("bf16") == config.imbalance_threshold
     assert mok.resolve_imbalance_threshold("mxfp8") == 2.7
     with pytest.raises(ValueError, match="precision must be one of"):
