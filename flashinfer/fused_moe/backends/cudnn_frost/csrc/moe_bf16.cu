@@ -158,20 +158,18 @@ void tensor(TensorView t, DLDevice device, DLDataType dtype, std::initializer_li
   TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(t.data_ptr()) % alignment, 0);
 }
 
-class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
+class CudnnFrostMoeRunner final : public tvm::ffi::ModuleObj {
  public:
-  CudnnFrostMoePlan(Function fc1, Function fc2, int64_t tokens, int64_t hidden,
-                    int64_t intermediate, int64_t experts, int64_t topk, int device,
-                    size_t scratch1, size_t scratch2, bool gated, Array<int64_t> tail, bool swap1,
-                    bool swap2, bool fma)
+  CudnnFrostMoeRunner(Array<Function> fc1, Array<Function> fc2, int64_t hidden,
+                      int64_t intermediate, int64_t experts, int64_t topk, int device,
+                      size_t scratch1, size_t scratch2, bool gated, Array<int64_t> tail, bool swap1,
+                      bool swap2, bool fma)
       : fc1_(std::move(fc1)),
         fc2_(std::move(fc2)),
-        t_(tokens),
         h_(hidden),
         i_(intermediate),
         e_(experts),
         k_(topk),
-        s_(tokens * topk),
         device_{kDLCUDA, device},
         scratch1_(scratch1),
         scratch2_(scratch2),
@@ -179,45 +177,13 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
         tail_(std::move(tail)),
         swap1_(swap1),
         swap2_(swap2),
-        fma_(fma),
-        problem1_{s_, i_,          h_, e_, e_,          h_, 1, s_ * h_, h_,
-                  1,  2 * i_ * h_, h_, 1,  2 * i_ * h_, i_, 1, s_ * i_},
-        problem2_{s_, h_, i_, e_, e_, i_, 1, s_ * i_, i_, 1, h_ * i_, h_, 1, s_ * h_} {
-    if (swap1_)
-      problem1_ = Array<int64_t>{i_, s_,          h_, e_, e_,      h_, 1,  2 * i_ * h_, h_,
-                                 1,  2 * i_ * h_, h_, 1,  s_ * h_, 1,  i_, s_ * i_};
-    if (!gated_) {
-      problem1_ =
-          swap1_
-              ? Array<int64_t>{i_, s_, h_, e_, e_, h_, 1, i_ * h_, h_, 1, s_ * h_, 1, i_, s_ * i_}
-              : Array<int64_t>{s_, i_, h_, e_, e_, h_, 1, s_ * h_, h_, 1, i_ * h_, i_, 1, s_ * i_};
-    }
-    if (swap2_)
-      problem2_ =
-          Array<int64_t>{h_, s_, i_, e_, e_, i_, 1, h_ * i_, i_, 1, s_ * i_, 1, h_, s_ * h_};
-    size_t pos = 0;
-    auto reserve = [&](size_t bytes) {
-      size_t start = pos;
-      pos += align128(bytes);
-      return start;
-    };
-    x_pos_ = reserve(fma_ ? 0 : s_ * h_ * 2);
-    mid_pos_ = reserve(s_ * i_ * 2);
-    // FC1 has finished consuming grouped tokens before FC2 writes its output.
-    y_pos_ = x_pos_;
-    counts_pos_ = reserve(fma_ ? 0 : e_ * 4);
-    offsets_pos_ = reserve(fma_ ? 0 : (e_ + 1) * 4);
-    cursors_pos_ = reserve(fma_ ? 0 : e_ * 4);
-    mapping_pos_ = reserve(fma_ ? 0 : s_ * 4);
-    scale_pos_ = reserve(fma_ ? 0 : 3 * sizeof(float));
-    scratch_pos_ = reserve(std::max(scratch1_, scratch2_));
-    workspace_size_ = pos;
-  }
+        fma_(fma) {}
 
-  const char* kind() const final { return "cudnn_frost_bf16_moe_plan"; }
+  const char* kind() const final { return "cudnn_frost_bf16_moe_runner"; }
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
     if (name == "workspace_size")
-      return Function::FromTyped([this]() { return int64_t(workspace_size_); });
+      return Function::FromTyped(
+          [this](int64_t capacity) { return int64_t(make_layout(capacity).bytes); });
     if (name == "run")
       return Function::FromTyped(
           [this](TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
@@ -227,54 +193,116 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
   }
 
  private:
+  struct Layout {
+    size_t x, mid, counts, offsets, cursors, mapping, scale, scratch, bytes;
+  };
+
+  Layout make_layout(int64_t tokens) const {
+    TVM_FFI_ICHECK(tokens > 0 && tokens <= (1 << 20));
+    TVM_FFI_ICHECK_LE(tokens * k_, std::numeric_limits<int32_t>::max());
+    if (fma_) TVM_FFI_ICHECK_LE(tokens, fc1_.size());
+    int64_t s = tokens * k_;
+    size_t pos = 0;
+    auto reserve = [&](size_t bytes) {
+      size_t start = pos;
+      TVM_FFI_ICHECK_LE(bytes, size_t(std::numeric_limits<int64_t>::max()) - 127);
+      size_t aligned = align128(bytes);
+      TVM_FFI_ICHECK_LE(aligned, size_t(std::numeric_limits<int64_t>::max()) - pos);
+      pos += aligned;
+      return start;
+    };
+    Layout layout;
+    layout.x = reserve(fma_ ? 0 : s * h_ * 2);
+    layout.mid = reserve(s * i_ * 2);
+    layout.counts = reserve(fma_ ? 0 : e_ * 4);
+    layout.offsets = reserve(fma_ ? 0 : (e_ + 1) * 4);
+    layout.cursors = reserve(fma_ ? 0 : e_ * 4);
+    layout.mapping = reserve(fma_ ? 0 : s * 4);
+    layout.scale = reserve(fma_ ? 0 : 3 * sizeof(float));
+    layout.scratch = reserve(std::max(scratch1_, scratch2_));
+    layout.bytes = pos;
+    return layout;
+  }
+
+  Array<int64_t> make_problem(int64_t s, int64_t n, int64_t k, bool swap, bool gated) const {
+    Array<int64_t> shape;
+    shape.reserve(gated ? 17 : 14);
+    for (int64_t value : {swap ? n : s, swap ? s : n, k, e_, e_}) shape.push_back(value);
+    auto token = [&]() {
+      shape.push_back(k);
+      shape.push_back(1);
+      shape.push_back(s * k);
+    };
+    auto weight = [&]() {
+      shape.push_back(k);
+      shape.push_back(1);
+      shape.push_back((gated ? 2 : 1) * n * k);
+    };
+    if (!swap) token();
+    weight();
+    if (gated) weight();
+    if (swap) token();
+    shape.push_back(swap ? 1 : n);
+    shape.push_back(swap ? n : 1);
+    shape.push_back(s * n);
+    return shape;
+  }
+
   void run(TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
            TensorView w2, TensorView workspace) const {
-    tensor(out, device_, dl_bfloat16, {t_, h_});
-    tensor(x, device_, dl_bfloat16, {t_, h_});
-    tensor(ids, device_, dl_int32, {t_, k_}, 4);
-    tensor(scores, device_, dl_float32, {t_, k_}, 4);
+    TVM_FFI_ICHECK_EQ(x.ndim(), 2);
+    int64_t t = x.size(0);
+    Layout layout = make_layout(t);
+    int64_t s = t * k_;
+    tensor(out, device_, dl_bfloat16, {t, h_});
+    tensor(x, device_, dl_bfloat16, {t, h_});
+    tensor(ids, device_, dl_int32, {t, k_}, 4);
+    tensor(scores, device_, dl_float32, {t, k_}, 4);
     tensor(w1, device_, dl_bfloat16, {e_, (gated_ ? 2 : 1) * i_, h_});
     tensor(w2, device_, dl_bfloat16, {e_, h_, i_});
     tensor(workspace, device_, dl_uint8, {workspace.numel()}, 128);
-    TVM_FFI_ICHECK_GE(workspace.numel(), workspace_size_);
+    TVM_FFI_ICHECK_GE(workspace.numel(), layout.bytes);
     ffi::CUDADeviceGuard guard(device_.device_id);
     auto stream = get_stream(device_);
     auto base = static_cast<char*>(workspace.data_ptr());
     if (fma_) {
-      int64_t shape[]{s_, i_}, stride[]{i_, 1};
-      DLTensor mid{base + mid_pos_, device_, 2, dl_bfloat16, shape, stride, 0};
-      fc1_(x, w1, ids, TensorView(&mid), static_cast<void*>(stream));
-      fc2_(TensorView(&mid), w2, ids, scores, out, static_cast<void*>(stream));
+      int64_t shape[]{s, i_}, stride[]{i_, 1};
+      DLTensor mid{base + layout.mid, device_, 2, dl_bfloat16, shape, stride, 0};
+      fc1_[t - 1](x, w1, ids, TensorView(&mid), static_cast<void*>(stream));
+      fc2_[t - 1](TensorView(&mid), w2, ids, scores, out, static_cast<void*>(stream));
       checked(cudaGetLastError());
       return;
     }
-    auto gx = reinterpret_cast<__nv_bfloat16*>(base + x_pos_);
-    auto mid = reinterpret_cast<__nv_bfloat16*>(base + mid_pos_);
-    auto gy = reinterpret_cast<__nv_bfloat16*>(base + y_pos_);
-    auto counts = reinterpret_cast<int32_t*>(base + counts_pos_);
-    auto offsets = reinterpret_cast<int32_t*>(base + offsets_pos_);
-    auto cursors = reinterpret_cast<int32_t*>(base + cursors_pos_);
-    auto mapping = reinterpret_cast<int32_t*>(base + mapping_pos_);
-    auto scale = reinterpret_cast<float*>(base + scale_pos_);
-    auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
+    auto gx = reinterpret_cast<__nv_bfloat16*>(base + layout.x);
+    auto mid = reinterpret_cast<__nv_bfloat16*>(base + layout.mid);
+    // FC1 has consumed grouped tokens before FC2 overwrites their buffer.
+    auto gy = gx;
+    auto counts = reinterpret_cast<int32_t*>(base + layout.counts);
+    auto offsets = reinterpret_cast<int32_t*>(base + layout.offsets);
+    auto cursors = reinterpret_cast<int32_t*>(base + layout.cursors);
+    auto mapping = reinterpret_cast<int32_t*>(base + layout.mapping);
+    auto scale = reinterpret_cast<float*>(base + layout.scale);
+    auto scratch = reinterpret_cast<int64_t*>(base + layout.scratch);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
-    if (s_ <= 512 && e_ <= 256) {
-      route_small<<<std::max(s_, e_), 128, 0, stream>>>(
+    if (s <= 512 && e_ <= 256) {
+      route_small<<<std::max(s, e_), 128, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(x.data_ptr()), expert_ids, offsets, mapping, gx, scale,
-          s_, h_, k_, e_);
+          s, h_, k_, e_);
     } else {
       checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-      histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
-                                                                               s_, e_);
+      histogram<<<std::min<int64_t>((s + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts, s,
+                                                                              e_);
       prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, e_, scale);
-      gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-          static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s_, h_, k_,
+      gather<<<std::min<int64_t>(s, 4096), 128, 0, stream>>>(
+          static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s, h_, k_,
           e_);
     }
     checked(cudaGetLastError());
 
-    int64_t xshape[]{s_, h_, 1}, mshape[]{s_, i_, 1};
-    int64_t xstride[]{h_, 1, s_ * h_}, mstride[]{i_, 1, s_ * i_};
+    auto problem1 = make_problem(s, i_, h_, swap1_, gated_);
+    auto problem2 = make_problem(s, h_, i_, swap2_, false);
+    int64_t xshape[]{s, h_, 1}, mshape[]{s, i_, 1};
+    int64_t xstride[]{h_, 1, s * h_}, mstride[]{i_, 1, s * i_};
     int64_t w1shape[]{i_, h_, e_}, w1stride[]{h_, 1, (gated_ ? 2 : 1) * i_ * h_};
     int64_t w2shape[]{h_, i_, e_}, w2stride[]{i_, 1, h_ * i_};
     int64_t eshape[]{e_ + 1}, dshape[]{int64_t(scratch1_ / 8)}, unit[]{1};
@@ -291,8 +319,8 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     DLTensor factors[3];
     for (int j = 0; j < 3; ++j)
       factors[j] = DLTensor{scale + j, device_, 3, dl_float32, scale_shape, scale_stride, 0};
-    int64_t mshape_sw[]{i_, s_, 1}, mstride_sw[]{1, i_, s_ * i_};
-    int64_t yshape_sw[]{h_, s_, 1}, ystride_sw[]{1, h_, s_ * h_};
+    int64_t mshape_sw[]{i_, s, 1}, mstride_sw[]{1, i_, s * i_};
+    int64_t yshape_sw[]{h_, s, 1}, ystride_sw[]{1, h_, s * h_};
     DLTensor tm_sw{mid, device_, 3, dl_bfloat16, mshape_sw, mstride_sw, 0};
     DLTensor ty_sw{gy, device_, 3, dl_bfloat16, yshape_sw, ystride_sw, 0};
     auto fc1_out = swap1_ ? &tm_sw : &tm;
@@ -311,58 +339,58 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
                                       TensorView(&factors[2])};
     tvm::ffi::AnyView args[12];
     int argc = 0;
-    args[argc++] = problem1_;
+    args[argc++] = problem1;
     for (int j = 0; j < (gated_ ? 5 : 4); ++j) args[argc++] = tensors[j];
     for (auto slot : tail_) args[argc++] = tensors[slot + 6];
     args[argc++] = static_cast<void*>(stream);
     tvm::ffi::Any result;
-    fc1_.CallPacked(args, argc, &result);
+    fc1_[0].CallPacked(args, argc, &result);
     dshape[0] = scratch2_ / 8;
-    fc2_(problem2_, TensorView(&first), TensorView(&desc), TensorView(swap2_ ? &down : &tm),
-         TensorView(swap2_ ? &tm : &down), TensorView(swap2_ ? &ty_sw : &ty),
-         static_cast<void*>(stream));
-    if (t_ <= 8) {
-      finalize<true><<<std::min<int64_t>(t_ * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
+    fc2_[0](problem2, TensorView(&first), TensorView(&desc), TensorView(swap2_ ? &down : &tm),
+            TensorView(swap2_ ? &tm : &down), TensorView(swap2_ ? &ty_sw : &ty),
+            static_cast<void*>(stream));
+    if (t <= 8) {
+      finalize<true><<<std::min<int64_t>(t * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
-          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t, h_, k_, e_);
     } else {
-      finalize<false><<<std::min<int64_t>(t_, 4096), 128, 0, stream>>>(
+      finalize<false><<<std::min<int64_t>(t, 4096), 128, 0, stream>>>(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
-          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t, h_, k_, e_);
     }
     checked(cudaGetLastError());
   }
 
-  Function fc1_, fc2_;
-  int64_t t_, h_, i_, e_, k_, s_;
+  Array<Function> fc1_, fc2_;
+  int64_t h_, i_, e_, k_;
   DLDevice device_;
   size_t scratch1_, scratch2_;
   bool gated_;
   Array<int64_t> tail_;
   bool swap1_, swap2_, fma_;
-  Array<int64_t> problem1_, problem2_;
-  size_t x_pos_, mid_pos_, y_pos_, counts_pos_, offsets_pos_, cursors_pos_, mapping_pos_,
-      scale_pos_, scratch_pos_, workspace_size_;
 };
 
-Module make_plan(Function fc1, Function fc2, int64_t tokens, int64_t hidden, int64_t intermediate,
-                 int64_t experts, int64_t topk, int64_t device, int64_t scratch1, int64_t scratch2,
-                 bool gated, Array<int64_t> tail, bool swap1, bool swap2, bool fma) {
+Module make_runner(Array<Function> fc1, Array<Function> fc2, int64_t hidden, int64_t intermediate,
+                   int64_t experts, int64_t topk, int64_t device, int64_t scratch1,
+                   int64_t scratch2, bool gated, Array<int64_t> tail, bool swap1, bool swap2,
+                   bool fma) {
   // Limit the private ABI to practical int32-indexed dimensions and avoid
   // overflow in the workspace/launch descriptors even for malformed callers.
   constexpr int64_t max_dim = 1 << 20;
-  TVM_FFI_ICHECK(tokens > 0 && tokens <= max_dim && hidden > 0 && hidden <= max_dim &&
-                 intermediate > 0 && intermediate <= max_dim && experts > 0 && experts <= 1024 &&
-                 topk > 0 && topk <= experts);
-  TVM_FFI_ICHECK_LE(tokens * topk, std::numeric_limits<int32_t>::max());
+  TVM_FFI_ICHECK(hidden > 0 && hidden <= max_dim && intermediate > 0 && intermediate <= max_dim &&
+                 experts > 0 && experts <= 1024 && topk > 0 && topk <= experts);
   TVM_FFI_ICHECK_EQ(hidden % 8, 0) << "cuDNN Frost MoE routing uses 128-bit BF16 packs";
   TVM_FFI_ICHECK(scratch1 >= 0 && scratch1 % 128 == 0 && scratch2 >= 0 && scratch2 % 128 == 0);
   if (fma) {
     TVM_FFI_ICHECK(!swap1 && !swap2 && scratch1 == 0 && scratch2 == 0 && tail.empty());
-    TVM_FFI_ICHECK(
-        (experts == 64 && hidden == 2048 && intermediate == 1408 && topk == 6 && tokens <= 4) ||
-        (experts == 12 && hidden == 7168 && intermediate == 3072 && topk == 2 && tokens == 1));
+    bool small = experts == 64 && hidden == 2048 && intermediate == 1408 && topk == 6;
+    bool large = experts == 12 && hidden == 7168 && intermediate == 3072 && topk == 2;
+    TVM_FFI_ICHECK(small || large);
+    TVM_FFI_ICHECK_EQ(fc1.size(), small ? 4 : 1);
+    TVM_FFI_ICHECK_EQ(fc2.size(), fc1.size());
   } else {
+    TVM_FFI_ICHECK_EQ(fc1.size(), 1);
+    TVM_FFI_ICHECK_EQ(fc2.size(), 1);
     TVM_FFI_ICHECK(tail.size() == 2 || tail.size() == 4);
     int mask = 0;
     for (auto slot : tail) {
@@ -372,10 +400,10 @@ Module make_plan(Function fc1, Function fc2, int64_t tokens, int64_t hidden, int
     }
     TVM_FFI_ICHECK(mask == 3 || mask == 15);
   }
-  return Module(tvm::ffi::make_object<CudnnFrostMoePlan>(
-      std::move(fc1), std::move(fc2), tokens, hidden, intermediate, experts, topk, device, scratch1,
+  return Module(tvm::ffi::make_object<CudnnFrostMoeRunner>(
+      std::move(fc1), std::move(fc2), hidden, intermediate, experts, topk, device, scratch1,
       scratch2, gated, std::move(tail), swap1, swap2, fma));
 }
 }  // namespace
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_plan, make_plan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_runner, make_runner);

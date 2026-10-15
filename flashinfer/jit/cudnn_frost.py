@@ -23,7 +23,7 @@ def gen_cudnn_frost_moe_module(dtype: str, arch: str = "sm_107a"):
         / f"moe_{dtype}.cu"
     )
     return gen_jit_spec(
-        f"cudnn_frost_{dtype}_moe_v2_{arch}",
+        f"cudnn_frost_{dtype}_moe_{arch}",
         [source],
         extra_cuda_cflags=flags,
     )

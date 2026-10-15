@@ -252,8 +252,16 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
         arch=arch,
         digest=compile_digest,
         compile_options=compile_options,
+        # The shared device header includes its helper definitions from the
+        # content-addressed ``csrc/cake_device_helpers/`` files relative to ``csrc``
+        # (root.parents[1], as the host-shim build below already passes it).
         include_paths=tuple(
-            dict.fromkeys((root / header["path"]).parent for header in headers)
+            dict.fromkeys(
+                [
+                    *((root / header["path"]).parent for header in headers),
+                    root.parents[1],
+                ]
+            )
         ),
         nvcc=nvcc,
     )
@@ -335,9 +343,29 @@ def _prefill_schedule_attr(
     return "_".join(pieces)
 
 
+def _serves_arch(record: dict[str, Any], arch: CakeGDNArch) -> bool:
+    """Whether a manifest record lists ``arch`` and carries a kernel body for it."""
+
+    return arch in record["architectures"] and any(
+        arch in output["architectures"] for output in record["outputs"]
+    )
+
+
 def _variant_for(
-    *, domain: str, schedule_attr: str, specializations: dict[str, int | float]
+    *,
+    arch: CakeGDNArch,
+    domain: str,
+    schedule_attr: str,
+    specializations: dict[str, int | float],
 ) -> dict[str, Any]:
+    """The one frozen record ``arch`` runs for an exact (schedule, specializations) key.
+
+    A record that does not list ``arch`` (or has no body for it) is not a
+    match: an architecture the row was never exported for fails closed here
+    with ``CakeGDNUnsupportedError`` instead of surfacing as a ``ValueError``
+    from the cubin loader.
+    """
+
     source_schedule = {
         "decode": "flashinfer.cake_gdn.generated.decode",
         "prefill": "flashinfer.cake_gdn.generated.prefill",
@@ -351,11 +379,12 @@ def _variant_for(
         and record["source_schedule"] == expected_source
         and record["specializations"] == specializations
         and record["tma_abi"] == expected_tma_abi
+        and _serves_arch(record, arch)
     ]
     if len(matches) != 1:
         raise CakeGDNUnsupportedError(
             "no exact frozen Cake GDN variant for "
-            f"{expected_source} with {specializations!r}"
+            f"{expected_source} with {specializations!r} on {arch}"
         )
     return matches[0]
 
@@ -518,6 +547,7 @@ def select_cake_gdn_prefill_variant(
         "USE_STATE_INDICES": int(use_state_indices),
     }
     record = _variant_for(
+        arch=arch,
         domain="prefill",
         schedule_attr=schedule_attr,
         specializations=specializations,
@@ -531,6 +561,77 @@ def select_cake_gdn_prefill_variant(
     return CakeGDNRoute(
         f"{route}.{'dvsplit' if dvsplit else 'full_dv'}", record["name"]
     )
+
+
+def cake_gdn_prefill_geometries(
+    *,
+    arch: CakeGDNArch,
+    io_dtype: str,
+    state_dtype: str,
+    use_initial_state: bool,
+    store_final_state: bool,
+    dvsplit: bool,
+) -> frozenset[tuple[int, int, int]]:
+    """Frozen ``(HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2)`` triples of one prefill contract on ``arch``.
+
+    The contract is the plain non-CP prefill route of one physical schedule
+    (DV-split or full-DV) for the given I/O and state dtypes with or without
+    an initial and a final state: no checkpoints, packed (non-indexed) state,
+    gates taken at runtime.  The triples are read from the manifest records
+    the resolver can select on ``arch``; nothing is tabulated here.  A head
+    pair maps to ``HEAD_GROUP_LOG2 = log2(max(Hq, Hv) / min(Hq, Hv))``,
+    ``IS_GQA = int(Hq >= Hv)`` and ``NUM_O_HEADS_LOG2 = log2(max(Hq, Hv))``;
+    ``-1`` marks a head count that is not a power of two (a dynamic-head body
+    takes it at runtime).
+    """
+
+    if arch not in _ARCH_ACTIVE_CLUSTERS:
+        raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
+    if io_dtype not in {"float16", "bfloat16"}:
+        raise CakeGDNUnsupportedError(f"unsupported I/O dtype {io_dtype}")
+    if state_dtype not in {
+        "float32",
+        "bfloat16",
+        "float16",
+        "float8_e4m3fn",
+        "float8_e5m2",
+    }:
+        raise CakeGDNUnsupportedError(f"unsupported state dtype {state_dtype}")
+    schedule_attr = _prefill_schedule_attr(
+        dvsplit=dvsplit,
+        use_initial_state=use_initial_state,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        single_chunk=False,
+        gatepipe4=False,
+        fullgrid_vhold=False,
+    )
+    expected_source = f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
+    fixed: dict[str, int] = {
+        "ENABLE_CHECKPOINTS": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": int(store_final_state),
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": int(use_initial_state),
+        "USE_STATE_INDICES": 0,
+    }
+    geometry_keys = ("HEAD_GROUP_LOG2", "IS_GQA", "NUM_O_HEADS_LOG2")
+    geometries: set[tuple[int, int, int]] = set()
+    for record in _manifest()["variants"]:
+        specializations = record["specializations"]
+        if (
+            record["domain"] != "prefill"
+            or record["source_schedule"] != expected_source
+            or record["tma_abi"] != "grid_constant"
+            or not _serves_arch(record, arch)
+            or set(specializations) != set(fixed) | set(geometry_keys)
+            or any(specializations[key] != value for key, value in fixed.items())
+        ):
+            continue
+        geometries.add(
+            tuple(int(specializations[key]) for key in geometry_keys)  # type: ignore[arg-type]
+        )
+    return frozenset(geometries)
 
 
 # BF16-state T=1 decode: every per-rank (H, HV) geometry is admitted at any
@@ -648,6 +749,57 @@ CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
 CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
     "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
 }
+# The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
+# is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
+# shipped `splitv8` body (TILE_V 16, eight CTAs per state head) below 256 state heads
+# and its `splitv8_tilev32` twin (TILE_V 32, four CTAs per state head; bitwise-identical
+# output, only the row -> CTA mapping changes) from 256 state heads on: 5-8.5 % faster
+# on R200 from 256 through 2048 state heads, 11-17 % slower at 32 and 128.  B200 / B300
+# keep `splitv8` at every count.  Mirrors `FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS` /
+# `FP32_T1_SPLITV8_ARCH_BANDS` / `select_fp32_t1_splitv8_route` in
+# loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
+CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
+# (largest state-head count of the band or None for the open last band, body)
+CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
+    "sm_107a": (
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8"),
+        (None, "splitv8_tilev32"),
+    ),
+}
+# CTAs per state head each fp32 T=1 body launches (the host grid is B * HV times this),
+# keyed by the record's schedule: the resolved record carries its own grid instead of a
+# fixed eight.
+CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
+    "gdn_decode_pretranspose_splitv8": 8,
+    "gdn_decode_pretranspose_splitv8_tilev32": 4,
+}
+
+
+def cake_gdn_fp32_t1_route(batch_size: int, num_v_heads: int, arch: CakeGDNArch) -> str:
+    """Body (``splitv8`` or ``splitv8_tilev32``) of the fp32-state T=1 pretranspose route for ``batch_size * num_v_heads`` state heads on ``arch``."""
+
+    bands = CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS.get(arch)
+    if bands is None:
+        return "splitv8"
+    state_heads = int(batch_size) * int(num_v_heads)
+    for max_state_heads, body in bands:
+        if max_state_heads is None or state_heads <= max_state_heads:
+            return body
+    raise AssertionError("fp32 T=1 route band tables must end with an open band")
+
+
+@functools.cache
+def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
+    """CTAs per state head the fp32-state T=1 pretranspose record ``variant_name`` launches (read from its schedule)."""
+
+    record = _kernel_record(variant_name)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    ctas_per_state = CAKE_GDN_FP32_T1_CTAS_PER_STATE.get(schedule)
+    if ctas_per_state is None:
+        raise CakeGDNUnsupportedError(
+            f"{variant_name!r} ({schedule}) is not an fp32-state T=1 pretranspose record"
+        )
+    return ctas_per_state
 
 
 def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
@@ -733,6 +885,7 @@ def select_cake_gdn_decode_variant(
             body, tile_v = cake_gdn_bf16_t1_route(batch_size, num_v_heads, arch)
             if body == "wide":
                 record = _variant_for(
+                    arch=arch,
                     domain="decode",
                     schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
                     specializations={
@@ -753,6 +906,7 @@ def select_cake_gdn_decode_variant(
                     record["name"],
                 )
             record = _variant_for(
+                arch=arch,
                 domain="decode",
                 schedule_attr=f"gdn_decode_pretranspose_t1_bf16state_{body}",
                 specializations={
@@ -826,6 +980,7 @@ def select_cake_gdn_decode_variant(
             # tile-v16 kernel with T_STEPS specialized (the `tile16_vpre` body on
             # sm_107a), B>=5 falls through to wide32.
             record = _variant_for(
+                arch=arch,
                 domain="decode",
                 schedule_attr=cake_gdn_bf16_verify_tile16_schedule(arch),
                 specializations={
@@ -854,6 +1009,7 @@ def select_cake_gdn_decode_variant(
             }
             route = "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
             record = _variant_for(
+                arch=arch,
                 domain="decode",
                 schedule_attr=schedule_attr,
                 specializations=specializations,
@@ -864,6 +1020,7 @@ def select_cake_gdn_decode_variant(
         tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         update_state = not cache_intermediate_states
         record = _variant_for(
+            arch=arch,
             domain="decode",
             schedule_attr=cake_gdn_bf16_wide_schedule(arch, seq_len),
             specializations={
@@ -953,6 +1110,7 @@ def select_cake_gdn_decode_variant(
                 }
             )
         record = _variant_for(
+            arch=arch,
             domain="decode",
             schedule_attr=schedule_attr,
             specializations=mtp_specializations,
@@ -963,8 +1121,14 @@ def select_cake_gdn_decode_variant(
             "FP32-state T=1 child contract requires state update and no cache"
         )
     if layout == "pretranspose":
-        schedule_attr = "gdn_decode_pretranspose_splitv8"
-        route = "flashinfer.gdn_decode.indexed_fp32_t1_splitv8"
+        # The body follows the state-head count per architecture (sm_107a runs the
+        # `splitv8_tilev32` twin from 256 state heads); the route id names a twin and
+        # the host reads the record's CTAs per state head for the grid.
+        body = cake_gdn_fp32_t1_route(batch_size, num_v_heads, arch)
+        schedule_attr = f"gdn_decode_pretranspose_{body}"
+        route = "flashinfer.gdn_decode.indexed_fp32_t1_splitv8" + body.removeprefix(
+            "splitv8"
+        )
     elif layout == "nontranspose":
         if batch_size < 32:
             schedule_attr = "gdn_decode_nontranspose_fp32_t1_small"
@@ -975,6 +1139,7 @@ def select_cake_gdn_decode_variant(
     else:
         raise CakeGDNUnsupportedError(f"unsupported decode state layout {layout}")
     record = _variant_for(
+        arch=arch,
         domain="decode",
         schedule_attr=schedule_attr,
         specializations={"H": num_q_heads, "HV": num_v_heads, "SCALE": scale},
@@ -1000,6 +1165,7 @@ __all__ = [
     "CakeGDNRoute",
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
+    "cake_gdn_prefill_geometries",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "select_cake_gdn_decode_variant",

@@ -1,7 +1,7 @@
 {
   "kernels": [
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -568,7 +568,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_stg.py",
-        "sha256": "aed41fafd21aa028bb22ab99cc320d005f474e576a536a5f7beb994f08d7e422"
+        "sha256": "b7b7ca9f6c778d87210a548133758e395d54e46894cb00c43de10ffb614f1089"
       },
       "tactic": {
         "cta_group": 1,
@@ -596,7 +596,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -1159,7 +1159,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_tma.py",
-        "sha256": "e197ed2af7a467ca4fd4d9731602ffa33be9ccaf927594a055f783dfc910930d"
+        "sha256": "ad2050f4fba3906abdf86b601afac8e9fe8430910bfb40f95416936881c7c05d"
       },
       "tactic": {
         "cta_group": 1,
@@ -1187,7 +1187,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -1754,7 +1754,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_stg.py",
-        "sha256": "aed41fafd21aa028bb22ab99cc320d005f474e576a536a5f7beb994f08d7e422"
+        "sha256": "b7b7ca9f6c778d87210a548133758e395d54e46894cb00c43de10ffb614f1089"
       },
       "tactic": {
         "cta_group": 2,
@@ -1782,7 +1782,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -2345,7 +2345,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_tma.py",
-        "sha256": "e197ed2af7a467ca4fd4d9731602ffa33be9ccaf927594a055f783dfc910930d"
+        "sha256": "ad2050f4fba3906abdf86b601afac8e9fe8430910bfb40f95416936881c7c05d"
       },
       "tactic": {
         "cta_group": 2,
@@ -2373,7 +2373,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -2936,7 +2936,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_swap_ab_tma.py",
-        "sha256": "41bfe688a525ad66c7023bc51440d08a7b62c8d48ca74654572b8a30303aaf7f"
+        "sha256": "8f3205c0893798f231ccfd29da265af27e090415b0e415c866d56b57f4d2826b"
       },
       "tactic": {
         "cta_group": 2,
@@ -2964,7 +2964,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -3531,7 +3531,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_stg.py",
-        "sha256": "aed41fafd21aa028bb22ab99cc320d005f474e576a536a5f7beb994f08d7e422"
+        "sha256": "b7b7ca9f6c778d87210a548133758e395d54e46894cb00c43de10ffb614f1089"
       },
       "tactic": {
         "cta_group": 2,
@@ -3559,7 +3559,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -4122,7 +4122,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_tma.py",
-        "sha256": "e197ed2af7a467ca4fd4d9731602ffa33be9ccaf927594a055f783dfc910930d"
+        "sha256": "ad2050f4fba3906abdf86b601afac8e9fe8430910bfb40f95416936881c7c05d"
       },
       "tactic": {
         "cta_group": 2,
@@ -4150,7 +4150,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -4717,7 +4717,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_stg.py",
-        "sha256": "aed41fafd21aa028bb22ab99cc320d005f474e576a536a5f7beb994f08d7e422"
+        "sha256": "b7b7ca9f6c778d87210a548133758e395d54e46894cb00c43de10ffb614f1089"
       },
       "tactic": {
         "cta_group": 2,
@@ -4745,7 +4745,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -5308,7 +5308,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_normal_tma.py",
-        "sha256": "e197ed2af7a467ca4fd4d9731602ffa33be9ccaf927594a055f783dfc910930d"
+        "sha256": "ad2050f4fba3906abdf86b601afac8e9fe8430910bfb40f95416936881c7c05d"
       },
       "tactic": {
         "cta_group": 2,
@@ -5336,7 +5336,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -5899,7 +5899,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_swap_ab_tma.py",
-        "sha256": "41bfe688a525ad66c7023bc51440d08a7b62c8d48ca74654572b8a30303aaf7f"
+        "sha256": "8f3205c0893798f231ccfd29da265af27e090415b0e415c866d56b57f4d2826b"
       },
       "tactic": {
         "cta_group": 2,
@@ -5927,7 +5927,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -6490,7 +6490,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_nvfp4_swap_ab_tma.py",
-        "sha256": "41bfe688a525ad66c7023bc51440d08a7b62c8d48ca74654572b8a30303aaf7f"
+        "sha256": "8f3205c0893798f231ccfd29da265af27e090415b0e415c866d56b57f4d2826b"
       },
       "tactic": {
         "cta_group": 2,
@@ -6518,7 +6518,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -7081,7 +7081,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_swap_ab_tma.py",
-        "sha256": "5d5450677471192edf599c2ca4591ad4d7a27aa7f2714daa97b6c3e550468f0b"
+        "sha256": "050b5d22f524d97e6220ee73551bd921538ea68857e9c7772ba961724396a709"
       },
       "tactic": {
         "cta_group": 1,
@@ -7109,7 +7109,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -7676,7 +7676,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_stg.py",
-        "sha256": "d3ea8737da918f3ac0a9064ff5e8a107d06b5bcb4a60a4ae981bdc16844c79ec"
+        "sha256": "2b3c8bf337ce7a58c451d3c72cfdcebbb063641217c62c7ae0832e77d66f1811"
       },
       "tactic": {
         "cta_group": 2,
@@ -7704,7 +7704,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -8267,7 +8267,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_tma.py",
-        "sha256": "9d1e9c9a140a03f9ae290829bfc158bd3767fe58f3187412a5100f7725dbdf5c"
+        "sha256": "8af1b33c99e9ec3109d4667bbfcfcb4d34e8d6cd664af5ed71a9964e99e3d7df"
       },
       "tactic": {
         "cta_group": 2,
@@ -8295,7 +8295,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -8858,7 +8858,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_swap_ab_tma.py",
-        "sha256": "5d5450677471192edf599c2ca4591ad4d7a27aa7f2714daa97b6c3e550468f0b"
+        "sha256": "050b5d22f524d97e6220ee73551bd921538ea68857e9c7772ba961724396a709"
       },
       "tactic": {
         "cta_group": 2,
@@ -8886,7 +8886,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -9453,7 +9453,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_stg.py",
-        "sha256": "d3ea8737da918f3ac0a9064ff5e8a107d06b5bcb4a60a4ae981bdc16844c79ec"
+        "sha256": "2b3c8bf337ce7a58c451d3c72cfdcebbb063641217c62c7ae0832e77d66f1811"
       },
       "tactic": {
         "cta_group": 2,
@@ -9481,7 +9481,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -10048,7 +10048,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_stg.py",
-        "sha256": "d3ea8737da918f3ac0a9064ff5e8a107d06b5bcb4a60a4ae981bdc16844c79ec"
+        "sha256": "2b3c8bf337ce7a58c451d3c72cfdcebbb063641217c62c7ae0832e77d66f1811"
       },
       "tactic": {
         "cta_group": 2,
@@ -10076,7 +10076,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -10639,7 +10639,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_tma.py",
-        "sha256": "9d1e9c9a140a03f9ae290829bfc158bd3767fe58f3187412a5100f7725dbdf5c"
+        "sha256": "8af1b33c99e9ec3109d4667bbfcfcb4d34e8d6cd664af5ed71a9964e99e3d7df"
       },
       "tactic": {
         "cta_group": 2,
@@ -10667,7 +10667,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -11230,7 +11230,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_swap_ab_tma.py",
-        "sha256": "5d5450677471192edf599c2ca4591ad4d7a27aa7f2714daa97b6c3e550468f0b"
+        "sha256": "050b5d22f524d97e6220ee73551bd921538ea68857e9c7772ba961724396a709"
       },
       "tactic": {
         "cta_group": 2,
@@ -11258,7 +11258,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -11821,7 +11821,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_swap_ab_tma.py",
-        "sha256": "5d5450677471192edf599c2ca4591ad4d7a27aa7f2714daa97b6c3e550468f0b"
+        "sha256": "050b5d22f524d97e6220ee73551bd921538ea68857e9c7772ba961724396a709"
       },
       "tactic": {
         "cta_group": 2,
@@ -11849,7 +11849,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -12416,7 +12416,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_stg.py",
-        "sha256": "d3ea8737da918f3ac0a9064ff5e8a107d06b5bcb4a60a4ae981bdc16844c79ec"
+        "sha256": "2b3c8bf337ce7a58c451d3c72cfdcebbb063641217c62c7ae0832e77d66f1811"
       },
       "tactic": {
         "cta_group": 1,
@@ -12444,7 +12444,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -13007,7 +13007,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_tma.py",
-        "sha256": "9d1e9c9a140a03f9ae290829bfc158bd3767fe58f3187412a5100f7725dbdf5c"
+        "sha256": "8af1b33c99e9ec3109d4667bbfcfcb4d34e8d6cd664af5ed71a9964e99e3d7df"
       },
       "tactic": {
         "cta_group": 1,
@@ -13035,7 +13035,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -13602,7 +13602,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_stg.py",
-        "sha256": "d3ea8737da918f3ac0a9064ff5e8a107d06b5bcb4a60a4ae981bdc16844c79ec"
+        "sha256": "2b3c8bf337ce7a58c451d3c72cfdcebbb063641217c62c7ae0832e77d66f1811"
       },
       "tactic": {
         "cta_group": 2,
@@ -13630,7 +13630,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -14193,7 +14193,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_normal_tma.py",
-        "sha256": "9d1e9c9a140a03f9ae290829bfc158bd3767fe58f3187412a5100f7725dbdf5c"
+        "sha256": "8af1b33c99e9ec3109d4667bbfcfcb4d34e8d6cd664af5ed71a9964e99e3d7df"
       },
       "tactic": {
         "cta_group": 2,
@@ -14221,7 +14221,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -14784,7 +14784,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_swap_ab_tma.py",
-        "sha256": "5d5450677471192edf599c2ca4591ad4d7a27aa7f2714daa97b6c3e550468f0b"
+        "sha256": "050b5d22f524d97e6220ee73551bd921538ea68857e9c7772ba961724396a709"
       },
       "tactic": {
         "cta_group": 2,
@@ -14812,7 +14812,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -15375,7 +15375,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_nvfp4_swap_ab_tma.py",
-        "sha256": "5d5450677471192edf599c2ca4591ad4d7a27aa7f2714daa97b6c3e550468f0b"
+        "sha256": "050b5d22f524d97e6220ee73551bd921538ea68857e9c7772ba961724396a709"
       },
       "tactic": {
         "cta_group": 2,
@@ -15403,7 +15403,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -15969,7 +15969,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_stg.py",
-        "sha256": "ad5b0ad57e482f9d8268c461eafe0e96fa73573d9b20fd765683e7bd4d0f0904"
+        "sha256": "19fb85eb3557998b1f8385171a33687d6816dd811a4e76d5e0b10342ebeabe0f"
       },
       "tactic": {
         "cta_group": 1,
@@ -15997,7 +15997,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -16559,7 +16559,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_tma.py",
-        "sha256": "29961314512254f849bd75dce6ab8adfeacd07f7bb297e3ccd498c86f2937ff6"
+        "sha256": "763b0bd5d256c956b21c91bdc56deb20a22af63aaab90c77c74600206f3377fc"
       },
       "tactic": {
         "cta_group": 1,
@@ -16587,7 +16587,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -17149,7 +17149,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_swap_ab_tma.py",
-        "sha256": "7a30bcd8e68d478b5694aa0be931886f38ff2be65587238d2d9fdf5df48f9318"
+        "sha256": "e3781cc5890e6384da228606776f749e5ddb06270e17c2d1cccedd3be91ce21f"
       },
       "tactic": {
         "cta_group": 1,
@@ -17177,7 +17177,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -17743,7 +17743,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_stg.py",
-        "sha256": "ad5b0ad57e482f9d8268c461eafe0e96fa73573d9b20fd765683e7bd4d0f0904"
+        "sha256": "19fb85eb3557998b1f8385171a33687d6816dd811a4e76d5e0b10342ebeabe0f"
       },
       "tactic": {
         "cta_group": 2,
@@ -17771,7 +17771,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -18333,7 +18333,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_tma.py",
-        "sha256": "29961314512254f849bd75dce6ab8adfeacd07f7bb297e3ccd498c86f2937ff6"
+        "sha256": "763b0bd5d256c956b21c91bdc56deb20a22af63aaab90c77c74600206f3377fc"
       },
       "tactic": {
         "cta_group": 2,
@@ -18361,7 +18361,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -18923,7 +18923,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_swap_ab_tma.py",
-        "sha256": "7a30bcd8e68d478b5694aa0be931886f38ff2be65587238d2d9fdf5df48f9318"
+        "sha256": "e3781cc5890e6384da228606776f749e5ddb06270e17c2d1cccedd3be91ce21f"
       },
       "tactic": {
         "cta_group": 2,
@@ -18951,7 +18951,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -19517,7 +19517,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_stg.py",
-        "sha256": "ad5b0ad57e482f9d8268c461eafe0e96fa73573d9b20fd765683e7bd4d0f0904"
+        "sha256": "19fb85eb3557998b1f8385171a33687d6816dd811a4e76d5e0b10342ebeabe0f"
       },
       "tactic": {
         "cta_group": 2,
@@ -19545,7 +19545,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -20107,7 +20107,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_tma.py",
-        "sha256": "29961314512254f849bd75dce6ab8adfeacd07f7bb297e3ccd498c86f2937ff6"
+        "sha256": "763b0bd5d256c956b21c91bdc56deb20a22af63aaab90c77c74600206f3377fc"
       },
       "tactic": {
         "cta_group": 2,
@@ -20135,7 +20135,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -20701,7 +20701,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_stg.py",
-        "sha256": "ad5b0ad57e482f9d8268c461eafe0e96fa73573d9b20fd765683e7bd4d0f0904"
+        "sha256": "19fb85eb3557998b1f8385171a33687d6816dd811a4e76d5e0b10342ebeabe0f"
       },
       "tactic": {
         "cta_group": 2,
@@ -20729,7 +20729,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -21291,7 +21291,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_tma.py",
-        "sha256": "29961314512254f849bd75dce6ab8adfeacd07f7bb297e3ccd498c86f2937ff6"
+        "sha256": "763b0bd5d256c956b21c91bdc56deb20a22af63aaab90c77c74600206f3377fc"
       },
       "tactic": {
         "cta_group": 2,
@@ -21319,7 +21319,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -21881,7 +21881,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_swap_ab_tma.py",
-        "sha256": "7a30bcd8e68d478b5694aa0be931886f38ff2be65587238d2d9fdf5df48f9318"
+        "sha256": "e3781cc5890e6384da228606776f749e5ddb06270e17c2d1cccedd3be91ce21f"
       },
       "tactic": {
         "cta_group": 2,
@@ -21909,7 +21909,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -22471,7 +22471,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_swap_ab_tma.py",
-        "sha256": "7a30bcd8e68d478b5694aa0be931886f38ff2be65587238d2d9fdf5df48f9318"
+        "sha256": "e3781cc5890e6384da228606776f749e5ddb06270e17c2d1cccedd3be91ce21f"
       },
       "tactic": {
         "cta_group": 2,
@@ -22499,7 +22499,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -23061,7 +23061,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_tma.py",
-        "sha256": "29961314512254f849bd75dce6ab8adfeacd07f7bb297e3ccd498c86f2937ff6"
+        "sha256": "763b0bd5d256c956b21c91bdc56deb20a22af63aaab90c77c74600206f3377fc"
       },
       "tactic": {
         "cta_group": 1,
@@ -23089,7 +23089,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -23655,7 +23655,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_nvfp4_normal_stg.py",
-        "sha256": "ad5b0ad57e482f9d8268c461eafe0e96fa73573d9b20fd765683e7bd4d0f0904"
+        "sha256": "19fb85eb3557998b1f8385171a33687d6816dd811a4e76d5e0b10342ebeabe0f"
       },
       "tactic": {
         "cta_group": 2,
@@ -23683,7 +23683,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -24249,7 +24249,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_stg.py",
-        "sha256": "41ecc1ddd56fec2451e1e00c9920e03cd1e1772891464a8242057f33bad51964"
+        "sha256": "a7490112fbb2d399803cb7e6ca289320e93327f5ded837941c9f0e9264f15d55"
       },
       "tactic": {
         "cta_group": 2,
@@ -24277,7 +24277,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -24839,7 +24839,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -24867,7 +24867,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -25429,7 +25429,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -25457,7 +25457,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -26023,7 +26023,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_stg.py",
-        "sha256": "41ecc1ddd56fec2451e1e00c9920e03cd1e1772891464a8242057f33bad51964"
+        "sha256": "a7490112fbb2d399803cb7e6ca289320e93327f5ded837941c9f0e9264f15d55"
       },
       "tactic": {
         "cta_group": 1,
@@ -26051,7 +26051,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -26617,7 +26617,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_stg.py",
-        "sha256": "41ecc1ddd56fec2451e1e00c9920e03cd1e1772891464a8242057f33bad51964"
+        "sha256": "a7490112fbb2d399803cb7e6ca289320e93327f5ded837941c9f0e9264f15d55"
       },
       "tactic": {
         "cta_group": 2,
@@ -26645,7 +26645,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -27207,7 +27207,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_tma.py",
-        "sha256": "e68b6075ce2777f8333b71ea04acbaffab0385da527adb943ed6d194adefe5ab"
+        "sha256": "f7ba959c4f13739dd76db32df1ca91fd4a328e3a67b67c64db153e16f0f316ce"
       },
       "tactic": {
         "cta_group": 2,
@@ -27235,7 +27235,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -27797,7 +27797,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -27825,7 +27825,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -28387,7 +28387,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -28415,7 +28415,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -28977,7 +28977,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -29005,7 +29005,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -29567,7 +29567,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -29595,7 +29595,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -30157,7 +30157,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_tma.py",
-        "sha256": "e68b6075ce2777f8333b71ea04acbaffab0385da527adb943ed6d194adefe5ab"
+        "sha256": "f7ba959c4f13739dd76db32df1ca91fd4a328e3a67b67c64db153e16f0f316ce"
       },
       "tactic": {
         "cta_group": 2,
@@ -30185,7 +30185,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -30747,7 +30747,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -30775,7 +30775,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -31337,7 +31337,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_tma.py",
-        "sha256": "e68b6075ce2777f8333b71ea04acbaffab0385da527adb943ed6d194adefe5ab"
+        "sha256": "f7ba959c4f13739dd76db32df1ca91fd4a328e3a67b67c64db153e16f0f316ce"
       },
       "tactic": {
         "cta_group": 2,
@@ -31365,7 +31365,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -31927,7 +31927,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_normal_tma.py",
-        "sha256": "e68b6075ce2777f8333b71ea04acbaffab0385da527adb943ed6d194adefe5ab"
+        "sha256": "f7ba959c4f13739dd76db32df1ca91fd4a328e3a67b67c64db153e16f0f316ce"
       },
       "tactic": {
         "cta_group": 2,
@@ -31955,7 +31955,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -32517,7 +32517,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_nvfp4_swap_ab_tma.py",
-        "sha256": "7abfa90461cb013ae9113b48463fbfb39e36f15249c2238e161d741a9d180974"
+        "sha256": "346c8cd2d30257304ec82d53d6fa444c3b3f806193c5fb209198606259bc7298"
       },
       "tactic": {
         "cta_group": 2,
@@ -32545,7 +32545,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -33111,7 +33111,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_stg.py",
-        "sha256": "24b82b11052240d979b176d38f35436b73d7ebde67246e03e6d99ff484f87349"
+        "sha256": "40b18dd0ecbbbe39211c09be83f7ed3eb8bf1d4602ca2b2bfe86d05d732f0785"
       },
       "tactic": {
         "cta_group": 2,
@@ -33139,7 +33139,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -33701,7 +33701,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -33729,7 +33729,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -34291,7 +34291,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -34319,7 +34319,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -34885,7 +34885,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_stg.py",
-        "sha256": "24b82b11052240d979b176d38f35436b73d7ebde67246e03e6d99ff484f87349"
+        "sha256": "40b18dd0ecbbbe39211c09be83f7ed3eb8bf1d4602ca2b2bfe86d05d732f0785"
       },
       "tactic": {
         "cta_group": 1,
@@ -34913,7 +34913,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -35479,7 +35479,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_stg.py",
-        "sha256": "24b82b11052240d979b176d38f35436b73d7ebde67246e03e6d99ff484f87349"
+        "sha256": "40b18dd0ecbbbe39211c09be83f7ed3eb8bf1d4602ca2b2bfe86d05d732f0785"
       },
       "tactic": {
         "cta_group": 2,
@@ -35507,7 +35507,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -36069,7 +36069,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_tma.py",
-        "sha256": "e9c80426e3df315dcedfb8905fa4ef47cc58027d559daafb63423a4fea3d2934"
+        "sha256": "8442bd848715268acc191a2b441a851540943a830dc983103dd410269ea5fa4e"
       },
       "tactic": {
         "cta_group": 2,
@@ -36097,7 +36097,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -36663,7 +36663,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_stg.py",
-        "sha256": "24b82b11052240d979b176d38f35436b73d7ebde67246e03e6d99ff484f87349"
+        "sha256": "40b18dd0ecbbbe39211c09be83f7ed3eb8bf1d4602ca2b2bfe86d05d732f0785"
       },
       "tactic": {
         "cta_group": 2,
@@ -36691,7 +36691,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -37253,7 +37253,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_tma.py",
-        "sha256": "e9c80426e3df315dcedfb8905fa4ef47cc58027d559daafb63423a4fea3d2934"
+        "sha256": "8442bd848715268acc191a2b441a851540943a830dc983103dd410269ea5fa4e"
       },
       "tactic": {
         "cta_group": 2,
@@ -37281,7 +37281,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -37843,7 +37843,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -37871,7 +37871,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -38433,7 +38433,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -38461,7 +38461,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -39023,7 +39023,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -39051,7 +39051,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -39613,7 +39613,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -39641,7 +39641,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -40203,7 +40203,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_tma.py",
-        "sha256": "e9c80426e3df315dcedfb8905fa4ef47cc58027d559daafb63423a4fea3d2934"
+        "sha256": "8442bd848715268acc191a2b441a851540943a830dc983103dd410269ea5fa4e"
       },
       "tactic": {
         "cta_group": 2,
@@ -40231,7 +40231,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -40793,7 +40793,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -40821,7 +40821,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -41383,7 +41383,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_normal_tma.py",
-        "sha256": "e9c80426e3df315dcedfb8905fa4ef47cc58027d559daafb63423a4fea3d2934"
+        "sha256": "8442bd848715268acc191a2b441a851540943a830dc983103dd410269ea5fa4e"
       },
       "tactic": {
         "cta_group": 2,
@@ -41411,7 +41411,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -41973,7 +41973,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_nvfp4_swap_ab_tma.py",
-        "sha256": "05e2348a6c3ff66affd2c3bd6b00a61eb9ec9a37a3a00da468a8709c627ede02"
+        "sha256": "aa43952723c73062b9a3717c7948cdbd7660e4c3a0eb32b70e66dd33d9d50490"
       },
       "tactic": {
         "cta_group": 2,
@@ -42001,7 +42001,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -42567,7 +42567,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_stg.py",
-        "sha256": "0cf2a29666f1b8a0ef82ef73c6fdc02528ae064c817d16498c51041adbd94687"
+        "sha256": "1f4ba9cd707078a2a1295bb79d00234535c6bbf287455230134ee87caaa3510f"
       },
       "tactic": {
         "cta_group": 2,
@@ -42595,7 +42595,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -43157,7 +43157,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -43185,7 +43185,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -43747,7 +43747,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -43775,7 +43775,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -44341,7 +44341,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_stg.py",
-        "sha256": "0cf2a29666f1b8a0ef82ef73c6fdc02528ae064c817d16498c51041adbd94687"
+        "sha256": "1f4ba9cd707078a2a1295bb79d00234535c6bbf287455230134ee87caaa3510f"
       },
       "tactic": {
         "cta_group": 1,
@@ -44369,7 +44369,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -44935,7 +44935,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_stg.py",
-        "sha256": "0cf2a29666f1b8a0ef82ef73c6fdc02528ae064c817d16498c51041adbd94687"
+        "sha256": "1f4ba9cd707078a2a1295bb79d00234535c6bbf287455230134ee87caaa3510f"
       },
       "tactic": {
         "cta_group": 2,
@@ -44963,7 +44963,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -45525,7 +45525,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_tma.py",
-        "sha256": "a7be5721f38628c6556da0052f63f55f87ce1e596fae3ad629d5c322ff33ae45"
+        "sha256": "0dc0fea8524a9e194409aae53199252e49c0ce72651be0a00812aa03d821825f"
       },
       "tactic": {
         "cta_group": 2,
@@ -45553,7 +45553,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -46119,7 +46119,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_stg.py",
-        "sha256": "0cf2a29666f1b8a0ef82ef73c6fdc02528ae064c817d16498c51041adbd94687"
+        "sha256": "1f4ba9cd707078a2a1295bb79d00234535c6bbf287455230134ee87caaa3510f"
       },
       "tactic": {
         "cta_group": 2,
@@ -46147,7 +46147,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -46709,7 +46709,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_tma.py",
-        "sha256": "a7be5721f38628c6556da0052f63f55f87ce1e596fae3ad629d5c322ff33ae45"
+        "sha256": "0dc0fea8524a9e194409aae53199252e49c0ce72651be0a00812aa03d821825f"
       },
       "tactic": {
         "cta_group": 2,
@@ -46737,7 +46737,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -47299,7 +47299,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -47327,7 +47327,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -47889,7 +47889,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -47917,7 +47917,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -48479,7 +48479,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -48507,7 +48507,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -49069,7 +49069,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -49097,7 +49097,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -49659,7 +49659,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_tma.py",
-        "sha256": "a7be5721f38628c6556da0052f63f55f87ce1e596fae3ad629d5c322ff33ae45"
+        "sha256": "0dc0fea8524a9e194409aae53199252e49c0ce72651be0a00812aa03d821825f"
       },
       "tactic": {
         "cta_group": 2,
@@ -49687,7 +49687,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -50249,7 +50249,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -50277,7 +50277,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -50839,7 +50839,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_tma.py",
-        "sha256": "a7be5721f38628c6556da0052f63f55f87ce1e596fae3ad629d5c322ff33ae45"
+        "sha256": "0dc0fea8524a9e194409aae53199252e49c0ce72651be0a00812aa03d821825f"
       },
       "tactic": {
         "cta_group": 2,
@@ -50867,7 +50867,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -51429,7 +51429,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_normal_tma.py",
-        "sha256": "a7be5721f38628c6556da0052f63f55f87ce1e596fae3ad629d5c322ff33ae45"
+        "sha256": "0dc0fea8524a9e194409aae53199252e49c0ce72651be0a00812aa03d821825f"
       },
       "tactic": {
         "cta_group": 2,
@@ -51457,7 +51457,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -52019,7 +52019,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_nvfp4_swap_ab_tma.py",
-        "sha256": "6b864860bdfeb85733db88bd05edf5b28d20f4f7b24a6e202176537f8d9ce45e"
+        "sha256": "f7d1ac210359cca15ae0e6eec98b14e103d80f2646c8361256e470f0ede45bb9"
       },
       "tactic": {
         "cta_group": 2,
@@ -52047,7 +52047,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -52613,7 +52613,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_stg.py",
-        "sha256": "84c1594af21e4b89072d47838b51c5a9568a297bbc4aaa7d67fa226608f79855"
+        "sha256": "7e9f423452dd1be60fd15937746d6cc44b696e7f96ccc81044410e398cf6a767"
       },
       "tactic": {
         "cta_group": 2,
@@ -52641,7 +52641,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -53203,7 +53203,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_swap_ab_tma.py",
-        "sha256": "934d2f278dbf97c853728993259170d75275ce9e223faa12d15e6da35820fcff"
+        "sha256": "843a05a2b50b31118c6fdc2fd48362a2ba4bae60d3dfd6bb849e947bb4e12524"
       },
       "tactic": {
         "cta_group": 2,
@@ -53231,7 +53231,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -53793,7 +53793,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_swap_ab_tma.py",
-        "sha256": "934d2f278dbf97c853728993259170d75275ce9e223faa12d15e6da35820fcff"
+        "sha256": "843a05a2b50b31118c6fdc2fd48362a2ba4bae60d3dfd6bb849e947bb4e12524"
       },
       "tactic": {
         "cta_group": 2,
@@ -53821,7 +53821,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -54387,7 +54387,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_stg.py",
-        "sha256": "84c1594af21e4b89072d47838b51c5a9568a297bbc4aaa7d67fa226608f79855"
+        "sha256": "7e9f423452dd1be60fd15937746d6cc44b696e7f96ccc81044410e398cf6a767"
       },
       "tactic": {
         "cta_group": 1,
@@ -54415,7 +54415,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -54977,7 +54977,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_tma.py",
-        "sha256": "11acc1244107646d767e89736aa6e2a7fdee32a35764a01f71f0731371ca4433"
+        "sha256": "c2c04817b8ca622a9a2bd8373f606bbe6113909b4cef758946398d13909658f1"
       },
       "tactic": {
         "cta_group": 1,
@@ -55005,7 +55005,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -55571,7 +55571,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_stg.py",
-        "sha256": "84c1594af21e4b89072d47838b51c5a9568a297bbc4aaa7d67fa226608f79855"
+        "sha256": "7e9f423452dd1be60fd15937746d6cc44b696e7f96ccc81044410e398cf6a767"
       },
       "tactic": {
         "cta_group": 2,
@@ -55599,7 +55599,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -56165,7 +56165,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_stg.py",
-        "sha256": "84c1594af21e4b89072d47838b51c5a9568a297bbc4aaa7d67fa226608f79855"
+        "sha256": "7e9f423452dd1be60fd15937746d6cc44b696e7f96ccc81044410e398cf6a767"
       },
       "tactic": {
         "cta_group": 2,
@@ -56193,7 +56193,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -56755,7 +56755,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_tma.py",
-        "sha256": "11acc1244107646d767e89736aa6e2a7fdee32a35764a01f71f0731371ca4433"
+        "sha256": "c2c04817b8ca622a9a2bd8373f606bbe6113909b4cef758946398d13909658f1"
       },
       "tactic": {
         "cta_group": 2,
@@ -56783,7 +56783,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -57349,7 +57349,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_stg.py",
-        "sha256": "84c1594af21e4b89072d47838b51c5a9568a297bbc4aaa7d67fa226608f79855"
+        "sha256": "7e9f423452dd1be60fd15937746d6cc44b696e7f96ccc81044410e398cf6a767"
       },
       "tactic": {
         "cta_group": 2,
@@ -57377,7 +57377,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -57939,7 +57939,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_normal_tma.py",
-        "sha256": "11acc1244107646d767e89736aa6e2a7fdee32a35764a01f71f0731371ca4433"
+        "sha256": "c2c04817b8ca622a9a2bd8373f606bbe6113909b4cef758946398d13909658f1"
       },
       "tactic": {
         "cta_group": 2,
@@ -57967,7 +57967,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -58529,7 +58529,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_swap_ab_tma.py",
-        "sha256": "934d2f278dbf97c853728993259170d75275ce9e223faa12d15e6da35820fcff"
+        "sha256": "843a05a2b50b31118c6fdc2fd48362a2ba4bae60d3dfd6bb849e947bb4e12524"
       },
       "tactic": {
         "cta_group": 2,
@@ -58557,7 +58557,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -59119,7 +59119,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_swap_ab_tma.py",
-        "sha256": "934d2f278dbf97c853728993259170d75275ce9e223faa12d15e6da35820fcff"
+        "sha256": "843a05a2b50b31118c6fdc2fd48362a2ba4bae60d3dfd6bb849e947bb4e12524"
       },
       "tactic": {
         "cta_group": 2,
@@ -59147,7 +59147,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -59709,7 +59709,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_swap_ab_tma.py",
-        "sha256": "934d2f278dbf97c853728993259170d75275ce9e223faa12d15e6da35820fcff"
+        "sha256": "843a05a2b50b31118c6fdc2fd48362a2ba4bae60d3dfd6bb849e947bb4e12524"
       },
       "tactic": {
         "cta_group": 2,
@@ -59737,7 +59737,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -60299,7 +60299,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_nvfp4_swap_ab_tma.py",
-        "sha256": "934d2f278dbf97c853728993259170d75275ce9e223faa12d15e6da35820fcff"
+        "sha256": "843a05a2b50b31118c6fdc2fd48362a2ba4bae60d3dfd6bb849e947bb4e12524"
       },
       "tactic": {
         "cta_group": 2,
@@ -60327,7 +60327,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -60896,7 +60896,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_normal_stg.py",
-        "sha256": "1cda9b6fde2d62642451149b268d946a1b44b35d01a53505306a744b2934ec05"
+        "sha256": "60f3c83b39fb62f47c42d14aef59f4e31d4e7c9d73eba67e425cb76f893ed3bb"
       },
       "tactic": {
         "cta_group": 1,
@@ -60924,7 +60924,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -61493,7 +61493,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_stg.py",
-        "sha256": "8be1bf0c8ee0efc4406e28260be1f84d0019904886ae35658345f254e11f8e76"
+        "sha256": "caaa2c6d8887182fddfeafe43b8e1a7803845af8a2615fa0cdd324110b3e3cf7"
       },
       "tactic": {
         "cta_group": 1,
@@ -61521,7 +61521,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -62086,7 +62086,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_tma.py",
-        "sha256": "f7c05c4f6358a486b2fa9693ed958b001ed28ded0f2469211dc57360a4d14483"
+        "sha256": "a7a13ac16d4c31b7e75e51c568fcf189d6dc32cfb6875a4c5324d7f53395f89e"
       },
       "tactic": {
         "cta_group": 1,
@@ -62114,7 +62114,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -62683,7 +62683,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_normal_stg.py",
-        "sha256": "1cda9b6fde2d62642451149b268d946a1b44b35d01a53505306a744b2934ec05"
+        "sha256": "60f3c83b39fb62f47c42d14aef59f4e31d4e7c9d73eba67e425cb76f893ed3bb"
       },
       "tactic": {
         "cta_group": 2,
@@ -62711,7 +62711,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -63280,7 +63280,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_stg.py",
-        "sha256": "8be1bf0c8ee0efc4406e28260be1f84d0019904886ae35658345f254e11f8e76"
+        "sha256": "caaa2c6d8887182fddfeafe43b8e1a7803845af8a2615fa0cdd324110b3e3cf7"
       },
       "tactic": {
         "cta_group": 2,
@@ -63308,7 +63308,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -63873,7 +63873,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_tma.py",
-        "sha256": "f7c05c4f6358a486b2fa9693ed958b001ed28ded0f2469211dc57360a4d14483"
+        "sha256": "a7a13ac16d4c31b7e75e51c568fcf189d6dc32cfb6875a4c5324d7f53395f89e"
       },
       "tactic": {
         "cta_group": 2,
@@ -63901,7 +63901,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -64470,7 +64470,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_normal_stg.py",
-        "sha256": "1cda9b6fde2d62642451149b268d946a1b44b35d01a53505306a744b2934ec05"
+        "sha256": "60f3c83b39fb62f47c42d14aef59f4e31d4e7c9d73eba67e425cb76f893ed3bb"
       },
       "tactic": {
         "cta_group": 2,
@@ -64498,7 +64498,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -65067,7 +65067,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_normal_stg.py",
-        "sha256": "1cda9b6fde2d62642451149b268d946a1b44b35d01a53505306a744b2934ec05"
+        "sha256": "60f3c83b39fb62f47c42d14aef59f4e31d4e7c9d73eba67e425cb76f893ed3bb"
       },
       "tactic": {
         "cta_group": 2,
@@ -65095,7 +65095,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -65664,7 +65664,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_stg.py",
-        "sha256": "8be1bf0c8ee0efc4406e28260be1f84d0019904886ae35658345f254e11f8e76"
+        "sha256": "caaa2c6d8887182fddfeafe43b8e1a7803845af8a2615fa0cdd324110b3e3cf7"
       },
       "tactic": {
         "cta_group": 2,
@@ -65692,7 +65692,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -66257,7 +66257,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_tma.py",
-        "sha256": "f7c05c4f6358a486b2fa9693ed958b001ed28ded0f2469211dc57360a4d14483"
+        "sha256": "a7a13ac16d4c31b7e75e51c568fcf189d6dc32cfb6875a4c5324d7f53395f89e"
       },
       "tactic": {
         "cta_group": 2,
@@ -66285,7 +66285,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -66854,7 +66854,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_stg.py",
-        "sha256": "8be1bf0c8ee0efc4406e28260be1f84d0019904886ae35658345f254e11f8e76"
+        "sha256": "caaa2c6d8887182fddfeafe43b8e1a7803845af8a2615fa0cdd324110b3e3cf7"
       },
       "tactic": {
         "cta_group": 2,
@@ -66882,7 +66882,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -67451,7 +67451,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_nvfp4_swap_ab_stg.py",
-        "sha256": "8be1bf0c8ee0efc4406e28260be1f84d0019904886ae35658345f254e11f8e76"
+        "sha256": "caaa2c6d8887182fddfeafe43b8e1a7803845af8a2615fa0cdd324110b3e3cf7"
       },
       "tactic": {
         "cta_group": 2,
@@ -67479,7 +67479,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -68046,7 +68046,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_stg.py",
-        "sha256": "74998d603b94a77bb8fcb9b156ed3112e8261ffa23a992af380b5fdf9de43942"
+        "sha256": "21f5911810f127e4e33b96a5eaf36de5f19a1767b6f7dfa6f10fb70f77e2371f"
       },
       "tactic": {
         "cta_group": 2,
@@ -68074,7 +68074,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -68641,7 +68641,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_stg.py",
-        "sha256": "74998d603b94a77bb8fcb9b156ed3112e8261ffa23a992af380b5fdf9de43942"
+        "sha256": "21f5911810f127e4e33b96a5eaf36de5f19a1767b6f7dfa6f10fb70f77e2371f"
       },
       "tactic": {
         "cta_group": 2,
@@ -68669,7 +68669,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -69232,7 +69232,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_tma.py",
-        "sha256": "3ceb624fe301e278305d3850c233142b39925b9e733d9d915771c488f083a9ea"
+        "sha256": "10e62e47a036232878959cc2a8825db526852ca5013882f81cf04143468b1307"
       },
       "tactic": {
         "cta_group": 2,
@@ -69260,7 +69260,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -69823,7 +69823,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_swap_ab_tma.py",
-        "sha256": "360cd03131e396b71aa7e99a7869d35003b1810ca8f522d272b0bd1f77a0038a"
+        "sha256": "cb4b6077a5bfc5ec614850abe9d8157fe0dc51734af245c820a05723ecbd1755"
       },
       "tactic": {
         "cta_group": 2,
@@ -69851,7 +69851,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -70418,7 +70418,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_swap_ab_stg.py",
-        "sha256": "c353572fdf8c2ff5f2017162b89621bffa47c63b583b2d0bcb627a31cdb07cb9"
+        "sha256": "d8e1f3ce2bf7b3bc2bad725281db312037f9037b6e9870f1879c4d1d71638361"
       },
       "tactic": {
         "cta_group": 2,
@@ -70446,7 +70446,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -71009,7 +71009,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_swap_ab_tma.py",
-        "sha256": "360cd03131e396b71aa7e99a7869d35003b1810ca8f522d272b0bd1f77a0038a"
+        "sha256": "cb4b6077a5bfc5ec614850abe9d8157fe0dc51734af245c820a05723ecbd1755"
       },
       "tactic": {
         "cta_group": 2,
@@ -71037,7 +71037,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -71604,7 +71604,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_stg.py",
-        "sha256": "74998d603b94a77bb8fcb9b156ed3112e8261ffa23a992af380b5fdf9de43942"
+        "sha256": "21f5911810f127e4e33b96a5eaf36de5f19a1767b6f7dfa6f10fb70f77e2371f"
       },
       "tactic": {
         "cta_group": 1,
@@ -71632,7 +71632,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -72195,7 +72195,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_tma.py",
-        "sha256": "3ceb624fe301e278305d3850c233142b39925b9e733d9d915771c488f083a9ea"
+        "sha256": "10e62e47a036232878959cc2a8825db526852ca5013882f81cf04143468b1307"
       },
       "tactic": {
         "cta_group": 1,
@@ -72223,7 +72223,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -72790,7 +72790,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_stg.py",
-        "sha256": "74998d603b94a77bb8fcb9b156ed3112e8261ffa23a992af380b5fdf9de43942"
+        "sha256": "21f5911810f127e4e33b96a5eaf36de5f19a1767b6f7dfa6f10fb70f77e2371f"
       },
       "tactic": {
         "cta_group": 2,
@@ -72818,7 +72818,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -73381,7 +73381,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_tma.py",
-        "sha256": "3ceb624fe301e278305d3850c233142b39925b9e733d9d915771c488f083a9ea"
+        "sha256": "10e62e47a036232878959cc2a8825db526852ca5013882f81cf04143468b1307"
       },
       "tactic": {
         "cta_group": 2,
@@ -73409,7 +73409,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -73976,7 +73976,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_stg.py",
-        "sha256": "74998d603b94a77bb8fcb9b156ed3112e8261ffa23a992af380b5fdf9de43942"
+        "sha256": "21f5911810f127e4e33b96a5eaf36de5f19a1767b6f7dfa6f10fb70f77e2371f"
       },
       "tactic": {
         "cta_group": 2,
@@ -74004,7 +74004,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -74571,7 +74571,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_normal_stg.py",
-        "sha256": "74998d603b94a77bb8fcb9b156ed3112e8261ffa23a992af380b5fdf9de43942"
+        "sha256": "21f5911810f127e4e33b96a5eaf36de5f19a1767b6f7dfa6f10fb70f77e2371f"
       },
       "tactic": {
         "cta_group": 2,
@@ -74599,7 +74599,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -75162,7 +75162,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_swap_ab_tma.py",
-        "sha256": "360cd03131e396b71aa7e99a7869d35003b1810ca8f522d272b0bd1f77a0038a"
+        "sha256": "cb4b6077a5bfc5ec614850abe9d8157fe0dc51734af245c820a05723ecbd1755"
       },
       "tactic": {
         "cta_group": 2,
@@ -75190,7 +75190,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -75753,7 +75753,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_swap_ab_tma.py",
-        "sha256": "360cd03131e396b71aa7e99a7869d35003b1810ca8f522d272b0bd1f77a0038a"
+        "sha256": "cb4b6077a5bfc5ec614850abe9d8157fe0dc51734af245c820a05723ecbd1755"
       },
       "tactic": {
         "cta_group": 2,
@@ -75781,7 +75781,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -76344,7 +76344,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_nvfp4_swap_ab_tma.py",
-        "sha256": "360cd03131e396b71aa7e99a7869d35003b1810ca8f522d272b0bd1f77a0038a"
+        "sha256": "cb4b6077a5bfc5ec614850abe9d8157fe0dc51734af245c820a05723ecbd1755"
       },
       "tactic": {
         "cta_group": 2,
@@ -76372,7 +76372,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -76939,7 +76939,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_stg.py",
-        "sha256": "a913c1bc935f70fa6f5193cb135a9c1a7c68c0f36954422aad3815ae811fd0fc"
+        "sha256": "035926e94654425a9c26e23632eb621deb34207aa740cf3a40bca6a8cc1635e3"
       },
       "tactic": {
         "cta_group": 1,
@@ -76967,7 +76967,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -77530,7 +77530,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_tma.py",
-        "sha256": "d124d5b94954fdf739aac46c43298b69aab3c9ec04f5f8db7fa32a681f770020"
+        "sha256": "48eee8f065e8412d505a51bd8afd85e1a980479868da39187b907b6750daf671"
       },
       "tactic": {
         "cta_group": 1,
@@ -77558,7 +77558,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -78121,7 +78121,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_swap_ab_tma.py",
-        "sha256": "1b582206575c0643b2509f1c3c644ecdecffba5161c4cf60a663439205543ca1"
+        "sha256": "f6b3bdb76f56f4ea1bb2895961d135a988d293d1edaf56895dfba11e19ca5e52"
       },
       "tactic": {
         "cta_group": 1,
@@ -78149,7 +78149,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -78712,7 +78712,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_tma.py",
-        "sha256": "d124d5b94954fdf739aac46c43298b69aab3c9ec04f5f8db7fa32a681f770020"
+        "sha256": "48eee8f065e8412d505a51bd8afd85e1a980479868da39187b907b6750daf671"
       },
       "tactic": {
         "cta_group": 2,
@@ -78740,7 +78740,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -79303,7 +79303,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_swap_ab_tma.py",
-        "sha256": "1b582206575c0643b2509f1c3c644ecdecffba5161c4cf60a663439205543ca1"
+        "sha256": "f6b3bdb76f56f4ea1bb2895961d135a988d293d1edaf56895dfba11e19ca5e52"
       },
       "tactic": {
         "cta_group": 2,
@@ -79331,7 +79331,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -79898,7 +79898,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_stg.py",
-        "sha256": "a913c1bc935f70fa6f5193cb135a9c1a7c68c0f36954422aad3815ae811fd0fc"
+        "sha256": "035926e94654425a9c26e23632eb621deb34207aa740cf3a40bca6a8cc1635e3"
       },
       "tactic": {
         "cta_group": 2,
@@ -79926,7 +79926,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -80489,7 +80489,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_tma.py",
-        "sha256": "d124d5b94954fdf739aac46c43298b69aab3c9ec04f5f8db7fa32a681f770020"
+        "sha256": "48eee8f065e8412d505a51bd8afd85e1a980479868da39187b907b6750daf671"
       },
       "tactic": {
         "cta_group": 2,
@@ -80517,7 +80517,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -81084,7 +81084,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_stg.py",
-        "sha256": "a913c1bc935f70fa6f5193cb135a9c1a7c68c0f36954422aad3815ae811fd0fc"
+        "sha256": "035926e94654425a9c26e23632eb621deb34207aa740cf3a40bca6a8cc1635e3"
       },
       "tactic": {
         "cta_group": 2,
@@ -81112,7 +81112,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -81675,7 +81675,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_normal_tma.py",
-        "sha256": "d124d5b94954fdf739aac46c43298b69aab3c9ec04f5f8db7fa32a681f770020"
+        "sha256": "48eee8f065e8412d505a51bd8afd85e1a980479868da39187b907b6750daf671"
       },
       "tactic": {
         "cta_group": 2,
@@ -81703,7 +81703,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -82266,7 +82266,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_swap_ab_tma.py",
-        "sha256": "1b582206575c0643b2509f1c3c644ecdecffba5161c4cf60a663439205543ca1"
+        "sha256": "f6b3bdb76f56f4ea1bb2895961d135a988d293d1edaf56895dfba11e19ca5e52"
       },
       "tactic": {
         "cta_group": 2,
@@ -82294,7 +82294,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -82857,7 +82857,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_nvfp4_swap_ab_tma.py",
-        "sha256": "1b582206575c0643b2509f1c3c644ecdecffba5161c4cf60a663439205543ca1"
+        "sha256": "f6b3bdb76f56f4ea1bb2895961d135a988d293d1edaf56895dfba11e19ca5e52"
       },
       "tactic": {
         "cta_group": 2,
@@ -82885,7 +82885,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -83446,7 +83446,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -83474,7 +83474,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -84039,7 +84039,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_normal_stg.py",
-        "sha256": "953ca2daf3cc478f19fa4746e4d2b0e59fdfa5a7b2e72a4f8b9ba7227807821e"
+        "sha256": "60d6085a23b4741b7cf7446dd31c5ec8adf6c5b0d7eedc59956eea5b2e54ac04"
       },
       "tactic": {
         "cta_group": 1,
@@ -84067,7 +84067,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -84628,7 +84628,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -84656,7 +84656,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -85221,7 +85221,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_normal_stg.py",
-        "sha256": "953ca2daf3cc478f19fa4746e4d2b0e59fdfa5a7b2e72a4f8b9ba7227807821e"
+        "sha256": "60d6085a23b4741b7cf7446dd31c5ec8adf6c5b0d7eedc59956eea5b2e54ac04"
       },
       "tactic": {
         "cta_group": 2,
@@ -85249,7 +85249,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -85810,7 +85810,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -85838,7 +85838,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -86399,7 +86399,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -86427,7 +86427,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -86988,7 +86988,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -87016,7 +87016,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -87577,7 +87577,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_normal_tma.py",
-        "sha256": "68d490331300944d5f531f02f0c27bbf42dfe77a830e66a35049dcb8220d5a62"
+        "sha256": "bf09c05487017ac969ff595f63da812a1ba819ac687f0cc767213435e7f92fd4"
       },
       "tactic": {
         "cta_group": 2,
@@ -87605,7 +87605,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -88166,7 +88166,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -88194,7 +88194,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -88755,7 +88755,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_normal_tma.py",
-        "sha256": "68d490331300944d5f531f02f0c27bbf42dfe77a830e66a35049dcb8220d5a62"
+        "sha256": "bf09c05487017ac969ff595f63da812a1ba819ac687f0cc767213435e7f92fd4"
       },
       "tactic": {
         "cta_group": 2,
@@ -88783,7 +88783,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -89344,7 +89344,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_normal_tma.py",
-        "sha256": "68d490331300944d5f531f02f0c27bbf42dfe77a830e66a35049dcb8220d5a62"
+        "sha256": "bf09c05487017ac969ff595f63da812a1ba819ac687f0cc767213435e7f92fd4"
       },
       "tactic": {
         "cta_group": 2,
@@ -89372,7 +89372,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -89933,7 +89933,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -89961,7 +89961,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -90522,7 +90522,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -90550,7 +90550,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm2_swap_ab",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -91111,7 +91111,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm2_nvfp4_swap_ab_tma.py",
-        "sha256": "4e86525cbb4bdfd7132ae6ac1677ca0cf2b626af6e8d31ddefa28df782f907bf"
+        "sha256": "a7e015c153f927e9d11a22e7b9167c0be62262122d1db597d1fefe5ffd7e0ac5"
       },
       "tactic": {
         "cta_group": 2,
@@ -91139,7 +91139,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -91715,7 +91715,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "e8035c47d89ef7a89fd2027a322784618ba1e45360a974a3b3750064f9824524"
+        "sha256": "06abbe8cd5ba4ce898c95f60f583d290a4a2085dfeec37faf1e6bffc7e7b13ab"
       },
       "tactic": {
         "cta_group": 1,
@@ -91733,7 +91733,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -92309,7 +92309,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "e8035c47d89ef7a89fd2027a322784618ba1e45360a974a3b3750064f9824524"
+        "sha256": "06abbe8cd5ba4ce898c95f60f583d290a4a2085dfeec37faf1e6bffc7e7b13ab"
       },
       "tactic": {
         "cta_group": 2,
@@ -92327,7 +92327,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -92903,7 +92903,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "e8035c47d89ef7a89fd2027a322784618ba1e45360a974a3b3750064f9824524"
+        "sha256": "06abbe8cd5ba4ce898c95f60f583d290a4a2085dfeec37faf1e6bffc7e7b13ab"
       },
       "tactic": {
         "cta_group": 2,
@@ -92921,7 +92921,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -93497,7 +93497,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "e8035c47d89ef7a89fd2027a322784618ba1e45360a974a3b3750064f9824524"
+        "sha256": "06abbe8cd5ba4ce898c95f60f583d290a4a2085dfeec37faf1e6bffc7e7b13ab"
       },
       "tactic": {
         "cta_group": 2,
@@ -93515,7 +93515,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -94091,7 +94091,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_stg.py",
-        "sha256": "3c5d6d9dee49d5f2b97b982a2560f35a215d9c096b3aa58486b9b3552964b6be"
+        "sha256": "e3619b8bb75468c5134634fd40a728add54eb3472b5f50be5b18b25580fb3cc4"
       },
       "tactic": {
         "cta_group": 2,
@@ -94109,7 +94109,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -94685,7 +94685,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_stg.py",
-        "sha256": "3c5d6d9dee49d5f2b97b982a2560f35a215d9c096b3aa58486b9b3552964b6be"
+        "sha256": "e3619b8bb75468c5134634fd40a728add54eb3472b5f50be5b18b25580fb3cc4"
       },
       "tactic": {
         "cta_group": 2,
@@ -94703,7 +94703,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -95279,7 +95279,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_stg.py",
-        "sha256": "3c5d6d9dee49d5f2b97b982a2560f35a215d9c096b3aa58486b9b3552964b6be"
+        "sha256": "e3619b8bb75468c5134634fd40a728add54eb3472b5f50be5b18b25580fb3cc4"
       },
       "tactic": {
         "cta_group": 2,
@@ -95297,7 +95297,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -95873,7 +95873,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_stg.py",
-        "sha256": "3c5d6d9dee49d5f2b97b982a2560f35a215d9c096b3aa58486b9b3552964b6be"
+        "sha256": "e3619b8bb75468c5134634fd40a728add54eb3472b5f50be5b18b25580fb3cc4"
       },
       "tactic": {
         "cta_group": 1,
@@ -95891,7 +95891,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -96467,7 +96467,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_stg.py",
-        "sha256": "3c5d6d9dee49d5f2b97b982a2560f35a215d9c096b3aa58486b9b3552964b6be"
+        "sha256": "e3619b8bb75468c5134634fd40a728add54eb3472b5f50be5b18b25580fb3cc4"
       },
       "tactic": {
         "cta_group": 2,
@@ -96485,7 +96485,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -97060,7 +97060,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_stg.py",
-        "sha256": "6c25ce7e9dbd86ec4f45b7422cf0f2c9ea85a434b4a6f3d910e0b9048ea683ce"
+        "sha256": "7f0c2ae12f73636772aaa7e35f2363212b921b8566382e77eadab4a485262b89"
       },
       "tactic": {
         "cta_group": 1,
@@ -97078,7 +97078,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -97653,7 +97653,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_stg.py",
-        "sha256": "6c25ce7e9dbd86ec4f45b7422cf0f2c9ea85a434b4a6f3d910e0b9048ea683ce"
+        "sha256": "7f0c2ae12f73636772aaa7e35f2363212b921b8566382e77eadab4a485262b89"
       },
       "tactic": {
         "cta_group": 2,
@@ -97671,7 +97671,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -98246,7 +98246,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_stg.py",
-        "sha256": "6c25ce7e9dbd86ec4f45b7422cf0f2c9ea85a434b4a6f3d910e0b9048ea683ce"
+        "sha256": "7f0c2ae12f73636772aaa7e35f2363212b921b8566382e77eadab4a485262b89"
       },
       "tactic": {
         "cta_group": 2,
@@ -98264,7 +98264,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -98839,7 +98839,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_stg.py",
-        "sha256": "6c25ce7e9dbd86ec4f45b7422cf0f2c9ea85a434b4a6f3d910e0b9048ea683ce"
+        "sha256": "7f0c2ae12f73636772aaa7e35f2363212b921b8566382e77eadab4a485262b89"
       },
       "tactic": {
         "cta_group": 2,
@@ -98857,7 +98857,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -99432,7 +99432,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_stg.py",
-        "sha256": "6c25ce7e9dbd86ec4f45b7422cf0f2c9ea85a434b4a6f3d910e0b9048ea683ce"
+        "sha256": "7f0c2ae12f73636772aaa7e35f2363212b921b8566382e77eadab4a485262b89"
       },
       "tactic": {
         "cta_group": 1,
@@ -99450,7 +99450,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -100025,7 +100025,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_stg.py",
-        "sha256": "6c25ce7e9dbd86ec4f45b7422cf0f2c9ea85a434b4a6f3d910e0b9048ea683ce"
+        "sha256": "7f0c2ae12f73636772aaa7e35f2363212b921b8566382e77eadab4a485262b89"
       },
       "tactic": {
         "cta_group": 2,
@@ -100043,7 +100043,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -100618,7 +100618,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_stg.py",
-        "sha256": "4fc858d5cefb55067d09c22d239734437ca58dbf120169d046939e05799e0b75"
+        "sha256": "20d09e3effa7cd066bcfddf0ce94d3b1f518ecf1805434fb29c5039dc53cabdb"
       },
       "tactic": {
         "cta_group": 2,
@@ -100636,7 +100636,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -101211,7 +101211,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_stg.py",
-        "sha256": "4fc858d5cefb55067d09c22d239734437ca58dbf120169d046939e05799e0b75"
+        "sha256": "20d09e3effa7cd066bcfddf0ce94d3b1f518ecf1805434fb29c5039dc53cabdb"
       },
       "tactic": {
         "cta_group": 1,
@@ -101229,7 +101229,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -101804,7 +101804,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_stg.py",
-        "sha256": "4fc858d5cefb55067d09c22d239734437ca58dbf120169d046939e05799e0b75"
+        "sha256": "20d09e3effa7cd066bcfddf0ce94d3b1f518ecf1805434fb29c5039dc53cabdb"
       },
       "tactic": {
         "cta_group": 2,
@@ -101822,7 +101822,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -102397,7 +102397,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_stg.py",
-        "sha256": "4fc858d5cefb55067d09c22d239734437ca58dbf120169d046939e05799e0b75"
+        "sha256": "20d09e3effa7cd066bcfddf0ce94d3b1f518ecf1805434fb29c5039dc53cabdb"
       },
       "tactic": {
         "cta_group": 2,
@@ -102415,7 +102415,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -102990,7 +102990,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_stg.py",
-        "sha256": "4fc858d5cefb55067d09c22d239734437ca58dbf120169d046939e05799e0b75"
+        "sha256": "20d09e3effa7cd066bcfddf0ce94d3b1f518ecf1805434fb29c5039dc53cabdb"
       },
       "tactic": {
         "cta_group": 2,
@@ -103008,7 +103008,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -103583,7 +103583,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_stg.py",
-        "sha256": "4fc858d5cefb55067d09c22d239734437ca58dbf120169d046939e05799e0b75"
+        "sha256": "20d09e3effa7cd066bcfddf0ce94d3b1f518ecf1805434fb29c5039dc53cabdb"
       },
       "tactic": {
         "cta_group": 2,
@@ -103601,7 +103601,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -104176,7 +104176,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_stg.py",
-        "sha256": "312a67cf69169070053cc37974833031d407bbd2b08939956eff540708f12f55"
+        "sha256": "e4fb65e1505f8c2b0fe5ecb3757f222382db549f34b488db4ef990d8f9d08b45"
       },
       "tactic": {
         "cta_group": 2,
@@ -104194,7 +104194,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -104769,7 +104769,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_stg.py",
-        "sha256": "312a67cf69169070053cc37974833031d407bbd2b08939956eff540708f12f55"
+        "sha256": "e4fb65e1505f8c2b0fe5ecb3757f222382db549f34b488db4ef990d8f9d08b45"
       },
       "tactic": {
         "cta_group": 1,
@@ -104787,7 +104787,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -105362,7 +105362,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_stg.py",
-        "sha256": "312a67cf69169070053cc37974833031d407bbd2b08939956eff540708f12f55"
+        "sha256": "e4fb65e1505f8c2b0fe5ecb3757f222382db549f34b488db4ef990d8f9d08b45"
       },
       "tactic": {
         "cta_group": 2,
@@ -105380,7 +105380,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -105955,7 +105955,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_stg.py",
-        "sha256": "312a67cf69169070053cc37974833031d407bbd2b08939956eff540708f12f55"
+        "sha256": "e4fb65e1505f8c2b0fe5ecb3757f222382db549f34b488db4ef990d8f9d08b45"
       },
       "tactic": {
         "cta_group": 2,
@@ -105973,7 +105973,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -106548,7 +106548,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_stg.py",
-        "sha256": "312a67cf69169070053cc37974833031d407bbd2b08939956eff540708f12f55"
+        "sha256": "e4fb65e1505f8c2b0fe5ecb3757f222382db549f34b488db4ef990d8f9d08b45"
       },
       "tactic": {
         "cta_group": 2,
@@ -106566,7 +106566,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -107141,7 +107141,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_stg.py",
-        "sha256": "312a67cf69169070053cc37974833031d407bbd2b08939956eff540708f12f55"
+        "sha256": "e4fb65e1505f8c2b0fe5ecb3757f222382db549f34b488db4ef990d8f9d08b45"
       },
       "tactic": {
         "cta_group": 2,
@@ -107159,7 +107159,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -107734,7 +107734,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 2,
@@ -107752,7 +107752,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -108327,7 +108327,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 1,
@@ -108345,7 +108345,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -108920,7 +108920,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 2,
@@ -108938,7 +108938,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -109513,7 +109513,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 2,
@@ -109531,7 +109531,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -110106,7 +110106,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 2,
@@ -110124,7 +110124,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -110699,7 +110699,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 2,
@@ -110717,7 +110717,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -111292,7 +111292,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_stg.py",
-        "sha256": "252c278a0d76ef02c71c3d51761a13cad9d8ce54a76f3c2fad3fc94bc57d5f51"
+        "sha256": "ef6135eaa447ed6f14e3ff3e8057ca6dd15f8a92dc9a6ad605e0cc6d3c7faa3d"
       },
       "tactic": {
         "cta_group": 2,
@@ -111310,7 +111310,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -111885,7 +111885,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_stg.py",
-        "sha256": "b037b81d91f52dd0544e7d3041fc1d58c5fbd83eb8302b8efa051af460f2892b"
+        "sha256": "bc1d90b4f30e1538fdb1d2409320da0900f1afd74e9945f24ad16173f83502ed"
       },
       "tactic": {
         "cta_group": 2,
@@ -111903,7 +111903,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -112478,7 +112478,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_stg.py",
-        "sha256": "b037b81d91f52dd0544e7d3041fc1d58c5fbd83eb8302b8efa051af460f2892b"
+        "sha256": "bc1d90b4f30e1538fdb1d2409320da0900f1afd74e9945f24ad16173f83502ed"
       },
       "tactic": {
         "cta_group": 1,
@@ -112496,7 +112496,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -113071,7 +113071,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_stg.py",
-        "sha256": "b037b81d91f52dd0544e7d3041fc1d58c5fbd83eb8302b8efa051af460f2892b"
+        "sha256": "bc1d90b4f30e1538fdb1d2409320da0900f1afd74e9945f24ad16173f83502ed"
       },
       "tactic": {
         "cta_group": 2,
@@ -113089,7 +113089,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -113664,7 +113664,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_stg.py",
-        "sha256": "b037b81d91f52dd0544e7d3041fc1d58c5fbd83eb8302b8efa051af460f2892b"
+        "sha256": "bc1d90b4f30e1538fdb1d2409320da0900f1afd74e9945f24ad16173f83502ed"
       },
       "tactic": {
         "cta_group": 2,
@@ -113682,7 +113682,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -114257,7 +114257,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_stg.py",
-        "sha256": "b037b81d91f52dd0544e7d3041fc1d58c5fbd83eb8302b8efa051af460f2892b"
+        "sha256": "bc1d90b4f30e1538fdb1d2409320da0900f1afd74e9945f24ad16173f83502ed"
       },
       "tactic": {
         "cta_group": 2,
@@ -114275,7 +114275,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -114853,7 +114853,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_stg.py",
-        "sha256": "44a8fdad78486c3df6201690fa8c93e7d6b5dcd5b212d6868a002c363fc83e3d"
+        "sha256": "de370248ca702f45909d0f670cf04cba8f19e581cf2ce022ea9c3c062326edde"
       },
       "tactic": {
         "cta_group": 1,
@@ -114871,7 +114871,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -115449,7 +115449,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_stg.py",
-        "sha256": "44a8fdad78486c3df6201690fa8c93e7d6b5dcd5b212d6868a002c363fc83e3d"
+        "sha256": "de370248ca702f45909d0f670cf04cba8f19e581cf2ce022ea9c3c062326edde"
       },
       "tactic": {
         "cta_group": 2,
@@ -115467,7 +115467,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -116045,7 +116045,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_stg.py",
-        "sha256": "44a8fdad78486c3df6201690fa8c93e7d6b5dcd5b212d6868a002c363fc83e3d"
+        "sha256": "de370248ca702f45909d0f670cf04cba8f19e581cf2ce022ea9c3c062326edde"
       },
       "tactic": {
         "cta_group": 2,
@@ -116063,7 +116063,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -116641,7 +116641,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_stg.py",
-        "sha256": "44a8fdad78486c3df6201690fa8c93e7d6b5dcd5b212d6868a002c363fc83e3d"
+        "sha256": "de370248ca702f45909d0f670cf04cba8f19e581cf2ce022ea9c3c062326edde"
       },
       "tactic": {
         "cta_group": 2,
@@ -116659,7 +116659,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -117235,7 +117235,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "c47920fbcddb1fd157bba88d974a1f7874aaf700361bf229ee96155d39b4b62f"
+        "sha256": "e5b9b24426d9d6e76cfc29363f51b5016dd4d484f4fa5d9eba80e6f71fd997e6"
       },
       "tactic": {
         "cta_group": 2,
@@ -117253,7 +117253,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -117829,7 +117829,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "c47920fbcddb1fd157bba88d974a1f7874aaf700361bf229ee96155d39b4b62f"
+        "sha256": "e5b9b24426d9d6e76cfc29363f51b5016dd4d484f4fa5d9eba80e6f71fd997e6"
       },
       "tactic": {
         "cta_group": 2,
@@ -117847,7 +117847,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -118423,7 +118423,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "c47920fbcddb1fd157bba88d974a1f7874aaf700361bf229ee96155d39b4b62f"
+        "sha256": "e5b9b24426d9d6e76cfc29363f51b5016dd4d484f4fa5d9eba80e6f71fd997e6"
       },
       "tactic": {
         "cta_group": 1,
@@ -118441,7 +118441,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -119017,7 +119017,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "c47920fbcddb1fd157bba88d974a1f7874aaf700361bf229ee96155d39b4b62f"
+        "sha256": "e5b9b24426d9d6e76cfc29363f51b5016dd4d484f4fa5d9eba80e6f71fd997e6"
       },
       "tactic": {
         "cta_group": 2,
@@ -119035,7 +119035,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -119611,7 +119611,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "c47920fbcddb1fd157bba88d974a1f7874aaf700361bf229ee96155d39b4b62f"
+        "sha256": "e5b9b24426d9d6e76cfc29363f51b5016dd4d484f4fa5d9eba80e6f71fd997e6"
       },
       "tactic": {
         "cta_group": 2,
@@ -119629,7 +119629,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -120205,7 +120205,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_stg.py",
-        "sha256": "c47920fbcddb1fd157bba88d974a1f7874aaf700361bf229ee96155d39b4b62f"
+        "sha256": "e5b9b24426d9d6e76cfc29363f51b5016dd4d484f4fa5d9eba80e6f71fd997e6"
       },
       "tactic": {
         "cta_group": 2,
@@ -120223,7 +120223,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -120799,7 +120799,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_stg.py",
-        "sha256": "221fc729d8dd2529834467627f544c250b1f3de4ca1efb3f5d3cd1bd33a940be"
+        "sha256": "262f48e21059b3353b1976fac11387139e934e1b566b073c9ddec86146df41d4"
       },
       "tactic": {
         "cta_group": 1,
@@ -120817,7 +120817,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -121393,7 +121393,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_stg.py",
-        "sha256": "221fc729d8dd2529834467627f544c250b1f3de4ca1efb3f5d3cd1bd33a940be"
+        "sha256": "262f48e21059b3353b1976fac11387139e934e1b566b073c9ddec86146df41d4"
       },
       "tactic": {
         "cta_group": 2,
@@ -121411,7 +121411,7 @@
       "workspace_bytes": 52352
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -121987,7 +121987,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_stg.py",
-        "sha256": "221fc729d8dd2529834467627f544c250b1f3de4ca1efb3f5d3cd1bd33a940be"
+        "sha256": "262f48e21059b3353b1976fac11387139e934e1b566b073c9ddec86146df41d4"
       },
       "tactic": {
         "cta_group": 2,
@@ -122005,7 +122005,7 @@
       "workspace_bytes": 43136
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -122581,7 +122581,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_stg.py",
-        "sha256": "221fc729d8dd2529834467627f544c250b1f3de4ca1efb3f5d3cd1bd33a940be"
+        "sha256": "262f48e21059b3353b1976fac11387139e934e1b566b073c9ddec86146df41d4"
       },
       "tactic": {
         "cta_group": 2,
@@ -122599,7 +122599,7 @@
       "workspace_bytes": 41088
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -123171,7 +123171,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "f743e3d88ca1d95da6114aff6cb772309f62e713350300fd3a2040c2b1d64fd4"
+        "sha256": "6658ffb8b809a0070dbd64e7433fe241ed5106f216d2f769d3c8ee75c98fcf85"
       },
       "tactic": {
         "cta_group": 1,
@@ -123189,7 +123189,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -123761,7 +123761,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "f743e3d88ca1d95da6114aff6cb772309f62e713350300fd3a2040c2b1d64fd4"
+        "sha256": "6658ffb8b809a0070dbd64e7433fe241ed5106f216d2f769d3c8ee75c98fcf85"
       },
       "tactic": {
         "cta_group": 2,
@@ -123779,7 +123779,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -124351,7 +124351,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "f743e3d88ca1d95da6114aff6cb772309f62e713350300fd3a2040c2b1d64fd4"
+        "sha256": "6658ffb8b809a0070dbd64e7433fe241ed5106f216d2f769d3c8ee75c98fcf85"
       },
       "tactic": {
         "cta_group": 2,
@@ -124369,7 +124369,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu",
@@ -124941,7 +124941,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "f743e3d88ca1d95da6114aff6cb772309f62e713350300fd3a2040c2b1d64fd4"
+        "sha256": "6658ffb8b809a0070dbd64e7433fe241ed5106f216d2f769d3c8ee75c98fcf85"
       },
       "tactic": {
         "cta_group": 2,
@@ -124959,7 +124959,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -125531,7 +125531,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_tma.py",
-        "sha256": "6cc5000d066afbda5c9a9e06a7a0000e0b541173ebc6e1c7360338d5dacb1822"
+        "sha256": "605537bc7e8d9ddcb3d6d69fd8a546cc720d4ece2c132aa9522e99d84a5858d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -125549,7 +125549,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -126121,7 +126121,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_tma.py",
-        "sha256": "6cc5000d066afbda5c9a9e06a7a0000e0b541173ebc6e1c7360338d5dacb1822"
+        "sha256": "605537bc7e8d9ddcb3d6d69fd8a546cc720d4ece2c132aa9522e99d84a5858d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -126139,7 +126139,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -126711,7 +126711,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_tma.py",
-        "sha256": "6cc5000d066afbda5c9a9e06a7a0000e0b541173ebc6e1c7360338d5dacb1822"
+        "sha256": "605537bc7e8d9ddcb3d6d69fd8a546cc720d4ece2c132aa9522e99d84a5858d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -126729,7 +126729,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -127301,7 +127301,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_tma.py",
-        "sha256": "6cc5000d066afbda5c9a9e06a7a0000e0b541173ebc6e1c7360338d5dacb1822"
+        "sha256": "605537bc7e8d9ddcb3d6d69fd8a546cc720d4ece2c132aa9522e99d84a5858d5"
       },
       "tactic": {
         "cta_group": 1,
@@ -127319,7 +127319,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_geglu_tanh_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "geglu_tanh",
@@ -127891,7 +127891,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_geglu_tanh_quantized_nvfp4_normal_tma.py",
-        "sha256": "6cc5000d066afbda5c9a9e06a7a0000e0b541173ebc6e1c7360338d5dacb1822"
+        "sha256": "605537bc7e8d9ddcb3d6d69fd8a546cc720d4ece2c132aa9522e99d84a5858d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -127909,7 +127909,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -128480,7 +128480,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_tma.py",
-        "sha256": "33726e3a759f56fe01f1303b2074de8bd7d59222276f96652976ac59b081df2e"
+        "sha256": "bb7d95fd1370c6ee402cf49a0e72ca8d8f8ce1874229e96e87bd3f6c13e90521"
       },
       "tactic": {
         "cta_group": 1,
@@ -128498,7 +128498,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -129069,7 +129069,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_tma.py",
-        "sha256": "33726e3a759f56fe01f1303b2074de8bd7d59222276f96652976ac59b081df2e"
+        "sha256": "bb7d95fd1370c6ee402cf49a0e72ca8d8f8ce1874229e96e87bd3f6c13e90521"
       },
       "tactic": {
         "cta_group": 2,
@@ -129087,7 +129087,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -129658,7 +129658,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_tma.py",
-        "sha256": "33726e3a759f56fe01f1303b2074de8bd7d59222276f96652976ac59b081df2e"
+        "sha256": "bb7d95fd1370c6ee402cf49a0e72ca8d8f8ce1874229e96e87bd3f6c13e90521"
       },
       "tactic": {
         "cta_group": 2,
@@ -129676,7 +129676,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -130247,7 +130247,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_tma.py",
-        "sha256": "33726e3a759f56fe01f1303b2074de8bd7d59222276f96652976ac59b081df2e"
+        "sha256": "bb7d95fd1370c6ee402cf49a0e72ca8d8f8ce1874229e96e87bd3f6c13e90521"
       },
       "tactic": {
         "cta_group": 2,
@@ -130265,7 +130265,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -130836,7 +130836,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_tma.py",
-        "sha256": "33726e3a759f56fe01f1303b2074de8bd7d59222276f96652976ac59b081df2e"
+        "sha256": "bb7d95fd1370c6ee402cf49a0e72ca8d8f8ce1874229e96e87bd3f6c13e90521"
       },
       "tactic": {
         "cta_group": 1,
@@ -130854,7 +130854,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_gelu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "gelu",
@@ -131425,7 +131425,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_gelu_quantized_nvfp4_normal_tma.py",
-        "sha256": "33726e3a759f56fe01f1303b2074de8bd7d59222276f96652976ac59b081df2e"
+        "sha256": "bb7d95fd1370c6ee402cf49a0e72ca8d8f8ce1874229e96e87bd3f6c13e90521"
       },
       "tactic": {
         "cta_group": 2,
@@ -131443,7 +131443,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -132014,7 +132014,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_tma.py",
-        "sha256": "26fcb3f6655e1824ee393f569edd31f18a1e16f4be55e9a677a1ca2b8d9d8179"
+        "sha256": "977e4adbba7efe3d54ccb3ef2e3f433750fff1ac6097352ab622c02baaaceb47"
       },
       "tactic": {
         "cta_group": 2,
@@ -132032,7 +132032,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -132603,7 +132603,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_tma.py",
-        "sha256": "26fcb3f6655e1824ee393f569edd31f18a1e16f4be55e9a677a1ca2b8d9d8179"
+        "sha256": "977e4adbba7efe3d54ccb3ef2e3f433750fff1ac6097352ab622c02baaaceb47"
       },
       "tactic": {
         "cta_group": 1,
@@ -132621,7 +132621,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_identity_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "identity",
@@ -133192,7 +133192,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_identity_quantized_nvfp4_normal_tma.py",
-        "sha256": "26fcb3f6655e1824ee393f569edd31f18a1e16f4be55e9a677a1ca2b8d9d8179"
+        "sha256": "977e4adbba7efe3d54ccb3ef2e3f433750fff1ac6097352ab622c02baaaceb47"
       },
       "tactic": {
         "cta_group": 2,
@@ -133210,7 +133210,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -133781,7 +133781,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_tma.py",
-        "sha256": "22195860a8c9edc1df6d6cfac07b2da57fbf4ed5c4aaf826aa15f6f2504a4cab"
+        "sha256": "dcb04987f22a3258de5bb15587789749fed46975f5951735dfb8f1ec126c8f82"
       },
       "tactic": {
         "cta_group": 2,
@@ -133799,7 +133799,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -134370,7 +134370,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_tma.py",
-        "sha256": "22195860a8c9edc1df6d6cfac07b2da57fbf4ed5c4aaf826aa15f6f2504a4cab"
+        "sha256": "dcb04987f22a3258de5bb15587789749fed46975f5951735dfb8f1ec126c8f82"
       },
       "tactic": {
         "cta_group": 1,
@@ -134388,7 +134388,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -134959,7 +134959,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_tma.py",
-        "sha256": "22195860a8c9edc1df6d6cfac07b2da57fbf4ed5c4aaf826aa15f6f2504a4cab"
+        "sha256": "dcb04987f22a3258de5bb15587789749fed46975f5951735dfb8f1ec126c8f82"
       },
       "tactic": {
         "cta_group": 2,
@@ -134977,7 +134977,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu2_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu2",
@@ -135548,7 +135548,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu2_quantized_nvfp4_normal_tma.py",
-        "sha256": "22195860a8c9edc1df6d6cfac07b2da57fbf4ed5c4aaf826aa15f6f2504a4cab"
+        "sha256": "dcb04987f22a3258de5bb15587789749fed46975f5951735dfb8f1ec126c8f82"
       },
       "tactic": {
         "cta_group": 2,
@@ -135566,7 +135566,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -136137,7 +136137,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_tma.py",
-        "sha256": "c1cdbdab4628a3c84227ea480d364177a5cd764ce327cd2e3b332978fe5017e3"
+        "sha256": "05a9ab215f6e858715f26d133c07b82b0c990bbd5913145b20767d9072ae35d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -136155,7 +136155,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -136726,7 +136726,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_tma.py",
-        "sha256": "c1cdbdab4628a3c84227ea480d364177a5cd764ce327cd2e3b332978fe5017e3"
+        "sha256": "05a9ab215f6e858715f26d133c07b82b0c990bbd5913145b20767d9072ae35d5"
       },
       "tactic": {
         "cta_group": 1,
@@ -136744,7 +136744,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -137315,7 +137315,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_tma.py",
-        "sha256": "c1cdbdab4628a3c84227ea480d364177a5cd764ce327cd2e3b332978fe5017e3"
+        "sha256": "05a9ab215f6e858715f26d133c07b82b0c990bbd5913145b20767d9072ae35d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -137333,7 +137333,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_relu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "relu",
@@ -137904,7 +137904,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_relu_quantized_nvfp4_normal_tma.py",
-        "sha256": "c1cdbdab4628a3c84227ea480d364177a5cd764ce327cd2e3b332978fe5017e3"
+        "sha256": "05a9ab215f6e858715f26d133c07b82b0c990bbd5913145b20767d9072ae35d5"
       },
       "tactic": {
         "cta_group": 2,
@@ -137922,7 +137922,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -138493,7 +138493,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_tma.py",
-        "sha256": "d319169a9e82c17c765d498a57414a5c79c7e90f3616989e49c2859949fffc28"
+        "sha256": "e5f93f9b6169cdca2ec08ddc8cd4b444ddee649e8bb3c7b7c54bffb89f33eb79"
       },
       "tactic": {
         "cta_group": 2,
@@ -138511,7 +138511,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -139082,7 +139082,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_tma.py",
-        "sha256": "d319169a9e82c17c765d498a57414a5c79c7e90f3616989e49c2859949fffc28"
+        "sha256": "e5f93f9b6169cdca2ec08ddc8cd4b444ddee649e8bb3c7b7c54bffb89f33eb79"
       },
       "tactic": {
         "cta_group": 1,
@@ -139100,7 +139100,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -139671,7 +139671,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_tma.py",
-        "sha256": "d319169a9e82c17c765d498a57414a5c79c7e90f3616989e49c2859949fffc28"
+        "sha256": "e5f93f9b6169cdca2ec08ddc8cd4b444ddee649e8bb3c7b7c54bffb89f33eb79"
       },
       "tactic": {
         "cta_group": 2,
@@ -139689,7 +139689,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -140260,7 +140260,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_tma.py",
-        "sha256": "d319169a9e82c17c765d498a57414a5c79c7e90f3616989e49c2859949fffc28"
+        "sha256": "e5f93f9b6169cdca2ec08ddc8cd4b444ddee649e8bb3c7b7c54bffb89f33eb79"
       },
       "tactic": {
         "cta_group": 2,
@@ -140278,7 +140278,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_silu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "silu",
@@ -140849,7 +140849,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_silu_quantized_nvfp4_normal_tma.py",
-        "sha256": "d319169a9e82c17c765d498a57414a5c79c7e90f3616989e49c2859949fffc28"
+        "sha256": "e5f93f9b6169cdca2ec08ddc8cd4b444ddee649e8bb3c7b7c54bffb89f33eb79"
       },
       "tactic": {
         "cta_group": 2,
@@ -140867,7 +140867,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -141441,7 +141441,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_tma.py",
-        "sha256": "babd9dec37a8652749566e85805f70673d6421f222a879dbc24c14a84d5c67c3"
+        "sha256": "1680da3db77160ad0786de697581de20bb1462295b670812f34b0d65575ed0b7"
       },
       "tactic": {
         "cta_group": 1,
@@ -141459,7 +141459,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -142033,7 +142033,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_tma.py",
-        "sha256": "babd9dec37a8652749566e85805f70673d6421f222a879dbc24c14a84d5c67c3"
+        "sha256": "1680da3db77160ad0786de697581de20bb1462295b670812f34b0d65575ed0b7"
       },
       "tactic": {
         "cta_group": 2,
@@ -142051,7 +142051,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -142625,7 +142625,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_tma.py",
-        "sha256": "babd9dec37a8652749566e85805f70673d6421f222a879dbc24c14a84d5c67c3"
+        "sha256": "1680da3db77160ad0786de697581de20bb1462295b670812f34b0d65575ed0b7"
       },
       "tactic": {
         "cta_group": 2,
@@ -142643,7 +142643,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_situ_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "situ",
@@ -143217,7 +143217,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_situ_quantized_nvfp4_normal_tma.py",
-        "sha256": "babd9dec37a8652749566e85805f70673d6421f222a879dbc24c14a84d5c67c3"
+        "sha256": "1680da3db77160ad0786de697581de20bb1462295b670812f34b0d65575ed0b7"
       },
       "tactic": {
         "cta_group": 2,
@@ -143235,7 +143235,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -143807,7 +143807,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "ecf9ad0234b576008b82eacd2ed8b7f4f63f1606882645a2af44ea60901ba445"
+        "sha256": "b1314d8b5ae53d8dfed8980948953f86c997ab187f1880e7e242bafaa96e8705"
       },
       "tactic": {
         "cta_group": 2,
@@ -143825,7 +143825,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -144397,7 +144397,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "ecf9ad0234b576008b82eacd2ed8b7f4f63f1606882645a2af44ea60901ba445"
+        "sha256": "b1314d8b5ae53d8dfed8980948953f86c997ab187f1880e7e242bafaa96e8705"
       },
       "tactic": {
         "cta_group": 2,
@@ -144415,7 +144415,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -144987,7 +144987,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "ecf9ad0234b576008b82eacd2ed8b7f4f63f1606882645a2af44ea60901ba445"
+        "sha256": "b1314d8b5ae53d8dfed8980948953f86c997ab187f1880e7e242bafaa96e8705"
       },
       "tactic": {
         "cta_group": 1,
@@ -145005,7 +145005,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -145577,7 +145577,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "ecf9ad0234b576008b82eacd2ed8b7f4f63f1606882645a2af44ea60901ba445"
+        "sha256": "b1314d8b5ae53d8dfed8980948953f86c997ab187f1880e7e242bafaa96e8705"
       },
       "tactic": {
         "cta_group": 2,
@@ -145595,7 +145595,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -146167,7 +146167,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "ecf9ad0234b576008b82eacd2ed8b7f4f63f1606882645a2af44ea60901ba445"
+        "sha256": "b1314d8b5ae53d8dfed8980948953f86c997ab187f1880e7e242bafaa96e8705"
       },
       "tactic": {
         "cta_group": 2,
@@ -146185,7 +146185,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu",
@@ -146757,7 +146757,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_quantized_nvfp4_normal_tma.py",
-        "sha256": "ecf9ad0234b576008b82eacd2ed8b7f4f63f1606882645a2af44ea60901ba445"
+        "sha256": "b1314d8b5ae53d8dfed8980948953f86c997ab187f1880e7e242bafaa96e8705"
       },
       "tactic": {
         "cta_group": 2,
@@ -146775,7 +146775,7 @@
       "workspace_bytes": 61568
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -147347,7 +147347,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_tma.py",
-        "sha256": "ffc72c3edaa764088bcd2d4bb183c8d065451be261ef1e44371a6742c22a6045"
+        "sha256": "25a368dcb5d896bf74b775171a1f14008f7b02d733c60e441f7fc05e404c11a1"
       },
       "tactic": {
         "cta_group": 1,
@@ -147365,7 +147365,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -147937,7 +147937,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_tma.py",
-        "sha256": "ffc72c3edaa764088bcd2d4bb183c8d065451be261ef1e44371a6742c22a6045"
+        "sha256": "25a368dcb5d896bf74b775171a1f14008f7b02d733c60e441f7fc05e404c11a1"
       },
       "tactic": {
         "cta_group": 2,
@@ -147955,7 +147955,7 @@
       "workspace_bytes": 78464
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -148527,7 +148527,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_tma.py",
-        "sha256": "ffc72c3edaa764088bcd2d4bb183c8d065451be261ef1e44371a6742c22a6045"
+        "sha256": "25a368dcb5d896bf74b775171a1f14008f7b02d733c60e441f7fc05e404c11a1"
       },
       "tactic": {
         "cta_group": 2,
@@ -148545,7 +148545,7 @@
       "workspace_bytes": 64640
     },
     {
-      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized_v2",
+      "abi": "cudnn_frost_block_scale_grouped_gemm1_swiglu_step_quantized",
       "arch": "sm_107a",
       "contract": {
         "activation": "swiglu_step",
@@ -149117,7 +149117,7 @@
           "version": 1
         },
         "path": "sources/sm107_cudnn_frost_grouped_gemm1_swiglu_step_quantized_nvfp4_normal_tma.py",
-        "sha256": "ffc72c3edaa764088bcd2d4bb183c8d065451be261ef1e44371a6742c22a6045"
+        "sha256": "25a368dcb5d896bf74b775171a1f14008f7b02d733c60e441f7fc05e404c11a1"
       },
       "tactic": {
         "cta_group": 2,

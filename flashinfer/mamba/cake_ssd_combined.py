@@ -99,23 +99,33 @@ class _Program:
 # the single place the Cake export refreshes; every program binding below
 # derives from it.  Two kernel families ship, each x {bf16, f16, f32 state} x
 # {batched, varlen}, plus one preprocess shared by both: the exact scan
-# (``exact_*``) and the chunk-parallel program (``chunkpar_*``).
+# (``exact_*``) and the chunk-parallel program (``chunkpar_*``).  The exact
+# scan ships two schedule variants of every program: the ring program
+# (``exact_<state>_<mode>``) and the ``_noring`` program (the same kernel built
+# with ``epilogue_ring=False``, bitwise-identical outputs), selected per call
+# by :func:`_exact_scan_variant` from host-known shape quantities.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_ff8a998f8c"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_7da5d63944",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_3a3fe8cb43",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_bfec63639e",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_ea2dad0346",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_86a33e371f",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_7f4b2ec368",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_f074fc128b",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d",
+    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6",
+    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9",
+    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163",
+    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e",
+    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
+    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_52f48bcff4",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_df1813f0fc",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_fe997dc53a",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_c940274209",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_4d536d26a8",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_8fb2ad56db",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_58cc6c44e9",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_d34b53f551",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_2ee7eee952",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_889999950a",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_72cf27a680",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_70337c7f89",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_9837d3f677",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -139,8 +149,12 @@ _STATE_DTYPE_KEYS = {
 }
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
-_EXACT_SMEM_BYTES = 232448
+_EXACT_SMEM_BYTES = 231808
 _CHUNKPAR_SMEM_BYTES = 232448
+# Main dynamic SMEM of the exact-scan ``_noring`` programs (the start schedule
+# keeps the prefix control placement); refreshed by the Cake export with the
+# ``exact_*_noring`` table entries.
+_EXACT_NORING_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -295,12 +309,19 @@ def _scan(module: str) -> _Kernel:
     return _Kernel(module, f"kernel_{symbol}", threads=512, fast_math=True)
 
 
-def _program(name: str, module: str) -> _Program:
-    """Bind program ``<family>_<state>_<mode>`` to its generated main source."""
+# Main dynamic SMEM of a family's non-default schedule variants.
+_VARIANT_SMEM_BYTES = {("exact", "noring"): _EXACT_NORING_SMEM_BYTES}
 
-    family, state_key, _mode = name.split("_")
+
+def _program(name: str, module: str) -> _Program:
+    """Bind program ``<family>_<state>_<mode>[_<variant>]`` to its generated main source."""
+
+    family, state_key, _mode, *variant = name.split("_")
     code, bits = _STATE_DTYPE_CODES[state_key]
     host_template, main_args, smem_bytes = _FAMILY_HOST[family]
+    if variant:
+        (variant_name,) = variant
+        smem_bytes = _VARIANT_SMEM_BYTES[(family, variant_name)]
     return _Program(
         family,
         _SEGMENT_PREPROCESS,
@@ -319,12 +340,16 @@ _PROGRAMS: dict[str, _Program] = {
 }
 
 
-def _program_name(family: str, state_dtype: torch.dtype, mode_varlen: bool) -> str:
+def _program_name(
+    family: str, state_dtype: torch.dtype, mode_varlen: bool, variant: str = ""
+) -> str:
     """The program of ``family`` serving a state dtype in batched or
-    packed-varlen mode."""
+    packed-varlen mode; ``variant`` names a non-default schedule variant of the
+    family (``"noring"`` for the exact scan)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
-    return f"{family}_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}"
+    suffix = f"_{variant}" if variant else ""
+    return f"{family}_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}{suffix}"
 
 
 def _require_exported(name: str, program: _Program) -> None:
@@ -450,7 +475,9 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 # of loom/examples/weave/
 # flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1.py), copied
 # verbatim: both copies must be refreshed together whenever the seed is
-# recalibrated.  Least-squares fits of the main-kernel time in microseconds:
+# recalibrated (CAKE-956 round 5, 2026-10-11: B200 step
+# b74734547976789d7eb7036b, B300 step 8ae022395365a025939cf937).
+# Least-squares fits of the main-kernel time in microseconds:
 #   exact scan     = serial_fixed + per_chunk(work_items) * chunks
 #     per_chunk is flat up to 32 concurrent (sequence, head) items and larger
 #     at 128 items (128 CTAs streaming x/B/C through L2); item counts in
@@ -461,18 +488,18 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 _CHUNK_PARALLEL_COST_MODEL_US = {
     # (major, minor) compute capability -> calibrated constants.
     (10, 0): {  # B200, sm_100a
-        "serial_fixed": 4.69,
-        "serial_per_chunk_small": 2.594,
-        "serial_per_chunk_large": 2.809,
-        "cp_fixed": 25.2,
-        "cp_per_tile": 0.0493,
+        "serial_fixed": 4.99,
+        "serial_per_chunk_small": 2.556,
+        "serial_per_chunk_large": 2.758,
+        "cp_fixed": 25.0,
+        "cp_per_tile": 0.0491,
     },
     (10, 3): {  # B300 / GB300, sm_103a
-        "serial_fixed": 4.33,
-        "serial_per_chunk_small": 2.395,
-        "serial_per_chunk_large": 2.51,
-        "cp_fixed": 24.3,
-        "cp_per_tile": 0.0432,
+        "serial_fixed": 4.72,
+        "serial_per_chunk_small": 2.345,
+        "serial_per_chunk_large": 2.432,
+        "cp_fixed": 24.1,
+        "cp_per_tile": 0.0429,
     },
 }
 # Unmeasured capabilities use the B200 constants.
@@ -894,6 +921,120 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
     return source
 
 
+# Host selection between the two exact-scan schedule variants (CAKE-956 round 5,
+# route lane).  Both variants compute bitwise-identical outputs; the ring
+# program (``exact_*``) is faster on every calibrated geometry except the ones
+# below, where its epilogue z refill queues behind the partial-segment scalar
+# stores of one-chunk work items.  Calibration = scan-kernel time ring / start
+# (CUPTI, cold L2, 3 rounds, arms alternating in one step) on NVIDIA B200
+# (nsc-svg-slurm-1-gpu-104) and GB300 (nvl72d423-T07), Nemotron-H geometry
+# nheads 128 / ngroups 8, bf16 state, D per head, initial states; steps
+# a64287477fdbbd7e1393d6c2 / aa3374884f3fb4da09ecd0d8 (84 cells) and
+# 54d7ca23fc6a62e86d35f518 / ec121ae14d1b35e5ba452d77 (28 boundary cells).
+# Kernel band 0.0035.  GB300 / B200 ring / start:
+#
+#   varlen, z, nseq x tokens      16      32      48      56      64      72      96     128
+#     nseq 1                   0.940   0.933      -       -   0.937      -   0.959   0.958   (B200 0.933-0.969)
+#     nseq 2                   0.974   0.984      -       -   0.999      -   0.978   0.976   (B200 0.959-0.998)
+#     nseq 3 / 4 (64 tok)          -       -      -       -  0.986 / 1.000-1.003             (B200 0.990 / 0.999-1.002)
+#     nseq 6 (64 tok)              -       -      -       -   1.009      -       -       -   (B200 1.006)
+#     nseq 8                   0.984   0.988  0.960   0.963   1.019   0.959   0.991   0.915   (B200 0.978 0.985 0.952 0.952 1.013 0.957 0.967 0.917)
+#     nseq 16                  0.960   0.974      -       -   1.009      -   0.979   0.917   (B200 0.963 0.977 1.011 0.965 0.918)
+#     nseq 32                  0.907   0.965      -       -   1.003      -   0.986   0.911   (B200 0.925 0.971 1.006 0.973 0.913)
+#     nseq 64                  0.862   0.914  0.958   0.949   1.008   0.969   0.988   0.901   (B200 0.882 0.938 0.956 0.949 1.000 0.960 0.977 0.906)
+#     nseq 128                 0.836   0.860      -       -   1.004      -   0.990   0.899   (B200 0.867 0.884 1.002 0.976 0.903)
+#   80 / 100 / 112 tokens (nseq 8 / 64): 0.949-0.988 on both archs; 127 tokens: 0.970-0.985 on both;
+#   60 / 63 / 65 / 68 tokens (nseq 8 / 64): 0.950-0.979 on both archs (steps 0043bcdea2f8b84c94a470ad /
+#   426afd144b4818c5731b89af); at 64 tokens nseq 5 1.001 / 0.994, nseq 7 1.000 / 0.999, nseq 12 0.999 / 1.005.
+#   Mixtures whose consecutive pairs sum to 128 tokens (two partial segments per chunk, tokens per sequence
+#   = 64 on average): [32, 96] x 4 1.006 / 1.005, [48, 80] x 4 1.007 / 1.003, [63, 65] x 4 1.008 / 1.007.
+#   varlen, no z, 64 tokens: nseq 8 0.992 / 0.990, nseq 64 0.987 / 0.980 (ring wins; the loss needs z).
+#   batched, z, initial states, batch x tokens 50 / 100 / 127 / 128: batch 1 0.965-0.979 (B200 0.948-0.959),
+#     batch 2 0.983-1.002 (B200 0.979-0.987), batch 8 0.929-0.949 (B200 0.939-0.949), batch 64 0.898-0.921 (B200 0.908-0.920);
+#     batch 2 x 25 / 75 tokens 0.988 / 0.993 (B200 0.975 / 0.977); batch 4 x 50 0.960 (B200 0.948).
+#   batched, no z, initial states: batch 64 0.898-0.920 (B200 0.908-0.921); batch 4 x 50 0.973 (B200 0.960);
+#     batch 2 x 25 0.990 (B200 0.991); batch 2 x 100 / 127 / 128 0.995 / 1.000 / 0.990 (B200 0.991 / 0.995 / 0.995);
+#     batch 2 x 50 0.995-1.008 over six readings per arch (B200 1.000-1.005); batch 2 x 60 1.000 (B200 1.000);
+#     batch 2 x 75 1.005 / 0.995 (B200 0.993 / 0.998); batch 2 x 90 0.987 (B200 0.995);
+#     batch 1 x 25 / 50 / 75 / 100 0.963-0.975 (B200 0.955-0.959); batch 3 x 50 / 75 0.992 / 0.985 (B200 0.986 / 0.981);
+#     batch 4 x 75 0.966 (B200 0.961); batch 8 x 50 0.944 (B200 0.948).
+#
+#   FI-level re-measurement of the 64-token window on the acceptance instrument (the
+#   FlashInfer call, CUPTI call span split per kernel, cold L2, 5 interleaved rounds,
+#   one process per arm; steps 2916e66a06685ae93d43293c GB300 / 9ac4a94a6de616b831f11b19
+#   B200), ring / start scan-kernel time, nseq x 64 tokens, z, initial states (GB300 / B200):
+#     bf16 state   nseq 1 0.937 / 0.940   nseq 2 1.011 / 1.001   nseq 3 0.996 / 0.989
+#     f32 state    nseq 1 0.939 / 0.941   nseq 2 1.003 / 0.975   nseq 3 0.978 / 0.974
+#   The 93-row gate row nem_v64_64 (2 x 64, bf16 state) read 1.018 / 1.017 / 1.013 on GB300
+#   in three earlier gates against 0.997 / 0.997 on B200, and its f32 twin 0.978-0.987 /
+#   0.977.  So with a 16-bit state the 2 x 64 cell is a measured loss on GB300 (four
+#   readings) and a tie on B200, and the 3 x 64 cell a tie on GB300 (B200 0.989):
+#   the start schedule begins at 2 sequences x 128 heads.  With an f32 state (twice
+#   the final-state bytes per item) the 2 x 64 and 3 x 64 cells keep winning on both
+#   archs, so its threshold stays at 4 x 128.  The kernel-level cells above read the
+#   bf16 2 x 64 cell as a tie (0.999 / 0.993-1.003); the FI-level reading decides
+#   because it is the acceptance instrument.  float16 state is unmeasured and
+#   follows bfloat16 (same state width).
+#
+# Rule: a measured losing cell goes to the start schedule (``_noring``); a
+# winning cell keeps the ring program; ties and unmeasured cells follow the ring
+# program only where the nearest measured cells win on BOTH archs, otherwise the
+# start schedule.  The varlen loss geometry is the one where consecutive
+# sequence pairs tile every 128-token chunk with two partial segments (both
+# one-chunk items on the scalar-store path): uniform 64-token sequences and
+# the pair-sum-128 mixtures, i.e. 64 tokens per sequence on average; uniform
+# 63 and 65 tokens win on both archs, so the window is exclusive of them; at
+# 64 tokens the item-count threshold is 2 sequences x 128 heads for a 16-bit
+# state (the FI-level 2 x 64 loss above) and 4 sequences x 128 heads for an
+# f32 state (nseq 3 wins, 4 / 5 tie and 6 loses).  The batched no-z batch-2
+# cells at 50-75 tokens are the only batched readings at or beyond the band
+# (batch 1, 3, 4, 8 and z calls win); 25 and 90 tokens win on both archs.
+# Only host-known quantities enter: the runner's mode / has_z / nheads /
+# state dtype and the call's batch, seqlen and sequence count
+# (``cu_seqlens.numel() - 1``, ``num_seqs`` or ``initial_states.shape[0]``);
+# no per-sequence lengths and no device synchronisation, so prepared / captured
+# shapes keep their program.
+_EXACT_NORING_VARLEN_MIN_ITEMS = {  # sequences x heads, by state dtype
+    torch.bfloat16: 2 * 128,
+    torch.float16: 2 * 128,
+    torch.float32: 4 * 128,
+}
+# exclusive bounds on tokens per sequence (average over the call)
+_EXACT_NORING_VARLEN_TOKENS = (63, 65)
+_EXACT_NORING_BATCHED_BATCH = 2
+_EXACT_NORING_BATCHED_SEQLEN = (25, 90)  # exclusive bounds
+
+
+def _exact_scan_variant(
+    *,
+    mode_varlen: bool,
+    has_z: bool,
+    nheads: int,
+    num_sequences: int,
+    total_tokens: int,
+    batch: int,
+    seqlen: int,
+    state_dtype: torch.dtype,
+) -> str:
+    """Schedule variant of the exact-scan program for one call shape: ``""`` (the
+    ring program) or ``"noring"`` (the start schedule), from host-known
+    quantities only (see the calibration table above)."""
+
+    if mode_varlen:
+        min_items = _EXACT_NORING_VARLEN_MIN_ITEMS[state_dtype]
+        if not has_z or num_sequences * nheads < min_items:
+            return ""
+        low, high = _EXACT_NORING_VARLEN_TOKENS
+        # tokens per sequence strictly inside (low, high), in integers
+        if low * num_sequences < total_tokens < high * num_sequences:
+            return "noring"
+        return ""
+    if has_z or batch != _EXACT_NORING_BATCHED_BATCH:
+        return ""
+    low, high = _EXACT_NORING_BATCHED_SEQLEN
+    return "noring" if low < seqlen < high else ""
+
+
 @functools.cache
 def _load_generated_program(name: str, arch: str):
     """Build one program for ``arch``; the loaded module serves every device."""
@@ -1303,11 +1444,27 @@ class CakeSSDCombined:
             capability=capability,
             mode=key.chunk_parallel_mode,
         )
+        variant = (
+            ""
+            if chunk_parallel
+            else _exact_scan_variant(
+                mode_varlen=self.has_varlen,
+                has_z=self.has_z,
+                nheads=self.nheads,
+                num_sequences=num_sequences,
+                # packed varlen: x is [1, total tokens, nheads, 64]
+                total_tokens=batch * seqlen,
+                batch=batch,
+                seqlen=seqlen,
+                state_dtype=self.state_dtype,
+            )
+        )
         workspace: dict[str, Any] = {
             "program": _program_name(
                 "chunkpar" if chunk_parallel else "exact",
                 self.state_dtype,
                 self.has_varlen,
+                variant,
             ),
             "starts": starts,
             "lengths": lengths,

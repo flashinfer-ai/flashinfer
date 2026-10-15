@@ -35,6 +35,7 @@ import tvm_ffi
 
 from ...jit.cake_gdn_cp_backend import (
     GDNCPArch,
+    has_gdn_cp_kernel,
     load_gdn_cp_kernel,
     prepare_gdn_cp_kernel,
 )
@@ -109,6 +110,19 @@ def _choose_chunk_len(
     )
 
 
+def _bounded_chunks(
+    chunk_len: int, *, max_seqlen: int, total_tokens: int, num_seqs: int
+) -> int:
+    """Safe upper bound of the chunk CTAs per head (the pinned source's rule)."""
+
+    remaining_tokens = max(0, total_tokens - max_seqlen)
+    remaining_seqs = max(0, num_seqs - 1)
+    longest = _ceil_div(max_seqlen, chunk_len)
+    compact_bound = min(remaining_seqs, remaining_tokens)
+    compact_bound += (remaining_tokens - compact_bound) // chunk_len
+    return longest + compact_bound
+
+
 def _choose_long_chunk_len(
     *,
     max_seqlen: int,
@@ -119,15 +133,13 @@ def _choose_long_chunk_len(
 ) -> int:
     """Resolve the shared long-path chunk search for an explicit CTA target."""
 
-    remaining_tokens = max(0, total_tokens - max_seqlen)
-    remaining_seqs = max(0, num_seqs - 1)
-
     def bounded_chunks(chunk_len: int) -> int:
-        # This is the same safe upper bound used by the pinned source.
-        longest = _ceil_div(max_seqlen, chunk_len)
-        compact_bound = min(remaining_seqs, remaining_tokens)
-        compact_bound += (remaining_tokens - compact_bound) // chunk_len
-        return longest + compact_bound
+        return _bounded_chunks(
+            chunk_len,
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+        )
 
     lo = 1
     hi = max(1, _ceil_div(max_seqlen, chunk_len_granularity))
@@ -182,6 +194,37 @@ def _default_physical_chunk_len(
                 return _round_up(_ceil_div(total_tokens, 2), 2 * _BLOCK)
             target_chunks = max(1, 2 * num_sms // num_heads)
             granularity = 2 * _BLOCK
+    else:
+        # One CTA per SM and a chunk-major launch: when the rounded-up target
+        # leaves more chunk CTAs than SMs, the overflow CTAs are tail blocks
+        # that start only after the first tail CTAs finish, so the critical
+        # path becomes max(chunk, 2 * tail).  Use the one-wave floor target
+        # when that second wave is longer than a full chunk.  Introduced for
+        # the 212-SM R200; applied to every SM count without a dedicated wave
+        # budget (one-wave overflow rule): on the 148-SM B200 the hq8/hv32 1x16384 plan
+        # moves from 5 x 3584 (160 CTAs, two waves) to 4 x 4096 (one wave),
+        # 332 -> 314 us.
+        chunk_len = _choose_long_chunk_len(
+            max_seqlen=max_seqlen,
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+            target_chunks=target_chunks,
+            chunk_len_granularity=granularity,
+        )
+        longest = _ceil_div(max_seqlen, chunk_len)
+        tail = max_seqlen - (longest - 1) * chunk_len
+        overflow = (
+            num_heads
+            * _bounded_chunks(
+                chunk_len,
+                max_seqlen=max_seqlen,
+                total_tokens=total_tokens,
+                num_seqs=num_seqs,
+            )
+            > num_sms
+        )
+        if overflow and 2 * tail > chunk_len:
+            target_chunks = max(1, num_sms // num_heads)
     return _choose_long_chunk_len(
         max_seqlen=max_seqlen,
         total_tokens=total_tokens,
@@ -287,8 +330,10 @@ def _arch_for(device: torch.device) -> GDNCPArch:
         return "sm_100a"
     if capability == (10, 3):
         return "sm_103a"
+    if capability == (10, 7):
+        return "sm_107a"
     raise ValueError(
-        "GDN CP-prefill requires exact compute capability 10.0 or 10.3, "
+        "GDN CP-prefill requires exact compute capability 10.0, 10.3 or 10.7, "
         f"got {capability[0]}.{capability[1]}"
     )
 
@@ -315,6 +360,13 @@ class GDNCPPrefillPlan:
     total_cp_chunks: int
     max_t_blocks_per_seq: int
     max_cp_chunks_per_seq: int
+    # Caller prefix-sum dtype.  int64 is bound by address for every stage; int32
+    # is widened on-device into the owned int64 buffer by the cu32 Stage-1
+    # program, or by a host ``copy_`` before every launch when
+    # ``host_stages_cu_seqlens`` is set (Stage 1 does not run, or the
+    # architecture ships no cu32 program).
+    cu_seqlens_dtype: torch.dtype
+    host_stages_cu_seqlens: bool
     t_kernel: str
     mn_kernel: str
     fixup_kernel: str
@@ -365,25 +417,40 @@ def _head_mapping_is_legal(hq: int, hk: int, hv: int) -> bool:
     )
 
 
+# Architectures whose BF16 CP kernels are native: output and final state pass
+# the FP32 recurrence oracle at 1e-2 without a token-serial repair (measured at
+# <= 5.4e-4 state error on B200 and GB300).  Every other architecture keeps the
+# BF16 state repair recurrences.
+_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a")
+
+
 def _recurrence_requirements(
     *,
     io_dtype: torch.dtype,
     alpha_was_none: bool,
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
+    arch: GDNCPArch,
 ) -> tuple[bool, bool, int, int]:
-    """Resolve semantic recurrence launches, including BF16 state repair."""
+    """Resolve the semantic recurrence launches.
 
+    A recurrence runs where the chunked kernels do not produce the requested
+    value: the normalized final state when Q/K are normalized in the kernel,
+    and both the output and the final state when alpha is absent.  On compute
+    capability 10.0 and 10.3 (``_NATIVE_BF16_ARCHES``) the BF16 kernels are
+    native, so ``io_dtype`` selects no recurrence there.  Every other
+    architecture (sm_107a) keeps the BF16 state repair: the final-state
+    recurrence for BF16 I/O, and the block-64 output recurrence when alpha is
+    present and Q/K are not normalized in the kernel.
+    """
+
+    bf16_repair = io_dtype == torch.bfloat16 and arch not in _NATIVE_BF16_ARCHES
     needs_final_state = output_final_state and (
-        alpha_was_none or use_qk_l2norm_in_kernel or io_dtype == torch.bfloat16
+        alpha_was_none or use_qk_l2norm_in_kernel or bf16_repair
     )
-    needs_output = alpha_was_none or (
-        io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
-    )
+    needs_output = alpha_was_none or (bf16_repair and not use_qk_l2norm_in_kernel)
     use_block64_final_state = (
-        io_dtype == torch.bfloat16
-        and not alpha_was_none
-        and not use_qk_l2norm_in_kernel
+        bf16_repair and not alpha_was_none and not use_qk_l2norm_in_kernel
     )
     return (
         needs_final_state,
@@ -403,8 +470,11 @@ def _build_plan(
     checkpoint_count: int = 0,
     checkpoint_every_n_tokens: int = 0,
     cp_chunk_len: int | None = None,
+    cu_seqlens_dtype: torch.dtype = torch.int64,
 ) -> GDNCPPrefillPlan:
     arch = _arch_for(q.device)
+    if cu_seqlens_dtype not in (torch.int32, torch.int64):
+        raise TypeError("cu_seqlens must have int32 or int64 dtype")
     total_tokens, hq, head_dim = map(int, q.shape)
     hk = int(k.shape[1])
     hv = int(v.shape[1])
@@ -469,7 +539,18 @@ def _build_plan(
         )
     dtype_suffix = "_bf16" if q.dtype == torch.bfloat16 else ""
     t_kernel = f"t_precompute{dtype_suffix}"
-    if (
+    # The cu32 Stage-1 variant reads the caller's int32 prefix sums and
+    # publishes the int64 copy the later stages read, removing the per-launch
+    # host cast.  It is selected before any alias rule and only where Stage 1
+    # runs and the architecture ships the program.
+    stage1_publishes_cu_seqlens = (
+        cu_seqlens_dtype == torch.int32
+        and total_tokens > 0
+        and has_gdn_cp_kernel(f"{t_kernel}_cu32", arch)
+    )
+    if stage1_publishes_cu_seqlens:
+        t_kernel = f"{t_kernel}_cu32"
+    elif (
         q.dtype == torch.float16
         and arch == "sm_103a"
         and hk == 16
@@ -526,11 +607,17 @@ def _build_plan(
         total_cp_chunks=_workspace_num_chunks(total_tokens, num_seqs, cp_chunk_len),
         max_t_blocks_per_seq=_ceil_div(max_seqlen, _BLOCK),
         max_cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
+        cu_seqlens_dtype=cu_seqlens_dtype,
+        host_stages_cu_seqlens=(
+            cu_seqlens_dtype == torch.int32 and not stage1_publishes_cu_seqlens
+        ),
         t_kernel=t_kernel,
         mn_kernel=f"mn_precompute{dtype_suffix}",
+        # sm_107a runs the fp32 SIMT fixup only (no TF32 UTCMMA recurrence);
+        # sm_100a/sm_103a keep the parallelism-based choice unchanged.
         fixup_kernel=(
             "state_fixup_simt_row4"
-            if total_tokens <= (num_seqs - 1) * max_seqlen
+            if arch == "sm_107a" or total_tokens <= (num_seqs - 1) * max_seqlen
             else _choose_fixup_kind(num_seqs * num_sab_heads, num_sms)
         ),
         prefill_kernel=prefill_kernel,
@@ -649,13 +736,21 @@ class GDNCPPrefill:
             self._device_index = torch.cuda.current_device()
         self._stream = torch.cuda.current_stream(q.device)
 
-        # Generated stage ABIs consume int64 prefix sums. Stage the caller's
-        # int32/int64 tensor on-device before every launch so changing metadata
+        # Generated stage ABIs consume int64 prefix sums.  An int64 caller tensor
+        # is bound by address for every stage (no owned copy).  An int32 tensor is
+        # widened on-device into the owned int64 buffer: by the cu32 Stage-1
+        # program, which reads the caller's prefix sums and publishes the int64
+        # copy before the later stages read it, or by a host ``copy_`` before
+        # every launch when Stage 1 does not run (``total_tokens == 0``) or the
+        # architecture ships no cu32 program.  Either way changing metadata
         # never requires a host read or a new plan.
         self.cu_seqlens_input = cu_seqlens
-        self.cu_seqlens = torch.empty(
-            (plan.num_seqs + 1,), dtype=torch.int64, device=q.device
-        )
+        if plan.cu_seqlens_dtype == torch.int64:
+            self.cu_seqlens = cu_seqlens
+        else:
+            self.cu_seqlens = torch.empty(
+                (plan.num_seqs + 1,), dtype=torch.int64, device=q.device
+            )
         if state_indices is None:
             self.state_indices = torch.empty((1,), dtype=torch.int32, device=q.device)
             self._use_state_indices = False
@@ -804,6 +899,7 @@ class GDNCPPrefill:
             alpha_was_none=alpha_was_none,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             output_final_state=output_final_state,
+            arch=plan.arch,
         )
         if needs_final_state_recurrence:
             self._final_state_recurrence = load_gdn_cp_kernel(
@@ -903,6 +999,21 @@ class GDNCPPrefill:
 
         if self._graph is not None:
             raise RuntimeError("dynamic GDN CP bindings require a direct composite")
+        plan = self.plan
+        if cu_seqlens.dtype != plan.cu_seqlens_dtype:
+            raise TypeError(
+                f"cu_seqlens must keep the prepared dtype {plan.cu_seqlens_dtype}, "
+                f"got {cu_seqlens.dtype}"
+            )
+        if tuple(cu_seqlens.shape) != (plan.num_seqs + 1,):
+            raise ValueError(
+                f"cu_seqlens must have shape {(plan.num_seqs + 1,)}, "
+                f"got {tuple(cu_seqlens.shape)}"
+            )
+        if not cu_seqlens.is_contiguous():
+            raise ValueError("cu_seqlens must be contiguous")
+        if cu_seqlens.device != q.device:
+            raise ValueError("cu_seqlens must live on the device of q")
         current = torch.cuda.current_stream(q.device)
         if current.cuda_stream != self._stream.cuda_stream:
             raise RuntimeError("GDNCPPrefill must launch on its preparation stream")
@@ -912,6 +1023,8 @@ class GDNCPPrefill:
         self.v = v
         self.output = output
         self.cu_seqlens_input = cu_seqlens
+        if plan.cu_seqlens_dtype == torch.int64:
+            self.cu_seqlens = cu_seqlens
         if state_indices is not None:
             self.state_indices = state_indices
         if self._qk_norm is None:
@@ -946,11 +1059,12 @@ class GDNCPPrefill:
 
     def _launch_direct(self) -> None:
         p = self.plan
-        self.cu_seqlens.copy_(self.cu_seqlens_input)
+        if p.host_stages_cu_seqlens:
+            self.cu_seqlens.copy_(self.cu_seqlens_input)
         if p.checkpoint_count:
             assert self.checkpoint_cu_starts is not None
             self.checkpoint_indices = _checkpoint_fixed_state_indices(
-                self.cu_seqlens,
+                self.cu_seqlens_input,
                 self.checkpoint_cu_starts,
                 checkpoint_count=p.checkpoint_count,
                 cp_chunk_len=p.cp_chunk_len,
@@ -968,17 +1082,33 @@ class GDNCPPrefill:
                     max(p.num_q_heads, p.num_k_heads),
                     1,
                 )
-            self._t(
-                self.k_normalized,
-                self.beta,
-                self.t,
-                self.cu_seqlens,
-                p.num_k_heads,
-                p.num_sab_heads,
-                p.total_t_blocks,
-                p.num_seqs,
-                *p.t_grid,
-            )
+            if p.cu_seqlens_dtype == torch.int32 and not p.host_stages_cu_seqlens:
+                # cu32 Stage 1: reads the caller's int32 prefix sums and
+                # publishes the owned int64 copy the later stages read.
+                self._t(
+                    self.k_normalized,
+                    self.beta,
+                    self.t,
+                    self.cu_seqlens_input,
+                    self.cu_seqlens,
+                    p.num_k_heads,
+                    p.num_sab_heads,
+                    p.total_t_blocks,
+                    p.num_seqs,
+                    *p.t_grid,
+                )
+            else:
+                self._t(
+                    self.k_normalized,
+                    self.beta,
+                    self.t,
+                    self.cu_seqlens,
+                    p.num_k_heads,
+                    p.num_sab_heads,
+                    p.total_t_blocks,
+                    p.num_seqs,
+                    *p.t_grid,
+                )
             self._mn(
                 self.k_normalized,
                 self.v,
@@ -1220,6 +1350,7 @@ def prepare_gdn_cp_prefill(
         checkpoint_count=checkpoint_count,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         cp_chunk_len=cp_chunk_len,
+        cu_seqlens_dtype=cu_seqlens.dtype,
     )
 
     _validate_contiguous_tensor(

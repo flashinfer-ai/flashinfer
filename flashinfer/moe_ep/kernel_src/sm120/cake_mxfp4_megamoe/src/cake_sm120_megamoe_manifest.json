@@ -1,0 +1,95 @@
+{
+ "arch": "sm_120a",
+ "binding": {
+  "path": "cake_sm120_megamoe_binding.cu",
+  "sha256": "7d5fc70247b391e28fd72473828e8b1ece9488a6a39dea5d52d8b13c75214c17"
+ },
+ "device": {
+  "entry": "cake_sm120_megamoe_kernel.cuh",
+  "instances": [
+   {
+    "copiers_active": true,
+    "instance": 0,
+    "name": "m128_copier",
+    "path": "cake_sm120_megamoe_m128_copier.cu",
+    "sha256": "84a82b76ab74bc94aee507b3f4d99faf4fcc4e08e5dffd1dfa5af4fb176c37fe",
+    "symbol": "cake_megamoe_m128_copier",
+    "task_m": 128
+   },
+   {
+    "copiers_active": true,
+    "instance": 1,
+    "name": "m64_copier",
+    "path": "cake_sm120_megamoe_m64_copier.cu",
+    "sha256": "f15c4b6ac055222aaf9b4f9b1662ed8aa4a388aec28eee0bb30e5db88a17dd1e",
+    "symbol": "cake_megamoe_m64_copier",
+    "task_m": 64
+   },
+   {
+    "copiers_active": false,
+    "instance": 2,
+    "name": "m128_nocopier",
+    "path": "cake_sm120_megamoe_m128_nocopier.cu",
+    "sha256": "46ee9e0bd18fea9d10721cf660e2328b540baa711a220c3b4b95891938054796",
+    "symbol": "cake_megamoe_m128_nocopier",
+    "task_m": 128
+   },
+   {
+    "copiers_active": false,
+    "instance": 3,
+    "name": "m64_nocopier",
+    "path": "cake_sm120_megamoe_m64_nocopier.cu",
+    "sha256": "974619c0be403557c25e55d8e0942402e98756537602aa3bb9de10b7d3c2d835",
+    "symbol": "cake_megamoe_m64_nocopier",
+    "task_m": 64
+   }
+  ],
+  "license_header_prepended": true,
+  "parameters": {
+   "MOE_CODEC_OVF_BLOCKS": "return-codec raw-overflow capacity, 64-value blocks per row (16..256, default 16)",
+   "MOE_EXPERTS": "routed experts, global (physical experts with EPLB replicas); MOE_EXPERTS % MOE_RANKS == 0",
+   "MOE_HIDDEN": "hidden size (multiple of 512)",
+   "MOE_INSTANCE": "schedule instance (set by the wrapper TU)",
+   "MOE_INTERMEDIATE": "expert intermediate size (multiple of 128)",
+   "MOE_LSA_COPIERS": "LSA copier CTAs of the copier instances (>= LSA destinations per rank; 1..min(ranks - 1, 16))",
+   "MOE_MAX_ROWS": "max tokens per rank per call (multiple of 128)",
+   "MOE_RANKS": "expert-parallel world size (ranks of the EP group)",
+   "MOE_SHARED_EXPERT": "1: one in-kernel FP8 shared expert, 0: routed top-k sum only",
+   "MOE_SWIGLU_LIMIT": "SwiGLU clamp L: gate <= L, up in [-L, L] (10 = DeepSeek-V4); 0 = unclamped SwiGLU",
+   "MOE_TOPK": "routed experts per token"
+  },
+  "renamed_identifiers": [
+   "CAKE_INF",
+   "CakeTensorMap",
+   "CakeTensorMap64",
+   "CakeTensorMapPack"
+  ],
+  "sources": {
+   "cake_sm120_megamoe_kernel.cuh": "3f089d518e2d6de7f578c906b80b1c1cf3c75f345357de0d8796aef096dfc9be",
+   "cake_sm120_megamoe_kernel_part001.cuh": "4b2c722685f89708e4bd348965b2d9c12ab178e62ee07253e43b9c589f6f6869",
+   "cake_sm120_megamoe_kernel_part002.cuh": "4b2c722685f89708e4bd348965b2d9c12ab178e62ee07253e43b9c589f6f6869",
+   "cake_sm120_megamoe_kernel_part003.cuh": "9c32dc62e5049b24ce5e7b816bf69b94a4623a68bfd709878d5306bb0ae73c55",
+   "cake_sm120_megamoe_kernel_part004.cuh": "0c41ad6021a6d3b9acd32029e5bc6366ba9122aa97100523d180f1e180d1e1e8",
+   "cake_sm120_megamoe_kernel_part005.cuh": "569139a382e5b33d0dedd835655f6a7ee38c6e8150a13d1828861c58ea93349e",
+   "cake_sm120_megamoe_kernel_part006.cuh": "5097d0710176d160d5bc013e88886cd292f14230c26d58bf54a3df9ea8fd99d1",
+   "cake_sm120_megamoe_kernel_part007.cuh": "a3a38ef4ebe8fa99a1190801e57bc3a8e75540dcce0234a0a46dcddc7d3094f7",
+   "cake_sm120_megamoe_kernel_part008.cuh": "c039855b56e5f029915380dabbe0d211ba66fce54b37dcb15ea5c02b3bd5072a",
+   "cake_sm120_megamoe_kernel_part009.cuh": "25d15769421963f406e7ac163bd07ba4582093b1157c7de9ca789b450eeaccf9",
+   "cake_sm120_megamoe_kernel_part010.cuh": "93138bb4022db7fedc6fbddfd7f4973f5956bf3af2021fee0218d89284571d73",
+   "cake_sm120_megamoe_kernel_part011.cuh": "4914fd68d32a807be5ea87b8cfd97bd321b106547f394d1d85d025c071703f77",
+   "cake_sm120_megamoe_kernel_part012.cuh": "2b48e3f060e24f7ca262780cb0491dc3f0817849a1e562fa84b4086621e4afc5"
+  },
+  "threads": 384
+ },
+ "format": "cake-sm120-megamoe-manifest/3",
+ "geometry": {
+  "path": "cake_sm120_megamoe_geometry.json",
+  "sha256": "f9154d53638b0258770f6cb967a13a302da1201bba3373b25538d2cb78332f94"
+ },
+ "provenance": {
+  "generator_commit": "0729d2f1d",
+  "geometry_module_sha256": "1426697803676662b5bbe0a0fcdd68c808aa33d016e9c43e77bad788a16765c2",
+  "single_file_sha256": "b43d46163a340421284d7efe830eafe98a861aa7461df300e36ea25377c5b44f",
+  "unrenamed_sha256": "629936d9bb3c01f9972c8593a77efa8637b8f5d70cb4b6a34f2f1cfe122dd625"
+ }
+}
