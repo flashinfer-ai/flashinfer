@@ -5051,6 +5051,42 @@ def test_convenience_cache_is_bounded_and_evicts_the_least_recently_used_entry()
     ]
 
 
+def test_convenience_cache_bound_is_read_at_call_time(monkeypatch):
+    """``CONVENIENCE_CACHE_SIZE`` is a module knob: ``_cache_put`` reads it on every insertion, so a value set
+    after the import bounds the caches; an explicit ``bound=`` still overrides it."""
+    monkeypatch.setattr(cake_backend, "CONVENIENCE_CACHE_SIZE", 2)
+    cache: OrderedDict = OrderedDict()
+    for i in range(3):
+        cake_backend._cache_put(cache, ("k", i), i)
+    assert list(cache) == [("k", 1), ("k", 2)]
+    monkeypatch.setattr(cake_backend, "CONVENIENCE_CACHE_SIZE", 3)
+    cake_backend._cache_put(cache, ("k", 3), 3)
+    assert list(cache) == [("k", 1), ("k", 2), ("k", 3)]
+    cake_backend._cache_put(cache, ("k", 4), 4, bound=1)
+    assert list(cache) == [("k", 4)]
+
+
+def test_convenience_cache_hit_evicted_before_its_refresh_is_a_miss():
+    """A hit whose entry another thread evicts between the lookup and the recency refresh is a miss -- the
+    caller plans the key again (at worst a key is planned twice) -- not a ``KeyError`` out of the launch."""
+
+    class _EvictedBetween(OrderedDict):
+        def get(self, key, default=None):
+            entry = super().get(key, default)
+            if entry is not None:
+                # the other thread's eviction lands between the lookup and the refresh
+                del self[key]
+            return entry
+
+    cache = _EvictedBetween()
+    cake_backend._cache_put(cache, ("k", 0), "first", bound=4)
+    assert cake_backend._cache_get(cache, ("k", 0)) is None
+    assert ("k", 0) not in cache
+    assert cake_backend._cache_put(cache, ("k", 0), "second", bound=4) == "second"
+    assert cache[("k", 0)] == "second" and list(cache) == [("k", 0)]
+    assert cake_backend._cache_get(OrderedDict(), ("k", 0)) is None
+
+
 @pytest.mark.parametrize("sm_count", SM_COUNTS)
 def test_convenience_views_match_the_planner_views(sm_count):
     """The per-call view rebuild of the convenience path (``_k1_views`` under ``_k1_swapped``) returns the
@@ -5113,6 +5149,16 @@ def test_router_convenience_views_match_the_planner():
             (op == "wgrad"),
             ROUTER_SPLITS[plan.layout],
         )
+        # the fail-closed check of the convenience prepare: the planner's operands pass and yield the
+        # per-call views; a rebuild that is not the planner's view (another buffer) refuses to cache
+        checked = cake_backend._k2_checked_views(v["A"], v["B"], A_eff, B_eff, plan)
+        assert all(
+            cake_backend._same_view(got, want)
+            for got, want in zip(checked, (a_view, split_src), strict=True)
+        ), op
+        for wrong_a, wrong_b in ((A_eff.clone(), B_eff), (A_eff, B_eff.clone())):
+            with pytest.raises(RuntimeError, match="differ from the planner's"):
+                cake_backend._k2_checked_views(v["A"], v["B"], wrong_a, wrong_b, plan)
     workspace = torch.empty(4, 6, 8)
     assert cake_backend._k2_workspace_strides(workspace) == (8, 48)
     out = torch.empty(6, 16)[:, :8]

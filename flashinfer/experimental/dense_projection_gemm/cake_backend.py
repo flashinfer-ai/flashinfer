@@ -2449,8 +2449,10 @@ def flat_alias(t: torch.Tensor) -> torch.Tensor:
 # never a caller's tensor: the operand views are rebound from the caller's tensors on every call.  The key holds
 # the raw stream, so launches on different streams never share a workspace, and launches of one entry are ordered
 # by their stream.  The caches are plain dicts under the GIL: concurrent threads may plan one key twice (both
-# results are valid; the later one is kept).  A CUDA Graph should capture a prepared launch, not the convenience
-# path: an entry evicted after capture would free the workspace the graph replays.
+# results are valid; the later one is kept), and a hit whose entry another thread evicts between the lookup and
+# the recency refresh is a miss.  The bound is read on every insertion, so a process may set it after the import.
+# A CUDA Graph should capture a prepared launch, not the convenience path: an entry evicted after capture would
+# free the workspace the graph replays.
 CONVENIENCE_CACHE_SIZE = 64
 
 
@@ -2487,9 +2489,14 @@ def convenience_key(
 
 
 def _cache_get(cache: "OrderedDict[tuple, Any]", key: tuple) -> Any:
+    """The cached entry of ``key`` (refreshed as the most recent) or ``None``: a miss, or a hit whose entry
+    another thread evicted between the lookup and the refresh (the caller plans the key again)."""
     entry = cache.get(key)
     if entry is not None:
-        cache.move_to_end(key)
+        try:
+            cache.move_to_end(key)
+        except KeyError:
+            return None
     return entry
 
 
@@ -2497,8 +2504,12 @@ def _cache_put(
     cache: "OrderedDict[tuple, Any]",
     key: tuple,
     entry: Any,
-    bound: int = CONVENIENCE_CACHE_SIZE,
+    bound: Optional[int] = None,
 ) -> Any:
+    """Insert ``entry`` as the most recent and evict the least recent entries beyond ``bound``
+    (``CONVENIENCE_CACHE_SIZE`` at call time when ``None``)."""
+    if bound is None:
+        bound = CONVENIENCE_CACHE_SIZE
     cache[key] = entry
     cache.move_to_end(key)
     while len(cache) > bound:
@@ -3226,6 +3237,29 @@ def _k2_views(
     return a_view, split_src
 
 
+def _k2_checked_views(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_eff: torch.Tensor,
+    B_eff: torch.Tensor,
+    plan: RouterPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_k2_views` of the caller's operands, checked against the planner's operands ``(A_eff, B_eff)``
+    of :func:`plan_router_fp32_gemm` in the launch form (the streamed ``[1, M, K]`` / ``[1, K, M]`` span under
+    ``plan.a_mn``, the split source under ``plan.b_mn``).  The convenience path rebuilds the views from the
+    caller's tensors on every call, so a rebuild that is not the planner's view fails closed here (the K1 check
+    of :func:`_prepare_cached_gemm`) instead of launching on a view the plan never validated."""
+    a_view, split_src = _k2_views(A, B, plan)
+    want_a = A_eff.t().unsqueeze(0) if plan.a_mn else A_eff.unsqueeze(0)
+    want_split = B_eff if plan.b_mn else B_eff.t()
+    if not (_same_view(a_view, want_a) and _same_view(split_src, want_split)):
+        raise RuntimeError(
+            "router_fp32_gemm: the per-call operand views differ from the planner's; "
+            "the convenience path cannot cache this binding (use prepare_router_fp32_gemm)"
+        )
+    return a_view, split_src
+
+
 def _k2_workspace(
     plan: RouterPlan, split_src: torch.Tensor, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -3337,8 +3371,8 @@ def clear_convenience_caches() -> None:
 def _prepare_cached_router(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
 ) -> _CachedRouter:
-    plan, _, _, arch, module_name = _k2_plan(A, B, out, splits=splits)
-    _, split_src = _k2_views(A, B, plan)
+    plan, A_eff, B_eff, arch, module_name = _k2_plan(A, B, out, splits=splits)
+    _, split_src = _k2_checked_views(A, B, A_eff, B_eff, plan)
     parts, resid, workspace = _k2_workspace(plan, split_src, out.device)
     if workspace is not None:
         out32, (ldo, out_l) = workspace, _k2_workspace_strides(workspace)
