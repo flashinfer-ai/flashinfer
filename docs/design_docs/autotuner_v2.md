@@ -145,29 +145,36 @@ maintaining a migration path for data that is, by construction, an optimization.
 
 ### Custom tuning protocols
 
-`AutoTuner.choose_with_protocol()` delegates collective operations that own their
-candidate enumeration, measurement and installation. `TuningContext.records()`
-reads the active store's protocol records; `publish()` persists a winner while
-tuning is enabled. Replay imports remain in memory. No JSON filename is required.
+`AutoTuner.choose_with_protocol()` supports operations that own candidate
+enumeration, measurement and result installation, on one device or across
+processes. It supplies the tuner's controls, lock, statistics and record storage.
+The protocol defines cache compatibility and handles any distributed coordination.
+The tuner always invokes it, even when tuning is disabled or the operation is
+skipped, so a protocol can coordinate its fallback or cache decision.
+
+`TuningContext.records()` reads the active store's protocol records.
+`context.publish()` keeps a record in memory and writes it to that store when
+tuning is enabled. Returning a `TuningResult` does not publish it. Replay imports
+remain in memory. No JSON filename is required.
 
 Protocol records live under `protocols/<namespace_hash>/<key_hash>.json` in the
 same environment directory as tactic entries. Each file contains its namespace,
 key and JSON value. The store validates both hashes and preloads these records
-at attach. Atomic per-record publication preserves unrelated concurrent writes;
-`clear_cache()` and `autotune_v2_reload()` invalidate their lookup memos. The
-protocol retains its own compatibility and bucket selection over these records.
-The additional directory does not change existing tactic entries.
+at attach. Atomic per-record writes preserve unrelated concurrent writes;
+writers to the same key can overwrite each other. `clear_cache()` and
+`autotune_v2_reload()` invalidate lookup memos. The protocol retains its own
+compatibility and bucket selection over these records.
 
 Root and environment switches isolate protocol records. With persistence disabled,
 records use the in-memory measurement-policy partition, and the protocol must
-also disable its compatibility-file reads and writes. Explicit measurement
-policies are passed to the protocol, which must implement or reject them rather
-than silently measure a different boundary. Protocol records are separate from
-v1 JSON import/export. Existing `autotune()` controls still compose with v2 as
-described above. `context.cache_identity` includes store/policy identity, reload
-generation for prepared-result invalidation. Inherited graph replay counts are
-exposed separately for tuning provenance; they do not invalidate serving results.
-Bare serving uses the attached store's measurement policy.
+also disable any compatibility-file reads and writes. Measurement policies and
+inherited graph replay counts are passed to the protocol, which must implement
+or reject them. Protocol records are separate from v1 JSON import/export.
+Existing `autotune()` controls still compose with v2 as described above.
+`context.cache_identity` includes the store or policy identity, reload generation
+and skip state so protocols can invalidate prepared selections. Inherited graph
+replay counts are exposed separately; they are not part of that identity.
+Serving outside a context uses the attached store's measurement policy.
 
 ### 2.5 MeasurementPolicy — tune the way you deploy
 
@@ -375,5 +382,6 @@ single ambient policy matching the mode-sensitive path is sufficient.
   supported cleanup.
 - **Representative probe construction** for MoE (skewed routing / EP-deflated shapes) is a
   separate op-level track; balanced probes cannot exercise the regression class in #3622.
-- **Comm/collective op tuning** is out of scope: it needs lockstep candidate enumeration, a
-  MAX-reduction, one group-level decision, and topology fields in the manifest.
+- **Built-in collective orchestration** is not provided. A custom tuning protocol must
+  coordinate candidates and timing aggregation, agree on results, and include any required
+  topology information in its cache keys.

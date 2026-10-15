@@ -431,35 +431,41 @@ with ``torchrun``), you could use separate output files per rank and merge them 
 Custom tuning protocols
 -----------------------
 
-Operations that own candidate preparation, measurement and result installation
-can implement ``TuningProtocol.run(context)`` and call
-``AutoTuner.get().choose_with_protocol(namespace, protocol)``. The method uses
-the existing tuner's lock, tuning mode, ``skip_ops`` and statistics. It calls
-the protocol even when tuning is disabled, so collective operations can agree
-on cached results before any rank returns.
-When ``context.skipped`` is true, the protocol must use its built-in fallback
-without selecting from either the managed cache or a compatibility file.
+Operations with their own tuning loop can implement ``TuningProtocol.run(context)``
+and call ``AutoTuner.get().choose_with_protocol(namespace, protocol)``. This works
+for single-device and distributed operations. AutoTuner holds its lock while
+calling the protocol, supplies the current controls, and updates statistics from
+the returned ``TuningResult``. The protocol owns candidate preparation,
+measurement, cache selection and result installation.
+
+The method always calls the protocol, including when tuning is disabled or the
+operation is in ``skip_ops``. A disabled protocol can select a cached result or
+use its fallback. When ``context.skipped`` is true, it must use the fallback
+without cache selection. ``force_tune=True`` requests a fresh search regardless
+of the ambient tuning mode or ``skip_ops``; the protocol must honor that flag.
+It does not enable disk persistence.
 
 ``TuningContext`` provides ``lookup(key)``, ``records()`` and
-``publish(key, value)`` for namespaced JSON records. The protocol defines cache
-identity and compatibility rules; ``records()`` returns a copy for lookups such
-as capacity fallback. With ``autotune_v2()``, winners persist automatically in
-its managed store. Replay contexts load records before serving; an attached
-store remains available after context exit. ``persistent_cache=False`` keeps
-selection in memory. Protocols must honor ``context.disk_cache_enabled`` for
-any compatibility-file I/O and implement or reject ``context.measurement_policy``.
-Protocol records are separate from the older ``autotune(cache=...)`` JSON format.
-Existing ``autotune()`` controls can be nested as specified by v2; they do not
-import or export protocol records. ``context.cache_identity`` changes on a store
-switch or reload, so adapters can invalidate prepared selections.
+``publish(key, value)`` for namespaced JSON records. The protocol defines its
+keys and compatibility rules; ``records()`` returns a copy for lookups such as
+capacity fallback. Returning a ``TuningResult`` does not publish a record.
+``context.publish()`` keeps the record in memory and writes it to the active
+managed store when tuning is enabled. With ``autotune_v2()``, that store is
+attached automatically and remains available after context exit.
+``persistent_cache=False`` keeps records in memory. Protocols must also honor
+``context.disk_cache_enabled`` for any compatibility-file I/O. Managed writes are atomic per record.
 
-Return a ``TuningResult`` containing the selected value, whether it was cached,
-and the number of attempted and successful candidates. The protocol owns
-distributed agreement, numerical checks, capture restrictions and allocation
-lifetime. Use one process per device for collective protocols. Designate one
-EP rank to publish a collectively selected winner. Managed records use atomic
-per-record writes. ``force_tune=True`` requests a fresh explicit search regardless
-of the ambient tuning mode or ``skip_ops``; the protocol must honor that flag.
+Protocols must implement or reject ``context.measurement_policy`` and inherited
+graph replay counts. They manage numerical checks, capture restrictions and
+allocation lifetime. Distributed protocols must coordinate collective execution
+and cache decisions, including which participants publish a shared result;
+AutoTuner provides no cross-process synchronization.
+
+``context.cache_identity`` changes when the active store, measurement policy or
+skip state changes, or when caches are cleared or reloaded. Use it to invalidate
+prepared selections. Protocol records are separate from v1 JSON import/export.
+Existing ``autotune()`` controls can be nested as specified by v2; they do not
+import or export protocol records.
 
 cuTile Autotuning
 -----------------

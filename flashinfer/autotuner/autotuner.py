@@ -2221,17 +2221,23 @@ class AutoTuner:
         *,
         force_tune: bool = False,
     ) -> T:
-        """Delegate a complete tuning transaction using this tuner's state.
+        """Run a custom tuning loop using this tuner's controls and storage.
 
-        ``force_tune`` requests a fresh explicit search, including outside an
-        autotune context. Otherwise the protocol receives the current tuning
-        mode and skip_ops policy. It owns cache agreement, preparation,
-        measurement and result adoption. No rank-local cache or mode shortcut
-        is taken here. Use one process per device for collective protocols.
+        The protocol runs under the tuner's lock, including when tuning is
+        disabled or the operation is skipped. It owns cache selection,
+        preparation, measurement and result installation. Distributed protocols
+        must coordinate their participants; this method performs no collectives.
+        Calls sharing a tuner are serialized. Collective participants must not
+        wait for another call blocked on that lock.
 
-        Protocol records use the active v2 managed store or a separate memory
-        partition. They are not imported or exported by the v1 JSON API.
-        The protocol owns its keys independently of choose_one's tensor buckets.
+        ``force_tune`` requests a fresh search regardless of the ambient tuning
+        mode or skip_ops policy. The protocol must honor it. The flag does not
+        enable persistence or change the ambient tuning mode.
+
+        Return the value from TuningResult and update tuning statistics.
+        Records must be published explicitly through the context. They use the
+        active v2 managed store or a separate memory partition, with keys owned
+        by the protocol, and are not imported or exported by the v1 JSON API.
         """
         with self._lock:
             context = self.protocol_context(custom_op, force_tune=force_tune)
