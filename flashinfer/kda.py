@@ -49,7 +49,6 @@ def _cudnn_kda_prefill_available() -> bool:
 
 
 def _select_kda_prefill_backend(q, initial_state, cu_seqlens, *, allow_cudnn=True):
-    """Prefer cuDNN within 10% of the measured best GPU time on GB200/GB300."""
     if not (
         q.is_cuda
         and q.dtype == torch.bfloat16
