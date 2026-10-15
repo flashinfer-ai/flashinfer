@@ -38,6 +38,7 @@ def _msa_kernel(
     SQ: cutlass.Constexpr,
     TPB: cutlass.Constexpr,
 ):
+    """Score one decode token's pages against the bf16 index cache."""
     M = G * SQ
 
     tid, _, _ = cute.arch.thread_idx()
@@ -222,6 +223,7 @@ def _msa_host(
     SQ: cutlass.Constexpr,
     TPB: cutlass.Constexpr,
 ):
+    """Launch the bf16 decode scoring grid."""
     max_k_tiles = mPT.shape[1]
     batch = mCu.shape[0] - 1
     _msa_kernel(mQ, mK, mCu, mPT, mSK, mO, KPS, KHS, G, SQ, TPB).launch(
@@ -237,6 +239,7 @@ _STREAM: dict = {}
 
 @torch.no_grad()
 def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
+    """Compute bf16 MSA proxy scores for a decode batch. Writes ``max_score``."""
     total_q = q.shape[0]
     Hq = q.shape[1]
     Hkv = k.shape[1]

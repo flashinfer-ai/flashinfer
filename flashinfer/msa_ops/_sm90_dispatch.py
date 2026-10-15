@@ -173,13 +173,29 @@ def topk_select_sm90(
     return output
 
 
-def _as_packed_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _as_packed_kv(
+    k: torch.Tensor, v: torch.Tensor, head_dim: Optional[int] = None
+) -> torch.Tensor:
     """Recover the (num_pages, Hkv, page, 2*D) cache the SM90 decode kernel reads.
 
     vLLM stores MSA K and V interleaved in one allocation and hands out halves;
     when that is what we were given the packed view is free. Materializing it
     otherwise would copy the whole cache every call, so refuse instead.
     """
+    if k.dim() != 4:
+        raise NotImplementedError(
+            "SM90 MSA reads a 4D paged KV cache "
+            f"(pages, kv_heads, {_BLK_KV}, head_dim), got shape {tuple(k.shape)}"
+        )
+    if int(k.shape[2]) != _BLK_KV:
+        raise NotImplementedError(
+            f"SM90 MSA is built around page size {_BLK_KV}, got {int(k.shape[2])}"
+        )
+    if head_dim is not None and int(k.shape[3]) != int(head_dim):
+        raise NotImplementedError(
+            f"SM90 MSA KV head_dim {int(k.shape[3])} does not match q head_dim "
+            f"{int(head_dim)}"
+        )
     if k.dtype != v.dtype or k.shape != v.shape or k.stride() != v.stride():
         raise NotImplementedError("SM90 sparse decode needs matching k/v layouts")
     d = k.shape[-1]
@@ -190,6 +206,14 @@ def _as_packed_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             "SM90 sparse decode requires K and V interleaved in one cache "
             "(v must be the second half of k's last dim); separate allocations "
             "would need a full-cache copy per call"
+        )
+    # Tokens inside a page must be 2*d apart: that spacing IS the interleaving
+    # the packed view relies on. The page stride is left free -- a per-layer
+    # cache is a view into a pool, so it is legitimately larger than dense.
+    if k.stride(2) != 2 * d:
+        raise NotImplementedError(
+            f"SM90 MSA needs K and V interleaved per token (stride {2 * d} "
+            f"between tokens of a page), got {k.stride(2)}"
         )
     # Preserve k's storage offset: a per-layer KV cache is a view into a pool, so
     # hardcoding 0 would silently read the wrong memory rather than fail.
@@ -219,7 +243,7 @@ def sparse_decode_sm90(
     """MSA sparse decode attention on Hopper. Writes ``out``."""
     from .cute_dsl.sparse_decode_sm90 import run as _decode
 
-    kv = _as_packed_kv(k, v)
+    kv = _as_packed_kv(k, v, q.shape[-1])
     q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     _decode(
         q,
@@ -254,7 +278,7 @@ def sparse_prefill_sm90(
     else:
         from .cute_dsl.sparse_prefill_sm90 import run as _prefill
 
-    kv = _as_packed_kv(k, v)
+    kv = _as_packed_kv(k, v, q.shape[-1])
     q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()

@@ -24,6 +24,7 @@ from cutlass.cute.runtime import from_dlpack
 # accumulator layout helpers (WGMMA C fragment -> (M, N) view)
 # ---------------------------------------------------------------------------
 def _layout_separate(thr, src, ref):
+    """Split a tiled-MMA layout into its thread part and its value part."""
     lt = cute.make_layout(())
     ge = cute.make_layout(())
     for k, v in enumerate(ref):
@@ -40,6 +41,7 @@ def _layout_separate(thr, src, ref):
 
 
 def layout_acc_mn(tiled_mma, acc):
+    """Accumulator layout of this tiled MMA in (M, N) coordinates."""
     separated = _layout_separate(
         tiled_mma.shape_mnk[0], acc[0], tiled_mma.tv_layout_C.stride[1]
     )
@@ -61,6 +63,7 @@ def layout_acc_mn(tiled_mma, acc):
 
 
 def reduction_target_n(tiled_mma):
+    """N extent the row-max epilogue has to reduce over for this tiled MMA."""
     separated = _layout_separate(
         tiled_mma.shape_mnk[0],
         cute.make_layout(tiled_mma.tv_layout_C.shape[0]),
@@ -82,6 +85,7 @@ def mma_issue(
     kslice,
     nkb: cutlass.Constexpr,
 ):
+    """Issue one WGMMA group over the K slices of this sub-tile."""
     cute.nvgpu.warpgroup.fence()
     mma_atom = cute.make_mma_atom(mma_op)
     mma_atom.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
@@ -118,6 +122,7 @@ def mma_epilogue(
     total_q,
     do_mask: cutlass.Constexpr = True,
 ):
+    """Row-max epilogue: apply the mask if any, then reduce along N."""
     if cutlass.const_expr(do_mask):
         if cutlass.min(delta, kmax) < page - 1:
             for i in cutlass.range_constexpr(cute.size(acc)):
@@ -166,6 +171,7 @@ class MsaProxyScore:
         use_tma_q=True,
         fold=0,
     ):
+        """Record the tile geometry and TMA options this body is built for."""
         self.hq = hq
         self.use_tma_q = use_tma_q
         self.nsub = nsub
@@ -205,6 +211,7 @@ class MsaProxyScore:
         n_mtiles: cutlass.Int32,
     ):
         # rebuild K as (page, d, num_pages) with STATIC tile modes (TMA needs it)
+        """Launch the proxy-score grid for one call."""
         npages = mK4.shape[0]
         mKp = cute.make_tensor(
             mK4.iterator,
@@ -303,6 +310,7 @@ class MsaProxyScore:
         q_smem_layout: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
     ):
+        """Producer warp streams paged K; consumer warpgroups score and reduce."""
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, bz = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -779,6 +787,7 @@ class MsaProxyScore:
 
 
 def select_split_k(total_q, hq, batch_size, nkt):
+    """Pick the split-K fan-in from the grid this call would otherwise launch."""
     n_mtiles = (total_q // batch_size + 127) // 128
     base_ctas = n_mtiles * hq * batch_size
     best_cost = 0x7FFFFFFF
@@ -841,6 +850,7 @@ _KF_STREAMS: dict = {}
 
 
 def _kf_stream():
+    """CUstream for the current torch stream, cached per handle."""
     h = torch.cuda.current_stream().cuda_stream
     s = _KF_STREAMS.get(h)
     if s is None:
@@ -855,6 +865,7 @@ _CACHE: dict = {}
 def run(
     q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score, max_seqlen_q=None
 ):
+    """Compute MSA proxy scores for a prefill batch. Writes ``ma``."""
     total_q, hq, _ = q.shape
     batch_size = seqused_k.shape[0]
     # The caller's score buffer is (hq, max_k_tiles, total_q) where max_k_tiles

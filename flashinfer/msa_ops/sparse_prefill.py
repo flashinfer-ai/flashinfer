@@ -396,6 +396,7 @@ def _union_tile_config(group_size: int):
 
 
 def _get_compiled_union(topk: int, tokens_per_tile: int):
+    """Compile, and cache, the union prefill body for this geometry."""
     import cutlass
     import cutlass.cute as cute
 

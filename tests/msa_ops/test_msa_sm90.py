@@ -659,3 +659,61 @@ def test_prefill_single_key_window_returns_v_exactly(hq, hkv):
     v0 = kv[0, 0, 0, HEAD_DIM:].float()
     for h in range(hq):
         torch.testing.assert_close(out[0, h], v0, atol=0.0, rtol=0.0)
+
+
+@sm90_only
+def test_packed_kv_rejects_unsupported_paged_layouts():
+    """The packed view is rebuilt with raw strides, so a wrong shape reads garbage.
+
+    _views() builds the paged pointers assuming a 4D (pages, kv_heads, 128,
+    head_dim) cache whose tokens are 2*head_dim apart. Anything else resolves to
+    the wrong addresses and returns finite nonsense, and there is no SM90
+    fallback to hand the call to, so each case has to raise.
+    """
+    from flashinfer.msa_ops._sm90_dispatch import _as_packed_kv
+
+    base = (torch.randn(4, 1, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    # the supported layout is accepted
+    _as_packed_kv(k, v, HEAD_DIM)
+
+    with pytest.raises(NotImplementedError, match="4D paged KV cache"):
+        _as_packed_kv(k[0], v[0], HEAD_DIM)
+
+    short = (torch.randn(4, 1, 64, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    with pytest.raises(NotImplementedError, match="page size"):
+        _as_packed_kv(short[..., :HEAD_DIM], short[..., HEAD_DIM:], HEAD_DIM)
+
+    with pytest.raises(NotImplementedError, match="head_dim"):
+        _as_packed_kv(k, v, HEAD_DIM // 2)
+
+    # separate allocations: tokens are head_dim apart, not 2*head_dim
+    with pytest.raises(NotImplementedError):
+        _as_packed_kv(k.contiguous(), v.contiguous(), HEAD_DIM)
+
+
+@sm90_only
+def test_decode_scratch_is_not_shared_across_streams():
+    """Split-K partials are live for a whole launch.
+
+    Two streams running decode concurrently would otherwise write each other's
+    partial outputs and combine counters, so the stream has to be part of the
+    cache key rather than only the device and tile geometry.
+    """
+    from flashinfer.msa_ops.cute_dsl import sparse_decode_sm90 as sd
+
+    saved = dict(sd._WS)
+    sd._WS.clear()
+    try:
+        dev = torch.device("cuda:0")
+        sd._scratch(4, 8, HEAD_DIM, dev, 1)
+        sd._scratch(4, 8, HEAD_DIM, dev, 2)
+        streams = {key[1] for key in sd._WS}
+        assert streams == {1, 2}, f"scratch key ignores the stream: {list(sd._WS)}"
+    finally:
+        sd._WS.clear()
+        sd._WS.update(saved)

@@ -37,6 +37,7 @@ OSTR = 136  # padded bf16 row stride of the smem epilogue buffer
 
 
 def _c_layout_to_a_layout(c, a):
+    """Relabel a WGMMA accumulator layout as the matching A-operand layout."""
     return cute.make_layout(
         (a, c.shape[1], (c.shape[2], cute.size(c, mode=[0]) // cute.size(a))),
         stride=(
@@ -60,6 +61,7 @@ def _acc_to_operand(acc, operand_layout_tv, Element):
 
 class MsaSparseAttn:
     def __init__(self, hq, hkv, nbuf=2):
+        """Record the head counts and KV ring depth this body is built for."""
         self.hq = hq
         self.hkv = hkv
         self.g = hq // hkv  # 8 or 16, compile-time
@@ -73,6 +75,7 @@ class MsaSparseAttn:
     # Part 1 of a block step: QK GEMM issued async, V fp8->f16 conversion folded
     # into its shadow.  On return both SMEM buffers of this block are free.
     def _p1(self, j, qk_mma, tidx, mbar, tSrQ, tSrK, acc_s, srcT, dstT, cv8, cv16):
+        """Issue the QK gemm for block j into the score accumulator."""
         bk = 0  # nbuf == 2 -> buffer ids are compile-time
         bv = 1  # constants, so all SMEM addressing folds
         cute.arch.mbarrier_wait(mbar + bk, j % 2)
@@ -96,6 +99,7 @@ class MsaSparseAttn:
         # Row-major-within-a-phase mapping: the eight lanes that share an STS
         # phase land on eight different rows at the same 16B column, so the
         # xor-swizzle spreads them over all eight slots -> conflict free.
+        """Convert one staged V buffer into the fp16 PV operand."""
         f16 = self.f16
         for it in range(NKV * (D // 16) // NTHR):
             idx = tidx + it * NTHR
@@ -130,6 +134,7 @@ class MsaSparseAttn:
         cv8,
         cv16,
     ):
+        """Mask, softmax and accumulate P @ V for one block."""
         f16, f32 = self.f16, self.f32
 
         if warp == 0:
@@ -171,6 +176,7 @@ class MsaSparseAttn:
     # ---------------------------------------------------------------- host
     @cute.jit
     def __call__(self, pq, pkv, pidx, pcu, ppt, ppfx, po, tq, npg, nb, mpg, stream):
+        """Launch the attend grid for one call."""
         f8, f16 = self.f8, self.f16
         mQ = _bf16t(pq, tq, self.hq)
         mO = _bf16t(po, tq, self.hq)
@@ -285,6 +291,7 @@ class MsaSparseAttn:
         lKV,
         lVh,
     ):
+        """One CTA per query token: walk that token's selected blocks."""
         f8, f16, f32 = self.f8, self.f16, self.f32
         tidx, _, _ = cute.arch.thread_idx()
         tok, hkv, _ = cute.arch.block_idx()
@@ -503,6 +510,7 @@ def _views(hkv, pkv, pvt, npg):
 
 
 def _bf16t(ptr, n, hq):
+    """Wrap a raw gmem pointer as an (n, hq, D) bf16 tensor."""
     return cute.make_tensor(
         cute.make_ptr(cutlass.BFloat16, ptr, cute.AddressSpace.gmem, assumed_align=16),
         cute.make_layout((n, hq, D), stride=(hq * D, D, 1)),
@@ -510,6 +518,7 @@ def _bf16t(ptr, n, hq):
 
 
 def _i32t(ptr, shape, stride):
+    """Wrap a raw gmem pointer as an int32 tensor with the given layout."""
     return cute.make_tensor(
         cute.make_ptr(cutlass.Int32, ptr, cute.AddressSpace.gmem, assumed_align=4),
         cute.make_layout(shape, stride=stride),
@@ -530,11 +539,13 @@ class VTranspose:
     """
 
     def __init__(self, hkv):
+        """Record the KV head count the transpose grid is sized for."""
         self.hkv = hkv
         self.f8 = cutlass.Float8E4M3FN
 
     @cute.jit
     def __call__(self, pkv, pvt, npg, stream):
+        """Launch the V transpose, one CTA per (page, KV head)."""
         f8 = self.f8
         mKV, mVT = _views(self.hkv, pkv, pvt, npg)
 
@@ -553,6 +564,7 @@ class VTranspose:
 
     @cute.kernel
     def kernel(self, mKV, mVT):
+        """Transpose one page's V half into keys-innermost order."""
         f8 = self.f8
         tidx, _, _ = cute.arch.thread_idx()
         pg, h, _ = cute.arch.block_idx()
@@ -613,6 +625,7 @@ class MsaSparseAttnFp8:
     fp8->f16 V unpack, no SMEM staging of V beyond the TMA landing buffer."""
 
     def __init__(self, hq, hkv):
+        """Record the head counts this fp8 body is built for."""
         self.hq = hq
         self.hkv = hkv
         self.g = hq // hkv
@@ -626,6 +639,7 @@ class MsaSparseAttnFp8:
     def __call__(
         self, pq, pkv, pvt, pidx, pcu, ppt, ppfx, po, tq, npg, nb, mpg, stream
     ):
+        """Launch the V transpose and the fp8 attend grid."""
         f8 = self.f8
         mQ = _bf16t(pq, tq, self.hq)
         mO = _bf16t(po, tq, self.hq)
@@ -800,6 +814,7 @@ class MsaSparseAttnFp8:
         lK,
         lV,
     ):
+        """One CTA per query token over an fp8 paged cache."""
         f8, f32 = self.f8, self.f32
         tidx, _, _ = cute.arch.thread_idx()
         tok, hkv, _ = cute.arch.block_idx()
@@ -1005,6 +1020,7 @@ def _blk(
     tVs,
     hkv,
 ):
+    """One mainloop block: QK gemm, optional causal mask, softmax, PV accumulate."""
     f32 = cutlass.Float32
 
     cute.arch.mbarrier_wait(mbar + 0, j % 2)
@@ -1077,6 +1093,7 @@ _STREAMS: dict = {}
 
 
 def _stream():
+    """CUstream for the current torch stream, cached per handle."""
     h = torch.cuda.current_stream().cuda_stream
     st = _STREAMS.get(h)
     if st is None:
@@ -1089,6 +1106,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
     # Shape-only decisions (fp8-vs-f16 V feed, boxed extents, entry point) are
     # resolved once per shape signature; the steady-state call boxes pointers
     # and makes a single DSL invocation.
+    """Run MSA sparse prefill with one query token per CTA. Writes ``p``."""
     ptshape = page_table.shape
     sig = (q.shape[1], kv.shape[1], kv.shape[0], q.shape[0], ptshape[0], ptshape[1])
     plan = _PLAN.get(sig)

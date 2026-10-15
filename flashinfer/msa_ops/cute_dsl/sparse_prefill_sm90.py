@@ -73,6 +73,7 @@ def _views(hkv, pkv, pvt, npg):
 
 
 def _bf16t(ptr, n, hq):
+    """Wrap a raw gmem pointer as an (n, hq, D) bf16 tensor."""
     return cute.make_tensor(
         cute.make_ptr(cutlass.BFloat16, ptr, cute.AddressSpace.gmem, assumed_align=16),
         cute.make_layout((n, hq, D), stride=(hq * D, D, 1)),
@@ -80,6 +81,7 @@ def _bf16t(ptr, n, hq):
 
 
 def _i32t(ptr, shape, stride):
+    """Wrap a raw gmem pointer as an int32 tensor with the given layout."""
     return cute.make_tensor(
         cute.make_ptr(cutlass.Int32, ptr, cute.AddressSpace.gmem, assumed_align=4),
         cute.make_layout(shape, stride=stride),
@@ -94,11 +96,13 @@ class VTranspose:
     """
 
     def __init__(self, hkv):
+        """Record the KV head count the transpose grid is sized for."""
         self.hkv = hkv
         self.f8 = cutlass.Float8E4M3FN
 
     @cute.jit
     def __call__(self, pkv, pvt, npg, stream):
+        """Launch the V transpose, one CTA per (page, KV head)."""
         f8 = self.f8
         mKV, mVT = _views(self.hkv, pkv, pvt, npg)
 
@@ -117,6 +121,7 @@ class VTranspose:
 
     @cute.kernel
     def kernel(self, mKV, mVT):
+        """Transpose one page's V half into keys-innermost order."""
         f8 = self.f8
         tidx, _, _ = cute.arch.thread_idx()
         pg, h, _ = cute.arch.block_idx()
@@ -215,6 +220,7 @@ class MsaSparseAttnFp8:
     """NT tokens per CTA; the CTA walks the union of their selected KV blocks."""
 
     def __init__(self, hq, hkv, nt, reverse=False):
+        """Record the head counts, tokens per CTA and walk order for this body."""
         self.hq = hq
         self.hkv = hkv
         self.g = hq // hkv
@@ -246,6 +252,7 @@ class MsaSparseAttnFp8:
         ngrp,
         stream,
     ):
+        """Launch the V transpose and the union attend grid."""
         f8 = self.f8
         mQ = _bf16t(pq, tq, self.hq)
         mO = _bf16t(po, tq, self.hq)
@@ -431,6 +438,7 @@ class MsaSparseAttnFp8:
         sq,
         gps,
     ):
+        """One CTA per NT-token tile: walk the union of their selected blocks."""
         f8, f32 = self.f8, self.f32
         tidx, _, _ = cute.arch.thread_idx()
         grp, hkv, _ = cute.arch.block_idx()
@@ -789,6 +797,7 @@ _STREAMS: dict = {}
 
 
 def _stream():
+    """CUstream for the current torch stream, cached per handle."""
     h = torch.cuda.current_stream().cuda_stream
     s = _STREAMS.get(h)
     if s is None:
@@ -801,6 +810,7 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
     # Everything that depends only on the shape signature (tile choice, launch
     # geometry, the boxed scalars the compiled entry expects) is resolved once
     # per shape; the per-call path is seven pointer boxes and one DSL call.
+    """Run MSA sparse prefill over the union schedule. Writes ``p``."""
     ptshape = page_table.shape
     sig = (q.shape[1], kv.shape[1], kv.shape[0], q.shape[0], ptshape[0], ptshape[1])
     plan = _PLAN.get(sig)

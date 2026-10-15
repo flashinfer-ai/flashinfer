@@ -149,6 +149,7 @@ FULL = 0xFFFFFFFF
 
 
 def _mk_net():
+    """Build the compile-time bitonic comparator network."""
     net = (
         (0, 13),
         (1, 12),
@@ -240,6 +241,7 @@ def _batcher(n):
 
 
 def _mk_bmerge():
+    """Build the compile-time comparator list for the bitonic merge."""
     a, b = [], []
     step = TOPK // 2
     while step >= 1:
@@ -275,6 +277,7 @@ _ASC = _mk_asc_stages()  # 10 lane-parallel stages, ascending
 def _fill_kernel(
     mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor, MASK: cutlass.Constexpr
 ):
+    """Emit the identity selection for rows with at most TOPK candidate tiles."""
     tidx, _, _ = cute.arch.thread_idx()
     bx, _, _ = cute.arch.block_idx()
     lane = tidx & Int32(31)
@@ -784,6 +787,7 @@ def _topk_kernel(
     C0: cutlass.Constexpr,
     MASK: cutlass.Constexpr,
 ):
+    """Select the TOPK highest-scoring tiles for each (head, query) row."""
     c, w, _ = cute.arch.thread_idx()
     bq, h, _ = cute.arch.block_idx()
 
@@ -1361,6 +1365,7 @@ def _topk_kernel(
 def _launch_fill(
     stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor, MASK: cutlass.Constexpr
 ):
+    """Launch the fill path for rows with at most TOPK tiles."""
     rows = mS.shape[0] * mS.shape[2]
     _fill_kernel(mS, mO, mNVP, MASK).launch(
         grid=[(rows + Int32(7)) // Int32(8), 1, 1],
@@ -1384,6 +1389,7 @@ def _launch(
     C0: cutlass.Constexpr,
     MASK: cutlass.Constexpr,
 ):
+    """Launch the selection kernel for the planned geometry."""
     Hq = mS.shape[0]
     Nq = mS.shape[2]
     C = Int32(C0)
@@ -1631,6 +1637,7 @@ _KF_STREAMS: dict = {}
 
 
 def _kf_stream():
+    """CUstream for the current torch stream, cached per handle."""
     h = torch.cuda.current_stream().cuda_stream
     s = _KF_STREAMS.get(h)
     if s is None:
