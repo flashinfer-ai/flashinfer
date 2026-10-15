@@ -224,7 +224,7 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
         v,
         alpha,
         beta,
-        1.0,
+        1.0 / math.sqrt(head_size),
         None,
         True,
         cu_seqlens,
@@ -241,6 +241,7 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
         seq_lens,
         alpha=alpha,
         beta=beta,
+        scale_factor=1.0 / math.sqrt(head_size),
         block_size=64,
         state_dtype=torch.float32,
     )

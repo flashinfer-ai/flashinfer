@@ -1226,7 +1226,7 @@ def _test_verify_kernel_mtp(
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
-@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("scale", ["auto"])
 @pytest.mark.parametrize("seq_len", [2, 4, 8])
 @pytest.mark.parametrize("head_size", [128, 64], ids=lambda d: f"dk{d}")
 @pytest.mark.parametrize("head_size_v", [128, 64], ids=lambda d: f"dv{d}")
