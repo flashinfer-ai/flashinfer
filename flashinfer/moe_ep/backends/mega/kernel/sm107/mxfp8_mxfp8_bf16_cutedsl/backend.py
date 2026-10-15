@@ -51,6 +51,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     # compute(output=None) returns a view into the workspace.
     supports_output_view = True
+    supports_auto_workspaces = True
 
     def __init__(
         self,
@@ -59,6 +60,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
+
+    def needs_workspace_replacement(self, workspace):
+        from ..automatic import needs_replacement
+
+        return needs_replacement(self, workspace)
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -162,14 +168,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
-        """Resolve the config's ``knobs`` field into shim-kwarg overrides.
-
-        ``None`` -> {} (the explicit config fields stand); a dict ->
-        validated explicit overrides; ``"cache"`` -> knob-cache lookup with
-        the built-in heuristic fallback.  The online ``"auto"`` sweep is not
-        supported on the engine path — the SM107 session bakes knobs at
-        construction; tune offline with ``python -m flashinfer.moe_ep.tune``.
-        """
+        """Resolve fixed overrides or the automatic workspace's initial heuristic."""
         from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
@@ -183,6 +182,16 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                     f"(valid: {sorted(KNOB_KEYS)})"
                 )
             return dict(k.knobs)
+        if k.knobs == "auto":
+            from ......kernel_src.sm107.next_cutedsl_megamoe import default_knobs
+
+            # Cache selection must be collective before it affects allocation.
+            return default_knobs(
+                fleet_params.max_tokens_per_rank,
+                quant_kind=k.kind,
+                kernel_variant=k.kernel_variant,
+                combine_dtype=k.combine_dtype,
+            )
         if k.knobs == "cache":
             knobs = self._workspace_knobs(fleet_params)
             assert knobs is not None
@@ -194,11 +203,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                     flush=True,
                 )
             return knobs
-        raise MoEEpConfigError(
-            "knobs='auto' (online sweep) is not supported by the SM107 "
-            "backends; run the offline tuner (python -m flashinfer.moe_ep.tune)"
-            " and use knobs=None, knobs='cache', or an explicit knob dict."
-        )
+        raise MoEEpConfigError("knobs must be None, 'cache', 'auto', or a dictionary")
 
     def validate_forward(
         self,
@@ -276,6 +281,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                     "compute() called before stage_inputs(); no token count is staged."
                 )
 
+        from ..automatic import maybe_tune
+
+        maybe_tune(self, workspace, transformed_weights, output, num_tokens)
         view = sm107_block_scaled_mega_moe(
             output,
             transformed_weights[0],
@@ -287,6 +295,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams):
+        if self._kernel_config.knobs == "auto":
+            return None
         from ......core.kernel.workspace_pool import knobs_pool_key
 
         k = self._kernel_config

@@ -503,6 +503,13 @@ class Sm107BlockScaledSymmBuffer:
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
+        self._allocate_execution_state()
+        self._staged_tokens: Optional[int] = None
+        self._destroyed = False
+
+    def _allocate_execution_state(self) -> None:
+        cfg, kernel = self.config, self.kernel
+        tokens = cfg.padded_tokens_per_rank
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
         # straight into the output, so it must live on the SYMMETRIC heap and
         # start zeroed; the separate-reduce path only sees local stores.
@@ -563,8 +570,6 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
-        self._staged_tokens: Optional[int] = None
-        self._destroyed = False
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
@@ -717,12 +722,12 @@ class Sm107BlockScaledSymmBuffer:
             },
         }
 
-    def launch(
+    def prepare(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
     ) -> None:
-        """Compile on first use, then launch the fused mega kernel."""
+        """Compile and bind the selected kernel without launching it."""
         import cutlass.cute as cute
 
         if self._destroyed:
@@ -753,6 +758,16 @@ class Sm107BlockScaledSymmBuffer:
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+
+    def launch(
+        self,
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+    ) -> None:
+        """Compile on first use, then launch the fused mega kernel."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            self._autotune_graph_captured = True
+        self.prepare(transformed_l1, transformed_l2)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
@@ -771,26 +786,53 @@ class Sm107BlockScaledSymmBuffer:
                 )
         self._compiled(**self._launch_kwargs)
 
+    def _release_execution_state(self) -> None:
+        self._compiled = None
+        self._launch_kwargs = None
+        self._launch_weights = None
+        self._launch_key = None
+        self._pre_reduced_activation = None
+        self._pre_reduced_activation_sf = None
+        comm.free_sym_tensor(getattr(self, "shared_workspace", None))
+        if self.config.reduce_topk_in_kernel:
+            comm.free_sym_tensor(self.output_activation)
+        self.output_activation = None
+        self.shared_workspace = None
+        self.local_workspace = None
+
+    def install_tuned_knobs(self, knobs, transformed_l1, transformed_l2) -> None:
+        """Replace kernel scratch before capture, retaining staged inputs."""
+        import dataclasses
+
+        comm.ensure_not_capturing("SM107 tuning winner installation")
+        if self._destroyed or getattr(self, "_autotune_graph_captured", False):
+            raise RuntimeError("cannot tune a destroyed or captured SM107 workspace")
+        config = dataclasses.replace(self.config, **knobs)
+        if config != self.config:
+            kernel = self._build_kernel(config)
+            sf_cols = int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if config.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            )
+            if sf_cols != self.sf_cols:
+                raise ValueError("tuning cannot change the staged scale layout")
+            torch.cuda.synchronize()
+            self._release_execution_state()
+            self.config, self.kernel = config, kernel
+            self._allocate_execution_state()
+        self.prepare(transformed_l1, transformed_l2)
+
     def destroy(self) -> None:
         if self._destroyed:
             return
         comm.ensure_not_capturing("SM107 mega workspace free")
-        # nvshmem free is collective and does not wait for in-flight work;
-        # drain this rank's device before releasing symmetric memory that a
-        # still-running launch (ours or a peer's dispatch pull) may touch.
+        # Symmetric free is collective and does not wait for in-flight kernels.
         torch.cuda.synchronize()
-        self._compiled = None
-        self._launch_kwargs = None
-        self._launch_weights = None
-        self._pre_reduced_activation = None
-        self._pre_reduced_activation_sf = None
-        for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
+        self._release_execution_state()
+        for name in ("x", "x_sf", "topk_weights"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)
-        if self.config.reduce_topk_in_kernel:
-            comm.free_sym_tensor(self.output_activation)
-        self.output_activation = None
-        self.local_workspace = None
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True

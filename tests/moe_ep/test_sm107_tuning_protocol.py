@@ -1,0 +1,524 @@
+"""Rubin cache compatibility and deferred automatic tuning without a GPU."""
+
+import dataclasses
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from flashinfer import autotune, autotune_v2
+from flashinfer.autotuner import AutoTuner
+from flashinfer.moe_ep import BootstrapConfig, FleetParams
+from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+    autotune as native,
+    block_scaled,
+    knob_cache,
+    tuning_protocol,
+)
+from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
+
+
+@pytest.mark.parametrize("config_cls,backend_cls,name", _BACKENDS)
+def test_auto_initial_config_does_not_depend_on_rank_local_cache(
+    config_cls, backend_cls, name, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    backend = create_mega_kernel(config_cls(256, 3, knobs="auto"))
+    backend.bind_ep_bootstrap(BootstrapConfig(rank=0, world_size=2))
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=384)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    initial = backend._resolved_config(fleet)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path / "managed"))
+    knobs = {"fc2_use_bulk": False, "fc2_tma_stages": None}
+    knob_cache.record_knobs(knobs, **backend._tuning_key(fleet))
+    assert knob_cache.lookup_knobs(**backend._tuning_key(fleet)) == knobs
+    assert backend._resolved_config(fleet) == initial
+    assert backend._workspace_pool_key(fleet) is None
+
+
+@pytest.fixture
+def state(monkeypatch, tmp_path):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path / "managed"))
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setattr(
+        block_scaled.Sm107BlockScaledSymmBuffer, "_build_kernel", lambda cfg: None
+    )
+    tuner = AutoTuner.get()
+    tuner._managed_cache = None
+    tuner._managed_stores.clear()
+    tuner.clear_cache()
+    tuner.reset_statistics()
+    cfg = block_scaled.Sm107BlockScaledMoeConfig(
+        num_total_experts=4,
+        max_tokens_per_rank=128,
+        num_topk=2,
+        hidden=128,
+        intermediate=64,
+        rank=0,
+        world_size=1,
+    )
+    workspace = SimpleNamespace(
+        config=cfg, staged_tokens=lambda: 4, install_tuned_knobs=Mock()
+    )
+    sweep = Mock(return_value=({"fc2_use_bulk": False}, 1.0, 1))
+    monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
+
+    def run(**kwargs):
+        return native.autotune_sm107_block_scaled_mega_moe(
+            None,
+            None,
+            None,
+            workspace,
+            candidates=[{"fc2_use_bulk": False}],
+            install_winner=True,
+            force_tune=False,
+            **kwargs,
+        )
+
+    yield SimpleNamespace(
+        workspace=workspace,
+        sweep=sweep,
+        run=run,
+        tuner=tuner,
+        path=tmp_path / "knobs.json",
+    )
+    tuner.clear_cache()
+    tuner._managed_cache = None
+    tuner._managed_stores.clear()
+
+
+def test_deferred_search_persistence_and_shared_hit_file_output(state, tmp_path):
+    assert state.run() is None
+    state.sweep.assert_not_called()
+    with autotune(True, skip_ops={tuning_protocol.NAMESPACE}):
+        assert state.run() is None
+    state.sweep.assert_not_called()
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": False}
+        assert list((tmp_path / "managed").glob("v2/*/protocols/*/*.json"))
+    state.sweep.assert_called_once()
+    state.workspace.install_tuned_knobs.assert_called_once()
+    state.path.unlink()
+    state.tuner.clear_cache()
+    state.tuner._managed_cache = None
+    state.tuner._managed_stores.clear()
+    with autotune_v2(mode="replay"):
+        assert state.run() == {"fc2_use_bulk": False}
+    assert state.path.is_file()
+    state.sweep.assert_called_once()
+    assert state.workspace.install_tuned_knobs.call_count == 2
+
+
+def test_record_fallback_and_numerical_contract_are_shared(state):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    query = protocol._query(4)
+    entries = []
+    for capacity in (64, 256):
+        entry = knob_cache.make_record(
+            {"fc2_use_bulk": capacity == 256},
+            **{**query, "max_tokens": capacity, "live_tokens": capacity},
+        )
+        entries.append(entry)
+    for i, entry in enumerate(entries):
+        state.tuner.publish_protocol_record(
+            tuning_protocol.NAMESPACE, str(i), entry, persist=False
+        )
+    assert state.run() == {"fc2_use_bulk": True}
+    state.sweep.assert_not_called()
+    # Identical geometry with a different activation must not reuse a record.
+    state.workspace.config = dataclasses.replace(
+        state.workspace.config, activation="situ", situ_beta=1.0, situ_linear_beta=1.0
+    )
+    with autotune(False):
+        assert state.run() is None
+    state.workspace.config = dataclasses.replace(
+        state.workspace.config,
+        activation="swiglu",
+        situ_beta=None,
+        situ_linear_beta=None,
+        max_sm_count=16,
+    )
+    # Records carrying a different implementation/resource contract are rejected.
+    entry = {**entries[0], "protocol_contract": {"different": True}}
+    state.tuner.clear_cache()
+    state.tuner.publish_protocol_record(
+        tuning_protocol.NAMESPACE, "entry", entry, persist=False
+    )
+    state.path.unlink()
+    with autotune(False):
+        assert state.run() is None
+
+    # An incompatible bucket must not hide a compatible larger file bucket.
+    knob_cache.write_record(entry)
+    knob_cache.write_record(entries[1])
+    with autotune(False):
+        assert state.run() == {"fc2_use_bulk": True}
+
+
+@pytest.mark.parametrize("change", ["backend_revision", "environment", "resources"])
+def test_cache_compatibility_after_runtime_change(state, monkeypatch, change):
+    import importlib
+
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": False}
+    if change == "backend_revision":
+        monkeypatch.setattr(knob_cache, "BACKEND_REVISION", "new-revision")
+    elif change == "environment":
+        module = importlib.import_module("flashinfer.autotuner.autotuner")
+        metadata = {**module._collect_metadata(), "cutlass_dsl_version": "new-version"}
+        monkeypatch.setattr(module, "_collect_metadata", lambda: metadata)
+    else:
+        state.workspace.config = dataclasses.replace(
+            state.workspace.config, max_sm_count=16
+        )
+    with autotune_v2(mode="replay"):
+        assert state.run() is None
+    state.sweep.assert_called_once()
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": False}
+    assert state.sweep.call_count == 2
+
+
+def test_native_import_and_explicit_search(state):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    knob_cache.record_knobs({"fc2_use_bulk": True}, **protocol._query(4))
+    with autotune(False):
+        assert state.run() == {"fc2_use_bulk": True}
+    state.sweep.assert_not_called()
+    assert state.tuner.get_protocol_records(tuning_protocol.NAMESPACE)
+    # A search that leaves the source workspace unchanged can run after capture.
+    state.workspace._autotune_graph_captured = True
+    for _ in range(2):
+        assert native.autotune_sm107_block_scaled_mega_moe(
+            None, None, None, state.workspace, candidates=[{"fc2_use_bulk": False}]
+        ) == {"fc2_use_bulk": False}
+    assert state.sweep.call_count == 2
+    # Only the online import installs a winner; offline searches leave it alone.
+    state.workspace.install_tuned_knobs.assert_called_once()
+
+
+def test_pending_capture_freezes_workspace(state, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert state.run() is None
+    state.workspace.install_tuned_knobs.assert_not_called()
+    with autotune(True), pytest.raises(RuntimeError, match="before CUDA graph capture"):
+        state.run()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with autotune(True), pytest.raises(RuntimeError, match="captured workspace"):
+        state.run()
+    state.sweep.assert_not_called()
+
+
+def test_cli_persists_managed_cache_by_default(state, monkeypatch, tmp_path):
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setattr(package, "require_sm107_dsl", lambda: None)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def tune_one(*args):
+        return native.autotune_sm107_block_scaled_mega_moe(
+            None, None, None, state.workspace, candidates=[{"fc2_use_bulk": False}]
+        )
+
+    monkeypatch.setattr(tuning, "tune_one", tune_one)
+    options = [
+        "--arch",
+        "sm107",
+        "--dtype",
+        "nvfp4",
+        "--hidden",
+        "128",
+        "--intermediate",
+        "64",
+        "--num-experts",
+        "4",
+        "--topk",
+        "2",
+        "--max-tokens",
+        "128",
+    ]
+    for _ in range(2):
+        assert tune.main(options) == 0
+        state.tuner.clear_cache()
+        state.tuner._managed_cache = None
+        state.tuner._managed_stores.clear()
+        with autotune_v2(mode="replay"):
+            assert state.tuner.get_protocol_records(tuning_protocol.NAMESPACE)
+        assert state.path.is_file()
+    assert state.sweep.call_count == 2
+    with pytest.raises(SystemExit):
+        tune.main(options + ["--autotune-cache", str(tmp_path / "unused.json")])
+
+
+def test_memory_only_skips_both_disk_caches_and_policy_is_explicit(state, tmp_path):
+    from flashinfer.autotune_cache import MeasurementPolicy
+
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    knob_cache.record_knobs({"fc2_use_bulk": True}, **protocol._query(4))
+    original = state.path.read_bytes()
+    with autotune_v2(mode="replay", persistent_cache=False):
+        assert state.run() is None
+    with autotune_v2(persistent_cache=False):
+        assert state.run() == {"fc2_use_bulk": False}
+    assert state.path.read_bytes() == original
+    assert not (tmp_path / "managed").exists()
+    with autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="eager")):
+        assert state.run() == {"fc2_use_bulk": False}
+    assert state.sweep.call_args.kwargs["measurement"]["timer"] == "events_no_delay"
+
+
+def test_replay_import_requires_provenance_before_tuning_reuse(state):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    knob_cache.record_knobs({"fc2_use_bulk": True}, **protocol._query(4))
+    with autotune_v2(mode="replay"):
+        assert state.run() == {"fc2_use_bulk": True}
+    state.sweep.assert_not_called()
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": False}
+    state.sweep.assert_called_once()
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": False}
+    state.sweep.assert_called_once()
+
+
+def test_compatibility_file_failure_does_not_break_selection(state, monkeypatch):
+    def unavailable(*args):
+        raise OSError("cache storage is unavailable")
+
+    monkeypatch.setattr(knob_cache, "_load_entries", unavailable)
+    monkeypatch.setattr(knob_cache, "write_record", unavailable)
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": False}
+    state.sweep.assert_called_once()
+    with autotune_v2(mode="replay"):
+        assert state.run() == {"fc2_use_bulk": False}
+    state.sweep.assert_called_once()
+
+
+@pytest.mark.parametrize("fallback", ["empty_store", "skip_ops"])
+def test_automatic_workspace_returns_to_initial_knobs(
+    state, monkeypatch, tmp_path, fallback
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
+    from flashinfer.moe_ep.core.kernel.base import MegaKernelBackend
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
+    backend = SimpleNamespace(
+        _kernel_config=SimpleNamespace(knobs="auto", in_kernel_fc2_reduce=False),
+        ep_world_size=1,
+        ep_comm_group=None,
+    )
+    workspace = state.workspace
+    workspace.config = dataclasses.replace(workspace.config, fc2_use_bulk=True)
+
+    def select():
+        automatic.maybe_tune(backend, workspace, (None, None), None, 4)
+
+    with autotune_v2():
+        select()
+    assert workspace._autotune_winner == {"fc2_use_bulk": False}
+    assert MegaKernelBackend.get_tuned_knobs(backend) == workspace._autotune_winner
+    options = (
+        {"cache_root": str(tmp_path / "empty")}
+        if fallback == "empty_store"
+        else {"skip_ops": {tuning_protocol.NAMESPACE}}
+    )
+    with autotune_v2(mode="replay", **options):
+        select()
+        assert (
+            workspace._autotune_cache_identity
+            == automatic.tuning_context().cache_identity
+        )
+    assert workspace._autotune_winner is None
+    with pytest.raises(RuntimeError, match="no completed automatic tuning result"):
+        MegaKernelBackend.get_tuned_knobs(backend)
+    assert workspace._autotune_tuned_identity is None
+    initial = workspace._autotune_initial_knobs
+    assert initial["fc2_use_bulk"] is True
+    workspace.install_tuned_knobs.assert_called_with(initial, None, None)
+    with autotune_v2(mode="replay"):
+        select()
+    assert workspace._autotune_winner == {"fc2_use_bulk": False}
+    assert MegaKernelBackend.get_tuned_knobs(backend) == workspace._autotune_winner
+    state.sweep.assert_called_once()
+    if fallback == "skip_ops":
+        workspace._autotune_graph_captured = True
+        with (
+            autotune_v2(skip_ops={tuning_protocol.NAMESPACE}),
+            pytest.raises(RuntimeError, match="skip_ops requires fallback"),
+        ):
+            select()
+
+
+def test_capture_cannot_accept_a_cache_change_without_selection(state, monkeypatch):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
+    backend = SimpleNamespace(
+        _kernel_config=SimpleNamespace(knobs="auto", in_kernel_fc2_reduce=False),
+        ep_world_size=1,
+        ep_comm_group=None,
+    )
+    workspace = state.workspace
+    automatic.maybe_tune(backend, workspace, (None, None), None, 4)
+    previous = workspace._autotune_cache_identity
+    state.tuner.clear_cache()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="Warm up Rubin automatic selection"):
+        automatic.needs_replacement(backend, workspace)
+    # Explicit handles stay pinned and cannot claim a lookup from the new store.
+    workspace._autotune_graph_captured = True
+    automatic.maybe_tune(backend, workspace, (None, None), None, 4)
+    assert workspace._autotune_cache_identity == previous
+    state.sweep.assert_not_called()
+
+
+def test_invalid_cached_resources_are_a_miss_before_bucket_selection(
+    state, monkeypatch
+):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    for capacity, bulk in ((128, False), (256, True)):
+        record = knob_cache.make_record(
+            {"fc2_use_bulk": bulk},
+            **{**protocol._query(4), "max_tokens": capacity, "live_tokens": capacity},
+        )
+        state.tuner.publish_protocol_record(
+            tuning_protocol.NAMESPACE, str(capacity), record, persist=False
+        )
+
+    def build(config):
+        if not config.fc2_use_bulk:
+            raise ValueError("configuration exceeds available resources")
+
+    monkeypatch.setattr(block_scaled.Sm107BlockScaledSymmBuffer, "_build_kernel", build)
+    assert state.run() == {"fc2_use_bulk": True}
+    state.sweep.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["auto", "eager", "cuda_graph"])
+@pytest.mark.parametrize("cold", [False, True])
+def test_measurement_policy_reuse_is_isolated(state, mode, cold):
+    from flashinfer.autotune_cache import MeasurementPolicy
+
+    policy = MeasurementPolicy(execution_mode=mode, cold_l2=cold)
+    with autotune_v2(measurement_policy=policy):
+        state.run()
+        settings = state.sweep.call_args.kwargs["measurement"]
+        assert settings["cold_l2"] is cold
+        assert settings["cuda_graph_profile_replays"] == (
+            1 if mode == "cuda_graph" else None
+        )
+        assert (
+            settings["timer"]
+            == {
+                "auto": "native_events",
+                "eager": "events_no_delay",
+                "cuda_graph": "events",
+            }[mode]
+        )
+    with autotune_v2(measurement_policy=policy):
+        state.run()
+    state.sweep.assert_called_once()
+    # A file winner for one policy must not satisfy another policy's replay.
+    with autotune_v2(
+        mode="replay",
+        measurement_policy=MeasurementPolicy(execution_mode=mode, cold_l2=not cold),
+    ):
+        assert state.run() is None
+    state.sweep.assert_called_once()
+
+
+def _subgroup_worker(rank, rendezvous):
+    from datetime import timedelta
+    import torch.distributed as dist
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.cuda, "is_available", lambda: False)
+        patch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+        patch.setattr(
+            block_scaled.Sm107BlockScaledSymmBuffer, "_build_kernel", lambda cfg: None
+        )
+        dist.init_process_group(
+            "gloo",
+            init_method=rendezvous,
+            rank=rank,
+            world_size=3,
+            timeout=timedelta(seconds=30),
+        )
+        group = dist.new_group([1, 2])
+        try:
+            if rank != 0:
+                cfg = block_scaled.Sm107BlockScaledMoeConfig(
+                    num_total_experts=4,
+                    max_tokens_per_rank=128,
+                    num_topk=2,
+                    hidden=128,
+                    intermediate=64,
+                    rank=rank - 1,
+                    world_size=2,
+                )
+                workspace = SimpleNamespace(
+                    config=cfg,
+                    staged_tokens=lambda: rank * 4,
+                    install_tuned_knobs=Mock(),
+                )
+                protocol = tuning_protocol.RubinTuningProtocol(
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    candidates=[{"fc2_use_bulk": False}],
+                    process_group=group,
+                    install_winner=True,
+                )
+                tuner = AutoTuner.get()
+                tuner.clear_cache()
+                if rank == 1:
+                    record = knob_cache.make_record(
+                        {"fc2_use_bulk": False}, **protocol._query(16)
+                    )
+                    tuner.publish_protocol_record(
+                        tuning_protocol.NAMESPACE, "winner", record, persist=False
+                    )
+                with autotune(False):
+                    assert tuner.choose_with_protocol(
+                        tuning_protocol.NAMESPACE, protocol
+                    ) == {"fc2_use_bulk": False}
+                workspace.install_tuned_knobs.assert_called_once()
+                with autotune(rank == 1), pytest.raises(ValueError, match="controls"):
+                    tuner.choose_with_protocol(tuning_protocol.NAMESPACE, protocol)
+
+                def prepare():
+                    if rank == 1:
+                        raise ValueError("candidate compilation failed")
+
+                with pytest.raises(RuntimeError, match="candidate compilation failed"):
+                    native._prepare_collectively(prepare, 2, group)
+            dist.barrier()
+        finally:
+            dist.destroy_process_group()
+
+
+def test_ep_subgroup_cache_agreement_and_mode_mismatch(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _subgroup_worker,
+        args=(f"file://{tmp_path / 'rendezvous'}",),
+        nprocs=3,
+        join=True,
+    )

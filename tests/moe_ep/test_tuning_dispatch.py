@@ -63,6 +63,8 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
 @pytest.mark.parametrize(
     "options",
     [
+        ["--arch", "sm100", "--autotune-cache", "cache.json"],
+        ["--dtype", "sm120_mxfp4_mxfp8", "--autotune-cache", "cache.json"],
         ["--arch", "sm107", "--dtype", "bf16"],
         ["--arch", "auto", "--dtype", "bf16_mxfp8_e4m3"],
         ["--arch", "sm107", "--dtype", "bf16_mxfp8_e5m2"],
