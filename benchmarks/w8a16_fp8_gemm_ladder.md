@@ -407,6 +407,17 @@ the activation tile height, and the measured order on that row follows it exactl
 way through is a 256-row activation tile with A in TMEM (one accumulator stage, or a
 224-row tile with one A stage), a mainloop change, not a knob.
 
+Tried (version B18 experiment): a 256x224 tile with a 64-deep k-tile, which fits TMEM
+with A still there (2 x 224 + 2 x 32 = 512 columns).  Compiles, passes the tests, and is
+slower than auto on every row (mlp.gate_up tp2 1.08-1.10 vs 1.03, mlp.down tp2 1.08 vs
+1.02, und.q tp2 1.04-1.05 vs 0.96, attn.out tp8 1.23-1.25 vs 1.13, mlp.down tp1 1.06 vs
+1.04): the halved k-tile costs more pipeline than the saved conversions buy.  Removed
+from the build together with the cluster-(2,2,1) variants (`W8A16Sm100Cfg<256, 224, 64,
+2, true>` and `W8A16Sm100Cfg<256, {128,192}, 128, 2, true, false, 2>` rebuild them;
+the `kClusterN` template parameter stays).  So at M=88320 Blackwell ends at 21 of 24 rows
+at or under 1.02 x cuBLAS; mlp.down tp2 and mlp.gate_up tp2 at 1.02-1.03, attn.out tp8
+at 1.03-1.1 on a 0.6 ms kernel, all three at the converter's energy floor.
+
 Lesson for the whole line, both arches: on a power-capped part a GEMM at 97% tensor-pipe
 utilisation is not "compute-bound, done"; every DRAM byte costs clock, and cuBLAS's edge on
 the wide rows was never its mainloop but its L2 footprint.

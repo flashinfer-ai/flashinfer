@@ -305,10 +305,6 @@ using W8A16Sm100Cfg2SM256x192 = W8A16Sm100Cfg<256, 192, 128, 2, true>;
 // TMA / epilogue predication, and the transform work per k-tile (the weight tile) is
 // the same, so the taller tile costs only its extra MMA.
 using W8A16Sm100Cfg2SM256x160 = W8A16Sm100Cfg<256, 160, 128, 2, true>;
-// Version B16 experiment: cluster (2, 2, 1): two 2SM pairs on neighbouring activation
-// tiles, weight tile multicast between them.
-using W8A16Sm100Cfg2SM256x128C2 = W8A16Sm100Cfg<256, 128, 128, 2, true, false, 2>;
-using W8A16Sm100Cfg2SM256x192C2 = W8A16Sm100Cfg<256, 192, 128, 2, true, false, 2>;
 
 // Rung B12: split-K.  With kSplitK the kernel runs as a *batch* of `splits` GEMMs over
 // K-slices in one launch (batch stride = the slice length along K for A and B, one
@@ -507,11 +503,12 @@ enum class W8A16Sm100Tile {
   k2SM256x192 = 4,
   k2SM256x128SplitK = 5,  // version B12: 256x128 tile, batched K-slices + fp32 reduce
   k2SM256x128StreamK = 6,  // version B13: 256x128 tile under the stream-K scheduler
-  k2SM256x160 = 7,         // version B14: 160-row tile for wave quantisation
-  k2SM256x128C2 = 8,       // version B16 experiment: cluster (2,2,1), weight multicast
-  k2SM256x192C2 = 9
+  k2SM256x160 = 7          // version B14: 160-row tile for wave quantisation
+  // Codes 8-10 were the B16 / B18 experiments (cluster (2,2,1) weight multicast on the
+  // 128 / 192 tiles, a 224-row tile with a 64-deep k-tile); all measured slower than the
+  // tiles above on every row and were removed from the build (ladder doc, "losers").
 };
-constexpr int kW8A16Sm100MaxTileCode = 9;
+constexpr int kW8A16Sm100MaxTileCode = 7;
 constexpr int kW8A16Sm100MaxSplits = 8;
 
 inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
@@ -532,8 +529,6 @@ inline W8A16Sm100Tile W8A16Sm100TileEnv() {
     if (std::strcmp(s, "2sm256x128_splitk") == 0) return W8A16Sm100Tile::k2SM256x128SplitK;
     if (std::strcmp(s, "2sm256x128_streamk") == 0) return W8A16Sm100Tile::k2SM256x128StreamK;
     if (std::strcmp(s, "2sm256x160") == 0) return W8A16Sm100Tile::k2SM256x160;
-    if (std::strcmp(s, "2sm256x128_c2") == 0) return W8A16Sm100Tile::k2SM256x128C2;
-    if (std::strcmp(s, "2sm256x192_c2") == 0) return W8A16Sm100Tile::k2SM256x192C2;
     return W8A16Sm100Tile::kAuto;
   }();
   return tile;
@@ -797,12 +792,6 @@ size_t W8A16Fp8GemmSm100WorkspaceBytes(int M, int N, int K, int device_id, int n
     case W8A16Sm100Tile::k2SM256x160:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
-    case W8A16Sm100Tile::k2SM256x128C2:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128C2>::WorkspaceBytes(M, N, K, device_id,
-                                                                          num_sms);
-    case W8A16Sm100Tile::k2SM256x192C2:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192C2>::WorkspaceBytes(M, N, K, device_id,
-                                                                          num_sms);
     default:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::WorkspaceBytes(M, N, K, device_id,
                                                                         num_sms);
@@ -842,14 +831,6 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
-    case W8A16Sm100Tile::k2SM256x128C2:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128C2>::Run(
-          act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
-          stream);
-    case W8A16Sm100Tile::k2SM256x192C2:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192C2>::Run(
-          act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
-          stream);
     default:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
