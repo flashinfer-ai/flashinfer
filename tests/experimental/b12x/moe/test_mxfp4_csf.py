@@ -12,8 +12,9 @@ from ..quantization.test_mxfp4_csf import fixture
 @pytest.mark.parametrize("tokens", [1, 17, 33, 128])
 @pytest.mark.parametrize("h,n", [(512, 192), (5120, 576), (512, 256)])
 @pytest.mark.parametrize("raw", ["blocks"])
+@pytest.mark.parametrize("nonlinearity", ["silu", "situ"])
 def test_native_expert_output_and_shared_scratch_poisoned_replay(
-    tokens, h, n, raw, activation_mode="a8"
+    tokens, h, n, raw, nonlinearity, activation_mode="a8"
 ):
     device = require_b12x()
     e, topk = 8, 2
@@ -44,7 +45,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     weight_plan = moe.plan_weights(
         source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
         activation=moe.ActivationSpec(
-            mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16
+            mode=activation_mode, nonlinearity=nonlinearity, io_dtype=torch.bfloat16
         ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
     )
@@ -569,5 +570,6 @@ def test_block_scales_use_native_expert_math_and_shared_scratch(tokens, mode, h,
         h=h,
         n=n,
         raw="blocks",
+        nonlinearity="silu",
         activation_mode=mode,
     )
