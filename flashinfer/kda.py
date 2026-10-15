@@ -362,14 +362,13 @@ def recurrent_kda(
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
-            It is optional for eager execution and required for CUDA graph
-            capture. Warm it eagerly with the exact tensors on the capture
+            It is optional for eager execution and required for native CUDA
+            graph capture. Auto-selected cuDNN leaves it unused and manages
+            its own scratch buffers. Native fallback uses the supplied workspace.
+            Warm the selected backend with the exact tensors on the capture
             stream before capture. Use one workspace per captured
-            ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use non-persistent schedules, including eligible BT16,
-            M64, small-BH, and direct routes. Persistent task planning is an
-            eager-only B200/GB200 route because its bins depend on host-visible
-            sequence lengths.
+            ``recurrent_kda`` invocation. Cake's persistent task planning is
+            eager-only because its bins depend on host-visible sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
             Checkpoint output or pool ``[C, H, 128, 128]`` for prefill. CuTe DSL
             accepts BF16 or FP32 and requires it to match ``initial_state`` when
@@ -751,7 +750,6 @@ def recurrent_kda(
     )
     cudnn_auto = (
         auto_prefill
-        and prefill_workspace is None
         and _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens)
         and _cudnn_kda_prefill_available()
     )
@@ -992,6 +990,7 @@ def recurrent_kda(
                 )
                 if result is not None:
                     return result
+            # cuDNN was skipped or declined; select a native fallback.
             native_backend = (
                 _select_kda_prefill_backend(
                     q, initial_state, cu_seqlens, allow_cudnn=False

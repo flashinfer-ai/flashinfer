@@ -89,9 +89,11 @@ requires heads divisible by eight and no more than the device SM count,
 so this single-sequence route never uses inter-CTA state handoffs. An
 unavailable cuDNN frontend falls back to a compatible native backend.
 Unbounded gates, state pools, checkpoints, strided Q/K, multiple sequences,
-and sizes outside these regions retain the existing policy. A native
-``prefill_workspace`` keeps the call on a native provider; warm that provider
-with the same workspace before CUDA Graph capture.
+and sizes outside these regions retain the existing policy. Auto-selected
+cuDNN leaves a supplied ``prefill_workspace`` unused and manages its own
+scratch buffers, including private storage during CUDA Graph capture.
+Native fallback uses the supplied workspace. Warm the selected backend with
+the same arguments and stream before capture.
 
 Input layout
 ~~~~~~~~~~~~
@@ -542,11 +544,11 @@ The frozen kernel uses restricted output and auxiliary storage. A preallocated
 ``output`` and checkpoint buffers must not overlap Q, K, V, G, beta, state,
 metadata, or descriptor storage.
 
-Eager calls without ``prefill_workspace`` use an internal serialized workspace
+Native eager calls without ``prefill_workspace`` use an internal serialized workspace
 for the current CUDA stream. This default workspace is eager-only and cannot
 be used during CUDA graph capture.
 
-CUDA graph capture requires a caller-owned
+Native CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
 workspace owns optional final-state scratch for calls without an initial
 state, beta padding, separate TMA descriptor blocks, and the small-BH compact

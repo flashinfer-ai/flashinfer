@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Auto substitutes a provider without changing native prefill semantics.
+"""Auto preserves KDA math and native fallback behavior.
 
 Contract tests force the policy on; policy tests cover the measured regions.
 """
@@ -137,7 +137,6 @@ def test_auto_preserves_math_dtype_and_fresh_bindings(
 @pytest.mark.parametrize(
     "excluded",
     [
-        "prefill_workspace",
         "ssm_state_indices",
         "initial_state_source",
         "initial_state_indices",
@@ -157,11 +156,7 @@ def test_auto_preserves_unadmitted_native_contracts(monkeypatch, excluded):
     seen = []
     _force_native_route(monkeypatch, "cute-dsl", seen)
     values = _inputs()
-    if excluded == "prefill_workspace":
-        # Only the dispatch type check runs here; the real constructor allocates
-        # CUDA storage, whereas this host test substitutes the native launcher.
-        values[excluded] = object.__new__(RecurrentKDAPrefillWorkspace)
-    elif excluded == "checkpoint_every_n_tokens":
+    if excluded == "checkpoint_every_n_tokens":
         values[excluded] = 32
     elif excluded == "strided_qk":
         for name in ("q", "k"):
@@ -182,6 +177,28 @@ def test_auto_preserves_unadmitted_native_contracts(monkeypatch, excluded):
         values[excluded] = torch.tensor([0], dtype=torch.int32)
     kda.recurrent_kda(**values, backend="auto")
     assert [provider for provider, _ in seen] == ["native"]
+
+
+@pytest.mark.parametrize("native", ["small-bh", "cute-dsl"])
+@pytest.mark.parametrize("declines", [False, True])
+def test_workspace_is_unused_by_cudnn_and_retained_for_fallback(
+    monkeypatch, native, declines
+):
+    seen = []
+    _force_native_route(monkeypatch, native, seen)
+    values = _inputs()
+    # Native launch is mocked, so no CUDA workspace allocation is needed.
+    workspace = object.__new__(RecurrentKDAPrefillWorkspace)
+    values["prefill_workspace"] = workspace
+    if declines:
+        monkeypatch.setattr(kda, "_try_cudnn_kda_prefill", lambda **kwargs: None)
+    kda.recurrent_kda(**values, backend="auto")
+    provider, bound = seen[-1]
+    assert provider == ("native" if declines else "cudnn")
+    if declines:
+        assert bound["prefill_workspace"] is workspace
+    else:
+        assert "prefill_workspace" not in bound
 
 
 @pytest.mark.parametrize("order", ["valid", "dtype", "shape", "device"])
@@ -557,7 +574,9 @@ def test_persistent_auto_preserves_native_eligibility(monkeypatch, backend, excl
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("with_workspace", [False, True])
+@pytest.mark.parametrize(
+    "with_workspace,decline_cudnn", [(False, False), (True, False), (True, True)]
+)
 @pytest.mark.parametrize(
     "heads,tokens,state_dtype",
     [
@@ -572,7 +591,7 @@ def test_persistent_auto_preserves_native_eligibility(monkeypatch, backend, excl
     ],
 )
 def test_measured_routes_match_native_and_replay(
-    monkeypatch, heads, tokens, state_dtype, with_workspace
+    monkeypatch, heads, tokens, state_dtype, with_workspace, decline_cudnn
 ):
     device = torch.device("cuda")
     if get_compute_capability(device) not in ((10, 0), (10, 3)):
@@ -598,11 +617,13 @@ def test_measured_routes_match_native_and_replay(
     )
     if with_workspace:
         values["prefill_workspace"] = RecurrentKDAPrefillWorkspace(device=device)
+    if decline_cudnn:
+        monkeypatch.setattr(kda, "_try_cudnn_kda_prefill", lambda **kwargs: None)
     selected = kda._select_kda_prefill_backend(
         values["q"],
         values["initial_state"],
         values["cu_seqlens"],
-        allow_cudnn=not with_workspace,
+        allow_cudnn=not decline_cudnn,
     )
     persistent = importlib.import_module("flashinfer.kda_prefill_persistent")
     module, name = {
