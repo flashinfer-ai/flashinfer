@@ -937,9 +937,7 @@ def run_unified_moe_test(args):
             input_dtype=args.input_dtype,
             weight_dtype=weight_format or "bfloat16",
             activation_type=activation.type.name,
-            swiglu_limit=(
-                activation.limit if isinstance(activation, SwiGLU) else ""
-            ),
+            swiglu_limit=(activation.limit if isinstance(activation, SwiGLU) else ""),
             quant_variant=args.quant_variant,
             autotune=args.autotune,
             tactic=repr(tuple(tactic) if isinstance(tactic, (tuple, list)) else tactic),

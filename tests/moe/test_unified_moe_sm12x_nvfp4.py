@@ -169,9 +169,7 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
             tune=False,
             swiglu_limit=None,
         )
-        assert not (
-            torch.equal(q1, q1_unclamped) and torch.equal(sf1, sf1_unclamped)
-        )
+        assert not (torch.equal(q1, q1_unclamped) and torch.equal(sf1, sf1_unclamped))
     ref = cute_dsl_sm12x_fc2_finalize_nvfp4(
         q1,
         sf1,
