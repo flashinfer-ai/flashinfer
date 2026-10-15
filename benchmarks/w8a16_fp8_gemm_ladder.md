@@ -943,6 +943,21 @@ cuBLAS at M = 1 / 16 / 32 / 64 / 128 / 256 / 512 / 1024 / 2048 / 4096: 1.060 / 1
 attn.out tp8).  Worst cell: und.kv tp8 M = 1 at 1.72x cuBLAS, on the hand kernel.  Per-cell
 table: `hopper-mail/step2b_64x128.md`.
 
+**Step 3.1: split-K on the CUTLASS path** (`cutlass_128x128_splitk`, `cutlass_128x256_splitk`; not
+yet in `auto`).  Same structure as the Blackwell `2sm256x128_splitk`: the GEMM runs as one launch
+of a batch of `splits` GEMMs over equal K-slices (A / B batch stride = the slice length, fp32
+partials batch stride M x N in the workspace), the epilogue stores plain fp32, and our flat reduce
+applies scale and bias once.  The grouped tile scheduler now decodes the batch index.  Split count
+from the hand kernel's cost model, ported, restricted to equal slices of at least 8 k-tiles.
+
+Against the hand kernel (all splits in {2, 4, 5, 8} pinned, both tiles, plus the plain tiles;
+`s31b_*`): the CUTLASS best is within 1.02 of hand on 115 of 144 cells at M <= 512, geomean 0.936.
+It beats hand by 5-15% on every narrow-N row (same 128x128 tile and stage count, none of the hand
+kernel's split-tile staging).  It still loses 5-22% on long K at M <= 256 (mlp.down tp1 / tp2): the
+hand model picks 3 splits there and 400 / 200 k-tiles do not divide by 3, so the equal-slice batch
+cannot run it; the next step is unequal slices or a (tile, k-range) work-unit scheduler.
+Details: `hopper-mail/step3_1_splitk.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16

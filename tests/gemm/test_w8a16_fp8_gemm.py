@@ -146,6 +146,8 @@ _ALGOS_SM90 = [
     "cutlass_128x256_streamk",
     "cutlass_128x192_streamk",
     "cutlass_64x128",
+    "cutlass_128x128_splitk",
+    "cutlass_128x256_splitk",
 ]
 
 
