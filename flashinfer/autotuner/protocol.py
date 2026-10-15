@@ -21,9 +21,9 @@ _tuning_scope: ContextVar[object | None] = ContextVar("tuning_scope", default=No
 class TuningContext:
     """Shared controls and record storage for one protocol invocation.
 
-    The protocol decides when a local cache record is usable. In particular,
-    collective operations must agree on a decision before any rank returns.
-    Distributed writers must publish only on their designated cache writer.
+    The protocol decides when a cache record is usable and when to publish a
+    result. For collective operations, it also coordinates those decisions
+    across participants. The context does not perform synchronization.
     """
 
     tuner: AutoTuner
@@ -69,7 +69,7 @@ class TuningContext:
 
     @property
     def cache_identity(self) -> tuple:
-        """Local identity for prepared results; changes on store switch or reload."""
+        """Identify the store/policy, cache generation and skip state."""
         return (
             self.tuner._winner_cache_identity(),
             self.tuner._protocol_cache_generation,
@@ -104,12 +104,14 @@ class TuningResult(Generic[T]):
 class TuningProtocol(Protocol[T]):
     """Own selection, preparation, measurement and adoption of a result.
 
-    AutoTuner supplies its controls, lock and persistence. It performs no
-    local early return, input synthesis or timing around this call. A protocol
-    can retain prepared workspaces and use its own numerical and timing rules.
-    Tensor bucket mapping belongs to the protocol. Measurement policies and
-    inherited replay counts must be honored by its measurement implementation.
+    AutoTuner supplies its controls, lock and record storage for single-device
+    or distributed tuning. The protocol owns input bucketing, preparation,
+    measurement and any distributed coordination. It must implement or reject
+    the measurement policy and inherited replay counts.
+
     A skipped operation must use its built-in fallback without cache selection.
+    Publish selected records through the context; returning a TuningResult
+    only supplies the caller's value and tuning statistics.
     """
 
     def run(self, context: TuningContext) -> TuningResult[T]: ...
