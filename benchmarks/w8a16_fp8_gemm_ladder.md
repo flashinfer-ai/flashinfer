@@ -46,7 +46,8 @@ mainloop kernel runs at 57-72% tensor pipe plus a bandwidth-bound reduce kernel;
 rows are 20-50 us against a cuBLAS of 15-35 us.
 
 The plain checkpoint layout is the shipped path; `prepare_w8a16_fp8_weight` +
-`weight_prepared=True` (ldmatrix fragment loads) is opt-in and not faster on H100/H200.
+`weight_prepared=True` (ldmatrix fragment loads) was opt-in and not faster on H100/H200
+(both removed in H7 together with the hand kernel).
 Spill-free on every instantiation the dispatcher can launch (128x256 and 128x128, plain
 and prepared, persistent and split-K, bf16 and fp16; the reduce kernel).
 
@@ -984,6 +985,16 @@ the best variant; cuBLAS uses a 64 x 16-64 tile with clusters there), the 1-2 wa
 (1.08-1.19), and the big rows at 2-6 waves (1.05-1.15).  At this recipe the same pinned variant on a
 300+ us kernel moves 5-15% between runs, so single-cell differences of that size are not read as
 regressions.  M >= 44160 runs the H6 rules unchanged.  Table: `hopper-mail/step3_2_costmodel.md`.
+
+**Step 3.4: the hand-written kernel is retired.**  `auto` stopped using it in step 3.2, and the best
+CUTLASS variant was within 2% of it on 70 of the 72 Cosmos3 cells at M = 1024-4096 (the two misses,
+gen.qkv tp2 and mlp.down tp4 at M = 4096, 1.035 and 1.048, at the bench's run-to-run spread).  Deleted:
+`include/flashinfer/gemm/w8a16_fp8_gemm.cuh` (the version-37 wgmma kernel, its tile / split-K cost
+model and split-K reduce), the `prepare_w8a16_fp8_weight` / `weight_prepared` path, the `hand` algo
+(code 1 reserved, never reused), and the `K % 16` / `N % 8` fallback that routed misaligned shapes to
+the hand kernel (which then failed with a bare `invalid argument`).  Misaligned K / N are now rejected
+by the Python op with a ValueError before launch.  The rung history above (rungs 0-38, H1-H6) still
+describes that kernel; it is the record of how the CUTLASS menu got here.
 
 ## Why not the Hopper design
 

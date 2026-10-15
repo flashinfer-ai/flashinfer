@@ -17,9 +17,10 @@
 #define FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUTLASS_CUH_
 
 // W8A16 GEMM for Hopper (sm_90a) on CUTLASS's mixed-input mainloop
-// (sm90_mma_tma_gmma_rs_warpspecialized_mixed_input): version H1 of the Hopper
-// CUTLASS line, built next to the hand-written kernel of w8a16_fp8_gemm.cuh so the
-// two can be measured per shape through the Python op's `algo` argument.
+// (sm90_mma_tma_gmma_rs_warpspecialized_mixed_input).  Since version H7 this is the only
+// Hopper code path: the hand-written wgmma kernel it was built next to (version 37, the
+// former w8a16_fp8_gemm.cuh) and its prepared weight layout were retired once the CUTLASS
+// menu matched it within 2% on the Cosmos3 rows (benchmarks/w8a16_fp8_gemm_ladder.md, H7).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
@@ -32,11 +33,8 @@
 // column-major, which is out[M, N] row-major.  Per-tensor scale = epilogue alpha
 // (device pointer), bias = per-row (M' = N) broadcast in the fused epilogue.
 //
-// What this buys over the hand kernel: the activation tile height (wgmma N) is a
-// template argument, so the dispatcher gets a menu of heights (256 / 192 / 160 / 128)
-// to land the tile count near a whole number of waves, and CUTLASS's stream-K
-// scheduler is a template argument too.  Whether it also matches the hand kernel's
-// mainloop speed is what the per-shape sweep decides.
+// The tile shapes, the stream-K scheduler and our split-K are template arguments, so the
+// dispatcher (W8A16Sm90PickAlgo) picks among them per problem.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -562,11 +560,11 @@ struct W8A16Sm90Gemm {
 };
 
 // Hopper `algo` codes of the Python op (`flashinfer.gemm.w8a16_fp8_gemm(..., algo=...)`
-// on sm_90a); they must not change.  0 = the launcher's choice, 1 = the hand-written
-// kernel's own dispatcher (w8a16_fp8_gemm.cuh), 2.. = one CUTLASS variant.
+// on sm_90a); they must not change.  0 = the launcher's choice, 2.. = one CUTLASS variant.
+// 1 was the retired hand-written kernel: reserved, never reuse it.
 enum class W8A16Sm90Algo {
   kAuto = 0,
-  kHand = 1,
+  kRetiredHand = 1,  // reserved; rejected by the launcher
   kCutlass128x256 = 2,
   kCutlass128x192 = 3,
   kCutlass128x160 = 4,
@@ -582,18 +580,17 @@ enum class W8A16Sm90Algo {
 constexpr int kW8A16Sm90MaxAlgoCode = 11;
 
 inline W8A16Sm90Algo W8A16Sm90AlgoFromCode(int code) {
-  return (code >= 1 && code <= kW8A16Sm90MaxAlgoCode) ? static_cast<W8A16Sm90Algo>(code)
+  return (code >= 2 && code <= kW8A16Sm90MaxAlgoCode) ? static_cast<W8A16Sm90Algo>(code)
                                                       : W8A16Sm90Algo::kAuto;
 }
 
-// FLASHINFER_W8A16_FP8_ALGO_SM90 = "hand" | "cutlass_128x256" | "cutlass_128x192" |
+// FLASHINFER_W8A16_FP8_ALGO_SM90 = "cutlass_128x256" | "cutlass_128x192" |
 // "cutlass_128x160" | "cutlass_128x128" | "cutlass_64x256" | "cutlass_128x256_streamk" |
 // "cutlass_128x192_streamk" pins the variant; read once.
 inline W8A16Sm90Algo W8A16Sm90AlgoEnv() {
   static const W8A16Sm90Algo algo = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_ALGO_SM90");
     if (s == nullptr || *s == '\0') return W8A16Sm90Algo::kAuto;
-    if (std::strcmp(s, "hand") == 0) return W8A16Sm90Algo::kHand;
     if (std::strcmp(s, "cutlass_128x256") == 0) return W8A16Sm90Algo::kCutlass128x256;
     if (std::strcmp(s, "cutlass_128x192") == 0) return W8A16Sm90Algo::kCutlass128x192;
     if (std::strcmp(s, "cutlass_128x160") == 0) return W8A16Sm90Algo::kCutlass128x160;
@@ -737,40 +734,12 @@ inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
   return v;
 }
 
-// Version H3: the dispatcher over the CUTLASS variants and the hand kernel, fitted to the
-// locked-clock sweep of Tue 13 Oct 2026 (H100 SXM ipp2-0148 / ipp2-0069, every launch timed
-// by ncu at base clocks, 24 Cosmos3 shapes x 6 M classes, each variant / the bf16 cuBLAS
-// GEMM measured next to it) taken AFTER the scheduler's padding tiles were removed (see
-// W8A16Sm90PickSwizzle; version H2 was fitted to padded CUTLASS numbers).  Geomean kernel /
-// cuBLAS per M class:
-//
-//   M       hand   CUTLASS 128x256   this rule (measured)   per-row oracle
-//   1024    1.32   1.65              1.19                   1.16
-//   2048    1.20   1.33              1.10                   1.08
-//   4096    1.09   1.15              1.06                   1.04
-//   8192    1.04   1.06              1.02                   1.01
-//   44160   1.03   1.04              1.01                   1.01
-//   88320   1.03   1.02              1.01                   1.00
-//
-// Without the padding, the CUTLASS 128x256 mainloop and the hand kernel are the same
-// kernel to within 2% on every row with N > 512 (same tensor-pipe utilisation, same stall
-// mix under ncu); a cluster of 2 with the activation tile multicast changes nothing (+-2%).
-// What remains is wave quantisation of the 128x256 tile (units = weight tiles x activation
-// tiles over 132 SMs), so the rule reads the wave count and how full the last wave is:
-//   * one partial wave (<= 1.5): a long K (>= 4096) with at least 0.7 of a wave -> stream-K
-//     splits the tiles along K (attn.out / mlp.down / gen.qkv at M=1024-2048: 25-30% over
-//     the hand kernel's split-K); otherwise the 64x256 ping-pong tile, which puts 2x the
-//     CTAs on the machine (10-25%).
-//   * more than 1.5 waves: a last wave that is >= 0.8 full costs nothing -> 128x256; a
-//     sliver of a last wave (< 0.15, e.g. mlp.gate_up tp4 at M=4096: 6.06 waves) -> stream-K
-//     (2-10%); in between, ping-pong up to 3 waves (gen.qkv tp8 at M=8192: 2.42 waves,
-//     12%), 128x256 beyond.
-//   * N <= 512 (und.kv at TP 2-8): the hand kernel's split-K up to M=4096 (CUTLASS's
-//     stream-K has a ~40 us floor there), the 128x128 tile for under a wave, 128x256 above.
-// Worst row of the rule against the per-row oracle: und.kv tp4 M=4096 (+12%, 27 us).
-// The hand kernel is left with 8 of the 144 rows.  128x192 / 128x160 never win a row (the
-// register-sourced mainloop converts the weight once per activation tile, so narrower
-// tiles convert more per flop); they stay `algo`-only.
+// Dispatcher history: H3 / H4 fitted wave-count rules over the CUTLASS tiles and the hand
+// kernel at every M; H7 replaced them at M <= 8192 with the cost model below and retired the
+// hand kernel.  Above M = 8192 (M = 44160 / 88320) the H3-H6 rules in W8A16Sm90PickAlgo
+// still apply: 128x256 when the last wave is >= 0.8 full, stream-K for a sliver of a last
+// wave, 64x256 ping-pong at short K or under 3 waves, 128x192 for N <= 512, all with the
+// padding-free L2 grouping (benchmarks/w8a16_fp8_gemm_ladder.md, H3-H6).
 // Split-K slicing: a whole number of 64-deep k-tiles per slice, all slices equal, at least
 // 8 k-tiles each, at most 8 slices.  FLASHINFER_W8A16_FP8_SM90_SPLITS pins a count (read
 // once).  The count itself comes from the cost model (W8A16Sm90SplitUs).
@@ -928,7 +897,6 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   if (forced != W8A16Sm90Algo::kAuto) return forced;
   const W8A16Sm90Algo env = W8A16Sm90AlgoEnv();
   if (env != W8A16Sm90Algo::kAuto) return env;
-  if (K % 16 != 0 || N % 8 != 0) return W8A16Sm90Algo::kHand;  // CUTLASS alignment
   const long long units = 1LL * ((N + 127) / 128) * ((M + 255) / 256);
   const double waves = static_cast<double>(units) / std::max(num_sms, 1);
   const double frac = waves - std::floor(waves);
@@ -960,8 +928,7 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   return W8A16Sm90Algo::kCutlass128x256;
 }
 
-// Workspace bytes of a CUTLASS variant (0 for the hand kernel: its own function sizes
-// its split-K partials).
+// Workspace bytes of a CUTLASS variant.
 template <typename T>
 size_t W8A16Fp8GemmSm90CutlassWorkspaceBytes(W8A16Sm90Algo algo, int M, int N, int K, int device_id,
                                              int num_sms) {

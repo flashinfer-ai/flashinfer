@@ -350,15 +350,13 @@ def make_kernel(
     w_fp8: torch.Tensor,
     scale: torch.Tensor,
     bias,
-    prepared: bool = False,
     algo: str | None = None,
     out: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor] | None:
-    """FlashInfer kernel; ``prepared`` uses the opt-in prepared weight layout
-    (the one-time ``prepare_w8a16_fp8_weight`` copy is done here, untimed);
-    ``algo`` pins a kernel variant (``--algo``; Hopper or Blackwell names)."""
+    """FlashInfer kernel; ``algo`` pins a kernel variant (``--algo``; Hopper or
+    Blackwell names)."""
     try:
-        from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
+        from flashinfer.gemm import w8a16_fp8_gemm
     except ImportError as e:
         print(f"# WARNING: flashinfer.gemm import failed: {e!r}", file=sys.stderr)
         return None
@@ -366,7 +364,7 @@ def make_kernel(
         out = torch.empty(
             act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
         )
-    w_use = prepare_w8a16_fp8_weight(w_fp8) if prepared else w_fp8
+    w_use = w_fp8
     # "<algo>@g<n>": Hopper L2 group size n for this column (FLASHINFER_W8A16_FP8_SM90_GROUP,
     # read per call; the graph capture bakes it in).
     # The launcher caches the variable as absent if it is unset at its first read, so it is
@@ -388,7 +386,6 @@ def make_kernel(
                 scale,
                 bias=bias,
                 out=out,
-                weight_prepared=prepared,
                 algo=algo,
             )
         finally:
@@ -457,17 +454,13 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     if "cublas" in args.impls:
         impls["cublas"] = make_cublas(act, w_deq, bias)
     kernel_out: torch.Tensor | None = None
-    for name, prepared, algo in _kernel_variants(args):
-        if prepared and torch.cuda.get_device_capability()[0] != 9:
-            continue  # prepared weight layout is Hopper-only
+    for name, algo in _kernel_variants(args):
         # One output buffer shared by all kernel columns (each column's error is computed
         # right after its own call, before the next one overwrites it): 16 columns of a
         # 4.5 GB output do not fit in 80 GB.
         if kernel_out is None:
             kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
-        fn = make_kernel(
-            act, w_fp8, scale, bias, prepared=prepared, algo=algo, out=kernel_out
-        )
+        fn = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
         if fn is None:
             print(
                 "# WARNING: flashinfer.gemm.w8a16_fp8_gemm not available; "
@@ -548,27 +541,23 @@ def _ratio(num: float | None, den: float | None) -> str:
     return f"{r:7.3f}" if r < 0.1 else f"{r:7.2f}"
 
 
-def _kernel_variants(args) -> list[tuple[str, bool, str | None]]:
-    """(column name, prepared, algo) for every kernel column requested.  With
+def _kernel_variants(args) -> list[tuple[str, str | None]]:
+    """(column name, algo) for every kernel column requested.  With
     ``--algo a b ...`` the ``kernel`` column becomes one ``kernel:<algo>`` column per
     algo, all measured back to back on the same tensors (the fair way to compare
     variants under free-running clocks)."""
-    out: list[tuple[str, bool, str | None]] = []
+    out: list[tuple[str, str | None]] = []
     if "kernel" in args.impls:
         if args.algo:
-            out += [
-                (f"kernel:{a}", False, None if a == "auto" else a) for a in args.algo
-            ]
+            out += [(f"kernel:{a}", None if a == "auto" else a) for a in args.algo]
         else:
-            out.append(("kernel", False, None))
-    if "kernel_prep" in args.impls:
-        out.append(("kernel_prep", True, None))
+            out.append(("kernel", None))
     return out
 
 
 def _impl_cols(args) -> list[str]:
     cols = [i for i in ("cast", "cublas") if i in args.impls]
-    return cols + [name for name, _, _ in _kernel_variants(args)]
+    return cols + [name for name, _ in _kernel_variants(args)]
 
 
 def table_header(args) -> str:
@@ -611,7 +600,7 @@ def print_table(rows: list[Row], args) -> None:
 
 def write_csv(rows: list[Row], path: str, args) -> None:
     variants = [
-        name for name, _, _ in _kernel_variants(args) if name.startswith("kernel:")
+        name for name, _ in _kernel_variants(args) if name.startswith("kernel:")
     ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -699,8 +688,8 @@ def parse_args(argv=None):
     p.add_argument(
         "--impls",
         nargs="+",
-        default=["cast", "cublas", "kernel", "kernel_prep"],
-        choices=["cast", "cublas", "kernel", "kernel_prep"],
+        default=["cast", "cublas", "kernel"],
+        choices=["cast", "cublas", "kernel"],
     )
     p.add_argument("--iters", type=int, default=50)
     p.add_argument(
@@ -731,7 +720,7 @@ def parse_args(argv=None):
         nargs="+",
         default=None,
         help="one kernel:<algo> column per listed variant, measured back to back "
-        "(Blackwell: 2sm256x128 ...; Hopper: hand, cutlass_128x256, cutlass_128x192 ...); "
+        "(Blackwell: 2sm256x128 ...; Hopper: cutlass_128x256, cutlass_128x192 ...); "
         "default: a single kernel column with the launcher's model",
     )
     p.add_argument("--csv", type=str, default=None)

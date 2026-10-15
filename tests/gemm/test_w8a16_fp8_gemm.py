@@ -18,12 +18,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.gemm import prepare_w8a16_fp8_weight, w8a16_fp8_gemm
+from flashinfer.gemm import w8a16_fp8_gemm
 from flashinfer.utils import get_compute_capability
-
-
-def _is_hopper() -> bool:
-    return get_compute_capability(torch.device("cuda"))[0] == 9
 
 
 def _quantize(w32: torch.Tensor):
@@ -43,10 +39,7 @@ def _cast_copy_reference(act, w_fp8, scale, bias):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("bias", [False, True])
-@pytest.mark.parametrize("prepared", [False, True])
-def test_w8a16_fp8_gemm(m, n, k, dtype, bias, prepared):
-    if prepared and not _is_hopper():
-        pytest.skip("prepared weight layout is Hopper-only")
+def test_w8a16_fp8_gemm(m, n, k, dtype, bias):
     torch.manual_seed(0)
     dev = torch.device("cuda")
     act = torch.randn(m, k, device=dev, dtype=torch.float32).to(dtype)
@@ -54,12 +47,7 @@ def test_w8a16_fp8_gemm(m, n, k, dtype, bias, prepared):
     w_fp8, scale = _quantize(w32)
     b = torch.randn(n, device=dev, dtype=torch.float32).to(dtype) if bias else None
 
-    if prepared:
-        out = w8a16_fp8_gemm(
-            act, prepare_w8a16_fp8_weight(w_fp8), scale, bias=b, weight_prepared=True
-        )
-    else:
-        out = w8a16_fp8_gemm(act, w_fp8, scale, bias=b)
+    out = w8a16_fp8_gemm(act, w_fp8, scale, bias=b)
     assert out.shape == (m, n)
     assert out.dtype == dtype
 
@@ -127,6 +115,25 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
         w8a16_fp8_gemm(act[:, :32], w_fp8, scale)
 
 
+@pytest.mark.parametrize("n,k", [(1024, 5128), (1028, 5120)])
+def test_w8a16_fp8_gemm_rejects_misaligned(n, k):
+    """K % 16 and N % 8 are rejected upfront with a clear message (no silent fallback)."""
+    dev = torch.device("cuda")
+    act = torch.randn(64, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev))
+    with pytest.raises(ValueError, match="multiple of"):
+        w8a16_fp8_gemm(act, w_fp8, scale)
+
+
+def test_w8a16_fp8_gemm_rejects_retired_hand_algo():
+    """The hand-written Hopper kernel was retired in version H7; its name is gone."""
+    dev = torch.device("cuda")
+    act = torch.randn(16, 256, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(128, 256, device=dev))
+    with pytest.raises(ValueError):
+        w8a16_fp8_gemm(act, w_fp8, scale, algo="hand")
+
+
 _ALGOS_SM100 = [
     "2sm256x128",
     "2sm256x192",
@@ -137,7 +144,6 @@ _ALGOS_SM100 = [
     "2sm256x160",
 ]
 _ALGOS_SM90 = [
-    "hand",
     "cutlass_128x256",
     "cutlass_128x192",
     "cutlass_128x160",
@@ -152,7 +158,9 @@ _ALGOS_SM90 = [
 
 
 @pytest.mark.parametrize("algo", _ALGOS_SM100 + _ALGOS_SM90)
-@pytest.mark.parametrize("m,n,k", [(1024, 1024, 5120), (200, 1024, 5120), (4096, 128, 5120)])
+@pytest.mark.parametrize(
+    "m,n,k", [(1024, 1024, 5120), (200, 1024, 5120), (4096, 128, 5120)]
+)
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_w8a16_fp8_gemm_algo(algo, m, n, k, bias, dtype):
@@ -173,9 +181,15 @@ def test_w8a16_fp8_gemm_algo(algo, m, n, k, bias, dtype):
     ref32 = act.float() @ (w_fp8.float() * scale).T
     if b is not None:
         ref32 = ref32 + b.float()
-    cast_err = (_cast_copy_reference(act, w_fp8, scale, b).float() - ref32).abs().max().item()
+    cast_err = (
+        (_cast_copy_reference(act, w_fp8, scale, b).float() - ref32).abs().max().item()
+    )
     err = (out.float() - ref32).abs().max().item()
     assert torch.isfinite(out.float()).all()
-    assert err <= max(2.0 * cast_err, 2e-3 * ref32.abs().max().item()), (algo, err, cast_err)
+    assert err <= max(2.0 * cast_err, 2e-3 * ref32.abs().max().item()), (
+        algo,
+        err,
+        cast_err,
+    )
     with pytest.raises(ValueError):
         w8a16_fp8_gemm(act, w_fp8, scale, algo="nope")

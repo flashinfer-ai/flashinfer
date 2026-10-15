@@ -16,8 +16,8 @@
 #include "tvm_ffi_utils.h"
 
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
-                    ffi::Optional<TensorView> bias, bool weight_prepared,
-                    ffi::Optional<TensorView> workspace, int64_t algo);
+                    ffi::Optional<TensorView> bias, ffi::Optional<TensorView> workspace,
+                    int64_t algo);
 int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t device_id,
                                        int64_t algo);
 
