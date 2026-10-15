@@ -67,10 +67,11 @@ DECLARE_COMBINE_TOP_K(22)
 
 // Exact 16-byte BF16 combine for TOP_K in {1, 2, 4}: same argument list as the
 // generic per-TOP_K combine, same pinned FP32 reduction tree per output element.
-#define DECLARE_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                                     \
-  extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K( \
-      uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,                \
-      unsigned long long, int, int, int, int, int, int, int, bool, bool);
+#define DECLARE_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                          \
+  extern "C" __global__ void                                                              \
+      kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K(             \
+          uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long, \
+          unsigned long long, int, int, int, int, int, int, int, bool, bool);
 
 DECLARE_COMBINE_BF16_VECTOR_TOP_K(1)
 DECLARE_COMBINE_BF16_VECTOR_TOP_K(2)
@@ -326,8 +327,7 @@ void preloadFusedQuantizedCombineKernel(int top_k) {
     PRELOAD_COMBINE_QUANTIZED_TOP_K(18);
     PRELOAD_COMBINE_QUANTIZED_TOP_K(22);
     default:
-      FLASHINFER_CHECK(false, "unsupported top_k for the fused quantized moe_a2a_combine: ",
-                       top_k);
+      FLASHINFER_CHECK(false, "unsupported top_k for the fused quantized moe_a2a_combine: ", top_k);
   }
 #undef PRELOAD_COMBINE_QUANTIZED_TOP_K
 }
@@ -531,8 +531,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
       LAUNCH_COMBINE_QUANTIZED_TOP_K(18);
       LAUNCH_COMBINE_QUANTIZED_TOP_K(22);
       default:
-        FLASHINFER_CHECK(false, "unsupported top_k for the fused quantized moe_a2a_combine: ",
-                         params.top_k);
+        FLASHINFER_CHECK(
+            false, "unsupported top_k for the fused quantized moe_a2a_combine: ", params.top_k);
     }
 #undef LAUNCH_COMBINE_QUANTIZED_TOP_K
     return;
@@ -570,26 +570,26 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
         dtypeCode(params.dtype), output_dtype_code, params.ep_rank, params.use_low_precision,
         params.enable_pdl);
   } else if (useBf16VectorCombine(params)) {
-#define LAUNCH_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                                 \
-  case TOP_K:                                                                                   \
-    launchWithPdlWhenEnabled(                                                                   \
-        "mnnvl_moe_alltoall_combine_bf16_vector_top_k_" #TOP_K, params.enable_pdl,              \
-        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K, grid,           \
+#define LAUNCH_COMBINE_BF16_VECTOR_TOP_K(TOP_K)                                                   \
+  case TOP_K:                                                                                     \
+    launchWithPdlWhenEnabled(                                                                     \
+        "mnnvl_moe_alltoall_combine_bf16_vector_top_k_" #TOP_K, params.enable_pdl,                \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_##TOP_K, grid,             \
         kCombineThreads, 0, params.stream, params.workspace, static_cast<uint8_t*>(accumulation), \
-        params.workspace_stride_bytes, byteOffset(params.topk_target_ranks, rank_workspace),    \
-        byteOffset(params.topk_send_indices, rank_workspace),                                   \
-        byteOffset(params.recv_buffers[params.ep_rank], rank_workspace),                        \
-        params.max_tokens_per_rank, params.local_num_tokens, params.elements_per_token,         \
-        dtypeBytes(params.dtype), dtypeCode(params.dtype), output_dtype_code, params.ep_rank,   \
-        params.use_low_precision, params.enable_pdl);                                           \
+        params.workspace_stride_bytes, byteOffset(params.topk_target_ranks, rank_workspace),      \
+        byteOffset(params.topk_send_indices, rank_workspace),                                     \
+        byteOffset(params.recv_buffers[params.ep_rank], rank_workspace),                          \
+        params.max_tokens_per_rank, params.local_num_tokens, params.elements_per_token,           \
+        dtypeBytes(params.dtype), dtypeCode(params.dtype), output_dtype_code, params.ep_rank,     \
+        params.use_low_precision, params.enable_pdl);                                             \
     break
     switch (params.top_k) {
       LAUNCH_COMBINE_BF16_VECTOR_TOP_K(1);
       LAUNCH_COMBINE_BF16_VECTOR_TOP_K(2);
       LAUNCH_COMBINE_BF16_VECTOR_TOP_K(4);
       default:
-        FLASHINFER_CHECK(false, "unsupported top_k for the BF16 vector moe_a2a_combine: ",
-                         params.top_k);
+        FLASHINFER_CHECK(false,
+                         "unsupported top_k for the BF16 vector moe_a2a_combine: ", params.top_k);
     }
 #undef LAUNCH_COMBINE_BF16_VECTOR_TOP_K
   } else {
@@ -632,14 +632,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   int const quant_grid = params.local_num_tokens * layout.blocks_per_row;
   auto* output_bytes = static_cast<uint8_t*>(params.output_data);
   auto* scale_bytes = static_cast<uint8_t*>(params.output_scales);
-  launchWithPdlWhenEnabled(
-      "mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
-      kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid, kQuantThreads, 0,
-      params.stream, static_cast<uint8_t*>(params.accumulation_data), output_bytes, output_bytes,
-      scale_bytes, scale_bytes, params.elements_per_token, dtypeBytes(params.dtype),
-      dtypeCode(params.dtype), layout.quant_mode, static_cast<int>(params.swizzle_mode),
-      params.output_scalar_scale, layout.blocks_per_row, layout.padded_scale_cols,
-      params.enable_pdl);
+  launchWithPdlWhenEnabled("mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
+                           kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid,
+                           kQuantThreads, 0, params.stream,
+                           static_cast<uint8_t*>(params.accumulation_data), output_bytes,
+                           output_bytes, scale_bytes, scale_bytes, params.elements_per_token,
+                           dtypeBytes(params.dtype), dtypeCode(params.dtype), layout.quant_mode,
+                           static_cast<int>(params.swizzle_mode), params.output_scalar_scale,
+                           layout.blocks_per_row, layout.padded_scale_cols, params.enable_pdl);
 }
 
 bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params) {
