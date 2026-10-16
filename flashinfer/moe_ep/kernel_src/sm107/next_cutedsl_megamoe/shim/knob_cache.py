@@ -26,6 +26,10 @@ import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 _CACHE_VERSION = 1
+_BACKEND_REVISIONS = {
+    "inference": "sm107-block-scaled-1667b47a-runtime-options-v1",
+    "genphase": "sm107-block-scaled-1667b47a-runtime-options-v2",
+}
 _KEY_FIELDS = (
     "backend_revision",
     "kernel_variant",
@@ -129,12 +133,12 @@ def _matching_entries(
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Return the cached knob dict for this session key, or ``None`` on miss."""
+    """Find compatible tuning entries for this session."""
     path = _cache_path()
     if path is None:
         return []
     key = dict(
-        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        backend_revision=_BACKEND_REVISIONS[kernel_variant],
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
@@ -151,16 +155,46 @@ def _matching_entries(
         topk=topk,
         combine_dtype=combine_dtype,
     )
+    revisions: Tuple[str, ...] = (_BACKEND_REVISIONS[kernel_variant],)
+    if kernel_variant == "genphase":
+        # v2 changed schedule admission; grouped v1 configurations remain valid.
+        revisions += (_BACKEND_REVISIONS["inference"],)
     matches = [
         e
         for e in _load_entries(path)
-        if all(e.get(f) == key[f] for f in _KEY_FIELDS)
+        if e.get("backend_revision") in revisions
+        and all(e.get(f) == key[f] for f in _KEY_FIELDS if f != "backend_revision")
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
         and (
             allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
         )
     ]
+    if kernel_variant == "genphase":
+        compatible = []
+        for entry in matches:
+            schedule = entry["knobs"].get("schedule_policy", ("grouped", None))
+            if (
+                isinstance(schedule, (list, tuple))
+                and len(schedule) == 2
+                and schedule[0] == "grouped"
+            ):
+                compatible.append(entry)
+        rejected = len(matches) - len(compatible)
+        if rejected:
+            warnings.warn(
+                f"[moe_ep-knob-cache] ignoring {rejected} GenPhase cache entries "
+                f"with unsupported schedule_policy in {path!r}; GenPhase requires "
+                "grouped scheduling because phase_interleave can stall. "
+                "Retune the affected profiles.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        # Prefer a retuned entry when both revisions cover the same bucket.
+        matches = sorted(
+            compatible,
+            key=lambda e: e["backend_revision"] != _BACKEND_REVISIONS["genphase"],
+        )
     return matches
 
 
@@ -263,7 +297,7 @@ def record_knobs(
     if path is None:
         return None
     entry = dict(
-        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        backend_revision=_BACKEND_REVISIONS[kernel_variant],
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,

@@ -30,12 +30,12 @@ def test_genphase_repeated_launches(monkeypatch, kind, early, ikr):
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("capacity", [1, 17, 65, 129])
-@pytest.mark.parametrize("tile_n", [64, 128])
+@pytest.mark.parametrize("tile_n", [64, 128, 256])
 @pytest.mark.parametrize(
     "schedule, work_id",
     [
         (("grouped", None), "grid_stride"),
-        (("phase_interleave", None), "atomic_counter"),
+        (("grouped", None), "atomic_counter"),
     ],
 )
 def test_genphase_live_rows_and_sf_tile_boundaries(

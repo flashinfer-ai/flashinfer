@@ -387,14 +387,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(
                     "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
                 )
-            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
-                # EP1 phase-interleave coverage does not establish multirank
-                # liveness: an EP2 dense/replay case stalls with this geometry.
-                # Reject before allocation or compilation; autotune applies
-                # this same config validation through is_valid_sm107.
+            if mode == "phase_interleave":
+                # This schedule can stall even at EP1. Reject it before
+                # allocation or compilation, including during autotuning.
                 raise ValueError(
-                    "GenPhase N64 with world_size > 1 requires grouped scheduling; "
-                    "multirank phase_interleave is not qualified."
+                    "GenPhase requires grouped scheduling; phase_interleave can stall."
                 )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
@@ -563,6 +560,7 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
+        self._routing_checks: dict[tuple, Any] = {}
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
 
@@ -782,6 +780,7 @@ class Sm107BlockScaledSymmBuffer:
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None
+        self._routing_checks.clear()
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
@@ -791,6 +790,10 @@ class Sm107BlockScaledSymmBuffer:
             comm.free_sym_tensor(self.output_activation)
         self.output_activation = None
         self.local_workspace = None
+        if self.config.quant_kind == "nvfp4":
+            from ....sm100.cutedsl_megamoe.shim.quant_stage import forget_staged_tokens
+
+            forget_staged_tokens(self.topk_idx)
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True

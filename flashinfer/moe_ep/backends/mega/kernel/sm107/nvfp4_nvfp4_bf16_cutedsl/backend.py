@@ -229,7 +229,10 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         validate_routing_values(
-            t.topk_ids, t.topk_weights, workspace.config.num_total_experts
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
         )
         for name, value in self._scalar_values(t).items():
             target = getattr(workspace, name)

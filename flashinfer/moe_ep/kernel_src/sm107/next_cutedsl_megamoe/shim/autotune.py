@@ -67,7 +67,8 @@ def sm107_candidates(
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
 
-    Default GenPhase candidates use cluster (4, 1) and require FC2 bulk stores.
+    Default GenPhase candidates use grouped scheduling, cluster (4, 1),
+    and FC2 bulk stores.
     MXFP8 E4M3 and mixed FP4/FP8 additionally include the N64 decode tile,
     using one FC2 stage and deterministic separate top-k reduction.
 
@@ -76,16 +77,13 @@ def sm107_candidates(
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
     tile_k = 256 if quant_kind == "nvfp4" else 128
-    launches = (
+    launches = [
         # (cluster, fallback, schedule_policy, work_id_mode)
         ((2, 1), None, ("grouped", None), "grid_stride"),
         ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
-    )
+    ]
     if kernel_variant == "genphase":
-        launches = (
-            ((4, 1), None, ("grouped", None), "grid_stride"),
-            ((4, 1), None, ("phase_interleave", None), "atomic_counter"),
-        )
+        launches = [((4, 1), None, ("grouped", None), "grid_stride")]
     elif kernel_variant != "inference":
         raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
     out: List[Dict[str, Any]] = []
@@ -122,7 +120,6 @@ def sm107_candidates(
         for schedule, work_id in (
             (("grouped", None), "grid_stride"),
             (("grouped", None), "atomic_counter"),
-            (("phase_interleave", None), "atomic_counter"),
         ):
             out.append(
                 {
@@ -145,11 +142,20 @@ def sm107_candidates(
 def sm107_schedule_candidates(
     base: Dict[str, Any], *, kernel_variant: str = "inference"
 ) -> List[Dict[str, Any]]:
-    """Expand a base knob dict into the skew-sensitive schedule grid
-    (phase-interleave hint x token-in flag batch)."""
+    """Expand a base knob dict into the supported schedule grid."""
+    if kernel_variant == "genphase":
+        return [
+            {
+                **base,
+                "schedule_policy": ("grouped", None),
+                "work_id_mode": work_id,
+                "token_in_flag_batch": 1,
+            }
+            for work_id in ("grid_stride", "atomic_counter")
+        ]
     out: List[Dict[str, Any]] = []
     for hint in (None, 3, 4, 6):
-        for tif in (1,) if kernel_variant == "genphase" else (1, 4):
+        for tif in (1, 4):
             out.append(
                 {
                     **base,

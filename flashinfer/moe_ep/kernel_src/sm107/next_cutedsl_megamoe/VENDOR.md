@@ -65,11 +65,9 @@ with `kernel_variant="genphase"`. It requires `fc2_use_bulk=True`, at most
 inherited tile-N 128/256 configurations use `(4, 1)` clusters. The local
 `(256, 64, 128)` decode tile additionally admits MXFP8 E4M3 with `(2, 1)` or
 `(4, 1)` clusters, and MXFP4 weights/MXFP8 E4M3 activations with `(4, 1)`
-clusters. At EP greater than one, the N64 path requires grouped scheduling:
-an N64 phase-interleave EP2 dense/replay case stalls despite EP1 and EP4
-coverage. The shim rejects that combination before allocation or compilation,
-and `is_valid_sm107` excludes it from the geometry-specific tuning set. EP1
-phase-interleave and the inherited N128/N256 admission remain unchanged.
+clusters. GenPhase requires grouped scheduling at every tile and EP size:
+phase-interleave can stall, including at EP1. The shim rejects that schedule
+before allocation or compilation, and `is_valid_sm107` excludes it from tuning.
 Other N64 combinations remain rejected. Combine remains BF16.
 Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
 SiTU requires both beta parameters, matching the exported kernel.
@@ -95,7 +93,11 @@ the older drop. At FlashInfer `0f710df8`, this export passed 187 host/CUDA check
 with no skips. See the
 [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
 for coverage and the separate reference-decoder regression.
-Tuning-cache entries use revision `sm107-block-scaled-1667b47a-runtime-options-v1`.
+Standard inference tuning entries retain revision
+`sm107-block-scaled-1667b47a-runtime-options-v1`. GenPhase writes
+`sm107-block-scaled-1667b47a-runtime-options-v2` and also accepts compatible
+grouped entries from v1. Unsupported GenPhase schedules are skipped with a
+warning in either revision.
 The cache identity includes the kernel variant and combine format, along with
 activation, beta parameters, and clamp settings.
 

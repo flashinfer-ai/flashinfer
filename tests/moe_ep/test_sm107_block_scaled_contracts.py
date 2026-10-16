@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,6 +27,7 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
 from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     block_scaled,
     comm,
+    knob_cache,
 )
 
 
@@ -166,6 +168,7 @@ def _workspace():
     ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._routing_checks = {}
     ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})
     ws.topk_idx = torch.tensor([[0, 1], [2, -1], [-1, -1], [-1, -1]])
     ws._pre_reduced_activation = torch.full((4, 2, 128), 7.0)
@@ -274,13 +277,159 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
         is None
     )
     data = json.loads(path.read_text())
-    # The new upstream drop must not reuse tuning results from the old kernel.
-    data["entries"][0]["backend_revision"] = "sm107-block-scaled-v2"
-    path.write_text(json.dumps(data))
-    assert lookup_knobs(**key, allow_nondeterministic=True) is None
+    for revision in (
+        "sm107-block-scaled-v2",
+        "sm107-block-scaled-1667b47a-runtime-options-v2",
+    ):
+        data["entries"][0]["backend_revision"] = revision
+        path.write_text(json.dumps(data))
+        assert lookup_knobs(**key, allow_nondeterministic=True) is None
     del data["entries"][0]["backend_revision"]
     path.write_text(json.dumps(data))
     assert lookup_knobs(**key, allow_nondeterministic=True) is None
+
+
+@pytest.mark.parametrize("family", ["inference", "genphase"])
+def test_cache_revision_is_specific_to_kernel_variant(tmp_path, monkeypatch, family):
+    path = tmp_path / "knobs.json"
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
+    key = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=128,
+        intermediate=64,
+        num_experts=8,
+        topk=2,
+        max_tokens=128,
+        device="rubin-test",
+        kernel_variant=family,
+    )
+    knobs = {"schedule_policy": ("grouped", None)}
+    record_knobs(knobs, **key)
+    data = json.loads(path.read_text())
+    revision = "v2" if family == "genphase" else "v1"
+    assert data["entries"][0]["backend_revision"] == (
+        "sm107-block-scaled-1667b47a-runtime-options-" + revision
+    )
+    assert lookup_knobs(**key) == knobs
+
+    data["entries"][0]["backend_revision"] = (
+        "sm107-block-scaled-1667b47a-runtime-options-v1"
+    )
+    path.write_text(json.dumps(data))
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        assert lookup_knobs(**key) == knobs
+    assert not emitted
+    data["entries"][0]["knobs"] = {"schedule_policy": ["phase_interleave", None]}
+    path.write_text(json.dumps(data))
+    expected = {"schedule_policy": ("phase_interleave", None)}
+    if family == "inference":
+        assert lookup_knobs(**key) == expected
+    else:
+        with pytest.warns(RuntimeWarning, match="phase_interleave can stall"):
+            assert lookup_knobs(**key) is None
+
+
+@pytest.fixture
+def genphase_cache(tmp_path, monkeypatch):
+    path = tmp_path / "knobs.json"
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
+    key = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=128,
+        intermediate=64,
+        num_experts=8,
+        topk=2,
+        max_tokens=128,
+        device="rubin-test",
+        kernel_variant="genphase",
+    )
+    return path, key
+
+
+@pytest.mark.parametrize("revision", ["v1", "v2"])
+@pytest.mark.parametrize(
+    "schedule",
+    [None, ["grouped", None], ["phase_interleave", None], ["phase_interleave", 3]],
+)
+def test_genphase_cache_checks_schedule_in_both_revisions(
+    genphase_cache, revision, schedule
+):
+    path, key = genphase_cache
+    knobs = {} if schedule is None else {"schedule_policy": schedule}
+    record_knobs(knobs, **key)
+    data = json.loads(path.read_text())
+    data["entries"][0]["backend_revision"] = (
+        "sm107-block-scaled-1667b47a-runtime-options-" + revision
+    )
+    path.write_text(json.dumps(data))
+    before = path.read_bytes()
+    if schedule is None or schedule[0] == "grouped":
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always")
+            expected = {} if schedule is None else {"schedule_policy": tuple(schedule)}
+            assert lookup_knobs(**key) == expected
+            assert knob_cache.live_token_buckets(**key) == [128]
+        assert not emitted
+    else:
+        with pytest.warns(RuntimeWarning, match="ignoring 1 GenPhase cache entries"):
+            assert lookup_knobs(**key) is None
+        with pytest.warns(RuntimeWarning, match="Retune the affected profiles"):
+            assert knob_cache.live_token_buckets(**key) == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_genphase_cache_preserves_buckets_and_prefers_current_revision(
+    genphase_cache, reverse
+):
+    path, key = genphase_cache
+    record_knobs({"schedule_policy": ("grouped", None)}, live_tokens=32, **key)
+    entry = json.loads(path.read_text())["entries"][0]
+    legacy = dict(
+        entry,
+        backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
+        knobs={"schedule_policy": ["grouped", None], "work_id_mode": "grid_stride"},
+    )
+    current = dict(
+        entry,
+        knobs={"schedule_policy": ["grouped", None], "work_id_mode": "atomic_counter"},
+    )
+    rejected = dict(
+        entry, live_tokens=64, knobs={"schedule_policy": ["phase_interleave", None]}
+    )
+    larger = dict(legacy, live_tokens=128)
+    unrelated = dict(rejected, hidden=256)
+    entries = [legacy, current, rejected, larger, unrelated]
+    if reverse:
+        entries.reverse()
+    path.write_text(json.dumps({"version": 1, "entries": entries}))
+    with pytest.warns(RuntimeWarning, match="ignoring 1 GenPhase cache entries"):
+        assert lookup_knobs(**key, live_tokens=8)["work_id_mode"] == "atomic_counter"
+    with pytest.warns(RuntimeWarning, match="ignoring 1 GenPhase cache entries"):
+        assert lookup_knobs(**key, live_tokens=64)["work_id_mode"] == "grid_stride"
+    with pytest.warns(RuntimeWarning, match="ignoring 1 GenPhase cache entries"):
+        assert knob_cache.live_token_buckets(**key) == [32, 128]
+
+
+def test_genphase_cache_does_not_accept_unknown_revisions_or_warn_for_other_keys(
+    genphase_cache,
+):
+    path, key = genphase_cache
+    record_knobs({"schedule_policy": ("grouped", None)}, **key)
+    entry = json.loads(path.read_text())["entries"][0]
+    entries = [
+        dict(entry, backend_revision="unknown"),
+        dict(entry, hidden=256, knobs={"schedule_policy": ["phase_interleave", None]}),
+    ]
+    path.write_text(json.dumps({"version": 1, "entries": entries}))
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        assert lookup_knobs(**key) is None
+        assert knob_cache.live_token_buckets(**key) == []
+    assert not emitted
 
 
 def test_sm100_and_sm107_cache_entries_cannot_collide(tmp_path, monkeypatch):
