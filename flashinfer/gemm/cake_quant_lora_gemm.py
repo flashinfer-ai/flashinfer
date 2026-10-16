@@ -16,17 +16,34 @@
 
 ``out = alpha_base * (dequant(a) @ dequant(b)^T) + lora_scale * (d @ lora_b^T) [+ bias]``
 
-The base weights stay quantized (NVFP4 or FP8), the LoRA factors are consumed as
-BF16 at their original scale, ``alpha_base`` and ``lora_scale`` are independent
-fp32 device scalars, the accumulation is fp32 and the output is rounded once to
-bf16.  Swapping the adapter is swapping pointers: no weight preparation, no
-folding of ``lora_scale`` into the operands.  ``lora_scale`` must be a normal float
-or ±0 (a one-element fp32 device tensor; ``None`` disables the adapter); denormal
-scales are unsupported.
+The base weights stay quantized (NVFP4 or FP8), the accumulation is fp32 and the
+output is rounded once to bf16.  Two adapter paths exist; the call's API form
+selects one (never a device read):
+
+* **Raw path** (``lora_b`` + ``lora_scale``; both operators).  The LoRA factors
+  are consumed as BF16 at their original scale, ``alpha_base`` and ``lora_scale``
+  are independent fp32 device scalars and nothing is folded into the operands.
+  Swapping the adapter is swapping pointers: no weight preparation
+  (0-preparation switching).  ``lora_scale`` must be a normal float or ±0 (a
+  one-element fp32 device tensor; ``None`` disables the adapter); denormal
+  scales are unsupported.  This path is unchanged by the prepared path, bitwise.
+* **Prepared path** (``lora_adapter=`` of :func:`mm_nvfp4_lora`; NVFP4 only).
+  :func:`prepare_nvfp4_lora_adapter` folds the adapter ONCE at the adapter
+  switch, ``b_folded = bf16(lora_b * lora_scale / alpha)``, and the call consumes
+  ``b_folded`` with the base product accumulated first and ``alpha`` applied once
+  in the fp32 epilogue -- SVDQuant-equivalent numerics (``lora_b`` is re-rounded
+  once to bf16; the fold is bitwise the ``l1`` fold of
+  :func:`~flashinfer.mm_nvfp4_svdquant`).  Snapshot semantics: the adapter pins
+  its source tensors and a call raises :class:`StaleAdapterError` when one moved
+  without a re-prepare; ``prepare_nvfp4_lora_adapter(..., out=adapter)`` refolds in
+  place without a host read and is the adapter-switch protocol inside a captured
+  CUDA graph.  The relaxation is opt-in (Cake user decisions of 2026-10-15:
+  "允许放宽约束 1，分阶段做" and "A 认可通过，启动第二阶段").
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Literal, Optional
 
@@ -54,6 +71,15 @@ FAMILY_FP8 = "fp8"
 #: Blackwell, runtime scalar on Hopper).  Rank 96 compiles in Cake but is not
 #: delivered; any other rank raises ``ValueError``.
 SUPPORTED_RANKS = (32, 64, 128)
+#: Adapter states of one call, known from its API form alone (never a device read):
+#: ``"none"`` (no adapter), ``"raw"`` (``lora_b`` + ``lora_scale``) and ``"prepared"``
+#: (``lora_adapter=``).  Every ``PROGRAMS`` record lists the states it serves
+#: (``adapter_states``): the raw-path programs serve ``"none"`` and ``"raw"`` (the
+#: adapter-off call is the same program's ``has_lora == 0`` path), the prepared-path
+#: program serves ``"prepared"`` only.
+ADAPTER_STATES = ("none", "raw", "prepared")
+#: The prepared-path raster rule this host ports (``dispatch[arch]["prepared"]["raster_rule"]``).
+_PREPARED_RASTER_RULE = "k_band_then_n256_bytes_model"
 _NO_ADAPTER_RANK = SUPPORTED_RANKS[0]
 _SF_BLOCK = 16
 _SF_SWIZZLE_ROWS = 128
@@ -64,13 +90,29 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-def _templates_for(family: str, target: CakeQuantLoraTarget) -> list[str]:
+def _templates_for(
+    family: str, target: CakeQuantLoraTarget, adapter_state: str = "raw"
+) -> list[str]:
     arch = TARGET_ARCH[target]
     return sorted(
         name
         for name, record in PROGRAMS.items()
-        if record["family"] == family and arch in record["arches"]
+        if record["family"] == family
+        and arch in record["arches"]
+        and adapter_state in record["adapter_states"]
     )
+
+
+def _adapter_state(lora_b, lora_scale, lora_adapter) -> str:
+    """The call's adapter state from its API form alone (no device read): ``"prepared"`` with ``lora_adapter``,
+    ``"raw"`` with ``lora_b`` / ``lora_scale``, ``"none"`` otherwise.  Both forms in one call are refused."""
+    prepared = lora_adapter is not None
+    raw = lora_b is not None or lora_scale is not None
+    if prepared and raw:
+        raise ValueError(
+            "pass either lora_adapter (the prepared path) or lora_b + lora_scale (the raw path), not both"
+        )
+    return "prepared" if prepared else ("raw" if raw else "none")
 
 
 def fp8_blackwell_tile_n(record: dict, m: int, n: int, sm_count: int) -> int:
@@ -348,18 +390,116 @@ def _nvfp4_raster_dram_bytes(
     return a_passes * a_bytes + w_passes * w_bytes, order, tok_tiles, w_tiles
 
 
+def _nvfp4_svdq_raster_bytes(
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+    *,
+    pair_m: int,
+    tile_n: int,
+    group: int,
+    budget: int,
+) -> int:
+    """Modeled DRAM read bytes of one grouped raster ``group`` of the prepared-path program: the Cake 256-wide kernel's
+    bytes model, ported verbatim.  Per token row A carries ``K/2`` NVFP4 bytes + ``K/16`` scale bytes + ``2 rank`` bf16
+    LoRA bytes and per weight row W the same (``_nvfp4_operand_row_bytes``).  ``group == 0`` is the token-first order
+    (consecutive tiles share the weight tile, so A streams once per weight tile unless it is L2-resident); ``group >= 1``
+    walks ``group`` token tiles per weight tile: the group's A set stays resident and W streams ``ceil(tok_tiles /
+    group)`` times unless it fits next to it; an A set above the budget thrashes (A streams per weight tile)."""
+    tok_tiles = _ceil_div(int(m), int(pair_m))
+    w_tiles = _ceil_div(int(n), int(tile_n))
+    row_bytes = _nvfp4_operand_row_bytes(int(k), int(rank))
+    a_bytes = int(m) * row_bytes
+    w_bytes = int(n) * row_bytes
+    budget = int(budget)
+    if int(group) == 0:
+        return w_bytes + (a_bytes if a_bytes <= budget else w_tiles * a_bytes)
+    a_group = min(int(group), tok_tiles) * int(pair_m) * row_bytes
+    passes = _ceil_div(tok_tiles, int(group))
+    if a_group <= budget:
+        return a_bytes + (w_bytes if w_bytes <= budget - a_group else passes * w_bytes)
+    return w_tiles * a_bytes + passes * w_bytes
+
+
+def nvfp4_svdq_raster_group(
+    record: dict, arch: str, m: int, n: int, k: int, rank: int
+) -> int:
+    """Grouped-raster size of the prepared-path program: the Cake svdq kernel's own rule, evaluated from the delivered
+    ``record["dispatch"][arch]["prepared"]`` data.
+
+    The K band first: group ``k_band_group`` (1) for ``K <= k_band_max_k`` and ``M >= k_band_min_m``; otherwise the
+    256-wide kernel's bytes model (``_nvfp4_svdq_raster_bytes``) over ``bytes_model_candidates`` at
+    ``bytes_model_pair_m x bytes_model_tile_n`` tiles against ``bytes_model_budget_bytes`` -- fewest modeled DRAM read
+    bytes, ties to the smallest group ``>= 1``, ``G = 0`` last.  Raises ``ValueError`` when ``record`` is not the
+    prepared-path program or the delivered rule is not the one this host ports.
+    """
+    constants = record["dispatch"][arch]
+    prepared = constants["prepared"]
+    if (
+        record["dispatch_kernel"] != prepared["kernel"]
+        or "prepared" not in record["adapter_states"]
+    ):
+        raise ValueError(
+            f"the prepared-path raster rule applies to the {prepared['kernel']!r} program only, got {record['dispatch_kernel']!r}"
+        )
+    if str(prepared["raster_rule"]) != _PREPARED_RASTER_RULE:
+        raise ValueError(
+            f"the delivered prepared-path raster rule {prepared['raster_rule']!r} is not {_PREPARED_RASTER_RULE!r}, "
+            "which this host ports"
+        )
+    kernel = constants["kernels"][prepared["kernel"]]
+    pair_m, tile_n = (
+        int(prepared["bytes_model_pair_m"]),
+        int(prepared["bytes_model_tile_n"]),
+    )
+    if (int(kernel["tile_m"]), int(kernel["tile_n"])) != (pair_m, tile_n):
+        raise ValueError(
+            f"the prepared-path bytes model counts {pair_m} x {tile_n} tiles, the {prepared['kernel']!r} program is "
+            f"{kernel['tile_m']} x {kernel['tile_n']}"
+        )
+    if int(k) <= int(prepared["k_band_max_k"]) and int(m) >= int(
+        prepared["k_band_min_m"]
+    ):
+        return int(prepared["k_band_group"])
+    candidates = sorted({int(value) for value in prepared["bytes_model_candidates"]})
+    if not candidates or candidates[0] < 0:
+        raise ValueError(
+            f"prepared-path raster candidates must be >= 0, got {prepared['bytes_model_candidates']!r}"
+        )
+    budget = int(prepared["bytes_model_budget_bytes"])
+    if budget <= 0:
+        raise ValueError(f"bytes_model_budget_bytes must be positive, got {budget}")
+    last = (
+        candidates[-1] + 1
+    )  # G = 0 sorts after every grouped order on an exact modeled-byte tie
+    return min(
+        candidates,
+        key=lambda group: (
+            _nvfp4_svdq_raster_bytes(
+                m, n, k, rank, pair_m=pair_m, tile_n=tile_n, group=group, budget=budget
+            ),
+            group if group >= 1 else last,
+        ),
+    )
+
+
 def nvfp4_blackwell_raster_group(
     record: dict, arch: str, m: int, n: int, k: int, rank: int
 ) -> int:
     """Grouped-raster size of an NVFP4 pair-tile program: the Cake dispatch rule's raster selection, ported verbatim.
 
-    Candidates and the L2 resident budget come from the delivered ``record["dispatch"][arch]`` data (the Cake
+    A prepared-path record (``"prepared" in record["adapter_states"]``) follows the svdq kernel's own rule
+    (:func:`nvfp4_svdq_raster_group`: the K band, then the 256-wide bytes model).  For the raw-path programs the
+    candidates and the L2 resident budget come from the delivered ``record["dispatch"][arch]`` data (the Cake
     dispatch module's ``DISPATCH_CONSTANTS[arch]`` as committed: ``kernels[<kernel>]`` geometry + ``raster_candidates``
     and ``l2_budget_bytes``).  ``G >= 1`` is
     forced whenever the along-M mainline would walk more token tiles than weight tiles (``tok_tiles > w_tiles``);
     otherwise the candidate with the fewest modeled DRAM read bytes wins, ties go to the smallest grouped order
     ``G >= 1`` and ``G = 0`` only as the sole tie member.  Raises ``ValueError`` when no candidate is admissible.
     """
+    if "prepared" in record["adapter_states"]:
+        return nvfp4_svdq_raster_group(record, arch, m, n, k, rank)
     constants = record["dispatch"][arch]
     kernel = constants["kernels"][record["dispatch_kernel"]]
     tile_m, tile_n = int(kernel["tile_m"]), int(kernel["tile_n"])
@@ -487,11 +627,27 @@ def select_cake_quant_lora_template(
     k: int,
     rank: int,
     sm_count: int,
+    adapter_state: str = "raw",
 ) -> str:
-    """Return the generated program for a problem, or raise ``ValueError`` naming the violated requirement."""
+    """Return the generated program for a problem, or raise ``ValueError`` naming the violated requirement.
+
+    ``adapter_state`` is the call's API form (``ADAPTER_STATES``): ``"none"`` and ``"raw"`` run the family's per-problem
+    rule over the raw-path programs (today's dispatch, unchanged); ``"prepared"`` (NVFP4 only) runs the prepared-path
+    program -- the pre-switch of the Cake dispatch -- whenever the problem is at or above that program's ``min_k``
+    floor.  The shape rules are shared by every program of a family on an architecture.
+    """
+    if adapter_state not in ADAPTER_STATES:
+        raise ValueError(
+            f"adapter_state must be one of {ADAPTER_STATES}, got {adapter_state!r}"
+        )
     label = "NVFP4" if family == FAMILY_NVFP4 else "FP8"
-    candidates = _templates_for(family, target)
+    candidates = _templates_for(family, target, adapter_state)
     if not candidates:
+        if adapter_state == "prepared":
+            raise ValueError(
+                f"the Cake {label} LoRA GEMM has no prepared-adapter program for {TARGET_ARCH[target]} (lora_adapter= "
+                "is an NVFP4 Blackwell path; pass lora_b + lora_scale for the raw path)"
+            )
         raise ValueError(
             f"the Cake {label} LoRA GEMM has no generated program for {TARGET_ARCH[target]}"
         )
@@ -527,6 +683,26 @@ def select_cake_quant_lora_template(
             f"the Cake {label} LoRA GEMM on {TARGET_ARCH[target]} requires M * N <= {max_mn} "
             f"(32-bit output indexing), got M*N={m * n}"
         )
+    if adapter_state == "prepared":
+        # The pre-switch: one prepared-path program per architecture, refused below its K floor (the Cake dispatch's
+        # ``min_k`` of that kernel) so no prepared call reaches a problem the program was not admitted for.
+        if len(candidates) != 1:
+            raise ValueError(
+                f"expected one prepared-adapter program for {TARGET_ARCH[target]}, delivered: {candidates}"
+            )
+        (template,) = candidates
+        prepared = PROGRAMS[template]
+        min_k = int(
+            prepared["dispatch"][TARGET_ARCH[target]]["kernels"][
+                prepared["dispatch_kernel"]
+            ]["min_k"]
+        )
+        if k < min_k:
+            raise ValueError(
+                f"the prepared-adapter path ({template}) requires K >= {min_k}, got K={k}; pass lora_b + lora_scale "
+                "for the raw path"
+            )
+        return template
     if len(candidates) == 1:
         return candidates[0]
     if record["grid"] == "sm90_persistent":
@@ -544,6 +720,216 @@ def _lora_carrier(record: dict, device: torch.device) -> torch.Tensor:
     nbytes = rows * cols * 2
     buffer = _get_cache_buf(_CARRIER_BUFFER, nbytes, device, zero_init=True)
     return buffer[:nbytes].view(torch.bfloat16).view(rows, cols)
+
+
+class StaleAdapterError(ValueError):
+    """A prepared adapter's source tensor (``lora_b`` / ``lora_scale`` / ``alpha``) moved since its prepare (snapshot
+    semantics): re-prepare (``prepare_nvfp4_lora_adapter(..., out=adapter)``) or capture the refold inside the graph."""
+
+
+def _pin(tensor: torch.Tensor) -> tuple:
+    return (
+        int(tensor.data_ptr()),
+        int(tensor._version),
+        tuple(tensor.shape),
+        str(tensor.device),
+    )
+
+
+def _pins(lora_b: torch.Tensor, lora_scale: torch.Tensor, alpha: torch.Tensor) -> dict:
+    return {
+        "lora_b": _pin(lora_b),
+        "lora_scale": _pin(lora_scale),
+        "alpha": _pin(alpha),
+    }
+
+
+@dataclasses.dataclass(eq=False)
+class PreparedNvFp4LoraAdapter:
+    r"""A LoRA adapter prepared for the NVFP4 prepared path of :func:`mm_nvfp4_lora` (``lora_adapter=``).
+
+    ``b_folded`` = ``bf16(lora_b * lora_scale / alpha)`` (``[N, rank]`` bf16: ONE bf16 rounding of the fp32 product of
+    ``lora_b`` and the fp32 ratio ``div.rn.f32(fp32(lora_scale), fp32(alpha))`` -- bit-identical to the ``l1`` fold of
+    :func:`~flashinfer.mm_nvfp4_svdquant`).  ``lora_scale`` is the adapter's own device scalar; the kernel reads it on
+    the device (``lora_scale == 0`` takes the zero-adapter path, bitwise the adapter-off call).  Snapshot semantics: the
+    adapter keeps references to its source tensors ``lora_b`` / ``lora_scale`` / ``alpha`` and ``pins`` = their
+    ``(data_ptr, _version, shape, device)`` at prepare time; every call compares these host integers (no sync) and
+    raises :class:`StaleAdapterError` naming the tensor that moved without a re-prepare.  Writes that bypass torch's
+    version counter (NCCL into an existing buffer, a raw memcpy) need an explicit prepare.  ``alpha`` is fixed per
+    prepared adapter: the call requires the SAME ``alpha`` tensor (identity) at its pinned version -- re-prepare when
+    alpha changes (no value comparison).
+    """
+
+    b_folded: torch.Tensor
+    lora_b: torch.Tensor
+    lora_scale: torch.Tensor
+    alpha: torch.Tensor
+    pins: dict
+    n: int
+    rank: int
+
+    def check_fresh(self) -> None:
+        """Raise :class:`StaleAdapterError` when a source tensor moved since the prepare (host integers only, no sync)."""
+        for name in ("lora_b", "lora_scale", "alpha"):
+            now = _pin(getattr(self, name))
+            if now != self.pins[name]:
+                raise StaleAdapterError(
+                    f"prepared adapter is stale: {name} moved since prepare (data_ptr, version, shape, device) "
+                    f"{self.pins[name]} -> {now}; call prepare_nvfp4_lora_adapter(lora_b, lora_scale, alpha, out=adapter) "
+                    "again (or capture that refold inside the graph); writes that bypass torch need an explicit prepare"
+                )
+
+
+def _require_prepared_tensor(
+    tensor, *, name: str, shape: tuple, dtype: torch.dtype, device: torch.device
+) -> None:
+    if tensor is None:
+        raise ValueError(f"{name} must not be None")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if tuple(tensor.shape) != tuple(shape):
+        raise ValueError(
+            f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}"
+        )
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if tensor.device != device:
+        raise ValueError(
+            f"{name} must be on the same device as lora_b ({device}), got {tensor.device}"
+        )
+
+
+@flashinfer_api
+def prepare_nvfp4_lora_adapter(
+    lora_b: torch.Tensor,
+    lora_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    out: Optional[PreparedNvFp4LoraAdapter] = None,
+) -> PreparedNvFp4LoraAdapter:
+    r"""Prepare (fold) one LoRA adapter for the NVFP4 prepared path: ``b_folded = bf16(lora_b * lora_scale / alpha)``.
+
+    This is the adapter-switch cost of the prepared path (one small elementwise kernel, counted as the ``l1`` fold of
+    :func:`~flashinfer.mm_nvfp4_svdquant` is counted); the per-call path then does no host read and no fold.  The fold
+    kernel is PyTorch's own elementwise ``mul`` (bf16 x fp32 scalar in fp32 opmath, IEEE round-to-nearest-even to bf16;
+    PyTorch is built without ``--use_fast_math``): ``ratio = div.rn.f32(fp32(lora_scale), fp32(alpha[0]))``,
+    ``b_folded[i] = bf16_rne(fp32(lora_b[i]) * ratio)``.
+
+    Parameters
+    ----------
+    lora_b : torch.Tensor
+        LoRA-up weight, ``bf16 [N, r]`` row-major, contiguous (the raw path's ``lora_b``).
+    lora_scale : torch.Tensor
+        fp32 device tensor of shape ``(1,)`` -- ``s_lora`` as on the raw path (``0`` folds to the zero adapter).
+    alpha : torch.Tensor
+        fp32 device tensor of shape ``(1,)``: the base scale ``alpha_base / (a_global_scale * b_global_scale)`` the
+        call passes as ``alpha`` -- the same tensor object (alpha is fixed per prepared adapter).  ``alpha == 0`` is
+        refused (``s / alpha`` is undefined); the alpha == 0 LoRA-only call is the raw path.
+    out : PreparedNvFp4LoraAdapter, optional
+        Refold IN PLACE into ``out.b_folded`` with NO host read (graph-capturable; capturing this refold plus the call
+        is the adapter-switch protocol inside a CUDA graph): the same fp32 ratio computed on the device, the same fp32
+        product and the same single bf16 rounding -- bitwise the eager form.  ``alpha`` must be ``out``'s own alpha
+        tensor; ``lora_scale`` may be a new tensor (the adapter then carries it); ``lora_b`` must keep ``out``'s
+        ``[N, r]`` and device.  The source pins are refreshed.
+
+    Returns
+    -------
+    PreparedNvFp4LoraAdapter
+        A new adapter (``out=None``: the single documented host read of the adapter switch -- one device-to-host copy
+        of ``(lora_scale, alpha)`` -- checks ``alpha != 0`` and a finite ratio, else ``ValueError``), or ``out``.
+    """
+    if lora_b is None or lora_scale is None or alpha is None:
+        raise ValueError(
+            "prepare_nvfp4_lora_adapter needs lora_b, lora_scale and alpha"
+        )
+    if (
+        lora_b.dim() != 2
+        or lora_b.dtype != torch.bfloat16
+        or not lora_b.is_contiguous()
+    ):
+        raise ValueError(
+            f"lora_b must be a contiguous bf16 [N, rank] tensor, got {tuple(lora_b.shape)} {lora_b.dtype}"
+        )
+    n, rank = (int(value) for value in lora_b.shape)
+    device = lora_b.device
+    _require_prepared_tensor(
+        lora_scale, name="lora_scale", shape=(1,), dtype=torch.float32, device=device
+    )
+    _require_prepared_tensor(
+        alpha, name="alpha", shape=(1,), dtype=torch.float32, device=device
+    )
+    if out is None:
+        pair = torch.stack(
+            (lora_scale.reshape(()), alpha.reshape(()))
+        ).cpu()  # the ONE host read of the switch
+        if float(pair[1]) == 0.0:
+            raise ValueError(
+                "prepare_nvfp4_lora_adapter: alpha == 0 has no folded operand (s / alpha is undefined); the alpha == 0 "
+                "LoRA-only path is the raw lora_b + lora_scale call"
+            )
+        ratio = (
+            pair[0] / pair[1]
+        ).item()  # fp32 division on the host: div.rn.f32(fp32(s), fp32(alpha[0]))
+        if not math.isfinite(ratio):
+            raise ValueError(
+                f"prepare_nvfp4_lora_adapter: s / alpha = {float(pair[0])} / {float(pair[1])} is not finite"
+            )
+        b_folded = torch.mul(
+            lora_b, ratio
+        )  # ONE kernel: bf16 x fp32 scalar in fp32 opmath, one RNE to bf16
+        return PreparedNvFp4LoraAdapter(
+            b_folded=b_folded.contiguous(),
+            lora_b=lora_b,
+            lora_scale=lora_scale,
+            alpha=alpha,
+            pins=_pins(lora_b, lora_scale, alpha),
+            n=n,
+            rank=rank,
+        )
+    if not isinstance(out, PreparedNvFp4LoraAdapter):
+        raise TypeError(
+            f"out must be a PreparedNvFp4LoraAdapter, got {type(out).__name__}"
+        )
+    if (out.n, out.rank) != (n, rank) or out.b_folded.device != device:
+        raise ValueError(
+            f"out was prepared for [N, rank] = {(out.n, out.rank)} on {out.b_folded.device}; refold needs the same "
+            f"geometry and device, got {(n, rank)} on {device}"
+        )
+    if alpha is not out.alpha:
+        raise ValueError(
+            "alpha is fixed per prepared adapter: refold with out.alpha, or prepare a new adapter"
+        )
+    ratio_t = lora_scale.reshape(()) / alpha.reshape(
+        ()
+    )  # fp32 device division (IEEE), no host read
+    out.b_folded.copy_(
+        lora_b.float() * ratio_t
+    )  # fp32 product, one RNE to bf16 -- bitwise the eager form
+    out.lora_b = lora_b
+    out.lora_scale = lora_scale
+    out.pins = _pins(lora_b, lora_scale, alpha)
+    return out
+
+
+def _prepared_adapter_operands(
+    adapter, *, d, alpha
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The LoRA operands ``(b_folded, lora_scale)`` of a prepared-path call after its host checks (no device read):
+    the adapter's type, ``d`` present, the call's ``alpha`` is the adapter's own tensor, and the snapshot is fresh."""
+    if not isinstance(adapter, PreparedNvFp4LoraAdapter):
+        raise TypeError(
+            f"lora_adapter must be a PreparedNvFp4LoraAdapter, got {type(adapter).__name__}"
+        )
+    if d is None:
+        raise ValueError(
+            "the prepared path needs d (the LoRA-down output) beside lora_adapter"
+        )
+    if adapter.alpha is not alpha:
+        raise ValueError(
+            "lora_adapter was prepared against a different alpha tensor: re-prepare when alpha changes"
+        )
+    adapter.check_fresh()
+    return adapter.b_folded, adapter.lora_scale
 
 
 def _check_adapter_and_output(
@@ -638,6 +1024,7 @@ def _check_mm_nvfp4_lora_problem(
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cake", "auto"] = "cake",
     enable_pdl: Optional[bool] = None,
+    lora_adapter: Optional[PreparedNvFp4LoraAdapter] = None,
 ):
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("a and b must be 2-D packed-e2m1 (uint8) tensors")
@@ -675,6 +1062,10 @@ def _check_mm_nvfp4_lora_problem(
             raise ValueError(
                 f"{name} must be on the same device as a ({a.device}), got {tensor.device}"
             )
+    # Routing by API form (no device read): the prepared path binds the adapter's folded operand and its own scale;
+    # its host checks (type, d present, alpha identity, snapshot freshness) precede the shared geometry checks.
+    if _adapter_state(lora_b, lora_scale, lora_adapter) == "prepared":
+        lora_b, lora_scale = _prepared_adapter_operands(lora_adapter, d=d, alpha=alpha)
     _check_adapter_and_output(
         m=m,
         n=n,
@@ -740,7 +1131,11 @@ def _check_mm_fp8_lora_problem(
 
 
 def _select_for_call(
-    family: str, a: torch.Tensor, b: torch.Tensor, d: Optional[torch.Tensor]
+    family: str,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: Optional[torch.Tensor],
+    adapter_state: str,
 ) -> tuple[str, CakeQuantLoraTarget, int]:
     target = cake_quant_lora_target(a.device)
     m = int(a.shape[0])
@@ -749,16 +1144,35 @@ def _select_for_call(
     rank = int(d.shape[1]) if d is not None else _NO_ADAPTER_RANK
     sm_count = get_device_sm_count(a.device)
     template = select_cake_quant_lora_template(
-        family=family, target=target, m=m, n=n, k=k, rank=rank, sm_count=sm_count
+        family=family,
+        target=target,
+        m=m,
+        n=n,
+        k=k,
+        rank=rank,
+        sm_count=sm_count,
+        adapter_state=adapter_state,
     )
     return template, target, sm_count
 
 
 @supported_compute_capability([100, 103])
 def _cake_nvfp4_lora_requirement(
-    a, b, a_sf, b_sf, alpha, d=None, lora_b=None, lora_scale=None, **kwargs
+    a,
+    b,
+    a_sf,
+    b_sf,
+    alpha,
+    d=None,
+    lora_b=None,
+    lora_scale=None,
+    *,
+    lora_adapter=None,
+    **kwargs,
 ):
-    _select_for_call(FAMILY_NVFP4, a, b, d)
+    _select_for_call(
+        FAMILY_NVFP4, a, b, d, _adapter_state(lora_b, lora_scale, lora_adapter)
+    )
     return True
 
 
@@ -766,7 +1180,7 @@ def _cake_nvfp4_lora_requirement(
 def _cake_fp8_lora_requirement(
     a, b, a_scale, b_scale, d=None, lora_b=None, lora_scale=None, **kwargs
 ):
-    _select_for_call(FAMILY_FP8, a, b, d)
+    _select_for_call(FAMILY_FP8, a, b, d, _adapter_state(lora_b, lora_scale, None))
     return True
 
 
@@ -783,13 +1197,15 @@ def _run(
     d: Optional[torch.Tensor],
     lora_b: Optional[torch.Tensor],
     lora_scale: Optional[torch.Tensor],
+    lora_adapter: Optional[PreparedNvFp4LoraAdapter],
     bias: Optional[torch.Tensor],
     out: Optional[torch.Tensor],
     enable_pdl: Optional[bool],
     scale_views: dict[str, torch.Tensor],
 ) -> torch.Tensor:
     device = a.device
-    template, target, sm_count = _select_for_call(family, a, b, d)
+    adapter_state = _adapter_state(lora_b, lora_scale, lora_adapter)
+    template, target, sm_count = _select_for_call(family, a, b, d, adapter_state)
     record = PROGRAMS[template]
     if enable_pdl is not None and enable_pdl is not bool(record["pdl"]):
         raise ValueError(
@@ -798,19 +1214,30 @@ def _run(
     m = int(a.shape[0])
     n = int(b.shape[0])
     k = int(a.shape[1]) * (2 if family == FAMILY_NVFP4 else 1)
-    # lora_scale=None disables the adapter even when d / lora_b are passed (the zero-adapter fast path,
-    # bitwise identical to lora_scale == 0 and to the all-None call).
-    has_lora = d is not None and lora_b is not None and lora_scale is not None
-    rank = int(d.shape[1]) if d is not None else _NO_ADAPTER_RANK
     has_bias = bias is not None
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
-    if has_lora:
-        d_arg, b_arg, scale_arg = d, lora_b, lora_scale.reshape(1)
+    if adapter_state == "prepared":
+        # The prepared path: the adapter's folded operand and its own scale are the LoRA operands (the kernel reads
+        # the scale on the device; lora_scale == 0 takes its zero-adapter path), no fold and no host read per call.
+        has_lora = True
+        rank = int(d.shape[1])
+        d_arg, b_arg, scale_arg = (
+            d,
+            lora_adapter.b_folded,
+            lora_adapter.lora_scale.reshape(1),
+        )
     else:
-        # The typed pointer / tensor-map ABI needs valid carriers; has_lora=0 keeps them unread.
-        carrier = _lora_carrier(record, device)
-        d_arg, b_arg, scale_arg = carrier, carrier, base_scales["carrier"]
+        # lora_scale=None disables the adapter even when d / lora_b are passed (the zero-adapter fast path,
+        # bitwise identical to lora_scale == 0 and to the all-None call).
+        has_lora = d is not None and lora_b is not None and lora_scale is not None
+        rank = int(d.shape[1]) if d is not None else _NO_ADAPTER_RANK
+        if has_lora:
+            d_arg, b_arg, scale_arg = d, lora_b, lora_scale.reshape(1)
+        else:
+            # The typed pointer / tensor-map ABI needs valid carriers; has_lora=0 keeps them unread.
+            carrier = _lora_carrier(record, device)
+            d_arg, b_arg, scale_arg = carrier, carrier, base_scales["carrier"]
     bias_arg = bias if has_bias else out
     grid = launch_grid(record, m, n, sm_count)
     block_k = int(record["block_k"])
@@ -824,6 +1251,8 @@ def _run(
         "W": b_view,
         "D": d_arg,
         "LORA_B": b_arg,
+        "LORA_B_PRE": b_arg,
+        "LORA_B_TAIL": b_arg,
         "BL": b_arg,
         "lora_scale": scale_arg,
         "bias": bias_arg,
@@ -889,6 +1318,7 @@ def mm_nvfp4_lora(
     lora_b: Optional[torch.Tensor] = None,
     lora_scale: Optional[torch.Tensor] = None,
     *,
+    lora_adapter: Optional[PreparedNvFp4LoraAdapter] = None,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
@@ -901,12 +1331,25 @@ def mm_nvfp4_lora(
 
     The NVFP4 operands are consumed exactly as :func:`~flashinfer.mm_fp4` does
     (E2M1 codes packed two per byte, UE4M3 block scales of 16 along K in the
-    128x4 swizzled layout produced by :func:`~flashinfer.fp4_quantize`).  The
-    correction is computed from the BF16 factors as given -- ``d`` (the LoRA-down
-    output ``x @ A^T``) and ``lora_b`` (the LoRA-up weight) are never re-rounded
-    or pre-scaled -- in fp32 inside the same kernel, and the result is rounded
-    once to bf16.  ``alpha`` and ``lora_scale`` are independent fp32 device
-    scalars (no offline folding of either into the weights).
+    128x4 swizzled layout produced by :func:`~flashinfer.fp4_quantize`); the
+    correction is computed in fp32 inside the same kernel and the result is
+    rounded once to bf16.  The adapter arrives in one of two forms:
+
+    * **Raw path** (``lora_b`` + ``lora_scale``): the BF16 factors are consumed as
+      given -- ``d`` (the LoRA-down output ``x @ A^T``) and ``lora_b`` (the LoRA-up
+      weight) are never re-rounded or pre-scaled -- and ``alpha`` / ``lora_scale``
+      are independent fp32 device scalars (no folding of either into the weights).
+      Swapping the adapter is swapping pointers (0-preparation switching).
+    * **Prepared path** (``lora_adapter=``, from :func:`prepare_nvfp4_lora_adapter`):
+      the adapter was folded once at the switch, ``b_folded = bf16(lora_b *
+      lora_scale / alpha)``; the kernel accumulates the base product first and
+      applies ``alpha`` once in the fp32 epilogue -- the numerics of
+      :func:`~flashinfer.mm_nvfp4_svdquant` (``lora_b`` re-rounded once to bf16; on
+      the measured contract rows SQNR 53.8 dB vs 55.6 dB on the raw path, max abs
+      error vs fp64 0.038-0.042 vs 0.031).  Every prepared call runs the
+      prepared-path program (the raw dispatch table is untouched) and keeps the
+      snapshot checks of :class:`PreparedNvFp4LoraAdapter`.  Passing both forms
+      raises ``ValueError``; neither form is the adapter-off call.
 
     Parameters
     ----------
@@ -930,6 +1373,12 @@ def mm_nvfp4_lora(
         multiplier), independent of ``alpha``.  ``0`` and ``None`` both take the zero-adapter
         fast path (no LoRA work, bitwise identical outputs): ``lora_scale=None`` disables the
         adapter even if ``d`` / ``lora_b`` are passed; pass a device scalar to apply it.
+    lora_adapter : PreparedNvFp4LoraAdapter, optional
+        The prepared path: an adapter from :func:`prepare_nvfp4_lora_adapter` (``lora_b`` and
+        ``lora_scale`` must then be ``None``; ``d`` is still required).  Its ``alpha`` must be
+        this call's ``alpha`` tensor (re-prepare when alpha changes) and its source tensors
+        must not have moved since the prepare (:class:`StaleAdapterError` otherwise).  A
+        prepared adapter with ``lora_scale == 0`` produces the adapter-off output, bitwise.
     bias : torch.Tensor, optional
         ``bf16 [N]``, added in fp32 before the single rounding.
     out : torch.Tensor, optional
@@ -960,10 +1409,18 @@ def mm_nvfp4_lora(
       by the caller or computed from the full ``x``) and the full ``lora_b``, and only
       the owner rank passes ``lora_scale`` / ``bias`` (the others pass ``lora_scale = 0``
       and ``bias = None``) so the correction is counted exactly once before the
-      all-reduce of the base partials.
-    * CUDA graphs: a captured call keeps the adapter *pointers* captured.  Swapping
-      ``d`` / ``lora_b`` / ``lora_scale`` for new tensors after capture does not affect
-      replays; write the new adapter into the captured tensors (``copy_``) instead.
+      all-reduce of the base partials.  On the prepared path every rank prepares its
+      own adapter from its shard (the non-owner ranks of a row-parallel layout with
+      ``lora_scale = 0``, which folds to the zero adapter).
+    * CUDA graphs, raw path: a captured call keeps the adapter *pointers* captured.
+      Swapping ``d`` / ``lora_b`` / ``lora_scale`` for new tensors after capture does not
+      affect replays; write the new adapter into the captured tensors (``copy_``) instead.
+      Prepared path: a captured call keeps the prepared adapter captured; the adapter
+      switch is ``prepare_nvfp4_lora_adapter(lora_b, lora_scale, alpha, out=adapter)``
+      captured right before the call (an in-place refold without a host read), after
+      which a ``copy_`` into the captured ``lora_b`` / ``lora_scale`` is folded by every
+      replay.  Outside a graph, a ``copy_`` into a source tensor makes the adapter stale
+      (``StaleAdapterError``) until it is re-prepared.
     """
     if backend not in ("cake", "auto"):
         raise ValueError(
@@ -999,6 +1456,7 @@ def mm_nvfp4_lora(
         d=d,
         lora_b=lora_b,
         lora_scale=lora_scale,
+        lora_adapter=lora_adapter,
         bias=bias,
         out=out,
         enable_pdl=enable_pdl,
@@ -1110,6 +1568,7 @@ def mm_fp8_lora(
         d=d,
         lora_b=lora_b,
         lora_scale=lora_scale,
+        lora_adapter=None,
         bias=bias,
         out=out,
         enable_pdl=enable_pdl,
@@ -1118,8 +1577,11 @@ def mm_fp8_lora(
 
 
 __all__ = [
+    "ADAPTER_STATES",
     "SUPPORTED_RANKS",
     "TARGET_OF_ARCH",
+    "PreparedNvFp4LoraAdapter",
+    "StaleAdapterError",
     "fp8_blackwell_l2_point",
     "fp8_blackwell_program",
     "fp8_blackwell_raster_group",
@@ -1127,9 +1589,11 @@ __all__ = [
     "fp8_blackwell_tile_n",
     "nvfp4_blackwell_program",
     "nvfp4_blackwell_raster_group",
+    "nvfp4_svdq_raster_group",
     "launch_grid",
     "mm_fp8_lora",
     "mm_nvfp4_lora",
+    "prepare_nvfp4_lora_adapter",
     "select_cake_quant_lora_template",
     "sm90_fp8_lora_program",
 ]
