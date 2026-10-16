@@ -65,6 +65,18 @@ class LLAllReduceTuning:
     publish_threads: int = 128
     publish_release_before_store: bool = False
     collective: LLCollectiveTuning = LLCollectiveTuning()
+    # Publish through each rank's unicast mapping instead of one multicast
+    # store (requires publish_elements_per_thread=8). The first
+    # publish_multicast_fragments 8-element fragments of every token keep the
+    # multicast store, so the publish draws on the switch's multicast
+    # replication and on the unicast paths at once. With
+    # publish_bulk_peer_stores each CTA stages its unicast fragments in shared
+    # memory and sends every rank one bulk copy, which moves fewer, larger
+    # NVLink writes than one 16-byte store per thread; publish_multicast_fragments
+    # must then be a multiple of publish_threads.
+    peer_stores: bool = False
+    publish_multicast_fragments: int = 0
+    publish_bulk_peer_stores: bool = False
 
 
 LL_FINALIZE_GB300_TP8_H8192_K10 = LLFinalizeTuning()
@@ -87,6 +99,24 @@ LL_ALL_REDUCE_GB300_TP16_H8192_M_GE_18 = LLAllReduceTuning(
 )
 LL_ALL_REDUCE_GB300_TP8_H8192 = LL_ALL_REDUCE_GB300_TP8_H8192_M_GE_5
 LL_ALL_REDUCE_GB300_TP16_H8192 = LL_ALL_REDUCE_GB300_TP16_H8192_M_LE_10
+
+# TP4, hidden 8192, measured separately on GB300 and Rubin. The multicast
+# one-shot default is fastest for the fewest tokens. Once its publish is byte
+# bound, the BULK variant keeps the multicast store for the first quarter of
+# each token and sends the rest as per-CTA bulk copies to each rank.
+_LL_ALL_REDUCE_H8192_BULK = LLAllReduceTuning(
+    publish_threads=256,
+    peer_stores=True,
+    publish_multicast_fragments=256,
+    publish_bulk_peer_stores=True,
+)
+
+LL_ALL_REDUCE_GB300_TP4_H8192 = LLAllReduceTuning()
+LL_ALL_REDUCE_GB300_TP4_H8192_BULK = _LL_ALL_REDUCE_H8192_BULK
+LL_FINALIZE_GB300_TP4_H8192_K10 = LLFinalizeTuning()
+LL_ALL_REDUCE_RUBIN_TP4_H8192 = LLAllReduceTuning()
+LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK = _LL_ALL_REDUCE_H8192_BULK
+LL_FINALIZE_RUBIN_TP4_H8192_K10 = LLFinalizeTuning()
 
 # hidden_size=5120, bf16. Tuning presets carry launch
 # knobs only -- hidden_size/top_k reach the kernels through StaticProfile -- so
@@ -147,6 +177,8 @@ def create_ll_state(
     rank: int,
     capacity_m: int,
     hidden: int,
+    *,
+    materialize_peer_addresses: bool = False,
 ) -> LLProtocolState:
     """Collectively allocate a sentinel-filled ``[3, tp, capacity_m, hidden]`` mailbox."""
     if dist.get_world_size(group) != tp_size:
@@ -160,6 +192,7 @@ def create_ll_state(
         device,
         group,
         require_multicast=True,
+        materialize_peer_addresses=materialize_peer_addresses,
     )
     mailbox.tensor.view(torch.int16).fill_(-32768)
     return LLProtocolState(
@@ -178,8 +211,17 @@ def compile_shared_only_publish(
     threads: int,
     release_before_store: bool,
     enable_pdl: bool,
+    peer_stores: bool = False,
+    multicast_fragments: int = 0,
+    bulk_peer_stores: bool = False,
 ):
-    """Compile the publisher that multicasts a local ``[m, hidden]`` BF16 tensor."""
+    """Compile the publisher that multicasts a local ``[m, hidden]`` BF16 tensor.
+
+    The compiled function takes ``(local, stage_state, multicast_address,
+    peer_mailboxes, m, stream)``; ``peer_mailboxes`` is the ``[tp]`` int64
+    table of unicast mailbox addresses with ``peer_stores`` and ``None``
+    otherwise.
+    """
     device_kernel = _SharedOnlyPublishDeviceKernel(
         hidden=hidden,
         tp=tp,
@@ -189,12 +231,18 @@ def compile_shared_only_publish(
         threads=threads,
         release_before_store=release_before_store,
         enable_pdl=enable_pdl,
+        peer_stores=peer_stores,
+        multicast_fragments=multicast_fragments,
+        bulk_peer_stores=bulk_peer_stores,
     )
     return cute.compile(
         device_kernel,
         make_fake_dynamic_compact_tensor(BFloat16, alignment=16, divisibility=hidden),
         make_fake_compact_tensor(Int32, (2,), assumed_align=4),
         Int64(0),
+        make_fake_compact_tensor(Int64, (tp,), assumed_align=8)
+        if peer_stores
+        else None,
         Int32(capacity_m),
         current_cu_stream(),
     )
@@ -344,9 +392,12 @@ class FinalizeAllReduceRMSNormLLKernel(_LLPath):
 
 
 class AllReduceRMSNormLLKernel(_LLPath):
-    def __init__(self, *, compiled: _CompiledAllReduce, **kwargs) -> None:
+    def __init__(
+        self, *, compiled: _CompiledAllReduce, peer_stores: bool = False, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self._compiled = compiled
+        self._peer_stores = peer_stores
 
     def __call__(
         self,
@@ -371,6 +422,9 @@ class AllReduceRMSNormLLKernel(_LLPath):
             ),
             to_cute(state.stage_state, 4),
             Int64(cast(int, state.contribution_mailbox.multicast_address)),
+            to_cute(cast(torch.Tensor, state.contribution_mailbox.peer_addresses), 8)
+            if self._peer_stores
+            else None,
             Int32(m),
             current_cu_stream(),
         )
@@ -427,6 +481,17 @@ class LLProtocol:
         self.write_norm_output = write_norm_output
         self.apply_rms_norm = apply_rms_norm
 
+        for tuning in all_reduce_tunings:
+            if tuning.peer_stores and tuning.publish_elements_per_thread != 8:
+                raise ValueError("peer_stores requires publish_elements_per_thread=8")
+            if tuning.publish_bulk_peer_stores and (
+                not tuning.peer_stores
+                or tuning.publish_multicast_fragments % tuning.publish_threads
+            ):
+                raise ValueError(
+                    "publish_bulk_peer_stores requires peer_stores and a "
+                    "publish_multicast_fragments multiple of publish_threads"
+                )
         collective_cache = {
             tuning: self._compile_collective(tuning)
             for tuning in {
@@ -450,11 +515,21 @@ class LLProtocol:
                     publish=self._compile_all_reduce_publish(tuning),
                     collective=collective_cache[tuning.collective],
                 ),
+                peer_stores=tuning.peer_stores,
                 **self._path_kwargs(),
             )
             for tuning in dict.fromkeys(all_reduce_tunings)
         }
-        self.state = create_ll_state(group, tp_size, rank, capacity_m, hidden_size)
+        self.state = create_ll_state(
+            group,
+            tp_size,
+            rank,
+            capacity_m,
+            hidden_size,
+            materialize_peer_addresses=any(
+                item.peer_stores for item in all_reduce_tunings
+            ),
+        )
 
     def _path_kwargs(self) -> _PathKwargs:
         return {
@@ -516,6 +591,9 @@ class LLProtocol:
             threads=tuning.publish_threads,
             release_before_store=tuning.publish_release_before_store,
             enable_pdl=tuning.collective.enable_pdl,
+            peer_stores=tuning.peer_stores,
+            multicast_fragments=tuning.publish_multicast_fragments,
+            bulk_peer_stores=tuning.publish_bulk_peer_stores,
         )
 
     def _compile_collective(self, tuning: LLCollectiveTuning):

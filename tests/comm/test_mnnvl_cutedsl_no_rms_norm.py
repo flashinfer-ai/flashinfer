@@ -268,6 +268,44 @@ def test_disabled_norm_requires_a_residual_output(distributed_group):
         )
 
 
+@pytest.mark.parametrize("protocol", ("ll", "bt"))
+@torch.inference_mode()
+def test_disabled_norm_plain_all_reduce(distributed_group, protocol):
+    """Without the norm and the residual, the all-reduce path is a plain all-reduce.
+
+    The token count is not a multiple of the TP size.
+    """
+    group = distributed_group
+    rank = dist.get_rank(group)
+    m = 1025
+    workspace = _workspace(protocol, m, group, add_residual=False, apply_rms_norm=False)
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(5300 + rank)
+        local = _sanitize_negative_zero(
+            torch.randn(
+                m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+            )
+        )
+        expected = _sanitize_negative_zero(
+            _ordered_reduce(local, group).to(torch.bfloat16)
+        )
+        for _ in range(3):
+            residual_out = torch.empty_like(local)
+            returned = allreduce_fusion(
+                input=local,
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=residual_out,
+            )
+            assert returned.data_ptr() == residual_out.data_ptr()
+            assert torch.equal(
+                residual_out.view(torch.int16), expected.view(torch.int16)
+            )
+    finally:
+        workspace.destroy()
+
+
 @torch.inference_mode()
 def test_high_throughput_rejects_disabled_norm(distributed_group):
     """HT fuses the norm into a warp group, so it cannot be compiled out."""

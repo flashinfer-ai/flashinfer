@@ -30,7 +30,10 @@ from ..cute_dsl_primitives import (
     WARP_SIZE,
     bf16x4_to_packed_u32x2,
     bf16x8_to_packed_u32x4,
+    bulk_store_shared_to_global,
+    bulk_wait_group_read,
     f32_to_bf16_bits,
+    fence_proxy_async_shared_cta,
     fragment_has_negative_zero,
     load_global_bf16_as_f32,
     load_global_bf16_as_f32_predicated,
@@ -50,6 +53,7 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
     store_shared_cluster_f32,
+    store_shared_u32x4,
 )
 from ..static_fp8_epilogue import store_rmsnorm_output
 
@@ -560,9 +564,14 @@ class _SharedOnlyPublishDeviceKernel:
         threads: int,
         release_before_store: bool,
         enable_pdl: bool,
+        peer_stores: bool = False,
+        multicast_fragments: int = 0,
+        bulk_peer_stores: bool = False,
     ) -> None:
         if elements_per_thread not in (1, QUAD_BF16, VEC_BF16):
             raise ValueError("elements_per_thread must be 1, 4, or 8")
+        if peer_stores and elements_per_thread != VEC_BF16:
+            raise ValueError("peer_stores requires elements_per_thread == 8")
         if hidden <= 0 or hidden % elements_per_thread:
             raise ValueError("hidden must divide evenly across thread fragments")
         self.hidden = hidden
@@ -575,6 +584,23 @@ class _SharedOnlyPublishDeviceKernel:
         self.ctas_per_token = math.ceil(self.fragments / threads)
         self.release_before_store = release_before_store
         self.enable_pdl = enable_pdl
+        # Store to every rank's mailbox through its unicast mapping instead of
+        # one multicast store; the local copy is an ordinary local store. Each
+        # rank walks its peers starting from rank + 1 so that the ranks' first
+        # stores land on different GPUs. The first multicast_fragments
+        # fragments of a token keep the multicast store, which splits the
+        # publish between the switch's multicast replication and the unicast
+        # paths.
+        self.peer_stores = peer_stores
+        self.multicast_fragments = multicast_fragments if peer_stores else 0
+        # Stage the CTA's unicast fragments in shared memory and send each
+        # peer one bulk copy instead of one 16-byte store per thread.
+        self.bulk_peer_stores = bulk_peer_stores and peer_stores
+        if self.bulk_peer_stores and multicast_fragments % threads:
+            raise ValueError("multicast_fragments must be a multiple of threads")
+
+    def smem_size_in_bytes(self) -> int:
+        return self.threads * 16 + 128 if self.bulk_peer_stores else 0
 
     @cute.jit
     def __call__(
@@ -582,6 +608,7 @@ class _SharedOnlyPublishDeviceKernel:
         shared_output: cute.Tensor,
         stage_state: cute.Tensor,
         contribution_mailbox_multicast_address: Int64,
+        peer_mailboxes: cute.Tensor | None,
         m: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -589,9 +616,11 @@ class _SharedOnlyPublishDeviceKernel:
             shared_output,
             stage_state,
             contribution_mailbox_multicast_address,
+            peer_mailboxes,
         ).launch(
             grid=(m * self.ctas_per_token, 1, 1),
             block=(self.threads, 1, 1),
+            smem=self.smem_size_in_bytes(),
             stream=stream,
             use_pdl=self.enable_pdl,
         )
@@ -602,12 +631,16 @@ class _SharedOnlyPublishDeviceKernel:
         shared_output: cute.Tensor,
         stage_state: cute.Tensor,
         contribution_mailbox_multicast_address: Int64,
+        peer_mailboxes: cute.Tensor | None,
     ) -> None:
         block, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         token = block // self.ctas_per_token
         cta_in_token = block % self.ctas_per_token
         fragment = cta_in_token * self.threads + tidx
+        if cutlass.const_expr(self.bulk_peer_stores):
+            smem = cutlass.utils.SmemAllocator()
+            staging = smem.allocate_array(Uint32, self.threads * 4, byte_alignment=128)
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
@@ -696,10 +729,64 @@ class _SharedOnlyPublishDeviceKernel:
                     (Int64(stage) * self.tp + self.rank) * self.capacity_m
                     + Int64(token)
                 ) * self.hidden + Int64(fragment) * VEC_BF16
-                stmc_bf16x8(
-                    contribution_mailbox_multicast_address + mailbox_element * 2,
-                    packed_words,
-                )
+                if cutlass.const_expr(self.bulk_peer_stores):
+                    if cta_in_token * self.threads < self.multicast_fragments:
+                        stmc_bf16x8(
+                            contribution_mailbox_multicast_address
+                            + mailbox_element * 2,
+                            packed_words,
+                        )
+                elif cutlass.const_expr(self.peer_stores):
+                    unicast = True
+                    if cutlass.const_expr(self.multicast_fragments > 0):
+                        unicast = fragment >= self.multicast_fragments
+                    if unicast:
+                        for step in cutlass.range_constexpr(1, self.tp + 1):
+                            destination = (self.rank + step) % self.tp
+                            peer_base = cute.arch.load(
+                                (peer_mailboxes.iterator + destination).llvm_ptr,
+                                Int64,
+                            )
+                            store_global_u32x4(
+                                peer_base + mailbox_element * 2, packed_words
+                            )
+                    else:
+                        stmc_bf16x8(
+                            contribution_mailbox_multicast_address
+                            + mailbox_element * 2,
+                            packed_words,
+                        )
+                else:
+                    stmc_bf16x8(
+                        contribution_mailbox_multicast_address + mailbox_element * 2,
+                        packed_words,
+                    )
+
+        if cutlass.const_expr(self.bulk_peer_stores):
+            first_fragment = cta_in_token * self.threads
+            if first_fragment >= self.multicast_fragments:
+                store_shared_u32x4(staging + tidx * 4, packed_words)
+                fence_proxy_async_shared_cta()
+                cute.arch.barrier()
+                if tidx < self.tp:
+                    destination = (tidx + (self.rank + 1)) % self.tp
+                    peer_base = cute.arch.load(
+                        (peer_mailboxes.iterator + destination).llvm_ptr,
+                        Int64,
+                    )
+                    chunk_element = (
+                        (Int64(stage) * self.tp + self.rank) * self.capacity_m
+                        + Int64(token)
+                    ) * self.hidden + Int64(first_fragment) * VEC_BF16
+                    valid = self.fragments - first_fragment
+                    if valid > self.threads:
+                        valid = Int32(self.threads)
+                    bulk_store_shared_to_global(
+                        peer_base + chunk_element * 2,
+                        Int32(staging.toint()),
+                        valid * 16,
+                    )
+                    bulk_wait_group_read(0)
 
         if cutlass.const_expr(not self.release_before_store):
             if block == 0 and tidx == 0:
