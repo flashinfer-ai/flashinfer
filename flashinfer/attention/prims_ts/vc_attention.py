@@ -87,23 +87,29 @@ def vc_mean_operand_shape(head_dim: int) -> tuple[int, int]:
 class VCAttentionConfig:
     """Compile-time VC-Attention-QK16 recipe of one plan.
 
-    ``k_block_size`` tokens share one restored value mean. The kernel supports
-    its 128-token K/V tile only. A non-zero ``repair_tiles`` selects V repair
-    instead of the tile means. That many 128-row K/V tiles of quantization
-    residuals from ``vc_quantize_repair`` follow the sequence and only add to
-    the output.
+    With demean on, the default, the kernel restores the tile means. Each
+    128-token K/V tile stores E4M3 residuals around its bf16 mean and the
+    kernel adds the mean back. With demean off the means are zero and the
+    kernel skips that step. This is the plan for the steps after the V-Smooth
+    window. The demean flag changes per denoising step while a plan is
+    compiled once, so a caller holds one plan of each kind.
+
+    A positive repair tile count selects V repair and needs demean off. The
+    preprocessor appends that many 128-row tiles of the largest quantization
+    residuals after the sequence and the kernel adds them to the output. Each
+    repair tile costs one extra K/V tile of attention work. Budgets of two to
+    five percent of the sequence were used so far and the count cannot exceed
+    the number of sequence tiles.
     """
 
-    k_block_size: int = VC_K_BLOCK_SIZE
+    demean: bool = True
     repair_tiles: int = 0
 
     def __post_init__(self) -> None:
-        if self.k_block_size != VC_K_BLOCK_SIZE:
-            raise ValueError(
-                f"k_block_size must be {VC_K_BLOCK_SIZE}, got {self.k_block_size}"
-            )
         if self.repair_tiles < 0:
             raise ValueError(f"repair_tiles must be >= 0, got {self.repair_tiles}")
+        if self.repair_tiles and self.demean:
+            raise ValueError("repair_tiles requires demean=False")
 
 
 def vc_repair_tiles(seq_len_kv: int, budget: float) -> int:
@@ -129,15 +135,11 @@ class VCAttentionParams:
     ``tile_means`` is the packed bf16 mean operand ``[B, Hkv,
     ceil(num_kv_tiles / 16), 16, 256]`` from ``pack_vc_tile_means`` (means already divided by
     ``v_scale``). The scale must be positive and finite. The kernel does not
-    check it. ``demean`` says whether the run restores the means. It is
-    ``False`` after the V-Smooth window, when they are zero and the kernel
-    skips the mean steps, so it changes per run. A V repair plan takes no
-    ``tile_means``.
+    check it. A plan with demean off takes no ``tile_means``.
     """
 
     v_scale: torch.Tensor
     tile_means: torch.Tensor | None
-    demean: bool = True
 
 
 def vc_scale_shapes(
@@ -149,10 +151,9 @@ def vc_scale_shapes(
     head_dim: int,
 ) -> dict[str, tuple[int, ...]]:
     """Return the shape of every ``VCAttentionParams`` tensor a plan consumes, by field name."""
-    repairs_v = config.repair_tiles > 0
-    if repairs_v:
+    if not config.demean:
         return {"v_scale": (batch_size, num_kv_heads, head_dim)}
-    num_kv_tiles = _blocks(seq_len_kv, config.k_block_size)
+    num_kv_tiles = _blocks(seq_len_kv, VC_K_BLOCK_SIZE)
     return {
         "v_scale": (batch_size, num_kv_heads, head_dim),
         "tile_means": (
@@ -182,6 +183,8 @@ def validate_vc_params(
     """
     if not isinstance(params, VCAttentionParams):
         raise TypeError("vc must be a VCAttentionParams instance")
+    if "tile_means" not in expected_shapes and params.tile_means is not None:
+        raise ValueError("tile_means must be None on a plan with demean off")
     for name, expected_shape in expected_shapes.items():
         tensor = getattr(params, name)
         if not isinstance(tensor, torch.Tensor):
@@ -232,9 +235,7 @@ class VCAttentionOperands:
     @property
     def params(self) -> "VCAttentionParams":
         """The per-run operands ``BatchPrefillTSWrapper.run`` takes as ``vc``."""
-        return VCAttentionParams(
-            v_scale=self.v_scale, tile_means=self.mu, demean=self.demean
-        )
+        return VCAttentionParams(v_scale=self.v_scale, tile_means=self.mu)
 
 
 def _blocks(length: int, block: int) -> int:
@@ -478,7 +479,7 @@ def vc_quantize(
         v=v8,
         v_scale=v_scale,
         mean=mean,
-        mu=mu,
+        mu=mu if demean else None,
         perm=perm,
         demean=demean,
     )

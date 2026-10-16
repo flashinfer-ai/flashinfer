@@ -145,7 +145,9 @@ def _run_case(case: _VCCase):
             seq_len=case.seq_len,
             num_heads=case.num_heads,
             sm_scale=sm_scale,
-            vc_config=VCAttentionConfig(repair_tiles=ops.repair_tiles),
+            vc_config=VCAttentionConfig(
+                demean=ops.demean, repair_tiles=ops.repair_tiles
+            ),
         )
         out = wrapper.run(q, ops.k, ops.v, vc=ops.params)
     reference = vca.vc_reference(q, ops, sm_scale=sm_scale)
@@ -178,9 +180,9 @@ def test_vc_attention_matches_dequantized_reference(case: _VCCase):
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.arch_blackwell
 def test_vc_mean_step():
-    """A constant tile mean shifts every output by exactly that constant. With zero
-    tile means, demean=False (mean UMMA skipped) equals demean=True bit for bit and
-    differs from a run whose means are non-zero."""
+    """A constant tile mean shifts every output by exactly that constant. A plan
+    with demean off equals the means plan fed zero tile means and differs from a
+    run whose means are non-zero."""
     q, k, v = _random_inputs(1, 1024, 2)
     ops = vca.vc_quantize(k, v)
     wrapper = BatchPrefillTSWrapper()
@@ -197,14 +199,24 @@ def test_vc_mean_step():
         atol=1.6e-2,
     )
     plain = vca.vc_quantize(k, v, perm=ops.perm, demean=False)
-    assert plain.params.demean is False
-    out_off = wrapper.run(q, plain.k, plain.v, vc=plain.params)
-    out_on = wrapper.run(q, plain.k, plain.v, vc=replace(plain.params, demean=True))
-    assert torch.equal(out_on, out_off)
-    out = wrapper.run(q, ops.k, ops.v, vc=ops.params)
-    assert not torch.equal(
-        out, wrapper.run(q, ops.k, ops.v, vc=replace(ops.params, demean=False))
+    assert plain.params.tile_means is None
+    wrapper_off = BatchPrefillTSWrapper()
+    _plan(
+        wrapper_off,
+        batch_size=1,
+        seq_len=1024,
+        num_heads=2,
+        vc_config=VCAttentionConfig(
+            demean=plain.demean, repair_tiles=plain.repair_tiles
+        ),
     )
+    out_off = wrapper_off.run(q, plain.k, plain.v, vc=plain.params)
+    zero_mu = vca.pack_vc_tile_means(torch.zeros_like(ops.mean), plain.v_scale)
+    out_on = wrapper.run(
+        q, plain.k, plain.v, vc=replace(plain.params, tile_means=zero_mu)
+    )
+    torch.testing.assert_close(out_on, out_off, rtol=0, atol=0)
+    assert not torch.equal(wrapper.run(q, ops.k, ops.v, vc=ops.params), outs["zero"])
 
 
 @_REQUIRES_CONTEXT_GPU
@@ -230,16 +242,10 @@ def test_vc_mean_step():
         ),
         pytest.param({"num_qo_heads": 2}, ValueError, "equal Q and K/V head", id="gqa"),
         pytest.param(
-            {"vc_config": {"k_block_size": 128}},
+            {"vc_config": {"repair_tiles": 0}},
             TypeError,
             "VCAttentionConfig instance",
             id="dict-config",
-        ),
-        pytest.param(
-            {"vc_config": lambda: VCAttentionConfig(k_block_size=64)},
-            ValueError,
-            "k_block_size must be",
-            id="k-block-64",
         ),
     ),
 )
@@ -294,7 +300,9 @@ def test_vc_run_rejects_mismatched_operands():
             repair.k,
             repair.v,
             vc=repair.params,
-            vc_config=VCAttentionConfig(repair_tiles=repair.repair_tiles),
+            vc_config=VCAttentionConfig(
+                demean=repair.demean, repair_tiles=repair.repair_tiles
+            ),
         )
 
 

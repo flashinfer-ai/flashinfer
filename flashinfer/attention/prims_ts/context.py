@@ -163,11 +163,7 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
-    # Placeholders bound to the VC-Attention-QK16 operand slots of non-VC plans.
-    empty_vc_mu: torch.Tensor
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
-    vc_ctrl_on: Optional[torch.Tensor] = None
-    vc_ctrl_off: Optional[torch.Tensor] = None
     # Output scale of VC runs: the per-channel V scale times the planned or passed scale.
     vc_output_scale: Optional[torch.Tensor] = None
 
@@ -296,10 +292,7 @@ def _make_context_kernel(
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
-    vc_k_block_size: int = 0,
-    vc_num_q_heads: int = 0,
-    vc_head_dim_v: int = 128,
-    vc_repair_tiles: int = 0,
+    vc_attention: str | None = None,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -349,10 +342,7 @@ def _make_context_kernel(
         enable_skip_correction=True,
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
-        vc_k_block_size=vc_k_block_size,
-        vc_num_q_heads=vc_num_q_heads,
-        vc_head_dim_v=vc_head_dim_v,
-        vc_repair_tiles=vc_repair_tiles,
+        vc_attention=vc_attention,
         **paged_kwargs,
     )
     return fmha
@@ -1823,10 +1813,9 @@ def _get_compiled_context(
         two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
-        vc_k_block_size=compile_spec.vc.k_block_size if vc_attention else 0,
-        vc_num_q_heads=num_qo_heads if vc_attention else 0,
-        vc_head_dim_v=head_dim_vo or head_dim,
-        vc_repair_tiles=compile_spec.vc.repair_tiles if vc_attention else 0,
+        vc_attention=("means" if compile_spec.vc.demean else "outliers")
+        if vc_attention
+        else None,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1858,13 +1847,13 @@ def _get_compiled_context(
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
-        vc_mu: cute.Tensor,
-        vc_ctrl: cute.Tensor,
+        vc_mu: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
+        static_vc_repair_tiles: cutlass.Constexpr[int],
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
@@ -1886,7 +1875,7 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 vc_mu=vc_mu,
-                vc_ctrl=vc_ctrl,
+                vc_repair_tiles=static_vc_repair_tiles,
             )
         else:
             fmha(
@@ -1902,7 +1891,7 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 vc_mu=vc_mu,
-                vc_ctrl=vc_ctrl,
+                vc_repair_tiles=static_vc_repair_tiles,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1944,9 +1933,9 @@ def _get_compiled_context(
     out_fake = fake_compact(output_dtype, out_shape, 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     if vc_attention:
-        # Per-(batch, q head, channel) V residual scale table.
+        # Per-channel V residual scale table, one row per batch and head.
         output_scale_fake = fake_compact(
-            cutlass.Float32, (batch_size * num_qo_heads * head_dim_vo,), 64
+            cutlass.Float32, (batch_size, num_qo_heads, head_dim_vo), 64
         )
     else:
         output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
@@ -1968,20 +1957,22 @@ def _get_compiled_context(
     variable_window_cta_starts_fake = fake_compact(
         cutlass.Int32, variable_window_cta_shape, 4
     )
-    vc_mu_shape: tuple[object, ...] = (1, 1, 1, 1, 1)
+    vc_mu_fake = None
     if vc_attention:
         if packed:
             raise RuntimeError("VC-Attention-QK16 context requires fixed tensors")
-        if not compile_spec.vc.repair_tiles:
-            vc_mu_shape = vc_scale_shapes(
-                compile_spec.vc,
-                batch_size=batch_size,
-                seq_len_kv=max_seq_len_k,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim_vo or head_dim,
-            )["tile_means"]
-    vc_mu_fake = fake_compact(cutlass.BFloat16, vc_mu_shape, 16)
-    vc_ctrl_fake = fake_compact(cutlass.Int32, (1,), 4)
+        if compile_spec.vc.demean:
+            vc_mu_fake = fake_compact(
+                cutlass.BFloat16,
+                vc_scale_shapes(
+                    compile_spec.vc,
+                    batch_size=batch_size,
+                    seq_len_kv=max_seq_len_k,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim_vo or head_dim,
+                )["tile_means"],
+                16,
+            )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -2001,12 +1992,12 @@ def _get_compiled_context(
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
             vc_mu_fake,
-            vc_ctrl_fake,
             stream_fake,
             max_active_clusters,
             packed,
             max_seq_len_q,
             max_seq_len_k,
+            compile_spec.vc.repair_tiles if vc_attention else 0,
             options=_COMPILE_OPTIONS,
         )
     policy = (
@@ -2684,9 +2675,9 @@ class BatchPrefillTSWrapper:
         if geometry.vc is not None:
             output_scale_tensor = torch.full(
                 (
-                    geometry.batch_size
-                    * geometry.num_qo_heads
-                    * (geometry.head_dim_vo or geometry.head_dim),
+                    geometry.batch_size,
+                    geometry.num_qo_heads,
+                    geometry.head_dim_vo or geometry.head_dim,
                 ),
                 output_scale,
                 dtype=torch.float32,
@@ -2723,9 +2714,6 @@ class BatchPrefillTSWrapper:
         # making plan publication atomic, this lets compute-sanitizer patch the
         # generated attention kernel without interleaving later PyTorch setup
         # launches with the DSL compiler/runtime callbacks.
-        empty_vc_mu = torch.zeros(
-            (1, 1, 1, 1, 1), dtype=torch.bfloat16, device=geometry.device
-        )
         vc_shapes = None
         if vc_config is not None:
             vc_shapes = vc_scale_shapes(
@@ -2745,10 +2733,7 @@ class BatchPrefillTSWrapper:
             variable_window_cta_starts=variable_window_cta_starts,
             compiled=compiled,
             policy=policy,
-            empty_vc_mu=empty_vc_mu,
             vc_scale_shapes=vc_shapes,
-            vc_ctrl_on=torch.ones((1,), dtype=torch.int32, device=geometry.device),
-            vc_ctrl_off=torch.zeros((1,), dtype=torch.int32, device=geometry.device),
             vc_output_scale=vc_output_scale_buffer,
         )
 
@@ -2836,17 +2821,14 @@ class BatchPrefillTSWrapper:
                 "by a plan without VC-Attention-QK16"
             )
         vc_output_scale: Optional[torch.Tensor] = None
-        vc_ctrl = state.vc_ctrl_on
-        vc_mu = state.empty_vc_mu
+        vc_mu: Optional[torch.Tensor] = None
         if vc is not None:
             if validate:
                 validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
-            if vc.tile_means is not None:
-                vc_mu = vc.tile_means
-            # VC plans have equal Q and K/V head counts, so the [B, H, D] scale is
-            # already in output order.
-            vc_output_scale = vc.v_scale.reshape(-1)
-            vc_ctrl = state.vc_ctrl_on if vc.demean else state.vc_ctrl_off
+            vc_mu = vc.tile_means
+            # VC plans have equal Q and K/V head counts, so the per-channel V
+            # scale is already in output order.
+            vc_output_scale = vc.v_scale
         if validate:
             _validate_runtime_inputs(
                 q,
@@ -2951,7 +2933,6 @@ class BatchPrefillTSWrapper:
             runtime_window_ends,
             runtime_window_cta_starts,
             vc_mu,
-            vc_ctrl,
         )
         return out
 
@@ -3360,16 +3341,18 @@ def batch_prefill(
     if vc_config is not None and vc is None:
         raise ValueError("vc_config requires the vc operands of this call")
     if (vc_config is not None and vc_config.repair_tiles) or (
-        vc is not None and vc.tile_means is None
+        vc_config is None and vc is not None and vc.tile_means is None
     ):
         # The K/V rows of V repair operands include the repair tiles, so the
-        # plan bounds cannot be derived from the operands alone.
+        # plan bounds cannot be derived from the operands alone. Without a
+        # config, operands with no tile means may be repair operands.
         raise NotImplementedError(
             "batch_prefill does not run V repair operands; plan "
-            "BatchPrefillTSWrapper with VCAttentionConfig(repair_tiles=...)"
+            "BatchPrefillTSWrapper with VCAttentionConfig(repair_tiles=...), or "
+            "pass vc_config=VCAttentionConfig(demean=False) for plain operands"
         )
     if vc is not None and vc_config is None:
-        vc_config = VCAttentionConfig()
+        vc_config = VCAttentionConfig(demean=vc.tile_means is not None)
     geometry = _resolve_geometry(
         q,
         k,

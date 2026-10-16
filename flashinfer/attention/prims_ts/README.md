@@ -470,7 +470,6 @@ afterwards. `vc_quantize` is the torch reference of the same preparation.
 | Q/K dtype | `torch.bfloat16` |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
-| `k_block_size` | 128 (the K/V tile whose mean is restored) |
 | Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"`; runs the two-CTA UMMA form |
 
 ### Operand tensors
@@ -478,12 +477,14 @@ afterwards. `vc_quantize` is the torch reference of the same preparation.
 `v_scale` is the `[B, Hkv, D]` fp32 per-channel residual scale and
 `tile_means` the packed bf16 `[B, Hkv, ceil(Skv / 2048), 16, 256]` mean operands
 from `pack_vc_tile_means`; both are contiguous and 16-byte aligned on the run
-device, and a validating `run()` checks them against the plan. `demean` says
-whether the run restores the means (`False` after the V-Smooth window, when
-they are zero). `VCAttentionPreprocessor.prepare` and `vc_quantize` (two CuTe
+device, and a validating `run()` checks them against the plan. The plan's
+`VCAttentionConfig` sets `demean`. It is off after the V-Smooth window, when
+the means are zero, so a caller holds one plan of each kind and picks by
+`ops.demean`. `VCAttentionPreprocessor.prepare` and `vc_quantize` (two CuTe
 DSL kernels) return them with the permuted K and the E4M3 V as
-`VCAttentionOperands`, whose `.params` is the run-time object; `vc_quantize_repair`
-builds the V repair operands instead (`VCAttentionConfig(repair_tiles=...)`).
+`VCAttentionOperands`, whose `.params` is the run-time object. `vc_quantize_repair`
+builds the V repair operands instead and their plan has demean off and a positive
+`repair_tiles`.
 
 ### Example
 
@@ -492,16 +493,18 @@ from flashinfer.attention.prims_ts import (
     BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor,
 )
 
-wrapper = BatchPrefillTSWrapper()
-wrapper.plan(
-    device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
-    num_qo_heads=H, num_kv_heads=H, head_dim=128,
-    q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, v_dtype=torch.float8_e4m3fn,
-    out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(),
-)
+wrappers = {}
+for demean in (True, False):
+    wrappers[demean] = BatchPrefillTSWrapper()
+    wrappers[demean].plan(
+        device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
+        num_qo_heads=H, num_kv_heads=H, head_dim=128,
+        q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, v_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),
+    )
 prep = VCAttentionPreprocessor()
 ops = prep.prepare(k_bf16, v_bf16, denoise_step=(step, num_steps))
-out = wrapper.run(q_bf16, ops.k, ops.v, vc=ops.params)
+out = wrappers[ops.demean].run(q_bf16, ops.k, ops.v, vc=ops.params)
 ```
 
 The one-shot `batch_prefill(..., vc=ops.params)` plans the recipe from the

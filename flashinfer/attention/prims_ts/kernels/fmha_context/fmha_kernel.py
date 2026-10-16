@@ -680,7 +680,7 @@ def build_context_task_manager(
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     tma_mu_desc: cutlass.Pointer | None = None,
-    vc_ctrl: cute.Tensor | None = None,
+    vc_repair_tiles: int = 0,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
     domain_n_kwargs: DomainKwargs,
@@ -1072,8 +1072,9 @@ def build_context_task_manager(
             name="smem_v",
             **kv_resource_kwargs,
         )
-    # VC-Attention-QK16: one bf16 tile-mean operand per K/V tile, staged by the load
-    # warp in lockstep with V and consumed by the UMMA warp's mean step.
+    # Mu is the per-tile mean of V. It is a UMMA operand like K and V,
+    # so it must sit in shared memory. The load warp stages it beside
+    # each V tile and the UMMA warp consumes it.
     smem_mu: SmemMuResource | None = None
     if cfg.vc_restores_means:
         smem_mu_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -1208,6 +1209,7 @@ def build_context_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         smem_p=smem_p0,
+        vc_repair_tiles=vc_repair_tiles,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1301,6 +1303,7 @@ def build_context_task_manager(
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             smem_p=smem_p1,
+            vc_repair_tiles=vc_repair_tiles,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1346,7 +1349,6 @@ def build_context_task_manager(
         tmem_vec1_resource=tmem_vec1,
         smem_p0_resource=smem_p0,
         smem_p1_resource=smem_p1,
-        vc_ctrl=vc_ctrl,
         name="tmem_o",
         **tmem_o_kwargs,
     )
@@ -2624,7 +2626,7 @@ def build_fmha_task_manager(
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     tma_mu_desc: cutlass.Pointer | None = None,
-    vc_ctrl: cute.Tensor | None = None,
+    vc_repair_tiles: int = 0,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
@@ -2718,7 +2720,7 @@ def build_fmha_task_manager(
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
         tma_mu_desc=tma_mu_desc,
-        vc_ctrl=vc_ctrl,
+        vc_repair_tiles=vc_repair_tiles,
         num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
         domain_n_kwargs=domain_policy.domain_n_kwargs,
@@ -2831,10 +2833,7 @@ class FmhaTs:
         causal_single_kv_tile: bool = False,
         exhaustive_deadlock_race_check: bool = True,
         d_v: int | None = None,
-        vc_k_block_size: int = 0,
-        vc_num_q_heads: int = 0,
-        vc_head_dim_v: int = 128,
-        vc_repair_tiles: int = 0,
+        vc_attention: str | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -2915,10 +2914,7 @@ class FmhaTs:
         cfg.two_cta_umma = two_cta_umma
         if two_cta_umma:
             cfg.cluster_shape_mn = (2, 1)
-        cfg.vc_k_block_size = vc_k_block_size
-        cfg.vc_num_q_heads = vc_num_q_heads
-        cfg.vc_head_dim_v = vc_head_dim_v
-        cfg.vc_repair_tiles = vc_repair_tiles
+        cfg.vc_attention = vc_attention
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         self.cfg = cfg
         # Compact Q and staged O fit two resident query tiles plus the K/V
@@ -3119,14 +3115,14 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
         vc_mu: cute.Tensor | None = None,
-        vc_ctrl: cute.Tensor | None = None,
+        vc_repair_tiles: int = 0,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
-        VC-Attention-QK16 takes ``vc_mu`` ([B, Hkv, ceil(num_kv_tiles / 16), 16, 256] bf16, the
-        host-packed tile-mean UMMA operands) and ``vc_ctrl`` (one Int32, 1 to
-        restore the tile means and 0 for the plain kernel after the V-Smooth
-        window).
+        VC-Attention-QK16 adds two inputs. The tile means are the bf16 UMMA
+        operands packed by the host, sixteen tiles per group. The repair tile
+        count is a compile-time constant giving how many outlier tiles end
+        the K/V loop of an outlier plan.
 
         ``scale_softmax_log2`` and ``output_scale`` must be one-element float32
         device tensors. Example host values are
@@ -3335,7 +3331,7 @@ class FmhaTs:
         if cutlass.const_expr(cfg.vc_restores_means):
             if cutlass.const_expr(vc_mu is None):
                 raise ValueError("VC-Attention-QK16 requires vc_mu")
-            mu_rows, mu_cols = vc_mean_operand_shape(cfg.vc_head_dim_v)
+            mu_rows, mu_cols = vc_mean_operand_shape(cfg.pv_mma_tiler[1])
             tma_mu_desc = cuda.create_tensor_map_tiled_from_view(
                 vc_mu,
                 # Two-CTA loads the half of the rows its channels need.
@@ -3454,7 +3450,7 @@ class FmhaTs:
             variable_window_cta_starts,
             Int32(s_q),
             tma_mu_desc,
-            vc_ctrl,
+            vc_repair_tiles,
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -3496,7 +3492,7 @@ class FmhaTs:
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
         tma_mu_desc: cutlass.GridConstant[cuda.TensorMap],
-        vc_ctrl: cute.Tensor | None,
+        vc_repair_tiles: cutlass.Constexpr[int] = 0,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -3565,7 +3561,7 @@ class FmhaTs:
             output_scale=output_scale,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
-            vc_ctrl=vc_ctrl if cfg.vc_restores_means else None,
+            vc_repair_tiles=vc_repair_tiles,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,
             clc_response_ptr=clc_response_ptr,
