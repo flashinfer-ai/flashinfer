@@ -1100,7 +1100,8 @@ struct FlashAlibiDecode : AttentionVariantBase {
 
 if __name__ == "__main__":
     test_single_decode_mask()
-    test_flash_sigmoid()
+    test_flash_sigmoid(128, 8, 8, 1027, 2e-2)
+    test_flash_sigmoid(32, 128, 8, 4096, 1e-1)
     test_dump_logits()
     test_batch_decode_flash_sigmoid(False)
     test_batch_decode_flash_sigmoid(True)
