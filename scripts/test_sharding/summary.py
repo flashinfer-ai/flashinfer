@@ -747,6 +747,7 @@ def _detect_gpu_name() -> str:
     return "unknown"
 
 
+@lru_cache(maxsize=1)
 def _runtime_version_line() -> str:
     """Format runtime and dependency versions as space-separated name=value pairs."""
     versions = [
