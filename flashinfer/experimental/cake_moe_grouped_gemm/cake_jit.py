@@ -44,11 +44,7 @@ from . import cake_build
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_05498a17b6c266797a62": {
         "kernel": "kernel_cake_moe_grouped_gemm_05498a17b6c266797a62",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_05498a17b6c266797a62_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_05498a17b6c266797a62_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_05498a17b6c266797a62",
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "partials"],
@@ -68,19 +64,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "abbfa115c214e49b89626e627d72e3afa13014359b48220d92f5fd857a043344",
-            "sm_103a": "52d1a8e2658ba012514bc589f462c077ee228b0fbf0a262db4b9d7b6a550a623",
-            "sm_107a": "e4c396a0d972a4f789792e789a99cf8471b1252984c162a480c8230aa5e1ed46",
-        },
     },
     "cake_moe_grouped_gemm_1edcad995dcc790600cb": {
         "kernel": "kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_1edcad995dcc790600cb_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_1edcad995dcc790600cb_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_1edcad995dcc790600cb",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -98,19 +85,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "fa648c04b22543a51dc0304904b2e26c6a0353c02581e9762493d14dd8343ac0",
-            "sm_103a": "ebc610dea0a23724755fd2a7c06bf1b8016c855c1343ad984334f70c31ff39e0",
-            "sm_107a": "b510f7c4acaa0c9ab610d4c71ef639637f667bb15c743f64147cc87140b09979",
-        },
     },
     "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb": {
         "kernel": "kernel_cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -128,19 +106,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "abf84e571383ff0278d803512b2d92ae1bad287ebb351a0fdf3db5237db27409",
-            "sm_103a": "4d7ef5c662fdc78fbda315ab684cd737dfcfd94ce3b2668cd141efcd7b0b865a",
-            "sm_107a": "ef3292e9e48676eb3f26bbbd3d20c385f462aec2bf1932a24f9caf11112f7d84",
-        },
     },
     "cake_moe_grouped_gemm_611af0ca12365b0e7c3b": {
         "kernel": "kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_611af0ca12365b0e7c3b_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_611af0ca12365b0e7c3b_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -163,18 +132,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": {
-            "sm_100a": "39386f1dc339419bb3f6222994e917d840e9f25d235d46b9cc932369bfe9ded8",
-            "sm_103a": "6bf2ac1b3644c1f0c8b342933fa832e73ed16df0519ea82a90a7122eaef52946",
-        },
     },
     "cake_moe_grouped_gemm_7ac85aef90878e42ea02": {
         "kernel": "kernel_cake_moe_grouped_gemm_7ac85aef90878e42ea02",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_7ac85aef90878e42ea02_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_7ac85aef90878e42ea02_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_7ac85aef90878e42ea02",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -197,19 +158,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "faaf1db3e955f61855255922a9f6c91605f54057f46382194410b70efbe77c55",
-            "sm_103a": "71a89cf2996e30a30a94787f67663c080df39281b0ba5344d62fa19896d2a52f",
-            "sm_107a": "e2c2a69e1d3e7f4f9f8d5ad7f56e5178ec3fda84046589207cb5cd2d0fc02bed",
-        },
     },
     "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c": {
         "kernel": "kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_bc774d802e4f0b3ac27c_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_bc774d802e4f0b3ac27c_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "partials"],
@@ -229,19 +181,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "2b4f8b7d1972d2b3d9bd22216efe03d676afc7181d9bda2e03d97259db3956c9",
-            "sm_103a": "d8fab5232bb4e5a4552cf1e9c1cf7d65ca7fe19a77152cece9f24eb6d4ebf6a8",
-            "sm_107a": "b417bf2fe46c7dbe5da3bf6966f7c0d04ca4685cbcfa7a48c695e236f479b7de",
-        },
     },
     "cake_moe_grouped_gemm_d77aff0f30a2661aecc8": {
         "kernel": "kernel_cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_d77aff0f30a2661aecc8_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_d77aff0f30a2661aecc8_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -264,18 +207,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": {
-            "sm_100a": "042280f0088f3d85f54297503c051d6b8c0849442fe20a734d448423d666e207",
-            "sm_103a": "9373772f4982086b10ce549a55f7eb87344c302e7fc53480e87716033b494fbf",
-        },
     },
     "cake_moe_grouped_gemm_ed9a74f36ba13a52183d": {
         "kernel": "kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_ed9a74f36ba13a52183d_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_ed9a74f36ba13a52183d_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -298,11 +233,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "3942edc8283280f84d90b2b11362ed0b4a9196ce35a53d228efee5047aad77b9",
-            "sm_103a": "c2247708f998a7669f3a82661945196cc392ffbd2c88258f713d54bee06db623",
-            "sm_107a": "7e9e44e57903afe5ec70e767ea0ce4e0415bc39910d601bb49c79459ca020cfe",
-        },
     },
 }
 ROUTES: dict[str, dict[str, Any]] = {
