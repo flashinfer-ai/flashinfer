@@ -1275,8 +1275,8 @@ def test_trtllm_batch_decode(
 @pytest.mark.parametrize(
     "max_in_kv_len", [64, 256], ids=["window-does-not-bind", "window-binds"]
 )
-def test_trtllm_batch_decode_window_selection(max_in_kv_len: int) -> None:
-    """Exercise both sides of the causal-window kernel-selection boundary."""
+def test_trtllm_batch_decode_sliding_window_accuracy(max_in_kv_len: int) -> None:
+    """Check accuracy on both sides of the causal-window kernel-selection boundary."""
     _test_trtllm_batch_decode(
         backend="trtllm-gen",
         kv_layout="HND",

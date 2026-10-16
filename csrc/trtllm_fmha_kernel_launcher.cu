@@ -215,6 +215,12 @@ void trtllm_paged_attention_launcher(
       "variable window starts and ends must be provided together");
   validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
                                 variable_window_token_starts != nullptr);
+  // Keep the public FFI's backward-compatible causal convention at the launcher boundary. A
+  // sliding-window cubin requires a complete pair even though callers may omit the causal right
+  // bound.
+  if (is_causal && window_left >= 0 && window_right == -1) {
+    window_right = 0;
+  }
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -841,9 +847,6 @@ void trtllm_paged_attention_context(
     variable_window_token_starts_ptr = static_cast<int*>(starts.data_ptr());
     variable_window_token_ends_ptr = static_cast<int*>(ends.data_ptr());
   }
-  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
-                                variable_window_token_starts.has_value());
-
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), multi_ctas_kv_counter_buffer.data_ptr(),
@@ -1084,9 +1087,6 @@ void trtllm_ragged_attention(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
   bool const use_fp16_softmax_value = use_fp16_softmax.value_or(false);
   bool const uses_spcompress_value = uses_spcompress.value_or(false);
-
-  validateTrtllmGenWindowConfig(is_causal, window_left, is_causal && window_left >= 0 ? 0 : -1,
-                                /*has_variable_window=*/false);
 
   trtllm_ragged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),

@@ -1128,9 +1128,7 @@ def test_trtllm_ragged_prefill_rejects_noncausal_sliding_window(backend):
     query = torch.empty((1, 1, 128), dtype=torch.bfloat16)
     key = torch.empty_like(query)
     value = torch.empty_like(query)
-    with pytest.raises(
-        NotImplementedError, match="previously the window was silently ignored"
-    ):
+    with pytest.raises(NotImplementedError, match="exposes only window_left"):
         flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=query,
             key=key,

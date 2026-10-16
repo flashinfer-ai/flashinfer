@@ -6288,9 +6288,10 @@ def trtllm_ragged_attention_deepseek(
     batch_size : int
         batch size
     window_left : int
-        The left (inclusive) attention window. ``-1`` selects the full sequence.
-        The ``trtllm-gen`` backend does not support a finite window for
-        non-causal attention; older versions silently ignored that combination.
+        The left (inclusive) window size for the attention window. A value of ``N`` includes the
+        current position and keys up to ``N`` positions to its left; ``-1`` selects the full
+        sequence. The ``trtllm-gen`` ragged interface has no right-window argument, so a finite
+        window is supported only for causal attention.
     cum_seq_lens_q : torch.Tensor
         cumulative sequence lengths for query
     cum_seq_lens_kv : torch.Tensor
@@ -6380,8 +6381,8 @@ def trtllm_ragged_attention_deepseek(
     )
     if backend != "cute-dsl" and not is_causal and window_left >= 0:
         raise NotImplementedError(
-            "trtllm-gen ragged attention does not support non-causal sliding-window "
-            "attention; previously the window was silently ignored"
+            "trtllm-gen ragged attention requires a right-window bound for non-causal "
+            "sliding-window attention, but the ragged interface exposes only window_left"
         )
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
@@ -7008,13 +7009,14 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_kv : torch.Tensor
         cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
     window_left : int = -1
-        Number of tokens to the left of the current query position that remain visible, excluding
-        the current token. ``-1`` means unbounded. Defaults to ``-1``.
+        The left (inclusive) window size for the attention window. A value of ``N`` includes the
+        current position and keys up to ``N`` positions to its left. ``-1`` means unbounded.
+        Defaults to ``-1``.
     window_right : int = -1
-        Number of tokens to the right of the current query position that remain visible, excluding
-        the current token. For backward compatibility, causal attention with ``window_left >= 0``
-        treats ``window_right=-1`` as ``0``. A non-causal fixed window requires a non-negative
-        value. Defaults to ``-1``.
+        The right (inclusive) window size for the attention window. A value of ``N`` includes the
+        current position and keys up to ``N`` positions to its right. For backward compatibility,
+        causal attention with ``window_left >= 0`` treats ``window_right=-1`` as ``0``. A
+        non-causal fixed window requires a non-negative value. Defaults to ``-1``.
     variable_window_token_starts : Optional[torch.Tensor]
         Contiguous int32 tensor with one entry per packed query token. Together with
         ``variable_window_token_ends``, supplies the inclusive K/V interval visible to every query
