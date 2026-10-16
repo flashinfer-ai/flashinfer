@@ -150,9 +150,9 @@ def _tp2_plain_remote_push_enabled() -> bool:
 
 
 def _tp4_remote_push_enabled() -> bool:
-    """Enable the qualified fused TP4 remote-write transport."""
+    """Enable the qualified fused TP4 remote-write transport by default."""
 
-    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
+    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "1") not in ("", "0")
 
 
 def _tp8_owner_reduce_enabled() -> bool:
@@ -1647,8 +1647,8 @@ class _CuTeOneshotBackend:
         )
 
     @staticmethod
-    def _fused_threads() -> int:
-        threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
+    def _fused_threads(default: int = 256) -> int:
+        threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", str(default)))
         return min(512, max(64, (threads // 32) * 32))
 
     @staticmethod
@@ -1661,7 +1661,7 @@ class _CuTeOneshotBackend:
         if (
             state.eager_tables is None
             or state.eager_buffer_bytes is None
-            or inp.dtype not in (torch.float16, torch.bfloat16)
+            or inp.dtype not in (torch.float16, torch.bfloat16, torch.float32)
             or inp.ndim == 0
         ):
             return None
@@ -1673,6 +1673,7 @@ class _CuTeOneshotBackend:
         if (
             state.world_size == 8
             and tp8_owner
+            and inp.dtype in (torch.float16, torch.bfloat16)
             and hidden in (4096, 6144)
             and 2 <= rows <= 8
         ):
@@ -1684,7 +1685,13 @@ class _CuTeOneshotBackend:
             and 1 <= rows <= 32
         ):
             return "stage_remote_push"
-        if state.world_size == 2 and tp2_remote and hidden == 4096 and 1 <= rows <= 32:
+        if (
+            state.world_size == 2
+            and tp2_remote
+            and inp.dtype in (torch.float16, torch.bfloat16)
+            and hidden == 4096
+            and 1 <= rows <= 32
+        ):
             return "stage_remote_push"
         return None
 
@@ -1697,7 +1704,14 @@ class _CuTeOneshotBackend:
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
-        threads = cls._fused_threads()
+        topology_mode = cls._fused_topology_mode(state, inp)
+        threads = cls._fused_threads(
+            512
+            if state.world_size == 4
+            and inp.dtype == torch.float32
+            and topology_mode == "stage_remote_push"
+            else 256
+        )
         override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
         if override > 0:
             ctas_per_row = override
@@ -1710,7 +1724,6 @@ class _CuTeOneshotBackend:
         register_normalize = (hidden_packs + ctas_per_row * threads - 1) // (
             ctas_per_row * threads
         ) <= _REG_PACKS
-        topology_mode = cls._fused_topology_mode(state, inp)
         if topology_mode is not None:
             mode = topology_mode
         elif state.eager_tables is None:
@@ -3184,9 +3197,17 @@ class PCIeOneshotAllReduce:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
+        zero_centered: bool = False,
+        reduction_dtype: torch.dtype | None = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """All-reduce ``inp``, add ``residual``, and apply RMSNorm."""
+        """All-reduce, optionally round, add the residual, then apply RMSNorm.
+
+        The plan declares independent residual, weight, and output dtypes.
+        ``zero_centered`` uses ``1 + weight``; ``reduction_dtype`` rounds the
+        FP32 collective sum before residual addition. Residual output may
+        alias the residual input, retaining FP32 storage across layers.
+        """
         with _device_guard(self.device):
             return self._all_reduce_fused_on_device(
                 inp,
@@ -3196,6 +3217,8 @@ class PCIeOneshotAllReduce:
                 plan=plan,
                 out=out,
                 residual_out=residual_out,
+                zero_centered=zero_centered,
+                reduction_dtype=reduction_dtype,
                 peer_input_ptrs=peer_input_ptrs,
             )
 
@@ -3209,6 +3232,8 @@ class PCIeOneshotAllReduce:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
+        zero_centered: bool = False,
+        reduction_dtype: torch.dtype | None = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Guarded implementation for the fused public entry point."""
@@ -3232,43 +3257,28 @@ class PCIeOneshotAllReduce:
             raise ValueError(
                 "the last input dimension must occupy a multiple of 16 bytes"
             )
-        if residual.device != inp.device:
-            raise ValueError("residual tensor must be on the same device as the input")
-        if residual.shape != inp.shape or residual.dtype != inp.dtype:
-            raise ValueError("residual tensor must match input shape and dtype")
-        if not _is_weak_contiguous(residual):
-            raise ValueError("residual tensor must be weak-contiguous")
-        if weight.device != inp.device:
-            raise ValueError("weight tensor must be on the same device as the input")
-        if weight.shape != (hidden_size,) or weight.dtype != inp.dtype:
-            raise ValueError(
-                "weight tensor must match the input dtype and last dimension"
-            )
-        if not weight.is_contiguous():
-            raise ValueError("weight tensor must be contiguous")
-        if epsilon < 0:
-            raise ValueError("epsilon must be non-negative")
-
-        if out is None:
-            out = torch.empty_like(inp)
-        if residual_out is None:
-            residual_out = torch.empty_like(residual)
-        for name, tensor in (("output", out), ("residual output", residual_out)):
-            if tensor.device != inp.device:
-                raise ValueError(
-                    f"{name} tensor must be on the same device as the input"
-                )
-            if tensor.shape != inp.shape or tensor.dtype != inp.dtype:
-                raise ValueError(f"{name} tensor must match input shape and dtype")
-            if not _is_weak_contiguous(tensor):
-                raise ValueError(f"{name} tensor must be weak-contiguous")
-        if out.data_ptr() == residual_out.data_ptr():
-            raise ValueError("output and residual output must not alias")
-
         if peer_input_ptrs is not None:
             raise ValueError("peer input registration belongs to oneshot preparation")
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
+        if not state.query.surface.endswith(".all_reduce_fused_add_rms_norm"):
+            raise ValueError("fused RMSNorm requires a fused preparation plan")
+        from ._oneshot_preparation import _fused_semantics
+
+        semantics = _fused_semantics(
+            inp.dtype, zero_centered=zero_centered, reduction_dtype=reduction_dtype
+        )
+        if any(
+            semantics[key] != state.query.call[key]
+            for key in ("zero_centered", "reduction_dtype")
+        ):
+            raise ValueError("fused RMSNorm arithmetic differs from the prepared plan")
+        if out is None:
+            out = torch.empty_like(
+                inp, dtype=getattr(torch, state.query.call["output_dtype"])
+            )
+        if residual_out is None:
+            residual_out = torch.empty_like(residual)
         state.run_fused(inp, residual, weight, out, residual_out, float(epsilon))
         return out, residual_out
 
@@ -4004,6 +4014,8 @@ class PCIeOneshotAllReducePool:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
+        zero_centered: bool = False,
+        reduction_dtype: torch.dtype | None = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -4017,6 +4029,8 @@ class PCIeOneshotAllReducePool:
                 plan=plan,
                 out=out,
                 residual_out=residual_out,
+                zero_centered=zero_centered,
+                reduction_dtype=reduction_dtype,
                 peer_input_ptrs=peer_input_ptrs,
                 stream=stream,
                 channel_id=channel_id,
@@ -4032,6 +4046,8 @@ class PCIeOneshotAllReducePool:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
+        zero_centered: bool = False,
+        reduction_dtype: torch.dtype | None = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -4049,6 +4065,8 @@ class PCIeOneshotAllReducePool:
                 plan=plan,
                 out=out,
                 residual_out=residual_out,
+                zero_centered=zero_centered,
+                reduction_dtype=reduction_dtype,
                 peer_input_ptrs=peer_input_ptrs,
             )
 

@@ -96,6 +96,7 @@ class Nvfp4MaterializedPhase1Kernel:
         source_tile_m: int = 128,
         activation: str = "silu",
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -108,6 +109,7 @@ class Nvfp4MaterializedPhase1Kernel:
         self.fast_math = bool(fast_math)
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
 
@@ -302,8 +304,9 @@ class Nvfp4MaterializedPhase1Kernel:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            if cutlass.const_expr(not self.swiglu_clamp_after_silu):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -311,7 +314,11 @@ class Nvfp4MaterializedPhase1Kernel:
         sigmoid = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )
-        return gate * sigmoid * up
+        activated = gate * sigmoid
+        if cutlass.const_expr(self.has_swiglu_limit and self.swiglu_clamp_after_silu):
+            if activated > cutlass.Float32(self.swiglu_limit):
+                activated = cutlass.Float32(self.swiglu_limit)
+        return activated * up
 
     @cute.jit
     def _run_task(

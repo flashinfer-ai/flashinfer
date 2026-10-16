@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 import cutlass
 
@@ -88,6 +89,7 @@ def _make_merge_problem(
     *,
     dtype: torch.dtype = torch.bfloat16,
     counts: list[int] | None = None,
+    head_dim: int = 256,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -101,7 +103,6 @@ def _make_merge_problem(
     device = "cuda"
     counts = [0, 1, 3, 1, 4] if counts is None else counts
     num_heads = 3
-    head_dim = 256
     nnz = sum(counts)
     partial_o = (torch.randn(nnz, num_heads, head_dim, device=device) / 4).to(dtype)
     partial_lse = (
@@ -242,7 +243,8 @@ def _run_laguna_verify_merge_kernel(
 
 
 @torch.inference_mode()
-def test_paged_persistent_merge_matches_reference() -> None:
+@pytest.mark.parametrize("head_dim", [192, 256])
+def test_paged_persistent_merge_matches_reference(head_dim) -> None:
     require_b12x()
     (
         partial_o,
@@ -253,11 +255,12 @@ def test_paged_persistent_merge_matches_reference() -> None:
         total_rows_ptr,
         cache_seqlens,
         kv_chunk_size_ptr,
-    ) = _make_merge_problem()
+    ) = _make_merge_problem(head_dim=head_dim)
     kernel = PagedPersistentMergeKernel(
         cutlass.BFloat16,
         cutlass.BFloat16,
-        head_dim=256,
+        head_dim=head_dim,
+        vec_size=head_dim // 32,
         persistent_ctas=2,
     )
 

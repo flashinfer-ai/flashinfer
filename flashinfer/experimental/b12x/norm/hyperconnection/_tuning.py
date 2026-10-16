@@ -25,8 +25,12 @@ class HyperConnectionQuery:
     eps: float = 1.0e-6
     limit: float = float("inf")
     round_silu: bool = False
+    clamp_after_silu: bool = False
     zero_centered: bool = True
     weight_dtype: str = "bfloat16"
+    add_residual: bool = False
+    gate_stride: int = 0
+    paired: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -115,6 +119,7 @@ def _validate_query(query, device):
         "swiglu",
         "add",
         "sigmoid",
+        "head_gate",
     ):
         raise ValueError("unknown HyperConnection operation")
     if any(
@@ -134,9 +139,11 @@ def _validate_query(query, device):
     )
     if query.operation != "combine_norm" and query.output_mode != expected_mode:
         raise ValueError("output form is not supported by this operation")
-    if query.dtype != "bfloat16":
+    if query.dtype != "bfloat16" and not (
+        query.operation == "grouped_rmsnorm" and query.dtype == "float32"
+    ):
         raise ValueError("HyperConnection state dtype must be bfloat16")
-    if query.operation not in ("add", "sigmoid") and any(
+    if query.operation not in ("add", "sigmoid", "grouped_rmsnorm") and any(
         value != "bfloat16"
         for value in (
             query.left_dtype,
@@ -164,18 +171,47 @@ def _validate_query(query, device):
         raise ValueError(
             "affine normalization controls require a normalization operation"
         )
-    if query.zero_centered and query.weight_dtype != "bfloat16":
+    if (
+        query.operation != "grouped_rmsnorm"
+        and query.zero_centered
+        and query.weight_dtype != "bfloat16"
+    ):
         raise ValueError("zero-centered grouped RMSNorm requires BF16 weights")
+    if type(query.add_residual) is not bool or (
+        query.add_residual and query.operation != "grouped_rmsnorm"
+    ):
+        raise ValueError("residual addition requires grouped RMS normalization")
+    if type(query.gate_stride) is not int or (
+        query.gate_stride < query.streams
+        if query.operation == "head_gate"
+        else query.gate_stride != 0
+    ):
+        raise ValueError("head gates require a row stride covering every head")
+    if type(query.paired) is not bool or (
+        query.paired
+        and (
+            query.operation != "grouped_rmsnorm"
+            or query.streams != 2
+            or query.add_residual
+            or query.dtype != "bfloat16"
+        )
+    ):
+        raise ValueError(
+            "paired normalization requires two BF16 streams without residual addition"
+        )
     if query.operation == "sigmoid" and query.right_dtype != query.left_dtype:
         raise ValueError("sigmoid uses one input dtype")
     if not math.isfinite(query.eps) or query.eps <= 0:
         raise ValueError("normalization epsilon must be finite and positive")
     if math.isnan(query.limit) or query.limit <= 0:
         raise ValueError("activation limit must be positive or infinity")
-    if type(query.token_mask) is not bool or type(query.round_silu) is not bool:
+    if any(
+        type(value) is not bool
+        for value in (query.token_mask, query.round_silu, query.clamp_after_silu)
+    ):
         raise TypeError("operand and rounding flags must be boolean")
     if query.operation != "swiglu" and (
-        query.round_silu or query.limit != float("inf")
+        query.round_silu or query.clamp_after_silu or query.limit != float("inf")
     ):
         raise ValueError("activation controls apply only to SwiGLU")
     if query.operation != "engram_mix" and query.token_mask:
@@ -225,7 +261,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
-    query_schema_version=23,
+    query_schema_version=27,
     config_schema_version=22,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),

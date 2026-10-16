@@ -49,6 +49,7 @@ class MoeDecodeQuery:
     numerical_recipe: str | None
     controls: FrozenMapping
     shared_input_scales: bool = False
+    swiglu_clamp_after_silu: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -72,6 +73,7 @@ class MoeDecodeQuery:
             "swiglu_alpha": self.swiglu_alpha,
             "swiglu_beta": self.swiglu_beta,
             "swiglu_limit": self.swiglu_limit,
+            "swiglu_clamp_after_silu": self.swiglu_clamp_after_silu,
             "numerical_recipe": self.numerical_recipe,
             "top_k": self.top_k,
             "w13_layout": self.w13_layout,
@@ -813,7 +815,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=28,
+    query_schema_version=29,
     config_schema_version=24,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),

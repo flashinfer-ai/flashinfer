@@ -818,6 +818,7 @@ class MoEDynamicKernelBackend:
         materialize_intermediate: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
@@ -859,6 +860,7 @@ class MoEDynamicKernelBackend:
         self.is_gated = is_gated_moe_activation(activation)
         self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.swiglu_alpha = float(swiglu_alpha)
@@ -1079,6 +1081,7 @@ class MoEDynamicKernelBackend:
                 # supported specialization here.
                 activation=self.activation,
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             )
             self.materialized_phase2_kernel = Nvfp4MaterializedPhase2Kernel(
                 source_tile_m=materialized_source_tile_m,
@@ -1836,8 +1839,9 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            if cutlass.const_expr(not self.swiglu_clamp_after_silu):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -1861,7 +1865,11 @@ class MoEDynamicKernelBackend:
                 fastmath=self.fast_math,
             )
             return situ_gate * situ_up
-        return gate * sigmoid * up_term
+        activated = gate * sigmoid
+        if cutlass.const_expr(self.has_swiglu_limit and self.swiglu_clamp_after_silu):
+            if activated > cutlass.Float32(self.swiglu_limit):
+                activated = cutlass.Float32(self.swiglu_limit)
+        return activated * up_term
 
     @cute.jit
     def _resident_grid_barrier(

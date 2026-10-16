@@ -358,6 +358,7 @@ class A4PackedPrefillGemm:
         terms: int = 1,
         warps: int = NUM_WARPS,
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
     ):
         if phase not in ("fc1", "fc2"):
             raise ValueError(f"unknown A4 prefill phase {phase!r}")
@@ -378,6 +379,7 @@ class A4PackedPrefillGemm:
         self.fast_quant = bool(fast_quant)
         self.terms = int(terms)
         self.has_swiglu_limit = swiglu_limit is not None
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         # Four warps per row group, one per N64 chunk slot; 16 warps own 32 rows
         # each (64 accumulators), 8 warps own 64 rows (128 accumulators).
@@ -416,6 +418,7 @@ class A4PackedPrefillGemm:
             self.terms,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_clamp_after_silu,
             BLOCK_M,
             TILE_K,
             self.warps,
@@ -954,8 +957,9 @@ class A4PackedPrefillGemm:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = Float32(self.swiglu_limit)
             neg_limit = Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            if cutlass.const_expr(not self.swiglu_clamp_after_silu):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -963,7 +967,11 @@ class A4PackedPrefillGemm:
         sigmoid = cute.arch.rcp_approx(
             Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )
-        return self._round(self._round(gate * sigmoid) * self._round(up))
+        activated = gate * sigmoid
+        if cutlass.const_expr(self.has_swiglu_limit and self.swiglu_clamp_after_silu):
+            if activated > Float32(self.swiglu_limit):
+                activated = Float32(self.swiglu_limit)
+        return self._round(self._round(activated) * self._round(up))
 
     # -- kernel --------------------------------------------------------------------
 
@@ -1224,6 +1232,7 @@ def _compile_a4_kernels(
     terms: int,
     warps: int,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool = False,
 ):
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
     from b12x._lib.utils import current_cuda_stream
@@ -1237,6 +1246,7 @@ def _compile_a4_kernels(
         int(terms),
         warps,
         swiglu_limit,
+        swiglu_clamp_after_silu,
     )
     stream = current_cuda_stream()
     quant = b12x_compile(
@@ -1264,6 +1274,7 @@ def _compile_a4_kernels(
                     terms=terms,
                     warps=warps,
                     swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 ),
                 _fake(cutlass.Uint32),
                 _fake(cutlass.Uint32, 4),
@@ -1307,6 +1318,7 @@ def compile_w4a16_a4_prefill(
     terms: int = 1,
     warps: int = NUM_WARPS,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> W4A16A4PrefillLaunches:
     from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
     from b12x.moe._shared.kernels.w4a16.route_pack import (
@@ -1321,6 +1333,7 @@ def compile_w4a16_a4_prefill(
         terms=terms,
         warps=warps,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
     )
     topk_sum = compile_w4a16_topk_sum(
         m=tokens,

@@ -5,6 +5,14 @@ By default this is a pre-routed benchmark: model loading, routing-logit
 generation, top-k selection, compilation, and oracle/reference checks all
 happen outside the timed region. Use ``--include-routing`` to include the
 deterministic top-k + softmax routing step in the measured closure.
+
+Step-5 TP4/C1 with MTP3 verifies four rows. Its checkpoint profile defaults to
+layer 3, NVFP4 W4A4, lossless CSF scales, and the checkpoint's clamp-after-SiLU
+limit. For the expert-sharing sweep, run with ``--model-profile
+step5-preview-nvfp4 --batch-sizes 4 --graph-only --routing-workload shared_N``
+for N in 0, 20, 40, 60, 80. CSF expansion is inside each timed call;
+``--scale-compression none`` measures native scales instead. Autotuning uses
+all five sharing patterns independently of the selected measurement case.
 """
 
 from __future__ import annotations
@@ -20,6 +28,8 @@ import pathlib
 import statistics
 import sys
 from dataclasses import asdict, dataclass, replace
+from fnmatch import fnmatchcase
+from functools import partial
 from typing import Callable, Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
@@ -57,7 +67,7 @@ from benchmarks.experimental.b12x.common import (
 from b12x.testing.reference.w4a16_reference import moe_reference_w4a16
 
 from b12x.moe import fused_moe
-from b12x.preparation import PreparationSession
+from b12x.preparation import PreparationSession, PreparedCall
 from benchmarks.experimental.b12x.moe_preparation import (
     prepared_call,
     request_for_capacity,
@@ -100,6 +110,7 @@ BATCH_SIZE_PROFILES = {
     "micro": LEGACY_BATCH_SIZES,
     "nano35-mtp": NANO35_MTP_BATCH_SIZES,
     "qwen38-flash-next": QWEN38_FLASH_NEXT_BATCH_SIZES,
+    "step5-mtp3": [1, 4],
     "sglang-single-request": RECORDED_SGLANG_SINGLE_REQUEST_BATCH_SIZES,
     "chunked-prefill": CHUNKED_PREFILL_BATCH_SIZES,
 }
@@ -133,12 +144,18 @@ class ActivationParams:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    swiglu_clamp_after_silu: bool = False
 
-    def kwargs(self) -> dict[str, float | None]:
+    def kwargs(self) -> dict[str, float | bool | None]:
         return {
             "swiglu_limit": self.swiglu_limit,
             "swiglu_alpha": self.swiglu_alpha,
             "swiglu_beta": self.swiglu_beta,
+            **(
+                {"swiglu_clamp_after_silu": True}
+                if self.swiglu_clamp_after_silu
+                else {}
+            ),
         }
 
 
@@ -320,12 +337,26 @@ class ModelProfile:
     default_swiglu_limit: float | None = None
     default_swiglu_alpha: float | None = None
     default_swiglu_beta: float | None = None
+    default_swiglu_clamp_after_silu: bool = False
+    default_scale_compression: str | None = None
     default_routing: str = "synthetic"
     default_scale_contract: str = "shared"
     shape: ShapeSpec | None = None
 
 
 MODEL_PROFILES = {
+    "step5-preview-nvfp4": ModelProfile(
+        label="Step-5 Preview NVFP4",
+        checkpoint_family="step5",
+        default_layer_idx=3,
+        tp_size=4,
+        hf_repo_id="stepfun-ai/Step-5-Preview-NVFP4",
+        default_quant_mode="nvfp4",
+        default_swiglu_clamp_after_silu=True,
+        default_scale_compression="csf",
+        default_routing="model",
+        default_scale_contract="per-expert",
+    ),
     "puzzle3-iq2-xs": ModelProfile(
         label="Puzzle 3 IQ2_XS/NVFP4",
         checkpoint_family="puzzle3_iq2_xs",
@@ -784,6 +815,27 @@ def build_model_spec(
         )
 
     cfg = _load_config(model_path)
+    if profile.checkpoint_family == "step5":
+        selected = profile.default_layer_idx if layer_idx is None else layer_idx
+        if cfg.get("model_type") != "step5" or selected not in cfg["moe_layer_list"]:
+            raise ValueError("Step-5 requires a routed-expert layer")
+        if (
+            tp <= 0
+            or not 0 <= tp_rank < tp
+            or cfg["moe_intermediate_size"] % tp
+            or (cfg["moe_intermediate_size"] // tp) % 32
+        ):
+            raise ValueError(
+                "Step-5 requires a valid TP rank and a 32-aligned expert shard"
+            )
+        return ModelSpec(
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=cfg["moe_intermediate_size"],
+            num_experts=cfg["moe_num_experts"],
+            top_k=cfg["moe_top_k"],
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
     if profile.checkpoint_family == "puzzle3_iq2_xs":
         selected = profile.default_layer_idx if layer_idx is None else layer_idx
         block = cfg["block_configs"][selected]
@@ -1280,6 +1332,122 @@ def load_expert_weights(
         g2_alphas = (w2_input_scale * down_gs).to(torch.float32)
         w13_input_scale_per_expert = gate_is
         g1_alphas_per_expert = (gate_is * gate_gs).to(torch.float32)
+    elif checkpoint_family == "step5":
+        raw_cfg = json.loads((model_path / "config.json").read_text())
+        quant = raw_cfg["quantization_config"]
+        prefix = f"model.layers.{layer_idx}.moe"
+        if (
+            activation != "silu"
+            or layer_idx not in cfg["moe_layer_list"]
+            or quant.get("quant_method") != "modelopt"
+            or quant.get("quant_algo") != "NVFP4"
+            or quant.get("group_size") != 16
+        ):
+            raise ValueError("Step-5 benchmark requires ModelOpt NVFP4 SiLU experts")
+        if any(
+            fnmatchcase(f"{prefix}.experts.{eid}.{projection}", pattern)
+            for eid in range(E)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+            for pattern in quant["ignore"]
+        ):
+            raise ValueError(
+                f"Step-5 layer {layer_idx} has unquantized experts; select an NVFP4 layer"
+            )
+
+        def stack(projection, suffix, rows, columns, dtype, dimension, packing):
+            tensor = loader.get_tensor(f"{prefix}.{projection}.{suffix}")
+            if tensor.shape != (E, rows, columns) or tensor.dtype != dtype:
+                raise ValueError(
+                    f"{prefix}.{projection}.{suffix}: unexpected shape or dtype"
+                )
+            width = I_tp // packing
+            return (
+                tensor.narrow(dimension, spec.tp_rank * width, width)
+                .to(device)
+                .contiguous()
+            )
+
+        vectors = {}
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("input_scale", "weight_scale_2"):
+                tensor = loader.get_tensor(f"{prefix}.{projection}.{suffix}")
+                if (
+                    tensor.shape != (E,)
+                    or tensor.dtype != torch.float32
+                    or not bool((torch.isfinite(tensor) & (tensor > 0)).all())
+                ):
+                    raise ValueError(
+                        f"{prefix}.{projection}.{suffix}: expected positive finite FP32 scales"
+                    )
+                vectors[projection, suffix] = tensor
+        for suffix in ("input_scale", "weight_scale_2"):
+            if not torch.equal(
+                vectors["gate_proj", suffix], vectors["up_proj", suffix]
+            ):
+                raise ValueError(
+                    f"{prefix}: gate/up {suffix} differ; fusion would change calibration"
+                )
+
+        print(f"  Loading {E} stacked experts...", end="", flush=True)
+        up_w, gate_w = [
+            stack(p, "weight", spec.intermediate_size, K // 2, torch.uint8, 1, 1)
+            for p in ("up_proj", "gate_proj")
+        ]
+        up_sf, gate_sf = [
+            stack(
+                p,
+                "weight_scale",
+                spec.intermediate_size,
+                K // 16,
+                torch.float8_e4m3fn,
+                1,
+                1,
+            )
+            for p in ("up_proj", "gate_proj")
+        ]
+        w13_layout = "w13"
+        w13_weight = torch.cat((up_w, gate_w), dim=1)
+        w13_blockscale_swizzled = swizzle_block_scale(
+            torch.cat((up_sf, gate_sf), dim=1)
+        )
+        w2_weight = stack(
+            "down_proj", "weight", K, spec.intermediate_size // 2, torch.uint8, 2, 2
+        )
+        w2_blockscale_swizzled = swizzle_block_scale(
+            stack(
+                "down_proj",
+                "weight_scale",
+                K,
+                spec.intermediate_size // 16,
+                torch.float8_e4m3fn,
+                2,
+                16,
+            )
+        )
+        w13_permuted, down_permuted = (
+            w13_weight.permute(1, 2, 0),
+            w2_weight.permute(1, 2, 0),
+        )
+        w13_scale = as_grouped_scale_view(
+            w13_blockscale_swizzled.view(torch.uint8), 2 * I_tp, K
+        )
+        down_scale = as_grouped_scale_view(
+            w2_blockscale_swizzled.view(torch.uint8), K, I_tp
+        )
+        gate_gs = vectors["gate_proj", "weight_scale_2"].to(device)
+        gate_is = vectors["gate_proj", "input_scale"].to(device)
+        down_gs = vectors["down_proj", "weight_scale_2"].to(device)
+        down_is = vectors["down_proj", "input_scale"].to(device)
+        w13_input_scale, w2_input_scale = gate_is.max(), down_is.max()
+        w13_input_scale_per_expert = gate_is
+        g1_alphas, g2_alphas = w13_input_scale * gate_gs, w2_input_scale * down_gs
+        g1_alphas_per_expert = gate_is * gate_gs
+        gate_weight = loader.get_tensor(f"{prefix}.gate.weight").to(device).contiguous()
+        gate_bias = loader.get_tensor(f"{prefix}.router_bias").to(device).contiguous()
+        gate_score_func = "sigmoid"
+        gate_route_scale = float(cfg["moe_router_scaling_factor"])
+        gate_norm_topk_prob = bool(cfg["norm_expert_weight"])
+        print(" done.")
     elif checkpoint_family == "nemotron":
         if activation != "relu2":
             raise ValueError("Nemotron backbone FP4 benchmark expects relu2 experts")
@@ -2072,6 +2240,7 @@ def plan_b12x_benchmark_weights(
     activation: str,
     w4a16_native: bool = False,
     activation_params: ActivationParams | None = None,
+    scale_compression: str | None = None,
 ):
     """Declare the benchmark's canonical checkpoint representation."""
     activation_params = activation_params or ActivationParams()
@@ -2102,6 +2271,7 @@ def plan_b12x_benchmark_weights(
             **activation_params.kwargs(),
         ),
         constraints=fused_moe.WeightPlanConstraints(
+            scale_compression=scale_compression,
             required_packing=(
                 fused_moe.WeightPacking.SOURCE_NATIVE
                 if quant_mode.lower() == "w4a16" and w4a16_native
@@ -2120,6 +2290,7 @@ def prepare_b12x_benchmark_weights(
     w4a16_native: bool = False,
     plan=None,
     activation_params: ActivationParams | None = None,
+    scale_compression: str | None = None,
 ):
     """Prepare canonical weights for a declaration, never an executable plan."""
     quant_mode = quant_mode.lower()
@@ -2130,6 +2301,7 @@ def prepare_b12x_benchmark_weights(
             activation=activation,
             w4a16_native=w4a16_native,
             activation_params=activation_params,
+            scale_compression=scale_compression,
         )
     if weights.source_format in IQ2_CODECS:
         if quant_mode != "w4a16":
@@ -2162,8 +2334,23 @@ def prepare_b12x_benchmark_weights(
             w2_global_scales=w2_global_scale,
             input_scale=params.a1_gscale,
             intermediate_scale=params.a2_gscale,
+            immutable_input_scales=True,
+        ),
+        scale_scratch=(
+            tuple(
+                torch.empty_like(t)
+                for t in (
+                    weights.w13_blockscale_swizzled,
+                    weights.w2_blockscale_swizzled,
+                )
+            )
+            if plan.scale_compression == "csf"
+            else None
         ),
     )
+    if plan.scale_compression == "csf":
+        weights.w13_scale = weights.down_scale = None
+        weights.w13_blockscale_swizzled = weights.w2_blockscale_swizzled = None
     if experts._impl.plan.prepares_runtime_alphas:
         params = ScaleContractParams(
             a1_gscale=experts._impl.a1_gscale,
@@ -2394,6 +2581,17 @@ def make_oracle_reference(
     activation_params = activation_params or ActivationParams()
     spec = weights.spec
     quant_mode = quant_mode.lower()
+    if activation_params.swiglu_clamp_after_silu and not (
+        (quant_mode == "nvfp4" and oracle_mode == "nvfp4")
+        or (
+            quant_mode == "w4a16"
+            and oracle_mode == "f32"
+            and weights.source_format == "modelopt_nvfp4"
+        )
+    ):
+        raise ValueError(
+            "clamp-after-SiLU requires the NVFP4 oracle or the W4A16 f32 oracle"
+        )
     if weights.source_format in IQ2_CODECS:
         from b12x.testing.iq2_xs_reference import moe_reference_iq2_xs
 
@@ -2760,6 +2958,9 @@ def prepare_moe_execution(
     override: fused_moe.MoeDecodeConfig | None = None,
 ) -> object:
     """Prepare each exact benchmark M before binding its real caller buffers."""
+    from b12x.moe.fused_moe.workloads import TUNING_WORKLOAD_VERSION, make_tuning_routes
+    from b12x.preparation._measurement import capture_benchmark_call
+
     capacity = fused_moe.ExecutionCapacity(
         max_tokens=max(inputs),
         top_k=top_k,
@@ -2775,8 +2976,25 @@ def prepare_moe_execution(
             max_active_clusters=None,
             w4a16_route_mode=route_mode,
         )
+    invocation = {"tuning_route_pattern": TUNING_WORKLOAD_VERSION}
+    if experts.has_csf_blocks:
+        invocation["tuning_execution"] = "cuda_graph"
+    scale_plans = (
+        {
+            m: fused_moe.plan_scale_expansion(
+                experts, routes=m * top_k, invocation=invocation
+            )
+            for m in inputs
+        }
+        if experts.has_csf_blocks
+        else {}
+    )
     declaration = fused_moe.plan_execution(
-        experts=experts, capacity=capacity, override=override
+        experts=experts,
+        capacity=capacity,
+        override=override,
+        invocation=invocation,
+        scale_expansion=scale_plans,
     )
     calls = {
         m: prepared_call(
@@ -2794,25 +3012,80 @@ def prepare_moe_execution(
         for m in getattr(declaration, "token_counts", (capacity.max_tokens,))
     }
 
-    def race_call(state, *, tokens):
-        call = calls[tokens](state)
-        source = inputs[tokens][0].clone()
-        return replace(
-            call,
-            produce=lambda: inputs[tokens][0].copy_(source),
-            owners=(*call.owners, source),
+    tuning = {
+        m: (
+            tuple(t.clone() for t in inputs[m]),
+            torch.empty_like(outputs[m]),
+            make_tuning_routes(
+                m, top_k, experts.num_experts, device=inputs[m][0].device
+            ),
         )
+        for m in inputs
+    }
+
+    def produce(tokens, index):
+        operands, _, routes = tuning[tokens]
+        operands[0].copy_(inputs[tokens][0])
+        operands[1].copy_(routes[index])
+        operands[2].copy_(inputs[tokens][2])
+
+    def scale_call(state, ids):
+        active = torch.empty(experts.num_experts, dtype=torch.int32, device=ids.device)
+        binding = state.bind(
+            ids=ids,
+            out13=experts._impl.w1_blockscale,
+            out2=experts._impl.w2_blockscale,
+            scratch=active,
+        )
+        return PreparedCall(run=binding.run, owners=(binding, active, experts))
+
+    def race_call(state, *, tokens, expansion=False):
+        operands, output, routes = tuning[tokens]
+        if expansion:
+            call = scale_call(state, operands[1])
+        else:
+            call = prepared_call(
+                output=output,
+                bind=lambda state, scratch: state.bind(
+                    scratch=scratch,
+                    a=operands[0],
+                    experts=experts,
+                    topk_ids=operands[1],
+                    topk_weights=operands[2],
+                    output=output,
+                    input_scales_static=True,
+                ),
+            )(state)
+        producers = tuple(partial(produce, tokens, i) for i in range(len(routes)))
+        call = replace(
+            call,
+            produce=producers[0],
+            benchmark_producers=producers,
+            owners=(*call.owners, tuning[tokens]),
+        )
+        return capture_benchmark_call(call) if experts.has_csf_blocks else call
 
     benchmark_calls = {
         m: (lambda state, m=m: race_call(state, tokens=m)) for m in calls
     }
     session.prepare(
         (
+            *(
+                plan.request(
+                    name=f"{name}-scales-m{m}",
+                    prepare_call=lambda state, m=m: scale_call(state, inputs[m][1]),
+                    benchmark_call=lambda state, m=m: race_call(
+                        state, tokens=m, expansion=True
+                    ),
+                )
+                for m, plan in scale_plans.items()
+            ),
             request_for_capacity(
                 declaration,
                 name=name,
                 calls=calls,
                 benchmark_calls=benchmark_calls,
+                dependencies=tuple(f"{name}-scales-m{m}" for m in scale_plans),
             ),
         )
     )
@@ -3003,6 +3276,7 @@ def bench_multilayer_graph_mode(
             activation=args.activation,
             w4a16_native=args.w4a16_native,
             activation_params=activation_params,
+            scale_compression=args.scale_compression,
         )
         experts_stack.append(experts)
 
@@ -3284,7 +3558,19 @@ def bench_e2e() -> None:
         "--swiglu-limit",
         type=float,
         default=None,
-        help="Clamp gated SwiGLU inputs before activation; defaults to the model profile value.",
+        help="SwiGLU clamp limit; defaults to the model profile or selected checkpoint layer.",
+    )
+    parser.add_argument(
+        "--swiglu-clamp-after-silu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Clamp the SiLU result rather than its input; defaults to the model profile.",
+    )
+    parser.add_argument(
+        "--scale-compression",
+        choices=("none", "csf"),
+        default=None,
+        help="Lossless expert-scale compression, including expansion in the timed call; profile default if omitted.",
     )
     parser.add_argument(
         "--swiglu-alpha",
@@ -3453,6 +3739,10 @@ def bench_e2e() -> None:
         else None
     )
     model_profile = MODEL_PROFILES[args.model_profile]
+    model_path = resolve_model_path(model_profile, args.model_path)
+    layer_idx = (
+        model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
+    )
     if args.activation is None:
         args.activation = model_profile.default_activation
     args.activation = normalize_moe_activation(args.activation)
@@ -3460,11 +3750,19 @@ def bench_e2e() -> None:
         args.quant_mode = model_profile.default_quant_mode or quant_mode_default
     if args.scale_contract is None:
         args.scale_contract = model_profile.default_scale_contract
+    if args.scale_compression is None:
+        args.scale_compression = model_profile.default_scale_compression
+    elif args.scale_compression == "none":
+        args.scale_compression = None
+    if args.swiglu_clamp_after_silu is None:
+        args.swiglu_clamp_after_silu = model_profile.default_swiglu_clamp_after_silu
     use_w4a16 = args.quant_mode == "w4a16"
     use_w4a8 = args.quant_mode in {"w4a8_mx", "w4a8_nvfp4"}
     swiglu_limit = (
         args.swiglu_limit
         if args.swiglu_limit is not None
+        else _load_config(model_path)["swiglu_limits"][layer_idx]
+        if model_profile.checkpoint_family == "step5"
         else model_profile.default_swiglu_limit
     )
     swiglu_alpha = (
@@ -3481,6 +3779,7 @@ def bench_e2e() -> None:
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        swiglu_clamp_after_silu=args.swiglu_clamp_after_silu,
     )
     args.activation_params = activation_params
     if args.validate is None:
@@ -3488,17 +3787,17 @@ def bench_e2e() -> None:
     if args.oracle_mode is None:
         args.oracle_mode = (
             "f32"
-            if use_w4a16 and args.activation == SWIGLUOAI_UNINTERLEAVE
+            if use_w4a16
+            and (
+                args.activation == SWIGLUOAI_UNINTERLEAVE
+                or args.swiglu_clamp_after_silu
+            )
             else args.quant_mode
         )
     batch_sizes = (
         args.batch_sizes
         if args.batch_sizes is not None
         else BATCH_SIZE_PROFILES[args.batch_size_profile]
-    )
-    model_path = resolve_model_path(model_profile, args.model_path)
-    layer_idx = (
-        model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
     )
 
     if model_profile.checkpoint_family in {"qwen_iq2_xs", "puzzle3_iq2_xs"}:
@@ -3640,6 +3939,8 @@ def bench_e2e() -> None:
         print(f"W4A16 tile config: {args.w4a16_tile_config or 'auto'}")
     if swiglu_limit is not None:
         print(f"SwiGLU limit: {swiglu_limit:g}")
+        print(f"SwiGLU clamp after SiLU: {args.swiglu_clamp_after_silu}")
+    print(f"Scale compression: {args.scale_compression or 'none'}")
     if swiglu_alpha is not None:
         print(f"SwiGLU alpha: {swiglu_alpha:g}")
     if swiglu_beta is not None:
@@ -3733,6 +4034,7 @@ def bench_e2e() -> None:
         activation=args.activation,
         activation_params=activation_params,
         w4a16_native=args.w4a16_native,
+        scale_compression=args.scale_compression,
     )
     precomputed_oracles: dict[int, torch.Tensor] = {}
     if args.validate == "oracle":
@@ -3849,6 +4151,7 @@ def bench_e2e() -> None:
                 quant_mode=args.quant_mode,
                 activation=args.activation,
                 activation_params=activation_params,
+                scale_compression=args.scale_compression,
             )
             x_r = torch.randn(1, rspec.hidden_size, dtype=torch.bfloat16, device=device)
             rk_warm = torch.randn(
@@ -4354,6 +4657,8 @@ def bench_e2e() -> None:
                     "source_format": weights.source_format,
                     "weight_storage": "pytorch",
                     "scale_contract": args.scale_contract,
+                    "scale_compression": args.scale_compression,
+                    "activation_params": asdict(activation_params),
                     "routing_workload": args.routing_workload,
                     "timing_backend": args.timing_backend,
                     "cold_l2": args.flush_l2,

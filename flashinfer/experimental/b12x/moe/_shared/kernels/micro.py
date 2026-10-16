@@ -401,6 +401,7 @@ class MoEMicroKernelBackend:
         e4m3_scale_layout: str = "packed",
         e8m0_scale_layout: str = "packed",
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
@@ -453,6 +454,7 @@ class MoEMicroKernelBackend:
         self.w13_layout = w13_layout
         # "w31" (gate_up) keeps the gate half first; "w13" (up_gate) keeps up first.
         self.w13_gate_first = w13_layout == "w31"
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.swiglu_alpha = float(swiglu_alpha)
@@ -509,6 +511,7 @@ class MoEMicroKernelBackend:
             self.w13_layout,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_clamp_after_silu,
             self.swiglu_alpha,
             self.swiglu_beta,
             _W4A16_PACKED_E4M3_SCALE_CACHE_VERSION,
@@ -5314,8 +5317,11 @@ class MoEMicroKernelBackend:
                                 if cutlass.const_expr(self.has_swiglu_limit):
                                     limit = Float32(self.swiglu_limit)
                                     neg_limit = Float32(-self.swiglu_limit)
-                                    if gate_red > limit:
-                                        gate_red = limit
+                                    if cutlass.const_expr(
+                                        not self.swiglu_clamp_after_silu
+                                    ):
+                                        if gate_red > limit:
+                                            gate_red = limit
                                     if up_red > limit:
                                         up_red = limit
                                     if up_red < neg_limit:
@@ -5329,7 +5335,14 @@ class MoEMicroKernelBackend:
                                     Float32(1.0)
                                     + cute.math.exp(-sigmoid_arg, fastmath=False)
                                 )
-                                activated = sigmoid * gate_red * up_term
+                                activated = sigmoid * gate_red
+                                if cutlass.const_expr(
+                                    self.has_swiglu_limit
+                                    and self.swiglu_clamp_after_silu
+                                ):
+                                    if activated > Float32(self.swiglu_limit):
+                                        activated = Float32(self.swiglu_limit)
+                                activated = activated * up_term
                             else:
                                 relu_val = fmax_f32(gate_red, Float32(0.0))
                                 activated = relu_val * relu_val

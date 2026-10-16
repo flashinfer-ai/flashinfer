@@ -32,7 +32,13 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
     config = HyperConnectionConfig.from_config(FrozenMapping(config_payload))
     role, streams, hidden = query.operation, query.streams, query.hidden_size
     device = torch.device("cuda", ordinal)
-    if role == "grouped_rmsnorm" and not query.zero_centered:
+    if (
+        role == "grouped_rmsnorm"
+        and not query.zero_centered
+        and not query.add_residual
+        and not query.paired
+        and query.dtype == query.output_dtype == "bfloat16"
+    ):
         weight_dtype = getattr(torch, query.weight_dtype)
         return native._compile(
             ("rmsnorm", ordinal, streams, hidden, str(weight_dtype)),
@@ -46,14 +52,21 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
         )
     if role == "grouped_rmsnorm":
         return kernels._grouped_rmsnorm_kernel.warmup(
-            torch.bfloat16,
-            torch.bfloat16,
-            torch.bfloat16,
+            getattr(torch, query.dtype),
+            getattr(torch, query.weight_dtype),
+            getattr(torch, query.output_dtype),
+            getattr(torch, query.right_dtype if query.add_residual else query.dtype),
             query.eps,
+            hidden * streams,
+            hidden * streams,
             HIDDEN_SIZE=hidden,
             STREAMS=streams,
             BLOCK_H=config.reduction_block_h,
+            ZERO_CENTERED=query.zero_centered,
+            ADD_RESIDUAL=query.add_residual,
+            PAIRED=query.paired,
             num_warps=config.reduction_num_warps,
+            enable_fp_fusion=False,
             grid=(query.max_tokens * streams,),
         )
     if role == "gate_mean":
@@ -131,12 +144,12 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
                 torch.bfloat16,
             ),
         )
-    if role in ("swiglu", "add", "sigmoid"):
+    if role in ("swiglu", "add", "sigmoid", "head_gate"):
         dtypes = tuple(
             getattr(torch, name)
             for name in (query.left_dtype, query.right_dtype, query.output_dtype)
         )
-        width = hidden if role == "swiglu" else 1
+        width = hidden if role in ("swiglu", "head_gate") else 1
         key = (
             role,
             ordinal,
@@ -144,6 +157,9 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
             width,
             None if query.limit == float("inf") else query.limit,
             query.round_silu,
+            query.clamp_after_silu,
+            query.streams if role == "head_gate" else 1,
+            query.gate_stride,
         )
         return native._compile(
             key,
@@ -153,6 +169,9 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
                 width,
                 query.limit,
                 query.round_silu,
+                query.clamp_after_silu,
+                query.streams if role == "head_gate" else 1,
+                query.gate_stride,
             ),
             3,
             device,
@@ -167,16 +186,27 @@ def _launcher(query, config, compiled):
     from . import _kernels as kernels
 
     role = query.operation
-    if role == "grouped_rmsnorm" and query.zero_centered:
+    if role == "grouped_rmsnorm" and (
+        query.zero_centered
+        or query.add_residual
+        or query.paired
+        or query.dtype == "float32"
+        or query.output_dtype == "float32"
+    ):
 
-        def invoke(*tensors, eps=None):
+        def invoke(state, weight, output, *, eps=None, residual=None, paired=None):
             kernels._norm_launch(
-                *tensors,
+                state,
+                weight,
+                output,
                 query.eps,
                 query.streams,
                 query.hidden_size,
                 config.reduction_block_h,
                 config.reduction_num_warps,
+                zero_centered=query.zero_centered,
+                residual=residual,
+                paired=paired,
             )
     elif role == "gate_mean":
 
@@ -244,8 +274,12 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         "eps",
         "limit",
         "round_silu",
+        "clamp_after_silu",
         "zero_centered",
         "weight_dtype",
+        "add_residual",
+        "gate_stride",
+        "paired",
     }
     if set(invocation) - fields or "operation" not in invocation:
         raise ValueError(

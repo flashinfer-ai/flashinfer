@@ -51,6 +51,38 @@ def _dtype_name(dtype: torch.dtype) -> str:
     }[dtype]
 
 
+def _fused_semantics(
+    dtype,
+    *,
+    residual_dtype=None,
+    weight_dtype=None,
+    output_dtype=None,
+    zero_centered=False,
+    reduction_dtype=None,
+):
+    supported = (torch.float16, torch.bfloat16, torch.float32)
+    operands = {
+        "residual_dtype": residual_dtype or dtype,
+        "weight_dtype": weight_dtype or dtype,
+        "output_dtype": output_dtype or dtype,
+    }
+    if any(
+        value not in supported for value in operands.values()
+    ) or reduction_dtype not in (None, *supported):
+        raise ValueError(
+            "fused RMSNorm operands and reduction rounding require FP16, BF16, or FP32"
+        )
+    if type(zero_centered) is not bool:
+        raise TypeError("zero_centered must be a boolean")
+    return {
+        **{key: _dtype_name(value) for key, value in operands.items()},
+        "zero_centered": zero_centered,
+        "reduction_dtype": (
+            None if reduction_dtype is None else _dtype_name(reduction_dtype)
+        ),
+    }
+
+
 def _input_from_call(call: Mapping[str, object]) -> torch.Tensor:
     inp = call.get("inp")
     if not isinstance(inp, torch.Tensor):
@@ -153,6 +185,11 @@ def query_from_metadata(
     dtype: torch.dtype,
     strides: tuple[int, ...] | None = None,
     alignment: int = 16,
+    residual_dtype: torch.dtype | None = None,
+    weight_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype | None = None,
+    zero_centered: bool = False,
+    reduction_dtype: torch.dtype | None = None,
 ) -> PcieQuery:
     """Extract a native declaration from immutable invocation metadata only."""
     tensor = _InvocationTensor(
@@ -179,9 +216,14 @@ def query_from_metadata(
         launcher = _plain_launcher_metadata(backend, native, tensor)
         registered = not launcher["stage_input"]
     else:
-        if tensor.ndim == 0 or tensor.shape[-1] * tensor.element_size() % 16:
+        if (
+            tensor.ndim == 0
+            or tensor.numel() == 0
+            or tensor.shape[-1] * tensor.element_size() % 16
+            or tensor.stride() != _contiguous_strides(tensor.shape)
+        ):
             raise ValueError(
-                "fused oneshot input last dimension must occupy 16-byte packs"
+                "fused oneshot input must be nonempty and contiguous with 16-byte row packs"
             )
         mode, single_cta, register_normalize, threads = backend._fused_launch_config(
             native, tensor
@@ -196,6 +238,14 @@ def query_from_metadata(
         ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
         ctas = max(1, min(ctas, 36 // rows))
         launcher = {
+            **_fused_semantics(
+                dtype,
+                residual_dtype=residual_dtype,
+                weight_dtype=weight_dtype,
+                output_dtype=output_dtype,
+                zero_centered=zero_centered,
+                reduction_dtype=reduction_dtype,
+            ),
             "dtype": _dtype_name(dtype),
             "mode": mode,
             "single_cta": single_cta,
@@ -256,9 +306,14 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     if not runtime.should_allreduce(inp):
         raise ValueError("input does not satisfy PCIe oneshot requirements")
     if surface in _FUSED_SURFACES and (
-        inp.ndim == 0 or inp.shape[-1] * inp.element_size() % 16
+        inp.ndim == 0
+        or inp.numel() == 0
+        or not inp.is_contiguous()
+        or inp.shape[-1] * inp.element_size() % 16
     ):
-        raise ValueError("fused oneshot input last dimension must occupy 16-byte packs")
+        raise ValueError(
+            "fused oneshot input must be nonempty and contiguous with 16-byte row packs"
+        )
     backend = runtime._ext
     dtype = _dtype_name(inp.dtype)
     stage_input = native.eager_tables is not None
@@ -279,6 +334,14 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
         ctas = max(1, min(ctas, 36 // rows))
         launcher = {
+            **_fused_semantics(
+                inp.dtype,
+                residual_dtype=getattr(values.get("residual"), "dtype", inp.dtype),
+                weight_dtype=getattr(values.get("weight"), "dtype", inp.dtype),
+                output_dtype=getattr(values.get("out"), "dtype", inp.dtype),
+                zero_centered=values.get("zero_centered", False),
+                reduction_dtype=values.get("reduction_dtype"),
+            ),
             "dtype": dtype,
             "mode": mode,
             "single_cta": single_cta,
@@ -373,6 +436,11 @@ def compile_oneshot_surface(query_payload, ordinal):
                     variant[1],
                     call["threads"],
                     call["device_index"],
+                    residual_dtype=call["residual_dtype"],
+                    weight_dtype=call["weight_dtype"],
+                    output_dtype=call["output_dtype"],
+                    zero_centered=call["zero_centered"],
+                    reduction_dtype=call["reduction_dtype"],
                 )
                 for variant in variants
             }
@@ -442,6 +510,33 @@ class _OneshotExecutionState:
 
     def run_fused(self, inp, residual, weight, out, residual_out, epsilon):
         self._require_bound_input(inp)
+        if self.query.surface not in _FUSED_SURFACES:
+            raise ValueError("fused RMSNorm requires a fused preparation plan")
+        for name, tensor, shape, dtype in (
+            ("residual", residual, inp.shape, self.query.call["residual_dtype"]),
+            ("weight", weight, inp.shape[-1:], self.query.call["weight_dtype"]),
+            ("output", out, inp.shape, self.query.call["output_dtype"]),
+            (
+                "residual output",
+                residual_out,
+                inp.shape,
+                self.query.call["residual_dtype"],
+            ),
+        ):
+            if (
+                tensor.shape != shape
+                or tensor.dtype != getattr(torch, dtype)
+                or tensor.device != inp.device
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(
+                    f"fused RMSNorm {name} metadata differs from the prepared plan"
+                )
+        if out.data_ptr() == residual_out.data_ptr():
+            raise ValueError("output and residual output must not alias")
+        if not epsilon >= 0:
+            raise ValueError("epsilon must be non-negative")
         return self.runtime._run_prepared_fused(
             inp,
             residual,

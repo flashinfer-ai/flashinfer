@@ -55,12 +55,17 @@ class ActivationSpec:
     ``a16_max_tokens`` forces A16 up to an inclusive token capacity, except
     for an explicit hybrid ``bind(a4_prefill=True)`` selection; zero
     disables the constraint. Larger calls retain ``mode``.
+
+    ``swiglu_clamp_after_silu`` clamps SiLU(gate) instead of gate before
+    multiplying by the symmetrically clamped up branch. It specializes the
+    A4 and A16 kernels at compile time; the default clamps gate before SiLU.
     """
 
     mode: ActivationMode
     nonlinearity: str
     io_dtype: torch.dtype
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     rotation_dtype: torch.dtype | None = None
@@ -75,6 +80,15 @@ class ActivationSpec:
             raise TypeError("rotation_dtype must be torch.float16 or None")
         if type(self.a16_max_tokens) is not int or self.a16_max_tokens < 0:
             raise ValueError("a16_max_tokens must be a nonnegative integer")
+        if type(self.swiglu_clamp_after_silu) is not bool:
+            raise TypeError("swiglu_clamp_after_silu must be a boolean")
+        if self.swiglu_clamp_after_silu and (
+            self.nonlinearity != "silu"
+            or self.mode not in (ActivationMode.A4, ActivationMode.A16)
+        ):
+            raise ValueError(
+                "post-SiLU clamping requires SiLU with A4 or A16 activations"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -317,12 +317,17 @@ class _Pointwise:
         width: int = 1,
         limit: float = float("inf"),
         round_silu: bool = False,
+        clamp_after_silu: bool = False,
+        heads: int = 1,
+        gate_stride: int = 0,
     ) -> None:
         self.operation = operation
         self.output_dtype = output_dtype
         self.width = int(width)
         self.limit = float(limit)
         self.round_silu = bool(round_silu)
+        self.clamp_after_silu = bool(clamp_after_silu)
+        self.heads, self.gate_stride = int(heads), int(gate_stride)
 
     @cute.jit
     def __call__(
@@ -356,18 +361,29 @@ class _Pointwise:
                 source += offset % Int64(self.width)
                 gate = Float32(left[source])
                 up = Float32(left[source + Int64(self.width)])
-                if gate > Float32(self.limit):
-                    gate = Float32(self.limit)
+                if cutlass.const_expr(not self.clamp_after_silu):
+                    if gate > Float32(self.limit):
+                        gate = Float32(self.limit)
                 if up > Float32(self.limit):
                     up = Float32(self.limit)
                 if up < Float32(-self.limit):
                     up = Float32(-self.limit)
                 activated = gate * _sigmoid(gate)
+                if cutlass.const_expr(self.clamp_after_silu):
+                    if activated > Float32(self.limit):
+                        activated = Float32(self.limit)
                 if cutlass.const_expr(self.round_silu):
                     activated = Float32(BFloat16(activated))
                 value = activated * up
             elif cutlass.const_expr(self.operation == "add"):
                 value = Float32(left[offset]) + Float32(right[offset])
+            elif cutlass.const_expr(self.operation == "head_gate"):
+                row = offset // Int64(self.width * self.heads)
+                head = (offset // Int64(self.width)) % Int64(self.heads)
+                gate = BFloat16(
+                    _sigmoid(Float32(right[row * Int64(self.gate_stride) + head]))
+                )
+                value = Float32(left[offset]) * Float32(gate)
             else:
                 value = _sigmoid(Float32(left[offset]))
             output[offset] = value.to(self.output_dtype)
@@ -836,7 +852,7 @@ def _compile(
                 *args,
                 compile_spec=KernelCompileSpec.from_key(
                     "norm.hyperconnection.cute",
-                    8,
+                    9,
                     key,
                 ),
             )

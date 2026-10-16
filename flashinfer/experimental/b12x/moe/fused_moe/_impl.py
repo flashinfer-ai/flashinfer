@@ -745,6 +745,7 @@ class _TPCoreWorkspacePlan:
     quant_mode: str
     activation: str
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     state_E: int
@@ -801,6 +802,7 @@ class TPMoEPlan:
     activation: str
     decode_config: MoeDecodeConfig
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     state_E: int
@@ -834,6 +836,7 @@ class TPMoEScratchCaps:
     route_logits_dtype: torch.dtype | None = None
     apply_router_weight_on_input: bool = False
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     collect_activation_amax: bool = False
@@ -866,6 +869,14 @@ class TPMoEScratchCaps:
                 f"quant_mode={quant_mode!r} is absent from the weight plan"
             )
         object.__setattr__(self, "quant_mode", quant_mode)
+        if type(self.swiglu_clamp_after_silu) is not bool:
+            raise TypeError("swiglu_clamp_after_silu must be a boolean")
+        if self.swiglu_clamp_after_silu and (
+            quant_mode not in {"nvfp4", "w4a16"} or self.activation != "silu"
+        ):
+            raise ValueError(
+                "post-SiLU clamping requires SiLU with A4 or A16 activations"
+            )
         if self.core_token_counts is not None:
             object.__setattr__(
                 self,
@@ -1169,6 +1180,7 @@ class TPMoEScratchPlan:
             decode_config=self.caps.decode_config,
             unit_scale_contract=unit_scale_contract,
             swiglu_limit=self.caps.swiglu_limit,
+            swiglu_clamp_after_silu=self.caps.swiglu_clamp_after_silu,
             swiglu_alpha=self.caps.swiglu_alpha,
             swiglu_beta=self.caps.swiglu_beta,
             activation_amax=activation_amax,
@@ -1214,6 +1226,7 @@ class TPMoEFP4Binding:
     deterministic_output: bool = False
     unit_scale_contract: bool = False
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     activation_amax: torch.Tensor | None = None
@@ -1334,6 +1347,7 @@ class TPMoESparseFP4Binding:
     fast_math: bool | None = None
     quant_mode: str | None = None
     swiglu_limit: float | None = None
+    swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     activation_amax: torch.Tensor | None = None
@@ -1408,6 +1422,7 @@ class _ActivationKernelSpec:
         self,
         *,
         swiglu_limit=None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha=None,
         swiglu_beta=None,
         **kernel_kwargs,
@@ -1418,12 +1433,15 @@ class _ActivationKernelSpec:
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
             )
+        if swiglu_clamp_after_silu:
+            kernel_kwargs["swiglu_clamp_after_silu"] = True
         return self.micro_kernel_cls(**kernel_kwargs)
 
     def make_dynamic_kernel(
         self,
         *,
         swiglu_limit=None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha=None,
         swiglu_beta=None,
         **kernel_kwargs,
@@ -1434,6 +1452,8 @@ class _ActivationKernelSpec:
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
             )
+        if swiglu_clamp_after_silu:
+            kernel_kwargs["swiglu_clamp_after_silu"] = True
         return self.dynamic_kernel_cls(**kernel_kwargs)
 
 
@@ -2747,6 +2767,7 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
             activation=query.activation,
             apply_router_weight_on_input=query.apply_router_weight_on_input,
             swiglu_limit=query.swiglu_limit,
+            swiglu_clamp_after_silu=query.swiglu_clamp_after_silu,
             swiglu_alpha=query.swiglu_alpha,
             swiglu_beta=query.swiglu_beta,
             element_dtype="bf16" if query.io_dtype == "bfloat16" else "fp16",
@@ -3007,6 +3028,7 @@ def _build_tp_moe_fp4_binding_from_views(
     decode_config: MoeDecodeConfig | None = None,
     unit_scale_contract: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     activation_amax: torch.Tensor | None = None,
@@ -3072,6 +3094,7 @@ def _build_tp_moe_fp4_binding_from_views(
         )
     if (
         swiglu_limit != plan.swiglu_limit
+        or swiglu_clamp_after_silu != plan.swiglu_clamp_after_silu
         or swiglu_alpha != plan.swiglu_alpha
         or swiglu_beta != plan.swiglu_beta
     ):
@@ -3187,6 +3210,7 @@ def _build_tp_moe_fp4_binding_from_views(
         deterministic_output=plan.deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
@@ -3365,6 +3389,7 @@ def _plan_core_workspace(
     collect_activation_amax: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> _TPCoreWorkspacePlan:
@@ -3551,6 +3576,7 @@ def _plan_core_workspace(
                 quant_mode=quant_mode,
                 activation=activation,
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 state_E=state_E,
@@ -3710,6 +3736,7 @@ def _plan_core_workspace(
                 activation=activation,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 element_dtype=_w4a16_element_dtype(dtype),
@@ -3803,6 +3830,7 @@ def _plan_core_workspace(
             quant_mode=quant_mode,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             state_E=state_E,
@@ -3906,6 +3934,7 @@ def _plan_core_workspace(
             quant_mode=quant_mode,
             activation=activation_spec.activation,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             state_E=state_E,
@@ -4063,6 +4092,7 @@ def _plan_core_workspace(
         quant_mode=quant_mode,
         activation=activation_spec.activation,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         state_E=state_E,
@@ -4414,6 +4444,7 @@ def _alloc_workspace(
     deterministic_output: bool = False,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     dynamic_physical_tiles: int | None = None,
@@ -4440,6 +4471,7 @@ def _alloc_workspace(
         deterministic_output=deterministic_output,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         dynamic_physical_tiles=dynamic_physical_tiles,
@@ -7415,6 +7447,7 @@ def plan_tp_moe_execution(
     weight_plan: MoEWeightPreparationPlan,
     quant_mode: str,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     apply_router_weight_on_input: bool = False,
@@ -7610,6 +7643,7 @@ def plan_tp_moe_execution(
         quant_mode=quant_mode,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         state_E=state_E,
@@ -8042,6 +8076,7 @@ def _resolve_workspace(
     input_scales_static: bool,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     weight_layout: str = "packed",
@@ -8239,6 +8274,7 @@ def plan_tp_moe_arena_layout(
     route_logits_dtype: torch.dtype | None = None,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     collect_activation_amax: bool = False,
@@ -8312,6 +8348,7 @@ def plan_tp_moe_arena_layout(
             weight_plan=weight_plan,
             quant_mode=quant_mode,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -8356,6 +8393,7 @@ def plan_tp_moe_arena_layout(
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
+            swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
             swiglu_alpha=plan.swiglu_alpha,
             swiglu_beta=plan.swiglu_beta,
         )
@@ -8481,6 +8519,7 @@ def _plan_full_rotation_w4a16_launches(
                 sms=sms,
                 max_shared_mem=max_shared_mem,
                 swiglu_limit=core_plan.swiglu_limit,
+                swiglu_clamp_after_silu=core_plan.swiglu_clamp_after_silu,
                 swiglu_alpha=core_plan.swiglu_alpha,
                 swiglu_beta=core_plan.swiglu_beta,
                 weight_layout=weight_layout,
@@ -8964,6 +9003,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         quant_mode=caps.quant_mode,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         swiglu_limit=caps.swiglu_limit,
+        swiglu_clamp_after_silu=caps.swiglu_clamp_after_silu,
         swiglu_alpha=caps.swiglu_alpha,
         swiglu_beta=caps.swiglu_beta,
         collect_activation_amax=caps.collect_activation_amax,
@@ -8997,6 +9037,7 @@ def plan_tp_moe_scratch(
         weight_plan=caps.weight_plan,
         quant_mode=caps.quant_mode,
         swiglu_limit=caps.swiglu_limit,
+        swiglu_clamp_after_silu=caps.swiglu_clamp_after_silu,
         swiglu_alpha=caps.swiglu_alpha,
         swiglu_beta=caps.swiglu_beta,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
@@ -9042,6 +9083,7 @@ def plan_tp_moe_scratch(
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=launch_plan.deterministic_output,
         swiglu_limit=launch_plan.swiglu_limit,
+        swiglu_clamp_after_silu=launch_plan.swiglu_clamp_after_silu,
         swiglu_alpha=launch_plan.swiglu_alpha,
         swiglu_beta=launch_plan.swiglu_beta,
     )
@@ -9119,6 +9161,7 @@ def _prewarm_w4a16_planned_launches(
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
+    swiglu_clamp_after_silu: bool = False,
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     w13_layout: str = "w13",
@@ -9239,6 +9282,7 @@ def _prewarm_w4a16_planned_launches(
                     sms=sms,
                     max_shared_mem=max_shared_mem,
                     swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                     swiglu_alpha=swiglu_alpha,
                     swiglu_beta=swiglu_beta,
                     weight_layout=weight_layout,
@@ -9408,6 +9452,7 @@ def _prewarm_w4a16_planned_launches(
                         sms=sms,
                         max_shared_mem=max_shared_mem,
                         swiglu_limit=swiglu_limit,
+                        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                         swiglu_alpha=swiglu_alpha,
                         swiglu_beta=swiglu_beta,
                         weight_layout=weight_layout,
@@ -9475,6 +9520,7 @@ def _prewarm_w4a16_planned_launches(
                     sms=sms,
                     max_shared_mem=max_shared_mem,
                     swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                     swiglu_alpha=swiglu_alpha,
                     swiglu_beta=swiglu_beta,
                     weight_layout=weight_layout,
@@ -9511,6 +9557,7 @@ def _prewarm_w4a16_planned_launches(
                     sms=sms,
                     max_shared_mem=max_shared_mem,
                     swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                     swiglu_alpha=swiglu_alpha,
                     swiglu_beta=swiglu_beta,
                     weight_layout=weight_layout,
@@ -9562,6 +9609,7 @@ def materialize_tp_moe_arena_workspaces(
     w13_layout = caps.w13_layout
     apply_router_weight_on_input = caps.apply_router_weight_on_input
     swiglu_limit = caps.swiglu_limit
+    swiglu_clamp_after_silu = caps.swiglu_clamp_after_silu
     swiglu_alpha = caps.swiglu_alpha
     swiglu_beta = caps.swiglu_beta
     collect_activation_amax = caps.collect_activation_amax
@@ -9596,6 +9644,7 @@ def materialize_tp_moe_arena_workspaces(
             weight_plan=weight_plan,
             quant_mode=quant_mode,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -9640,6 +9689,7 @@ def materialize_tp_moe_arena_workspaces(
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
+            swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
             swiglu_alpha=plan.swiglu_alpha,
             swiglu_beta=plan.swiglu_beta,
         )
@@ -9756,6 +9806,7 @@ def materialize_tp_moe_arena_workspaces(
                 token_counts=core_token_counts,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 swiglu_limit=materialized.planned_swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=materialized.planned_swiglu_alpha,
                 swiglu_beta=materialized.planned_swiglu_beta,
                 scale_format=w4a16_scale_format,
@@ -9821,6 +9872,7 @@ def build_tp_moe_fp4_binding(
     decode_config: MoeDecodeConfig,
     unit_scale_contract: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     activation_amax: torch.Tensor | None = None,
@@ -9892,6 +9944,7 @@ def build_tp_moe_fp4_binding(
         weight_plan=experts.plan,
         quant_mode=quant_mode,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -9926,6 +9979,7 @@ def build_tp_moe_fp4_binding(
             input_scales_static=input_scales_static,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
@@ -9955,6 +10009,7 @@ def build_tp_moe_fp4_binding(
         deterministic_output=deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
@@ -10245,6 +10300,7 @@ def build_tp_moe_sparse_fp4_binding(
     fast_math: bool | None = None,
     quant_mode: str | None = None,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     activation_amax: torch.Tensor | None = None,
@@ -10303,6 +10359,7 @@ def build_tp_moe_sparse_fp4_binding(
         fast_math=fast_math,
         quant_mode=quant_mode,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
@@ -10385,6 +10442,7 @@ def _get_micro_kernel(
     device: torch.device | None = None,
     quant_mode: str = "nvfp4",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     compile_time_phase: int = 0,
@@ -10413,6 +10471,7 @@ def _get_micro_kernel(
         scale_format=scale_format,
         e8m0_scale_layout=e8m0_scale_layout,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
@@ -11174,6 +11233,7 @@ def _get_dynamic_kernel(
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     trellis_bits: int = 0,
@@ -11289,6 +11349,7 @@ def _get_dynamic_kernel(
         bool(fast_math),
         str(activation),
         None if swiglu_limit is None else float(swiglu_limit),
+        bool(swiglu_clamp_after_silu),
         None if swiglu_alpha is None else float(swiglu_alpha),
         None if swiglu_beta is None else float(swiglu_beta),
         bool(dynamic_down_scale),
@@ -11351,6 +11412,7 @@ def _get_dynamic_kernel(
     kernel_kwargs["work_source"] = work_source
     kernel_kwargs["materialize_intermediate"] = materialize_intermediate
     kernel_kwargs["swiglu_limit"] = swiglu_limit
+    kernel_kwargs["swiglu_clamp_after_silu"] = swiglu_clamp_after_silu
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
@@ -11711,6 +11773,7 @@ def _launch_dynamic_flat(
     share_input_across_experts: bool,
     deterministic_output: bool,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     external_route_plan_requested: bool,
@@ -11923,6 +11986,7 @@ def _launch_dynamic_flat(
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         trellis_bits=trellis_bits,
@@ -12069,6 +12133,7 @@ def _encode_dynamic_launch_policy(
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool = False,
     mma_warps: int | None = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -12088,7 +12153,8 @@ def _encode_dynamic_launch_policy(
         | (int(bool(w4a8_n64_repacked)) << 5)
         | (int(bool(nvfp4_materialize_intermediate)) << 6)
         | (int(mma_warps == 4) << 7)
-        | ((int(policy_max_active_clusters) + 1) << 8)
+        | (int(bool(swiglu_clamp_after_silu)) << 8)
+        | ((int(policy_max_active_clusters) + 1) << 9)
     )
 
 
@@ -12104,7 +12170,7 @@ def _decode_dynamic_launch_policy(
         bool(value & 32),
         bool(value & 64),
         4 if value & 128 else None,
-        (value >> 8) - 1,
+        (value >> 9) - 1,
     )
 
 
@@ -12216,6 +12282,7 @@ def _tp_moe_dynamic_launch_op(
         mma_warps,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
+    swiglu_clamp_after_silu = bool(launch_policy & 256)
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -12280,6 +12347,7 @@ def _tp_moe_dynamic_launch_op(
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         external_route_plan_requested=external_route_plan_requested,
@@ -12389,6 +12457,7 @@ def _launch_dynamic(
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     external_route_plan_requested: bool = False,
@@ -12409,6 +12478,7 @@ def _launch_dynamic(
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         mma_warps=mma_warps,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
@@ -12600,6 +12670,7 @@ def _launch_compact_micro_flat(
     activation: str,
     quant_mode: str,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     volatile_launch_state: bool,
@@ -12670,6 +12741,7 @@ def _launch_compact_micro_flat(
                 device=a.device,
                 quant_mode=quant_mode,
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 compile_time_phase=phase,
@@ -12719,6 +12791,7 @@ def _launch_compact_micro_flat(
         device=a.device,
         quant_mode=quant_mode,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         weight_layout="trellis_t256" if w4a8_trellis else None,
@@ -12984,6 +13057,7 @@ def _tp_moe_compact_micro_launch_op(
     activation: str,
     quant_mode: str,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     volatile_launch_state: bool,
@@ -13015,6 +13089,7 @@ def _tp_moe_compact_micro_launch_op(
         activation=activation,
         quant_mode=quant_mode,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         volatile_launch_state=volatile_launch_state,
@@ -13049,6 +13124,7 @@ def _tp_moe_compact_micro_launch_fake(
     activation: str,
     quant_mode: str,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     volatile_launch_state: bool,
@@ -13080,6 +13156,7 @@ def _launch_micro(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     unit_scale_contract: bool = False,
@@ -13174,6 +13251,7 @@ def _launch_micro(
         activation,
         quant_mode,
         swiglu_limit,
+        swiglu_clamp_after_silu,
         float(swiglu_alpha),
         float(swiglu_beta),
         workspace.volatile_launch_state,
@@ -13278,6 +13356,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     activation = experts.activation
     quant_mode = binding.quant_mode
     swiglu_limit = binding.swiglu_limit
+    swiglu_clamp_after_silu = binding.swiglu_clamp_after_silu
     swiglu_alpha = binding.swiglu_alpha
     swiglu_beta = binding.swiglu_beta
     activation_amax = binding.activation_amax
@@ -13560,6 +13639,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             activation_amax=activation_amax,
             layer_idx=layer_idx,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             fused_launch=fused_launch,
@@ -13849,6 +13929,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             mma_warps=decode_config.dynamic_mma_warps,
             deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             external_route_plan_requested=decode_config.route_planner == "triton",
@@ -13913,6 +13994,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             activation=activation,
             quant_mode=quant_mode,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             unit_scale_contract=unit_scale_contract,
@@ -14455,6 +14537,7 @@ def b12x_sparse_moe_fp4(
     fast_math = binding.fast_math
     quant_mode = binding.quant_mode
     swiglu_limit = binding.swiglu_limit
+    swiglu_clamp_after_silu = binding.swiglu_clamp_after_silu
     swiglu_alpha = binding.swiglu_alpha
     swiglu_beta = binding.swiglu_beta
     activation_amax = binding.activation_amax
@@ -14515,6 +14598,7 @@ def b12x_sparse_moe_fp4(
         fast_math=fast_math,
         quant_mode=quant_mode_normalized,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,

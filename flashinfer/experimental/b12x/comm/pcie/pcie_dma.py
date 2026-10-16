@@ -227,6 +227,7 @@ class PCIeDmaAllReduce:
         self._wait_counters = torch.zeros(
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
+        self._wait_done = torch.zeros(FLAG_SLOTS, dtype=torch.int32, device=self.device)
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._flag_stream = torch.cuda.Stream(device=self.device)
         # Separate CE/flag streams for the a2a broadcast phase so allgather
@@ -612,10 +613,13 @@ class PCIeDmaAllReduce:
                         self._flag_ptr(nxt, slot(k, p)),
                         self._counter_ptr(self._send_counters, slot(k, p)),
                     )
-                kernels.dma_wait_flag(
+                wait = (
                     self._flag_ptr(rank, slot(k, p)),
                     self._counter_ptr(self._wait_counters, slot(k, p)),
+                    self._counter_ptr(self._wait_done, slot(k, p)),
                 )
+                if not reduce_phase or compressed_reduce:
+                    kernels.dma_wait_flag(*wait[:2])
                 if reduce_phase:
                     if compressed_reduce:
                         payload = fp8_scratch_piece(rank, k, p)
@@ -637,6 +641,7 @@ class PCIeDmaAllReduce:
                             scratch_piece(rank, k, p),
                             piece_elems,
                             dtype_code,
+                            wait=wait,
                         )
                 elif compressed_step:
                     payload = fp8_scratch_piece(rank, k, p)
@@ -695,6 +700,21 @@ class PCIeDmaAllReduce:
             self._kernels.dma_copy(scratch, scratch, 16)
             for dtype_code, elems in ((0, 8), (1, 8), (2, 4)):
                 self._kernels.dma_add(scratch, scratch, scratch, elems, dtype_code)
+                self._kernels.dma_set_flag(
+                    flag, self._counter_ptr(self._send_counters, slot)
+                )
+                self._kernels.dma_add(
+                    scratch,
+                    scratch,
+                    scratch,
+                    elems,
+                    dtype_code,
+                    wait=(
+                        flag,
+                        self._counter_ptr(self._wait_counters, slot),
+                        self._counter_ptr(self._wait_done, slot),
+                    ),
+                )
             if self._fp8:
                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:
                     raise RuntimeError(

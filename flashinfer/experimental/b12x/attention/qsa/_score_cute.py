@@ -1,6 +1,8 @@
 """Paged QSA representative scoring with device-side context bounds.
 
 Inactive CTAs initialize their score range without loading query or cache data.
+Bounded execution visits only the live prefix with an SM-sized grid. Indices-only
+execution leaves scores unwritten when all eligible groups fit in the selection.
 BF16 tensor cores score 64 groups per CTA for up to eight index heads and
 16-aligned head dimensions. Other geometries use scalar FP32 reductions over
 32 groups per CTA. No live extent enters compilation keys.
@@ -14,7 +16,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
@@ -48,6 +50,11 @@ class _RepresentativeScoreKernel:
         dcp_size,
         dcp_rank,
         cp_interleave,
+        weighted=False,
+        fp8=False,
+        position_offset=1,
+        workers=0,
+        indices_only=False,
     ):
         self.heads = heads
         self.dim = dim
@@ -60,27 +67,37 @@ class _RepresentativeScoreKernel:
         self.group_interleave = cp_interleave // ratio
         self.lane_values = (dim + 31) // 32
         self.scale = 1.0 / math.sqrt(dim)
+        self.weighted = weighted
+        self.fp8 = fp8
+        self.position_offset = position_offset
+        self.workers = workers
+        self.indices_only = indices_only
         self.use_mma = heads <= 8 and dim % 16 == 0
         self.groups = 64 if self.use_mma else 32
 
     @cute.jit
     def load_pair(self, pointer, offset):
-        address = pointer + offset
         value = Uint32(0)
-        if (address.toint().to(Int64) & Int64(3)) == Int64(0):
-            value = cute.recast_ptr(address.align(4), dtype=Uint32)[0].to(Uint32)
-        else:
-            # Odd storage offsets and token strides remain supported. Widening
-            # and reassembling BF16 bits introduces no quantization.
+        if cutlass.const_expr(self.fp8):
             lo = f32_to_raw_bits(pointer[offset].to(Float32)) >> 16
             hi = f32_to_raw_bits(pointer[offset + Int64(1)].to(Float32))
             value = (lo | hi).to(Uint32)
+        else:
+            address = pointer + offset
+            if (address.toint().to(Int64) & Int64(3)) == Int64(0):
+                value = cute.recast_ptr(address.align(4), dtype=Uint32)[0].to(Uint32)
+            else:
+                # Odd storage offsets and token strides remain supported.
+                lo = f32_to_raw_bits(pointer[offset].to(Float32)) >> 16
+                hi = f32_to_raw_bits(pointer[offset + Int64(1)].to(Float32))
+                value = (lo | hi).to(Uint32)
         return value
 
     @cute.jit
     def score_mma(
         self,
         query,
+        weights,
         cache,
         table,
         scores,
@@ -165,8 +182,11 @@ class _RepresentativeScoreKernel:
                         value,
                         (lane // 4) * 4 + head // 2,
                     )
+                    if cutlass.const_expr(self.weighted):
+                        value *= weights[row.to(Int64) * self.heads + head]
                     score = score + value
-                score = score * Float32(self.scale)
+                if cutlass.const_expr(not self.weighted):
+                    score = score * Float32(self.scale)
                 if valid[part] == 0:
                     score = Float32(-float("inf"))
                 local_group = warp_start + matrix_row + part * 8
@@ -189,8 +209,13 @@ class _RepresentativeScoreKernel:
         group_count: Int32,
         stream: cuda.CUstream,
     ):
+        blocks = (group_count + self.groups - 1) // self.groups
+        if cutlass.const_expr(self.workers > 0):
+            blocks = cutlass.min(
+                blocks, cutlass.max(Int32(self.workers) // rows, Int32(1))
+            )
         self.kernel(pointers, strides, group_offset, group_count).launch(
-            grid=((group_count + self.groups - 1) // self.groups, rows, 1),
+            grid=(blocks, rows, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -213,6 +238,7 @@ class _RepresentativeScoreKernel:
             scores,
             counts,
             merges,
+            weights,
         ) = pointers
         page_stride, token_stride, table_stride, score_stride = strides
         block, row, _ = cute.arch.block_idx()
@@ -222,7 +248,12 @@ class _RepresentativeScoreKernel:
         request = requests[row].to(Int64)
         eligible = Int32(0)
         if request >= Int64(0):
-            position_groups = (positions[row].to(Int64) + Int64(1)) // self.ratio
+            position_groups = (
+                cutlass.max(
+                    positions[row].to(Int64) + Int64(self.position_offset), Int64(0)
+                )
+                // self.ratio
+            )
             sequence_groups = lengths[request].to(Int64) // self.ratio
             global_eligible = cutlass.min(position_groups, sequence_groups).to(Int32)
             eligible = global_eligible
@@ -244,10 +275,68 @@ class _RepresentativeScoreKernel:
         carry = cutlass.min(cutlass.min(eligible, group_offset), Int32(self.budget))
         if (block == 0) & (thread == 0):
             counts[row] = eligible
+            if cutlass.const_expr(self.indices_only):
+                if eligible <= self.budget:
+                    counts[row] = Int32(0)
             merges[row] = carry + cutlass.min(
                 cutlass.max(eligible - group_offset, Int32(0)), group_count
             )
-        local_start = block * self.groups
+        extent = group_count
+        if cutlass.const_expr(self.workers > 0):
+            extent = cutlass.min(
+                group_count, cutlass.max(eligible - group_offset, Int32(0))
+            )
+        if cutlass.const_expr(self.indices_only):
+            if eligible <= self.budget:
+                extent = Int32(0)
+        blocks, _, _ = cute.arch.grid_dim()
+        for local_start in cutlass.range(
+            block * self.groups, extent, blocks * self.groups
+        ):
+            self.score_tile(
+                pointers,
+                strides,
+                request,
+                row,
+                group_offset,
+                group_count,
+                local_start,
+                eligible,
+                carry,
+                lane,
+                warp,
+                thread,
+            )
+
+    @cute.jit
+    def score_tile(
+        self,
+        pointers,
+        strides,
+        request,
+        row,
+        group_offset,
+        group_count,
+        local_start,
+        eligible,
+        carry,
+        lane,
+        warp,
+        thread,
+    ):
+        (
+            query,
+            positions,
+            requests,
+            lengths,
+            cache,
+            table,
+            scores,
+            counts,
+            merges,
+            weights,
+        ) = pointers
+        page_stride, token_stride, table_stride, score_stride = strides
         score_row = row.to(Int64) * score_stride
         if group_offset + local_start >= eligible:
             local_group = local_start + thread
@@ -258,6 +347,7 @@ class _RepresentativeScoreKernel:
         elif cutlass.const_expr(self.use_mma):
             self.score_mma(
                 query,
+                weights,
                 cache,
                 table,
                 scores,
@@ -319,8 +409,12 @@ class _RepresentativeScoreKernel:
                                 dot = dot + cute.arch.shuffle_sync_bfly(
                                     dot, offset=16 >> shift
                                 )
-                            score = score + cutlass.max(dot, Float32(0))
-                        score = score * Float32(self.scale)
+                            dot = cutlass.max(dot, Float32(0))
+                            if cutlass.const_expr(self.weighted):
+                                dot *= weights[row.to(Int64) * self.heads + head]
+                            score = score + dot
+                        if cutlass.const_expr(not self.weighted):
+                            score = score * Float32(self.scale)
                 if (lane == 0) & (local_group < group_count):
                     scores[score_row + (carry + local_group).to(Int64)] = score
 
@@ -343,6 +437,10 @@ def compile_score_representatives(
     eligible_counts,
     merge_lengths,
     caps,
+    weights=None,
+    position_offset=1,
+    bounded=False,
+    indices_only=False,
 ):
     """Resolve the exact configured CuTe score executable for QSA preparation."""
     tensors = (
@@ -355,15 +453,27 @@ def compile_score_representatives(
         scores,
         eligible_counts,
         merge_lengths,
+        scores if weights is None else weights,
     )
     types = tuple(
         {
             torch.bfloat16: BFloat16,
+            torch.float8_e4m3fn: Float8E4M3FN,
             torch.float32: Float32,
             torch.int32: Int32,
             torch.int64: Int64,
         }[tensor.dtype]
         for tensor in tensors
+    )
+    if indices_only and not bounded:
+        raise ValueError("indices-only scoring requires bounded live-prefix execution")
+    device_index = prepared_query.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    workers = (
+        2 * torch.cuda.get_device_properties(device_index).multi_processor_count
+        if bounded
+        else 0
     )
     geometry = (
         int(caps.index_heads),
@@ -375,6 +485,11 @@ def compile_score_representatives(
         int(caps.dcp_size),
         int(caps.dcp_rank),
         int(caps.cp_kv_cache_interleave_size),
+        weights is not None,
+        prepared_query.dtype == torch.float8_e4m3fn,
+        int(position_offset),
+        workers,
+        bool(indices_only),
     )
     device_index = prepared_query.device.index
     if device_index is None:
@@ -400,7 +515,7 @@ def compile_score_representatives(
                 Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "attention.qsa.representative_score", 2, key
+                    "attention.qsa.representative_score", 4, key
                 ),
             )
             _CACHE[key] = raw
@@ -421,8 +536,14 @@ def launch_score_representatives(
     group_offset,
     group_count,
     caps,
+    weights=None,
+    position_offset=1,
+    bounded=False,
+    indices_only=False,
     _prepared=None,
 ):
+    if indices_only and group_offset != 0:
+        raise ValueError("indices-only scoring does not accept segmented scores")
     tensors = (
         prepared_query,
         query_positions,
@@ -433,10 +554,12 @@ def launch_score_representatives(
         scores,
         eligible_counts,
         merge_lengths,
+        scores if weights is None else weights,
     )
     types = tuple(
         {
             torch.bfloat16: BFloat16,
+            torch.float8_e4m3fn: Float8E4M3FN,
             torch.float32: Float32,
             torch.int32: Int32,
             torch.int64: Int64,
@@ -457,6 +580,10 @@ def launch_score_representatives(
             eligible_counts=eligible_counts,
             merge_lengths=merge_lengths,
             caps=caps,
+            weights=weights,
+            position_offset=position_offset,
+            bounded=bounded,
+            indices_only=indices_only,
         )
     )
     if compile_only_launches_enabled():

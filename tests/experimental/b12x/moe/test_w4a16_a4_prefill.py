@@ -194,10 +194,15 @@ def _emulate(case, x, ids, wts, a1g, a2g, terms):
         gate = (xq[r // TOPK] @ w13[I:].T).float().to(torch.bfloat16).float()
         up = (xq[r // TOPK] @ w13[:I].T).float().to(torch.bfloat16).float()
         limit = case["plan"].activation.swiglu_limit
+        after_silu = case["plan"].activation.swiglu_clamp_after_silu
         if limit is not None:
-            gate = gate.clamp(max=limit)
+            if not after_silu:
+                gate = gate.clamp(max=limit)
             up = up.clamp(min=-limit, max=limit)
-        silu = (gate * torch.sigmoid(gate)).to(torch.bfloat16).float()
+        silu = gate * torch.sigmoid(gate)
+        if limit is not None and after_silu:
+            silu = silu.clamp(max=limit)
+        silu = silu.to(torch.bfloat16).float()
         act = (silu * up.to(torch.bfloat16).float()).to(torch.bfloat16).float()
         act = _qdq(act, a2g[e].reshape(1), terms).double()
         w2 = _dequant_weight(case["w2"][e], case["s2_log"][e], case["g2"][e])
@@ -245,17 +250,25 @@ def _scales(case):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("terms", [1, 2])
 @pytest.mark.parametrize(
-    "hidden_size,intermediate_size,num_experts,top_k,swiglu_limit",
+    "hidden_size,intermediate_size,num_experts,top_k,swiglu_limit,after_silu",
     [
-        (512, 256, 8, 2, None),
-        (512, 256, 8, 2, 2.03),
-        (512, 256, 8, 2, 10.0),
-        (512, 320, 8, 2, None),
-        (2560, 320, 16, 10, None),
+        (512, 256, 8, 2, None, False),
+        (512, 256, 8, 2, 2.03, False),
+        (512, 256, 8, 2, 10.0, False),
+        (512, 320, 8, 2, None, False),
+        (2560, 320, 16, 10, None, False),
+        (512, 256, 8, 2, 0.5, True),
     ],
 )
 def test_a4_prefill_matches_float64_emulation(
-    terms, hidden_size, intermediate_size, num_experts, top_k, swiglu_limit, monkeypatch
+    terms,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    top_k,
+    swiglu_limit,
+    after_silu,
+    monkeypatch,
 ):
     require_b12x()
     _env(monkeypatch, True, terms)
@@ -264,7 +277,11 @@ def test_a4_prefill_matches_float64_emulation(
 
     case["plan"] = moe.plan_weights(
         source=case["plan"].source,
-        activation=replace(case["plan"].activation, swiglu_limit=swiglu_limit),
+        activation=replace(
+            case["plan"].activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=after_silu,
+        ),
         geometry=case["plan"].geometry,
     )
     a1g, a2g = _scales(case)

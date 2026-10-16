@@ -1036,6 +1036,7 @@ class W4A16ActivationCompileResult:
     intermediate_size: int
     activation: str
     swiglu_limit: float | None
+    swiglu_clamp_after_silu: bool
     swiglu_alpha: float
     swiglu_beta: float
 
@@ -1070,6 +1071,7 @@ class W4A16FusedMoeCompileResult:
     element_dtype: str
     fast_math: bool
     swiglu_limit: float | None
+    swiglu_clamp_after_silu: bool
     swiglu_alpha: float
     swiglu_beta: float
     fc1_tile_n: int
@@ -1198,6 +1200,7 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
         single_token: bool,
         scale_format: str = "e4m3_k16",
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
@@ -1217,6 +1220,7 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
             scale_format=scale_format,
             e4m3_scale_layout="modelopt",
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
@@ -6604,6 +6608,7 @@ class W4A16FusedMoeKernel:
         element_dtype: str = "bf16",
         fast_math: bool = True,
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         weight_layout: str = "packed",
@@ -6734,6 +6739,7 @@ class W4A16FusedMoeKernel:
         self.activation_is_gated = is_gated
         self.activation_is_situ = activation == SITU
         self.activation_is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.swiglu_alpha = float(swiglu_alpha)
@@ -7034,6 +7040,7 @@ class W4A16FusedMoeKernel:
             self.activation_is_swigluoai,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_clamp_after_silu,
             self.swiglu_alpha,
             self.swiglu_beta,
             self.weight_layout,
@@ -7082,8 +7089,9 @@ class W4A16FusedMoeKernel:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            if cutlass.const_expr(not self.swiglu_clamp_after_silu):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -8746,6 +8754,9 @@ class W4A16FusedMoeKernel:
             exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
         sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
         silu = gate * sigmoid
+        if cutlass.const_expr(self.has_swiglu_limit and self.swiglu_clamp_after_silu):
+            if silu > cutlass.Float32(self.swiglu_limit):
+                silu = cutlass.Float32(self.swiglu_limit)
         if cutlass.const_expr(self.activation_is_situ):
             beta = cutlass.Float32(SITU_DEFAULT_BETA)
             linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -8936,6 +8947,11 @@ class W4A16FusedMoeKernel:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
                 sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
                 silu = gate * sigmoid
+                if cutlass.const_expr(
+                    self.has_swiglu_limit and self.swiglu_clamp_after_silu
+                ):
+                    if silu > cutlass.Float32(self.swiglu_limit):
+                        silu = cutlass.Float32(self.swiglu_limit)
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -8973,6 +8989,7 @@ class W4A16ActivationKernel:
         element_dtype: str = "bf16",
         fast_math: bool = True,
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
     ):
@@ -8994,6 +9011,7 @@ class W4A16ActivationKernel:
         self.is_gated = is_gated
         self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.swiglu_alpha = float(swiglu_alpha)
@@ -9013,6 +9031,7 @@ class W4A16ActivationKernel:
             self.is_swigluoai,
             self.has_swiglu_limit,
             self.swiglu_limit,
+            self.swiglu_clamp_after_silu,
             self.swiglu_alpha,
             self.swiglu_beta,
             self.element_dtype,
@@ -9035,8 +9054,9 @@ class W4A16ActivationKernel:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            if cutlass.const_expr(not self.swiglu_clamp_after_silu):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -9091,6 +9111,11 @@ class W4A16ActivationKernel:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
                 sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
                 silu = gate * sigmoid
+                if cutlass.const_expr(
+                    self.has_swiglu_limit and self.swiglu_clamp_after_silu
+                ):
+                    if silu > cutlass.Float32(self.swiglu_limit):
+                        silu = cutlass.Float32(self.swiglu_limit)
                 if cutlass.const_expr(self.is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -9760,6 +9785,7 @@ def _small_m_direct_supported(
     activation: str,
     apply_router_weight_on_input: bool,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float,
     swiglu_beta: float,
     element_dtype: str,
@@ -9823,6 +9849,7 @@ def _compile_w4a16_small_m_direct(
     device: torch.device | None,
     scale_format: str = "e4m3_k16",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     w13_layout: str = "w13",
@@ -9849,6 +9876,7 @@ def _compile_w4a16_small_m_direct(
         topk_ids_dtype,
         scale_format,
         swiglu_limit,
+        swiglu_clamp_after_silu,
         swiglu_alpha,
         swiglu_beta,
         w13_layout,
@@ -9865,6 +9893,7 @@ def _compile_w4a16_small_m_direct(
         single_token=(int(m) == 1),
         scale_format=scale_format,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
@@ -9925,6 +9954,7 @@ def _compile_w4a16_small_m_direct(
             ("topk_ids_dtype", str(topk_ids_dtype)),
             ("scale_format", scale_format),
             ("swiglu_limit", swiglu_limit),
+            ("swiglu_clamp_after_silu", swiglu_clamp_after_silu),
             ("swiglu_alpha", swiglu_alpha),
             ("swiglu_beta", swiglu_beta),
             ("w13_layout", w13_layout),
@@ -10276,6 +10306,7 @@ def compile_w4a16_fused_moe(
     max_shared_mem: int,
     direct_token_capacity: int | None = None,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     weight_layout: str = "packed",
@@ -10689,6 +10720,7 @@ def compile_w4a16_fused_moe(
         element_dtype=element_dtype,
         fast_math=fast_math,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
@@ -10742,6 +10774,7 @@ def compile_w4a16_fused_moe(
         activation=activation,
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         element_dtype=element_dtype,
@@ -10761,6 +10794,7 @@ def compile_w4a16_fused_moe(
                 topk_ids_dtype=ids_dtype,
                 scale_format=scale_format,
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 w13_layout=w13_layout,
@@ -10963,6 +10997,7 @@ def compile_w4a16_fused_moe(
         element_dtype=element_dtype,
         fast_math=bool(fast_math),
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         fc1_tile_n=fc1_tile_n,
@@ -11035,6 +11070,7 @@ def compile_w4a16_activation(
     element_dtype: str = "bf16",
     fast_math: bool = True,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> W4A16ActivationCompileResult:
@@ -11054,6 +11090,7 @@ def compile_w4a16_activation(
         element_dtype=element_dtype,
         fast_math=fast_math,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
@@ -11098,6 +11135,7 @@ def compile_w4a16_activation(
         intermediate_size=intermediate_size,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
@@ -11250,6 +11288,7 @@ def _w4a16_small_m_direct_launch_flat(
     scale_format: str,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     w13_layout: str,
@@ -11272,6 +11311,7 @@ def _w4a16_small_m_direct_launch_flat(
             topk_ids_dtype=topk_ids.dtype,
             scale_format=scale_format,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
@@ -11334,6 +11374,7 @@ def _w4a16_small_m_direct_launch_op(
     scale_format: str,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     w13_layout: str,
@@ -11363,6 +11404,7 @@ def _w4a16_small_m_direct_launch_op(
         scale_format=scale_format,
         has_swiglu_limit=has_swiglu_limit,
         swiglu_limit_value=swiglu_limit_value,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
@@ -11395,6 +11437,7 @@ def _w4a16_small_m_direct_launch_fake(
     scale_format: str,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     w13_layout: str,
@@ -11574,6 +11617,7 @@ def _w4a16_fused_moe_launch_flat(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     weight_layout: str,
@@ -11683,6 +11727,7 @@ def _w4a16_fused_moe_launch_flat(
         sms=sms,
         max_shared_mem=max_shared_mem,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
@@ -11971,6 +12016,7 @@ def _w4a16_fused_moe_launch_op(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     weight_layout: str,
@@ -12021,6 +12067,7 @@ def _w4a16_fused_moe_launch_op(
         max_shared_mem=max_shared_mem,
         has_swiglu_limit=has_swiglu_limit,
         swiglu_limit_value=swiglu_limit_value,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
@@ -12074,6 +12121,7 @@ def _w4a16_fused_moe_launch_fake(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     weight_layout: str,
@@ -12131,6 +12179,7 @@ def _w4a16_fused_moe_calibrated_launch_op(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     weight_layout: str,
@@ -12179,6 +12228,7 @@ def _w4a16_fused_moe_calibrated_launch_op(
         max_shared_mem=max_shared_mem,
         has_swiglu_limit=has_swiglu_limit,
         swiglu_limit_value=swiglu_limit_value,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         weight_layout=weight_layout,
@@ -12234,6 +12284,7 @@ def _w4a16_fused_moe_calibrated_launch_fake(
     max_shared_mem: int,
     has_swiglu_limit: bool,
     swiglu_limit_value: float,
+    swiglu_clamp_after_silu: bool,
     swiglu_alpha: float,
     swiglu_beta: float,
     weight_layout: str,
@@ -13041,6 +13092,7 @@ def run_w4a16_moe(
     apply_router_weight_on_input: bool = False,
     fast_math: bool = True,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     fused_launch: W4A16FusedMoeCompileResult
@@ -13371,6 +13423,7 @@ def run_w4a16_moe(
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             element_dtype=element_dtype,
@@ -13457,6 +13510,7 @@ def run_w4a16_moe(
             scale_format,
             swiglu_limit is not None,
             float(swiglu_limit or 0.0),
+            swiglu_clamp_after_silu,
             float(swiglu_alpha),
             float(swiglu_beta),
             w13_layout,
@@ -13722,6 +13776,7 @@ def run_w4a16_moe(
             sms=sms,
             max_shared_mem=max_shared_mem,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             weight_layout=weight_layout,
@@ -13768,6 +13823,7 @@ def run_w4a16_moe(
             element_dtype,
             bool(fast_math),
             swiglu_limit,
+            swiglu_clamp_after_silu,
             float(swiglu_alpha),
             float(swiglu_beta),
             weight_layout,
@@ -13800,6 +13856,7 @@ def run_w4a16_moe(
             fused_launch.element_dtype,
             bool(fused_launch.fast_math),
             fused_launch.swiglu_limit,
+            fused_launch.swiglu_clamp_after_silu,
             float(fused_launch.swiglu_alpha),
             float(fused_launch.swiglu_beta),
             getattr(fused_launch, "weight_layout", "packed"),
@@ -13958,6 +14015,7 @@ def run_w4a16_moe(
         max_shared_mem,
         swiglu_limit is not None,
         float(swiglu_limit or 0.0),
+        swiglu_clamp_after_silu,
         float(swiglu_alpha),
         float(swiglu_beta),
         weight_layout,
@@ -14055,6 +14113,7 @@ def run_w4a16_moe(
             _lt_msm,
             _lt_hsl,
             _lt_slv,
+            _lt_cas,
             _lt_sa,
             _lt_sb,
             _lt_wl,
@@ -14109,6 +14168,7 @@ def run_w4a16_moe(
             max_shared_mem=_lt_msm,
             has_swiglu_limit=_lt_hsl,
             swiglu_limit_value=_lt_slv,
+            swiglu_clamp_after_silu=_lt_cas,
             swiglu_alpha=_lt_sa,
             swiglu_beta=_lt_sb,
             weight_layout=_lt_wl,

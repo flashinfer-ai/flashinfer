@@ -1,4 +1,8 @@
-"""Construct exact QSA winners from a radix threshold in one CUDA block."""
+"""Construct exact QSA winners from a radix threshold in one CUDA block.
+
+Indices-only selection returns the live prefix directly when it fits the budget;
+its score outputs are unspecified. This mode requires unsegmented input order.
+"""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -23,8 +27,10 @@ _TYPES = (Float32, Int32, Int32, Int32, Float32, Float32, Int32)
 
 
 class StableSelectionKernel:
-    def __init__(self, budget):
+    def __init__(self, budget, input_order=False, indices_only=False):
         self.budget = int(budget)
+        self.input_order = bool(input_order)
+        self.indices_only = bool(indices_only)
 
     @cute.jit
     def __call__(
@@ -49,115 +55,139 @@ class StableSelectionKernel:
         score_base = row.to(Int64) * stride
         length = lengths[row].to(Int32)
         selected = cutlass.min(length, Int32(self.budget))
-        allocator = cutlass.utils.SmemAllocator()
-        minima = allocator.allocate_tensor(
-            Float32, cute.make_layout((8,)), byte_alignment=16
-        )
-        greater_counts = allocator.allocate_tensor(
-            Int32, cute.make_layout((8,)), byte_alignment=16
-        )
-        tie_counts = allocator.allocate_tensor(
-            Int32, cute.make_layout((8,)), byte_alignment=16
-        )
-        threshold = allocator.allocate_tensor(
-            Float32, cute.make_layout((1,)), byte_alignment=4
-        )
-        minimum = Float32(float("inf"))
-        for part in cutlass.range_constexpr(self.budget // 256):
-            column = tid + Int32(part * 256)
-            if column < selected:
-                minimum = cutlass.min(
-                    minimum, Float32(top_values[base + column.to(Int64)])
-                )
-            values[base + column.to(Int64)] = Float32(-float("inf"))
-            ids[base + column.to(Int64)] = Int32(-1)
-        for shift in cutlass.range_constexpr(5):
-            minimum = cutlass.min(
-                minimum, cute.arch.shuffle_sync_bfly(minimum, offset=16 >> shift)
+        identity = Int32(0)
+        if cutlass.const_expr(self.indices_only):
+            if length <= self.budget:
+                identity = Int32(1)
+        if identity != 0:
+            for part in cutlass.range_constexpr(self.budget // 256):
+                column = tid + Int32(part * 256)
+                value = Int32(-1)
+                if column < length:
+                    value = column
+                ids[base + column.to(Int64)] = value
+                values[base + column.to(Int64)] = Float32(-float("inf"))
+        else:
+            allocator = cutlass.utils.SmemAllocator()
+            minima = allocator.allocate_tensor(
+                Float32, cute.make_layout((8,)), byte_alignment=16
             )
-        if lane == Int32(0):
-            minima[warp] = minimum
-        cute.arch.sync_threads()
-        if tid == Int32(0):
+            greater_counts = allocator.allocate_tensor(
+                Int32, cute.make_layout((8,)), byte_alignment=16
+            )
+            tie_counts = allocator.allocate_tensor(
+                Int32, cute.make_layout((8,)), byte_alignment=16
+            )
+            threshold = allocator.allocate_tensor(
+                Float32, cute.make_layout((1,)), byte_alignment=4
+            )
             minimum = Float32(float("inf"))
-            for w in cutlass.range_constexpr(8):
-                minimum = cutlass.min(minimum, Float32(minima[w]))
-            threshold[0] = minimum
-        cute.arch.sync_threads()
-        cutoff = Float32(threshold[0])
-
-        # Each warp owns a contiguous span so threshold ties retain earlier
-        # input positions while both score scans use coalesced memory loads.
-        tiles = (length + Int32(255)) // Int32(256)
-        span = tiles * Int32(32)
-        start = warp * span
-        ng, nt = Int32(0), Int32(0)
-        for tile in cutlass.range(tiles):
-            column = start + tile * Int32(32) + lane
-            if column < length:
-                value = Float32(scores[score_base + column.to(Int64)])
-                if value > cutoff:
-                    ng += Int32(1)
-                if value == cutoff:
-                    nt += Int32(1)
-        for shift in cutlass.range_constexpr(5):
-            ng += cute.arch.shuffle_sync_bfly(ng, offset=16 >> shift)
-            nt += cute.arch.shuffle_sync_bfly(nt, offset=16 >> shift)
-        if lane == Int32(0):
-            greater_counts[warp], tie_counts[warp] = ng, nt
-        cute.arch.sync_threads()
-        greater_before, ties_before, total_greater = Int32(0), Int32(0), Int32(0)
-        for w in cutlass.range_constexpr(8):
-            count = Int32(greater_counts[w])
-            total_greater += count
-            if Int32(w) < warp:
-                greater_before += count
-                ties_before += Int32(tie_counts[w])
-        need = selected - total_greater
-        carry = cutlass.min(
-            cutlass.min(eligible[row].to(Int32), group_offset), Int32(self.budget)
-        )
-        for tile in cutlass.range(tiles):
-            column = start + tile * Int32(32) + lane
-            value = Float32(-float("inf"))
-            is_greater, is_tie = Int32(0), Int32(0)
-            if column < length:
-                value = Float32(scores[score_base + column.to(Int64)])
-                if value > cutoff:
-                    is_greater = Int32(1)
-                if value == cutoff:
-                    is_tie = Int32(1)
-            gp, tp = is_greater, is_tie
+            for part in cutlass.range_constexpr(self.budget // 256):
+                column = tid + Int32(part * 256)
+                if column < selected:
+                    minimum = cutlass.min(
+                        minimum, Float32(top_values[base + column.to(Int64)])
+                    )
+                values[base + column.to(Int64)] = Float32(-float("inf"))
+                ids[base + column.to(Int64)] = Int32(-1)
             for shift in cutlass.range_constexpr(5):
-                distance = Int32(1 << shift)
-                source_lane = cutlass.max(lane - distance, Int32(0))
-                g = cute.arch.shuffle_sync(gp, source_lane)
-                t = cute.arch.shuffle_sync(tp, source_lane)
-                if lane >= distance:
-                    gp += g
-                    tp += t
-            tie_rank = ties_before + tp - Int32(1)
-            chosen = (is_greater != Int32(0)) | (
-                (is_tie != Int32(0)) & (tie_rank < need)
+                minimum = cutlass.min(
+                    minimum, cute.arch.shuffle_sync_bfly(minimum, offset=16 >> shift)
+                )
+            if lane == Int32(0):
+                minima[warp] = minimum
+            cute.arch.sync_threads()
+            if tid == Int32(0):
+                minimum = Float32(float("inf"))
+                for w in cutlass.range_constexpr(8):
+                    minimum = cutlass.min(minimum, Float32(minima[w]))
+                threshold[0] = minimum
+            cute.arch.sync_threads()
+            cutoff = Float32(threshold[0])
+
+            # Each warp owns a contiguous span so threshold ties retain earlier
+            # input positions while both score scans use coalesced memory loads.
+            tiles = (length + Int32(255)) // Int32(256)
+            span = tiles * Int32(32)
+            start = warp * span
+            ng, nt = Int32(0), Int32(0)
+            for tile in cutlass.range(tiles):
+                column = start + tile * Int32(32) + lane
+                if column < length:
+                    value = Float32(scores[score_base + column.to(Int64)])
+                    if value > cutoff:
+                        ng += Int32(1)
+                    if value == cutoff:
+                        nt += Int32(1)
+            for shift in cutlass.range_constexpr(5):
+                ng += cute.arch.shuffle_sync_bfly(ng, offset=16 >> shift)
+                nt += cute.arch.shuffle_sync_bfly(nt, offset=16 >> shift)
+            if lane == Int32(0):
+                greater_counts[warp], tie_counts[warp] = ng, nt
+            cute.arch.sync_threads()
+            greater_before, ties_before, total_greater = Int32(0), Int32(0), Int32(0)
+            for w in cutlass.range_constexpr(8):
+                count = Int32(greater_counts[w])
+                total_greater += count
+                if Int32(w) < warp:
+                    greater_before += count
+                    ties_before += Int32(tie_counts[w])
+            need = selected - total_greater
+            carry = cutlass.min(
+                cutlass.min(eligible[row].to(Int32), group_offset), Int32(self.budget)
             )
-            if chosen:
-                destination = greater_before + gp - Int32(1)
-                if is_tie != Int32(0):
-                    destination = total_greater + tie_rank
-                global_id = group_offset + column - carry
-                if column < carry:
-                    global_id = prior_ids[base + column.to(Int64)].to(Int32)
-                values[base + destination.to(Int64)] = value
-                ids[base + destination.to(Int64)] = global_id
-            greater_before += cute.arch.shuffle_sync(gp, Int32(31))
-            ties_before += cute.arch.shuffle_sync(tp, Int32(31))
+            for tile in cutlass.range(tiles):
+                column = start + tile * Int32(32) + lane
+                value = Float32(-float("inf"))
+                is_greater, is_tie = Int32(0), Int32(0)
+                if column < length:
+                    value = Float32(scores[score_base + column.to(Int64)])
+                    if value > cutoff:
+                        is_greater = Int32(1)
+                    if value == cutoff:
+                        is_tie = Int32(1)
+                gp, tp = is_greater, is_tie
+                for shift in cutlass.range_constexpr(5):
+                    distance = Int32(1 << shift)
+                    source_lane = cutlass.max(lane - distance, Int32(0))
+                    g = cute.arch.shuffle_sync(gp, source_lane)
+                    t = cute.arch.shuffle_sync(tp, source_lane)
+                    if lane >= distance:
+                        gp += g
+                        tp += t
+                tie_rank = ties_before + tp - Int32(1)
+                chosen = (is_greater != Int32(0)) | (
+                    (is_tie != Int32(0)) & (tie_rank < need)
+                )
+                if chosen:
+                    destination = greater_before + gp - Int32(1)
+                    if is_tie != Int32(0):
+                        destination = total_greater + tie_rank
+                    if cutlass.const_expr(self.input_order):
+                        destination = (
+                            greater_before
+                            + gp
+                            + cutlass.min(ties_before + tp, need)
+                            - Int32(1)
+                        )
+                    global_id = group_offset + column - carry
+                    if column < carry:
+                        global_id = prior_ids[base + column.to(Int64)].to(Int32)
+                    values[base + destination.to(Int64)] = value
+                    ids[base + destination.to(Int64)] = global_id
+                greater_before += cute.arch.shuffle_sync(gp, Int32(31))
+                ties_before += cute.arch.shuffle_sync(tp, Int32(31))
 
 
-def compile_stable_selection(budget, device):
-    key = (device, int(budget))
+def compile_stable_selection(budget, device, input_order=False, indices_only=False):
+    if indices_only and not input_order:
+        raise ValueError(
+            "indices-only selection requires input ordering and an unsegmented score row"
+        )
+    key = (device, int(budget), bool(input_order), bool(indices_only))
     raw = _CACHE.get(key)
     if raw is None:
-        kernel = StableSelectionKernel(budget)
+        kernel = StableSelectionKernel(budget, input_order, indices_only)
         raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
         pointers = tuple(
             make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
@@ -171,7 +201,7 @@ def compile_stable_selection(budget, device):
             Int32(0),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "attention.qsa.stable_selection", 1, key
+                "attention.qsa.stable_selection", 3, key
             ),
         )
         _CACHE[key] = raw
@@ -190,7 +220,11 @@ def launch_stable_selection(
     group_offset,
     group_budget,
     prepared=None,
+    input_order=False,
+    indices_only=False,
 ):
+    if indices_only and group_offset != 0:
+        raise ValueError("indices-only selection does not accept segmented scores")
     device = scores.device.index
     if device is None:
         device = torch.cuda.current_device()
@@ -198,7 +232,9 @@ def launch_stable_selection(
         raw = (
             prepared
             if prepared is not None
-            else compile_stable_selection(group_budget, device)
+            else compile_stable_selection(
+                group_budget, device, input_order, indices_only
+            )
         )
         if compile_only_launches_enabled():
             for key in program_keys(raw):

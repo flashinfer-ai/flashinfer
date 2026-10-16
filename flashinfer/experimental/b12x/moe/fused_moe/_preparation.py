@@ -242,6 +242,7 @@ def _query(
         collect_activation_amax=bool(routing.collect_activation_amax),
         deterministic_output=deterministic_output,
         swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
+        swiglu_clamp_after_silu=experts.plan.activation.swiglu_clamp_after_silu,
         swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
         swiglu_beta=_codec_scalar(experts.plan.activation.swiglu_beta),
         w13_layout=plan.w13_layout,
@@ -349,6 +350,7 @@ def _lower_caps(
         collect_activation_amax=query.collect_activation_amax,
         deterministic_output=query.deterministic_output,
         swiglu_limit=_decode_scalar(query.swiglu_limit),
+        swiglu_clamp_after_silu=query.swiglu_clamp_after_silu,
         swiglu_alpha=_decode_scalar(query.swiglu_alpha),
         w4a16_block_size_m=(
             config.w4a16_block_size_m
@@ -549,6 +551,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             topk=core.num_topk,
             activation=core.activation,
             swiglu_limit=core.swiglu_limit,
+            swiglu_clamp_after_silu=core.swiglu_clamp_after_silu,
             swiglu_alpha=core.swiglu_alpha,
             swiglu_beta=core.swiglu_beta,
             scale_format=scale_format,
@@ -611,6 +614,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
             ),
             swiglu_limit=core.swiglu_limit,
+            swiglu_clamp_after_silu=core.swiglu_clamp_after_silu,
             swiglu_alpha=core.swiglu_alpha,
             swiglu_beta=core.swiglu_beta,
             weight_layout=weight_layout,
@@ -731,6 +735,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 terms=caps.w4a16_a4_prefill_terms,
                 warps=caps.w4a16_a4_prefill_warps,
                 swiglu_limit=core.swiglu_limit,
+                swiglu_clamp_after_silu=core.swiglu_clamp_after_silu,
             )
             a4_prefill = compile_w4a16_a4_prefill(
                 **a4_args,
@@ -998,6 +1003,7 @@ def _program_carriers(
                         device=plan.device,
                         quant_mode=plan.quant_mode,
                         swiglu_limit=plan.swiglu_limit,
+                        swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
                         swiglu_alpha=plan.swiglu_alpha,
                         swiglu_beta=plan.swiglu_beta,
                         weight_layout=weight_layout,
@@ -1028,6 +1034,7 @@ def _program_carriers(
                 share_input_across_experts=dynamic["share_input_across_experts"],
                 deterministic_output=plan.deterministic_output,
                 swiglu_limit=plan.swiglu_limit,
+                swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
                 swiglu_alpha=plan.swiglu_alpha,
                 swiglu_beta=plan.swiglu_beta,
                 trellis_bits=caps.weight_plan.trellis_bits or 0,

@@ -146,15 +146,33 @@ def _cuda_graph_kernel_chain(
     return worker
 
 
-def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
+def _prepare_fused_execution(
+    channel,
+    inp,
+    residual,
+    weight,
+    epsilon,
+    *,
+    name,
+    output_dtype=None,
+    zero_centered=False,
+    reduction_dtype=None,
+):
     """Build the real collective preparation request used by oneshot tests."""
+    out = torch.empty_like(inp, dtype=output_dtype or inp.dtype)
     query = query_from_runtime(
         channel,
         surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
-        call={"inp": inp},
+        call={
+            "inp": inp,
+            "residual": residual,
+            "weight": weight,
+            "out": out,
+            "zero_centered": zero_centered,
+            "reduction_dtype": reduction_dtype,
+        },
     )
     declaration = oneshot_plan(query, runtime=channel)
-    out = torch.empty_like(inp)
     ranks = tuple(range(dist.get_world_size()))
     collective = CollectiveRequirement(key=name, ranks=ranks)
     original_residual = residual.clone()
@@ -169,6 +187,7 @@ def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
             out=out,
             residual_out=residual,
             epsilon=epsilon,
+            reset=lambda: residual.copy_(original_residual),
         ),
     )
     session = PreparationSession(device=channel.device, autotune=False)
@@ -180,6 +199,122 @@ def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
     )
     residual.copy_(original_residual)
     return session, result, declaration, out
+
+
+def _run_mixed_graphs(pool, device, rank):
+    """Alternate mixed-precision graphs on one IPC channel with in-place residuals."""
+    epsilon, hidden = 1e-6, 4096
+    channel_id = "graph:mixed-rmsnorm"
+    pool.prepare_channels((channel_id,))
+    cases = (
+        (torch.float32, torch.float32, torch.bfloat16, True, None),
+        (torch.float32, torch.float32, torch.bfloat16, True, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, True, None),
+        (torch.float16, torch.float32, torch.float16, False, None),
+    )
+    graphs, resources, failures = [], [], []
+    try:
+        for case, (dtype, weight_dtype, output_dtype, centered, rounding) in enumerate(
+            cases
+        ):
+            for rows in (1, 4, 7, 36):
+                inp, residual, weight = _make_inputs(rows, hidden, dtype, device, rank)
+                residual = residual.float()
+                weight = weight.to(weight_dtype)
+                options = {"zero_centered": centered, "reduction_dtype": rounding}
+                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                with pool.capture(channel_id=channel_id) as channel:
+                    session, result, plan, out = _prepare_fused_execution(
+                        channel,
+                        inp,
+                        residual,
+                        weight,
+                        epsilon,
+                        name=f"mixed-rmsnorm:{case}:{rows}",
+                        output_dtype=output_dtype,
+                        **options,
+                    )
+                    resources.append((session, result))
+                    with torch.cuda.graph(graph):
+                        pool.all_reduce_fused_add_rms_norm(
+                            inp,
+                            residual,
+                            weight,
+                            epsilon,
+                            plan=plan,
+                            out=out,
+                            residual_out=residual,
+                            channel_id=channel_id,
+                            **options,
+                        )
+                _cuda_graph_kernel_chain(graph)
+                graphs.append((graph, inp, residual, weight, out, centered, rounding))
+
+        for iteration in range(3):
+            for graph, inp, residual, weight, out, centered, rounding in reversed(
+                graphs
+            ):
+                next_input, next_residual, _ = _make_inputs(
+                    inp.shape[0],
+                    hidden,
+                    inp.dtype,
+                    device,
+                    rank,
+                    iteration=iteration + 17,
+                )
+                inp.copy_(next_input)
+                residual.copy_(next_residual)
+                out.fill_(float("nan"))
+                reduced = inp.to(torch.float32, copy=True)
+                dist.all_reduce(reduced)
+                residual_bounds = None
+                if rounding is not None:
+                    reduced = reduced.to(rounding).float()
+                    sums = torch.stack((inp.double(), inp.double().abs()))
+                    dist.all_reduce(sums)
+                    steps = dist.get_world_size() - 1
+                    unit_roundoff = torch.finfo(torch.float32).eps / 2
+                    error = sums[1] * (
+                        steps * unit_roundoff / (1 - steps * unit_roundoff)
+                    )
+                    # Reduction orders can straddle a BF16 rounding midpoint.
+                    residual_bounds = tuple(
+                        residual + value.to(rounding).float()
+                        for value in (sums[0] - error, sums[0] + error)
+                    )
+                expected_residual = residual + reduced
+                expected = expected_residual * torch.rsqrt(
+                    expected_residual.square().mean(-1, keepdim=True) + epsilon
+                )
+                expected = (expected * (weight.float() + int(centered))).to(out.dtype)
+                allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize(device)
+                try:
+                    assert (
+                        torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                        == allocated
+                    )
+                    torch.testing.assert_close(
+                        residual,
+                        expected_residual
+                        if residual_bounds is None
+                        else residual.clamp(*residual_bounds),
+                        rtol=2e-5,
+                        atol=2e-5,
+                    )
+                    torch.testing.assert_close(out, expected, rtol=8e-3, atol=8e-3)
+                except AssertionError as exc:
+                    failures.append(
+                        f"{inp.dtype}, rows={inp.shape[0]}, rounding={rounding}: {exc}"
+                    )
+        assert not failures, "\n".join(failures)
+    finally:
+        for graph, *_ in graphs:
+            graph.reset()
+        for session, result in resources:
+            result.close()
+            session.close()
 
 
 def _run_eager(
@@ -312,7 +447,7 @@ def _run_graph(
         )
         or (
             world_size == 4
-            and os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
+            and os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "1") not in ("", "0")
         )
         or (
             world_size == 8
@@ -393,6 +528,7 @@ def _run_tp8_graph_mode_transition(
     channel = pool.for_stream(stream, channel_id=channel_id)
 
     calls = []
+    resources = []
     modes = []
     state = channel._ext._state(channel._ptr)
     for rows, iteration in ((1, 41), (4, 43)):
@@ -404,11 +540,18 @@ def _run_tp8_graph_mode_transition(
             rank,
             iteration=iteration,
         )
-        out = torch.empty_like(inp)
-        calls.append((inp, residual, weight, out))
         modes.append(_CuTeOneshotBackend._fused_launch_config(state, inp)[0])
         with torch.cuda.stream(stream):
-            channel.prepare_graph_fused_add_rms_norm(inp)
+            session, result, plan, out = _prepare_fused_execution(
+                channel,
+                inp,
+                residual,
+                weight,
+                epsilon,
+                name=f"transition:{rows}",
+            )
+        resources.append((session, result))
+        calls.append((inp, residual, weight, out, plan))
     assert modes == ["stage_pull", "stage_tp8_owner"]
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -416,12 +559,13 @@ def _run_tp8_graph_mode_transition(
         pool.capture(stream=stream, channel_id=channel_id),
         torch.cuda.graph(graph, stream=stream),
     ):
-        for inp, residual, weight, out in calls:
+        for inp, residual, weight, out, plan in calls:
             pool.all_reduce_fused_add_rms_norm(
                 inp,
                 residual,
                 weight,
                 epsilon,
+                plan=plan,
                 out=out,
                 residual_out=residual,
                 stream=stream,
@@ -430,7 +574,9 @@ def _run_tp8_graph_mode_transition(
 
     for replay in range(3):
         expected = []
-        for rows, (inp, residual, weight, _out) in zip((1, 4), calls, strict=True):
+        for rows, (inp, residual, weight, _out, _plan) in zip(
+            (1, 4), calls, strict=True
+        ):
             next_inp, next_residual, _ = _make_inputs(
                 rows,
                 hidden_size,
@@ -445,15 +591,19 @@ def _run_tp8_graph_mode_transition(
 
         graph.replay()
         stream.synchronize()
-        for (_inp, residual, _weight, out), (
+        for (_inp, residual, _weight, out, _plan), (
             expected_out,
             expected_residual,
         ) in zip(calls, expected, strict=True):
             _assert_close(out, expected_out, dtype)
             _assert_close(residual, expected_residual, dtype)
+    graph.reset()
+    for session, result in resources:
+        result.close()
+        session.close()
 
 
-def _worker(rank: int, world_size: int, port: int) -> None:
+def _worker(rank: int, world_size: int, port: int, mixed: bool) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -466,11 +616,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
-        max_input_bytes=128 * 1024,
-        max_size=128 * 1024,
+        max_input_bytes=(1024 if mixed else 128) * 1024,
+        max_size=(1024 if mixed else 128) * 1024,
+        single_channel=mixed,
         max_concurrent_channels=2,
     )
     try:
+        if mixed:
+            _run_mixed_graphs(pool, device, rank)
+            return
         pool.prepare_channels(
             (
                 "eager:fused-rmsnorm",
@@ -490,7 +644,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
+@pytest.mark.parametrize("mixed", [False, True], ids=["same-dtype", "fp32-residual"])
+def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph(mixed) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     world_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
@@ -502,7 +657,7 @@ def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
         )
     context = mp.spawn(
         _worker,
-        args=(world_size, _free_port()),
+        args=(world_size, _free_port(), mixed),
         nprocs=world_size,
         join=False,
     )

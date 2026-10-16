@@ -47,9 +47,9 @@ class HyperConnectionCaps:
             raise ValueError(f"streams must be positive, got {streams}")
         if lowrank <= 0:
             raise ValueError(f"lowrank must be positive, got {lowrank}")
-        if self.dtype != torch.bfloat16:
+        if self.dtype not in (torch.bfloat16, torch.float32):
             raise TypeError(
-                f"HyperConnection kernels require torch.bfloat16, got {self.dtype}"
+                f"HyperConnection kernels require torch.bfloat16 or torch.float32, got {self.dtype}"
             )
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "max_tokens", max_tokens)
@@ -152,7 +152,9 @@ class _HyperConnectionState:
                 tensor,
                 tokens=live_tokens,
                 tail=tails[name],
-                dtype=caps.dtype,
+                dtype=getattr(torch, self.query.output_dtype)
+                if name == "normalized"
+                else caps.dtype,
                 device=caps.device,
                 name=name,
             )
@@ -276,7 +278,15 @@ def _require_eps(eps: float) -> float:
 
 
 def run_grouped_rmsnorm_impl(
-    state, weight, *, eps, plan: _HyperConnectionState, out, zero_centered=True
+    state,
+    weight,
+    *,
+    eps,
+    plan: _HyperConnectionState,
+    out,
+    zero_centered=True,
+    residual=None,
+    paired=None,
 ):
     _require_cuda(plan)
     plan.require_operation("grouped_rmsnorm", eps=eps)
@@ -287,11 +297,35 @@ def run_grouped_rmsnorm_impl(
     width = caps.streams * caps.hidden_size
     _validate_input(
         state,
-        shape=(tokens, width),
+        shape=(tokens, caps.hidden_size if plan.query.paired else width),
         caps=caps,
         name="state",
-        row_strided=not plan.query.zero_centered,
+        row_strided=True,
     )
+    if (paired is not None) != plan.query.paired:
+        raise ValueError("paired normalization differs from preparation")
+    if paired is not None:
+        _validate_input(
+            paired, shape=state.shape, caps=caps, name="paired", row_strided=True
+        )
+        _validate_output_disjoint("normalized", out, (("paired", paired),))
+    if (residual is not None) != plan.query.add_residual:
+        raise ValueError("residual addition differs from preparation")
+    if residual is not None:
+        if (
+            residual.shape != state.shape
+            or residual.dtype != getattr(torch, plan.query.right_dtype)
+            or residual.device != state.device
+            or residual.stride(-1) != 1
+        ):
+            raise ValueError(
+                "residual must match the prepared normalization geometry and dtype"
+            )
+        from ._kernels import _require_disjoint
+
+        _require_disjoint(
+            "state", state, (("residual", residual), ("weight", weight), ("out", out))
+        )
     if weight.dtype != getattr(torch, plan.query.weight_dtype):
         raise ValueError("affine weight dtype differs from preparation")
     if (
@@ -306,13 +340,19 @@ def run_grouped_rmsnorm_impl(
         out,
         tokens=tokens,
         tail=(width,),
-        dtype=caps.dtype,
+        dtype=getattr(torch, plan.query.output_dtype),
         device=caps.device,
         name="out",
     )
     _validate_output_disjoint("normalized", out, (("state", state), ("weight", weight)))
     if tokens:
-        plan.launch(state, weight, out, eps=eps)
+        if paired is not None:
+            plan.launch(state, weight, out, eps=eps, paired=paired)
+        elif residual is None:
+            plan.launch(state, weight, out, eps=eps)
+        else:
+            _validate_output_disjoint("normalized", out, (("residual", residual),))
+            plan.launch(state, weight, out, eps=eps, residual=residual)
     return out[:tokens]
 
 
@@ -593,9 +633,11 @@ def run_swiglu_impl(
     round_silu: bool = False,
     plan: _HyperConnectionState,
 ) -> torch.Tensor:
-    """Clamp gate above only and up symmetrically, then compute FP32 SiLU*up.
+    """Compute FP32 SiLU*up with the prepared gate-clamp placement.
 
     Inputs are BF16 FC1 outputs, with gate followed by up along the last axis.
+    The invocation's ``clamp_after_silu`` moves the upper clamp from gate to
+    SiLU(gate); up is always clamped symmetrically.
     ``round_silu=True`` rounds SiLU to BF16 before multiplying for vision.
     ``limit=inf`` disables clamping. No activation scaling is applied.
     Warm once before capture; ``out`` is disjoint caller-owned BF16 storage.

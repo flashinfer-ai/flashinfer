@@ -440,3 +440,62 @@ def test_pcie_dma_preparation_tolerates_rank_skew_and_replays() -> None:
                     process.kill()
             for process in workers.processes:
                 process.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "dtype,dtype_code", [(torch.bfloat16, 0), (torch.float16, 1), (torch.float32, 2)]
+)
+def test_fused_receive_reduce_replay_and_grid_changes(dtype, dtype_code):
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    kernels = DmaKernels(CudaRTLibrary())
+    kernels.install(compile_launchers(world_size=2, wire_mode=""))
+    flags, sent, waited, done = (
+        torch.zeros(1, device=device, dtype=torch.int32) for _ in range(4)
+    )
+    left = torch.randn(65536, device=device).to(dtype)
+    received = torch.empty_like(left)
+    source = torch.randn_like(left)
+    outputs = [torch.empty_like(left[:n]) for n in (8, 65536, 512)]
+    producer = torch.cuda.Stream(device=device)
+    main = torch.cuda.current_stream(device)
+    wait = flags.data_ptr(), waited.data_ptr(), done.data_ptr()
+
+    def execute():
+        for output in outputs:
+            producer.wait_stream(main)
+            with torch.cuda.stream(producer):
+                received.copy_(source)
+                kernels.dma_set_flag(flags.data_ptr(), sent.data_ptr())
+            kernels.dma_add(
+                output.data_ptr(),
+                left.data_ptr(),
+                received.data_ptr(),
+                output.numel(),
+                dtype_code,
+                wait=wait,
+            )
+            main.wait_stream(producer)
+
+    execute()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        execute()
+    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for iteration in range(12):
+        left.mul_(0.75)
+        source.add_(0.125)
+        for output in outputs:
+            output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        for output in outputs:
+            expected = (
+                left[: output.numel()].float() + source[: output.numel()].float()
+            ).to(dtype)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            del expected
+        torch.testing.assert_close(sent, waited, rtol=0, atol=0)
+        assert not done.any()
+    graph.reset()

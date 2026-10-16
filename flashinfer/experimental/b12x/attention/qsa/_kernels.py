@@ -51,6 +51,22 @@ def _prepare_index_query_kernel(
     MROPE_SECTION_1: tl.constexpr,
     ROPE_IS_BF16: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    key_weight=None,
+    key_bias=None,
+    key_output=None,
+    value_output=None,
+    key_cache=None,
+    value_cache=None,
+    page_table=None,
+    cache_page_stride: tl.constexpr = 0,
+    table_stride: tl.constexpr = 0,
+    PAGE_SIZE: tl.constexpr = 128,
+    KEY_HEADS: tl.constexpr = 0,
+    KEY_LAYER_NORM: tl.constexpr = False,
+    COPY_VALUE: tl.constexpr = False,
+    APPEND_CACHE: tl.constexpr = False,
+    INVERSE_ROPE: tl.constexpr = False,
+    ROUND_OUTPUT: tl.constexpr = False,
 ):
     program = tl.program_id(0)
     row = program // INDEX_HEADS
@@ -65,10 +81,23 @@ def _prepare_index_query_kernel(
         mask=valid_row & dim_mask,
         other=0.0,
     ).to(tl.float32)
+    mean = tl.full((), 0.0, tl.float32)
     variance = tl.sum(values * values, axis=0) / HEAD_DIM
+    weight = tl.load(norm_weight + dims, mask=dim_mask, other=0.0).to(tl.float32) + 1.0
+    bias = tl.full((BLOCK_D,), 0.0, tl.float32)
+    if KEY_HEADS > 0:
+        if head >= INDEX_HEADS - KEY_HEADS:
+            weight = tl.load(key_weight + dims, dim_mask, other=0).to(tl.float32)
+            if KEY_LAYER_NORM:
+                mean = tl.sum(values, axis=0) / HEAD_DIM
+                variance -= mean * mean
+                bias = tl.load(key_bias + dims, dim_mask, other=0).to(tl.float32)
+            else:
+                weight += 1.0
     inv_rms = tl.rsqrt(variance + eps)
-    weight = tl.load(norm_weight + dims, mask=dim_mask, other=0.0).to(tl.float32)
-    normalized = (values * inv_rms * (1.0 + weight)).to(tl.bfloat16).to(tl.float32)
+    normalized = (
+        ((values - mean) * inv_rms * weight + bias).to(tl.bfloat16).to(tl.float32)
+    )
 
     half_rotary = ROTARY_DIM // 2
     in_rotary = dims < ROTARY_DIM
@@ -84,8 +113,23 @@ def _prepare_index_query_kernel(
         mask=in_rotary,
         other=0.0,
     ).to(tl.float32)
+    partner_weight += 1.0
+    partner_bias = tl.full((BLOCK_D,), 0.0, tl.float32)
+    if KEY_HEADS > 0:
+        if head >= INDEX_HEADS - KEY_HEADS:
+            partner_weight = tl.load(key_weight + partner_dim, in_rotary, other=0).to(
+                tl.float32
+            )
+            if KEY_LAYER_NORM:
+                partner_bias = tl.load(key_bias + partner_dim, in_rotary, other=0).to(
+                    tl.float32
+                )
+            else:
+                partner_weight += 1.0
     partner = (
-        (partner * inv_rms * (1.0 + partner_weight)).to(tl.bfloat16).to(tl.float32)
+        ((partner - mean) * inv_rms * partner_weight + partner_bias)
+        .to(tl.bfloat16)
+        .to(tl.float32)
     )
 
     if POSITION_AXES == 1:
@@ -109,17 +153,24 @@ def _prepare_index_query_kernel(
         mask=in_rotary,
         other=0,
     ).to(tl.int64)
-    valid_position = (position >= 0) & (position < rope_position_rows)
-    cosine = tl.load(
-        rope_cos + position * rope_cos_row_stride + pair,
-        mask=valid_row & in_rotary & valid_position,
-        other=1.0,
-    ).to(tl.float32)
-    sine = tl.load(
-        rope_sin + position * rope_sin_row_stride + pair,
-        mask=valid_row & in_rotary & valid_position,
-        other=0.0,
-    ).to(tl.float32)
+    if INVERSE_ROPE:
+        frequency = tl.load(rope_cos + pair, in_rotary, other=0) * tl.maximum(
+            position, 0
+        ).to(tl.float32)
+        cosine = tl.extra.cuda.libdevice.cos(frequency).to(tl.bfloat16).to(tl.float32)
+        sine = tl.extra.cuda.libdevice.sin(frequency).to(tl.bfloat16).to(tl.float32)
+    else:
+        valid_position = (position >= 0) & (position < rope_position_rows)
+        cosine = tl.load(
+            rope_cos + position * rope_cos_row_stride + pair,
+            mask=valid_row & in_rotary & valid_position,
+            other=1.0,
+        ).to(tl.float32)
+        sine = tl.load(
+            rope_sin + position * rope_sin_row_stride + pair,
+            mask=valid_row & in_rotary & valid_position,
+            other=0.0,
+        ).to(tl.float32)
     rotated_partner = tl.where(dims < half_rotary, -partner, partner)
     if ROPE_IS_BF16:
         direct_product = _round_fp32_to_bf16(normalized * cosine)
@@ -128,7 +179,54 @@ def _prepare_index_query_kernel(
     else:
         rotated = normalized * cosine + rotated_partner * sine
     result = tl.where(in_rotary, rotated, normalized)
-    tl.store(prepared_query + offsets, result, mask=dim_mask)
+    if ROUND_OUTPUT:
+        result = result.to(tl.bfloat16).to(tl.float32)
+    if KEY_HEADS > 0:
+        if head < INDEX_HEADS - KEY_HEADS:
+            out_offset = (
+                row.to(tl.int64) * (INDEX_HEADS - KEY_HEADS) + head
+            ) * HEAD_DIM + dims
+            tl.store(prepared_query + out_offset, result, dim_mask)
+        else:
+            key_head = head - (INDEX_HEADS - KEY_HEADS)
+            out_offset = (row.to(tl.int64) * KEY_HEADS + key_head) * HEAD_DIM + dims
+            tl.store(key_output + out_offset, result, dim_mask)
+            if COPY_VALUE:
+                value = tl.load(
+                    index_query
+                    + row.to(tl.int64) * index_query_row_stride
+                    + (INDEX_HEADS + key_head) * HEAD_DIM
+                    + dims,
+                    dim_mask,
+                    other=0,
+                )
+                tl.store(value_output + out_offset, value, dim_mask)
+                if APPEND_CACHE:
+                    absolute = tl.load(
+                        rope_positions + row * rope_position_row_stride
+                    ).to(tl.int64)
+                    request = tl.load(request_ids + row).to(tl.int64)
+                    valid = (absolute >= 0) & (request >= 0)
+                    page = tl.load(
+                        page_table + request * table_stride + absolute // PAGE_SIZE,
+                        valid,
+                        other=-1,
+                    ).to(tl.int64)
+                    cache_offset = (
+                        page * cache_page_stride
+                        + ((absolute % PAGE_SIZE) * KEY_HEADS + key_head) * HEAD_DIM
+                        + dims
+                    )
+                    tl.store(
+                        key_cache + cache_offset, result, valid & (page >= 0) & dim_mask
+                    )
+                    tl.store(
+                        value_cache + cache_offset,
+                        value,
+                        valid & (page >= 0) & dim_mask,
+                    )
+    else:
+        tl.store(prepared_query + offsets, result, mask=dim_mask)
 
 
 @triton.jit(do_not_specialize=["raw_key_row_stride"])
@@ -660,7 +758,8 @@ def _score_representatives_tiled_kernel(
             tl.store(
                 scores + score_rows[None, :] + local_groups[:, None],
                 score,
-                mask=member[None, :] & (local_groups[:, None] < chunk_eligible[None, :]),
+                mask=member[None, :]
+                & (local_groups[:, None] < chunk_eligible[None, :]),
             )
         remaining = remaining & ~member
 

@@ -41,6 +41,7 @@ def request_for_capacity(
     name: str,
     calls: dict[int, Callable[[object], PreparedCall]],
     benchmark_calls: dict[int, Callable[[object], PreparedCall]] | None = None,
+    dependencies: tuple[str, ...] = (),
 ):
     """Make the scalar or exact-M composite request without a legacy warmup path."""
     counts = getattr(declaration, "token_counts", None)
@@ -53,7 +54,11 @@ def request_for_capacity(
             name=name,
             prepare_call=next(iter(calls.values())),
             benchmark_call=next(iter(benchmark_calls.values())),
+            dependencies=dependencies,
         )
     return declaration.request(
-        name=name, prepare_calls=calls, benchmark_calls=benchmark_calls
+        name=name,
+        prepare_calls=calls,
+        benchmark_calls=benchmark_calls,
+        dependencies=dependencies,
     )

@@ -762,8 +762,10 @@ def test_trellis_w4a16_planner_runtime_key_preserves_exact_capacity() -> None:
     assert max_m_blocks == 542
 
 
+@pytest.mark.parametrize("clamp_after_silu", [False, True])
 def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
     monkeypatch: pytest.MonkeyPatch,
+    clamp_after_silu: bool,
 ) -> None:
     from contextlib import nullcontext
     from types import SimpleNamespace
@@ -823,6 +825,7 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         swiglu_limit=None,
         swiglu_alpha=1.0,
         swiglu_beta=1.0,
+        swiglu_clamp_after_silu=clamp_after_silu,
         scale_format="e4m3_k32",
         weight_layout="trellis_t256",
         w13_layout="trellis_t256_proj",
@@ -830,6 +833,9 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
     )
 
     main_calls = [call for call in fused_calls if call["size_m"] == 3072]
+    assert all(
+        call["swiglu_clamp_after_silu"] == clamp_after_silu for call in fused_calls
+    )
     direct_calls = [call for call in fused_calls if call["size_m"] != 3072]
     assert len(main_calls) == 2
     assert {call["max_m_blocks"] for call in main_calls} == {542}

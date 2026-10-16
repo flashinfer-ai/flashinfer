@@ -648,3 +648,52 @@ def test_combine_norm_rejects_output_aliases_and_declaration_mismatches():
                 zero_centered=False,
                 out=(state, normalized),
             )
+
+
+@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("round_silu", [False, True])
+def test_prepared_swiglu_clamp_order(after, round_silu):
+    device = require_b12x()
+    gate = torch.linspace(-8, 8, 4096, device=device).bfloat16().reshape(4, -1)
+    up = torch.linspace(4, -4, gate.numel(), device=device).bfloat16().reshape_as(gate)
+    gate_up = torch.cat((gate, up), dim=1)
+    output = torch.empty_like(gate)
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=4, hidden_size=gate.shape[1]),
+        invocation={
+            "operation": "swiglu",
+            "limit": 2.0,
+            "round_silu": round_silu,
+            "clamp_after_silu": after,
+        },
+    )
+    request = plan.request(
+        name="clamp-order",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.launch(gate_up, gate_up, output), output=output
+        ),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare((request,))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hc.run_swiglu(
+                gate_up, limit=2.0, round_silu=round_silu, out=output, plan=plan
+            )
+        gate_up.neg_()
+        gate, up = gate_up.chunk(2, dim=1)
+        activated = (
+            F.silu(gate.float()).clamp(max=2.0)
+            if after
+            else F.silu(gate.float().clamp(max=2.0))
+        )
+        if round_silu:
+            activated = activated.bfloat16().float()
+        expected = (activated * up.float().clamp(-2.0, 2.0)).bfloat16()
+        for _ in range(3):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)

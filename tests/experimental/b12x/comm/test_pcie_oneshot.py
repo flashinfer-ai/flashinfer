@@ -621,7 +621,7 @@ def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
             4,
             "B12X_PCIE_TP4_REMOTE_PUSH",
             (32, 6144),
-            "stage_pull",
+            "stage_remote_push",
             "stage_remote_push",
         ),
     ),
@@ -667,6 +667,24 @@ def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
     )
 
     assert mode == "stage_remote_push"
+
+
+@pytest.mark.parametrize("rows", (1, 4, 7, 32, 33))
+@pytest.mark.parametrize("hidden", (4096, 6144))
+def test_tp4_remote_push_float32_contract(monkeypatch, rows, hidden) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_TP4_REMOTE_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_FUSED_THREADS", raising=False)
+    monkeypatch.delenv("B12X_PCIE_FUSED_CTAS_PER_ROW", raising=False)
+    geometry = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(4), torch.empty((rows, hidden), dtype=torch.float32)
+    )
+    mode, single_cta, register_normalize, threads = geometry
+    assert mode == ("stage_remote_push" if rows <= 32 else "stage_pull")
+    if rows <= 32:
+        assert threads == 512
+        assert register_normalize
+        assert single_cta == (rows > 1)
 
 
 @pytest.mark.parametrize(
@@ -717,12 +735,12 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
         monkeypatch.delenv(name, raising=False)
 
     assert not _uses_sharded_eager_storage(2)
-    assert not _uses_sharded_eager_storage(4)
+    assert _uses_sharded_eager_storage(4)
     assert _uses_sharded_eager_storage(8)
     assert _eager_storage_shards(2) == 3
-    assert _eager_storage_shards(4) == 1
+    assert _eager_storage_shards(4) == 4
     assert _eager_storage_shards(8) == 8
-    assert _transport_policy_contract() == (False, False, True, False, True)
+    assert _transport_policy_contract() == (False, False, True, True, True)
 
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
     monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")

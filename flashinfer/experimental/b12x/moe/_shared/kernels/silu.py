@@ -35,6 +35,7 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
         scale_format: str = "e4m3_k16",
         e8m0_scale_layout: str = "packed",
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
     ):
@@ -53,6 +54,7 @@ class MoEMicroKernelSilu(MoEMicroKernelBackend):
             scale_format=scale_format,
             e8m0_scale_layout=e8m0_scale_layout,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
         )
@@ -94,6 +96,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
@@ -122,6 +125,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
             swiglu_limit=swiglu_limit,
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             mxfp6_fmt_a=mxfp6_fmt_a,

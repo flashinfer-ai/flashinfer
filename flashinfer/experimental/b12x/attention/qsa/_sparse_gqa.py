@@ -61,8 +61,8 @@ def _validate_launch(
         raise ValueError("query must contain at least one active row")
     if query.dtype != torch.bfloat16:
         raise TypeError(f"query must be torch.bfloat16, got {query.dtype}")
-    if head_dim < 16 or head_dim & (head_dim - 1):
-        raise ValueError("head_dim must be a power of two at least 16")
+    if head_dim not in (192, 256):
+        raise ValueError("head_dim must be 192 or 256")
     _require_unit_inner_stride(query, "query")
 
     if key_cache.ndim != 4:
@@ -121,14 +121,16 @@ def _validate_launch(
     if not query_positions.is_contiguous():
         raise ValueError("query_positions must be contiguous")
     if (
-        selected_positions.ndim != 2
+        selected_positions.ndim not in (2, 3)
         or int(selected_positions.shape[0]) < rows
-        or int(selected_positions.shape[1]) <= 0
+        or int(selected_positions.shape[-1]) <= 0
         or selected_positions.dtype != torch.int32
     ):
         raise TypeError(
-            "selected_positions must be int32 [capacity_rows, selection_width]"
+            "selected_positions must be int32 [rows, width] or [rows, kv_heads, width]"
         )
+    if selected_positions.ndim == 3 and selected_positions.shape[1] != kv_heads:
+        raise ValueError("selection groups must match KV heads")
     if not selected_positions.is_contiguous():
         raise ValueError("selected_positions must be contiguous")
     if (
@@ -167,7 +169,7 @@ def _validate_launch(
     splits = int(splits)
     if block_n not in (16, 64):
         raise ValueError("block_n must be 16 or 64")
-    key_tiles = math.ceil(int(selected_positions.shape[1]) / block_n)
+    key_tiles = math.ceil(int(selected_positions.shape[-1]) / block_n)
     if splits <= 0 or splits & (splits - 1) or splits > key_tiles:
         raise ValueError(
             "splits must be a positive power of two not exceeding key tiles"
@@ -229,7 +231,10 @@ def compile_sparse_paged_gqa(
             direct_output=direct,
             return_lse=return_lse if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
-            selection_width=int(selected_positions.shape[1]),
+            selection_width=int(selected_positions.shape[-1]),
+            selection_groups=int(selected_positions.shape[1])
+            if selected_positions.ndim == 3
+            else 1,
         )
     # Split merge is a distinct CuTe ABI; compile-only returns its carrier.
     partial_output = torch.empty(
@@ -297,7 +302,10 @@ def launch_sparse_paged_gqa(
             direct_output=direct,
             return_lse=output_lse is not None if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
-            selection_width=int(selected_positions.shape[1]),
+            selection_width=int(selected_positions.shape[-1]),
+            selection_groups=int(selected_positions.shape[1])
+            if selected_positions.ndim == 3
+            else 1,
         )
         for program in program_keys(raw):
             record_program(program)
@@ -333,7 +341,7 @@ def launch_sparse_paged_gqa(
         q_heads=int(query.shape[1]),
         kv_heads=int(key_cache.shape[2]),
         head_dim=int(query.shape[2]),
-        selection_width=int(selected_positions.shape[1]),
+        selection_width=int(selected_positions.shape[-1]),
         block_n=block_n,
         splits=splits,
     ):
@@ -341,7 +349,7 @@ def launch_sparse_paged_gqa(
             "QSA sparse GQA has no CuTe implementation for q_heads="
             f"{int(query.shape[1])}, kv_heads={int(key_cache.shape[2])}, "
             f"head_dim={int(query.shape[2])}, page_size={int(key_cache.shape[1])}, "
-            f"selection_width={int(selected_positions.shape[1])}, "
+            f"selection_width={int(selected_positions.shape[-1])}, "
             f"block_n={int(block_n)}, splits={int(splits)}"
         )
     if _prepared is not None:
@@ -386,6 +394,7 @@ def launch_sparse_paged_gqa(
                 if direct
                 else _pointer(partial_lse, Float32),
                 _pointer(output, BFloat16),
+                (),
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
                 int(block_table.shape[1]),
