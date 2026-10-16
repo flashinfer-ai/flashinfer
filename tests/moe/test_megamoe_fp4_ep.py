@@ -41,3 +41,24 @@ def test_nvfp4_jit_cache_distinguishes_ep_width():
 def test_nvfp4_planner_rejects_unvalidated_ep_width(ep):
     with pytest.raises(ValueError, match="4 or 8 ranks"):
         select_fused_plan(132, ep, 256, 6, 4096, 2048, 384, 1)
+
+
+@pytest.mark.parametrize(
+    "experts,hidden,intermediate,topk,push_max,rotated_from",
+    [
+        (256, 4096, 2048, 6, 32, None),
+        (384, 6144, 2048, 8, 32, None),
+        (384, 7168, 3072, 6, 64, 33),
+    ],
+)
+def test_h200_ep8_counter_policy(
+    experts, hidden, intermediate, topk, push_max, rotated_from
+):
+    for tokens in (1, 8, 24, 32, 33, 48, 64, 65, 128, 256):
+        plan = select_fused_plan(
+            132, 8, experts, topk, hidden, intermediate, 4096, tokens
+        )
+        assert plan.push_dispatch == (tokens <= push_max), tokens
+        assert plan.no_clean_barrier == (
+            rotated_from is not None and rotated_from <= tokens <= push_max
+        ), tokens

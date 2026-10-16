@@ -56,6 +56,17 @@ _H20_COUNTER_BUCKETS = (
     (6144, 384, 8, 17, 32, True, False),
 )
 
+# H200 (EP8): push wins by about 10 us per call at small M (1.03-1.16x kernel time);
+# at BM64 it loses (0.89-0.95x at M=256). Bounds are the largest M that does not lose on
+# any measured router (uniform, global Zipf skew, hot experts on one rank). The rotated
+# pool only pays on Pro above M=32; the clean barrier is ~1 us on H200.
+_H200_COUNTER_BUCKETS = (
+    (4096, 256, 6, 1, 32, True, False),
+    (6144, 384, 8, 1, 32, True, False),
+    (7168, 384, 6, 1, 32, True, False),
+    (7168, 384, 6, 33, 64, True, True),
+)
+
 # All-M arm table: which fused schedule to use. Every arm here runs the same
 # fused kernel; they differ in scheduler mode and the RS epilogue.
 #   "dynamic-rs"  -> interleaved scheduler + RS swap-AB (mode5)
@@ -223,16 +234,18 @@ def _select_arm(
 def _select_counter_policy(
     num_sms: int, hidden: int, num_experts: int, num_topk: int, m: int
 ) -> Tuple[bool, bool]:
-    """(push_dispatch, no_clean_barrier). H200 is unmeasured and keeps barriers.
+    """(push_dispatch, no_clean_barrier) from the measured per-GPU counter buckets.
 
     Matching on (hidden, num_experts, num_topk) rather than hidden alone: the
     payoff depends on the pushed row count (m * num_topk) and the per-expert
     pool pressure, so a model that merely shares a hidden size must not inherit
     a measured range. Unmatched shapes keep the always-correct barrier path.
     """
-    if num_sms != H20_NUM_SMS:
-        return False, False
-    for h, e, k, lo, hi, push, rotated in _H20_COUNTER_BUCKETS:
+    buckets = {
+        H20_NUM_SMS: _H20_COUNTER_BUCKETS,
+        H200_NUM_SMS: _H200_COUNTER_BUCKETS,
+    }.get(num_sms, ())
+    for h, e, k, lo, hi, push, rotated in buckets:
         if h == hidden and e == num_experts and k == num_topk and lo <= m <= hi:
             return push, push and rotated
     return False, False
