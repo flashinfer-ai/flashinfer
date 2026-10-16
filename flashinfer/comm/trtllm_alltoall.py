@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import torch
+from typing_extensions import deprecated
 
 from ..jit import gen_comm_alltoall_module
 from ..utils import register_custom_op
@@ -430,14 +431,32 @@ class MoEAlltoallInfo:
     local_token_allocation_count: int
 
 
+_MNNVL_MOE_DEPRECATION = (
+    "MnnvlMoe is deprecated; use flashinfer.moe_ep.NVLinkTwoSidedAlltoAll. "
+    "Its implementation will move into that class."
+)
+
+
+@deprecated(_MNNVL_MOE_DEPRECATION)
 class MnnvlMoe:
+    """NVLink two-sided MoE all-to-all-v over MNNVL FIFO workspaces.
+
+    .. deprecated:: 0.7.1
+        Use :class:`flashinfer.moe_ep.NVLinkTwoSidedAlltoAll`. The
+        implementation of this class will move into it; it will no longer
+        wrap this class.
+    """
+
     moe_workspace: MnnvlMemory = None
     moe_prepare_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
     moe_prepare_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
 
+    # The class is never instantiated, so the runtime warning is raised by the
+    # workspace getters every caller goes through first.
     @staticmethod
+    @deprecated(_MNNVL_MOE_DEPRECATION)
     def get_moe_workspaces(mapping: Mapping, config: Optional[MnnvlConfig] = None):
         if MnnvlMoe.moe_workspace is not None:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
@@ -454,6 +473,7 @@ class MnnvlMoe:
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod
+    @deprecated(_MNNVL_MOE_DEPRECATION)
     def get_moe_prepare_workspace(
         mapping: Mapping, config: Optional[MnnvlConfig] = None
     ):

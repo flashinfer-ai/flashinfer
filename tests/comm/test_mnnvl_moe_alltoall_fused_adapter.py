@@ -480,6 +480,9 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     monkeypatch.setattr(jit_comm, "gen_vllm_comm_module", lambda: spec("vllm"))
     monkeypatch.setattr(jit_comm, "gen_pcie_ipc_comm_module", lambda: spec("pcie"))
     monkeypatch.setattr(
+        jit_comm, "gen_pcie_ipc_ag_rs_module", lambda: spec("pcie_ag_rs")
+    )
+    monkeypatch.setattr(
         jit_comm,
         "gen_moe_alltoall_module",
         lambda target: selected.append(target) or spec(f"mnnvl_{target}"),
@@ -544,6 +547,22 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
     ).read_text()
 
+    for top_k in (1, 2, 4):
+        assert f"PRELOAD_COMBINE_BF16_VECTOR_TOP_K({top_k})" in launcher_source
+        assert f"LAUNCH_COMBINE_BF16_VECTOR_TOP_K({top_k})" in launcher_source
+    assert (
+        "(params.top_k == 1 || params.top_k == 2 || params.top_k == 4) &&"
+        in launcher_source
+    )
+    assert (
+        "params.dtype == nvinfer1::DataType::kBF16 && params.elements_per_token % 8 == 0;"
+        in launcher_source
+    )
+    assert "unsupported top_k for the BF16 vector moe_a2a_combine" in launcher_source
+    # the exported dispatch kernel carries the in-kernel sanitize switch; this launcher
+    # keeps the separate public sanitize launch and passes it disabled
+    assert "int sanitize_payload_index, int invalid_expert_id);" in launcher_source
+    assert "params.active_rank_mask[0], -1, 0);" in launcher_source
     for top_k in (6, 8):
         specialized_kernel = (
             f"kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk{top_k}"
@@ -561,7 +580,8 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
             f'"mnnvl_moe_alltoall_combine_bf16_topk{top_k}", params.enable_pdl,'
             in launcher_source
         )
-    assert launcher_source.count("params.elements_per_token % 8 == 0") == 2
+    # TOP_K=6, TOP_K=8 and the TOP_K in {1,2,4} vector route share the exact 16-byte boundary
+    assert launcher_source.count("params.elements_per_token % 8 == 0") == 3
     assert launcher_source.count("dim3 const topk6_grid(") == 1
     assert "constexpr int kBf16TopK6Threads = 32;" in launcher_source
     assert (
@@ -601,12 +621,20 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
             normalized_generated_source.count(
                 "void kernel_flashinfer_mnnvl_moe_alltoall_"
             )
-            == 19
+            == 33
         )
         for top_k in (6, 8):
             assert (
                 normalized_generated_source.count(
                     f"void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk{top_k}"
+                )
+                == 1
+            )
+        for top_k in (1, 2, 4):
+            assert (
+                normalized_generated_source.count(
+                    "void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_vector_top_k_"
+                    f"{top_k}("
                 )
                 == 1
             )
@@ -679,6 +707,154 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         "params.enable_pdl, params.enable_rank_mask, params.active_rank_mask[0]"
         in normalized_launcher_source
     )
+
+
+_FUSED_QUANTIZED_COMBINE_TOP_K = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 22)
+_FUSED_QUANTIZED_COMBINE_SYMBOL = (
+    "kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_"
+)
+
+
+def _normalized_cxx(source: str) -> str:
+    return " ".join(source.replace("\\\n", "\n").split())
+
+
+def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
+    repo_root = Path(__file__).resolve().parents[2]
+    kernel_root = (
+        repo_root / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels"
+    )
+    launcher_source = (kernel_root / "moeAlltoAllFusedKernels.cu").read_text()
+    launcher = _normalized_cxx(launcher_source)
+    header = _normalized_cxx((kernel_root / "moeAlltoAllKernels.h").read_text())
+    legacy = _normalized_cxx((kernel_root / "moeAlltoAllKernels.cu").read_text())
+    adapter = _normalized_cxx((repo_root / "csrc/trtllm_moe_alltoall.cu").read_text())
+
+    # one extern declaration, preload slot and launch case per exported TOP_K
+    for top_k in _FUSED_QUANTIZED_COMBINE_TOP_K:
+        assert f"DECLARE_COMBINE_QUANTIZED_TOP_K({top_k})" in launcher_source
+        assert f"kCombineQuantizedTopK{top_k}," in launcher_source
+        assert f"PRELOAD_COMBINE_QUANTIZED_TOP_K({top_k});" in launcher_source
+        assert f"LAUNCH_COMBINE_QUANTIZED_TOP_K({top_k});" in launcher_source
+    assert launcher_source.count("DECLARE_COMBINE_QUANTIZED_TOP_K(") == 12
+    assert launcher_source.count("PRELOAD_COMBINE_QUANTIZED_TOP_K(") == 12
+    assert launcher_source.count("LAUNCH_COMBINE_QUANTIZED_TOP_K(") == 12
+    # the extern declarations carry the generated argument list: five byte pointers, four
+    # workspace offsets, seven ints, the NVFP4 scalar scale, three ints and two flags
+    assert (
+        "kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_##TOP_K( "
+        "uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, unsigned long long, "
+        "unsigned long long, unsigned long long, unsigned long long, int, int, int, "
+        "int, int, int, int, float, int, int, int, bool, bool);" in launcher
+    )
+    # the selection rule is the Cake host rule `_select_fused_quantized_combine`
+    assert "constexpr bool kFusedQuantizedCombineEnabled = true;" in launcher_source
+    assert (
+        "bool useFusedQuantizedCombine(MoeA2ACombineParams const& params) { "
+        "return kFusedQuantizedCombineEnabled && "
+        "params.quant_mode != MoeA2ACombineQuantMode::NONE && "
+        "params.local_num_tokens > 0 && params.elements_per_token % 32 == 0 && "
+        "!useBf16TopK6Combine(params) && !useBf16TopK8Combine(params) && "
+        "!useBf16VectorCombine(params); }" in launcher
+    )
+    # the fused route replaces the combine preload, skips the quantize preload and
+    # launch, and returns before the carrier path
+    assert launcher_source.count("useFusedQuantizedCombine(params)") == 3
+    assert (
+        "bool const fused_quantized_combine = useFusedQuantizedCombine(params); "
+        "if (fused_quantized_combine) { preloadFusedQuantizedCombineKernel(params.top_k); } "
+        "else if (useBf16TopK6Combine(params)) {" in launcher
+    )
+    assert (
+        "if (params.quant_mode != MoeA2ACombineQuantMode::NONE && !fused_quantized_combine) {"
+        in launcher_source
+    )
+    assert (
+        "#undef LAUNCH_COMBINE_QUANTIZED_TOP_K return; } void* accumulation ="
+        in launcher
+    )
+    assert (
+        "unsupported top_k for the fused quantized moe_a2a_combine" in launcher_source
+    )
+    # launch constants: 256 threads, no dynamic shared memory, one CTA per local token
+    assert "constexpr int kCombineThreads = 256;" in launcher_source
+    assert (
+        "kernel_flashinfer_mnnvl_moe_alltoall_combine_quantized_top_k_##TOP_K, grid, "
+        "kCombineThreads, 0, params.stream, params.workspace, output_bytes, output_bytes, "
+        "scale_bytes, scale_bytes, params.workspace_stride_bytes, "
+        "byteOffset(params.topk_target_ranks, rank_workspace), "
+        "byteOffset(params.topk_send_indices, rank_workspace), "
+        "byteOffset(params.recv_buffers[params.ep_rank], rank_workspace), "
+        "params.max_tokens_per_rank, params.local_num_tokens, params.elements_per_token, "
+        "dtypeBytes(params.dtype), dtypeCode(params.dtype), layout.quant_mode, "
+        "static_cast<int>(params.swizzle_mode), params.output_scalar_scale, "
+        "layout.blocks_per_row, layout.padded_scale_cols, params.ep_rank, "
+        "params.use_low_precision, params.enable_pdl); break" in launcher
+    )
+    assert "int const grid = std::max(params.local_num_tokens, 1);" in launcher_source
+    # both quantized routes take the scale geometry from one helper
+    assert launcher_source.count("quantizedCombineLayout(params);") == 2
+    # the host boundary skips the BF16/FP16 intermediate on the fused route; the trtllm
+    # backend never fuses, so backend="trtllm" keeps its allocation
+    assert (
+        "bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params);"
+        in header
+    )
+    assert (
+        "bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params) { "
+        "return useFusedQuantizedCombine(params); }" in launcher
+    )
+    assert (
+        "bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const&) "
+        "{ return false; }" in legacy
+    )
+    assert (
+        "if (!tl_throughput::moe_a2a_combine_fuses_quantization(params)) { "
+        "accumulationStorage = alloc_tensor({localNumTokens, elementsPerToken}, "
+        "payload.dtype(), payload.device()); "
+        "params.accumulation_data = accumulationStorage.data_ptr(); }" in adapter
+    )
+
+    generated_root = repo_root / "csrc/generated"
+    for generated_name in (
+        "mnnvl_moe_alltoall_sm100.cu",
+        "mnnvl_moe_alltoall_sm103.cu",
+    ):
+        generated = " ".join((generated_root / generated_name).read_text().split())
+        for top_k in _FUSED_QUANTIZED_COMBINE_TOP_K:
+            symbol = f"{_FUSED_QUANTIZED_COMBINE_SYMBOL}{top_k}("
+            assert generated.count(f"void {symbol}") == 1
+            # 256 threads per CTA (the launcher passes kCombineThreads) and one TOP_K
+            # specialization per symbol
+            assert (
+                f"#define THREADS 256 #define TOP_K {top_k} "
+                f'extern "C" {{ __global__ __launch_bounds__(THREADS) void {symbol}'
+                in generated
+            )
+            signature, body = generated.split(f"void {symbol}", 1)[1].split(")", 1)
+            assert signature == (
+                "uint8_t* __restrict__ workspace, uint8_t* __restrict__ quantized_fp8, "
+                "uint8_t* __restrict__ quantized_packed, uint8_t* __restrict__ scales_u8, "
+                "uint8_t* __restrict__ scales_fp8, "
+                "unsigned long long workspace_stride_bytes, "
+                "unsigned long long topk_target_ranks_offset, "
+                "unsigned long long topk_send_indices_offset, "
+                "unsigned long long combine_payload_offset, int max_tokens_per_rank, "
+                "int local_num_tokens, int elements_per_token, int payload_element_bytes, "
+                "int payload_dtype_code, int quant_mode, int scale_layout, "
+                "float output_scalar_scale, int blocks_per_row, int padded_scale_cols, "
+                "int ep_rank, bool use_low_precision, bool enable_pdl"
+            )
+            # no static or dynamic shared memory: the launcher passes 0 dynamic bytes
+            body = body.split("__global__", 1)[0]
+            assert "__shared__" not in body
+            assert "SMEM_TOTAL" not in body
+        # the dispatch kernel owns the only dynamic smem pool in the bundle; its generated
+        # footprint must match the launcher constant
+        assert generated.count("extern __shared__") == 1
+        assert generated.count("#define SMEM_TOTAL ") == 1
+        assert "#define SMEM_TOTAL 256" in generated
+    assert "constexpr int kDispatchSharedBytes = 256;" in launcher_source
 
 
 def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():

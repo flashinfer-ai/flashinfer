@@ -858,28 +858,9 @@ def mm_nvfp4_svdquant(
     alpha_scalar = alpha.reshape(-1)[:1]
 
     if backend == "cake":
-        from ..jit.cake_nvfp4_svdquant import (
-            cake_nvfp4_svdquant_workspace_size,
-            run_cake_nvfp4_svdquant,
-        )
+        from ..jit.cake_nvfp4_svdquant import run_cake_nvfp4_svdquant
 
-        workspace_bytes = cake_nvfp4_svdquant_workspace_size(
-            m=int(a.shape[0]),
-            n=int(b.shape[0]),
-            k=int(a.shape[1]) * 2,
-            rank=int(d.shape[1]),
-            has_bias=bias is not None,
-            device=a.device,
-        )
-        workspace = None
-        if workspace_bytes:
-            workspace = _get_cache_buf(
-                "cake_nvfp4_svdquant_tma_workspace", workspace_bytes, a.device
-            )[:workspace_bytes]
-            if workspace.data_ptr() % 128:
-                raise RuntimeError("Cake descriptor workspace is not 128-byte aligned")
         return run_cake_nvfp4_svdquant(
-            backend="cake",
             a=a,
             b=b,
             a_sf=a_sf,
@@ -889,7 +870,6 @@ def mm_nvfp4_svdquant(
             l1=l1,
             bias=bias,
             out=out,
-            workspace=workspace,
             enable_pdl=enable_pdl,
         )
 
@@ -991,7 +971,7 @@ def nvfp4_quantize_smooth(
     enable_pdl: Optional[bool] = None,
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Smooth + NVFP4 quantize: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
+    r"""Smooth + NVFP4 quantization: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
 
     The SM100/SM103 CUTLASS backend applies the SVDQuant per-input-channel smoothing scale
     and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL backend also

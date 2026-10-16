@@ -199,6 +199,12 @@ class MNNVLCuteDSLConfig:
     """Static profiles and routing policy for one backend configuration."""
 
     profiles: tuple[StaticProfile, ...]
+    # Whether these boundaries were measured with the fused RMSNorm enabled.
+    # Crossovers move when the norm is compiled out, so a workspace rejects a
+    # mismatched pairing. ``None`` marks the protocol-pinned diagnostic
+    # configs, whose ranges force one protocol rather than describe a
+    # crossover, so they suit either.
+    applies_rms_norm: bool | None = True
 
     def __post_init__(self) -> None:
         keys = [

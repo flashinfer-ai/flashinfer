@@ -410,6 +410,48 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
+// Private planned-MLA query. These are the selection inputs of the dense MLA decode launcher;
+// no tensor data, workspace allocation, cubin loading, or kernel launch is needed.
+int64_t mla_plan_head_divisor(TensorView workspace, bool is_fp8, int64_t batch_size,
+                              int64_t max_q_len, int64_t max_kv_len, int64_t num_heads,
+                              int64_t head_dim_qk, int64_t head_dim_vo, int64_t page_size,
+                              int64_t sm_count) {
+  CHECK_CUDA(workspace);
+  for (auto value : {batch_size, max_q_len, max_kv_len, num_heads, sm_count}) {
+    TVM_FFI_ICHECK(value > 0 && value <= INT_MAX)
+        << "MLA planning dimensions must be positive int32 values";
+  }
+  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) ||
+                 (head_dim_qk == 320 && head_dim_vo == 256))
+      << "The head-divisibility query requires MLA head dimensions";
+  TVM_FFI_ICHECK(page_size == 32 || page_size == 64);
+  ffi::CUDADeviceGuard device_guard(workspace.device().device_id);
+  auto const dtype = is_fp8 ? Data_type::DATA_TYPE_E4M3 : Data_type::DATA_TYPE_BF16;
+  auto runner = TllmGenFmhaRunnerCache::get(dtype, dtype, dtype, Data_type::DATA_TYPE_BF16);
+  TllmGenFmhaRunnerParams params{};
+  params.mHeadDimQk = head_dim_qk;
+  params.mHeadDimV = head_dim_vo;
+  params.mNumHeadsQ = num_heads;
+  params.mNumHeadsKv = 1;
+  params.mNumHeadsQPerKv = num_heads;
+  params.mBatchSize = batch_size;
+  params.mMaxSeqLenQ = max_q_len;
+  params.mMaxSeqLenKv = max_kv_len;
+  params.mNumTokensPerPage = page_size;
+  params.mQkvLayout = QkvLayout::PagedKv;
+  params.mMultiProcessorCount = sm_count;
+  params.mAttentionWindowSize = INT_MAX;
+  params.mChunkedAttentionSize = INT_MAX;
+  params.mUsesSharedPagedKvIdx = true;
+  params.mMaskType = TrtllmGenAttentionMaskType::Dense;
+  params.mKernelType = FmhaKernelType::Generation;
+  params.mTileScheduler = TileScheduler::Static;
+  params.mMultiCtasKvMode = true;
+  // Other cubin selectors are zero, matching the planned adapter: no sparse MLA,
+  // BF16/FP8 transform, skip-softmax, FP16 softmax, sparse compression, or fused DSv4 output.
+  return runner->getMlaInitialHeadDivisor(params);
+}
+
 void trtllm_paged_attention_decode(
     TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
     TensorView value_cache, TensorView workspace_buffer, TensorView multi_ctas_kv_counter_buffer,
@@ -1239,6 +1281,7 @@ namespace trtllm_cubin_loader {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(_mla_plan_head_divisor, mla_plan_head_divisor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
                               trtllm_paged_attention_decode_sparse_mla_dsv4);

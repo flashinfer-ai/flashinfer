@@ -64,10 +64,9 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
-| `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `batch_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
-| `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -199,6 +198,13 @@ Q + paged K/V
     -> direct O, or split-KV partials -> reduction -> O
 ```
 
+Profiles that stream score fragments (KV256 tiles, block-sparse routes and
+8-bit Q128/KV128) choose their softmax arithmetic per architecture. SM100
+evaluates a quarter of each fragment's exponentials as FMA polynomials to
+offload MUFU. SM103, with twice the MUFU ex2 rate, keeps every exponential on
+MUFU, and its unmasked max pass takes fragment maxima (or Sage scale-group
+maxima) from LDTM.STAT instead of a register reduction.
+
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
 the worker tasks. Underfilled fixed- or packed-Q grids may instead split the
@@ -221,6 +227,9 @@ requires its captured address and shape to remain stable.
 | [`fmha_decode_tasks.py`](fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
 | [`fmha_decode_resources/`](fmha_decode_resources/) | GMEM/SMEM/TMEM resources and pipeline state |
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
+| [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |
+| [`block_sparse_inspect.py`](block_sparse_inspect.py) | One-shot validation of canonical BSR and live paged metadata |
+| [`sage_prepare.py`](sage_prepare.py) | Gather of a Sage plan's scales into the buffer the attention kernel reads |
 
 ## Example
 
@@ -229,7 +238,7 @@ import torch
 from flashinfer.attention.prims_ts import (
     BatchDecodePagedTSWrapper,
     get_prims_ts_batch_decode_workspace_size,
-    prims_ts_batch_decode_with_kv_cache,
+    batch_decode_with_paged_kv_cache,
 )
 
 device = "cuda"
@@ -288,13 +297,13 @@ workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
-standalone_out = prims_ts_batch_decode_with_kv_cache(
+standalone_out = batch_decode_with_paged_kv_cache(
     q,
     kv,
-    workspace,
     block_tables,
     seq_lens,
-    max_seq_len,
+    workspace_buffer=workspace,
+    max_kv_len=max_seq_len,
     mask_type="causal",
 )
 assert standalone_out.shape == q.shape
@@ -350,6 +359,10 @@ plan-owned length storage and requires graph recapture.
 - Attention sinks and custom masks are not exposed.
 - Q and K must share one dtype; the only mixed combination is
   `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
+- Sage attention (8-bit Q/K of one dtype with `torch.float8_e4m3fn` V and
+  dequantization scales) runs only through `BlockSparseTSWrapper` and
+  `block_sparse_attention`; see
+  [Sage attention](../../README.md#sage-attention).
 - Effective K/V lengths must be positive and no greater than the static plan
   bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks

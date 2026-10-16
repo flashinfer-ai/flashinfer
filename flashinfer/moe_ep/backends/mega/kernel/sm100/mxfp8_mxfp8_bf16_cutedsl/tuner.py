@@ -62,6 +62,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
+                    live_tokens=live_tokens,
                     combine_dtype=args.combine_dtype,
                     enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
                 )

@@ -38,6 +38,57 @@ from moe_nvfp4_swapab.runner_common import (
 # --- lazy: pull cutlass transitively; imported only on first attribute access
 #     (which happens inside the backend/test call sites, never at package load).
 _LAZY = {
+    "Contract": ("moe_nvfp4_swapab.contract", "Contract"),
+    "FunctionMapping": ("moe_nvfp4_swapab.contract", "FunctionMapping"),
+    "GpuReleaseFlagBatchTracker": ("src.flag_batch", "GpuReleaseFlagBatchTracker"),
+    "MoESchedConsumer": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedConsumer",
+    ),
+    "MoESchedExtension": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedExtension",
+    ),
+    "MoESchedulerBase": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedulerBase",
+    ),
+    "MoESchedulerParamsBase": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedulerParamsBase",
+    ),
+    "MoEWorkTileInfo": ("moe_nvfp4_swapab.moe_persistent_scheduler", "MoEWorkTileInfo"),
+    "Space": ("moe_nvfp4_swapab.contract", "Space"),
+    "SymBufferDeviceBase": ("src.sym_buffer", "SymBufferDeviceBase"),
+    "SymBufferHost": ("src.sym_buffer", "SymBufferHost"),
+    "TokenCommArgs": ("src.token_comm", "TokenCommArgs"),
+    "TokenInPullTokenBackPush": ("src.token_comm", "TokenInPullTokenBackPush"),
+    "TokenSrcMetadata": ("src.token_comm", "TokenSrcMetadata"),
+    "TopkReduce": ("moe_nvfp4_swapab.topk_reduce", "TopkReduce"),
+    "WorkTileState": ("moe_nvfp4_swapab.moe_persistent_scheduler", "WorkTileState"),
+    "_DEFAULT_SCHED_EXT": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "_DEFAULT_SCHED_EXT",
+    ),
+    "compute_expert_token_count_from_sizes": (
+        "moe_nvfp4_swapab.moe_utils",
+        "compute_expert_token_count_from_sizes",
+    ),
+    "eval_function_mapping": ("moe_nvfp4_swapab.contract", "eval_function_mapping"),
+    "fmax": ("common.moe_utils", "fmax"),
+    "fmin": ("common.moe_utils", "fmin"),
+    "get_cutedsl_target_arch": ("common.host_utils", "get_cutedsl_target_arch"),
+    "iket": ("src.iket_compat", "iket"),
+    "mbarrier_arrive_expect_tx_on_peer": (
+        "moe_nvfp4_swapab.moe_utils",
+        "mbarrier_arrive_expect_tx_on_peer",
+    ),
+    "rewrite_tensor_shape": ("moe_nvfp4_swapab.moe_utils", "rewrite_tensor_shape"),
+    "spin_wait": ("moe_nvfp4_swapab.moe_utils", "spin_wait"),
+    "store_i32_to_peer_cluster_smem_async": (
+        "moe_nvfp4_swapab.moe_utils",
+        "store_i32_to_peer_cluster_smem_async",
+    ),
     "_make_fp8_tensor": ("moe_mxfp8_glu.mega_runner", "_make_fp8_tensor"),
     "_make_e8m0_scale_tensor": ("moe_mxfp8_glu.mega_runner", "_make_e8m0_scale_tensor"),
     "compute_megamoe_reference_mxfp8": (
@@ -89,3 +140,4 @@ __all__ = [
     "compute_megamoe_reference_bf16",  # noqa: F822
     "compute_megamoe_reference_bf16_mxfp8",  # noqa: F822
 ]
+__all__ += [name for name in _LAZY if name not in __all__]

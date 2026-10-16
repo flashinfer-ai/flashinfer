@@ -155,6 +155,7 @@ def parse_gemm_args(line, parser):
             "tgv",
             "cublaslt",
             "cute-dsl",
+            "cute-dsl-native",
             "b12x",
             "auto",
             "tinygemm",
@@ -1718,7 +1719,7 @@ def testMmBf16Fp4(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return []
 
-    autotune_supported_backends = ["cudnn", "cute-dsl"]
+    autotune_supported_backends = ["cudnn", "cute-dsl", "cute-dsl-native"]
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (

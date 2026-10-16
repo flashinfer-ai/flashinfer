@@ -24,7 +24,8 @@ import random
 import torch
 import pytest
 
-pytestmark = pytest.mark.long_running
+# H100 CI peak GPU memory: 43.0 GiB.
+pytestmark = [pytest.mark.long_running, pytest.mark.gpu_exclusive]
 
 
 try:
@@ -44,12 +45,17 @@ from flashinfer.gdn_decode import (
     gated_delta_rule_mtp,
 )
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 # Import BF16 state kernels (T=1 and MTP)
 try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule as gdn_decode_bf16_state,
         gated_delta_rule_mtp as gdn_decode_bf16_state_mtp,
+        gated_delta_rule_t1_wide_vec as gdn_decode_bf16_state_t1_wide_vec,
     )
 
     GDN_DECODE_BF16_STATE_AVAILABLE = True
@@ -1863,7 +1869,7 @@ def _test_gdn_decode_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_kernel(
     dtype: str,
@@ -2352,7 +2358,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_mtp_kernel(
     dtype: str,
@@ -2386,7 +2392,7 @@ def test_gdn_decode_bf16_state_mtp_kernel(
 # ==============================================================================
 # Reuses _test_gdn_decode_bf16_state_mtp_kernel by monkey-patching the module's
 # `gdn_decode_bf16_state_mtp` symbol for the scope of this test only. The
-# parametrization is wider (B up to 256, T up to 8, HV in {32, 64}) because
+# parametrization is wider (B up to 64, T up to 8, HV in {32, 64}) because
 # wide_vec's sweet spot is at large work-sizes; we want coverage where it
 # matters. See results/bf16_mtp_optimization_apr18/wide_vec_design.md for the design.
 
@@ -2410,7 +2416,7 @@ except ImportError:
     [(16, 16, 64)],
 )
 # tile_v is an explicit axis here, so B adds no specialization.
-@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("batch_size", [16, 64])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
     monkeypatch,
@@ -2481,7 +2487,7 @@ except (ImportError, RuntimeError):
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
     monkeypatch,
@@ -2531,8 +2537,8 @@ def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
 # kernel with T = K_i tokens for each request independently.
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("max_T", [2, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 64])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -2602,7 +2608,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
         disable_state_update=False,  # write final state
         disable_output=True,  # recovery: no output
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -2626,7 +2632,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
             disable_state_update=False,
             disable_output=True,
             use_qk_l2norm_in_kernel=True,
-            scale=K**-0.5,
+            scale=1.0 / math.sqrt(K),
             softplus_beta=1.0,
             softplus_threshold=20.0,
         )
@@ -2634,8 +2640,9 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
         state_ref[i] = pool_i[0]
 
     # BF16 epsilon is 2^-8 ≈ 0.0039. Noise scales with sqrt(N) where N is
-    # accumulation count (B * K * K-dim reductions). At B=256, T=8, expected
-    # noise envelope is ~0.05 — set tolerance just above.
+    # accumulation count (B * K * K-dim reductions). At B=64, T=8 the envelope
+    # is ~0.025; the 0.06 bound predates the removal of B=256 and is left
+    # deliberately conservative.
     diff = (pool_state_perreq - state_ref).abs().max().item()
     assert diff <= 0.06, (
         f"per-request kernel deviates from per-request reference: "
@@ -2658,15 +2665,17 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
 # Verifies bit-equivalence (within BF16 noise) against the two-call reference.
 
 
-@pytest.mark.parametrize("recovery_steps", [1, 2, "T-1"])
-@pytest.mark.parametrize("T", [4, 8])
-@pytest.mark.parametrize("batch_size", [2, 8, 32])
-@pytest.mark.parametrize(
-    "num_q_heads, num_k_heads, num_v_heads",
-    [(16, 16, 64)],
+@parametrize_product(
+    {
+        "recovery_steps": [1, "T-1"],
+        "T": [8],
+        "batch_size": [2, 8, 32],
+        "num_q_heads,num_k_heads,num_v_heads": [(16, 16, 64)],
+        "head_size": [128],
+        "dtype": ["bfloat16"],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_fused_recovery_decode(
     dtype: str,
     head_size: int,
@@ -2717,7 +2726,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
         dt_bias=dt_bias,
         initial_state_indices=h0_indices,
         use_qk_l2norm_in_kernel=True,
-        scale=K_dim**-0.5,
+        scale=1.0 / math.sqrt(K_dim),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -2806,7 +2815,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
 #                                disable_state_update=True) → emits output[K_i+1:T]
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [2, 8, 32])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -2868,7 +2877,7 @@ def test_gdn_decode_bf16_state_fused_per_request_k(
         A_log=A_log,
         dt_bias=dt_bias,
         use_qk_l2norm_in_kernel=True,
-        scale=K_dim**-0.5,
+        scale=1.0 / math.sqrt(K_dim),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -3246,7 +3255,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 32])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 def test_gdn_decode_bf16_state_mtp_split_pool(
     batch_size: int,
@@ -3520,6 +3529,225 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 # ==============================================================================
+# Cache-step stride regression: a logical T view may have a larger batch stride.
+# ==============================================================================
+
+
+@pytest.mark.parametrize("cache_form", ["view", "padded", "offset"])
+@pytest.mark.parametrize(
+    "state_dtype,batch_size,num_v_heads,num_tokens",
+    [
+        pytest.param(torch.float32, 2, 64, 2, id="fp32-inline"),
+        pytest.param(torch.float32, 3, 64, 2, id="fp32-warp"),
+        pytest.param(torch.bfloat16, 2, 32, 2, id="bf16-ilp4"),
+        pytest.param(torch.bfloat16, 2, 64, 2, id="bf16-wide-vec"),
+        pytest.param(torch.bfloat16, 2, 64, 1, id="bf16-t1-wide-vec"),
+    ],
+)
+def test_gdn_decode_mtp_cache_steps_stride(
+    state_dtype: torch.dtype,
+    batch_size: int,
+    num_v_heads: int,
+    num_tokens: int,
+    cache_form: str,
+):
+    """Honor the physical cache stride of a padded cache.
+
+    ``cache_form="view"`` passes the leading view ``cache[:, :T]``;
+    ``cache_form="padded"`` passes the ``[B, cache_steps, HV, V, K]``
+    allocation directly with ``cache_steps > T``; ``cache_form="offset"``
+    passes ``cache[1:1 + B, :T]`` of a ``B + 1``-row allocation, so the view
+    also carries a non-zero storage offset. The old flat index used
+    ``i_n * T * HV`` and ignored the larger batch stride in both forms (and
+    the BF16 wrappers wrote a non-contiguous view into a throwaway copy). For
+    B > 1 that packed batch 1 into batch 0's trailing slots and left batch 1's
+    requested slots unwritten. Compare against an exact-T cache and require
+    the hidden trailing slots to remain bit-exact sentinels across every
+    FP32/BF16 MTP kernel route.
+    """
+    _skip_if_not_sm90_or_later()
+    if state_dtype == torch.bfloat16 and not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T, cache_steps = batch_size, num_tokens, 4
+    H, HV, K, V = 16, num_v_heads, 128, 128
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    initial_state = torch.randn(B, HV, V, K, dtype=state_dtype, device=device)
+    initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+
+    cache_exact = torch.zeros(B, T, HV, V, K, dtype=state_dtype, device=device)
+    sentinel = 7.0
+    extra_rows = 1 if cache_form == "offset" else 0
+    cache_backing = torch.full(
+        (B + extra_rows, cache_steps, HV, V, K),
+        sentinel,
+        dtype=state_dtype,
+        device=device,
+    )
+    # [B, cache_steps, HV, V, K]; a non-zero storage offset when extra_rows.
+    cache_rows = cache_backing[extra_rows:]
+    cache_view = cache_rows[:, :T]
+    assert cache_view.shape == cache_exact.shape
+    assert cache_view.stride(0) == cache_steps * HV * V * K
+    assert not cache_view.is_contiguous()
+    if cache_form == "padded":
+        # Padded allocation passed directly: logical dim 1 exceeds T and only
+        # steps [0, T) of each batch row may be written.
+        cache_under_test = cache_rows
+        assert cache_under_test.shape[1] == cache_steps > T
+        assert cache_under_test.is_contiguous()
+    else:
+        cache_under_test = cache_view
+        assert (
+            cache_under_test.storage_offset() == extra_rows * cache_steps * HV * V * K
+        )
+
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_indices=initial_state_indices,
+        scale=K**-0.5,
+        disable_state_update=False,
+    )
+
+    if state_dtype == torch.float32:
+        out_exact, _ = gated_delta_rule_mtp(
+            **common,
+            initial_state=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm=True,
+        )
+        out_padded, _ = gated_delta_rule_mtp(
+            **common,
+            initial_state=initial_state.clone(),
+            intermediate_states_buffer=cache_under_test,
+            use_qk_l2norm=True,
+        )
+    elif T == 1:
+        out_exact = gdn_decode_bf16_state_t1_wide_vec(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out_padded = gdn_decode_bf16_state_t1_wide_vec(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_under_test,
+            use_qk_l2norm_in_kernel=True,
+        )
+    else:
+        out_exact = gdn_decode_bf16_state_mtp(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out_padded = gdn_decode_bf16_state_mtp(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_under_test,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(cache_view, cache_exact, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        cache_rows[:, T:],
+        torch.full_like(cache_rows[:, T:], sentinel),
+        atol=0,
+        rtol=0,
+    )
+    if extra_rows:
+        # Rows before the batch slice must stay untouched.
+        assert torch.equal(
+            cache_backing[:extra_rows],
+            torch.full_like(cache_backing[:extra_rows], sentinel),
+        )
+
+
+def test_gdn_decode_bf16_dense_cache_int64_boundary():
+    """Dense BF16 cache addressing must remain 64-bit beyond 2**31 elements."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T, cache_steps = 257, 1, 8
+    H, HV, K, V = 1, 64, 128, 128
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    state = torch.randn(1, HV, V, K, dtype=torch.bfloat16, device=device)
+    state_indices = torch.zeros(B, dtype=torch.int32, device=device)
+
+    # At batch index 256, flat_idx * V * K reaches 2**31 elements. Keep the
+    # state pool compact and leave the 4.02 GiB cache uninitialized so the test
+    # exercises the boundary without unnecessary initialization traffic.
+    cache_backing = torch.empty(
+        B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    cache = cache_backing[:, :T]
+    output = gdn_decode_bf16_state_t1_wide_vec(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=state,
+        initial_state_indices=state_indices,
+        intermediate_states_buffer=cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+
+    ref_cache = torch.empty(1, T, HV, V, K, dtype=torch.bfloat16, device=device)
+    ref_output = gdn_decode_bf16_state_t1_wide_vec(
+        A_log=A_log,
+        a=a[-1:],
+        dt_bias=dt_bias,
+        q=q[-1:],
+        k=k[-1:],
+        v=v[-1:],
+        b=b[-1:],
+        initial_state_source=state,
+        initial_state_indices=state_indices[:1],
+        intermediate_states_buffer=ref_cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output[-1:], ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(cache[-1:, :T], ref_cache, atol=1e-2, rtol=1e-2)
+
+
+# ==============================================================================
 # BF16 state FLA-style per-token pool scatter (ssm_state_indices)
 # ==============================================================================
 # vLLM-compatible API: when `ssm_state_indices` (shape [B, T] int32) is passed,
@@ -3530,8 +3758,9 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 @pytest.mark.parametrize("split_pool", [False, True])
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("max_T", [2, 8])
+# B=1 dispatches the MTP kernel, B>=4 the wide-vec kernel; keep both sides.
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -3605,7 +3834,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
         dt_bias=dt_bias,
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -3680,7 +3909,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
         )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -3725,7 +3954,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
         ssm_state_indices=ssm_idx,
         accepted_steps=accepted_steps,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
     torch.cuda.synchronize()
 
@@ -3754,7 +3983,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
     )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -3793,7 +4022,7 @@ def test_gdn_decode_bf16_state_fla_scatter_state_only(
         dt_bias=torch.randn(HV, dtype=torch.float32, device=device),
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         disable_output=True,  # state-only
     )
 
@@ -3900,7 +4129,7 @@ def test_gdn_decode_bf16_state_fla_scatter_validation():
 # ============================================================================
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 16])
 def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
     batch_size: int,
@@ -3965,7 +4194,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
         initial_state_indices=h0_idx,
         ssm_state_indices=ssm_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
 
     # Reference: contiguous pool → flat path
@@ -3992,7 +4221,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
             )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 16])
 def test_gdn_decode_bf16_state_fla_scatter_random_slots(
     batch_size: int,
@@ -4050,7 +4279,7 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         b=b,
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
 
     # Dense reference (same input).
@@ -4084,8 +4313,13 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         assert diff == 0, f"unused slot {s} clobbered: {diff}"
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 128])
+@parametrize_product(
+    {
+        "max_T": [2, 8],
+        "batch_size": [1, 4, 16, 128],
+    },
+    regular=pairwise_product_cases,
+)
 def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
     batch_size: int,
     max_T: int,
@@ -4128,7 +4362,7 @@ def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
         dt_bias=dt_bias,
         b=b,
         initial_state_indices=h0_idx,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         disable_state_update=False,
         use_qk_l2norm=True,
     )

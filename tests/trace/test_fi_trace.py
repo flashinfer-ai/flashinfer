@@ -1557,3 +1557,42 @@ def test_nvfp4_append_trace_json_init_is_self_contained():
                 pytest.skip(f"{filename} init unsupported on CPU: {exc}")
             raise
         assert isinstance(result, dict)
+
+
+def test_gdn_replayssm_commit_fi_trace():
+    from flashinfer.gdn_decode import gated_delta_rule_replayssm_commit
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init(device="cpu")
+    defn = gated_delta_rule_replayssm_commit.fi_trace(**args)
+    _check_defn(defn, "gdn", "gated_delta_rule_replayssm_commit")
+    assert defn["axes"]["num_k_heads"]["value"] == 2
+    assert defn["inputs"]["accept_lens"]["dtype"] == "int32"
+    assert defn["outputs"]["checkpoint_state"]["dtype"] == "float32"
+
+
+def test_gdn_mtp_replayssm_fi_trace():
+    from flashinfer.gdn_decode import gated_delta_rule_mtp
+    from flashinfer.trace.templates.gdn import gdn_mtp_trace
+
+    args = gdn_mtp_trace.init(
+        batch_size=2,
+        pool_size=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=8,
+        device="cpu",
+    )
+    t = args["q"].shape[1]
+    args.update(
+        cache_replayssm=True,
+        disable_state_update=True,
+        replayssm_rawv=torch.empty(4, 8, t, 128, dtype=torch.bfloat16),
+        replayssm_rawk=torch.empty(4, 2, t, 128, dtype=torch.bfloat16),
+        replayssm_g=torch.empty(4, 8, t),
+        replayssm_beta=torch.empty(4, 8, t),
+    )
+    defn = gated_delta_rule_mtp.fi_trace(**args)
+    _check_defn(defn, "gdn", "gated_delta_rule_mtp")
+    for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
+        assert defn["outputs"][name]["shape"] == defn["inputs"][name]["shape"]

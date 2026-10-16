@@ -22,9 +22,8 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
-| `batch_mla_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `batch_mla_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_mla_decode_workspace_size` | Size caller-owned standalone scratch. |
-| `prims_ts_batch_mla_decode_with_kv_cache` | Standalone launch with caller-owned scratch. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot

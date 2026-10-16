@@ -1,0 +1,317 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#ifndef CAKE_BGMV_MOE_BODY_FILE
+#error "CAKE_BGMV_MOE_BODY_FILE must name one generated BGMV MoE body"
+#endif
+#ifndef CAKE_BGMV_MOE_HIDDEN
+#error "CAKE_BGMV_MOE_HIDDEN must describe the generated hidden size"
+#endif
+#ifndef CAKE_BGMV_MOE_INPUT_DTYPE
+#error "CAKE_BGMV_MOE_INPUT_DTYPE must describe the generated input dtype"
+#endif
+#ifndef CAKE_BGMV_MOE_CC_MAJOR
+#error "CAKE_BGMV_MOE_CC_MAJOR must name the compiled compute-capability major"
+#endif
+#ifndef CAKE_BGMV_MOE_CC_MINOR
+#error "CAKE_BGMV_MOE_CC_MINOR must name the compiled compute-capability minor"
+#endif
+#ifndef CAKE_BGMV_MOE_SHRINK_DECODE
+#error "CAKE_BGMV_MOE_SHRINK_DECODE must name the generated kernel symbol"
+#endif
+#ifndef CAKE_BGMV_MOE_SHRINK_PREFILL
+#error "CAKE_BGMV_MOE_SHRINK_PREFILL must name the generated kernel symbol"
+#endif
+#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN_T64
+#error "CAKE_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
+#endif
+#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN
+#error "CAKE_BGMV_MOE_EXPAND_TOKEN must name the generated kernel symbol"
+#endif
+#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL
+#error "CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL must name the generated kernel symbol"
+#endif
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <limits>
+
+#include "tvm_ffi_utils.h"
+
+#include CAKE_BGMV_MOE_BODY_FILE
+
+namespace flashinfer {
+namespace cake_bgmv_moe {
+
+constexpr int32_t kHidden = CAKE_BGMV_MOE_HIDDEN;
+constexpr int32_t kRank = 32;
+constexpr int32_t kShrinkThreads = 128;
+constexpr int32_t kShrinkDecodePairsPerBlock = 4;
+// Dynamic shared memory per launch; the generated body records the values its
+// kernels were scheduled with (x/weight cp.async rings plus FP32 partials for
+// the shrink kernels, routed activations plus the route list for expand).
+constexpr int32_t kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_DECODE;
+constexpr int32_t kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_PREFILL;
+constexpr int32_t kExpandT64SmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_T64;
+constexpr int32_t kExpandTokenSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN;
+constexpr int32_t kExpandDualSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_DUAL;
+static_assert(kShrinkDecodeSmemBytes == 221696, "decode shrink smem layout changed");
+static_assert(kShrinkPrefillSmemBytes == 36992, "prefill shrink smem layout changed");
+// Token->pair route index published by the shrink kernels and consumed by the
+// expand kernels for arbitrary pair order (u32 words): a 4-word header (launch
+// counter, parity used by the current shrink), per token a monotonic route
+// count, two launch-parity base counts and kRouteIndexMaxRoutes pair slots.
+// The plan allocates it zeroed once; the kernels never reset it.
+constexpr int32_t kRouteIndexMaxRoutes = 16;
+constexpr int32_t kRouteIndexHeaderWords = 4;
+constexpr int32_t kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes;
+
+enum class Schedule : int32_t {
+  kTokenOwnedT64 = 0,
+  kTokenOwned = 1,
+  kTokenOwnedDualCol = 2,
+};
+
+inline void CheckCuda(cudaError_t status, const char* operation) {
+  TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
+}
+
+// Each module is compiled for exactly one target (sm_90a for H100/H200,
+// sm_100a for B200/GB200, sm_103a for B300/GB300). The device must match it;
+// anything else fails closed instead of silently running another cubin.
+inline void CheckCompiledArch(int32_t device_id) {
+  int major = 0;
+  int minor = 0;
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
+            "cudaDeviceGetAttribute(major)");
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(minor)");
+  TVM_FFI_ICHECK(major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR)
+      << "Cake BGMV MoE module was compiled for compute capability " << CAKE_BGMV_MOE_CC_MAJOR
+      << "." << CAKE_BGMV_MOE_CC_MINOR << ", got " << major << "." << minor;
+}
+
+// Called once per loaded module: the device must match the compiled target and
+// the decode shrink needs its opt-in dynamic shared memory.
+void Configure() {
+  int32_t device_id = 0;
+  CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
+  CheckCompiledArch(device_id);
+
+  int32_t max_dynamic_smem = 0;
+  CheckCuda(
+      cudaDeviceGetAttribute(&max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id),
+      "cudaDeviceGetAttribute(max opt-in shared memory)");
+  TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkDecodeSmemBytes)
+      << "Cake BGMV MoE decode shrink requires " << kShrinkDecodeSmemBytes
+      << " bytes of dynamic shared memory, but device " << device_id << " supports "
+      << max_dynamic_smem;
+  CheckCuda(
+      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kShrinkDecodeSmemBytes),
+      "cudaFuncSetAttribute(Cake BGMV MoE decode shrink)");
+}
+
+inline void CheckCompact(const TensorView& tensor, const char* name) {
+  CHECK_CONTIGUOUS(tensor);
+  TVM_FFI_ICHECK(tensor.numel() <= std::numeric_limits<int32_t>::max())
+      << name << " exceeds the generated kernel's int32 index range";
+}
+
+// The expand kernels take the output row stride at runtime, so the FP32
+// accumulator may be a column slice of a wider row-major buffer: unit column
+// stride, row stride at least the hidden size, and every row offset within
+// the kernels' int32 index range.
+inline int32_t OutputRowStride(const TensorView& y_accum, int64_t num_tokens, int64_t hidden) {
+  TVM_FFI_ICHECK(y_accum.stride(1) == 1) << "y_accum must be contiguous along hidden";
+  const int64_t row_stride = y_accum.stride(0);
+  TVM_FFI_ICHECK(row_stride >= hidden)
+      << "y_accum row stride " << row_stride << " is smaller than hidden " << hidden;
+  TVM_FFI_ICHECK((num_tokens - 1) * row_stride + hidden <= std::numeric_limits<int32_t>::max())
+      << "y_accum exceeds the generated kernel's int32 index range";
+  return static_cast<int32_t>(row_stride);
+}
+
+void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
+         TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
+         TensorView lora_indices, TensorView topk_weights, TensorView route_index,
+         int64_t schedule_value, int64_t pdl_mode, int64_t cuda_stream) {
+  TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
+  // The specialized bodies take plain launches: measured as programmatic
+  // dependents they lose 2-16 % (round 5), so these kernels carry no
+  // griddepcontrol instruction and the host policy always passes 0.
+  TVM_FFI_ICHECK(pdl_mode == 0) << "the specialized Cake BGMV MoE kernels take plain launches "
+                                   "(pdl_mode must be 0), got "
+                                << pdl_mode;
+  CHECK_CUDA(x);
+  // The device/module match is checked once in Configure (module load); the
+  // Python side already routes each device to the module compiled for it.
+  ffi::CUDADeviceGuard device_guard(x.device().device_id);
+
+  CHECK_CUDA(y_accum);
+  CHECK_CUDA(shrink_out);
+  CHECK_CUDA(lora_a);
+  CHECK_CUDA(lora_b);
+  CHECK_CUDA(sorted_token_ids);
+  CHECK_CUDA(expert_ids);
+  CHECK_CUDA(lora_indices);
+  CHECK_CUDA(topk_weights);
+  CHECK_CUDA(route_index);
+  CHECK_DEVICE(x, y_accum);
+  CHECK_DEVICE(x, shrink_out);
+  CHECK_DEVICE(x, lora_a);
+  CHECK_DEVICE(x, lora_b);
+  CHECK_DEVICE(x, sorted_token_ids);
+  CHECK_DEVICE(x, expert_ids);
+  CHECK_DEVICE(x, lora_indices);
+  CHECK_DEVICE(x, topk_weights);
+  CHECK_DEVICE(x, route_index);
+
+  CHECK_INPUT_TYPE(x, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(shrink_out, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(lora_a, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(lora_b, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(y_accum, dl_float32);
+  CHECK_INPUT_TYPE(topk_weights, dl_float32);
+  CHECK_INPUT_TYPE(sorted_token_ids, dl_int64);
+  CHECK_INPUT_TYPE(expert_ids, dl_int64);
+  CHECK_INPUT_TYPE(lora_indices, dl_int64);
+  CHECK_INPUT_TYPE(route_index, dl_int32);
+
+  TVM_FFI_ICHECK(x.ndim() == 2 && x.size(0) > 0 && x.size(1) == kHidden)
+      << "x must have shape [num_tokens, " << kHidden << "]";
+  const int32_t num_tokens = static_cast<int32_t>(x.size(0));
+  TVM_FFI_ICHECK(sorted_token_ids.ndim() == 1 && sorted_token_ids.size(0) > 0)
+      << "sorted_token_ids must be a non-empty rank-1 tensor";
+  const int32_t num_pairs = static_cast<int32_t>(sorted_token_ids.size(0));
+  TVM_FFI_ICHECK(expert_ids.ndim() == 1 && expert_ids.size(0) == num_pairs)
+      << "expert_ids must have shape [num_pairs]";
+  TVM_FFI_ICHECK(topk_weights.ndim() == 1 && topk_weights.size(0) == num_pairs)
+      << "topk_weights must have shape [num_pairs]";
+  TVM_FFI_ICHECK(lora_indices.ndim() == 1 && lora_indices.size(0) == num_tokens)
+      << "lora_indices must have shape [num_tokens]";
+  TVM_FFI_ICHECK(shrink_out.ndim() == 3 && shrink_out.size(0) == 1 &&
+                 shrink_out.size(1) == num_pairs && shrink_out.size(2) == kRank)
+      << "shrink_out must have shape [1, num_pairs, 32]";
+  TVM_FFI_ICHECK(y_accum.ndim() == 2 && y_accum.size(0) == num_tokens && y_accum.size(1) == kHidden)
+      << "y_accum must have shape [num_tokens, " << kHidden << "]";
+  TVM_FFI_ICHECK(lora_a.ndim() == 4 && lora_a.size(0) > 0 && lora_a.size(1) > 0 &&
+                 lora_a.size(2) == kRank && lora_a.size(3) == kHidden)
+      << "lora_a must have shape [num_loras, num_experts, 32, " << kHidden << "]";
+  const int32_t num_experts = static_cast<int32_t>(lora_a.size(1));
+  TVM_FFI_ICHECK(lora_b.ndim() == 4 && lora_b.size(0) == lora_a.size(0) &&
+                 lora_b.size(1) == num_experts && lora_b.size(2) == kHidden &&
+                 lora_b.size(3) == kRank)
+      << "lora_b must have shape [num_loras, num_experts, " << kHidden << ", 32]";
+
+  CheckCompact(x, "x");
+  CheckCompact(shrink_out, "shrink_out");
+  CheckCompact(lora_a, "lora_a");
+  CheckCompact(lora_b, "lora_b");
+  CheckCompact(sorted_token_ids, "sorted_token_ids");
+  CheckCompact(expert_ids, "expert_ids");
+  CheckCompact(lora_indices, "lora_indices");
+  CheckCompact(topk_weights, "topk_weights");
+  CheckCompact(route_index, "route_index");
+  TVM_FFI_ICHECK(route_index.ndim() == 1 &&
+                 route_index.size(0) >= kRouteIndexHeaderWords + static_cast<int64_t>(num_tokens) *
+                                                                     kRouteIndexWordsPerToken)
+      << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
+      << kRouteIndexWordsPerToken << " int32 words";
+
+  TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
+                 schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
+      << "invalid Cake BGMV MoE schedule id: " << schedule_value;
+  const auto schedule = static_cast<Schedule>(schedule_value);
+  const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  auto* y_ptr = static_cast<float*>(y_accum.data_ptr());
+  auto* shrink_ptr = static_cast<unsigned short*>(shrink_out.data_ptr());
+  auto* x_ptr = static_cast<unsigned short*>(x.data_ptr());
+  auto* a_ptr = static_cast<unsigned short*>(lora_a.data_ptr());
+  auto* b_ptr = static_cast<unsigned short*>(lora_b.data_ptr());
+  auto* token_ptr = static_cast<long long*>(sorted_token_ids.data_ptr());
+  auto* expert_ptr = static_cast<long long*>(expert_ids.data_ptr());
+  auto* lora_ptr = static_cast<long long*>(lora_indices.data_ptr());
+  auto* weight_ptr = static_cast<float*>(topk_weights.data_ptr());
+  auto* route_ptr = static_cast<unsigned int*>(route_index.data_ptr());
+  constexpr int32_t kRouteBuild = 1;
+  constexpr int32_t kRouteLookup = 1;
+  constexpr int32_t kRouteAdvance = 1;
+
+  const dim3 shrink_block(kShrinkThreads, 1, 1);
+  if (num_pairs <= 32) {
+    const dim3 shrink_grid(
+        (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock, kRank / 8, 1);
+    CAKE_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
+        shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+        num_tokens, route_ptr, kRouteBuild);
+  } else {
+    const dim3 shrink_grid(num_pairs, kRank / 8, 1);
+    CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes, stream>>>(
+        shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+        num_tokens, route_ptr, kRouteBuild);
+  }
+  CheckCuda(cudaGetLastError(), "Cake BGMV MoE shrink launch");
+
+  const int32_t output_stride = OutputRowStride(y_accum, num_tokens, kHidden);
+  const int32_t output_offset = 0;
+  // Plain stream launch (no programmatic dependency): the specialized kernels
+  // carry no griddepcontrol instruction.
+  cudaLaunchConfig_t config = {};
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 0;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  cudaError_t expand_status;
+  if (schedule == Schedule::kTokenOwnedT64) {
+    config.gridDim = dim3(num_tokens, (kHidden + 63) / 64, 1);
+    config.blockDim = dim3(64, 1, 1);
+    config.dynamicSmemBytes = kExpandT64SmemBytes;
+    expand_status = cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_T64, y_ptr, shrink_ptr,
+                                       b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
+                                       num_pairs, num_experts, num_tokens, output_stride,
+                                       output_offset, route_ptr, kRouteLookup, kRouteAdvance);
+  } else if (schedule == Schedule::kTokenOwned) {
+    config.gridDim = dim3(num_tokens, (kHidden + 127) / 128, 1);
+    config.blockDim = dim3(128, 1, 1);
+    config.dynamicSmemBytes = kExpandTokenSmemBytes;
+    expand_status =
+        cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN, y_ptr, shrink_ptr, b_ptr, token_ptr,
+                           expert_ptr, lora_ptr, weight_ptr, num_pairs, num_experts, num_tokens,
+                           output_stride, output_offset, route_ptr, kRouteLookup, kRouteAdvance);
+  } else {
+    config.gridDim = dim3(num_tokens, (kHidden + 255) / 256, 1);
+    config.blockDim = dim3(128, 1, 1);
+    config.dynamicSmemBytes = kExpandDualSmemBytes;
+    expand_status = cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL, y_ptr, shrink_ptr,
+                                       b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
+                                       num_pairs, num_experts, num_tokens, output_stride,
+                                       output_offset, route_ptr, kRouteLookup, kRouteAdvance);
+  }
+  CheckCuda(expand_status, "Cake BGMV MoE expand launch");
+}
+
+}  // namespace cake_bgmv_moe
+}  // namespace flashinfer
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure, flashinfer::cake_bgmv_moe::Configure);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::cake_bgmv_moe::Run);

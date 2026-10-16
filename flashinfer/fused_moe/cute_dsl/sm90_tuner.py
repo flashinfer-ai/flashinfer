@@ -144,6 +144,7 @@ def is_valid_tactic(
         hidden_size,
         num_local_experts,
         swizzle_size=params["gemm1_swizzle_size"],
+        gated=gated,
     )
     gemm2_ok = Sm90ContiguousGroupedGemmFinalizeFusionKernel.can_implement(
         cutlass_dtype,
@@ -348,6 +349,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
                     gemm1_n,
                     hidden_size,
                     self.num_local_experts,
+                    gated=self.gated,
                 )
             ]
             gemm1_tactics = [

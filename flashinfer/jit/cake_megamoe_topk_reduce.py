@@ -15,45 +15,97 @@ limitations under the License.
 """
 
 import functools
-import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from .utils import write_if_different
 
 _SOURCE_FILE = "cake_megamoe_topk_reduce_kernels.cu"
-_MANIFEST_FILE = "manifest.json"
 _BINDING_HEADER = "cake_megamoe_topk_reduce_binding.cuh"
 _KERNEL_SYMBOL = "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
-_SOURCE_SHA256 = "721e39685cc4f217b6e15a32dc0359cbcd0d2cee671da8fab3b6dd5aa536ee89"
-_MANIFEST_KEYS = {
-    "arch",
-    "compile_flags",
-    "constraints",
-    "kernel_count",
-    "kernel_symbols",
-    "launch",
-    "schema_version",
-    "source_sha256",
-    "tma_abi",
+# One arch-neutral generated source serves every datacenter-Blackwell target;
+# each module compiles it with its own ``-gencode`` and runs on the exact
+# compute capability it was built for.
+_ARCHS: dict[str, dict[str, Any]] = {
+    "sm_100a": {"capability": (10, 0), "nvcc_flags": sm100a_nvcc_flags},
+    "sm_103a": {"capability": (10, 3), "nvcc_flags": sm103a_nvcc_flags},
 }
-_CONSTRAINTS = {
-    "capacities": [256, 4096],
-    "dtype": "bfloat16",
-    "hidden_size": 4096,
-    "top_k": 6,
-}
-_LAUNCH = {
-    "block_threads": 256,
-    "dynamic_smem_bytes": 0,
-    "grid_x": "4 * num_tokens",
-}
-_LOADED_MODULE: Any | None = None
+_CAPABILITY_TO_ARCH = {record["capability"]: arch for arch, record in _ARCHS.items()}
+_SUPPORTED_CAPABILITIES = tuple(sorted(_CAPABILITY_TO_ARCH))
+_LOADED_MODULES: dict[str, Any] = {}
+
+_BINDING_SOURCE = f"""\
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+#include "{_BINDING_HEADER}"
+"""
+
+
+def supported_capabilities() -> tuple[tuple[int, int], ...]:
+    """Exact compute capabilities the reducer is built for."""
+
+    return _SUPPORTED_CAPABILITIES
+
+
+def _device_index(device: torch.device | int | str | None) -> int:
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, int):
+        return device
+    index = torch.device(device).index
+    return torch.cuda.current_device() if index is None else index
+
+
+@functools.cache
+def _device_capability(index: int) -> tuple[int, int]:
+    """Compute capability of one device ordinal, queried once per process."""
+
+    return tuple(torch.cuda.get_device_capability(index))
+
+
+def supports_device(device: torch.device | int | str | None = None) -> bool:
+    """Whether ``device`` has an exact reducer build (no device query per call)."""
+
+    return _device_capability(_device_index(device)) in _CAPABILITY_TO_ARCH
+
+
+def resolve_arch(device: torch.device | int | str | None = None) -> str:
+    """Return the reducer arch (``sm_100a`` / ``sm_103a``) for ``device``.
+
+    Raises ``NotImplementedError`` when the device has no reducer build; the
+    caller is expected to fall back to the CuTeDSL terminal reducer.
+    """
+
+    capability = _device_capability(_device_index(device))
+    try:
+        return _CAPABILITY_TO_ARCH[capability]
+    except KeyError:
+        raise NotImplementedError(
+            "the MegaMoE TopK reducer is published for compute "
+            f"capabilities {list(_SUPPORTED_CAPABILITIES)}, got {capability}"
+        ) from None
+
+
+def _check_arch(arch: str) -> dict[str, Any]:
+    try:
+        return _ARCHS[arch]
+    except KeyError:
+        raise ValueError(
+            f"unknown MegaMoE TopK reducer arch {arch!r}; known: {sorted(_ARCHS)}"
+        ) from None
 
 
 def _get_csrc_dir() -> Path:
@@ -64,7 +116,7 @@ def _get_csrc_dir() -> Path:
     if checkout.is_dir():
         return checkout
     raise FileNotFoundError(
-        "frozen MegaMoE TopK-reduce sources were not found. Checked:\n"
+        "MegaMoE TopK-reduce sources were not found. Checked:\n"
         f"  - {installed}\n"
         f"  - {checkout}"
     )
@@ -83,138 +135,59 @@ def _get_include_dir() -> Path:
     )
 
 
-def _reject_duplicate_manifest_keys(pairs):
-    document = {}
-    for key, value in pairs:
-        if key in document:
-            raise RuntimeError(
-                f"MegaMoE TopK-reduce manifest has duplicate key {key!r}"
-            )
-        document[key] = value
-    return document
-
-
-def _program_source() -> tuple[Path, dict[str, Any]]:
-    csrc_dir = _get_csrc_dir()
-    source = csrc_dir / _SOURCE_FILE
-    manifest_path = csrc_dir / _MANIFEST_FILE
-    binding_header = csrc_dir / _BINDING_HEADER
-    missing = [
-        path.name
-        for path in (source, manifest_path, binding_header)
-        if not path.is_file()
-    ]
-    if missing:
-        raise RuntimeError(
-            "MegaMoE TopK-reduce source package is incomplete: missing "
-            + ", ".join(missing)
-        )
-
-    try:
-        manifest = json.loads(
-            manifest_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_manifest_keys,
-        )
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise RuntimeError("MegaMoE TopK-reduce manifest is invalid JSON") from error
-
-    source_bytes = source.read_bytes()
-    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
-    if source_sha256 != _SOURCE_SHA256:
-        raise RuntimeError("MegaMoE TopK-reduce source identity is invalid")
-    expected = {
-        "schema_version": 1,
-        "arch": "sm_100a",
-        "compile_flags": [],
-        "tma_abi": "pointer",
-        "kernel_count": 1,
-        "launch": _LAUNCH,
-        "constraints": _CONSTRAINTS,
-        "kernel_symbols": [_KERNEL_SYMBOL],
-        "source_sha256": _SOURCE_SHA256,
-    }
-    if (
-        not isinstance(manifest, dict)
-        or set(manifest) != _MANIFEST_KEYS
-        or manifest != expected
-    ):
-        raise RuntimeError("MegaMoE TopK-reduce manifest identity is invalid")
-    if source_bytes.count(_KERNEL_SYMBOL.encode()) != 1:
-        raise RuntimeError(
-            "MegaMoE TopK-reduce source does not define exactly one frozen kernel symbol"
-        )
-    return source, manifest
-
-
-def _module_identity(
-    source: Path, manifest: dict[str, Any], binding_header: Path
-) -> str:
-    digest = hashlib.sha256()
-    digest.update(source.read_bytes())
-    digest.update(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
-    digest.update(binding_header.read_bytes())
-    digest.update(_binding_source().encode())
-    digest.update(b"sm_100a")
-    return f"cake_megamoe_topk_reduce_sm100a_{digest.hexdigest()[:20]}"
-
-
-def _binding_source() -> str:
-    return f"""\
-/*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- * Licensed under the Apache License, Version 2.0.
- */
-
-#define CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE "{_SOURCE_FILE}"
-#define CAKE_MEGAMOE_TOPK_REDUCE_KERNEL {_KERNEL_SYMBOL}
-#define CAKE_MEGAMOE_TOPK_REDUCE_THREADS {_LAUNCH["block_threads"]}
-#define CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES {_LAUNCH["dynamic_smem_bytes"]}
-
-#include "{_BINDING_HEADER}"
-"""
-
-
-def get_cake_megamoe_topk_reduce_uri() -> str:
-    source, manifest = _program_source()
-    return _module_identity(source, manifest, _get_csrc_dir() / _BINDING_HEADER)
+def get_cake_megamoe_topk_reduce_uri(arch: str | None = None) -> str:
+    if arch is None:
+        arch = resolve_arch()
+    _check_arch(arch)
+    return f"cake_megamoe_topk_reduce_{arch.replace('_', '')}"
 
 
 @functools.cache
-def gen_cake_megamoe_topk_reduce_module() -> JitSpec:
-    source, manifest = _program_source()
-    csrc_dir = source.parent
-    uri = _module_identity(source, manifest, csrc_dir / _BINDING_HEADER)
+def gen_cake_megamoe_topk_reduce_module(arch: str = "sm_100a") -> JitSpec:
+    record = _check_arch(arch)
+    csrc_dir = _get_csrc_dir()
     binding = (
-        jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_megamoe_topk_reduce_binding.cu"
+        jit_env.FLASHINFER_GEN_SRC_DIR
+        / "cake_megamoe_topk_reduce"
+        / "cake_megamoe_topk_reduce_binding.cu"
     )
-    write_if_different(binding, _binding_source())
+    write_if_different(binding, _BINDING_SOURCE)
     spec = gen_jit_spec(
-        name=uri,
+        name=get_cake_megamoe_topk_reduce_uri(arch),
         sources=[binding],
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=record["nvcc_flags"],
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
         use_fast_math=False,
     )
-    logger.info("Generated frozen MegaMoE TopK-reduce JIT spec: %s", spec.name)
+    logger.info("Generated MegaMoE TopK-reduce JIT spec: %s", spec.name)
     return spec
 
 
-def load_cake_megamoe_topk_reduce_module():
-    global _LOADED_MODULE
-    if _LOADED_MODULE is None:
-        _LOADED_MODULE = gen_cake_megamoe_topk_reduce_module().build_and_load()
-        logger.info("Loaded frozen MegaMoE TopK-reduce module")
-    return _LOADED_MODULE
+def load_cake_megamoe_topk_reduce_module(arch: str | None = None):
+    if arch is None:
+        arch = resolve_arch()
+    module = _LOADED_MODULES.get(arch)
+    if module is None:
+        module = gen_cake_megamoe_topk_reduce_module(arch).build_and_load()
+        _LOADED_MODULES[arch] = module
+        logger.info("Loaded MegaMoE TopK-reduce module (%s)", arch)
+    return module
 
 
-def is_cake_megamoe_topk_reduce_module_loaded() -> bool:
-    """Whether the reducer can launch without lazy build/load work."""
+def is_cake_megamoe_topk_reduce_module_loaded(
+    device: torch.device | int | str | None = None,
+) -> bool:
+    """Whether the reducer for ``device`` can launch without lazy build/load work."""
 
-    return _LOADED_MODULE is not None
+    try:
+        arch = resolve_arch(device)
+    except NotImplementedError:
+        return False
+    return arch in _LOADED_MODULES
 
 
-def get_cake_megamoe_topk_reduce_module():
-    return load_cake_megamoe_topk_reduce_module()
+def get_cake_megamoe_topk_reduce_module(device: torch.device | int | str | None = None):
+    return load_cake_megamoe_topk_reduce_module(resolve_arch(device))
 
 
 def run_cake_megamoe_topk_reduce(
@@ -225,7 +198,7 @@ def run_cake_megamoe_topk_reduce(
     """Launch the reducer on ``partials``' current CUDA stream."""
 
     stream = torch.cuda.current_stream(device=partials.device).cuda_stream
-    get_cake_megamoe_topk_reduce_module().run(
+    get_cake_megamoe_topk_reduce_module(partials.device).run(
         partials,
         out,
         num_tokens,
@@ -239,5 +212,8 @@ __all__ = [
     "get_cake_megamoe_topk_reduce_uri",
     "load_cake_megamoe_topk_reduce_module",
     "is_cake_megamoe_topk_reduce_module_loaded",
+    "resolve_arch",
     "run_cake_megamoe_topk_reduce",
+    "supported_capabilities",
+    "supports_device",
 ]

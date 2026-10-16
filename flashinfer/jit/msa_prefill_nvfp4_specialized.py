@@ -18,9 +18,15 @@ import functools
 from typing import Literal
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
 
-MSAPrefillNVFP4Target = Literal["sm100a", "sm103a"]
+MSAPrefillNVFP4Target = Literal["sm100a", "sm103a", "sm107a"]
 
 # ptxas 12.9.41 (CUDA 12.9.0) miscompiles this kernel's first tcgen05.mma
 # descriptor, and no earlier 12.x toolkit has been qualified on it. The route
@@ -31,6 +37,7 @@ MIN_CUDA_VERSION = "13.0"
 _NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
+    "sm107a": sm107a_nvcc_flags,
 }
 
 # ``gen_jit_spec`` adds ``-use_fast_math`` unconditionally, which turns on

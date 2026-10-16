@@ -6,6 +6,7 @@
 """Direct public-API tests for the frozen GDN non-CP non-CP GDN prefill routes."""
 
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -89,6 +90,15 @@ def _caller_qk_l2norm(value):
         torch.sum(value_f32 * value_f32, dim=-1, keepdim=True) + 1e-6
     )
     return (value_f32 / denominator).to(value.dtype)
+
+
+def _expected_noncp_route_suffix(*, seq_lens, num_q_heads=4, num_v_heads=8, **_):
+    """Mirror select_cake_gdn_prefill_variant's physical-schedule rule for the live arch:
+    DV-split when 2 * num_seqs * num_o_heads fits the arch's active-cluster count."""
+    major, minor = torch.cuda.get_device_capability()
+    arch = cake_gdn.arch_for_compute_capability(major, minor)
+    tiles = 2 * len(seq_lens) * max(num_q_heads, num_v_heads)
+    return ".dvsplit" if tiles <= cake_gdn._ARCH_ACTIVE_CLUSTERS[arch] else ".full_dv"
 
 
 def _make_case(
@@ -226,13 +236,12 @@ def _launch(case):
     )
 
 
-def _launch_raw_indexed_prefill(case):
-    """Invoke the exported TVM FFI entry without public-adapter validation."""
+def _public_route(case):
+    """The frozen route the public adapter resolves for ``case`` on the live arch."""
 
     major, minor = torch.cuda.get_device_capability(case["q"].device)
-    arch = cake_gdn.arch_for_compute_capability(major, minor)
-    route = cake_gdn.select_cake_gdn_prefill_variant(
-        arch=arch,
+    return cake_gdn.select_cake_gdn_prefill_variant(
+        arch=cake_gdn.arch_for_compute_capability(major, minor),
         io_dtype={torch.bfloat16: "bfloat16", torch.float16: "float16"}[
             case["q"].dtype
         ],
@@ -245,13 +254,21 @@ def _launch_raw_indexed_prefill(case):
         num_q_heads=case["num_q_heads"],
         num_k_heads=case["num_k_heads"],
         num_v_heads=case["num_v_heads"],
-        use_initial_state=True,
+        use_initial_state=case["initial_state"] is not None,
         store_final_state=True,
         checkpoint_every_n_tokens=case["checkpoint_every"],
-        use_state_indices=True,
+        use_state_indices=case["state_indices"] is not None,
         gates_present=True,
         seq_lens=case["seq_lens"],
     )
+
+
+def _launch_raw_indexed_prefill(case):
+    """Invoke the exported TVM FFI entry without public-adapter validation."""
+
+    major, minor = torch.cuda.get_device_capability(case["q"].device)
+    arch = cake_gdn.arch_for_compute_capability(major, minor)
+    route = _public_route(case)
     entry = cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
     num_o_heads = max(case["num_q_heads"], case["num_v_heads"])
     total_tiles = (
@@ -268,7 +285,8 @@ def _launch_raw_indexed_prefill(case):
         max_chunks = max((length + 63) // 64 for length in case["seq_lens"])
         if max_chunks <= 8:
             grid_x = min(128, total_tiles)
-        elif active_clusters in (148, 160) and total_tiles == 256:
+        elif active_clusters in (148, 160, 212) and total_tiles == 256:
+            # 212 = Rubin R200; balanced two tiles per CTA.
             grid_x = 128
         else:
             grid_x = min(active_clusters, total_tiles)
@@ -339,6 +357,139 @@ def _launch_raw_indexed_prefill(case):
             "num_k_heads": 2,
             "num_v_heads": 4,
         },
+        # Qwen3.5 per-rank head splits with gathered BF16 state (the SGLang
+        # extend route): DV-split and full-DV physical schedules.
+        {
+            "seq_lens": (512, 300),
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (1024,),
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 32,
+        },
+        {
+            "seq_lens": (257, 64, 1000),
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (512,) * 8,
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (96,) * 16,
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 2,
+            "num_k_heads": 2,
+            "num_v_heads": 8,
+        },
+        {
+            "seq_lens": (2048,) * 4,
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 32,
+        },
+        # Qwen3-Next / Qwen3.5 per-rank head splits with packed FP32 initial
+        # and final state (the vLLM TP1/TP2/TP4/TP8 route), each geometry on
+        # both physical schedules: DV-split while 2 * num_seqs * num_o_heads
+        # fits the arch's active clusters (148/160/212), full-DV at 256 tiles
+        # on every arch.
+        {
+            "seq_lens": (300, 512),
+            "state_dtype": torch.float32,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (512,) * 8,
+            "state_dtype": torch.float32,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (1024,),
+            "state_dtype": torch.float32,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 8,
+        },
+        {
+            "seq_lens": (256,) * 16,
+            "state_dtype": torch.float32,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 8,
+        },
+        {
+            "seq_lens": (640,),
+            "state_dtype": torch.float32,
+            "num_q_heads": 2,
+            "num_k_heads": 2,
+            "num_v_heads": 4,
+        },
+        {
+            "seq_lens": (96,) * 32,
+            "state_dtype": torch.float32,
+            "num_q_heads": 2,
+            "num_k_heads": 2,
+            "num_v_heads": 4,
+        },
+        {
+            "seq_lens": (2048,),
+            "state_dtype": torch.float32,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 32,
+        },
+        {
+            "seq_lens": (512,) * 4,
+            "state_dtype": torch.float32,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 32,
+        },
+        {
+            "seq_lens": (300, 1000),
+            "state_dtype": torch.float32,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (512,) * 8,
+            "state_dtype": torch.float32,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (257,),
+            "state_dtype": torch.float32,
+            "num_q_heads": 2,
+            "num_k_heads": 2,
+            "num_v_heads": 8,
+        },
+        {
+            "seq_lens": (96,) * 16,
+            "state_dtype": torch.float32,
+            "num_q_heads": 2,
+            "num_k_heads": 2,
+            "num_v_heads": 8,
+        },
     ),
 )
 def test_public_cake_gdn_prefill_matches_independent_recurrence(kwargs):
@@ -348,6 +499,10 @@ def test_public_cake_gdn_prefill_matches_independent_recurrence(kwargs):
     )
     backing_before = None if case["backing"] is None else case["backing"].clone()
     expected_out, expected_state, expected_checkpoints = _reference(case, initial_state)
+    route = _public_route(case)
+    assert route.route_id.endswith(_expected_noncp_route_suffix(**kwargs)), (
+        route.route_id
+    )
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
@@ -380,6 +535,68 @@ def test_public_cake_gdn_prefill_matches_independent_recurrence(kwargs):
                 atol=0,
                 rtol=0,
             )
+
+
+def _carry_segment(case, start, stop, initial_state):
+    """``case`` cut to tokens ``[start, stop)`` of its one sequence, started from ``initial_state``."""
+
+    length = stop - start
+    segment = dict(case)
+    for key in ("q", "k", "v", "g", "beta"):
+        segment[key] = case[key][start:stop].contiguous()
+    segment["cu_seqlens"] = torch.tensor(
+        [0, length], dtype=torch.int32, device=case["q"].device
+    )
+    segment["seq_lens"] = (length,)
+    segment["initial_state"] = initial_state
+    segment["output"] = torch.empty(
+        (length, *case["output"].shape[1:]),
+        dtype=case["output"].dtype,
+        device=case["output"].device,
+    )
+    segment["output_state"] = initial_state.clone()
+    return segment
+
+
+@pytest.mark.parametrize(
+    "heads",
+    ((8, 16), (4, 8), (2, 4), (8, 32), (4, 16), (2, 8)),
+    ids=lambda heads: f"h{heads[0]}_hv{heads[1]}",
+)
+def test_public_cake_gdn_prefill_fp32_state_carry_matches_single_pass(heads):
+    # Chunked prefill over the vLLM FP32-state contract: one sequence as two
+    # consecutive public calls (six 64-token chunks, then four), the first
+    # call's final state feeding the second as its initial state.  Output and
+    # final state must match the single-pass call and the reference recurrence.
+    num_q_heads, num_v_heads = heads
+    split, total = 384, 640
+    case = _make_case(
+        seq_lens=(total,),
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    single_out, single_state = _launch(case)
+    torch.cuda.synchronize()
+    first = _carry_segment(case, 0, split, initial_state.clone())
+    first_out, carried_state = _launch(first)
+    second = _carry_segment(case, split, total, carried_state)
+    second_out, final_state = _launch(second)
+    torch.cuda.synchronize()
+    assert carried_state is first["output_state"]
+    assert final_state is second["output_state"]
+    carried_out = torch.cat((first_out, second_out))
+    for actual, expected in (
+        (carried_out, single_out),
+        (final_state, single_state),
+        (carried_out, expected_out),
+        (final_state, expected_state),
+    ):
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=1e-2, rtol=1e-2
+        )
 
 
 def test_public_cake_gdn_prefill_raw_ffi_bf16_indexed_checkpoint_b7_t421_noncompact_matches_independent_recurrence():
@@ -538,6 +755,216 @@ def test_public_cake_gdn_prefill_checkpoint_is_cuda_graph_safe():
 
 
 @torch.inference_mode()
+def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
+    """Int64 cu_seqlens reuse one cached int32 copy across calls; slots convert per call.
+
+    The kernels take int32 offsets and slots.  Converting on every call launched an
+    extra kernel ahead of the main kernel for int64 callers; the adapter now keeps one
+    int32 copy per live contract-immutable metadata tensor (cu_seqlens and checkpoint
+    starts: same key and immutability contract as the host-int cache).  state_indices
+    are dynamic device data and are never cached.  The int64 path must stay
+    bitwise-identical to int32.
+    """
+    from flashinfer import gdn_prefill as prefill_mod
+
+    case = _make_case(
+        seq_lens=(128, 64),
+        indexed=True,
+        state_dtype=torch.bfloat16,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=16,
+        state_pool_padding=0,
+    )
+    initial_state = case["initial_state"].clone()
+    _launch(case)
+    torch.cuda.synchronize()
+    out_i32 = case["output"].clone()
+    state_i32 = case["output_state"].clone()
+
+    cu64 = case["cu_seqlens"].to(torch.int64)
+    slots64 = case["state_indices"].to(torch.int64)
+    case["cu_seqlens"], case["state_indices"] = cu64, slots64
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    prefill_mod._CAKE_GDN_I32_COPIES.clear()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["output_state"], state_i32)
+    cached = {
+        key: value
+        for key, (
+            ref,
+            value,
+            _stream,
+            _ready,
+        ) in prefill_mod._CAKE_GDN_I32_COPIES.items()
+        if ref() is cu64
+    }
+    assert len(cached) == 1, sorted(prefill_mod._CAKE_GDN_I32_COPIES)
+    assert not any(
+        ref() is slots64
+        for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
+    ), "state_indices must not be cached"
+    first_copies = {id(value) for value in cached.values()}
+
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["output_state"], state_i32)
+    again = {
+        id(value)
+        for ref, value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        if ref() is cu64
+    }
+    assert again == first_copies, (
+        "the second int64 call must reuse the cached int32 copy"
+    )
+
+    # A call on another stream reuses the copy after waiting for its cast.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        case["initial_state"].copy_(initial_state)
+        case["output"].zero_()
+        _launch(case)
+    side.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["output_state"], state_i32)
+    assert {
+        id(value)
+        for ref, value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        if ref() is cu64
+    } == first_copies, "a call on another stream must reuse the cached int32 copy"
+
+    # A fresh int64 tensor (new identity) converts again; the stale entry is not reused.
+    cu64_again = cu64.clone()
+    case["cu_seqlens"] = cu64_again
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert any(
+        ref() is cu64_again
+        for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
+    )
+
+
+@torch.inference_mode()
+def test_public_cake_gdn_prefill_int64_state_indices_follow_in_place_updates():
+    """Slots rewritten in place (no version bump under inference mode) reach the kernel.
+
+    state_indices are validated on-device every call and were never under the
+    host-int immutability contract, so an int64 slot buffer that the caller refreshes
+    with ``copy_`` must drive the kernel with the new slots, bitwise-identical to
+    passing those slots as int32.
+    """
+
+    case = _make_case(
+        seq_lens=(128, 64),
+        indexed=True,
+        state_dtype=torch.bfloat16,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=16,
+        state_pool_padding=0,
+    )
+    pristine_pool = case["initial_state"].clone()
+    new_slots = [0, 4]  # pool has len(seq_lens) + 3 rows; default slots are [2, 3]
+
+    case["state_indices"] = torch.tensor(new_slots, dtype=torch.int32, device="cuda")
+    _launch(case)
+    torch.cuda.synchronize()
+    out_i32 = case["output"].clone()
+    pool_i32 = case["initial_state"].clone()
+
+    slots64 = torch.tensor([2, 3], dtype=torch.int64, device="cuda")
+    case["state_indices"] = slots64
+    case["initial_state"].copy_(pristine_pool)
+    case["output"].zero_()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert not torch.equal(case["initial_state"], pool_i32), "slots [2, 3] must differ"
+
+    slots64.copy_(torch.tensor(new_slots, dtype=torch.int64, device="cuda"))
+    case["initial_state"].copy_(pristine_pool)
+    case["output"].zero_()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["initial_state"], pool_i32)
+
+
+def test_public_cake_gdn_prefill_int64_metadata_graph_owns_its_copy():
+    """A captured graph never depends on the eager int32 copy cache.
+
+    Eager calls populate the cache; capture must still record its own cast into the
+    graph's private pool, so dropping every cached copy (LRU eviction or a clear) and
+    recycling the freed blocks cannot change what replay reads.
+    """
+    from flashinfer import gdn_prefill as prefill_mod
+
+    case = _make_case(
+        seq_lens=(128,),
+        indexed=True,
+        state_dtype=torch.bfloat16,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=16,
+        state_pool_padding=0,
+    )
+    case["cu_seqlens"] = case["cu_seqlens"].to(torch.int64)
+    initial_state = case["initial_state"].clone()
+    # The inputs were produced on the default stream; order the side stream after
+    # them before the adapter reads cu_seqlens on it.
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _launch(case)
+    stream.synchronize()
+    out_eager = case["output"].clone()
+    state_eager = case["output_state"].clone()
+    assert any(
+        ref() is case["cu_seqlens"]
+        for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
+    ), "the eager call must populate the int32 copy cache"
+    # The baseline clones above run asynchronously on the current stream; the side
+    # stream is non-blocking, so order it after them before it rewrites the pool and
+    # the output buffer they read (a write-after-read race otherwise seen under GPU
+    # contention: state_eager would capture the restored initial state).
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        case["initial_state"].copy_(initial_state)
+        case["output"].zero_()
+    stream.synchronize()
+    entries_before = len(prefill_mod._CAKE_GDN_I32_COPIES)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _launch(case)
+    assert len(prefill_mod._CAKE_GDN_I32_COPIES) == entries_before, (
+        "capture must not fill the cache"
+    )
+
+    prefill_mod._CAKE_GDN_I32_COPIES.clear()
+    with torch.cuda.stream(stream):
+        # Recycle the freed small blocks with poison so a stale baked address would show.
+        poison = [
+            torch.full((2,), -1, dtype=torch.int32, device="cuda") for _ in range(64)
+        ]
+        case["initial_state"].copy_(initial_state)
+        case["output"].zero_()
+    stream.synchronize()
+    graph.replay()
+    stream.synchronize()
+    assert torch.equal(case["output"], out_eager)
+    assert torch.equal(case["output_state"], state_eager)
+    del poison
+
+
 def test_public_cake_gdn_prefill_is_cuda_graph_safe():
     case = _make_case(
         seq_lens=(128,),
@@ -589,8 +1016,23 @@ def test_public_cake_gdn_prefill_is_cuda_graph_safe():
             ".dvsplit",
         ),
         (
+            # 2 * 3 seqs * 32 heads = 192 tiles: full-DV on SM100a/SM103a (148/160
+            # active clusters), DV-split on SM107 (212) -- the suffix follows the arch.
             {
                 "seq_lens": (128, 192, 64),
+                "indexed": True,
+                "state_dtype": torch.bfloat16,
+                "num_q_heads": 32,
+                "num_k_heads": 32,
+                "num_v_heads": 32,
+            },
+            "upper",
+            "auto",
+        ),
+        (
+            # 2 * 4 seqs * 32 heads = 256 tiles: full-DV on every supported arch.
+            {
+                "seq_lens": (128, 192, 64, 96),
                 "indexed": True,
                 "state_dtype": torch.bfloat16,
                 "num_q_heads": 32,
@@ -616,6 +1058,8 @@ def test_public_cake_gdn_prefill_is_cuda_graph_safe():
 def test_public_cake_gdn_prefill_raw_abi_invalid_slot_is_noop(
     kwargs, invalid_value, expected_route_suffix
 ):
+    if expected_route_suffix == "auto":
+        expected_route_suffix = _expected_noncp_route_suffix(**kwargs)
     case = _make_case(**kwargs)
     case["output"].fill_(13.0)
     if case["state_checkpoints"].numel():
@@ -740,6 +1184,7 @@ def test_public_cake_gdn_prefill_invalid_cuda_slots_fail_in_isolated_process(
         capture_output=True,
         text=True,
         timeout=120,
+        env={**os.environ, "FLASHINFER_CAKE_GDN_VALIDATE_SLOTS": "1"},
     )
     combined = completed.stdout + completed.stderr
     device_asserted = any(

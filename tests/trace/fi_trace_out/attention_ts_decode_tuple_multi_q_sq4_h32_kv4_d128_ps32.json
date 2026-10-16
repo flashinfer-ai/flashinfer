@@ -18,6 +18,10 @@
       "value": 4,
       "description": "Fixed query length per request."
     },
+    "workspace_size": {
+      "type": "var",
+      "description": "Optional caller scratch size in bytes."
+    },
     "num_qo_heads": {
       "type": "const",
       "value": 32
@@ -98,6 +102,23 @@
         "batch_size"
       ],
       "dtype": "int32"
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "uint8",
+      "optional": true
+    },
+    "max_kv_len": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
     },
     "qo_indptr": {
       "shape": [

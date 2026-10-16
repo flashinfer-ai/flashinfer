@@ -81,6 +81,9 @@ class TllmGenFmhaKernel {
  public:
   static constexpr int kDynamicNumTokensPerPageThreshold = 128;
   static constexpr int kDynamicNumTokensPerPageKernelKey = 128;
+  // Max KV splits per CGA cluster, and the per-CTA KV length up to which clamping to it pays off.
+  static constexpr int kMaxCgaSmemReductionCtasPerSeqKv = 16;
+  static constexpr int kMaxSeqLenKvPerCtaForCgaClamp = 4096;
 
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
@@ -363,6 +366,22 @@ class TllmGenFmhaKernel {
     // Hash the runner params.
     auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
     return std::make_pair(mKernelMetaMap.find(hashId) != mKernelMetaMap.end(), info);
+  }
+
+  // Planning-only query for dense MLA. This is the first kernel selected by run(), whose
+  // head divisibility check precedes every reselection trigger. Passing this check does not
+  // certify later launch conditions. Read registry metadata without loading a cubin.
+  int getMlaInitialHeadDivisor(RunnerParams const& params) const {
+    FLASHINFER_CHECK(isGenerationKernel(params.mKernelType) && isMlaGenKernel(params) &&
+                         !isSparseMla(params.mSparseMlaType),
+                     "The MLA head-divisibility query requires dense MLA generation.");
+    SelectKernelParams selectKernelParams{params};
+    selectKernel(params, selectKernelParams);
+    auto const [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
+    auto const found = mKernelMetaMap.find(hashId);
+    FLASHINFER_CHECK(found != mKernelMetaMap.end(), "Trtllm-gen kernels not found: " + info);
+    auto const& kernelMeta = mKernelMeta[found->second];
+    return kernelMeta.mGroupsHeadsQ ? std::min(params.mNumHeadsQPerKv, kernelMeta.mStepQ) : 1;
   }
 
   // start here
@@ -665,6 +684,21 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+      // Clamp >16 splits to 16 so small-batch long-KV decode keeps the CGA reduction.
+      // Benchmarked: 16-split CGA beats >16-split GMEM while each CTA walks <= 4096 KV tokens;
+      // beyond that, the extra CTAs win.
+      // Multi-token (spec-decode) D256 is excluded: the clamp measured slightly slower there.
+      if (numCtasPerSeqKv > kMaxCgaSmemReductionCtasPerSeqKv &&
+          (params.mMaxSeqLenQ == 1 || params.mHeadDimV != 256) && params.mHeadDimV < 512 &&
+          !isDsv3MinLatencyMode && !selectKernelParams.mForceGmemReduction &&
+          isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
+          flashinfer::ceil_div(maxAttentionWindow, kMaxCgaSmemReductionCtasPerSeqKv) <=
+              kMaxSeqLenKvPerCtaForCgaClamp &&
+          (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode) ||
+           (isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
+            hasCgaSmemReductionKernel(params, selectKernelParams)))) {
+        numCtasPerSeqKv = kMaxCgaSmemReductionCtasPerSeqKv;
+      }
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.

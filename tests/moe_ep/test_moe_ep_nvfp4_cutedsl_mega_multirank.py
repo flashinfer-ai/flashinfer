@@ -201,6 +201,9 @@ def _mega_problem(
         num_experts=num_experts,
         topk=topk,
         gate_up_clamp=gate_up_clamp,
+        activation="swiglu",
+        situ_beta=None,
+        situ_linear_beta=None,
         fast_math=fast_math,
         hidden_states=hidden_states,
         topk_weights=topk_weights,
@@ -245,6 +248,9 @@ def _reference_nvfp4_mega_moe_staged(
         gate_up_clamp=problem["gate_up_clamp"],
         swiglu_alpha=problem.get("swiglu_alpha"),
         swiglu_beta=problem.get("swiglu_beta"),
+        activation=problem["activation"],
+        situ_beta=problem["situ_beta"],
+        situ_linear_beta=problem["situ_linear_beta"],
         combine_dtype=combine_dtype,
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -381,6 +387,9 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         gate_up_clamp=problem["gate_up_clamp"],
+        activation=problem.get("activation", "swiglu"),
+        situ_beta=problem.get("situ_beta"),
+        situ_linear_beta=problem.get("situ_linear_beta"),
         fast_math=problem["fast_math"],
         swiglu_alpha=problem.get("swiglu_alpha"),
         swiglu_beta=problem.get("swiglu_beta"),
@@ -973,6 +982,7 @@ def _run_mega_torch_oracle(
     combine_dtype: str = "bf16",
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    activation: str = "swiglu",
 ):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
@@ -1028,6 +1038,13 @@ def _run_mega_torch_oracle(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
+    if activation == "situ":
+        problem.update(
+            gate_up_clamp=None,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
     num_local = problem["num_experts"] // world_size
     if swiglu_alpha is not None:
         problem["hidden_states"].mul_(0.1)
@@ -1074,6 +1091,9 @@ def _run_mega_torch_oracle(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            activation=problem["activation"],
+            situ_beta=problem["situ_beta"],
+            situ_linear_beta=problem["situ_linear_beta"],
             combine_dtype=combine_dtype,
             fc1_alpha=problem["fc1_alpha"],
             fc2_alpha=problem["fc2_alpha"],
@@ -1155,6 +1175,9 @@ def _run_mega_torch_oracle(
                 hidden=problem["hidden"],
                 intermediate=problem["intermediate"],
                 gate_up_clamp=problem["gate_up_clamp"],
+                activation=problem["activation"],
+                situ_beta=problem["situ_beta"],
+                situ_linear_beta=problem["situ_linear_beta"],
                 term_transform=term_transform,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
@@ -1207,16 +1230,17 @@ def _run_mega_torch_oracle(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "in_kernel_fc2_reduce,combine_dtype",
+    "in_kernel_fc2_reduce,combine_dtype,activation",
     [
-        (False, "bf16"),
-        (True, "bf16"),
-        (False, "nvfp4"),
-        (False, "mxfp8"),
+        (False, "bf16", "swiglu"),
+        (True, "bf16", "swiglu"),
+        (False, "nvfp4", "swiglu"),
+        (False, "mxfp8", "swiglu"),
+        (False, "bf16", "situ"),
     ],
 )
 def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
-    in_kernel_fc2_reduce, combine_dtype
+    in_kernel_fc2_reduce, combine_dtype, activation
 ):
     """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
     _require_cuda()
@@ -1229,10 +1253,507 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
         world_size,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
+        activation=activation,
     )
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
-        f"combine={combine_dtype}) matches the multi-rank torch oracle"
+        f"combine={combine_dtype}, activation={activation}) matches the "
+        "multi-rank torch oracle"
+    )
+
+
+def _run_nvfp4_routing_rounds(
+    rank,
+    world_size,
+    *,
+    mode,
+    hidden,
+    intermediate,
+    knobs,
+    changing_batches,
+    num_tokens=257,
+    in_kernel_fc2_reduce=False,
+    alpha_source="config",
+    activation_params=None,
+    with_norm=False,
+    apply_topk_in_fc1=False,
+    check_graph=False,
+    input_scale=1.0,
+    num_experts=None,
+    balanced_routing=False,
+    boundary_token_counts=(),
+    graph_rounds=(),
+):
+    """One public layer reuses its workspace across skew, empty sources and refill."""
+    import dataclasses
+    import torch
+    import torch.distributed as dist
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        PrequantizedMoEWeights,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        ensure_moe_ep_cuda_device,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        nvfp4_quantize_per_block_16,
+    )
+    from .test_nvfp4_cutedsl_kernel_vs_reference import (
+        NVFP4_MODES,
+        _nvfp4_reference_from_weights,
+        _assert_nvfp4_reference,
+    )
+
+    assert mode in NVFP4_MODES, mode
+    assert alpha_source in ("config", "runtime"), alpha_source
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    activation_params = {} if activation_params is None else activation_params
+    clamp = None if activation_params.get("activation") == "situ" else 1.5
+    num_experts = max(4, world_size) if num_experts is None else num_experts
+    topk, capacity = 2, num_tokens
+    assert num_experts % world_size == 0
+    local_experts = num_experts // world_size
+    alpha1, alpha2 = None, None
+    if mode == "w4a4":
+        w13, w2 = _make_bf16_weights(
+            rank,
+            num_local_experts=local_experts,
+            hidden=hidden,
+            intermediate=intermediate,
+        )
+        q13, s13 = nvfp4_quantize_per_block_16(w13.float().reshape(-1, hidden), 1.0)
+        q2, s2 = nvfp4_quantize_per_block_16(w2.float().reshape(-1, intermediate), 1.0)
+        weights = PrequantizedMoEWeights(
+            w13=q13.view(torch.uint8).reshape(
+                local_experts, 2 * intermediate, hidden // 2
+            ),
+            w2=q2.view(torch.uint8).reshape(local_experts, hidden, intermediate // 2),
+            w13_scale=s13.reshape(local_experts, 2 * intermediate, hidden // 16),
+            w2_scale=s2.reshape(local_experts, hidden, intermediate // 16),
+        )
+    elif mode == "w4a16":
+        from .w4a16_reference import make_w4a16_weights
+
+        weights = make_w4a16_weights(hidden, intermediate, local_experts, rank)
+        # Preserve expert-shard views, including their scalar-only alignment.
+        alpha1 = (
+            torch.linspace(0.71013, 1.23017, num_experts, device="cuda") / hidden**0.5
+        )[rank * local_experts : (rank + 1) * local_experts]
+        alpha2 = torch.linspace(1.17019, 0.83023, num_experts, device="cuda")[
+            rank * local_experts : (rank + 1) * local_experts
+        ]
+    alphas = dict(fc1_alpha=alpha1, fc2_alpha=alpha2)
+    if with_norm:
+        assert mode == "w4a16"
+        alphas["fc1_norm_const"] = torch.linspace(
+            0.67123, 1.31017, num_experts, device="cuda"
+        )[rank * local_experts : (rank + 1) * local_experts]
+    configs = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
+    layer = MoEEpMegaLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=hidden,
+        ),
+        weights=weights,
+        backend=MegaConfig(
+            megakernel=configs[mode](
+                intermediate_size=intermediate,
+                top_k=topk,
+                gate_up_clamp=clamp,
+                enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                knobs={**knobs, "in_kernel_fc2_reduce": in_kernel_fc2_reduce},
+                **activation_params,
+                **({"apply_topk_in_fc1": apply_topk_in_fc1} if mode == "w4a16" else {}),
+                **(alphas if alpha_source == "config" else {}),
+            )
+        ),
+    )
+    graph = None
+    try:
+        if mode == "w4a4":
+            # Preserve the existing W4A4 global-weight oracle. W4A16 instead
+            # computes on each expert owner and transfers its BF16 route bits.
+            global_weights = dataclasses.replace(
+                weights,
+                **{
+                    field.name: _all_gather_stack(value).flatten(0, 1)
+                    for field in dataclasses.fields(weights)
+                    if (value := getattr(weights, field.name)) is not None
+                },
+            )
+        rounds = (("skewed_tiles", num_tokens, not check_graph),)
+        if changing_batches:
+            rounds = (
+                ("balanced", 17, False),
+                ("uneven_sources", 5 if rank == 0 else 17, False),
+                ("skewed", 17, True),
+                ("single_token", 1 if rank == 0 else 0, False),
+                ("empty_source", 0 if rank == 0 else 11, False),
+                ("all_empty", 0, False),
+                ("refill", 9, False),
+            )
+        rounds += tuple(
+            (f"tile_boundary_{count}", count, False) for count in boundary_token_counts
+        )
+        for name, n, skewed in rounds:
+            # _make_inputs seeds with 7 + rank; retain the original 73 + rank
+            # inputs without allocating the unused single-rank expert weights.
+            hidden_states, topk_weights, topk_ids = _make_inputs(
+                rank + 66,
+                num_tokens=n,
+                hidden=hidden,
+                num_experts=num_experts,
+                topk=topk,
+            )
+            if balanced_routing:
+                # Populate every expert in balanced/refill rounds; skewed and
+                # empty rounds still exercise gaps and workspace reuse.
+                topk_ids.copy_(
+                    (
+                        torch.arange(n * topk, device="cuda").reshape(n, topk)
+                        + rank * topk
+                    )
+                    % num_experts
+                )
+            if name.startswith("tile_boundary_"):
+                # One remote source per expert: the routed count is exactly n,
+                # including the requested token-tile and MMA-width boundaries.
+                remote_expert = ((rank + 1) % world_size) * local_experts
+                topk_ids.copy_(torch.arange(topk, device="cuda") + remote_expert)
+            if input_scale != 1.0:
+                # Kernel and exact oracle consume the same BF16 values near
+                # the SiTU origin or in its saturated gate/up regions.
+                hidden_states.mul_(input_scale)
+            problem = dict(
+                hidden=hidden,
+                intermediate=intermediate,
+                gate_up_clamp=clamp,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                **activation_params,
+            )
+            if skewed:
+                problem["topk_ids"][:] = torch.tensor([0, 1], device="cuda")
+            if mode == "w4a16":
+                # Empty source ranks still own experts and join the oracle's
+                # input gathering and raw-bit exchange with every peer.
+                reference = _nvfp4_reference_from_weights(
+                    problem,
+                    weights,
+                    mode=mode,
+                    **alphas,
+                    apply_topk_in_fc1=apply_topk_in_fc1,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                )
+            elif mode == "w4a4":
+                reference = (
+                    _nvfp4_reference_from_weights(problem, global_weights, mode=mode)
+                    if n
+                    else None
+                )
+            tensors = MoEEpTensors(
+                **{
+                    key: problem[key]
+                    for key in ("hidden_states", "topk_ids", "topk_weights")
+                },
+                **(alphas if alpha_source == "runtime" else {}),
+            )
+            dist.barrier()
+            y = layer.forward(tensors)
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert y.dtype == torch.bfloat16 and y.shape == (n, hidden)
+            assert torch.isfinite(y).all(), (mode, name, rank)
+            if n:
+                _assert_nvfp4_reference(
+                    y,
+                    reference,
+                    mode=mode,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                )
+            if check_graph or name in graph_rounds:
+                assert mode == "w4a16" and not in_kernel_fc2_reduce
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = layer.forward(tensors)
+                if with_norm and alpha_source == "runtime":
+                    # Change only the captured norm source; no eager call may
+                    # pre-stage its new contents before replay.
+                    alphas["fc1_norm_const"].mul_(1.13)
+                    reference = _nvfp4_reference_from_weights(
+                        problem,
+                        weights,
+                        mode=mode,
+                        **alphas,
+                        apply_topk_in_fc1=apply_topk_in_fc1,
+                    )
+                    assert not torch.equal(y, reference)
+                graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                _assert_nvfp4_reference(captured, reference, mode=mode)
+                graph.reset()
+                graph = None
+    finally:
+        if graph is not None:
+            graph.reset()
+        layer.destroy()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode,input_scale",
+    [
+        pytest.param({}, True, "runtime", False, "epi_warps", 1.0, id="swiglu-norm"),
+        pytest.param(
+            {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
+            False,
+            "config",
+            False,
+            "epi_warps",
+            1.0,
+            id="minimax",
+        ),
+        pytest.param(
+            {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
+            True,
+            "runtime",
+            True,
+            "reuse_dispatch_warps",
+            1.0,
+            id="minimax-norm-topk",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0},
+            True,
+            "config",
+            False,
+            "epi_warps",
+            1.0,
+            id="situ-norm",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            True,
+            "reuse_dispatch_warps",
+            1.0,
+            id="situ-linear-norm-topk",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.00000024},
+            True,
+            "config",
+            False,
+            "epi_warps",
+            1.0,
+            id="situ-non-fp32-beta",
+        ),
+        pytest.param(
+            {
+                "activation": "situ",
+                "situ_beta": 4.00000024,
+                "situ_linear_beta": 25.000001,
+            },
+            True,
+            "runtime",
+            True,
+            "reuse_dispatch_warps",
+            1.0,
+            id="situ-linear-non-fp32-beta",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            False,
+            "epi_warps",
+            1e-4,
+            id="situ-small",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            False,
+            "epi_warps",
+            128.0,
+            id="situ-saturated",
+        ),
+    ],
+)
+def test_nvfp4_w4a16_epilogue_contract(
+    activation_params,
+    with_norm,
+    alpha_source,
+    apply_topk_in_fc1,
+    token_back_mode,
+    input_scale,
+):
+    """Opt-in activations and normalization retain the EP-aware bit-exact contract."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size not in (4, 8):
+        pytest.skip("requires four or eight ranks")
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode="w4a16",
+        hidden=256,
+        intermediate=256,
+        knobs={"token_back_mode": token_back_mode},
+        changing_batches=False,
+        num_tokens=17,
+        activation_params=activation_params,
+        with_norm=with_norm,
+        alpha_source=alpha_source,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        check_graph=True,
+        input_scale=input_scale,
+    )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "mode,token_back_mode,in_kernel_fc2_reduce,alpha_source,tile",
+    [
+        ("w4a4", "epi_warps", False, "config", None),
+        ("w4a4", "reuse_dispatch_warps", False, "config", None),
+        ("w4a16", "epi_warps", False, "config", None),
+        ("w4a16", "reuse_dispatch_warps", False, "config", None),
+        ("w4a16", "reuse_dispatch_warps", True, "config", None),
+        ("w4a16", "reuse_dispatch_warps", False, "runtime", None),
+        ("w4a16", "reuse_dispatch_warps", True, "runtime", None),
+        pytest.param(
+            "w4a16", "epi_warps", False, "config", (256, 32, 256), id="n32-swiglu-epi"
+        ),
+        pytest.param(
+            "w4a16",
+            "reuse_dispatch_warps",
+            False,
+            "runtime",
+            (256, 32, 256),
+            id="n32-situ-dispatch",
+        ),
+        pytest.param(
+            "w4a16",
+            "epi_warps",
+            False,
+            "config",
+            (128, 32, 256),
+            id="m128-n32-swiglu-epi",
+        ),
+        pytest.param(
+            "w4a16",
+            "reuse_dispatch_warps",
+            False,
+            "runtime",
+            (128, 32, 256),
+            id="m128-n32-situ-dispatch",
+        ),
+    ],
+)
+@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
+def test_nvfp4_mega_uneven_sources_and_empty_refill(
+    mode, token_back_mode, in_kernel_fc2_reduce, alpha_source, tile, load_balance_mode
+):
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    tile_n = tile[1] if tile is not None else None
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode=mode,
+        hidden=288 if tile_n == 32 else 256,
+        intermediate=448 if tile_n == 32 else 256,
+        knobs={
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": load_balance_mode,
+            **(
+                {
+                    "mma_tiler_mnk": tile,
+                    "use_2cta_instrs": tile[0] == 256,
+                    "group_hint": 6,
+                }
+                if tile is not None
+                else {}
+            ),
+        },
+        changing_batches=True,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        alpha_source=alpha_source,
+        num_experts=16 if tile_n is not None else None,
+        balanced_routing=tile_n is not None,
+        boundary_token_counts=(15, 16, 17, 31, 32, 33, 63, 64, 65)
+        if tile_n == 32
+        else (),
+        graph_rounds=("tile_boundary_33", "refill") if tile_n == 32 else (),
+        activation_params=(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0}
+            if tile_n == 32 and token_back_mode == "reuse_dispatch_warps"
+            else None
+        ),
+    )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize(
+    "mode,hidden,intermediate,tile_n",
+    [
+        pytest.param("w4a4", 1600, 832, 128, id="w4a4-tail"),
+        pytest.param("w4a16", 64, 64, 128, id="w4a16-small"),
+        pytest.param("w4a16", 288, 448, 64, id="w4a16-tail"),
+        pytest.param("w4a16", 7200, 2112, 64, id="w4a16-n64-wrap"),
+        pytest.param("w4a16", 7200, 2112, 128, id="w4a16-n128-wrap"),
+        pytest.param("w4a16", 18272, 64, 64, id="w4a16-activation-tail"),
+    ],
+)
+def test_nvfp4_mega_geometry_and_pipeline_tails(
+    mode, hidden, intermediate, tile_n, token_back_mode
+):
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    # 257 routed rows cross a work-tile boundary. Large K wraps both operand
+    # rings; the skinny shape exercises the activation-stage fit and K tail.
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode=mode,
+        hidden=hidden,
+        intermediate=intermediate,
+        knobs={
+            "mma_tiler_mnk": (256, tile_n, 256),
+            "cluster_shape_mnk": (2, 1, 1),
+            "use_2cta_instrs": True,
+            "group_hint": 512,
+            "flag_batch": 4,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": "atomic_counter",
+        },
+        changing_batches=False,
     )
 
 
@@ -1346,25 +1867,137 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
-    """The TRT-LLM-import knobs are plumbed through the FI backend config."""
-    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+@pytest.mark.parametrize(
+    "config_name,kernel_name",
+    [
+        (
+            "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_nvfp4_nvfp4_bf16_cutedsl",
+        ),
+        (
+            "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_bf16_bf16_bf16_cutedsl",
+        ),
+        (
+            "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "sm100_bf16_nvfp4_bf16_cutedsl",
+        ),
+    ],
+)
+def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
+    """Caller finalization is an explicit opt-in for each CuTe-DSL backend."""
+    from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    config_cls = getattr(moe_ep, config_name)
+    cfg = config_cls(
         intermediate_size=128,
         top_k=2,
         enable_in_kernel_fc2_reduce=True,
     )
-    assert cfg.combine_dtype == "bf16"
-    assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert cfg.do_finalize is True
+    kernel = create_mega_kernel(cfg)
+    assert kernel.kernel_name() == kernel_name
+    assert not kernel.supports_unfinalized_output
 
-    cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    cfg_unfinalized = config_cls(
         intermediate_size=128,
         top_k=2,
-        combine_dtype="nvfp4",
+        do_finalize=False,
     )
-    assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
+
+    if kernel_name == "sm100_nvfp4_nvfp4_bf16_cutedsl":
+        assert cfg.combine_dtype == "bf16"
+        cfg_q = config_cls(intermediate_size=128, top_k=2, combine_dtype="nvfp4")
+        assert create_mega_kernel(cfg_q).kernel_name() == kernel_name
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        {"enable_in_kernel_fc2_reduce": True},
+        {"knobs": "auto"},
+    ],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+    ],
+)
+def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompatible):
+    from flashinfer import moe_ep
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        getattr(moe_ep, config_name)(
+            intermediate_size=128,
+            top_k=2,
+            do_finalize=False,
+            **incompatible,
+        )
+
+
+def test_nvfp4_deferred_output_rejects_quantized_combine():
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2, do_finalize=False, combine_dtype="mxfp8"
+        )
+
+
+def test_w4a16_deferred_frontend_preserves_mode_when_applying_knobs():
+    import dataclasses
+
+    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+
+    config = bf16_nvfp4.MegaMoEBf16Nvfp4Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=7,
+        num_topk=2,
+        num_total_experts=2,
+        hidden=128,
+        intermediate=128,
+        defer_topk_reduce=True,
+    )
+    with pytest.raises(ValueError, match="defer_topk_reduce requires"):
+        dataclasses.replace(config, enable_in_kernel_fc2_reduce=True)
+    frontend = bf16_nvfp4.MegaMoEBf16Nvfp4Frontend(config)
+    frontend.apply_knobs({"defer_topk_reduce": False})
+    assert frontend.config.defer_topk_reduce
+    with pytest.raises(ValueError, match="unsupported BF16/NVFP4 MegaMoE knobs"):
+        frontend.apply_knobs({"in_kernel_fc2_reduce": True})
+
+
+def test_nvfp4_cutedsl_config_validates_situ():
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=16,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    assert cfg.activation == "situ"
+    with pytest.raises(ValueError, match="requires situ_beta"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=3072,
+            top_k=16,
+            activation="situ",
+        )
+    with pytest.raises(ValueError, match="not supported with SiTU"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=3072,
+            top_k=16,
+            activation="situ",
+            situ_beta=4.0,
+            gate_up_clamp=10.0,
+        )
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
@@ -1451,6 +2084,45 @@ def test_autotune_nvfp4_candidates_cover_ikr():
     pinned = nvfp4_candidates()
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
     assert len(pinned) * 2 == len(cands)
+
+
+def test_bf16_nvfp4_ikr_permission_and_candidates():
+    from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+        MegaMoEBf16Nvfp4Config,
+        bf16_nvfp4_candidates,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
+
+    assert not Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=256, top_k=2
+    ).enable_in_kernel_fc2_reduce
+    base = dict(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=256,
+        intermediate=256,
+    )
+    deterministic = bf16_nvfp4_candidates()
+    permitted = bf16_nvfp4_candidates(enable_in_kernel_fc2_reduce=True)
+    assert 0 < len(deterministic) < len(permitted)
+    assert [k for k in permitted if not k["in_kernel_fc2_reduce"]] == deterministic
+    for knobs in permitted:
+        assert tuner.is_valid_bf16_nvfp4(knobs)
+        config = MegaMoEBf16Nvfp4Config(
+            **base, enable_in_kernel_fc2_reduce=True, **knobs
+        )
+        assert config.in_kernel_fc2_reduce == knobs["in_kernel_fc2_reduce"]
+        if knobs["in_kernel_fc2_reduce"]:
+            assert knobs["token_back_mode"] == "reuse_dispatch_warps"
+            with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
+                MegaMoEBf16Nvfp4Config(**base, **knobs)
+            assert not tuner.is_valid_bf16_nvfp4(
+                {**knobs, "token_back_mode": "epi_warps"}
+            )
 
 
 @pytest.mark.gpu_2

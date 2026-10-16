@@ -1075,8 +1075,12 @@ kernel_cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define pair_done_addr (mbar_base + 0)
@@ -3295,8 +3299,11 @@ kernel_cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc
                                     : "r"(taddr + (unsigned int)tmem_row + (unsigned int)(state_buffer * 128) + (unsigned int)(io_part_1 * 32)));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 {
+#if __CUDA_ARCH__ == 1000
                                     const float2 final_scale_pair = make_float2(281474976710656.0f, 281474976710656.0f);
+#endif
                                     #pragma unroll
+#if __CUDA_ARCH__ == 1000
                                     for (int final_pair_index = 0; final_pair_index < 16; final_pair_index++) {
                                         float2 final_input_pair = make_float2(_tmem_load_46[final_pair_index * 2], _tmem_load_46[final_pair_index * 2 + 1]);
                                         float2 final_scaled_pair;
@@ -3305,6 +3312,10 @@ kernel_cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc
                                             : "l"(*(const unsigned long long*)&final_input_pair), "l"(*(const unsigned long long*)&final_scale_pair));
                                         _tmem_load_46[final_pair_index * 2] = final_scaled_pair.x;
                                         _tmem_load_46[final_pair_index * 2 + 1] = final_scaled_pair.y;
+#else
+                                    for (int word_16 = 0; word_16 < 32; word_16++) {
+                                        _tmem_load_46[word_16] = _tmem_load_46[word_16] * 281474976710656.0f;
+#endif
                                     }
                                 }
                                 {

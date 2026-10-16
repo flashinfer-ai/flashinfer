@@ -65,6 +65,7 @@ def _supported() -> bool:
     ) in (
         (10, 0),
         (10, 3),
+        (10, 7),
     )
 
 
@@ -210,7 +211,7 @@ def _run(
 @torch.inference_mode()
 def test_gated_act_mxfp8_correctness(m, k, direction, rowwise, colwise):
     if not _supported():
-        pytest.skip("fused gated MXFP8 quantization requires SM100 or SM103")
+        pytest.skip("fused gated MXFP8 quantization requires SM100, SM103 or SM107")
     gated_input, grad_output = _make_inputs(m, k)
     actual = _run(direction, gated_input, grad_output, rowwise, colwise)
     logical = _logical(direction, gated_input, grad_output)
@@ -244,7 +245,7 @@ def test_gated_act_mxfp8_correctness(m, k, direction, rowwise, colwise):
 @torch.inference_mode()
 def test_gated_act_mxfp8_mode_consistency(direction):
     if not _supported():
-        pytest.skip("fused gated MXFP8 quantization requires SM100 or SM103")
+        pytest.skip("fused gated MXFP8 quantization requires SM100, SM103 or SM107")
     gated_input, grad_output = _make_inputs(256, 512)
     row = _run(direction, gated_input, grad_output, True, False)
     col = _run(direction, gated_input, grad_output, False, True)

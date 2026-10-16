@@ -33,8 +33,6 @@ output dtype, and write final O. Batch and KV head remain grid dimensions;
 only split-KV is reduced here.
 """
 
-import math
-
 import cutlass
 import cutlass.cute as cute
 from .direct_sparse_metadata import DirectSparseMetadataView, HeadIndexedMetadataView
@@ -350,8 +348,8 @@ def _attention_sink_log2_lse(
         dtype=Float32,
     )
     sink_lse = sink_ptr.load() * Float32(1.4426950408889634)
-    if cutlass.const_expr(cfg.use_fp8_qkv):
-        sink_lse += Float32(math.log2(448.0))
+    if cutlass.const_expr(cfg.use_fp8_pv):
+        sink_lse += Float32(cfg.fp8_p_quant_log2_scale)
     return sink_lse
 
 
