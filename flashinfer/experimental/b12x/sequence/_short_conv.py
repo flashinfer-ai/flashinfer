@@ -132,22 +132,42 @@ def _speculative_decode_short_conv_kernel(
     else:
         num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
         request_live = request < num_seqs
-        slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(tl.int64)
-        fresh = tl.load(state_is_fresh_ptr + request, mask=request_live, other=True).to(tl.int1)
+        slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(
+            tl.int64
+        )
+        fresh = tl.load(state_is_fresh_ptr + request, mask=request_live, other=True).to(
+            tl.int1
+        )
         live = request_live & (slot >= 0)
-        accepted = tl.load(num_accepted_tokens_ptr + request, mask=request_live, other=0).to(tl.int32)
+        accepted = tl.load(
+            num_accepted_tokens_ptr + request, mask=request_live, other=0
+        ).to(tl.int32)
         rollback = tl.where(request_live, tl.minimum(accepted - 1, MAX_SPECULATIVE), 0)
-        query_start = tl.load(query_start_loc_ptr + request, mask=request_live, other=0).to(tl.int32)
-        query_length = tl.load(query_start_loc_ptr + request + 1, mask=request_live, other=0).to(tl.int32) - query_start
-        state_base = slot * stride_state_slot + channels.to(tl.int64) * stride_state_channel
+        query_start = tl.load(
+            query_start_loc_ptr + request, mask=request_live, other=0
+        ).to(tl.int32)
+        query_length = (
+            tl.load(query_start_loc_ptr + request + 1, mask=request_live, other=0).to(
+                tl.int32
+            )
+            - query_start
+        )
+        state_base = (
+            slot * stride_state_slot + channels.to(tl.int64) * stride_state_channel
+        )
 
         history = ()
         for position in tl.static_range(STATE_LENGTH):
             source_position = position + rollback
             history += (
                 tl.load(
-                    conv_state_ptr + state_base + source_position.to(tl.int64) * stride_state_position,
-                    mask=live & channel_mask & ~fresh & (source_position < STATE_CAPACITY),
+                    conv_state_ptr
+                    + state_base
+                    + source_position.to(tl.int64) * stride_state_position,
+                    mask=live
+                    & channel_mask
+                    & ~fresh
+                    & (source_position < STATE_CAPACITY),
                     other=0.0,
                 ),
             )
@@ -155,7 +175,9 @@ def _speculative_decode_short_conv_kernel(
         for relative in tl.static_range(MAX_SPECULATIVE + 1):
             query += (
                 tl.load(
-                    input_ptr + (query_start + relative).to(tl.int64) * INPUT_ROW_STRIDE + channels.to(tl.int64),
+                    input_ptr
+                    + (query_start + relative).to(tl.int64) * INPUT_ROW_STRIDE
+                    + channels.to(tl.int64),
                     mask=request_live & channel_mask & (relative < query_length),
                     other=0.0,
                 ),
@@ -165,9 +187,13 @@ def _speculative_decode_short_conv_kernel(
             accumulator = tl.zeros((BLOCK_C,), tl.float32)
             for tap in tl.static_range(KERNEL_SIZE):
                 if relative >= (KERNEL_SIZE - 1 - tap) * DILATION:
-                    source = query[relative - (KERNEL_SIZE - 1 - tap) * DILATION].to(tl.float32)
+                    source = query[relative - (KERNEL_SIZE - 1 - tap) * DILATION].to(
+                        tl.float32
+                    )
                 elif STATE_LENGTH + relative >= (KERNEL_SIZE - 1 - tap) * DILATION:
-                    source = history[STATE_LENGTH + relative - (KERNEL_SIZE - 1 - tap) * DILATION].to(tl.float32)
+                    source = history[
+                        STATE_LENGTH + relative - (KERNEL_SIZE - 1 - tap) * DILATION
+                    ].to(tl.float32)
                 else:
                     source = tl.zeros((BLOCK_C,), tl.float32)
                 weight = tl.load(
@@ -179,7 +205,9 @@ def _speculative_decode_short_conv_kernel(
             convolved = accumulator.to(tl.bfloat16).to(tl.float32)
             activated = (convolved * tl.sigmoid(convolved)).to(tl.bfloat16)
             tl.store(
-                out_ptr + (query_start + relative).to(tl.int64) * CHANNELS + channels.to(tl.int64),
+                out_ptr
+                + (query_start + relative).to(tl.int64) * CHANNELS
+                + channels.to(tl.int64),
                 tl.where(live, activated, 0.0),
                 mask=request_live & channel_mask & (relative < query_length),
             )
@@ -197,7 +225,9 @@ def _speculative_decode_short_conv_kernel(
             )
         for candidate in tl.static_range(MAX_SPECULATIVE):
             tl.store(
-                conv_state_ptr + state_base + (STATE_LENGTH + candidate) * stride_state_position,
+                conv_state_ptr
+                + state_base
+                + (STATE_LENGTH + candidate) * stride_state_position,
                 query[candidate + 1],
                 mask=live & channel_mask & (query_length > 0),
             )
@@ -428,7 +458,9 @@ def _short_conv_tiled_kernel(
         other=-1,
     ).to(tl.int64)
     live = token_live & (request >= 0) & (slot >= 0)
-    query_start = tl.load(query_start_loc_ptr + request, mask=live, other=0).to(tl.int32)
+    query_start = tl.load(query_start_loc_ptr + request, mask=live, other=0).to(
+        tl.int32
+    )
     query_relative = tokens - query_start
 
     accumulator = tl.zeros((BLOCK_T, BLOCK_C), tl.float32)
@@ -440,9 +472,7 @@ def _short_conv_tiled_kernel(
             history_distance = (KERNEL_SIZE - 1 - tap) * DILATION
             source_relative = query_relative - history_distance
             from_query = source_relative >= 0
-            query_rows = tl.multiple_of(
-                (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE, 16
-            )
+            query_rows = (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE
             query_value = tl.load(
                 input_ptr + query_rows[:, None] + channels[None, :],
                 mask=(live & from_query)[:, None] & channel_mask[None, :],
@@ -474,9 +504,7 @@ def _short_conv_tiled_kernel(
     else:
         for tap in tl.static_range(0, KERNEL_SIZE):
             source_relative = query_relative - (KERNEL_SIZE - 1 - tap) * DILATION
-            query_rows = tl.multiple_of(
-                (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE, 16
-            )
+            query_rows = (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE
             query_value = tl.load(
                 input_ptr + query_rows[:, None] + channels[None, :],
                 mask=live[:, None] & channel_mask[None, :],
@@ -491,7 +519,7 @@ def _short_conv_tiled_kernel(
 
     conv_float = accumulator.to(tl.bfloat16).to(tl.float32)
     activated = (conv_float * tl.sigmoid(conv_float)).to(tl.bfloat16)
-    output_rows = tl.multiple_of(tokens.to(tl.int64) * CHANNELS, 16)
+    output_rows = tokens.to(tl.int64) * CHANNELS
     tl.store(
         out_ptr + output_rows[:, None] + channels[None, :],
         tl.where(live[:, None], activated, 0.0),

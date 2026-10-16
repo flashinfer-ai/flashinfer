@@ -302,10 +302,31 @@ def test_prefill_chunks_match_one_canonical_convolution(dilation):
 
 
 @pytest.mark.parametrize("dilation", [1, 3])
-def test_tiled_prefill_matches_canonical_convolution_across_tiles(dilation):
+@pytest.mark.parametrize(
+    "channels,input_padding,weight_dtype",
+    [
+        (2304, 134, torch.float32),
+        (200, 0, torch.bfloat16),
+        (65, 15, torch.bfloat16),
+        (65, 0, torch.bfloat16),
+    ],
+)
+def test_tiled_prefill_matches_canonical_convolution_across_tiles(
+    dilation, channels, input_padding, weight_dtype
+):
     """Capacities that tile tokens keep requests crossing tile boundaries exact."""
-    case = _Case("prefill", channels=200, dilation=dilation, max_tokens=300)
+    case = _Case(
+        "prefill",
+        channels=channels,
+        input_padding=input_padding,
+        weight_dtype=weight_dtype,
+        dilation=dilation,
+        max_tokens=300,
+    )
     with _prepared(case) as binding:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            short_conv.run(binding)
         for lengths, slots, fresh in (
             ([31, 70, 1, 150], [3, 1, -1, 4], [True, False, True, False]),
             ([300], [2], [False]),
@@ -315,12 +336,20 @@ def test_tiled_prefill_matches_canonical_convolution_across_tiles(dilation):
             case.state.normal_()
             case.batch(lengths, slots, fresh, [1] * len(lengths))
             expected, state = case.oracle()
-            short_conv.run(binding)
-            live = sum(lengths)
-            torch.testing.assert_close(
-                binding.out[:live], expected[:live], rtol=0.008, atol=0.002
-            )
+            inputs = case.input_storage.clone()
+            padding = case.storage.reshape(6, -1)[:, -32:].clone()
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(binding.out, expected, rtol=0.008, atol=0.002)
             torch.testing.assert_close(case.state, state, rtol=0, atol=0)
+            torch.testing.assert_close(case.input_storage, inputs, rtol=0, atol=0)
+            torch.testing.assert_close(
+                case.storage.reshape(6, -1)[:, -32:], padding, rtol=0, atol=0
+            )
+        graph.reset()
 
 
 def test_binding_rejects_input_output_aliases_and_unknown_history_layout():
