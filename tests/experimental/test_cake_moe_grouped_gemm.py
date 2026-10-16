@@ -44,7 +44,7 @@ TINY_E5 = [1, 2, 3, 0, 4]
 LONG_E3 = [6145, 0, 12289]
 # Groups shorter than one 64-row k-step: every output tile is a single k-step, and
 # a CTA switches group at almost every tile (the shape of flashinfer-ai/flashinfer#6570).
-SMALL_E512 = [32] * 512  # groups shorter than one 64-row k-step: one single-step tile per group switch
+SMALL_E512 = [32] * 512
 SMALL_GROUP_LAUNCHES = 200
 
 
