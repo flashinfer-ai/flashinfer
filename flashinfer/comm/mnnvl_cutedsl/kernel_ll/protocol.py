@@ -22,7 +22,7 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Int32, Int64
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import QUAD_BF16
@@ -114,6 +114,26 @@ LL_FINALIZE_GB300_TP8_H5120_K3 = LLFinalizeTuning(
 LL_ALL_REDUCE_GB300_TP4_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
 LL_ALL_REDUCE_GB300_TP8_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
 
+# hidden_size=7168, bf16, top_k=16 (Kimi K3), TP4 and TP8. A token is
+# 896 bf16x8 fragments, so cluster_size=7 with 128 threads gives a fragment
+# stride of exactly 896. The collective therefore covers one token without a
+# partially utilised trip. TP8 finalize uses a separately measured decode
+# preset: two rank lanes and 256 collective threads reduce the inter-node
+# latency, while an 8-route prefetch group keeps its register footprint down.
+_LL_COLLECTIVE_H7168 = LLCollectiveTuning(cluster_size=7)
+
+LL_FINALIZE_GB300_TP4_H7168_K16 = LLFinalizeTuning(
+    prefetch_group=16, collective=_LL_COLLECTIVE_H7168
+)
+LL_FINALIZE_GB300_TP8_H7168_K16 = LLFinalizeTuning(
+    elements_per_thread=1,
+    threads=256,
+    prefetch_group=8,
+    collective=LLCollectiveTuning(cluster_size=8, rank_lanes=2, threads=256),
+)
+LL_ALL_REDUCE_GB300_TP4_H7168 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H7168)
+LL_ALL_REDUCE_GB300_TP8_H7168 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H7168)
+
 
 @dataclass(slots=True)
 class LLProtocolState:
@@ -138,6 +158,7 @@ class _PathKwargs(TypedDict):
     top_k: int
     capacity_m: int
     write_residual_output: bool
+    output_dtype: torch.dtype
 
 
 class _LLPath:
@@ -148,11 +169,13 @@ class _LLPath:
         top_k: int,
         capacity_m: int,
         write_residual_output: bool,
+        output_dtype: torch.dtype,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
         self.capacity_m = capacity_m
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
 
     def _outputs(
         self,
@@ -163,7 +186,7 @@ class _LLPath:
         shape = (m, self.hidden_size)
         device = torch.device("cuda", torch.cuda.current_device())
         if norm_output is None:
-            norm_output = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            norm_output = torch.empty(shape, dtype=self.output_dtype, device=device)
         if self.write_residual_output and residual_output is None:
             residual_output = torch.empty(shape, dtype=torch.bfloat16, device=device)
         return norm_output, residual_output
@@ -186,11 +209,11 @@ class _LLPath:
         norm_output: torch.Tensor,
         residual_output: torch.Tensor | None,
         m: int,
+        norm_output_bf16: torch.Tensor | None,
+        output_scale: torch.Tensor | None,
     ) -> None:
-        residual_arg = residual_source if residual_source is not None else norm_output
-        residual_output_arg = (
-            residual_output if residual_output is not None else norm_output
-        )
+        residual_arg = residual_source if residual_source is not None else gamma
+        residual_output_arg = residual_output if residual_output is not None else gamma
         collective(
             to_cute(state.contribution_mailbox.tensor.flatten(), 16),
             to_cute_dynamic(residual_arg.flatten(), 16, divisibility=self.hidden_size),
@@ -201,6 +224,12 @@ class _LLPath:
                 divisibility=self.hidden_size,
             ),
             to_cute_dynamic(norm_output.flatten(), 16, divisibility=self.hidden_size),
+            to_cute_dynamic(
+                norm_output_bf16.flatten(), 16, divisibility=self.hidden_size
+            )
+            if norm_output_bf16 is not None
+            else None,
+            to_cute(output_scale, 4) if output_scale is not None else None,
             to_cute(state.stage_state, 4),
             Int32(m),
             current_cu_stream(),
@@ -225,10 +254,12 @@ class FinalizeAllReduceRMSNormLLKernel(_LLPath):
         state: LLProtocolState,
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_state(state, m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
-        shared_arg = shared_output if shared_output is not None else norm_output
+        shared_arg = shared_output if shared_output is not None else gamma
         self._compiled.publish(
             to_cute_dynamic(routed_output.flatten(), 16, divisibility=self.hidden_size),
             to_cute_dynamic(expert_weights.flatten(), 2, divisibility=self.top_k),
@@ -247,6 +278,8 @@ class FinalizeAllReduceRMSNormLLKernel(_LLPath):
             norm_output,
             residual_output,
             m,
+            norm_output_bf16,
+            output_scale,
         )
         return norm_output, residual_output
 
@@ -266,6 +299,8 @@ class AllReduceRMSNormLLKernel(_LLPath):
         state: LLProtocolState,
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_state(state, m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
@@ -288,6 +323,8 @@ class AllReduceRMSNormLLKernel(_LLPath):
             norm_output,
             residual_output,
             m,
+            norm_output_bf16,
+            output_scale,
         )
         return norm_output, residual_output
 
@@ -313,6 +350,8 @@ class LLProtocol:
         finalize_tunings: tuple[LLFinalizeTuning, ...],
         all_reduce_tunings: tuple[LLAllReduceTuning, ...],
         group: dist.ProcessGroup,
+        output_dtype: torch.dtype = torch.bfloat16,
+        write_norm_output: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
@@ -325,6 +364,8 @@ class LLProtocol:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
+        self.write_norm_output = write_norm_output
         self.apply_rms_norm = apply_rms_norm
 
         collective_cache = {
@@ -362,6 +403,7 @@ class LLProtocol:
             "top_k": self.top_k,
             "capacity_m": self.capacity_m,
             "write_residual_output": self.write_residual_output,
+            "output_dtype": self.output_dtype,
         }
 
     def _compile_finalize(self, tuning: LLFinalizeTuning):
@@ -457,8 +499,18 @@ class LLProtocol:
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
             make_fake_dynamic_compact_tensor(
-                BFloat16, alignment=16, divisibility=self.hidden_size
+                Float8E4M3FN if self.output_dtype == torch.float8_e4m3fn else BFloat16,
+                alignment=16,
+                divisibility=self.hidden_size,
             ),
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            )
+            if self.write_norm_output
+            else None,
+            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
+            if self.output_dtype == torch.float8_e4m3fn
+            else None,
             make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),
             current_cu_stream(),

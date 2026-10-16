@@ -1,10 +1,9 @@
-import math
-
 import numpy as np
 import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.sampling import required_num_trials
 from flashinfer.logits_processor import (
     LogitsPipe,
     MinP,
@@ -38,31 +37,6 @@ def gumbel_distribution(beta):
 def set_random_seed(seed=42):
     torch.manual_seed(seed)
     np.random.seed(seed)
-
-
-def required_num_trials(
-    expected_probs,
-    cosine_threshold=0.99,
-    compare_two_samples=True,
-    safety_factor=1.25,
-    min_trials=10_000,
-):
-    """Compute the required trials from a probability distribution's effective support."""
-    probs = expected_probs.float()
-    probs = probs / probs.sum()
-
-    sum_p2 = probs.square().sum().item()
-    effective_support = 1.0 / sum_p2
-
-    if compare_two_samples:
-        multiplier = cosine_threshold / (1.0 - cosine_threshold)
-    else:
-        multiplier = cosine_threshold**2 / (1.0 - cosine_threshold**2)
-
-    return max(
-        min_trials,
-        math.ceil(safety_factor * multiplier * effective_support),
-    )
 
 
 def get_generators():

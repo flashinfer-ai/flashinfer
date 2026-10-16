@@ -20,6 +20,21 @@ import torch.distributed._symmetric_memory as symm_mem
 class MoKConfig:
     fwd_num_comm_sms: int = 40
     bwd_num_comm_sms: int = 28
+    # Imbalance-aware communication split. When set, every ``build_schedule``
+    # counts the gathered expert IDs per owning rank on device, and the later
+    # launches use these (forward, backward) communication-SM counts instead of
+    # ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` while the hottest rank's load
+    # is at least ``imbalance_threshold`` times the mean per-rank load. The
+    # recompute launch follows the forward count. The load is observed without
+    # a host synchronization (pinned copy behind a CUDA event); the counts are
+    # identical on every rank, the decision is per rank (see
+    # ``MoKFunctional._observe_load``). ``None`` keeps the fixed split; see
+    # ``MoKFunctional._comm_split``. The threshold default is the BF16 value of
+    # ``flashinfer.mok.IMBALANCE_THRESHOLDS`` (the facade resolves it per
+    # precision): on B200 BF16 the imbalance split pays from about 5.6x the mean
+    # load and shows no gain at 3x; on B200 MXFP8 it pays from 3x.
+    imbalance_comm_sms: tuple[int, int] | None = None
+    imbalance_threshold: float = 4.0
     minibatch_size: int = 4096
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5

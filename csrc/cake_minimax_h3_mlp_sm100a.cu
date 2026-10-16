@@ -278,24 +278,27 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
     #pragma unroll
     for (int i = 0; i < VECS_PER_LANE; i++) {
         int k = (lane + i * 32) * 8;
-        float _vec_load_0[8];
+        unsigned int _vec_load_0[4];
         {
-            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (load_base + (unsigned long long)k) + 0);
-            uint4 _vld_0[1];
-            #pragma unroll
-            for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_0[_blk] = _vptr_0[_blk];
-                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
-                }
-            }
+            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(x + (load_base + (unsigned long long)k) + 0);
+            _vec_load_0[0 + 0] = _uv4_0.x;
+            _vec_load_0[0 + 1] = _uv4_0.y;
+            _vec_load_0[0 + 2] = _uv4_0.z;
+            _vec_load_0[0 + 3] = _uv4_0.w;
         }
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            sum_sq += _vec_load_0[j] * _vec_load_0[j];
+        for (int j = 0; j < 4; j++) {
+            float _bf16x2_dot_f32_0;
+            asm(
+                "{\n\t"
+                ".reg .b16 a_lo, a_hi, b_lo, b_hi;\n\t"
+                "mov.b32 {a_lo, a_hi}, %1;\n\t"
+                "mov.b32 {b_lo, b_hi}, %2;\n\t"
+                "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
+                "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
+                "}\n"
+                : "=f"(_bf16x2_dot_f32_0) : "r"(_vec_load_0[j]), "r"(_vec_load_0[j]), "f"(sum_sq));
+            sum_sq = _bf16x2_dot_f32_0;
         }
     }
     float _warp_reduce_0 = sum_sq;
@@ -310,6 +313,7 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
         long long table_row = adaln_index[row];
         if (table_row >= 0 && table_row < (long long)adaln_rows) {
             unsigned long long table_base = (unsigned long long)table_row * (unsigned long long)adaln_row_stride;
+            unsigned int bf16_one_pair = 1065369472;
             #pragma unroll
             for (int i_1 = 0; i_1 < VECS_PER_LANE; i_1++) {
                 int k_1 = (lane + i_1 * 32) * 8;
@@ -343,20 +347,13 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
                         }
                     }
                 }
-                float _vec_load_3[8];
+                unsigned int _vec_load_3[4];
                 {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(adaln_scale + (table_base + (unsigned long long)k_1) + 0);
-                    uint4 _vld_3[1];
-                    #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                        _vld_3[_blk] = _vptr_3[_blk];
-                        uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                            (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
-                        }
-                    }
+                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(adaln_scale + (table_base + (unsigned long long)k_1) + 0);
+                    _vec_load_3[0 + 0] = _uv4_3.x;
+                    _vec_load_3[0 + 1] = _uv4_3.y;
+                    _vec_load_3[0 + 2] = _uv4_3.z;
+                    _vec_load_3[0 + 3] = _uv4_3.w;
                 }
                 float _vec_load_4[8];
                 {
@@ -375,18 +372,36 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
                 }
                 float vals[8];
                 #pragma unroll
-                for (int j_1 = 0; j_1 < 8; j_1++) {
-                    float scaled = rstd * _vec_load_1[j_1];
-                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(_vec_load_2[j_1] * scaled);
-                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
-                    float norm_value = _cvt_f32_0;
-                    __nv_bfloat16 _cvt_bf16_1 = __float2bfloat16(_vec_load_3[j_1] + 1.0f);
-                    float _cvt_f32_1 = __bfloat162float(_cvt_bf16_1);
-                    float scale_plus_one = _cvt_f32_1;
-                    float _fma_0 = __fmaf_rn(norm_value, scale_plus_one, _vec_load_4[j_1]);
-                    __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(_fma_0);
-                    float _cvt_f32_2 = __bfloat162float(_cvt_bf16_2);
-                    vals[j_1] = _cvt_f32_2;
+                for (int j_1 = 0; j_1 < 4; j_1++) {
+                    unsigned int s_plus_one_word[1];
+                    uint32_t _bf16x2_add_0;
+                    asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_0) : "r"(_vec_load_3[j_1]), "r"(bf16_one_pair));
+                    s_plus_one_word[0] = _bf16x2_add_0;
+                    float s_plus_one_word_f32[2];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&s_plus_one_word_f32[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(s_plus_one_word[_pair]) << 16);
+                        (&s_plus_one_word_f32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(s_plus_one_word[_pair]) & 0xffff0000u);
+                    }
+                    #pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        float scaled = rstd * _vec_load_1[2 * j_1 + h];
+                        float rounded_pair[2];
+                        rounded_pair[0] = 0.0f;
+                        rounded_pair[1] = _vec_load_2[2 * j_1 + h] * scaled;
+                        unsigned int rounded_word[1];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_pair[_lp*2 + 0], rounded_pair[_lp*2+1 + 0]));
+                            rounded_word[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        float rounded = 0.0f;
+                        rounded = reinterpret_cast<float*>(&rounded_word[0])[0];
+                        float norm_value = rounded;
+                        float scale_plus_one = s_plus_one_word_f32[h];
+                        float _fma_0 = __fmaf_rn(norm_value, scale_plus_one, _vec_load_4[2 * j_1 + h]);
+                        vals[2 * j_1 + h] = _fma_0;
+                    }
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -2149,24 +2164,27 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
     #pragma unroll
     for (int i = 0; i < VECS_PER_LANE; i++) {
         int k = (lane + i * 32) * 8;
-        float _vec_load_0[8];
+        unsigned int _vec_load_0[4];
         {
-            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (load_base + (unsigned long long)k) + 0);
-            uint4 _vld_0[1];
-            #pragma unroll
-            for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_0[_blk] = _vptr_0[_blk];
-                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
-                }
-            }
+            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(x + (load_base + (unsigned long long)k) + 0);
+            _vec_load_0[0 + 0] = _uv4_0.x;
+            _vec_load_0[0 + 1] = _uv4_0.y;
+            _vec_load_0[0 + 2] = _uv4_0.z;
+            _vec_load_0[0 + 3] = _uv4_0.w;
         }
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            sum_sq += _vec_load_0[j] * _vec_load_0[j];
+        for (int j = 0; j < 4; j++) {
+            float _bf16x2_dot_f32_0;
+            asm(
+                "{\n\t"
+                ".reg .b16 a_lo, a_hi, b_lo, b_hi;\n\t"
+                "mov.b32 {a_lo, a_hi}, %1;\n\t"
+                "mov.b32 {b_lo, b_hi}, %2;\n\t"
+                "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
+                "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
+                "}\n"
+                : "=f"(_bf16x2_dot_f32_0) : "r"(_vec_load_0[j]), "r"(_vec_load_0[j]), "f"(sum_sq));
+            sum_sq = _bf16x2_dot_f32_0;
         }
     }
     float _warp_reduce_0 = sum_sq;
@@ -2186,6 +2204,7 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
         long long table_row = adaln_index[row];
         if (table_row >= 0 && table_row < (long long)adaln_rows) {
             unsigned long long table_base = (unsigned long long)table_row * (unsigned long long)adaln_row_stride;
+            unsigned int bf16_one_pair = 1065369472;
             #pragma unroll
             for (int i_1 = 0; i_1 < VECS_PER_LANE; i_1++) {
                 int k_1 = (lane + i_1 * 32) * 8;
@@ -2219,20 +2238,13 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                         }
                     }
                 }
-                float _vec_load_3[8];
+                unsigned int _vec_load_3[4];
                 {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(adaln_scale + (table_base + (unsigned long long)k_1) + 0);
-                    uint4 _vld_3[1];
-                    #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                        _vld_3[_blk] = _vptr_3[_blk];
-                        uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                            (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
-                        }
-                    }
+                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(adaln_scale + (table_base + (unsigned long long)k_1) + 0);
+                    _vec_load_3[0 + 0] = _uv4_3.x;
+                    _vec_load_3[0 + 1] = _uv4_3.y;
+                    _vec_load_3[0 + 2] = _uv4_3.z;
+                    _vec_load_3[0 + 3] = _uv4_3.w;
                 }
                 float _vec_load_4[8];
                 {
@@ -2251,18 +2263,47 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 }
                 float vals[8];
                 #pragma unroll
-                for (int j_1 = 0; j_1 < 8; j_1++) {
-                    float scaled = rstd * _vec_load_1[j_1];
-                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(_vec_load_2[j_1] * scaled);
-                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
-                    float norm_value = _cvt_f32_0;
-                    __nv_bfloat16 _cvt_bf16_1 = __float2bfloat16(_vec_load_3[j_1] + 1.0f);
-                    float _cvt_f32_1 = __bfloat162float(_cvt_bf16_1);
-                    float scale_plus_one = _cvt_f32_1;
-                    float _fma_0 = __fmaf_rn(norm_value, scale_plus_one, _vec_load_4[j_1]);
-                    __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(_fma_0);
-                    float _cvt_f32_2 = __bfloat162float(_cvt_bf16_2);
-                    vals[j_1] = _cvt_f32_2;
+                for (int j_1 = 0; j_1 < 4; j_1++) {
+                    unsigned int s_plus_one_word[1];
+                    uint32_t _bf16x2_add_0;
+                    asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_0) : "r"(_vec_load_3[j_1]), "r"(bf16_one_pair));
+                    s_plus_one_word[0] = _bf16x2_add_0;
+                    float s_plus_one_word_f32[2];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&s_plus_one_word_f32[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(s_plus_one_word[_pair]) << 16);
+                        (&s_plus_one_word_f32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(s_plus_one_word[_pair]) & 0xffff0000u);
+                    }
+                    #pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        float scaled = rstd * _vec_load_1[2 * j_1 + h];
+                        float rounded_pair[2];
+                        rounded_pair[0] = 0.0f;
+                        rounded_pair[1] = _vec_load_2[2 * j_1 + h] * scaled;
+                        unsigned int rounded_word[1];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_pair[_lp*2 + 0], rounded_pair[_lp*2+1 + 0]));
+                            rounded_word[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        float rounded = 0.0f;
+                        rounded = reinterpret_cast<float*>(&rounded_word[0])[0];
+                        float norm_value = rounded;
+                        float scale_plus_one = s_plus_one_word_f32[h];
+                        float _fma_0 = __fmaf_rn(norm_value, scale_plus_one, _vec_load_4[2 * j_1 + h]);
+                        float rounded_pair_0[2];
+                        rounded_pair_0[0] = 0.0f;
+                        rounded_pair_0[1] = _fma_0;
+                        unsigned int rounded_word_1[1];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_pair_0[_lp*2 + 0], rounded_pair_0[_lp*2+1 + 0]));
+                            rounded_word_1[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        float rounded_2 = 0.0f;
+                        rounded_2 = reinterpret_cast<float*>(&rounded_word_1[0])[0];
+                        vals[2 * j_1 + h] = rounded_2;
+                    }
                 }
                 float mags[8];
                 #pragma unroll
@@ -3942,24 +3983,27 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
     #pragma unroll
     for (int i = 0; i < VECS_PER_LANE; i++) {
         int k = (lane + i * 32) * 8;
-        float _vec_load_0[8];
+        unsigned int _vec_load_0[4];
         {
-            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (load_base + (unsigned long long)k) + 0);
-            uint4 _vld_0[1];
-            #pragma unroll
-            for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_0[_blk] = _vptr_0[_blk];
-                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
-                }
-            }
+            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(x + (load_base + (unsigned long long)k) + 0);
+            _vec_load_0[0 + 0] = _uv4_0.x;
+            _vec_load_0[0 + 1] = _uv4_0.y;
+            _vec_load_0[0 + 2] = _uv4_0.z;
+            _vec_load_0[0 + 3] = _uv4_0.w;
         }
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            sum_sq += _vec_load_0[j] * _vec_load_0[j];
+        for (int j = 0; j < 4; j++) {
+            float _bf16x2_dot_f32_0;
+            asm(
+                "{\n\t"
+                ".reg .b16 a_lo, a_hi, b_lo, b_hi;\n\t"
+                "mov.b32 {a_lo, a_hi}, %1;\n\t"
+                "mov.b32 {b_lo, b_hi}, %2;\n\t"
+                "fma.rn.f32.bf16 %0, a_lo, b_lo, %3;\n\t"
+                "fma.rn.f32.bf16 %0, a_hi, b_hi, %0;\n\t"
+                "}\n"
+                : "=f"(_bf16x2_dot_f32_0) : "r"(_vec_load_0[j]), "r"(_vec_load_0[j]), "f"(sum_sq));
+            sum_sq = _bf16x2_dot_f32_0;
         }
     }
     float _warp_reduce_0 = sum_sq;
@@ -3986,6 +4030,7 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
         long long table_row = adaln_index[row];
         if (table_row >= 0 && table_row < (long long)adaln_rows) {
             unsigned long long table_base = (unsigned long long)table_row * (unsigned long long)adaln_row_stride;
+            unsigned int bf16_one_pair = 1065369472;
             #pragma unroll
             for (int i_1 = 0; i_1 < VECS_PER_LANE; i_1++) {
                 int k_1 = (lane + i_1 * 32) * 8;
@@ -4019,20 +4064,13 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                         }
                     }
                 }
-                float _vec_load_3[8];
+                unsigned int _vec_load_3[4];
                 {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(adaln_scale + (table_base + (unsigned long long)k_1) + 0);
-                    uint4 _vld_3[1];
-                    #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                        _vld_3[_blk] = _vptr_3[_blk];
-                        uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                            (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
-                        }
-                    }
+                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(adaln_scale + (table_base + (unsigned long long)k_1) + 0);
+                    _vec_load_3[0 + 0] = _uv4_3.x;
+                    _vec_load_3[0 + 1] = _uv4_3.y;
+                    _vec_load_3[0 + 2] = _uv4_3.z;
+                    _vec_load_3[0 + 3] = _uv4_3.w;
                 }
                 float _vec_load_4[8];
                 {
@@ -4051,18 +4089,47 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 }
                 float vals[8];
                 #pragma unroll
-                for (int j_1 = 0; j_1 < 8; j_1++) {
-                    float scaled = rstd * _vec_load_1[j_1];
-                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(_vec_load_2[j_1] * scaled);
-                    float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
-                    float norm_value = _cvt_f32_0;
-                    __nv_bfloat16 _cvt_bf16_1 = __float2bfloat16(_vec_load_3[j_1] + 1.0f);
-                    float _cvt_f32_1 = __bfloat162float(_cvt_bf16_1);
-                    float scale_plus_one = _cvt_f32_1;
-                    float _fma_0 = __fmaf_rn(norm_value, scale_plus_one, _vec_load_4[j_1]);
-                    __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(_fma_0);
-                    float _cvt_f32_2 = __bfloat162float(_cvt_bf16_2);
-                    vals[j_1] = _cvt_f32_2;
+                for (int j_1 = 0; j_1 < 4; j_1++) {
+                    unsigned int s_plus_one_word[1];
+                    uint32_t _bf16x2_add_0;
+                    asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_add_0) : "r"(_vec_load_3[j_1]), "r"(bf16_one_pair));
+                    s_plus_one_word[0] = _bf16x2_add_0;
+                    float s_plus_one_word_f32[2];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 1; _pair++) {
+                        (&s_plus_one_word_f32[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(s_plus_one_word[_pair]) << 16);
+                        (&s_plus_one_word_f32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(s_plus_one_word[_pair]) & 0xffff0000u);
+                    }
+                    #pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        float scaled = rstd * _vec_load_1[2 * j_1 + h];
+                        float rounded_pair[2];
+                        rounded_pair[0] = 0.0f;
+                        rounded_pair[1] = _vec_load_2[2 * j_1 + h] * scaled;
+                        unsigned int rounded_word[1];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_pair[_lp*2 + 0], rounded_pair[_lp*2+1 + 0]));
+                            rounded_word[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        float rounded = 0.0f;
+                        rounded = reinterpret_cast<float*>(&rounded_word[0])[0];
+                        float norm_value = rounded;
+                        float scale_plus_one = s_plus_one_word_f32[h];
+                        float _fma_0 = __fmaf_rn(norm_value, scale_plus_one, _vec_load_4[2 * j_1 + h]);
+                        float rounded_pair_0[2];
+                        rounded_pair_0[0] = 0.0f;
+                        rounded_pair_0[1] = _fma_0;
+                        unsigned int rounded_word_1[1];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_pair_0[_lp*2 + 0], rounded_pair_0[_lp*2+1 + 0]));
+                            rounded_word_1[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        float rounded_2 = 0.0f;
+                        rounded_2 = reinterpret_cast<float*>(&rounded_word_1[0])[0];
+                        vals[2 * j_1 + h] = rounded_2;
+                    }
                 }
                 float mags[8];
                 #pragma unroll
