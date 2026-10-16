@@ -2126,8 +2126,6 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
-    profiling_repeat=32,
-    profile_arena_input_indices=(1,),  # b
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -2143,6 +2141,15 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             lambda shapes: shapes[0][-2],
         ),
     ),
+)
+
+
+# Keep dense-weight arenas specific to CuTe-DSL: cuDNN also accepts gapped
+# strides and must retain the caller's tensors during profiling.
+_BF16_GEMM_CUTE_DSL_TUNING_CONFIG = replace(
+    _BF16_GEMM_SM100_TUNING_CONFIG,
+    profiling_repeat=32,
+    profile_arena_input_indices=(1,),  # b
 )
 
 
@@ -2619,7 +2626,9 @@ def bf16_gemm_sm100(
     runner, tactic = tuner.choose_one(
         "bf16_gemm",
         runners,
-        _BF16_GEMM_SM100_TUNING_CONFIG,
+        _BF16_GEMM_CUTE_DSL_TUNING_CONFIG
+        if runner_names == ["cute-dsl"]
+        else _BF16_GEMM_SM100_TUNING_CONFIG,
         inputs,
     )
 
