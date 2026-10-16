@@ -723,8 +723,8 @@ cvt_fp16_to_fp4_expert(
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 // Quantizes a 32-value block held by one thread (vecs[0]: values 0-15, vecs[1]: 16-31) into 32 e4m3
-// bytes and the UE8M0 scale sfByte. For a block without NaN it matches cvt_warp_fp16_to_mxfp8 with
-// CLAMP_NAN_TO_MAX off bit for bit (both flush float32 subnormals under the module's
+// bytes and the UE8M0 scale sfByte. For a block without NaN or infinity it matches
+// cvt_warp_fp16_to_mxfp8 bit for bit (both flush float32 subnormals under the module's
 // -use_fast_math), in fewer instructions: no cross-thread max, no MUFU.RCP for the output scale.
 template <class Type>
 __device__ __forceinline__ PackedU32x8 cvt_block32_to_mxfp8(PackedVec<Type, 16> const (&vecs)[2],
@@ -829,10 +829,7 @@ __global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32
                                                            numPaddedColBlocks, SFout,
                                                            QuantizationSFLayout::SWIZZLED_128x4);
         }
-        // NaN, including the NaN an infinity scales to, stays NaN, as on the plain path.
-        uint4 const outVec =
-            cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, SF_VEC_SIZE / 2, /*CLAMP_NAN_TO_MAX=*/false>(
-                vec, sfOut);
+        uint4 const outVec = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, SF_VEC_SIZE / 2>(vec, sfOut);
         if (colIdx < numPaddedHalfBlocks) {
           reinterpret_cast<uint4*>(out)[rowOffset * numPaddedHalfBlocks + colIdx] = outVec;
         }

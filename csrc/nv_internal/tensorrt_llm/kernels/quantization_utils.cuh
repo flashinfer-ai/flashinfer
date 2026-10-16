@@ -849,10 +849,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 }
 
 // Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
-// A block with an infinity and no NaN gets scale 2^127, whose reciprocal flushes to zero, so the
-// infinity becomes NaN and the finite values zero. Finite values saturate at +/-448;
-// CLAMP_NAN_TO_MAX also maps NaN to +448, otherwise NaN stays NaN.
-template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool CLAMP_NAN_TO_MAX = true>
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
@@ -911,11 +908,10 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
     }
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
-    if constexpr (CLAMP_NAN_TO_MAX) {
-      // fminf and fmaxf return their non-NaN operand, so NaN becomes 448.
-      fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);
-      fp2Vals[i].y = fmaxf(fminf(fp2Vals[i].y, 448.0f), -448.0f);
-    }
+    // Saturate to +/-E4M3 max (448) so inf / overflow map to the max finite
+    // value instead of NaN. This matches torch's saturating float8_e4m3fn cast.
+    fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);
+    fp2Vals[i].y = fmaxf(fminf(fp2Vals[i].y, 448.0f), -448.0f);
   }
 
   // Convert to e4m3 values. Overload selected by `fp2Vals` array length:

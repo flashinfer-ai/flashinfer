@@ -1,6 +1,6 @@
 import functools
 from types import SimpleNamespace
-from typing import Dict, Literal, NamedTuple, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import tvm_ffi
@@ -35,21 +35,18 @@ def _round_up(x: int, y: int) -> int:
 _MXFP8_EXPERTS_INPUT_ALIGNMENT = 32
 
 
-class _MxFP8ExpertsShapes(NamedTuple):
-    """Physical output shapes of the masked MXFP8 experts kernel."""
-
-    values: Tuple[int, int, int]  # [B, M, padded_K]
-    scales: Tuple[int, int, int]  # [B, padded_M, padded_K // 32]
-
-
-def _mxfp8_experts_output_shapes(
+def _mxfp8_experts_outputs(
     input: torch.Tensor, use_silu_and_mul: bool
-) -> _MxFP8ExpertsShapes:
-    b, m, in_k = input.shape
-    k = in_k // 2 if use_silu_and_mul else in_k
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Allocate the physical ``[B, M, padded_K]`` values and
+    ``[B, padded_M, padded_K // 32]`` scales of the masked MXFP8 experts kernel."""
+    b, m, k = input.shape
+    if use_silu_and_mul:
+        k //= 2
     padded_k = _round_up(k, 128)
-    return _MxFP8ExpertsShapes(
-        values=(b, m, padded_k), scales=(b, _round_up(m, 128), padded_k // 32)
+    return (
+        input.new_empty((b, m, padded_k), dtype=torch.float8_e4m3fn),
+        input.new_empty((b, _round_up(m, 128), padded_k // 32), dtype=torch.uint8),
     )
 
 
@@ -205,26 +202,13 @@ def get_mxfp8_quantization_sm100_module():
         use_silu_and_mul: bool,
         enable_pdl: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        shapes = _mxfp8_experts_output_shapes(input, use_silu_and_mul)
-        out_val = torch.empty(
-            shapes.values, dtype=torch.float8_e4m3fn, device=input.device
-        )
-        out_sf = torch.empty(shapes.scales, dtype=torch.uint8, device=input.device)
+        out_val, out_sf = _mxfp8_experts_outputs(input, use_silu_and_mul)
         # Skip empty inputs; the FFI contiguity check rejects their strides.
         if input.numel() > 0:
             module.silu_and_mul_mxfp8_experts_quantize(
                 input, mask, out_val, out_sf, use_silu_and_mul, enable_pdl
             )
         return _to_masked_gemm_layout(out_val, out_sf)
-
-    def _fake_mxfp8_experts_quantize(
-        input: torch.Tensor, use_silu_and_mul: bool
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        shapes = _mxfp8_experts_output_shapes(input, use_silu_and_mul)
-        return _to_masked_gemm_layout(
-            input.new_empty(shapes.values, dtype=torch.float8_e4m3fn),
-            input.new_empty(shapes.scales, dtype=torch.uint8),
-        )
 
     @register_custom_op(
         "flashinfer::silu_and_mul_mxfp8_experts_quantize_sm100",
@@ -244,7 +228,7 @@ def get_mxfp8_quantization_sm100_module():
         mask: torch.Tensor,
         enable_pdl: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return _fake_mxfp8_experts_quantize(input, True)
+        return _to_masked_gemm_layout(*_mxfp8_experts_outputs(input, True))
 
     @register_custom_op(
         "flashinfer::mxfp8_grouped_quant_sm100",
@@ -264,7 +248,7 @@ def get_mxfp8_quantization_sm100_module():
         mask: torch.Tensor,
         enable_pdl: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return _fake_mxfp8_experts_quantize(input, False)
+        return _to_masked_gemm_layout(*_mxfp8_experts_outputs(input, False))
 
     # Register the module
     return SimpleNamespace(
@@ -716,22 +700,6 @@ def _mxfp8_grouped_quantize_cake(
     )
 
 
-def _mxfp8_grouped_quantize_cuda(
-    a: torch.Tensor, mask: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch an already validated request to the CUDA experts kernel.
-
-    Copies ``a`` when it is not contiguous or not 32-byte aligned and makes
-    ``mask`` contiguous, so this backend accepts every input the ``"cutile"``
-    backend accepts.
-    """
-    if not a.is_contiguous() or a.data_ptr() % _MXFP8_EXPERTS_INPUT_ALIGNMENT != 0:
-        a = a.clone(memory_format=torch.contiguous_format)
-    return get_mxfp8_quantization_sm100_module().mxfp8_grouped_quant_sm100(
-        a, mask.contiguous(), device_support_pdl(a.device)
-    )
-
-
 @flashinfer_api(trace=mxfp8_grouped_quantize_trace)
 def mxfp8_grouped_quantize(
     a: torch.Tensor,
@@ -813,7 +781,11 @@ def mxfp8_grouped_quantize(
         raise RuntimeError("mxfp8_grouped_quantize requires SM100 or newer")
 
     if backend == "cuda":
-        return _mxfp8_grouped_quantize_cuda(a, mask)
+        if not a.is_contiguous() or a.data_ptr() % _MXFP8_EXPERTS_INPUT_ALIGNMENT != 0:
+            a = a.clone(memory_format=torch.contiguous_format)
+        return get_mxfp8_quantization_sm100_module().mxfp8_grouped_quant_sm100(
+            a, mask.contiguous(), device_support_pdl(a.device)
+        )
 
     if backend == "cutile":
         if not is_cuda_tile_available():
@@ -870,11 +842,11 @@ def silu_and_mul_mxfp8_experts_quantize(
         byte 0; rows past ``min(mask[i], M)`` (and their scale factors) are
         unspecified, so the consumer must use the same ``mask``.
 
-        The outputs match :func:`flashinfer.silu_and_mul` followed by the
-        ``"cuda"`` backend of :func:`mxfp8_grouped_quantize`, except possibly
-        in blocks that hold NaN. NaN stays NaN; an infinity, including a
-        float16 ``silu(gate) * up`` that overflows, quantizes to NaN and the
-        finite values of its block to zero.
+        For finite ``silu(gate) * up``, the outputs match
+        :func:`flashinfer.silu_and_mul` followed by the ``"cuda"`` backend of
+        :func:`mxfp8_grouped_quantize`. NaN and infinities (including a
+        float16 ``silu(gate) * up`` that overflows) quantize to 448, and a
+        block that holds an infinity quantizes its finite values to zero.
     """
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, 2 * K]")

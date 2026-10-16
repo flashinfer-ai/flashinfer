@@ -1135,7 +1135,8 @@ def _silu_and_mul_mxfp8_experts_quantize_reference(
 
     Rounds ``silu(gate) * up`` to the input dtype, as the kernel does, before
     quantizing; the kernel's fast ``exp`` can push a product near an
-    input-dtype rounding boundary to the other side. Returns
+    input-dtype rounding boundary to the other side. NaN and infinities
+    become NaN here, while the kernel quantizes them to 448. Returns
     ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0 bytes)
     without the K padding, scale swizzle or grouped GEMM permutation. Every
     row is computed; compare only the first ``min(mask[i], M)`` rows of
