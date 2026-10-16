@@ -982,7 +982,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_merge": {
                 "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "0f33036256bd7094ffde8e3b3050808b24c19aed965bbbc0da1b35e2fc1df3c9",
+                "identity": "0c4146f78e275850deedeaa5eecd9c6cfa790b7b62329e995d261b5b937881b7",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_merge_kernel.cu",
@@ -1462,7 +1462,7 @@ _ARCH_REGISTRATIONS = {
             "nvfp4_merge": {
                 "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "73050e8bff868aa535af7f8c7c5ef65edbc5b1a40ba6130380400642644a0074",
+                "identity": "2c3aa9fe35accdfdf40b7985fbe76e42aab2974cf575a1aacea0b92d6f0d9d4a",
                 "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_merge_kernel.cu",

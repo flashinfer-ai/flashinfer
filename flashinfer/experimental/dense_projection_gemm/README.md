@@ -1,4 +1,4 @@
-# Cake dense projection GEMM backend (SM100 / SM103 / SM107)
+# Cake dense projection GEMM backend (SM100 / SM107)
 
 Experimental backend for the GLM-5.2 training GEMMs: the BF16 dense projection
 GEMM (K1 -- BF16 operands, FP32 accumulation, BF16 or FP32 output, strided
@@ -7,11 +7,14 @@ GEMM through split-BF16x3 tensor-core emulation with chunked FP32 promotion
 (K2).  Tracking issue: flashinfer-ai/flashinfer#5677.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) and
-SM103 (B300 / GB300) are compiled from the same sources.  The feature is
-JIT-only, has no core entry point yet (importing this package is the
-explicit opt-in) and does not participate in automatic backend selection,
-autotuning or trace-apply.
+SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) is built
+from the same sources.  No program is registered for SM103 (B300 / GB300): a
+compute capability 10.3 device raises `NotImplementedError` naming the missing
+instance.  The feature has no core entry point yet (importing this package is
+the explicit opt-in) and does not participate in automatic backend selection,
+autotuning or trace-apply.  Its libraries are loaded prebuilt from `aot/` when
+the package ships them and JIT-built by FlashInfer from `build.json` otherwise
+(see "Layout of this package").
 
 ## Entry points (`cake_backend.py`)
 
@@ -148,23 +151,40 @@ launcher's.
 
 ## Layout of this package
 
-* `cake_jit.py` -- the registry (schema v2) and the JIT specs.  Three literals
-  filled by the generated-program export, each wrapped in `# fmt: off` /
-  `# fmt: on` and rendered one record per line (the export replaces a literal
-  from its head line up to the next `# fmt: on`): `ARG_PLANS` (the distinct
-  argument plans -- the ordered `[kind, name]` pairs a generated entry takes --
-  keyed by the first 12 hex digits of the SHA-256 of the plan's compact JSON,
-  `arg_plan_key`; one plan serves every K1 program and one every K2 program),
-  `MODULES` (one record per generated program: template, kernel symbol, cache
-  name, sources, compile flags, FFI entry, `arg_plan` key -- `arg_plan_of`
-  resolves it and still accepts an inline list -- launch geometry, `arches`,
-  closure digest) and `KERNELS` (`arch -> template -> module name`).
+* `cake_jit.py` -- the registry (schema v2) and the loader glue.  Three
+  literals filled by the generated-program export, each wrapped in
+  `# fmt: off` / `# fmt: on` and rendered one record per line (the export
+  replaces a literal from its head line up to the next `# fmt: on`):
+  `ARG_PLANS` (the distinct argument plans -- the ordered `[kind, name]` pairs
+  a generated entry takes -- keyed by the first 12 hex digits of the SHA-256
+  of the plan's compact JSON, `arg_plan_key`; one plan serves every K1 program
+  and one every K2 program), `MODULES` (one record per generated program:
+  template, kernel symbol, the architecture-free `library` stem, FFI entry,
+  `arg_plan` key -- `arg_plan_of` resolves it and still accepts an inline
+  list -- launch geometry, `arches`) and `KERNELS` (`arch -> template ->
+  module name`).  `ARCHES` names the registered architectures;
+  `load_cake_dense_projection_gemm_module(name, arch)` loads the build
+  `<library>_<arch>` through `cake_build`.
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  package (byte-identical copies) and this package's build manifest (schema
+  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
+  with its translation units, digests, nvcc flags, closure digest and
+  `aot/<name>.so` path.  `cake_build.load_library(name)` loads the prebuilt
+  library when `aot/` holds it and otherwise JIT-builds the entry through
+  FlashInfer (`gen_jit_spec`, sources digest-verified first);
+  `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
+  `flashinfer.jit.build_jit_specs`.  `cake_build.jit_spec(name)` /
+  `jit_specs(arch)` gate an entry on its `min_cuda` only (`sm_107a` entries
+  need CUDA 13.0): a 13.0 toolkit whose `nvcc` does not emit `compute_107a`
+  fails inside the JIT build with nvcc's own message.
 * `cake_backend.py` -- view validation, instance selection, stream-K
   planning, argument-plan binding, the prepared launches and the eager entry
   points.
 * `csrc/cake_dense_projection_gemm/` -- generated kernel and binding
   translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+  identity-checked by the manifest's digests); `csrc/cake_ffi_checks.h` -- the
+  tvm-ffi tensor checks the bindings include (shipped with the package, no
+  FlashInfer header).
 
 ## Status
 
@@ -173,9 +193,10 @@ Cake exporter (`exports/dense_projection_gemm` of the Cake repository) emits
 one program per template, shared by `sm_100a` and `sm_107a` wherever the generated text is the same (the per-architecture
 template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
 is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
-instance), and `sm_103a` is compiled from the same sources when a B300 route
-is exercised.  An entry point raises `NotImplementedError` naming the missing
-instance only for a template that no export has generated.
+instance).  `build.json` ships `sm_100a` and `sm_107a` builds only; `sm_103a`
+has no registered program.  An entry point raises `NotImplementedError` naming
+the missing instance for a template that no export has generated and for every
+template on a compute capability 10.3 device.
 
 CUDA Graphs: prepare outside capture and replay the prepared launch
 (`prepare_*` once, `launch` many times).  The convenience entry points
@@ -186,7 +207,7 @@ paths").
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered
-instance or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
+generated instance -- a compute capability 10.0 or 10.7 device).  Benchmark:
 `benchmarks/bench_cake_dense_projection_gemm.py` (the 11 GLM-5.2 projection
 rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
 batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the

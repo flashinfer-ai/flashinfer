@@ -51,6 +51,7 @@ def _launcher_ranks() -> tuple[int, int]:
     return rank, world_size
 
 
+@pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "tile_n,cluster_m,capacity",
