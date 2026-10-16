@@ -261,7 +261,7 @@ __device__ __forceinline__ void tcgen05_mma_mxf8f6f4_bs_k64_cta2(
 
 
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
+    return (x & 0x7FFFFULL) >> 4ULL;
 }
 
 
@@ -3206,8 +3206,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
                                 for (int idx_1 = 0; idx_1 < iterations; idx_1++) {
                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_1) * 8, 98304);
                                     mbarrier_wait(gemm_arrived_addr + (ring_1) * 8, phase_bits_2 >> (unsigned int)ring_1 & 1);
-                                    int _mma_a_lo_0 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
-                                    int _mma_b_lo_0 = (((b_smem_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
+                                    int _mma_a_lo_0 = (((a_smem_addr) >> 4) & 0x7FFF) + (ring_1) * 1024;
+                                    int _mma_b_lo_0 = (((b_smem_addr) >> 4) & 0x7FFF) + (ring_1) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -3242,8 +3242,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accumulator), "r"(((idx_1 == 0) ? 0 : 1)));
-                                    int _mma_a_lo_1 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
-                                    int _mma_b_lo_1 = (((b_hi_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
+                                    int _mma_a_lo_1 = (((a_smem_addr) >> 4) & 0x7FFF) + (ring_1) * 1024;
+                                    int _mma_b_lo_1 = (((b_hi_addr) >> 4) & 0x7FFF) + (ring_1) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -6652,8 +6652,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
                                 for (int idx_3 = 0; idx_3 < iterations_1; idx_3++) {
                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_3) * 8, 98304);
                                     mbarrier_wait(gemm_arrived_addr + (ring_3) * 8, phase_bits_3 >> (unsigned int)ring_3 & 1);
-                                    int _mma_a_lo_2 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
-                                    int _mma_b_lo_2 = (((b_smem_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
+                                    int _mma_a_lo_2 = (((a_smem_addr) >> 4) & 0x7FFF) + (ring_3) * 1024;
+                                    int _mma_b_lo_2 = (((b_smem_addr) >> 4) & 0x7FFF) + (ring_3) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -6688,8 +6688,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accumulator), "r"(((idx_3 == 0) ? 0 : 1)));
-                                    int _mma_a_lo_3 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
-                                    int _mma_b_lo_3 = (((b_hi_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
+                                    int _mma_a_lo_3 = (((a_smem_addr) >> 4) & 0x7FFF) + (ring_3) * 1024;
+                                    int _mma_b_lo_3 = (((b_hi_addr) >> 4) & 0x7FFF) + (ring_3) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -7047,8 +7047,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
                                         tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_6) * 8, (uint16_t)(3));
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_6) * 8, 98304);
                                         mbarrier_wait(gemm_arrived_addr + (ring_6) * 8, phase_bits_4 >> (unsigned int)ring_6 & 1);
-                                        int _mma_a_lo_4 = (((smem_v32_addr) >> 4) & 0x3FFF) + (ring_6) * 1024;
-                                        int _mma_b_lo_4 = (((smem_v33_addr) >> 4) & 0x3FFF) + (ring_6) * 1024;
+                                        int _mma_a_lo_4 = (((smem_v32_addr) >> 4) & 0x7FFF) + (ring_6) * 1024;
+                                        int _mma_b_lo_4 = (((smem_v33_addr) >> 4) & 0x7FFF) + (ring_6) * 1024;
                                         {
                                             uint64_t a_desc = ((uint64_t)_mma_a_lo_4) | ((uint64_t)0x40004040 << 32);
                                             uint64_t b_desc = ((uint64_t)_mma_b_lo_4) | ((uint64_t)0x40004040 << 32);
@@ -7058,8 +7058,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
                                             tcgen05_mma_mxf8f6f4_bs_k64_cta2(tmem_accumulator, a_desc + 4, b_desc + 4,
                                                 0xd0c00020U, (int)((tmem_tmem_sfa + buffer * 4 + 0) | 0x80000000), (int)((tmem_tmem_sfb + buffer * 8 + 0) | 0x80000000), 1);
                                         }
-                                        int _mma_a_lo_5 = (((smem_v32_addr) >> 4) & 0x3FFF) + (ring_6) * 1024;
-                                        int _mma_b_lo_5 = (((smem_v34_addr) >> 4) & 0x3FFF) + (ring_6) * 1024;
+                                        int _mma_a_lo_5 = (((smem_v32_addr) >> 4) & 0x7FFF) + (ring_6) * 1024;
+                                        int _mma_b_lo_5 = (((smem_v34_addr) >> 4) & 0x7FFF) + (ring_6) * 1024;
                                         {
                                             uint64_t a_desc = ((uint64_t)_mma_a_lo_5) | ((uint64_t)0x40004040 << 32);
                                             uint64_t b_desc = ((uint64_t)_mma_b_lo_5) | ((uint64_t)0x40004040 << 32);
@@ -9132,8 +9132,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
                                         tcgen05_commit_cg2_multicast(scales_finished_addr + (ring_9) * 8, (uint16_t)(3));
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_9) * 8, 98304);
                                         mbarrier_wait(gemm_arrived_addr + (ring_9) * 8, phase_bits_6 >> (unsigned int)ring_9 & 1);
-                                        int _mma_a_lo_6 = (((smem_v32_addr) >> 4) & 0x3FFF) + (ring_9) * 1024;
-                                        int _mma_b_lo_6 = (((smem_v33_addr) >> 4) & 0x3FFF) + (ring_9) * 1024;
+                                        int _mma_a_lo_6 = (((smem_v32_addr) >> 4) & 0x7FFF) + (ring_9) * 1024;
+                                        int _mma_b_lo_6 = (((smem_v33_addr) >> 4) & 0x7FFF) + (ring_9) * 1024;
                                         {
                                             uint64_t a_desc = ((uint64_t)_mma_a_lo_6) | ((uint64_t)0x40004040 << 32);
                                             uint64_t b_desc = ((uint64_t)_mma_b_lo_6) | ((uint64_t)0x40004040 << 32);
@@ -9143,8 +9143,8 @@ kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, cons
                                             tcgen05_mma_mxf8f6f4_bs_k64_cta2(tmem_accumulator, a_desc + 4, b_desc + 4,
                                                 0xd0c00020U, (int)((tmem_tmem_sfa + buffer_1 * 4 + 0) | 0x80000000), (int)((tmem_tmem_sfb + buffer_1 * 8 + 0) | 0x80000000), 1);
                                         }
-                                        int _mma_a_lo_7 = (((smem_v32_addr) >> 4) & 0x3FFF) + (ring_9) * 1024;
-                                        int _mma_b_lo_7 = (((smem_v34_addr) >> 4) & 0x3FFF) + (ring_9) * 1024;
+                                        int _mma_a_lo_7 = (((smem_v32_addr) >> 4) & 0x7FFF) + (ring_9) * 1024;
+                                        int _mma_b_lo_7 = (((smem_v34_addr) >> 4) & 0x7FFF) + (ring_9) * 1024;
                                         {
                                             uint64_t a_desc = ((uint64_t)_mma_a_lo_7) | ((uint64_t)0x40004040 << 32);
                                             uint64_t b_desc = ((uint64_t)_mma_b_lo_7) | ((uint64_t)0x40004040 << 32);
