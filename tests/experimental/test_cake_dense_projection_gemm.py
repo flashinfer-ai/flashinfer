@@ -41,7 +41,6 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     SK_DUMMY_BASE,
     SK_MIN_ITERS,
     SMEM_OPT_IN,
-    SUPPORTED_COMPUTE_CAPABILITIES,
     arch_for,
     bind_launch,
     convenience_key,
@@ -695,14 +694,19 @@ def _assert_mirrors_cake(plan, cake_template, where, arch):
 
 
 def _device_supported() -> bool:
-    return torch.cuda.is_available() and (
-        torch.cuda.get_device_capability(0) in SUPPORTED_COMPUTE_CAPABILITIES
+    """A device this checkout registers generated programs for (``build.json`` ships
+    ``sm_100a`` and ``sm_107a`` builds: compute capability 10.0 or 10.7; see README)."""
+    return torch.cuda.is_available() and generated_program_available(
+        torch.device("cuda")
     )
 
 
 def _require_program(template: str):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     if not generated_program_available(torch.device("cuda"), template):
         pytest.skip(f"generated instance {template!r} not registered for this device")
 
@@ -712,7 +716,10 @@ def _registered_knobs(v, *candidates):
     The per-arch export only ships the instances its measured rules route to, so a test that pins a tile
     family takes whichever family's instance this device has; skips when none is registered."""
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     templates = [_plan_template(v, **knobs) for knobs in candidates]
     for knobs, template in zip(candidates, templates, strict=True):
         if generated_program_available(torch.device("cuda"), template):
@@ -5267,7 +5274,10 @@ def _plan_template(v, **knobs):
 @pytest.mark.parametrize("row, op, out_dtype, T", GPU_ROWS)
 def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED)
     _require_program(_plan_template(v))
     if op == "wgrad":
@@ -5286,7 +5296,10 @@ def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
 @pytest.mark.parametrize("op", ["fwd", "dgrad", "wgrad"])
 def test_mla_batched_rows_match_fp64_reference(row, op):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _make_inputs("mla", row, op, "bf16", 257, seed=SEED + 1)
     _require_program(_plan_template(v))
     prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"])
@@ -5299,7 +5312,10 @@ def test_mla_batched_rows_match_fp64_reference(row, op):
 
 def test_strided_views_and_storage_offsets_match_fp64_reference():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 2)
     T, K, N = 301, 704, 264
@@ -5355,7 +5371,10 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
 
 def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     # a swapped weight gradient on a half-width synthetic row (N = 32, K = 3072, T = 1001): stream-K "auto"
     # two-part split of a single partial wave with the deterministic in-kernel fixup.  The round-9 rules route
     # the GLM small-N weight gradients to whole tiles on sm_100a (64-row family: 48 tiles, which 74 pairs cannot
@@ -5396,7 +5415,10 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
 
 def test_convenience_path_reuses_its_planned_launch_without_allocation():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 6)
     T, K, N = (
@@ -5445,7 +5467,10 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     geometry reuses them without a memset (the kernel resets every counter it uses), stays allocation-free
     and reproduces the first result bit for bit."""
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 7)
     T, K, N = (
@@ -5509,7 +5534,10 @@ def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
 )
 def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _router_inputs(op, T, seed=SEED + 4)
     plan, *_ = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
     _require_program(plan.template)

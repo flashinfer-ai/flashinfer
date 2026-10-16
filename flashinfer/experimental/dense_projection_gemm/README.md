@@ -204,7 +204,7 @@ paths").
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered
-instance -- a compute capability 10.0 or 10.7 device).  Benchmark:
+generated instance -- a compute capability 10.0 or 10.7 device).  Benchmark:
 `benchmarks/bench_cake_dense_projection_gemm.py` (the 11 GLM-5.2 projection
 rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
 batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the
