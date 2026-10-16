@@ -1388,7 +1388,7 @@ _alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
 _alpha_router_cc = torch.cuda.get_device_capability(device)
 if (
     _alpha_router_cc in {(10, 0), (10, 3)}
-    and is_sm100a_supported(device)
+    and is_sm100a_supported(torch.device(device))
     and is_cuda_version_at_least("12.9" if _alpha_router_cc == (10, 3) else "12.8")
 ):
     flashinfer.fused_moe.alphamoe_fused_router(
