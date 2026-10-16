@@ -3916,6 +3916,16 @@ class GvrTopkRegKernel:
         qc: cutlass.Int32,
         smem_bytes: cutlass.Int32,
     ):
+        row, _, _ = cute.arch.block_idx()
+        sbase = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()  # Int32 shared addr
+        self.row_topk(logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase)
+
+    @cute.jit
+    def row_topk(self, logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase):
+        """Register-resident top-K of row ``row``: the whole kernel body, with the
+        smem window (map in the family docstring) at byte address ``sbase``.
+        Separate from ``kern`` so the main family can call it for rows that fit
+        its CTA's registers."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         KPT = cutlass.const_expr(self.kpt)
@@ -3928,7 +3938,6 @@ class GvrTopkRegKernel:
             cute.arch.griddepcontrol_wait()  # knob default off
 
         tid, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
         lane = tid & cutlass.Int32(31)
 
         # ---- early row load (decode): the float4 batch is bounded by the launch
@@ -4150,10 +4159,7 @@ class GvrTopkRegKernel:
                 if tid == cutlass.Int32(0):
                     lmask = (cutlass.Int32(0xF) << lead) & cutlass.Int32(0xF)
 
-            # ---- shared-memory window (map in module docstring) ----
-            sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
-            sbase = sptr.toint()  # Int32 shared addr
-
+            # ---- shared-memory window at sbase (map in module docstring) ----
             s_res = _smem_view(cutlass.Int32, sbase, 0, 6)
             s_cnt = _smem_view(cutlass.Int32, sbase, 6, 2)  # [0]=s_o1 [1]=s_oc
             s_kmm = _smem_view(cutlass.Uint32, sbase, 8, 2)  # [0]=s_kmin [1]=s_kmax
