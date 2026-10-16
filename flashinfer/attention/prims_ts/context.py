@@ -76,6 +76,8 @@ _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
 _CONTEXT_TILE_SIZE_Q = 128
+# The context softmax dequantizes 16-column score blocks, one K scale each.
+_CONTEXT_SAGE_MIN_K_BLOCK_SIZE = 16
 # Query-paired D128 represents two 128-row Q tiles in one work tile.  Kernel
 # coordinates include the padded tail of that 256-row span and, for masking,
 # its exclusive right boundary.  Reserve the maximum 255-row tail padding in
@@ -1740,6 +1742,12 @@ def _validate_context_sage_config(
         )
     if sage.k_block_size not in SAGE_K_BLOCK_SIZES:
         raise ValueError(f"sage.k_block_size must be one of {SAGE_K_BLOCK_SIZES}")
+    if sage.k_block_size < _CONTEXT_SAGE_MIN_K_BLOCK_SIZE:
+        raise NotImplementedError(
+            "the context kernel reads one K scale per "
+            f"{_CONTEXT_SAGE_MIN_K_BLOCK_SIZE} tokens; got k_block_size="
+            f"{sage.k_block_size}"
+        )
 
 
 def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
