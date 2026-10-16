@@ -48,7 +48,8 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
                                  uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
-  uint32_t head_idx = ty;
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  if (head_idx >= num_heads) return;
 
   float s_a_val = s_a[pos * num_heads + head_idx];
   float s_b_val = s_b[pos * num_heads + head_idx];
@@ -96,7 +97,8 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
   if (mask != nullptr && mask[pos] == 0) return;
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t head_idx = ty;
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  if (head_idx >= num_heads) return;
 
   float s_val = s[pos * num_heads + head_idx];
   float s_other_val = s_other[pos * num_heads + head_idx];
@@ -184,7 +186,8 @@ __global__ void AttentionSumKernel(DTypeIn* __restrict__ V, DTypeO* __restrict__
                                    uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
-  uint32_t head_idx = ty;
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  if (head_idx >= num_heads) return;
 
   if (num_index_sets == 0) {
     vec_t<DTypeO, vec_size> v;
@@ -222,7 +225,8 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
-  uint32_t head_idx = ty;
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  if (head_idx >= num_heads) return;
 
   if (num_index_sets == 0) {
     vec_t<DTypeO, vec_size> v;
@@ -559,6 +563,15 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
 }
 
 /*!
+ * \brief blockDim.y for the merge kernels that map each head to one row of bdx threads.
+ * \note Heads beyond one block are tiled over gridDim.y, so bdx * bdy stays within the
+ *   1024-thread block limit (e.g. more than 64 heads of dim 128 in a 16-bit type).
+ */
+inline uint32_t merge_heads_per_block(uint32_t bdx, uint32_t num_heads) {
+  return std::max(1U, std::min(num_heads, 1024U / bdx));
+}
+
+/*!
  * \brief Merge the self-attention state of two index sets A and B.
  * \tparam DTypeIn The data type of v_a and v_b.
  * \tparam DTypeO The data type of v_merged.
@@ -582,8 +595,8 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     uint32_t bdx = HEAD_DIM / vec_size;
-    uint32_t bdy = num_heads;
-    dim3 nblks(seq_len);
+    uint32_t bdy = merge_heads_per_block(bdx, num_heads);
+    dim3 nblks(seq_len, ceil_div(num_heads, bdy));
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeO>;
     void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &s_merged, &num_heads, &head_dim};
@@ -614,8 +627,8 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
     uint32_t bdx = HEAD_DIM / vec_size;
-    uint32_t bdy = num_heads;
-    dim3 nblks(seq_len);
+    uint32_t bdy = merge_heads_per_block(bdx, num_heads);
+    dim3 nblks(seq_len, ceil_div(num_heads, bdy));
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStateInPlaceKernel<vec_size, DType>;
     void* args[] = {&v, &s, &v_other, &s_other, &mask, &num_heads, &head_dim};
@@ -662,8 +675,8 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     } else {
-      uint32_t bdy = num_heads;
-      dim3 nblks(seq_len);
+      uint32_t bdy = merge_heads_per_block(bdx, num_heads);
+      dim3 nblks(seq_len, ceil_div(num_heads, bdy));
       dim3 nthrs(bdx, bdy);
       auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
       void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
@@ -679,8 +692,8 @@ cudaError_t AttentionSum(DTypeIn* v, DTypeO* v_sum, uint32_t num_index_sets, uin
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    uint32_t bdy = num_heads;
-    dim3 nblks(seq_len);
+    uint32_t bdy = merge_heads_per_block(bdx, num_heads);
+    dim3 nblks(seq_len, ceil_div(num_heads, bdy));
     dim3 nthrs(bdx, bdy);
     auto kernel = AttentionSumKernel<vec_size, DTypeIn, DTypeO>;
     void* args[] = {&v, &v_sum, &num_index_sets, &num_heads, &head_dim};
