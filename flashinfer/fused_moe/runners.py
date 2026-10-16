@@ -54,8 +54,10 @@ from ..autotuner import (
 )
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
+    NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP44Over6Config,
     nvfp4_4over6_cache_key,
+    nvfp4_4over6_code,
     resolve_nvfp4_4over6,
 )
 from ..tllm_enums import DEFAULT_SWIGLU_LIMIT
@@ -2326,6 +2328,9 @@ class _CutlassRunnerBase(MoERunner):
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
             **self._activation_params,
+            # Unset everywhere except on CutlassNvfp4Runner (QuantConfig
+            # rejects an explicit value for other activations).
+            nvfp4_4over6=self.config.quant.nvfp4_4over6,
         )
         return inputs[0]
 
@@ -2447,6 +2452,9 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
     """
 
     backend_key = "cutlass_nvfp4"
+    # Threaded as QuantParams::FP4 nvfp4_4over6_code; both of CUTLASS's NVFP4
+    # activation quantizations have 4over6 variants, so no per-token rule.
+    supports_nvfp4_4over6 = True
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
@@ -5528,6 +5536,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
     backend_key = "trtllm_fp4_routed"
     supports_per_token_scale = True
+    # Threaded as MoERunnerArgs.nvfp4_4over6_code; _check_support() narrows
+    # it to the per-token path, the only one that requantizes the GEMM2 input.
+    supports_nvfp4_4over6 = True
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -5572,6 +5583,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 raise NotImplementedError(
                     f"{type(self).__name__} does not support per-token scale for "
                     f"{pair[0].name}×{pair[1].name}."
+                )
+            if (
+                isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+                and not self.config.quant.per_token_scale
+            ):
+                # Only a pinned recipe is rejected: ``None`` is what GEMM1's
+                # NVFP4 epilogue (no 4over6 variant) already does.
+                raise NotImplementedError(
+                    f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
+                    "only with per_token_scale=True, the one path that requantizes "
+                    "the GEMM2 input."
                 )
 
             from ..utils import get_compute_capability
@@ -5672,6 +5694,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             use_per_token_scaling=self._per_token,
             num_experts=self.config.routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
+            # Unset reads the environment per call, like the flat API.
+            nvfp4_4over6_code=NVFP4_4OVER6_CODE_FROM_ENV
+            if self.config.quant.nvfp4_4over6 is _UNSET
+            else nvfp4_4over6_code(
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+            ),
         )
 
     def get_valid_tactics(  # type: ignore[override]

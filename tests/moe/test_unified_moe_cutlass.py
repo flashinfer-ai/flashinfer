@@ -58,6 +58,8 @@ from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import MoERunner, _mxfp8_swizzled_act_sf_numel
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+from tests.moe.test_unified_moe import _nvfp4_4over6_env
 from tests.moe.utils import fp8_per_tensor_global_scale, fp8_per_tensor_requant_hook
 from flashinfer.utils import (
     get_compute_capability,
@@ -959,6 +961,22 @@ def test_cutlass_nvfp4_runner_rejects_out_of_scope_configs(config, match):
     runner.config = config
     with pytest.raises(NotImplementedError, match=match):
         runner.check_support()
+
+
+@pytest.mark.parametrize("setting", [None, NVFP44Over6Config()], ids=repr)
+def test_cutlass_nvfp4_runner_accepts_explicit_recipe(setting):
+    """Both CUTLASS NVFP4 activation quantizers take the recipe, so there is
+    no per-token restriction (unlike CuteDSL / TRT-LLM)."""
+    runner = CutlassNvfp4Runner.__new__(CutlassNvfp4Runner)
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            nvfp4_4over6=setting,
+        )
+    )
+    runner._device_arch = 100  # the architecture check needs a device
+    assert runner.check_support() is None
 
 
 @pytest.mark.parametrize(
@@ -2645,6 +2663,40 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     # needs to catch a wrong magnitude.
     ref_rtol = ref_atol = 3e-1 if isinstance(activation, Identity) else 2e-1
     _assert_numerically_close(actual, expected, rtol=ref_rtol, atol=ref_atol)
+
+
+@cutlass_nvfp4_required
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
+        pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
+    ],
+)
+def test_cutlass_nvfp4_pinned_recipe_matches_env(recipe):
+    """QuantConfig.nvfp4_4over6 reaches QuantParams::FP4 bit for bit, and
+    ``None`` ignores an environment that turns 4over6 on."""
+    config, act, weights, _view = _make_nvfp4_case()
+
+    def run(setting):
+        cfg = dataclasses.replace(
+            config, quant=dataclasses.replace(config.quant, nvfp4_4over6=setting)
+        )
+        out = MoELayer(cfg)(act, weights)
+        torch.cuda.synchronize()
+        return out.clone()
+
+    with _nvfp4_4over6_env(True, recipe):
+        env_on = run(config.quant.nvfp4_4over6)
+        none_under_env_on = run(None)
+    with _nvfp4_4over6_env(False):
+        env_off = run(config.quant.nvfp4_4over6)
+        pinned_under_env_off = run(recipe)
+
+    # The recipe must change the output, or the equalities below are vacuous.
+    assert not torch.equal(env_on, env_off)
+    assert torch.equal(pinned_under_env_off, env_on)
+    assert torch.equal(none_under_env_on, env_off)
 
 
 @cutlass_nvfp4_required

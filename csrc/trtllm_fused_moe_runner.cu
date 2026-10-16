@@ -763,10 +763,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
     // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
     // compile-time e4m3Max, so they cannot desync.
-    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
-    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
-    auto const recipe =
-        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
+    auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(args.nvfp4_4over6_code);
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * totalExpertsPerToken, args.intermediate_size,
         reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),

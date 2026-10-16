@@ -136,12 +136,12 @@ struct AbsMaxOp<__nv_bfloat16> {
   __device__ static float to_float(Accum value) { return __bfloat162float(value); }
 };
 
-// TODO(aleozlx, #5141): unlike the TRT-LLM quantization kernels, this CUTLASS-backend
-// dispatcher still reads FLASHINFER_NVFP4_4OVER6* directly instead of taking a
-// caller-supplied NVFP4RecipeSpec. Threading the recipe down to here is a follow-up.
+// Selects the compile-time NVFP4 quantizer variant from the recipe code
+// (resolveNVFP4Recipe(); the default code reads FLASHINFER_NVFP4_4OVER6*).
+// FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH stays a separate environment knob.
 template <typename Fn>
-auto dispatchNVFP44Over6Config(Fn&& fn) {
-  bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+auto dispatchNVFP44Over6Config(int64_t nvfp4_4over6_code, Fn&& fn) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp4_4over6_code);
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
 
   auto dispatchDisableFastMath = [&](auto e4m3MaxTag, auto errModeTag, auto errUseFastMathTag) {
@@ -155,13 +155,10 @@ auto dispatchNVFP44Over6Config(Fn&& fn) {
                                 decltype(errUseFastMathTag)::value>{});
   };
 
-  if (use4Over6) {
-    NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
-    bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-    int e4m3Max = 448;
-    if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
-      e4m3Max = 256;
-    }
+  if (recipe.use4Over6) {
+    NVFP44Over6ErrMode const errMode = recipe.errMode;
+    bool const errUseFastMath = recipe.errUseFastMath;
+    int const e4m3Max = recipe.e4m3Max;
 
     auto dispatchErrUseFastMath = [&](auto e4m3MaxTag, auto errModeTag) {
       if (errUseFastMath) {
@@ -1894,6 +1891,7 @@ void expandInputRowsKernelLauncher(
                            "NVFP4 block scaling is expected for FP4xFP4");
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
       return dispatchNVFP44Over6Config(
+          quant_params.fp4.nvfp4_4over6_code,
           [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
             return &expandInputRowsKernel<
                 InputActivationsType, ExpandedActivationsType,
@@ -2747,6 +2745,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       TLLM_CHECK_WITH_INFO(quant_params.fp4.fc2.weight_block_scale,
                            "NVFP4 block scaling is expected for FP4xFP4");
       return dispatchNVFP44Over6Config(
+          quant_params.fp4.nvfp4_4over6_code,
           [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
             return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
           });
