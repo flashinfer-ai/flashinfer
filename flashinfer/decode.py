@@ -5004,14 +5004,18 @@ def fast_decode_plan(
                 "q_len_per_req > 1 is currently only supported on the fa2 "
                 "tensor-core backend."
             )
-        if (
-            backend == "fa2"
-            and getattr(self, "_cached_q_data_type", None) == torch.float8_e4m3fn
-        ):
-            raise NotImplementedError(
-                "The fa2 tensor-core decode takes an e4m3 query only for "
-                "single-token requests."
-            )
+    if (
+        getattr(self, "_backend", None) == "fa2"
+        and getattr(self, "_cached_q_data_type", None) == torch.float8_e4m3fn
+        and (
+            q_len_per_req != 1
+            or num_qo_heads not in [num_kv_heads * g for g in (1, 2, 4, 8)]
+        )
+    ):
+        raise NotImplementedError(
+            "The fa2 tensor-core decode takes an e4m3 query only for single-token "
+            "requests with 1, 2, 4 or 8 query heads per KV head."
+        )
     if self.is_cuda_graph_enabled:
         frozen_q_len = getattr(self, "_q_len_per_req", None)
         if frozen_q_len is not None and frozen_q_len != q_len_per_req:

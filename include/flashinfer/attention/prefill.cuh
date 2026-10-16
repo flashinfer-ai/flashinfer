@@ -3777,7 +3777,8 @@ __device__ __forceinline__ void vosplit_compute_pv_fp8(
     }
   }
   smem_t<SwizzleMode::k64B> p8(smem_storage->p_smem_ptr());
-  smem_t<KTraits::SWIZZLE_MODE_KV> v_smem(smem_storage->v_smem);
+  smem_t<KTraits::SWIZZLE_MODE_KV> v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage->k_smem
+                                                                      : smem_storage->v_smem);
   const uint32_t q_row_base = warp_q_idx * NUM_MMA_Q * 16;
 #pragma unroll
   for (uint32_t kv32 = 0; kv32 < CTA_TILE_KV / 32; ++kv32) {

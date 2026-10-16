@@ -1331,7 +1331,7 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
 
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8])
 def test_tensor_core_decode_fp8_query(group_size):
-    if get_compute_capability(torch.device("cuda")) != (12, 0):
+    if get_compute_capability(torch.device("cuda:0")) != (12, 0):
         pytest.skip("The e4m3-query tensor-core decode runs on SM120 only.")
     batch_size, kv_len, page_size, num_kv_heads, head_dim = 7, 300, 16, 8, 256
     num_qo_heads, q_scale = num_kv_heads * group_size, 0.5
