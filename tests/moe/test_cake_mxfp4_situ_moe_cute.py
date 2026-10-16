@@ -363,9 +363,13 @@ def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
             and cfg["gemm2"][0] == 192
         )
     for args in (cfg["gemm1_dense"], cfg["gemm1_alt"]):
-        tile_m, n1, zero_fill, secondary, row_group, early, l2_hint, cluster_split = args
+        tile_m, n1, zero_fill, secondary, row_group, early, l2_hint, cluster_split = (
+            args
+        )
         assert l2_hint is hint_on and zero_fill and row_group and not early
-        assert cluster_split is False  # the zero-fill forms never take the cluster split-K twin
+        assert (
+            cluster_split is False
+        )  # the zero-fill forms never take the cluster split-K twin
         item = kernels.find_form(
             kind="gemm1_dense",
             tile_m=tile_m,
@@ -399,7 +403,9 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
     served = set(contract["forms"]) | set(contract["sibling_backend_forms"])
     for name in (plan.init_form_name(sort), plan.coop_form_name(sort)):
         assert plan._k6_stage(name, sort.pdl) in served, name
-    tile_m, n1, zero_fill, secondary, row_group, early, l2_hint, cluster_split = cfg["gemm1"]
+    tile_m, n1, zero_fill, secondary, row_group, early, l2_hint, cluster_split = cfg[
+        "gemm1"
+    ]
     assert l2_hint is True  # the dense chain keeps the EVICT_FIRST weight-stream hint
     # ep8 T = 2048 sits inside the cluster split-K window of the dense form (c): the plan switch decides the twin.
     assert cluster_split is bool(plan.DENSE_GEMM1_CLUSTER_SPLIT_FORM)
@@ -670,8 +676,14 @@ def test_gemm_forms_carry_the_trace_time_constants():
     assert situ["weight_l2_hint"] is True and situ["cluster_split"] is False
     # The 2-CTA cluster split-K twin of the same form (the plain chain's T <= 16 selection): a module of
     # its own, cluster (2, 1, 1), selected on ``cluster_split``; the single-CTA raster is the default.
-    cs_kernel = kernels.select_gemm1(8, 8, pdl_trigger_after_wait=True, cluster_split=True)
-    assert cs_kernel.stage == "gemm1_swapab_situ_n8_k8_cs" and cs_kernel.cluster == (2, 1, 1)
+    cs_kernel = kernels.select_gemm1(
+        8, 8, pdl_trigger_after_wait=True, cluster_split=True
+    )
+    assert cs_kernel.stage == "gemm1_swapab_situ_n8_k8_cs" and cs_kernel.cluster == (
+        2,
+        1,
+        1,
+    )
     assert cs_kernel.form["cluster_split"] is True and cs_kernel.form["kbps"] == 8
     assert (
         kernels.select_gemm1(16, 4, weight_l2_hint=False, cluster_split=True).stage
