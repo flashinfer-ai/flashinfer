@@ -65,6 +65,7 @@ def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):
     monkeypatch.setattr(norm, "_HAS_CUTE_DSL_FUSED_NORM", True)
     monkeypatch.setattr(norm, "_is_aligned", lambda *_: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
+    monkeypatch.setattr(norm, "_cute_dsl_supports_arch", lambda *_: True)
     calls = []
     monkeypatch.setattr(
         norm,
