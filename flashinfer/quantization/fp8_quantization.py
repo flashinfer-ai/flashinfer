@@ -25,7 +25,7 @@ def _round_up(x: int, y: int) -> int:
     return (x + y - 1) // y * y
 
 
-# The masked MXFP8 experts kernel loads 16 fp16/bf16 input values (32 bytes) per vector access.
+# The masked MXFP8 experts kernel reads its input with 32-byte vector loads.
 _MXFP8_EXPERTS_INPUT_ALIGNMENT = 32
 
 
@@ -50,8 +50,7 @@ def _mxfp8_experts_output_shapes(
 def _to_masked_gemm_layout(
     x_q: torch.Tensor, sf: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Permute physical ``[B, M, padded_K]`` values and ``[B, padded_M, padded_K // 32]``
-    scales to the logical layout of :func:`flashinfer.gemm.grouped_gemm_nt_masked`."""
+    """Permute the physical kernel outputs to the masked grouped GEMM layout."""
     b, padded_m, scale_k = sf.shape
     sf = sf.view(b, padded_m // 128, scale_k // 4, 32, 4, 4).permute(3, 4, 1, 5, 2, 0)
     return x_q.permute(1, 2, 0), sf
@@ -205,20 +204,18 @@ def get_mxfp8_quantization_sm100_module():
             shapes.values, dtype=torch.float8_e4m3fn, device=input.device
         )
         out_sf = torch.empty(shapes.scales, dtype=torch.uint8, device=input.device)
-        if input.numel() == 0:
-            # Nothing to quantize; the FFI contiguity check also rejects torch's
-            # strides for zero-size dimensions.
-            return out_val, out_sf
-        module.silu_and_mul_mxfp8_experts_quantize(
-            input, mask, out_val, out_sf, use_silu_and_mul, enable_pdl
-        )
-        return out_val, out_sf
+        # Skip empty inputs; the FFI contiguity check rejects their strides.
+        if input.numel() > 0:
+            module.silu_and_mul_mxfp8_experts_quantize(
+                input, mask, out_val, out_sf, use_silu_and_mul, enable_pdl
+            )
+        return _to_masked_gemm_layout(out_val, out_sf)
 
     def _fake_mxfp8_experts_quantize(
         input: torch.Tensor, use_silu_and_mul: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         shapes = _mxfp8_experts_output_shapes(input, use_silu_and_mul)
-        return (
+        return _to_masked_gemm_layout(
             input.new_empty(shapes.values, dtype=torch.float8_e4m3fn),
             input.new_empty(shapes.scales, dtype=torch.uint8),
         )
@@ -232,7 +229,7 @@ def get_mxfp8_quantization_sm100_module():
         mask: torch.Tensor,
         enable_pdl: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the physical ``[B, M, padded_K]`` values and ``[B, padded_M, padded_K // 32]`` scales."""
+        """Return ``(x_q, sf)`` in the :func:`flashinfer.gemm.grouped_gemm_nt_masked` layout."""
         return _mxfp8_experts_quantize(input, mask, True, enable_pdl)
 
     @register_fake_op("flashinfer::silu_and_mul_mxfp8_experts_quantize_sm100")
@@ -252,7 +249,7 @@ def get_mxfp8_quantization_sm100_module():
         mask: torch.Tensor,
         enable_pdl: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the physical ``[B, M, padded_K]`` values and ``[B, padded_M, padded_K // 32]`` scales."""
+        """Return ``(x_q, sf)`` in the :func:`flashinfer.gemm.grouped_gemm_nt_masked` layout."""
         return _mxfp8_experts_quantize(input, mask, False, enable_pdl)
 
     @register_fake_op("flashinfer::mxfp8_grouped_quant_sm100")
@@ -574,23 +571,22 @@ def _mxfp8_grouped_quantize_cuda(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dispatch an already validated request to the CUDA experts kernel.
 
-    The kernel reads ``a`` with 32-byte vector loads, so ``a`` is copied first when
-    it is not contiguous or not 32-byte aligned; the backend accepts the same
-    inputs as the others.
+    Copies ``a`` when it is not contiguous or not 32-byte aligned and makes
+    ``mask`` contiguous, so this backend accepts every input the ``"cutile"``
+    backend accepts.
     """
     if not a.is_contiguous() or a.data_ptr() % _MXFP8_EXPERTS_INPUT_ALIGNMENT != 0:
         a = a.clone(memory_format=torch.contiguous_format)
-    x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_grouped_quant_sm100(
+    return get_mxfp8_quantization_sm100_module().mxfp8_grouped_quant_sm100(
         a, mask.contiguous(), device_support_pdl(a.device)
     )
-    return _to_masked_gemm_layout(x_q, sf)
 
 
 @flashinfer_api(trace=mxfp8_grouped_quantize_trace)
 def mxfp8_grouped_quantize(
     a: torch.Tensor,
     mask: torch.Tensor,
-    backend: Literal["cuda", "cutile", "cake"] = "cuda",
+    backend: Literal["cutile", "cake", "cuda"] = "cutile",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize grouped inputs to MXFP8 with UE8M0 block scales.
 
@@ -600,34 +596,31 @@ def mxfp8_grouped_quantize(
         Input tensor of shape ``[B, M, K]`` with dtype ``float16`` or
         ``bfloat16``.
     mask : torch.Tensor
-        Int32 CUDA tensor of shape ``[B]``. Each value gives the number of
-        valid rows to quantize for the corresponding group. The values are not
-        validated at runtime, because reading the device-side ``mask`` would
-        force a host synchronization and break CUDA-graph capture. The
-        ``"cuda"`` backend processes the first ``min(mask[i], M)`` rows, so any
-        value is safe (a negative value selects no rows). The ``"cutile"`` and
-        ``"cake"`` backends require ``0 <= mask[i] <= M``; other values are
-        undefined behavior, and the cuTile kernel writes scale factors with
-        bounds checking disabled, so ``mask[i] > M`` corrupts neighboring groups
-        or writes out of bounds.
-    backend : {``"cuda"``, ``"cutile"``, ``"cake"``}
-        Implementation backend. ``"cuda"`` (the default) runs a single CUDA
-        kernel that reads ``mask`` on the device and skips the rows past it;
-        it is the same kernel as :func:`silu_and_mul_mxfp8_experts_quantize`
-        with the SiLU-and-mul step disabled, and it copies ``a`` first when
-        ``a`` is not contiguous or not 32-byte aligned. ``"cutile"`` runs the
-        cuTile kernel and requires the ``cuda-tile`` package. ``"cake"``
-        explicitly selects a generated, exact-architecture Blackwell profile
-        and raises a clear error when that profile is not installed. Runtime
-        launch failures are never silently retried through a different
-        implementation. For finite inputs, all backends produce the same
-        valid-row output bits and scale bytes, except in bfloat16 blocks whose
-        largest magnitude is below ``448 * 2**-126``: ``"cuda"`` and
-        ``"cake"`` quantize those to zero values with scale byte 0. A NaN
-        input value stays NaN on every backend. Blocks that contain an
-        infinity, or only NaN, can differ between backends: ``"cuda"`` and
-        ``"cake"`` give a block with an infinity the scale byte 254, quantize
-        the infinity to NaN and quantize the rest of the block to zero.
+        Int32 CUDA tensor of shape ``[B]`` with the number of valid rows of
+        each group. Its values are not validated, since reading them on the
+        host would synchronize and break CUDA-graph capture. The ``"cuda"``
+        backend uses the first ``min(mask[i], M)`` rows, so any value is safe
+        (a negative value selects no rows). The ``"cutile"`` and ``"cake"``
+        backends require ``0 <= mask[i] <= M``; other values are undefined
+        behavior, and the cuTile kernel writes scale factors without bounds
+        checks, so ``mask[i] > M`` corrupts neighboring groups or writes out of
+        bounds.
+    backend : {``"cutile"``, ``"cake"``, ``"cuda"``}
+        Implementation backend. ``"cutile"`` remains the default and fallback
+        path and requires the ``cuda-tile`` package. ``"cake"`` explicitly
+        selects a generated, exact-architecture Blackwell profile and raises a
+        clear error when that profile is not installed. ``"cuda"`` runs the
+        kernel of :func:`silu_and_mul_mxfp8_experts_quantize` without the
+        SiLU-and-mul step and copies ``a`` first when it is not contiguous or
+        not 32-byte aligned. Runtime launch failures are never silently
+        retried through a different implementation.
+
+        Valid-row outputs match across backends for finite inputs, except
+        possibly in bfloat16 blocks whose largest magnitude is at most
+        ``448 * 2**-117``. NaN stays NaN. Blocks that hold an infinity, or only
+        NaN, can differ: ``"cuda"`` and ``"cake"`` give a block with an
+        infinity the scale byte 254 and quantize the infinity to NaN and its
+        finite values to zero.
 
     Returns
     -------
@@ -636,15 +629,16 @@ def mxfp8_grouped_quantize(
         ``[M, padded_K, B]`` with dtype ``float8_e4m3fn`` and ``sf`` has
         logical shape ``[32, 4, padded_M // 128, 4, padded_K // 128, B]``
         with dtype ``uint8``. ``padded_K`` rounds ``K`` up to a multiple
-        of 128. The physical layouts are grouped by ``B`` and then
-        permuted to match FlashInfer masked grouped GEMM conventions.
+        of 128 and ``padded_M`` rounds ``M`` up to a multiple of 128. The
+        physical layouts are grouped by ``B`` and then permuted to match
+        FlashInfer masked grouped GEMM conventions.
 
         Only the valid rows of group ``i`` are written; the rows past them
         (and their scale factors) are unspecified. The consumer must use the
         same ``mask`` and read only the valid rows.
     """
 
-    if backend not in ("cuda", "cutile", "cake"):
+    if backend not in ("cutile", "cake", "cuda"):
         raise ValueError(f"Unsupported backend for mxfp8_grouped_quantize: {backend!r}")
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, K]")
@@ -691,34 +685,25 @@ def silu_and_mul_mxfp8_experts_quantize(
     *,
     enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Fused SiLU + mul + MXFP8 quantization of an expert-major, masked batch.
+    r"""Fused SiLU + mul + MXFP8 quantization with a per-expert row mask.
 
-    Computes ``silu(a[..., :K]) * a[..., K:]`` for the valid rows of each
-    expert, rounds it to the input dtype, and quantizes it to MXFP8 (E4M3
-    values with one UE8M0 scale per 32 elements). This is the activation step
-    between the two :func:`flashinfer.gemm.grouped_gemm_nt_masked` GEMMs of a
-    batched MoE expert computation.
-
-    The outputs use the same layout as :func:`mxfp8_grouped_quantize`, so they
-    can be passed directly as the ``(A, SFA)`` operand of
-    :func:`flashinfer.gemm.grouped_gemm_nt_masked` with
-    ``ab_dtype="float8_e4m3fn"``, ``sf_dtype="float8_e8m0fnu"`` and
-    ``sf_vec_size=32``.
+    Quantizes ``silu(a[..., :K]) * a[..., K:]``, rounded to the input dtype,
+    to MXFP8 (E4M3 values, one UE8M0 scale per 32 values). Requires SM100+.
+    The outputs feed the second :func:`flashinfer.gemm.grouped_gemm_nt_masked`
+    of a MoE as its ``(A, SFA)`` operand with ``ab_dtype="float8_e4m3fn"``,
+    ``sf_dtype="float8_e8m0fnu"`` and ``sf_vec_size=32``.
 
     Parameters
     ----------
     a : torch.Tensor
-        Contiguous input tensor of shape ``[B, M, 2 * K]`` with dtype
-        ``float16`` or ``bfloat16`` and a 32-byte aligned data pointer (as
-        every tensor PyTorch allocates is; an offset view into a buffer may
-        not be). Each row holds the gate values followed by the up values.
-        ``K`` must be divisible by 32.
+        Contiguous, 32-byte aligned ``float16`` or ``bfloat16`` tensor of
+        shape ``[B, M, 2 * K]``; each row holds the gate values, then the up
+        values. ``K`` must be divisible by 32.
     mask : torch.Tensor
-        Contiguous int32 CUDA tensor of shape ``[B]`` with the number of
-        valid rows of each expert. Only the first ``min(mask[i], M)`` rows of
-        expert ``i`` are read and written; a negative value selects no rows.
-        The values are read on the device, so the call does not synchronize
-        with the host and can be captured in a CUDA graph.
+        Contiguous int32 CUDA tensor of shape ``[B]``. Only the first
+        ``min(mask[i], M)`` rows of expert ``i`` are read and written (none for
+        a negative value). It is read on the device, so the call does not
+        synchronize and can be captured in a CUDA graph.
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch. Auto-detected from
         the device capability when ``None``.
@@ -726,20 +711,20 @@ def silu_and_mul_mxfp8_experts_quantize(
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
-        ``(x_q, sf)`` where ``x_q`` has logical shape ``[M, padded_K, B]``
-        with dtype ``float8_e4m3fn`` and ``sf`` has logical shape
+        ``(x_q, sf)`` in the layout of :func:`mxfp8_grouped_quantize`: ``x_q``
+        has logical shape ``[M, padded_K, B]`` with dtype ``float8_e4m3fn``
+        and ``sf`` has logical shape
         ``[32, 4, padded_M // 128, 4, padded_K // 128, B]`` with dtype
-        ``uint8``. ``padded_K`` rounds ``K`` up to a multiple of 128 (the
-        padded columns hold zero values and zero scales) and ``padded_M``
-        rounds ``M`` up to a multiple of 128. The physical layouts are grouped
-        by ``B`` and then permuted, matching :func:`mxfp8_grouped_quantize`.
+        ``uint8``, where ``padded_K`` and ``padded_M`` round ``K`` and ``M`` up
+        to multiples of 128. The padded columns hold zero values and scale
+        byte 0; rows past ``min(mask[i], M)`` (and their scale factors) are
+        unspecified, so the consumer must use the same ``mask``.
 
-        Rows ``>= mask[i]`` of expert ``i`` (and their scale factors) are
-        unspecified; the consumer must use the same ``mask``. A NaN value
-        stays NaN. An infinite value, including a float16
-        ``silu(gate) * up`` that overflows, quantizes to NaN and the rest of
-        its 32-value block to zero, as on the ``"cuda"`` backend of
-        :func:`mxfp8_grouped_quantize`.
+        The outputs match :func:`flashinfer.silu_and_mul` followed by the
+        ``"cuda"`` backend of :func:`mxfp8_grouped_quantize`, except possibly
+        in blocks that hold NaN. NaN stays NaN; an infinity, including a
+        float16 ``silu(gate) * up`` that overflows, quantizes to NaN and the
+        finite values of its block to zero.
     """
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, 2 * K]")
@@ -775,12 +760,11 @@ def silu_and_mul_mxfp8_experts_quantize(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(a.device)
 
-    x_q, sf = (
+    return (
         get_mxfp8_quantization_sm100_module().silu_and_mul_mxfp8_experts_quantize_sm100(
             a, mask, enable_pdl
         )
     )
-    return _to_masked_gemm_layout(x_q, sf)
 
 
 @flashinfer_api

@@ -923,12 +923,9 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
             jit_specs.append(gen_trtllm_gen_routing_module())
-        if has_sm100 or has_sm103 or has_sm107 or has_sm110 or has_sm120 or has_sm121:
-            # mxfp8_quantize and mxfp8_grouped_quantize default to this module on every SM100+ GPU,
-            # so each SM10x/SM11x/SM12x provider ships it; it builds for the targeted arch.
-            jit_specs.append(gen_mxfp8_quantization_sm100_module())
         if has_sm100f or has_sm103:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(

@@ -759,7 +759,7 @@ def _mxfp8_dequantize_grouped(x_q, sf, m, k):
         (2, 128, 128),
         (3, 256, 160),
         (4, 200, 2048),
-        # Rows wider than one block row: two column passes, the last one with padded columns.
+        # Two column passes per row, ending in padding (K = 4160) or full (K = 7168).
         (3, 40, 4160),
         (2, 72, 7168),
     ],
@@ -936,7 +936,7 @@ def test_mxfp8_experts_quantize_masked_gemm(batch_shape, use_silu_and_mul):
 def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
     batch_shape, dtype, other_backend
 ):
-    """The default ``cuda`` backend reproduces the other backends' valid-row bits."""
+    """The ``cuda`` backend reproduces the other backends' valid-row bits."""
     _skip_unless_grouped_backend("cuda")
     _skip_unless_grouped_backend(other_backend, dtype)
 
@@ -969,7 +969,7 @@ def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
 @pytest.mark.parametrize("other_backend", ["cutile", "cake"])
 @torch.inference_mode()
 def test_mxfp8_grouped_quantize_cuda_nan_matches_other_backends(other_backend):
-    """A NaN input value stays NaN, as in the other backends, with the same block scale."""
+    """NaN inputs stay NaN with the same block scales as the other backends."""
     _skip_unless_grouped_backend("cuda")
     _skip_unless_grouped_backend(other_backend)
 
@@ -1091,7 +1091,7 @@ def test_mxfp8_grouped_quantize_cuda_infinity():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_silu_and_mul_mxfp8_experts_quantize_non_finite(dtype):
-    """NaN and infinities quantize as on the plain path applied to ``silu_and_mul``."""
+    """Non-finite values match ``silu_and_mul`` + the ``cuda`` backend."""
     _skip_unless_grouped_backend("cuda")
 
     torch.manual_seed(0)
@@ -1191,7 +1191,7 @@ def test_mxfp8_experts_quantize_mask_out_of_range(use_silu_and_mul):
         )
 
 
-@pytest.mark.parametrize("batch_shape", [(0, 16, 64), (2, 0, 64)])
+@pytest.mark.parametrize("batch_shape", [(0, 16, 64), (2, 0, 64), (2, 16, 0)])
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
 def test_mxfp8_experts_quantize_empty(batch_shape, use_silu_and_mul):
@@ -1282,6 +1282,8 @@ def test_mxfp8_experts_quantize_non_current_device(use_silu_and_mul):
             rtol=0,
             atol=0,
         )
+    with pytest.raises(ValueError, match="same CUDA device"):
+        _run_mxfp8_experts_quantize(a, mask.to("cuda:0"), use_silu_and_mul)
 
 
 @torch.inference_mode()
@@ -1293,6 +1295,10 @@ def test_silu_and_mul_mxfp8_experts_quantize_invalid_inputs():
     a = torch.randn((b, m, 2 * k), dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
+    with pytest.raises(ValueError, match="3D"):
+        silu_and_mul_mxfp8_experts_quantize(a[0], mask)
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        silu_and_mul_mxfp8_experts_quantize(a.cpu(), mask)
     with pytest.raises(ValueError, match="K divisible by 32"):
         silu_and_mul_mxfp8_experts_quantize(a[..., :96].contiguous(), mask)
     with pytest.raises(ValueError, match="contiguous"):
@@ -1302,8 +1308,16 @@ def test_silu_and_mul_mxfp8_experts_quantize_invalid_inputs():
         silu_and_mul_mxfp8_experts_quantize(flat[8:].view(b, m, 2 * k), mask)
     with pytest.raises(ValueError, match="dtype"):
         silu_and_mul_mxfp8_experts_quantize(a.float(), mask)
+    with pytest.raises(ValueError, match="one entry per expert"):
+        silu_and_mul_mxfp8_experts_quantize(a, mask[:1])
+    with pytest.raises(ValueError, match="one entry per expert"):
+        silu_and_mul_mxfp8_experts_quantize(a, mask.view(b, 1))
     with pytest.raises(ValueError, match="int32"):
         silu_and_mul_mxfp8_experts_quantize(a, mask.long())
+    with pytest.raises(ValueError, match="same CUDA device"):
+        silu_and_mul_mxfp8_experts_quantize(a, mask.cpu())
+    with pytest.raises(ValueError, match="mask must be contiguous"):
+        silu_and_mul_mxfp8_experts_quantize(a, mask.repeat_interleave(2)[::2])
 
 
 @torch.inference_mode()
@@ -1315,12 +1329,22 @@ def test_mxfp8_grouped_quantize_cuda_invalid_inputs():
     x = torch.randn((b, m, k), dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
+    with pytest.raises(ValueError, match="3D"):
+        mxfp8_grouped_quantize(x[0], mask, backend="cuda")
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        mxfp8_grouped_quantize(x.cpu(), mask, backend="cuda")
     with pytest.raises(ValueError, match="divisible by 32"):
         mxfp8_grouped_quantize(x[..., :48].contiguous(), mask, backend="cuda")
     with pytest.raises(ValueError, match="dtype"):
         mxfp8_grouped_quantize(x.float(), mask, backend="cuda")
+    with pytest.raises(ValueError, match="one entry per group"):
+        mxfp8_grouped_quantize(x, mask[:1], backend="cuda")
+    with pytest.raises(ValueError, match="one entry per group"):
+        mxfp8_grouped_quantize(x, mask.view(b, 1), backend="cuda")
     with pytest.raises(ValueError, match="int32"):
         mxfp8_grouped_quantize(x, mask.long(), backend="cuda")
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        mxfp8_grouped_quantize(x, mask.cpu(), backend="cuda")
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])

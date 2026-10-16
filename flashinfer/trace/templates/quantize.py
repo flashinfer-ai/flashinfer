@@ -1012,7 +1012,7 @@ nvfp4_kv_quantize_trace = TraceTemplate(
 )
 
 
-# ── Grouped MXFP8 quantization (SM100+) ──────────────────────────────────────
+# ── Grouped MXFP8 quantization (cuTile, SM100+) ──────────────────────────────
 
 
 def _mxfp8_grouped_quantize_init(
@@ -1094,19 +1094,21 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
 )
 
 
+# ── SiLU+mul + masked MXFP8 experts quantization (SM100+) ────────────────────
+
+
 @torch.no_grad()
 def _quantize_mxfp8_round_up_scale(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8-quantize ``[M, K]`` bit for bit as the CUDA kernels do.
+    """MXFP8-quantize ``[M, K]`` with power-of-two block scales rounded up.
 
-    Each 32-element block scale ``amax / 448`` is rounded up to a power of two,
-    so the block maximum fits E4M3 without clamping. The block maximum skips
-    NaN; an all-NaN block gets scale byte 255 and NaN values. The kernels flush
-    float32 subnormals to zero, so a block whose scale is zero or subnormal gets
-    scale byte 0 and zero values, and a block that holds an infinity gets scale
-    byte 254 (whose reciprocal is subnormal): the infinity becomes NaN and the
-    other values zero. Every NaN is written as the positive E4M3 NaN. Returns
+    Rounding ``amax / 448`` up keeps each block maximum within E4M3. ``amax``
+    skips NaN, and every NaN is written as the positive E4M3 NaN. An all-NaN
+    block gets scale byte 255. A block whose scale is below ``2**-126`` gets
+    scale byte 0, and a block with an infinity gets 254; both quantize their
+    finite values to zero and an infinity to NaN. The CUDA kernels may differ
+    in blocks whose largest magnitude is at most ``448 * 2**-117``. Returns
     ``(x_q [M, K] fp8_e4m3fn, sf [M, K // 32] uint8)``.
     """
     m, k = x.shape
@@ -1131,12 +1133,13 @@ def _silu_and_mul_mxfp8_experts_quantize_reference(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for silu_and_mul_mxfp8_experts_quantize in a plain layout.
 
-    Rounds ``silu(gate) * up`` to the input dtype, as the kernel does, and
-    quantizes it per 32-element block. Returns ``(x_q, sf)`` with ``x_q`` of
-    shape ``[B, M, K]`` (fp8_e4m3fn) and ``sf`` of shape ``[B, M, K // 32]``
-    (UE8M0 bytes), without the grouped GEMM permutation, the K padding or the
-    scale swizzle. Every row is computed; the kernel writes only the first
-    ``min(mask[i], M)`` rows of expert ``i``, so compare those rows only.
+    Rounds ``silu(gate) * up`` to the input dtype, as the kernel does, before
+    quantizing; the kernel's fast ``exp`` can push a product near an
+    input-dtype rounding boundary to the other side. Returns
+    ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0 bytes)
+    without the K padding, scale swizzle or grouped GEMM permutation. Every
+    row is computed; compare only the first ``min(mask[i], M)`` rows of
+    expert ``i``.
     """
     b, m, k_doubled = a.shape
     k = k_doubled // 2
@@ -1185,11 +1188,10 @@ silu_and_mul_mxfp8_experts_quantize_trace = TraceTemplate(
     op_type="activation_quantize",
     name_prefix="silu_and_mul_mxfp8_experts_quantize",
     description=(
-        "Fused SiLU+mul activation followed by masked MXFP8 quantization "
-        "(SM100+), used between the two masked grouped GEMMs of batched MoE "
-        "experts: [B, M, 2K] bf16/fp16 -> fp8_e4m3fn activations + UE8M0 "
-        "block scales in the masked grouped GEMM layout. K is padded up to a "
-        "multiple of 128."
+        "Fused SiLU+mul + masked MXFP8 quantization between the two masked "
+        "grouped GEMMs of MoE experts (SM100+): [B, M, 2K] bf16/fp16 -> "
+        "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
+        "grouped GEMM. K is padded up to a multiple of 128."
     ),
     axes={
         "B": Var(description="Number of experts."),
