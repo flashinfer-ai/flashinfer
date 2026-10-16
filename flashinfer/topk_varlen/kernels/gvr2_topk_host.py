@@ -2429,12 +2429,22 @@ def run_varlen(
             )
         if not page_table.is_contiguous():
             raise RuntimeError("page_table must be contiguous")
-        # every column the kernels can emit (< min(envelope, width)) needs a page
-        need_pages = (min(_index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1], logits.shape[1]) + ps - 1) // ps
-        if page_table.shape[1] < need_pages:
+        # engine-independent bound: every engine ranks at least the view width
+        # (the reference engine ranks exactly the view), so a table short of it
+        # is refused here, on the host, before any launch. The auto engines'
+        # stride-based bound is checked below once their envelope is known.
+        need_lo = (
+            min(
+                _index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1],
+                logits.shape[1],
+            )
+            + ps
+            - 1
+        ) // ps
+        if page_table.shape[1] < need_lo:
             raise RuntimeError(
                 f"page_table has {page_table.shape[1]} pages per request; the logits width "
-                f"needs {need_pages} at page_size={ps}"
+                f"needs {need_lo} at page_size={ps}"
             )
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
@@ -2536,12 +2546,29 @@ def run_varlen(
                     "host — pass max_seq_len (a capture-stable engine "
                     "constant) under CUDA graph capture"
                 )
-            n_env = int(kv_lens.max().item()) >> cshift
+            kv_cols = int(kv_lens.max().item()) >> cshift
             # eager mode: quantize the data-dependent envelope up to the next
             # power of two so a growing decode does not recompile at every
             # R increment (bounded plans, bounded _VARLEN_CACHE)
-            n_env = 1 << max(n_env - 1, 1).bit_length()
+            n_env = 1 << max(kv_cols - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
+        if page_table is not None:
+            # every column the engines can emit needs a page. The emit bound is
+            # the envelope clamped to the row STRIDE, not the view width: a view
+            # narrower than its stride ranks the arena columns up to the caller's
+            # bound, and a table sized from the view width mapped the columns
+            # beyond it through missing entries (staged as -1 on the smem-table
+            # compile, read past the row on the global-table compile) and came
+            # back as negative slots without an error. In eager mode the bound
+            # is the live kv maximum, not the power-of-two envelope the cache
+            # key quantizes it to.
+            emit_bound = n_env if max_seq_len is not None else min(max(kv_cols, 1), npad)
+            need_pages = (emit_bound + ps - 1) >> page_shift
+            if page_table.shape[1] < need_pages:
+                raise RuntimeError(
+                    f"page_table has {page_table.shape[1]} pages per request; the engine "
+                    f"envelope of {emit_bound} columns needs {need_pages} at page_size={ps}"
+                )
         if windowed:
             idx = indices
             if idx.shape[1] != k:

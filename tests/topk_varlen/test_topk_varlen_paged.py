@@ -444,3 +444,99 @@ def test_paged_empty_row_tie_aware_check():
         bad = out.clone()
         bad[0, 0] = 0  # a slot for a request that spans no pages
         assert not check(out, bad, **kw)
+
+
+@requires_gvr2
+def test_paged_table_requirement_follows_the_engine_envelope():
+    """run_varlen's emit bound is the envelope clamped to the row STRIDE, not
+    the view width: on a [2, 2048] view of a [2, 4096] arena with kv_lens =
+    max_seq_len = 4096 the engines rank the arena columns up to 4096, so a page
+    table sized from the view width (32 pages of 64) is too small. That used to
+    pass validation and come back as garbage slots (reviewer's case); now the
+    call is refused, with or without an explicit envelope, and a table with the
+    64 pages the envelope needs gives the exact top-k of the arena rows. The
+    reference engine ranks the view, so the view-width bound stays for it; in
+    eager mode the auto engines' bound is the live kv maximum. The public API
+    passes the view width as the envelope, so it stays inside the view."""
+    k, ps = 1024, 64
+    arena = torch.randn(2, 4096, device=_DEV)
+    view = arena[:, :2048]
+    lens = torch.full((2,), 4096, dtype=torch.int32, device=_DEV)
+    out = torch.full((2, k), -7, dtype=torch.int32, device=_DEV)
+    short_pt = (
+        torch.arange(32, dtype=torch.int32, device=_DEV).repeat(2, 1).contiguous()
+    )
+    for msl in (4096, None):
+        with pytest.raises(RuntimeError, match="pages per request"):
+            _host.run_varlen(
+                view,
+                None,
+                lens,
+                out,
+                max_seq_len=msl,
+                top_k=k,
+                page_table=short_pt,
+                page_size=ps,
+            )
+    full_pt = torch.arange(64, dtype=torch.int32, device=_DEV).repeat(2, 1).contiguous()
+    _host.run_varlen(
+        view,
+        None,
+        lens,
+        out,
+        max_seq_len=4096,
+        top_k=k,
+        page_table=full_pt,
+        page_size=ps,
+    )
+    torch.cuda.synchronize()
+    for r in range(2):  # identity table: slot == arena column
+        sel = out[r].long()
+        assert (
+            int(sel.min()) >= 0 and int(sel.max()) < 4096 and sel.unique().numel() == k
+        )
+        assert torch.equal(
+            torch.sort(arena[r, sel]).values,
+            torch.sort(torch.topk(arena[r], k).values).values,
+        )
+    # the reference engine ranks the view, so the view-width bound still holds
+    # for it, on the host and before any launch: a 10-page table is refused
+    # instead of indexing the table out of range on the device
+    with pytest.raises(RuntimeError, match="pages per request"):
+        _host.run_varlen(
+            view,
+            None,
+            lens,
+            out,
+            max_seq_len=4096,
+            top_k=k,
+            page_table=short_pt[:, :10].contiguous(),
+            page_size=ps,
+            engine="reference",
+        )
+    # eager mode (no envelope): the requirement follows the live kv maximum, not
+    # the power-of-two envelope the cache key quantizes it to: a 3000-column view
+    # of a 65536-stride arena with kv 3000 needs 47 pages, not 64
+    wide = torch.randn(2, 65536, device=_DEV)
+    v3000 = wide[:, :3000]
+    lens3000 = torch.full((2,), 3000, dtype=torch.int32, device=_DEV)
+    pt47 = torch.arange(47, dtype=torch.int32, device=_DEV).repeat(2, 1).contiguous()
+    out3 = torch.full((2, k), -7, dtype=torch.int32, device=_DEV)
+    _host.run_varlen(
+        v3000, None, lens3000, out3, top_k=k, page_table=pt47, page_size=ps
+    )
+    torch.cuda.synchronize()
+    for r in range(2):  # identity table: slot == arena column, all inside the view
+        sel = out3[r].long()
+        assert (
+            int(sel.min()) >= 0 and int(sel.max()) < 3000 and sel.unique().numel() == k
+        )
+        assert torch.equal(
+            torch.sort(wide[r, sel]).values,
+            torch.sort(torch.topk(wide[r, :3000], k).values).values,
+        )
+    idx, _ = flashinfer.top_k_varlen(
+        view, lens, k, page_table=short_pt, page_size=ps, backend="gvr_2"
+    )
+    torch.cuda.synchronize()
+    assert int(idx.min()) >= 0 and int(idx.max()) < 2048
