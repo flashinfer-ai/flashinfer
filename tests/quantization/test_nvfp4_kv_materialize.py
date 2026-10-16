@@ -92,12 +92,14 @@ def _random_cache(num_pages, num_heads, page_size, head_dim, generator):
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 @pytest.mark.parametrize("page_strided", [False, True])
 @pytest.mark.parametrize("provide_out", [False, True])
+@pytest.mark.parametrize("compact", [False, True])
 def test_nvfp4_kv_materialize_fp8_matches_reference(
     head_dim: int,
     page_size: int,
     uses_shared_paged_kv_idx: bool,
     page_strided: bool,
     provide_out: bool,
+    compact: bool,
 ) -> None:
     num_physical_pages = 13
     num_heads = 2
@@ -137,12 +139,21 @@ def test_nvfp4_kv_materialize_fp8_matches_reference(
             _add_page_padding, (k_cache, v_cache, k_sf, v_sf)
         )
 
-    out_shape = (batch_size * max_pages + 1, 2, num_heads, page_size, head_dim)
+    # Compact mode reserves exactly each request's active pages.
+    active_pages = [(n + page_size - 1) // page_size for n in seq_lens_host]
+    page_starts = [sum(active_pages[:b]) for b in range(batch_size + 1)]
+    kv_page_indptr = num_pages = None
+    if compact:
+        kv_page_indptr = torch.tensor(page_starts, dtype=torch.int32, device="cuda")
+        num_pages = page_starts[-1]
+    else:
+        page_starts = [b * max_pages for b in range(batch_size + 1)]
+    out_shape = (page_starts[-1] + 1, 2, num_heads, page_size, head_dim)
     out = None
     if provide_out:
         out = torch.full(out_shape, 1.0, dtype=torch.float8_e4m3fn, device="cuda")
 
-    kv_fp8, compact_tables = nvfp4_kv_materialize_fp8(
+    kv_fp8, fp8_tables = nvfp4_kv_materialize_fp8(
         k_cache,
         v_cache,
         k_sf,
@@ -152,35 +163,35 @@ def test_nvfp4_kv_materialize_fp8_matches_reference(
         max_kv_len,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         out=out,
+        kv_page_indptr=kv_page_indptr,
+        num_pages=num_pages,
     )
     torch.cuda.synchronize()
 
     assert tuple(kv_fp8.shape) == out_shape
     if out is not None:
         assert kv_fp8.data_ptr() == out.data_ptr()
-    assert compact_tables.dtype == torch.int32
-    assert tuple(compact_tables.shape) == (batch_size, max_pages)
+    assert fp8_tables.dtype == torch.int32
+    assert tuple(fp8_tables.shape) == (batch_size, max_pages)
     assert torch.all(kv_fp8[0].view(torch.uint8) == 0)
 
     expected_k = _dequantize_reference(k_data, k_scales)
     expected_v = _dequantize_reference(v_data, v_scales)
-    compact_tables = compact_tables.cpu()
-    next_page = 1
+    fp8_tables = fp8_tables.cpu()
     for b, seq_len in enumerate(seq_lens_host):
         num_pages = (seq_len + page_size - 1) // page_size
         for j in range(max_pages):
-            compact = int(compact_tables[b, j])
+            page = int(fp8_tables[b, j])
             if j >= num_pages:
-                assert compact == 0
+                assert page == 0
                 continue
-            assert compact == next_page
-            next_page += 1
+            assert page == page_starts[b] + j + 1
             for plane, table, expected in (
                 (0, k_table, expected_k),
                 (1, v_table, expected_v),
             ):
                 torch.testing.assert_close(
-                    kv_fp8[compact, plane].view(torch.uint8),
+                    kv_fp8[page, plane].view(torch.uint8),
                     expected[int(table[b, j])].view(torch.uint8),
                     rtol=0,
                     atol=0,
