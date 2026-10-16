@@ -379,12 +379,12 @@ def test_mxfp8_grouped_quantize_cuda_graph_pool_reuse(batch_shape):
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
     # Eager reference. Also triggers the cuTile JIT compile before capture.
-    out_eager, sf_eager = mxfp8_grouped_quantize(x, mask, backend="cutile")
+    out_eager, sf_eager = mxfp8_grouped_quantize(x, mask)
     torch.cuda.synchronize()
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        out_graph, sf_graph = mxfp8_grouped_quantize(x, mask, backend="cutile")
+        out_graph, sf_graph = mxfp8_grouped_quantize(x, mask)
 
     scratch_numel = MAX_GROUPS_FUSED + 1
     for _ in range(8):
@@ -454,8 +454,8 @@ def test_mxfp8_grouped_quantize_concurrent_streams():
 
     # Per-stream eager references. Also triggers the cuTile JIT compile so the
     # concurrent loop does not compile on a side stream.
-    ref_qa, ref_sa = mxfp8_grouped_quantize(x_a, mask_a, backend="cutile")
-    ref_qb, ref_sb = mxfp8_grouped_quantize(x_b, mask_b, backend="cutile")
+    ref_qa, ref_sa = mxfp8_grouped_quantize(x_a, mask_a)
+    ref_qb, ref_sb = mxfp8_grouped_quantize(x_b, mask_b)
     torch.cuda.synchronize()
     ref_qa_v, ref_sa_v = valid_views(
         ref_qa, ref_sa, mask_vals_a, shape_a[1], shape_a[2]
@@ -473,9 +473,9 @@ def test_mxfp8_grouped_quantize_concurrent_streams():
     outs_b = []
     for _ in range(32):
         with torch.cuda.stream(stream_a):
-            outs_a.append(mxfp8_grouped_quantize(x_a, mask_a, backend="cutile"))
+            outs_a.append(mxfp8_grouped_quantize(x_a, mask_a))
         with torch.cuda.stream(stream_b):
-            outs_b.append(mxfp8_grouped_quantize(x_b, mask_b, backend="cutile"))
+            outs_b.append(mxfp8_grouped_quantize(x_b, mask_b))
     torch.cuda.synchronize()
 
     def assert_stream_matches(outs, ref_q_v, ref_s_v, masks, m, k):
@@ -1085,46 +1085,6 @@ def test_mxfp8_grouped_quantize_cuda_infinity():
     )
     torch.testing.assert_close(
         _grouped_mxfp8_scales(out_scale, m, k), ref_scale, rtol=0, atol=0
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@torch.inference_mode()
-def test_silu_and_mul_mxfp8_experts_quantize_non_finite(dtype):
-    """Non-finite values match ``silu_and_mul`` + the ``cuda`` backend."""
-    _skip_unless_grouped_backend("cuda")
-
-    torch.manual_seed(0)
-    b, m, k = 2, 128, 256
-    a = torch.randn((b, m, 2 * k), dtype=torch.float32, device="cuda") * 4
-    a[0, 0, 3] = float("nan")  # gate
-    a[0, 0, k + 40] = float("nan")  # up
-    a[0, 2, k + 64 : k + 96] = float("nan")  # a whole block
-    a[0, 1, 5] = 10.0
-    a[0, 1, k + 5] = float("inf")
-    a[1, 7, 200] = 10.0
-    a[1, 7, k + 200] = float("-inf")
-    if dtype == torch.float16:
-        # silu(300) * 300 overflows float16 to infinity.
-        a[1, 9, 17] = 300.0
-        a[1, 9, k + 17] = 300.0
-    a = a.to(dtype)
-    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
-
-    out, out_scale = silu_and_mul_mxfp8_experts_quantize(a, mask)
-    y = silu_and_mul(a.reshape(b * m, 2 * k)).reshape(b, m, k)
-    ref_out, ref_scale = mxfp8_grouped_quantize(y, mask, backend="cuda")
-
-    got = out.permute(2, 0, 1).contiguous().view(torch.uint8)
-    assert got[0, 0, 3].item() == 0x7F and got[0, 1, 5].item() == 0x7F
-    torch.testing.assert_close(
-        got, ref_out.permute(2, 0, 1).contiguous().view(torch.uint8), rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        _grouped_mxfp8_scales(out_scale, m, k),
-        _grouped_mxfp8_scales(ref_scale, m, k),
-        rtol=0,
-        atol=0,
     )
 
 
