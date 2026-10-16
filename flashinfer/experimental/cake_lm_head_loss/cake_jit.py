@@ -17,43 +17,44 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from pathlib import Path
 from typing import Any, Optional
 
-from ...jit import env as jit_env
-from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
-from ...jit.cpp_ext import get_cuda_version
+from . import cake_build
 
 # Explicit target-owned registration of the generated chunked LM-head + loss
 # programs, one record per architecture (the kernels take the call geometry
 # H / V as launch scalars; one record serves every admissible geometry).  The
 # generated-program export writes the compact tables between the two
-# ``generated registry``
-# markers; ``MODULES`` is their expansion.  A record carries ``arch``, the host
-# binding profile ``abi`` (the keyword set its kernels expect, see
-# ``cake_backend``), the list of kernel ``stages`` it registers (launch order),
-# the ``geometry`` the kernels were built for (see ``cake_backend.Geometry``:
-# the vocabulary columns per row-statistics partial, the GEMM row tile and CTA
-# pair, the K block of the weight-gradient GEMM, the element vector of the
-# cast, the divisibility ``V`` / ``H`` / the row stride of ``X`` must satisfy,
-# the label element type and, per GEMM, the cluster width, the work item's
-# columns and the default raster height), the program's ``closure_sha256`` and one
-# physical entry per stage: ``module`` (the generated program), ``sources``
-# (the kernel translation unit and its launch stub, relative to ``csrc/``),
-# ``compile_flags``, ``ffi_entry``, ``arg_plan``, ``closure_sha256``,
-# ``tma_workspace_bytes``, ``workspace_bytes``, ``grid`` and ``launch``.
+# ``generated registry`` markers; ``MODULES`` is their expansion.  A record
+# carries ``arch``, the host binding profile ``abi`` (the keyword set its
+# kernels expect, see ``cake_backend``), the list of kernel ``stages`` it
+# registers (launch order), the ``geometry`` the kernels were built for (see
+# ``cake_backend.Geometry``: the vocabulary columns per row-statistics
+# partial, the GEMM row tile and CTA pair, the K block of the weight-gradient
+# GEMM, the element vector of the cast, the divisibility ``V`` / ``H`` / the
+# row stride of ``X`` must satisfy, the label element type and, per GEMM, the
+# cluster width, the work item's columns and the default raster height) and
+# one physical entry per stage: ``module`` (the generated program),
+# ``library`` (the architecture-free stem of the stage's library; ``build.json``
+# names the per-architecture build ``<library>_<arch>``, see ``cake_build``),
+# ``ffi_entry``, ``arg_plan``, ``tma_workspace_bytes``, ``workspace_bytes``,
+# ``grid`` and ``launch``.  What to compile -- the translation units, the nvcc
+# flags (including the toolchain-conditional ``nvcc_flags_if``) and the
+# closure digest -- is recorded in ``build.json`` only, never here.
 #
 # Compact form: ``_ARG_PLANS`` and ``_LAUNCHES`` hold the distinct argument
 # plans and launch geometries by name; a stage row is
-# ``[unit, arg_plan, launch, closure_sha256, grid_x, grid_y, grid_z]`` plus an
-# optional trailing mapping of the fields that differ from their defaults
-# (``compile_flags`` ``[]``, ``ffi_entry`` ``"run"``, ``tma_workspace_bytes``
-# and ``workspace_bytes`` ``0``).  The unit names its two translation units:
-# ``csrc/cake_lm_head_loss/cake_lm_head_loss_<unit>_kernel.cu`` (one
-# architecture-neutral translation unit per kernel, shared by the records of
-# every architecture; the per-architecture lowering sits under ``__CUDA_ARCH__``
-# guards) and the launch stub ``..._launch.cu`` that binds the shared launcher
-# under ``csrc/cake_lm_head_loss/shim/`` to the kernel.  Do not edit by hand.
+# ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` plus an optional
+# trailing mapping of the fields that differ from their defaults
+# (``ffi_entry`` ``"run"``, ``tma_workspace_bytes`` and ``workspace_bytes``
+# ``0``).  The unit names the stage's program and library stem
+# ``cake_lm_head_loss_<unit>`` (one architecture-neutral translation unit per
+# kernel, shared by the records of every architecture; the per-architecture
+# lowering sits under ``__CUDA_ARCH__`` guards) whose ``build.json`` entry
+# ``cake_lm_head_loss_<unit>_<arch>`` lists ``csrc/cake_lm_head_loss/
+# cake_lm_head_loss_<unit>_kernel.cu`` and the launch stub ``..._launch.cu``
+# that binds the shared launcher under ``csrc/cake_lm_head_loss/shim/`` to the
+# kernel.  Do not edit by hand.
 # --- generated registry (written by the Cake export; do not edit) ---
 _ARG_PLANS: dict[str, list[list[str]]] = {
     "gather_rows_bf16": [["buffer", "x"], ["buffer", "idx_lo"], ["buffer", "count"], ["buffer", "out"], ["parameter", "ld_x_words"], ["parameter", "row_vecs"], ["parameter", "num_rows"], ["parameter", "T"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]],
@@ -142,11 +143,16 @@ STAGE_ROW_FIELDS = (
     "unit",
     "arg_plan",
     "launch",
-    "closure_sha256",
     "grid_x",
     "grid_y",
     "grid_z",
 )
+
+
+def library_stem(unit: str) -> str:
+    """Architecture-free library stem of the generated program of ``unit``; ``build.json`` names the
+    per-architecture build ``<stem>_<arch>`` (:func:`library_name`)."""
+    return f"cake_lm_head_loss_{unit}"
 
 
 def _expand_registry(
@@ -167,9 +173,7 @@ def _expand_registry(
         for stage, row in compact["stages"].items():
             if len(row) not in (len(STAGE_ROW_FIELDS), len(STAGE_ROW_FIELDS) + 1):
                 raise ValueError(f"{name}/{stage}: malformed registry row {row!r}")
-            unit, plan, launch, closure, grid_x, grid_y, grid_z = row[
-                : len(STAGE_ROW_FIELDS)
-            ]
+            unit, plan, launch, grid_x, grid_y, grid_z = row[: len(STAGE_ROW_FIELDS)]
             extra = (
                 dict(row[len(STAGE_ROW_FIELDS)])
                 if len(row) > len(STAGE_ROW_FIELDS)
@@ -177,14 +181,9 @@ def _expand_registry(
             )
             physical: dict[str, Any] = {
                 "module": f"cake_lm_head_loss_{unit}",
-                "sources": [
-                    f"cake_lm_head_loss/cake_lm_head_loss_{unit}_kernel.cu",
-                    f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu",
-                ],
-                "compile_flags": list(extra.pop("compile_flags", [])),
+                "library": library_stem(unit),
                 "ffi_entry": extra.pop("ffi_entry", "run"),
                 "arg_plan": [list(item) for item in arg_plans[plan]],
-                "closure_sha256": closure,
                 "tma_workspace_bytes": int(extra.pop("tma_workspace_bytes", 0)),
                 "workspace_bytes": int(extra.pop("workspace_bytes", 0)),
                 "grid": [grid_x, grid_y, grid_z],
@@ -192,7 +191,6 @@ def _expand_registry(
             }
             physical.update(extra)
             record[stage] = physical
-        record["closure_sha256"] = compact["closure_sha256"]
         modules[name] = record
     return modules
 
@@ -316,55 +314,30 @@ ROW_STAGES = (
     "scale_cast_f32",
     "scale_cast_scatter_bf16",
 )
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-}
-
-
-def toolchain_workaround_flags(arch: str) -> list[str]:
-    """Extra nvcc flags that work around a toolchain-specific code-generation problem.
-
-    CUDA 13.0's ptxas mis-schedules the sm_103a 2-CTA TMA producer loops of these programs.  At -O3 (and -O2, which
-    emits the same code), with a short K loop (<= 16 iterations, i.e. ``chunk_size <= 1024`` for the dW accumulate
-    GEMM) the second B-operand ``cp.async.bulk.tensor ... .cta_group::2`` of a stage is rejected by the TMA unit with
-    ``cudaErrorIllegalInstruction`` although every operand is legal; at -O1 the structural-form programs' dW cast GEMM
-    (the last chunk's ``dz_c^T @ X_c``) faults the same way on every call whose last chunk is partial (``T % chunk_size
-    != 0``: the short K loop of the tail chunk).  ptxas -O0 code is correct for both, as is the code of every other
-    toolchain (12.9, 13.3, 13.4); -O0 is therefore applied to the sm_103a programs on CUDA 13.0 only.
-    """
-    if arch != "sm_103a":
-        return []
-    version = get_cuda_version()
-    if (version.major, version.minor) == (13, 0):
-        return ["-Xptxas", "-O0"]
-    return []
 
 
 def toolchain_runs_hidden_count(arch: str) -> bool:
-    """Does the hidden valid-row count (``cake_backend.hidden_count_eligible``) run on ``arch`` with the nvcc this
-    checkout invokes?
+    """Does the hidden valid-row count (``cake_backend.hidden_count_eligible``) run on ``arch`` with the CUDA
+    toolkit that built (or will build) this package's libraries?
 
-    On CUDA 13.0 the sm_103a programs are built at ptxas -O0 (:func:`toolchain_workaround_flags`; -O1 before the
-    structural-form programs).  The -O1 code completed
-    the focused dW accumulate calls and the test file's shipped call schedule, but with the hidden count's schedule --
-    the compaction index, chunk 0's row gather and device-count logits GEMM queued before the count is read back -- the
-    test file still reaches a ``cudaErrorIllegalInstruction`` from the cluster launch of the dW accumulate GEMM at its
-    shortest K schedule (the one-row tail chunk of a two-chunk call), in every run; with the host count it passes, as
-    does the -O0 code with the hidden count.  So on CUDA 13.0 the sm_103a calls take the host-count path (the same
-    kernels per row, so bitwise the same outputs; the count and the index are formed on the host before the first
-    launch).  Every other architecture / toolchain pair runs the hidden count.  A mitigation of the ptxas 13.0 fault as
-    observed, not a root-cause fix.
+    On CUDA 13.0 the sm_103a programs are built at ptxas -O0 (``build.json`` carries ``["-Xptxas", "-O0"]``
+    under ``nvcc_flags_if`` for ``cuda == 13.0``: that toolchain's ptxas mis-schedules the sm_103a 2-CTA TMA
+    producer loops of these programs, see the package README).  The -O1 code completed the focused dW
+    accumulate calls and the test file's shipped call schedule, but with the hidden count's schedule -- the
+    compaction index, chunk 0's row gather and device-count logits GEMM queued before the count is read back --
+    the test file still reaches a ``cudaErrorIllegalInstruction`` from the cluster launch of the dW accumulate
+    GEMM at its shortest K schedule (the one-row tail chunk of a two-chunk call), in every run; with the host
+    count it passes, as does the -O0 code with the hidden count.  So on CUDA 13.0 the sm_103a calls take the
+    host-count path (the same kernels per row, so bitwise the same outputs; the count and the index are formed
+    on the host before the first launch).  Every other architecture / toolchain pair runs the hidden count.  A
+    mitigation of the ptxas 13.0 fault as observed, not a root-cause fix.
+
+    The toolkit version is :func:`cake_build.record_cuda_version`: the version that built the prebuilt
+    libraries (``aot/build_info.json``) when the package ships them, else the local toolkit of the JIT path.
     """
     if arch != "sm_103a":
         return True
-    version = get_cuda_version()
-    return (version.major, version.minor) != (13, 0)
-
-
-def toolchain_supports(arch: str) -> bool:
-    """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 only.)"""
-    return arch in ARCH_NVCC_FLAGS
+    return tuple(cake_build.record_cuda_version(arch)) != (13, 0)
 
 
 PRIMARY_RECORD = "cake_lm_head_loss_{arch}"  # the architecture's record (geometry-free: H / V are launch scalars)
@@ -434,46 +407,21 @@ def registered_stages(name: str) -> tuple[str, ...]:
     return present
 
 
-def _header_dirs():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return installed
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return source
-    raise FileNotFoundError("FlashInfer binding headers were not found")
-
-
-@functools.cache
-def gen_cake_lm_head_loss_module(name: str, stage: str):
+def library_name(name: str, stage: str) -> str:
+    """``build.json`` entry of ``stage`` of record ``name``: the stage's library stem plus the record's
+    architecture (``cake_lm_head_loss_<unit>_<arch>``)."""
     record = MODULES[name]
-    if not toolchain_supports(record["arch"]):
-        raise RuntimeError(
-            f"generated chunked LM-head program {name!r} targets {record['arch']}, "
-            "which this checkout cannot compile"
-        )
-    physical = record[stage]
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in physical["sources"]]
-    return gen_jit_spec(
-        name=f"{name}_{stage}_" + physical["closure_sha256"][:20],
-        sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
-            *physical["compile_flags"],
-            *toolchain_workaround_flags(record["arch"]),
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
-        use_fast_math=False,
-    )
+    return f"{record[stage]['library']}_{record['arch']}"
 
 
 @functools.cache
 def load_cake_lm_head_loss_module(name: str, stage: str):
-    return gen_cake_lm_head_loss_module(name, stage).build_and_load()
+    """Load (once per record and stage) the generated program of ``stage``: the prebuilt library under
+    ``aot/`` when the package ships it, else FlashInfer's JIT build of its ``build.json`` entry."""
+    return cake_build.load_library(library_name(name, stage))
+
+
+def specs_for_arch(arch: str):
+    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
+    ``flashinfer.jit.build_jit_specs`` warm-up)."""
+    return cake_build.jit_specs(arch)
