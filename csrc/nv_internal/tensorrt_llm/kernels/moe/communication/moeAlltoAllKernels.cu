@@ -1477,8 +1477,10 @@ __device__ __forceinline__ void vec_convert(
         out[j] = DstT(static_cast<float>(in[j]));
 }
 
-// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100+, Blackwell).
-#if TLLM_MOE_A2A_COMPILE_SM100
+// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100+, Blackwell). ptxas accepts the
+// bf16x2 source type from CUDA 13.1; older toolkits use the generic element-wise conversion above.
+#if TLLM_MOE_A2A_COMPILE_SM100 && defined(__CUDACC_VER_MAJOR__)                                                        \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1))
 template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
 __device__ __forceinline__ void vec_convert(
     flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out, flashinfer::vec_t<__nv_bfloat16, VEC_SIZE> const& in)
