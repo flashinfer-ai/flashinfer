@@ -5335,14 +5335,25 @@ class MoEMicroKernelBackend:
                                     Float32(1.0)
                                     + cute.math.exp(-sigmoid_arg, fastmath=False)
                                 )
-                                activated = sigmoid * gate_red
-                                if cutlass.const_expr(
-                                    self.has_swiglu_limit
-                                    and self.swiglu_clamp_after_silu
-                                ):
-                                    if activated > Float32(self.swiglu_limit):
-                                        activated = Float32(self.swiglu_limit)
-                                activated = activated * up_term
+                                if cutlass.const_expr(self.is_situ):
+                                    beta = Float32(SITU_DEFAULT_BETA)
+                                    linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
+                                    activated = (
+                                        beta
+                                        * cute.math.tanh(gate_red / beta, fastmath=False)
+                                        * sigmoid
+                                        * linear_beta
+                                        * cute.math.tanh(up_red / linear_beta, fastmath=False)
+                                    )
+                                else:
+                                    activated = sigmoid * gate_red
+                                    if cutlass.const_expr(
+                                        self.has_swiglu_limit
+                                        and self.swiglu_clamp_after_silu
+                                    ):
+                                        if activated > Float32(self.swiglu_limit):
+                                            activated = Float32(self.swiglu_limit)
+                                    activated = activated * up_term
                             else:
                                 relu_val = fmax_f32(gate_red, Float32(0.0))
                                 activated = relu_val * relu_val
