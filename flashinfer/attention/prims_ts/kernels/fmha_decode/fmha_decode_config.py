@@ -124,6 +124,7 @@ _SAGE_DTYPE_RECIPES = {
 }
 _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 128, 0, 2, 2),
     (BFloat16, BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
     (Float16, Float16, Float16, Float16, 256, 128, 1, 1),
 }
@@ -221,6 +222,7 @@ _KV256_DTYPE_RECIPES = {
     (BFloat16, BFloat16, BFloat16),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN),
     (Float8E4M3FN, Float8E4M3FN, Float16),
+    (Float8E4M3FN, Float8E4M3FN, BFloat16),
 }
 
 
@@ -230,10 +232,29 @@ _KV256_DTYPE_RECIPES = {
 # families rather than shape exceptions: batch size, KV length, tile choice,
 # and legal GMEM split fanout remain unrestricted by this declaration.
 _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
+    (
+        Float8E4M3FN,
+        Float8E4M3FN,
+        Float8E4M3FN,
+        output_dtype,
+        head_dim,
+        128 if head_dim == 256 else 0,
+        1 if head_dim == 256 else 2,
+        1 if head_dim == 256 else 2,
+    )
+    for head_dim in (64, 128, 256)
+    for output_dtype in (Float16, BFloat16, Float8E4M3FN)
+}
+
+# Automatic selection retains the established cost-model recipes. A working
+# output epilogue alone does not qualify another MMA layout for that model;
+# explicit kernel configurations can use the wider capability matrix above.
+_AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
 }
 
 
@@ -1294,13 +1315,7 @@ class FmhaDecodeConfig:
             and self.out_dtype in (Float16, BFloat16)
         ) or (
             self.q_dtype == Float8E4M3FN
-            and (
-                self.out_dtype in (Float16, Float8E4M3FN)
-                or (
-                    self.uses_q_token_kv_block_sparse_page_route
-                    and self.out_dtype == BFloat16
-                )
-            )
+            and self.out_dtype in (Float16, BFloat16, Float8E4M3FN)
         )
 
     @property
@@ -2198,6 +2213,21 @@ class FmhaDecodeConfig:
         return (self.q_dtype, self.k_dtype, self.out_dtype) in _KV256_DTYPE_RECIPES
 
     @property
+    def supports_auto_grouped_keeps(self) -> bool:
+        """Whether grouped Keeps is also qualified for automatic selection."""
+        if (
+            self.use_paged_kv
+            and self.tile_size_kv == 128
+            and self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
+        ):
+            return (
+                self._grouped_keeps_profile_key
+                in _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES
+                and self.supports_grouped_keeps
+            )
+        return self.supports_grouped_keeps
+
+    @property
     def uses_guarded_fixed_q1_grouped_keeps(self) -> bool:
         """Whether inactive grouped rows are excluded solely at output stores.
 
@@ -2210,6 +2240,7 @@ class FmhaDecodeConfig:
         profile = self._grouped_keeps_profile_key
         return (
             self.use_keeps_mma_ab
+            and self.use_paged_kv
             and self.groups_tokens_heads_q
             and self.max_seq_len_q == 1
             and not self.use_variable_seqlens_q
@@ -2236,6 +2267,7 @@ class FmhaDecodeConfig:
         profile = self._grouped_keeps_profile_key
         return (
             self.use_keeps_mma_ab
+            and self.use_paged_kv
             and self.groups_tokens_heads_q
             and not self.use_variable_seqlens_q
             and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
@@ -2873,7 +2905,7 @@ class FmhaDecodeConfig:
         if self.use_sage_attention:
             return False
 
-        if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
+        if self.use_paged_kv and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
             fixed_q1 = (
                 self.max_seq_len_q == 1 and 1 <= self.heads_q_per_kv <= self.tile_size_q
             )
@@ -4026,6 +4058,8 @@ def _try_apply_default_wide_keeps_config(
                 probe,
                 explicit_fields | {"tile_size_q"},
             )
+            if probe.groups_tokens_heads_q and not probe.supports_auto_grouped_keeps:
+                continue
             _validate_profile_support(
                 cfg=probe,
                 seq_len_q=seq_len_q,
@@ -4155,6 +4189,8 @@ def _resolve_grouped_q_launch_candidates(
             probe,
             explicit_fields | {"tile_size_q"},
         )
+        if probe.use_keeps_mma_ab and not probe.supports_auto_grouped_keeps:
+            return ()
         cost_num_insts_kv = probe.num_insts_kv
         _validate_profile_support(
             cfg=probe,
@@ -4735,9 +4771,9 @@ def _validate_profile_support(
             heads_q_per_kv=heads_q_per_kv,
             groups_tokens_heads_q=True,
         )
-    # Preserve the legacy fixed FP8 Q8/D128 profile. The D64/D256 extensions
-    # are deliberately limited to grouped page-32 decode; broader dtypes,
-    # head ratios, and variable-Q layouts remain unqualified.
+    # Fixed FP8 Q8 producers and reducers support both 16-bit output types.
+    # D64/D256 retain their grouped page-32 geometry; head ratios and
+    # variable-Q layouts remain constrained by the same resource profile.
     qualified_fp8_q8_separate_reduction_supported = (
         not use_keeps_mma_ab
         and cfg.use_split_kv
@@ -4747,14 +4783,14 @@ def _validate_profile_support(
         and cfg.k_dtype == Float8E4M3FN
         and cfg.v_dtype == Float8E4M3FN
         and (
-            (headdim == 128 and cfg.out_dtype == Float8E4M3FN)
+            headdim == 128
             or (
                 use_groups_tokens_heads_q
                 and cfg.use_paged_kv
                 and cfg.num_tokens_per_page == 32
                 and (
-                    (headdim == 64 and cfg.out_dtype == Float8E4M3FN)
-                    or (headdim == 256 and cfg.out_dtype == Float16)
+                    headdim == 64
+                    or (headdim == 256 and cfg.out_dtype in (Float16, BFloat16))
                 )
             )
         )
@@ -4930,20 +4966,6 @@ def _validate_profile_support(
             raise ValueError(
                 "fmha_decode keepsMmaAb requires numHeadsQPerKv == tile_size_q"
             )
-        fp8_q_token_kv_block_sparse_bf16_output = (
-            cfg.out_dtype == BFloat16
-            and use_groups_tokens_heads_q
-            and is_q_token_kv_block_sparse_grouped_keeps
-        )
-        if (
-            cfg.q_dtype == Float8E4M3FN
-            and cfg.out_dtype not in (Float16, Float8E4M3FN)
-            and not fp8_q_token_kv_block_sparse_bf16_output
-            and not cfg.use_sage_attention
-        ):
-            raise ValueError(
-                "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"
-            )
         use_split_kv = split_kv_mode != "disabled" or cfg.use_split_kv
         if use_split_kv:
             if cfg.q_dtype not in (Float16, BFloat16, Float8E4M3FN):
@@ -4993,7 +5015,7 @@ def _validate_profile_support(
             and cfg.q_dtype == Float8E4M3FN
             and cfg.k_dtype == Float8E4M3FN
             and cfg.v_dtype == Float8E4M3FN
-            and cfg.out_dtype == (Float16 if headdim == 256 else Float8E4M3FN)
+            and (headdim == 64 or cfg.out_dtype in (Float16, BFloat16))
             and cfg.splits_kv == cfg.max_splits_kv
             and 2 <= cfg.max_splits_kv <= 128
         )
@@ -5040,7 +5062,7 @@ def _validate_profile_support(
                 "{64,128,256}, TileSizeQ in {8,16,32}, "
                 "either ungrouped single-token or complete-token grouped Q, "
                 "at least two split CTAs, "
-                "and fp16/bf16 or fp8 qkv with fp16/fp8 output"
+                "and fp16/bf16 or fp8 qkv with fp16/bf16/fp8 output"
             )
         cluster_reason = cluster_smem_reduction_unsupported_reason(
             max_splits_kv=cfg.max_splits_kv,
@@ -5069,9 +5091,9 @@ def _validate_profile_support(
         raise ValueError(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
             "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
-            "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
-            "plus grouped paged-KV/page-32 D64 with FP8 output or D256 with "
-            "FP16 output); valid reduction dtypes and static split-KV are required"
+            "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile "
+            "(D128, plus grouped paged-KV/page-32 D64 or D256 with "
+            "FP16/BF16 output); valid reduction dtypes and static split-KV are required"
         )
     if tile_size_q and tile_size_q not in (8, 16, 32):
         raise ValueError("fmha_decode SwapsMmaAb supports tile_size_q in {8,16,32}")

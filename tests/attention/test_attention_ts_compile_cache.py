@@ -276,6 +276,7 @@ def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
     # Reuse the public numerical oracles for each distinct compiler entry.
     targets = [
         "test_attention_ts_decode.py::test_attention_ts_decode_compact_variable_k_acceptance[F7-fp8-sq4-q128-separate]",
+        "test_attention_ts_decode_bf16_output.py::test_fp8_bf16_output_public_entry_points[dense-True]",
         "test_attention_ts_context.py::test_attention_ts_context_bounded_public_correctness_matrix[fixed-fp16-dense-mha-one-shot]",
         "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[d128-bf16-32]",
         "test_attention_ts_mla_decode.py::test_attention_ts_mla_decode_compact_variable_k_acceptance[bf16-1cta-direct]",

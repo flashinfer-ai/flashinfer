@@ -1327,7 +1327,13 @@ def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
         )
 
 
-def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
+@pytest.mark.parametrize(
+    "output_dtype,output_name,output_suffix",
+    ((torch.float16, "float16", "fp16"), (torch.bfloat16, "bfloat16", "bf16")),
+)
+def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state(
+    output_dtype, output_name, output_suffix
+):
     """An omitted out override must retain the wrapper plan's output dtype."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
     from flashinfer.fi_trace import fi_trace
@@ -1352,7 +1358,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
         storage_page_size=page_size,
         use_packed_q=False,
         seq_len_q=1,
-        output_dtype=torch.float16,
+        output_dtype=output_dtype,
         mask_type="dense",
         window_left=-1,
         max_kv_len=page_size,
@@ -1369,10 +1375,42 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
     )
 
     assert definition["name"] == (
-        "prims_ts_decode_wrapper_tuple_fp16_output_dense_maxq1_maxk32_"
+        f"prims_ts_decode_wrapper_tuple_{output_suffix}_output_dense_maxq1_maxk32_"
         "wl-1_pf0_um0_h8_kv2_d128_ps32"
     )
-    assert definition["outputs"]["output"]["dtype"] == "float16"
+    assert definition["outputs"]["output"]["dtype"] == output_name
+
+
+@pytest.mark.parametrize("output_dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("combined", (False, True))
+@pytest.mark.parametrize("output_source", ("out", "out_dtype"))
+def test_attention_ts_decode_trace_uses_requested_16bit_output(
+    output_dtype, combined, output_source
+):
+    """FP8 input traces preserve both explicit output tensors and dtype overrides."""
+    from flashinfer.attention.prims_ts import batch_decode_with_paged_kv_cache
+    from flashinfer.fi_trace import fi_trace
+
+    q = torch.empty(2, 8, 128, dtype=torch.float8_e4m3fn)
+    cache = torch.empty(4, 2, 2, 32, 128, dtype=torch.float8_e4m3fn)
+    output_kwargs = (
+        {"out": torch.empty_like(q, dtype=output_dtype)}
+        if output_source == "out"
+        else {"out_dtype": output_dtype}
+    )
+    definition = fi_trace(
+        batch_decode_with_paged_kv_cache,
+        q=q,
+        paged_kv_cache=cache if combined else (cache[:, 0], cache[:, 1]),
+        block_tables=torch.arange(4, dtype=torch.int32).reshape(2, 2),
+        seq_lens_kv=torch.full((2,), 64, dtype=torch.int32),
+        **output_kwargs,
+    )
+    assert definition["outputs"]["output"]["dtype"] == str(output_dtype).removeprefix(
+        "torch."
+    )
+    suffix = "bf16" if output_dtype == torch.bfloat16 else "fp16"
+    assert f"_{suffix}_output_" in definition["name"]
 
 
 def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
