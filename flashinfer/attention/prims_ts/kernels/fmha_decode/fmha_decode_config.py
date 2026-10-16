@@ -2678,12 +2678,13 @@ class FmhaDecodeConfig:
             seq_len_q=self.max_seq_len_q,
             q_block_size=self.sage_q_block_size,
             heads_q_per_kv=self.heads_q_per_kv,
-            tile_size_q=self.tile_size_q,
+            q_tokens_per_tile=self.q_tokens_per_cta,
+            q_heads_interleaved=True,
             headdim=self.headdim,
             v_mean=self.sage_v_mean,
         )
         q_rows = layout.q_rows
-        assert q_rows.tokens_per_tile == self.q_tokens_per_cta
+        assert q_rows.rows_per_tile == self.tile_size_q
         assert q_rows.tiles == self.num_q_ctas
         return layout
 

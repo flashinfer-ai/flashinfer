@@ -74,10 +74,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     if config.use_sage_attention:
         sage_scale_layout = config.sage_scale_layout(key.seq_len_kv)
         prepare_sage_scales = _PrepareSageScales(
-            cfg=config,
-            layout=sage_scale_layout,
-            batch_size=key.batch_size,
-            num_kv_heads=key.num_kv_heads,
+            layout=sage_scale_layout, num_kv_heads=key.num_kv_heads
         )
     if key.use_block_sparse:
         prepare_kwargs = {
