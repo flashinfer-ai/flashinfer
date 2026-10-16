@@ -107,8 +107,6 @@ class Qwen35BlockGeometry:
             return f"the Qwen 3.5 block kernels serve head_dim={HEAD_DIM} only (the Rubin d256 flavor); got head_dim={self.head_dim}"
         if self.d_model % _PROJ_TILE:
             return f"d_model must be a multiple of {_PROJ_TILE} (the forced projection GEMM tile); got d_model={self.d_model}"
-        if self.rope_dim == 0:
-            return "rope_dim must be positive (the fused norm + RoPE projection rotates a leading slice of every head)"
         return None
 
     def frost(self):

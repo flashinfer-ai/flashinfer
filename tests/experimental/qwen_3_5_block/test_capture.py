@@ -1,7 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA-graph capture of the DECODE form: plan outside capture, the FIRST run captured with no eager warm-up under
-``set_sync_debug_mode("error")``, the replay bitwise the eager run, a replay over new lengths / tables / slots / inputs."""
+"""CUDA-graph capture of the three forms: plan outside capture, the FIRST run captured with no eager warm-up under
+``set_sync_debug_mode("error")``, the replay bitwise the eager run; on decode also a replay over new lengths / tables / slots /
+inputs; ``prepare`` under capture refused typed."""
 
 import pytest
 import torch
@@ -179,3 +180,186 @@ def test_prepare_under_capture_is_refused_typed():
             batch_size=1,
             block_table=case.block_table,
         )
+
+
+def _capture_first_run(run, out, kv_cache, rows=None):
+    """Capture ``run()`` as the FIRST launch of its plan under ``set_sync_debug_mode("error")``; assert nothing ran at capture; replay.
+    ``rows`` bounds the comparison on a bounded (extend) step: rows past the live ones are untouched by contract (they keep their NaN)."""
+    rows = out.shape[0] if rows is None else rows
+    written_before = int((kv_cache != 0).any(dim=-1).sum())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                run()
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert (
+            torch.isnan(out).all()
+            and int((kv_cache != 0).any(dim=-1).sum()) == written_before
+        ), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = out.clone()
+        assert torch.isnan(replayed[rows:]).all(), (
+            "rows past the live rows must stay untouched"
+        )
+        out.fill_(float("nan"))
+        run()
+        torch.cuda.synchronize()
+        assert torch.equal(out[:rows], replayed[:rows]), (
+            "the replay of the captured first run differs from the eager run"
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out[:rows], replayed[:rows]), (
+            "a second replay differs from the first"
+        )
+        return replayed
+    finally:
+        graph.reset()
+
+
+def test_extend_first_run_captured_replays_bitwise_eager():
+    """The extend form at a 64-token capacity (the small-capacity out-projection tile) with 32 live rows: the first run captured,
+    the replay bitwise the eager run, the pool rows as the oracle predicts."""
+    from flashinfer.qwen_3_5_block import (
+        Qwen35BlockGeometry,
+        prepare_qwen_3_5_block_bf16,
+    )
+
+    g = Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
+    case = PagedCase(
+        g,
+        (300, 0, 77),
+        (16, 0, 16),
+        page_size=16,
+        layout="NHD",
+        seed=24,
+        table_width=70,
+    )
+    cap, t = 64, case.t
+    plan = prepare_qwen_3_5_block_bf16(
+        "extend",
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=3,
+        token_capacity=cap,
+        block_table=case.block_table,
+    )
+    assert t % plan.live_rows_multiple == 0
+    h = torch.zeros(cap, g.d_model, dtype=torch.bfloat16, device="cuda")
+    cos = torch.ones(cap, g.rope_dim, dtype=torch.bfloat16, device="cuda")
+    sin = torch.zeros_like(cos)
+    slots = torch.full((cap,), -1, dtype=torch.int32, device="cuda")
+    h[:t], cos[:t], sin[:t], slots[:t] = (
+        case.hidden_states,
+        case.rope_cos,
+        case.rope_sin,
+        case.slot_mapping,
+    )
+    out = torch.full(
+        (cap, g.d_model), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    args = dict(
+        query_start_loc=case.query_start_loc.clone(),
+        kv_cache=case.kv_cache,
+        slot_mapping=slots,
+        block_table=case.block_table.clone(),
+        seq_lens=case.seq_lens.clone(),
+        num_actual_tokens=t,
+    )
+    replayed = _capture_first_run(
+        lambda: plan.run(h, cos, sin, case.weights, case.w_o, out=out, **args),
+        out,
+        case.kv_cache,
+        rows=t,
+    )
+    case.check_out(replayed[:t], label="extend replay")
+    case.check_written_rows(label="extend replay")
+
+
+def test_prefill_first_run_captured_replays_bitwise_eager():
+    from flashinfer.qwen_3_5_block import (
+        Qwen35BlockGeometry,
+        prepare_qwen_3_5_block_bf16,
+    )
+    from tests.test_helpers.qwen_3_5_block_cases import (
+        new_kv_cache,
+        random_weights,
+        ref_geometry,
+    )
+    from tests.test_helpers.qwen_3_5_block_reference import (
+        build_rope_tables,
+        cosine,
+        gated_attention_block_reference,
+    )
+
+    g = Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
+    weights, w_o = random_weights(g, device="cuda", seed=27)
+    batch, seq, page = 2, 96, 16
+    gen = torch.Generator(device="cuda").manual_seed(27)
+    h = torch.randn(
+        batch, seq, g.d_model, generator=gen, device="cuda", dtype=torch.float32
+    ).to(torch.bfloat16)
+    rg = ref_geometry(g)
+    cos, sin = build_rope_tables(
+        seq,
+        g.rope_dim,
+        base=rg.rope_base,
+        batch=batch,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    ref = gated_attention_block_reference(
+        h, weights.w_qkvg, weights.w_q_norm, weights.w_k_norm, cos, sin, w_o, rg
+    )
+    pages_per_seq = -(-seq // page)
+    kv = new_kv_cache(
+        batch * pages_per_seq + 3,
+        g.num_kv_heads,
+        page,
+        g.head_dim,
+        "NHD",
+        device="cuda",
+    )
+    pos = torch.arange(seq, device="cuda")
+    slots = torch.cat(
+        [
+            ((1 + b * pages_per_seq + pos // page) * page + pos % page)
+            for b in range(batch)
+        ]
+    ).to(torch.int32)
+    plan = prepare_qwen_3_5_block_bf16(
+        "prefill",
+        geometry=g,
+        device="cuda",
+        weights=weights,
+        w_o=w_o,
+        kv_cache=kv,
+        page_size=page,
+        batch_size=batch,
+        seq_len=seq,
+    )
+    out = torch.full(
+        (batch, seq, g.d_model), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    replayed = _capture_first_run(
+        lambda: plan.run(
+            h, cos, sin, weights, w_o, kv_cache=kv, slot_mapping=slots, out=out
+        ),
+        out,
+        kv,
+    )
+    c = cosine(replayed, ref.out)
+    print(f"[prefill replay] vs oracle cos {c:.6f}")
+    assert torch.isfinite(replayed.float()).all() and c > 0.999

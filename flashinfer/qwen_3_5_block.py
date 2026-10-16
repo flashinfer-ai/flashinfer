@@ -167,8 +167,8 @@ def qwen_3_5_block_rope_tables(
     byte-identical to what HF ``apply_rotary_pos_emb`` holds); a caller that already has them passes them directly.  This
     helper is for a stack that holds ``positions [num_tokens]`` and a ``cos_sin_cache [max_position, rope_dim]`` whose row is
     ``cos | sin`` halves of width ``rope_dim // 2`` (vLLM's ``RotaryEmbedding.cos_sin_cache``): one gather and two concats,
-    into ``out_cos`` / ``out_sin`` when given (capturable, no allocation).  mRoPE / YaRN / NTK differ only in how the cache is
-    built -- the caller's business.
+    into ``out_cos`` / ``out_sin`` when given (capturable: the gather's intermediate comes from the graph's pool under
+    capture, nothing else is allocated).  mRoPE / YaRN / NTK differ only in how the cache is built -- the caller's business.
 
     Parameters
     ----------
@@ -255,14 +255,20 @@ def prepare_qwen_3_5_block_bf16(
     max_query_len : Optional[int]
         extend: the longest sequence of new tokens a step carries (default ``token_capacity``).
     decode_split_kv : Optional[int]
-        decode: the split-KV (``None`` = the decode split model); the one performance knob, the same function under every value.
+        decode: the split-KV -- ``None`` = the decode split model, ``>= 2`` the split tile with the sigmoid gate in its combine,
+        ``1`` the unsplit tile with the gate as its own launch; a performance knob: the same function under every value.
     workspace_buffer : Optional[torch.Tensor]
         A caller-owned uint8 buffer of at least ``plan.workspace_size`` bytes; the plan allocates (and zeroes) its own when ``None``.
 
     Returns
     -------
     Qwen35BlockPlan
-        ``plan.run(...)`` launches it; ``plan.workspace_size``, ``plan.declaration`` and ``plan.supports(...)`` describe it.
+        ``plan.run(...)`` launches it; ``plan.workspace_size``, ``plan.declaration`` (the form, the compiled-in facts, the
+        stages, the decode route, the out-projection tile and ``live_rows_multiple`` of an extend plan, the cache roots) and
+        ``plan.supports(...)`` describe it.  On an extend plan of at most 128 tokens every ``num_actual_tokens`` must be a
+        multiple of ``plan.live_rows_multiple`` (the widest epilogue vector that divides the capacity; 32 on a 64- or 128-token
+        bf16 plan): the small-capacity out-projection tile takes the token rows as its epilogue-vector axis; a typed
+        ``ValueError`` names the remedy.
     """
     from .experimental.qwen_3_5_block import api as _impl
 
@@ -412,7 +418,8 @@ def qwen_3_5_block_bf16_extend(
     max_query_len : Optional[int]
         The longest sequence of new tokens the plan admits (default ``token_capacity``).
     num_actual_tokens : Optional[int]
-        The live token count (a host int: one captured graph per bucket).
+        The live token count (a host int: one captured graph per bucket).  On a plan of at most 128 tokens it must be a multiple
+        of ``plan.live_rows_multiple`` (32 in bf16; the small-capacity out-projection tile), else a typed ``ValueError``.
     kv_layout, out, workspace_buffer, plan
         As in :func:`qwen_3_5_block_bf16_prefill`.
 
@@ -493,7 +500,8 @@ def qwen_3_5_block_bf16_decode(
     max_seq_len : Optional[int]
         The logical KV bound (default ``max_pages * page_size``).
     decode_split_kv : Optional[int]
-        The one performance knob (``None`` = the decode split model).
+        The split-KV: ``None`` = the decode split model, ``>= 2`` the split tile with the gate in its combine, ``1`` the unsplit
+        tile with the gate as its own launch (a performance knob: the same function under every value).
     kv_layout, out, workspace_buffer, plan
         As in :func:`qwen_3_5_block_bf16_prefill`.
 

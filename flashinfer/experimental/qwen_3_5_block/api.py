@@ -13,6 +13,9 @@ onto plans without any host-side bookkeeping of its own.
 from __future__ import annotations
 
 import collections
+import functools
+import logging
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
@@ -37,6 +40,8 @@ __all__ = [
     "KvCache",
     "Qwen35BlockPlan",
     "cached_plan",
+    "clear_plan_cache",
+    "configure_vendored_tree",
     "decode",
     "extend",
     "kv_views",
@@ -49,6 +54,57 @@ def _frost_block():
     from ._cudnn_frost.gated_attention_block import GatedAttentionBlockFwd
 
     return GatedAttentionBlockFwd
+
+
+# --------------------------------------------------------------------------- the vendored tree in a FlashInfer process
+
+# The vendored tree's two on-disk caches and the variables it reads for them (documented in the README, "Caches and environment").
+_ENV_COMPILED_CACHE = "CUDNN_FRONTEND_COMPILED_CACHE"
+_ENV_GEMM_SOURCE_CACHE = "CUDNN_FRONTEND_GEMM_KERNEL_CACHE"
+_VENDORED_BANNER = "%s is an experimental API"
+# The vendored classes log their own experimental banner on a logger named after the class; FlashInfer's ExperimentalWarning
+# is the one opt-in signal of this API, so exactly that record is dropped.
+_VENDORED_BANNER_LOGGERS = ("GatedAttentionBlockFwd", "SdpaFwdDslSm100")
+
+
+class _DropVendoredBanner(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.msg != _VENDORED_BANNER
+
+
+@functools.lru_cache(maxsize=1)
+def configure_vendored_tree() -> Dict[str, Any]:
+    """Once per process, before the first plan: point the vendored cuDNN Frontend tree's two on-disk caches under FlashInfer's
+    cache root and drop its duplicate experimental banner.  Returns the cache facts a plan records in its ``declaration``.
+
+    The compiled-plan cache (``compile_cached``: the exported kernel objects, reloaded in milliseconds at the next start-up) goes
+    to ``FLASHINFER_CACHE_DIR/qwen_3_5_block/compiled_plans`` and the rendered GEMM sources to ``.../gemm_sources`` -- unless the
+    caller already chose a location through the tree's own variables (``CUDNN_FRONTEND_COMPILED_CACHE``,
+    ``CUDNN_FRONTEND_GEMM_KERNEL_CACHE``), which win.  ``CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`` turns the first cache off; the
+    second is where the JIT writes the source it imports and cannot be turned off.  Nothing is written here: the directories
+    are created by the first compile.
+    """
+    from flashinfer.jit.env import FLASHINFER_CACHE_DIR
+
+    from ._cudnn_frost.frost import compiled_cache
+
+    root = FLASHINFER_CACHE_DIR / "qwen_3_5_block"
+    compiled_plans = os.environ.get(_ENV_COMPILED_CACHE)
+    if not compiled_plans:
+        compiled_plans = str(root / "compiled_plans")
+        compiled_cache.set_cache_dir(compiled_plans)
+    gemm_sources = os.environ.get(_ENV_GEMM_SOURCE_CACHE)
+    if not gemm_sources:
+        # the tree reads the variable at every compile (no setter exists for this cache); set only when the caller left it unset
+        gemm_sources = str(root / "gemm_sources")
+        os.environ[_ENV_GEMM_SOURCE_CACHE] = gemm_sources
+    for name in _VENDORED_BANNER_LOGGERS:
+        logging.getLogger(name).addFilter(_DropVendoredBanner())
+    return {
+        "compiled_plans": compiled_plans,
+        "compiled_plans_enabled": bool(compiled_cache.enabled()),
+        "gemm_sources": gemm_sources,
+    }
 
 
 def _check_not_capturing(what: str) -> None:
@@ -350,6 +406,10 @@ class Qwen35BlockPlan:
     _k_strides: Tuple[int, ...] = field(repr=False)
     _v_strides: Tuple[int, ...] = field(repr=False)
     _workspace: Optional[torch.Tensor] = field(default=None, repr=False)
+    #: extend: every launched token-row count (the capacity, a ``num_actual_tokens``) is a multiple of this (1 = any count).  On a
+    #: plan of at most ``SMALL_CAPACITY`` tokens the out projection runs the small-capacity GEMM tile, whose token rows are the
+    #: kernel's epilogue-vector axis (see :func:`_out_projection_row_granularity`).
+    live_rows_multiple: int = 1
 
     @property
     def num_tokens(self) -> int:
@@ -436,6 +496,14 @@ class Qwen35BlockPlan:
                         f"qwen_3_5_block: num_actual_tokens must be an int in [1, {cap}] (the plan's token capacity), got {num_actual_tokens!r}"
                     )
                 live = int(num_actual_tokens)
+                if live % self.live_rows_multiple:
+                    raise ValueError(
+                        f"qwen_3_5_block: num_actual_tokens={live} must be a multiple of {self.live_rows_multiple} on this plan "
+                        f"(token_capacity={cap} <= {SMALL_CAPACITY}: the out projection runs the small-capacity GEMM tile "
+                        f"{self.declaration.get('out_proj_tile')}, whose token rows are its epilogue-vector axis); hand "
+                        f"num_actual_tokens=None with the token tensors at the capacity, round the live count up to a multiple of "
+                        f"{self.live_rows_multiple} with pad rows (finite values, slot -1), or plan with token_capacity > {SMALL_CAPACITY}"
+                    )
             counts = (cap,) if live is None else (cap, live)
             if hidden_states is not None:
                 bound["h"], rows, _ = _rows(
@@ -640,8 +708,12 @@ def prepare(
     max_query_len: Optional[int] = None,
     decode_split_kv: Optional[int] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
+    _declaration_overrides: Optional[Dict[str, Any]] = None,
 ) -> Qwen35BlockPlan:
-    """Declare, check and compile the block for one shape bucket; see :func:`flashinfer.qwen_3_5_block.prepare_qwen_3_5_block_bf16`."""
+    """Declare, check and compile the block for one shape bucket; see :func:`flashinfer.qwen_3_5_block.prepare_qwen_3_5_block_bf16`.
+
+    ``_declaration_overrides`` is a test hook, not part of the API: extra keywords for the vendored declaration (for instance
+    ``{"fuse_cache_write": False}`` to run the write-through as its own launch); the public entry points never pass it."""
     if form not in FORMS:
         raise ValueError(f"qwen_3_5_block: form must be one of {FORMS}, got {form!r}")
     if not isinstance(geometry, Qwen35BlockGeometry):
@@ -651,6 +723,7 @@ def prepare(
     _support.require_served(device, geometry, dtype, form)
     dev = _device_of(device)
     _check_not_capturing("prepare")
+    caches = configure_vendored_tree()
     if (
         isinstance(page_size, bool)
         or not isinstance(page_size, int)
@@ -683,7 +756,9 @@ def prepare(
     def mk(*shape):
         return torch.empty(*shape, dtype=dtype, device=dev)
 
-    knobs = dict(fuse_norm_rope=True, fuse_gate=True)
+    knobs: Dict[str, Any] = dict(fuse_norm_rope=True, fuse_gate=True)
+    if _declaration_overrides:
+        knobs.update(_declaration_overrides)
     table_sample = None
     pages = 0
     row_stride = 0
@@ -846,13 +921,31 @@ def prepare(
             **knobs,
         )
     # The projection GEMMs on the capture-safe JIT route by construction (the paged forms set it themselves; the dense prefill
-    # form does not yet -- a cuDNN Frontend follow-up -- and the vendored tree carries no cuDNN backend to query).
-    for st in (getattr(blk, "_proj", None), getattr(blk, "_out_proj", None)):
+    # form does not yet -- a cuDNN Frontend follow-up -- and the vendored tree carries no cuDNN backend to query).  The hook
+    # reaches into the vendored block; a re-vendor that renames these attributes must fail here, loudly, not drop the route.
+    missing = [a for a in ("_proj", "_out_proj", "_stages") if not hasattr(blk, a)]
+    if missing:
+        raise RuntimeError(
+            f"qwen_3_5_block: the vendored GatedAttentionBlockFwd no longer carries {missing}; the adapter's capture-safe hook "
+            "(api.prepare) must be updated with the re-vendored tree"
+        )
+    for st in (blk._proj, blk._out_proj):
         if st is not None:
             st.capture_safe = True
     blk.check_support()
     blk.compile()
     size = int(blk.get_workspace_size())
+    out_proj_tile, live_multiple = None, 1
+    if form == "extend":
+        out_proj_tile, live_multiple = _out_projection_row_granularity(blk, dtype)
+        # By construction the template picks the widest vector that divides the declared capacity, so this never fires; it is the
+        # tripwire for a re-vendor that changes the rule.
+        if rows % live_multiple:
+            raise ValueError(
+                f"qwen_3_5_block: token_capacity={rows} must be a multiple of {live_multiple} on a plan of at most {SMALL_CAPACITY} tokens "
+                f"(the out projection runs the small-capacity GEMM tile {out_proj_tile}, whose token rows are its epilogue-vector axis); "
+                f"pick a multiple of {live_multiple} or a token_capacity above {SMALL_CAPACITY}"
+            )
     if workspace_buffer is not None:
         ws = _tensor(workspace_buffer, "workspace_buffer")
         _on(ws, dev, "workspace_buffer")
@@ -901,6 +994,9 @@ def prepare(
                 "claimed",
             )
         },
+        out_proj_tile=out_proj_tile,
+        live_rows_multiple=live_multiple,
+        caches=caches,
         workspace_size=size,
     )
     return Qwen35BlockPlan(
@@ -924,7 +1020,48 @@ def prepare(
         _k_strides=tuple(int(x) for x in k.stride()),
         _v_strides=tuple(int(x) for x in v.stride()),
         _workspace=owned,
+        live_rows_multiple=live_multiple,
     )
+
+
+# The token capacity up to which the vendored out projection takes the small-capacity (swap-AB) GEMM route; the vendored
+# ``kernels/proj_gemm.py`` ``SMALL_M_MAX``.  Read from the tree when available so the two cannot drift.
+def _small_capacity() -> int:
+    try:
+        from ._cudnn_frost.gated_attention_block.kernels import proj_gemm
+
+        return int(proj_gemm.SMALL_M_MAX)
+    except Exception:  # noqa: BLE001 - the number is informational in error messages
+        return 128
+
+
+SMALL_CAPACITY = _small_capacity()
+
+
+def _out_projection_row_granularity(
+    blk, dtype: torch.dtype
+) -> Tuple[Optional[str], int]:
+    """``(the out-projection tile that runs, the multiple every launched token-row count must satisfy)`` on the bounded form.
+
+    Under a swap-AB tile (the small-capacity route, ``token_capacity <= SMALL_CAPACITY``) the token rows are the GEMM's N, which the
+    kernel template declares symbolic with the epilogue vector's divisibility (``vec_bytes_epi // itemsize`` elements); the fused QKV
+    projection and the forced 256-wide out-projection tile take the rows as M, which carries no such rule.  Read from the compiled
+    plan, never recomputed: the tile depends on the shape and on the device's SM count.
+    """
+    plan = getattr(getattr(blk, "_out_proj", None), "_plan", None)
+    jit = getattr(plan, "jit", None)
+    name = getattr(plan, "tile_config_name", None)
+    config = getattr(jit, "config", None)
+    if jit is None or config is None or not getattr(config, "swap_ab", False):
+        return name, 1
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    try:
+        from ._cudnn_frost.gemm.frost.sm100 import compiler as gemm_compiler
+
+        vec_bytes = int(gemm_compiler._epi_vec_bytes(jit.chain, config))
+    except Exception:  # noqa: BLE001 - a re-vendored compiler without the helper: the catalog's widest half-precision vector
+        vec_bytes = 64
+    return name, max(1, vec_bytes // itemsize)
 
 
 # --------------------------------------------------------------------------- the plan LRU behind the functional entry points

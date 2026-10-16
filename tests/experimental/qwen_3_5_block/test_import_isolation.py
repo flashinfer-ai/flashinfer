@@ -69,7 +69,8 @@ print("OK", len([k for k in sys.modules if k.startswith("flashinfer.experimental
 
 def test_vendored_tree_declares_the_forms_without_cudnn():
     """With the DSL importable (the vendored tree imports it at module level): the three forms DECLARE on host tensors with the
-    ``cudnn`` package blocked -- the vendored closure is complete."""
+    ``cudnn`` package blocked -- the vendored closure is complete.  The envelope's verdict follows the installed DSL: served with a
+    Rubin-capable DSL, a typed decline naming the missing ``sm_107a`` target without one (the CI images' DSL)."""
     pytest.importorskip("cutlass")
     out = _run_isolated(
         _BLOCK_CUDNN
@@ -90,7 +91,13 @@ Fwd(mk(64, DM), *w[:3], mk(64, ROPE), mk(64, ROPE), w[3], mk(64, DM), g, thd=Tru
 Fwd(mk(4, 2, DM), *w[:3], mk(4, 2, ROPE), mk(4, 2, ROPE), w[3], mk(4, 2, DM), g, paged_kv_page_size=P, kv_source="paged",
     sample_k_cache=kc, sample_v_cache=vc, sample_block_table=torch.zeros(4, 4, dtype=torch.int32), fuse_norm_rope=True, fuse_gate=True)
 env = Fwd.serving_envelope(g, DT, torch.device("cpu"), device_cc=(10, 7))
-assert env.extend.served and env.decode.served, (env.extend.reason, env.decode.reason)
+assert env.extend.served == env.decode.served == env.cutedsl_ok, (env.cutedsl_reason, env.extend.reason, env.decode.reason)
+from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+if is_rubin_cute_dsl_available():
+    assert env.cutedsl_ok and env.extend.served and env.decode.served, (env.extend.reason, env.decode.reason)
+else:
+    assert not env.cutedsl_ok and ("sm_107a" in env.cutedsl_reason or "nvidia-cutlass-dsl" in env.cutedsl_reason), env.cutedsl_reason
+    assert env.extend.reason == env.decode.reason == env.cutedsl_reason, (env.extend.reason, env.decode.reason)
 leaked = sorted(k for k in sys.modules if (k == "cudnn" and sys.modules[k] is not None) or k.startswith("cudnn."))
 assert not leaked, leaked
 print("OK")

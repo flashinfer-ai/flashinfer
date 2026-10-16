@@ -110,7 +110,7 @@ def test_version_probe_and_vendored_manifest_digests():
     assert (
         src.commit.startswith("fe8b50da0")
         and src.version == "1.32.0"
-        and src.files == 92
+        and src.files == 95
     )
     assert (
         src.validated_cutedsl == "4.8.0"
