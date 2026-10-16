@@ -1,9 +1,15 @@
 """Paged prepared API (DeepGEMM paged signatures): logits against the
 dequantized PyTorch paged reference (and DeepGEMM when importable), the
 clean_logits=False mask, graph replay with changed contents and chunk
-equivalence on SM100a/SM103a. Every paged call is ONE kernel launch (the
-schedule is derived in-kernel); ``get_paged_mqa_logits_metadata`` is a
-no-launch DeepGEMM-signature placeholder.
+equivalence on SM100a/SM103a, on BOTH paths of the optional schedule-meta
+input. Default path: every paged call is ONE kernel launch (the schedule is
+derived in-kernel); ``get_paged_mqa_logits_metadata`` is a no-launch
+DeepGEMM-signature placeholder and a tensor passed as ``schedule_meta`` keeps
+this path. Table path (opt-in): ``prepare_paged_mqa_schedule_meta`` returns the
+one-launch producer plan of the per-forward schedule table; a logits plan given
+it as ``schedule_meta`` serves the table-consuming ``:table`` program inside the
+catalog's ``sched_meta_windows`` (one logits launch, bit-identical logits) and
+the default program elsewhere (``plan.schedule_meta_used``).
 
 The tests skip while the installed catalog carries no paged route for the
 shape (``paged_route_available``); the host-only helpers are tested always and
@@ -22,6 +28,7 @@ from flashinfer.paged_mqa import (
     fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata,
     prepare_paged_mqa_logits,
+    prepare_paged_mqa_schedule_meta,
 )
 
 HEAD_DIM = 128
@@ -64,10 +71,50 @@ def _text_routes(scheduler):
     }
 
 
+def _is_meta_route(route_name):
+    """A schedule-meta producer route (``paged:fp8:meta:v<N>``): one ``schedule_meta`` stage, no logits program, no geometry
+    in its name -- the geometry-route checks below skip it (``test_paged_sched_meta_policy_and_producer_routes`` covers it)."""
+    return ":meta:" in route_name
+
+
 def _catalog_paged_routes():
     from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
 
-    return list(_catalog()["paged_routes"].values())
+    return [route for name, route in _catalog()["paged_routes"].items() if not _is_meta_route(name)]
+
+
+def _consumer_routes():
+    """The table-consuming ``:table`` routes (``policy.paged.sched_meta.consumer_routes``): served only to a plan given a
+    ``PagedScheduleMetaPlan`` inside the windows, never by ``paged_route_name`` (test_paged_schedule_meta_two_paths)."""
+    record = _runtime.paged_sched_meta()
+    return set() if record is None else set(record["consumer_routes"].values())
+
+
+def _schedule_meta_reference(ctx_2d, num_sms, split_kv):
+    """The schedule table the producer writes, in pure Python: ``num_segs[q] = ceil(ctx_last(q) / split_kv)`` over the
+    requests' last-token lengths, the inclusive prefix, ``total`` segments split as ``sm * (total // num_sms) + min(sm,
+    total % num_sms)`` and each start mapped back to its ``(request, kv_split)`` pair for ``sm`` in ``0..num_sms`` (one
+    atom per request: the paged programs iterate the next_n atoms in-kernel). Returns ``num_sms + 1`` pairs."""
+    lens = [int(v) for v in ctx_2d.reshape(-1).tolist()]
+    batch, next_n = (int(v) for v in ctx_2d.shape)
+    num_segs = [(lens[q * next_n + next_n - 1] + split_kv - 1) // split_kv for q in range(batch)]
+    prefix, acc = [], 0
+    for n in num_segs:
+        acc += n
+        prefix.append(acc)
+    total = prefix[-1] if batch else 0
+    qd, rd = (total // num_sms, total % num_sms) if num_sms > 0 else (0, 0)
+    table = []
+    for sm in range(num_sms + 1):
+        start = sm * qd + min(sm, rd)
+        q = 0
+        while q < batch and prefix[q] <= start:
+            q += 1
+        prev = prefix[q - 1] if q > 0 else 0
+        cur = prefix[q] if q < batch else total
+        offset, n = start - prev, cur - prev
+        table.append([q + (offset // n if n > 0 else 0), offset % n if n > 0 else 0])
+    return table
 
 
 def _skip_unless_route(heads, page, next_n):
@@ -137,13 +184,18 @@ def _one_shot(q, kv_cache, weights, ctx_2d, block_table, num_sms, max_len):
     ).run()
 
 
-def _inputs(heads, page, next_n, batch, avg_ctx, seed=7):
+def _inputs(heads, page, next_n, batch, avg_ctx, seed=7, uniform=False):
+    """Engine-layout operands; ``uniform`` pins every request's length to ``avg_ctx`` (the extent is then exactly ``avg_ctx``),
+    otherwise the lengths are drawn from ``[0.7 avg_ctx, 1.3 avg_ctx)``."""
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
     lo, hi = max(page, int(0.7 * avg_ctx)), max(page + 1, int(1.3 * avg_ctx))
-    ctx_max = torch.randint(
-        lo, hi, (batch,), device=device, dtype=torch.int32, generator=generator
-    )
+    if uniform:
+        ctx_max = torch.full((batch,), int(avg_ctx), device=device, dtype=torch.int32)
+    else:
+        ctx_max = torch.randint(
+            lo, hi, (batch,), device=device, dtype=torch.int32, generator=generator
+        )
     offsets = (next_n - 1 - torch.arange(next_n, device=device, dtype=torch.int32))[
         None, :
     ]
@@ -347,10 +399,11 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
         with pytest.raises(ValueError, match="is not admitted on"):
             prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len)
         plan = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len)
-    # The plan's route is the shipped per-call rule: the dynamic-scheduler route by batch, the static
-    # route inside this architecture's static-preferred windows (batch, max_context_len).
+    # The plan's route is the shipped per-call rule under the device's CTA budget: the rect / compact routes when
+    # the (request, KV split) rectangle fits one wave (catalog v11), else the dynamic-scheduler route by batch and
+    # the static route inside this architecture's static-preferred windows (batch, max_context_len).
     assert plan.route_name == _runtime.paged_route_name(
-        heads, page, next_n, batch=batch, max_context_len=max_len, arch=plan.arch
+        heads, page, next_n, batch=batch, max_context_len=max_len, arch=plan.arch, num_sms=plan.num_sms
     )
     static = _runtime.paged_route_name(heads, page, next_n)
     scheduler = _runtime.paged_dynamic_scheduler()
@@ -612,6 +665,8 @@ def test_paged_bindings_cover_every_program_argument():
     checked = 0
     counters = torch.zeros(2, dtype=torch.uint32, device=device)
     for route_name, route in catalog["paged_routes"].items():
+        if _is_meta_route(route_name):
+            continue  # the producer routes bind the schedule table by design (their own test)
         fields = {field[0]: int(field[1:]) for field in route_name.split(":")[2:5]}
         heads, page, next_n = fields["h"], fields["p"], fields["n"]
         ctx_2d = torch.full((batch, next_n), max_len, dtype=torch.int32, device=device)
@@ -657,6 +712,13 @@ def test_paged_bindings_cover_every_program_argument():
                 f"{program} binds a schedule buffer"
             )
             checked += 1
+        if route_name in _consumer_routes():
+            # the table-consuming program takes the table through ``sched_counters`` (the same contract, no extra operand)
+            # and is a program of its own next to the static route's on every architecture it is delivered for
+            static = route_name.rsplit(":", 1)[0]
+            for arch, program in route["stages"][0][1].items():
+                assert program != catalog["paged_routes"][static]["stages"][0][1][arch], (route_name, arch)
+                assert "sched_counters" in {name for _kind, name in catalog["programs"][program]["arg_plan"]}
     assert checked > 0
 
 
@@ -706,6 +768,10 @@ def test_paged_dynamic_scheduler_routes():
     for route_name in catalog["paged_routes"]:
         if (
             route_name.endswith(":dyn")
+            or route_name.endswith(":rect")  # catalog v11: selected only with num_sms (test_paged_rect_routes)
+            or route_name.endswith(":compact")  # catalog v11 (round-4 compact-walk adoption): selected only with num_sms, above one wave
+            or _is_meta_route(route_name)  # the schedule-meta producer routes: no geometry, never a logits route
+            or route_name in _consumer_routes()  # the table path: served only to a plan given a PagedScheduleMetaPlan
             or route_name in dynamic["routes"]
             or route_name in text_routes
         ):
@@ -816,8 +882,11 @@ SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
 def test_paged_static_window_lower_bound(monkeypatch):
     """A ``static_windows`` entry may carry a lower batch bound (``[min_batch, max_batch, max_context_len]``):
     the (64, 64, 2) route keeps the static program at batch == the SM count through 5376 context on both
-    architectures, while batch 64 / 128, the neighbouring batches and longer contexts take the dynamic route;
-    the static route admits the window; an entry of another length is refused when the policy is read."""
+    architectures, while batch 64 / 128, the neighbouring batches and the contexts between the ctx-4k and ctx-8k
+    classes take the dynamic route; the static route admits the window; an entry of another length is refused when
+    the policy is read. Round 4 (H35-b): the n1 route carries the same SM-count literal ``[sms, sms, 5376]`` and
+    ``[65, 128, 5376]``; round 4 (H35-c): ``[128, sms, 5632, 10752]`` on n2 / ``[64, sms, 5632, 10752]`` on n1 keep
+    the static program from 5632 through 10752 context, above it the dynamic route."""
     from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
 
     dynamic = _runtime.paged_dynamic_scheduler()
@@ -842,7 +911,8 @@ def test_paged_static_window_lower_bound(monkeypatch):
         for ctx in (2880, 4096, 5323, 5376):
             assert route(arch, sms, ctx) == static, (arch, ctx)
         assert _runtime.paged_static_preferred(arch, static, sms, 5376)
-        assert route(arch, sms, 5377) == dyn and route(arch, sms, 8192) == dyn
+        assert route(arch, sms, 5377) == dyn and route(arch, sms, 5631) == dyn  # between the ctx-4k and ctx-8k classes
+        assert route(arch, sms, 8192) == static and route(arch, sms, 10753) == dyn  # r4 H35-c: the n2 ctx-8k window [128, sms, 5632, 10752]
         for batch in (64, 128, sms - 1, sms + 1):
             assert route(arch, batch, 4096) == dyn, (arch, batch)
         # the batch-64 edge from batch 1 is unchanged; the other architecture's SM count is not this one's window
@@ -853,8 +923,11 @@ def test_paged_static_window_lower_bound(monkeypatch):
             _runtime.paged_route_name(
                 64, 64, 1, batch=sms, max_context_len=4096, arch=arch
             )
-            == "paged:fp8:h64:p64:n1:dyn"
+            == "paged:fp8:h64:p64:n1"  # r4 H35-b: the n1 SM-count window [sms, sms, 5376]
         )
+        assert _runtime.paged_route_name(64, 64, 1, batch=sms, max_context_len=5377, arch=arch) == "paged:fp8:h64:p64:n1:dyn"
+        assert _runtime.paged_route_name(64, 64, 1, batch=128, max_context_len=4096, arch=arch) == "paged:fp8:h64:p64:n1"  # r4 H35-b: [65, 128, 5376]
+        assert _runtime.paged_route_name(64, 64, 1, batch=129, max_context_len=4096, arch=arch) == "paged:fp8:h64:p64:n1:dyn"
         # the static route admits every call its window selects (the catalog invariant)
         assert _runtime.paged_route_admitted(arch, static, sms, 5376)
         # the context-lower-bounded four-field form (catalog v10): sm_100a keeps the static program at batch 256 from
@@ -885,7 +958,9 @@ def test_paged_static_window_lower_bound(monkeypatch):
             with pytest.raises(ValueError, match="at most"):
                 _runtime.paged_sched_state_words(hyb, 257)
         else:
-            assert not any(len(w) == 4 and w[2] > 1 for w in windows), windows
+            # sm_103a carries no catalog-v10 b256 window and no text route; its only context-lower-bounded window is
+            # the r4 H35-c n2 ctx-8k window pinned above (every published window reads as the four-field form here)
+            assert [w for w in windows if w[2] > 1] == [(128, sms, 5632, 10752)], windows
             assert route(arch, 256, 131072) == dyn
             assert not dynamic["static_window_routes"].get(arch), arch
     # an entry of another length is a catalog error, refused when the policy is read
@@ -1043,3 +1118,513 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
         q, kv_cache, weights, ctx_2d, wide, ctx, enforce_admission=False
     )
     assert plan.batch == batch and plan.max_context_len == ctx
+
+
+def test_paged_rect_routes():
+    """``policy.paged.rect`` (catalog v11) maps every single-atom static route to its ``:rect`` route, catalogued with one
+    logits stage whose program differs from the static and dynamic ones on every architecture; ``paged_route_name(...,
+    num_sms=)`` selects it FIRST exactly when ``batch * ceil(max_context_len / split_kv) <= max_waves * num_sms`` (the
+    boundary cases of the producer's rule table), without ``num_sms`` the pre-rect selection holds, and the rect route
+    carries the static route's admission rules."""
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    catalog = _catalog()
+    rect = _runtime.paged_rect()
+    if not rect["routes"]:
+        pytest.skip("catalog ships no rectangle-scheduled program")
+    dynamic = _runtime.paged_dynamic_scheduler()
+    assert rect["max_waves"] == 1 and rect["split_kv"] == int(_runtime.paged_policy()["split_kv"]) == 256
+    assert set(rect["routes"]) == set(dynamic["routes"])
+    for static, rect_route in rect["routes"].items():
+        assert rect_route == f"{static}:rect" and rect_route in catalog["paged_routes"]
+        assert [stage for stage, _p in catalog["paged_routes"][rect_route]["stages"]] == ["logits"]
+        for arch in sorted(catalog["arches"]):
+            programs = {
+                kind: catalog["paged_routes"][route]["stages"][0][1][arch]
+                for kind, route in (("static", static), ("dyn", dynamic["routes"][static]), ("rect", rect_route))
+            }
+            assert len(set(programs.values())) == 3, (static, arch, programs)
+            assert _runtime.paged_admission_rules(arch, rect_route) == _runtime.paged_admission_rules(arch, static)
+    name = _runtime.paged_route_name
+    n1, n2 = "paged:fp8:h64:p64:n1", "paged:fp8:h64:p64:n2"
+    # the producer's boundary table: one wave = batch x ceil(max_context_len / 256) <= num_sms
+    assert name(64, 64, 1, batch=4, max_context_len=4096, num_sms=148) == f"{n1}:rect"
+    assert name(64, 64, 1, batch=4, max_context_len=4096, num_sms=152) == f"{n1}:rect"
+    assert name(64, 64, 1, batch=1, max_context_len=1344, num_sms=148) == f"{n1}:rect"  # ceil: 6 splits
+    assert name(64, 64, 1, batch=16, max_context_len=1024, num_sms=148) == f"{n1}:rect"  # 64 units
+    assert name(64, 64, 2, batch=16, max_context_len=2304, num_sms=148) == f"{n2}:rect"  # 144 units
+    # above one wave (the round-4 compact-walk adoption, catalog v11 ``rect.compact``): the compact-walk route up to two waves at
+    # batch <= min(num_sms, 160); batch 1 takes the plain rect route at two waves; above two waves / above the batch bound the
+    # pre-rect selection holds (test_paged_rect_compact_routes pins the record itself)
+    compact = _runtime.paged_rect()["compact"]
+    if compact["routes"]:
+        assert name(64, 64, 2, batch=16, max_context_len=2560, num_sms=148) == f"{n2}:compact"  # 160 units
+        assert name(64, 64, 2, batch=16, max_context_len=2560, num_sms=152) == f"{n2}:compact"
+        assert name(64, 64, 1, batch=16, max_context_len=4096, num_sms=152) == f"{n1}:compact"  # 256 units
+        assert name(64, 32, 1, batch=1, max_context_len=37920, num_sms=148) == "paged:fp8:h64:p32:n1:rect"  # 149 splits, b1
+    else:
+        assert name(64, 64, 2, batch=16, max_context_len=2560, num_sms=148) == f"{n2}:dyn"  # 160 units
+        assert name(64, 64, 2, batch=16, max_context_len=2560, num_sms=152) == f"{n2}:dyn"
+        assert name(64, 64, 1, batch=16, max_context_len=4096, num_sms=152) == f"{n1}:dyn"  # 256 units
+        assert name(64, 32, 1, batch=1, max_context_len=37920, num_sms=148) == "paged:fp8:h64:p32:n1:dyn"  # 149 splits
+    assert name(64, 64, 1, batch=148, max_context_len=256, num_sms=148) == f"{n1}:rect"
+    assert name(64, 64, 1, batch=149, max_context_len=256, num_sms=148) == f"{n1}:dyn"  # 149 units, batch > num_sms
+    assert name(64, 64, 1, batch=16, max_context_len=8192, num_sms=148) == f"{n1}:dyn"  # 512 units: above two waves
+    assert name(64, 32, 1, batch=1, max_context_len=37888, num_sms=148) == "paged:fp8:h64:p32:n1:rect"  # 148 splits
+    assert name(32, 64, 2, batch=4, max_context_len=1024, num_sms=152) == "paged:fp8:h32:p64:n2:rect"
+    assert name(64, 64, 4, batch=4, max_context_len=1024, num_sms=152) == "paged:fp8:h64:p64:n4"  # multi-atom
+    assert _runtime.paged_rect_units(4, 4096) == 64 and _runtime.paged_rect_units(1, 1330) == 6
+    assert _runtime.paged_rect_applicable(n1, 148, 256, 148)
+    assert not _runtime.paged_rect_applicable(n1, 149, 256, 148)
+    assert not _runtime.paged_rect_applicable("paged:fp8:h64:p64:n4", 1, 256, 148)
+    # without num_sms (or without max_context_len) the pre-rect selection holds
+    assert name(64, 64, 1, batch=4, max_context_len=4096) == f"{n1}:dyn"
+    assert name(64, 64, 1, batch=4, num_sms=148) == f"{n1}:dyn"
+    assert name(64, 64, 1, num_sms=148) == n1
+    # with an architecture the rect route is served only where its (inherited) admission rules admit the call; elsewhere
+    # the pre-rect route of the same call is kept
+    for arch in sorted(catalog["arches"]):
+        assert name(64, 64, 1, batch=4, max_context_len=4096, arch=arch, num_sms=148) == f"{n1}:rect"
+        for heads, page, next_n, batch, ctx in ((32, 64, 2, 4, 8192), (64, 32, 2, 4, 8192), (64, 64, 2, 4, 1024)):
+            static = name(heads, page, next_n)
+            pre_rect = name(heads, page, next_n, batch=batch, max_context_len=ctx, arch=arch)
+            served = name(heads, page, next_n, batch=batch, max_context_len=ctx, arch=arch, num_sms=148)
+            if _runtime.paged_route_admitted(arch, rect["routes"][static], batch, ctx):
+                assert served == rect["routes"][static], (arch, static)
+            else:
+                assert served == pre_rect, (arch, static)
+
+
+def test_paged_rect_compact_routes():
+    """``policy.paged.rect.compact`` (catalog v11, the round-4 compact-walk adoption) maps every rect-capable static route to its
+    ``:compact`` route, catalogued with one logits stage whose program differs from the static / dyn / rect ones on every
+    architecture, admitted by the static route's rules; ``paged_route_name(..., num_sms=)`` selects it exactly when the
+    producer's shape-only rule does (``num_sms < U <= 2 num_sms``, ``batch <= min(num_sms, 160)``; batch 1 -> the rect route)."""
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    catalog = _catalog()
+    rect = _runtime.paged_rect()
+    compact = rect["compact"]
+    if not compact["routes"]:
+        pytest.skip("catalog ships no compact-walk program")
+    assert compact["max_waves"] == 2 and compact["max_batch"] == 160 and set(compact["routes"]) == set(rect["routes"])
+    for static, route in compact["routes"].items():
+        assert route == f"{static}:compact" and route in catalog["paged_routes"]
+        assert [stage for stage, _p in catalog["paged_routes"][route]["stages"]] == ["logits"]
+        for arch in sorted(catalog["arches"]):
+            programs = {
+                kind: catalog["paged_routes"][r]["stages"][0][1][arch]
+                for kind, r in (("static", static), ("rect", rect["routes"][static]), ("compact", route))
+            }
+            assert len(set(programs.values())) == 3, (static, arch, programs)
+            assert _runtime.paged_admission_rules(arch, route) == _runtime.paged_admission_rules(arch, static)
+    kind = _runtime.paged_rect_compact_kind
+    n1 = "paged:fp8:h64:p64:n1"
+    assert kind(n1, 16, 4096, 148) == "compact" and kind(n1, 16, 4096, 152) == "compact"  # 256 units
+    assert kind(n1, 4, 10624, 148) == "compact"  # S_max 42, 168 units
+    assert kind(n1, 4, 4096, 148) is None  # 64 units: one wave (the rect rule's)
+    assert kind(n1, 16, 8192, 148) is None  # 512 units: above two waves
+    assert kind(n1, 1, 42752, 148) == "rect" and kind(n1, 1, 37888, 148) is None  # 167 / 148 splits
+    assert kind(n1, 149, 256, 148) is None and kind(n1, 148, 512, 148) == "compact"  # the batch bound min(num_sms, 160)
+    assert kind(n1, 160, 512, 160) == "compact" and kind(n1, 161, 512, 161) is None
+    assert kind("paged:fp8:h64:p64:n4", 16, 4096, 148) is None  # multi-atom: no rect / compact program
+    name = _runtime.paged_route_name
+    assert name(64, 64, 1, batch=16, max_context_len=4096, num_sms=148) == f"{n1}:compact"
+    assert name(64, 64, 1, batch=4, max_context_len=10624, num_sms=148) == f"{n1}:compact"
+    assert name(64, 64, 1, batch=1, max_context_len=42752, num_sms=148) == f"{n1}:rect"
+    assert name(32, 64, 1, batch=16, max_context_len=4096, num_sms=152) == "paged:fp8:h32:p64:n1:compact"
+    assert name(64, 32, 2, batch=16, max_context_len=4096, num_sms=148) == "paged:fp8:h64:p32:n2:compact"
+    assert name(64, 64, 1, batch=16, max_context_len=4096) == f"{n1}:dyn"  # without num_sms the pre-rect selection holds
+    for arch in sorted(catalog["arches"]):
+        for heads, page, next_n, batch, ctx in ((64, 64, 1, 16, 4096), (32, 64, 1, 16, 4096), (64, 32, 2, 16, 4096), (32, 64, 2, 16, 4096)):
+            static = name(heads, page, next_n)
+            pre = name(heads, page, next_n, batch=batch, max_context_len=ctx, arch=arch)
+            served = name(heads, page, next_n, batch=batch, max_context_len=ctx, arch=arch, num_sms=148)
+            if _runtime.paged_route_admitted(arch, compact["routes"][static], batch, ctx):
+                assert served == compact["routes"][static], (arch, static)
+            else:
+                assert served == pre, (arch, static)
+
+
+def test_paged_sched_meta_policy_and_producer_routes():
+    """``policy.paged.sched_meta`` and ``policy.paged.dynamic_scheduler.sched_meta_windows`` (the unpublished v11, extended):
+    the producer routes ``paged:fp8:meta:v<N>`` are catalogued with one ``schedule_meta`` stage whose program binds the
+    schedule table and the producer's launch arguments on every architecture and whose record carries the launch geometry
+    (``threads``, ``dynamic_smem_bytes``, ``grid``) instead of the geometry fields; the selection names one of them for
+    every batch the paged programs accept, monotone in the batch (a larger batch never picks a smaller-capacity version);
+    the windows parse like ``static_windows``, lie inside the static route's admission and keep ``batch <= the SM count``;
+    ``consumer_routes`` maps exactly the windowed static routes to their ``:table`` routes (one logits stage, a program of
+    their own on the architectures whose windows name them, the static route's admission).  The producer launch and the
+    table path themselves are exercised by ``test_paged_schedule_meta_two_paths`` / ``test_paged_schedule_meta_producer_plan``."""
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    catalog = _catalog()
+    record = _runtime.paged_sched_meta()
+    if record is None:
+        pytest.skip("catalog carries no schedule-meta producer record")
+    assert record["table_shape"] == ("num_sms_plus_1", 2) and record["dtype"] == "int32"
+    args = record["producer_args"]
+    assert args["num_next_n_atoms"] == 1 and args["is_context_lens_2d"] == 1 and list(args["grid"]) == [1, 1, 1]
+    assert int(args["split_kv"]) == int(_runtime.paged_policy()["split_kv"])
+    programs = record["producer_programs"]
+    assert programs and set(programs) == {v for _b, _s, v in record["selection"]}
+    producer_args = {
+        "context_lens", "schedule_meta", "batch_size", "next_n", "num_next_n_atoms", "split_kv", "num_sms", "is_context_lens_2d",
+    }
+    for version, route in programs.items():
+        assert route == f"paged:fp8:meta:v{version}" and route in catalog["paged_routes"], route
+        rec = catalog["paged_routes"][route]
+        assert [stage for stage, _p in rec["stages"]] == ["schedule_meta"], route
+        assert rec["sequence"] is None
+        assert rec["num_heads"] is None and rec["block_q"] is None and rec["clean_logits"] is None
+        assert rec["kv_alignment"] is None and rec["kv_min"] is None
+        assert rec["threads"] % 32 == 0 and rec["threads"] >= 32 and rec["dynamic_smem_bytes"] >= 0 and rec["grid"] == [1, 1, 1]
+        by_arch = rec["stages"][0][1]
+        assert sorted(by_arch) == sorted(catalog["arches"]), route
+        for arch, program in by_arch.items():
+            bound = {name for _kind, name in catalog["programs"][program]["arg_plan"]}
+            assert producer_args <= bound, (route, arch, sorted(producer_args - bound))
+            assert arch in catalog["programs"][program]["arches"]
+        # the thread budget covers every SM index the selection hands this version (one thread per table entry)
+        for max_batch, max_sms_plus_1, named in record["selection"]:
+            if named == version and max_sms_plus_1 is not None:
+                assert rec["threads"] >= max_sms_plus_1, (route, max_sms_plus_1)
+    # the selection: a total rule over the accepted batches at both catalogued SM counts, monotone in the batch
+    for num_sms in sorted(SM_COUNT.values()):
+        picked = [
+            int(_runtime.paged_sched_meta_producer_route(batch, num_sms).rsplit(":v", 1)[1])
+            for batch in range(1, int(_runtime.paged_policy()["max_batch"]) + 1)
+        ]
+        capacity = {v: mb for mb, _s, v in record["selection"]}
+        assert all(capacity[a] <= capacity[b] for a, b in zip(picked, picked[1:])), num_sms
+        assert set(picked) <= set(programs)
+    with pytest.raises(ValueError):
+        _runtime.paged_sched_meta_producer_route(int(_runtime.paged_policy()["max_batch"]) + 1, 148)
+    # the windows: parsed like the static-preferred windows, inside the static route's admission, batch-capped by the SM count
+    windows = _runtime.paged_sched_meta_windows()
+    dynamic = _runtime.paged_dynamic_scheduler()
+    assert windows == dynamic["sched_meta_windows"]
+    for arch, table in windows.items():
+        assert arch in catalog["arches"]
+        for static, boxes in table.items():
+            assert static in catalog["paged_routes"] and boxes, (arch, static)
+            assert ":" not in static.split(":n", 1)[1]  # a static route, never a text / rect / dyn route
+            for min_batch, max_batch, min_ctx, max_ctx in boxes:
+                assert 1 <= min_batch <= max_batch <= SM_COUNT[arch], (arch, static, (min_batch, max_batch))
+                assert 2 <= min_ctx <= max_ctx, (arch, static, (min_ctx, max_ctx))
+                assert _runtime.paged_sched_meta_admitted(arch, static, min_batch, min_ctx)
+                assert _runtime.paged_sched_meta_admitted(arch, static, max_batch, max_ctx)
+                assert not _runtime.paged_sched_meta_admitted(arch, static, max_batch + 1, max_ctx)
+                assert not _runtime.paged_sched_meta_admitted(arch, static, max_batch, max_ctx + 1)
+                assert not _runtime.paged_sched_meta_admitted(arch, static, min_batch, min_ctx - 1)
+                for batch, ctx in ((min_batch, min_ctx), (max_batch, max_ctx)):
+                    assert _runtime.paged_route_admitted(arch, static, batch, ctx), (arch, static, batch, ctx)
+    assert not _runtime.paged_sched_meta_admitted("sm_90a", "paged:fp8:h64:p64:n4", 16, 4096)
+    # the consumer routes: one per windowed static route, the table-consuming program behind the ``:table`` suffix
+    consumers = record["consumer_routes"]
+    assert set(consumers) == {static for table in windows.values() for static in table}
+    for static, route in consumers.items():
+        assert route == f"{static}:table" and route in catalog["paged_routes"], route
+        assert _runtime.paged_sched_meta_consumer_route(static) == route
+        rec = catalog["paged_routes"][route]
+        assert [stage for stage, _p in rec["stages"]] == ["logits"] and rec["sequence"] is None
+        assert rec["num_heads"] == catalog["paged_routes"][static]["num_heads"] and rec["clean_logits"] == "raw"
+        assert set(rec["stages"][0][1]) == {arch for arch, table in windows.items() if static in table}, route
+        for arch, program in rec["stages"][0][1].items():
+            assert program != catalog["paged_routes"][static]["stages"][0][1][arch], (route, arch)
+            assert arch in catalog["programs"][program]["arches"]
+            assert _runtime.paged_admission_rules(arch, route) == _runtime.paged_admission_rules(arch, static), (route, arch)
+    unwindowed = [
+        name for name in catalog["paged_routes"]
+        if not _is_meta_route(name) and ":" not in name.split(":n", 1)[1] and name not in consumers
+    ]
+    assert all(_runtime.paged_sched_meta_consumer_route(name) is None for name in unwindowed)
+
+
+def test_paged_rect_route_matches_the_pre_rect_route_bitwise():
+    """A b4 ctx-4k call (64 (request, KV split) cells) takes the rect route under the device's CTA budget; the same
+    call under a one-CTA budget (``sm_count=1``: 64 cells do not fit one wave) takes the pre-rect route; both plans
+    compute the same logits bitwise, and the rect plan's grid is one CTA per cell."""
+    heads, page, next_n, batch, avg_ctx = 64, 64, 1, 4, 4096
+    _skip_unless_route(heads, page, next_n)
+    rect = _runtime.paged_rect()
+    static = _runtime.paged_route_name(heads, page, next_n)
+    if static not in rect["routes"]:
+        pytest.skip("catalog ships no rectangle-scheduled program for h64 p64 n1")
+    q, kv_cache, _kv_fp8, _scale, weights, ctx_2d, block_table, max_len = _inputs(
+        heads, page, next_n, batch, avg_ctx
+    )
+    plan = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len)
+    assert plan.route_name == rect["routes"][static] == _runtime.paged_route_name(
+        heads, page, next_n, batch=batch, max_context_len=max_len, arch=plan.arch, num_sms=plan.num_sms
+    )
+    cells = _runtime.paged_rect_units(batch, int(block_table.shape[1]) * page)
+    assert cells <= plan.num_sms and plan.grid_x == cells and plan.rect
+    one_cta = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, sm_count=1)
+    assert one_cta.route_name == _runtime.paged_route_name(
+        heads, page, next_n, batch=batch, max_context_len=max_len, arch=plan.arch
+    )
+    assert one_cta.route_name != plan.route_name and one_cta.grid_x == 1 and not one_cta.rect
+    # both programs store exactly DeepGEMM's per-request extent: the same cells written, the same bits on them; cells
+    # past a shorter request's extent are never written and stay unspecified in both (torch.empty) buffers
+    plan.output.fill_(float("nan"))
+    one_cta.output.fill_(float("nan"))
+    plan.run()
+    one_cta.run()
+    torch.cuda.synchronize()
+    written = ~torch.isnan(one_cta.logical_output)
+    assert torch.equal(~torch.isnan(plan.logical_output), written)
+    assert written.any() and torch.equal(plan.logical_output[written], one_cta.logical_output[written])
+    assert torch.isfinite(plan.logical_output[written]).any()
+
+
+# (heads, page, next_n, batch, avg context, uniform): the two-path cases of the optional schedule-meta input.  The first four
+# lie inside a ``sched_meta_windows`` box of the architecture(s) TABLE_ADMITTED names (``_inputs(uniform=True)`` pins the
+# extent to the average context): the n4 window ``[128, sms, 4096, 170304]`` on both architectures (random extents
+# 5734..10648 / the uniform floor 4096), the sm_100a n1 window ``[16, 16, 4096, 5248]`` at its ceiling and the sm_103a n1
+# window ``[64, 64, 4096, 5184]`` at its floor; the last two are accepted calls no window admits (a static-route call at
+# batch 3 and a rect-route call), on which the meta plan is accepted and NOT consumed.
+TABLE_CASES = [
+    (64, 64, 4, 128, 8192, False),
+    (64, 64, 4, 128, 4096, True),
+    (64, 64, 1, 16, 5248, True),
+    (64, 64, 1, 64, 4096, True),
+    (64, 64, 4, 3, 2048, False),
+    (64, 64, 1, 1, 1024, False),
+]
+TABLE_ADMITTED = {"sm_100a": {0, 1, 2}, "sm_103a": {0, 1, 3}}
+
+
+@pytest.mark.parametrize("index,case", list(enumerate(TABLE_CASES)))
+def test_paged_schedule_meta_two_paths(index, case):
+    """Both paths of the optional schedule-meta input on one call.  (i) The default path: ``schedule_meta=None`` is one launch
+    of the default program (``schedule_meta_used`` False); (ii) the DeepGEMM placeholder tensor is the same path, program for
+    program and bit for bit (no silent switch inside a window); (iii) ``prepare_paged_mqa_schedule_meta`` is one launch of
+    the producer route the selection names and writes the pure-Python reference table bit for bit; (iv) a plan given the
+    meta plan serves the ``:table`` route exactly where the catalog admits the call on the plain static route -- a program of
+    its own, one launch, the table bound through ``sched_counters`` -- and the default plan elsewhere, with bit-identical
+    logits either way; (v) the one-shot entry given the meta plan reproduces those bits; (vi) a CUDA graph of producer +
+    logits replayed on changed contents rewrites the table and reproduces an eager default-path plan bit for bit."""
+    heads, page, next_n, batch, avg_ctx, uniform = case
+    _skip_unless_route(heads, page, next_n)
+    if _runtime.paged_sched_meta() is None:
+        pytest.skip("catalog carries no schedule-meta producer record")
+    q, kv_cache, kv_fp8, scale, weights, ctx_2d, block_table, max_len = _inputs(
+        heads, page, next_n, batch, avg_ctx, uniform=uniform
+    )
+    admitted = _admitted(q, ctx_2d, max_len, heads, page, next_n)
+    arch, num_sms = _runtime._resolve_device(q, None)
+    static = _runtime.paged_route_name(heads, page, next_n)
+    split_kv = int(_runtime.paged_policy()["split_kv"])
+
+    def logits_plan(**kwargs):
+        if admitted:
+            return prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len, **kwargs)
+        return _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, **kwargs)
+
+    # (i) the default path
+    plan = logits_plan()
+    assert plan.launch_count == 1 and plan.schedule_meta_used is False and plan.schedule_meta is None
+    assert plan.program_names == [plan.route["stages"][0][1][arch]]
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
+    _check(plan.logical_output, ref, ctx_2d, max_len, plan.output)
+    written = ~torch.isnan(plan.logical_output)
+    default_bits = plan.logical_output.clone()
+    # (ii) the placeholder tensor: the default path, program for program and bit for bit
+    placeholder = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
+    assert not placeholder.any()
+    plan_p = logits_plan(schedule_meta=placeholder)
+    assert plan_p.route_name == plan.route_name and plan_p.program_names == plan.program_names
+    assert plan_p.schedule_meta_used is False and plan_p.schedule_meta is placeholder
+    assert plan_p.sched_counters.numel() == plan.sched_counters.numel()
+    plan_p.output.fill_(float("nan"))
+    plan_p.run()
+    torch.cuda.synchronize()
+    assert torch.equal(plan_p.logical_output[written], default_bits[written])
+    # (iii) the producer plan
+    meta = prepare_paged_mqa_schedule_meta(ctx_2d, num_sms=num_sms)
+    assert meta.launch_count == 1 and meta.num_sms == num_sms and (meta.batch, meta.next_n) == (batch, next_n)
+    assert meta.route_name == _runtime.paged_sched_meta_producer_route(batch, num_sms) and meta.arch == arch
+    assert _runtime.paged_sched_meta()["producer_programs"][meta.version] == meta.route_name
+    assert meta.program_name == meta_program(meta.route_name, arch)
+    assert meta.table.dtype == torch.int32 and tuple(meta.table.shape) == (num_sms + 1, 2)
+    assert meta.table.device == q.device and meta.table.is_contiguous()
+    meta.table.zero_()  # a wrong-but-valid table (the reference is non-zero past entry 0): a producer that did not run shows
+    assert meta.run() is meta.table
+    torch.cuda.synchronize()
+    assert meta.table.cpu().tolist() == _schedule_meta_reference(ctx_2d.cpu(), num_sms, split_kv)
+    # (iv) the logits plan given the producer plan
+    plan_t = logits_plan(schedule_meta=meta)
+    expected_used = plan.route_name == static and _runtime.paged_sched_meta_admitted(arch, static, batch, max_len)
+    assert expected_used == (index in TABLE_ADMITTED[arch]), (arch, index, plan.route_name, max_len)
+    assert plan_t.schedule_meta_used is expected_used and plan_t.schedule_meta is meta
+    assert plan_t.launch_count == 1 and plan_t.num_sms == num_sms
+    if expected_used:
+        consumer = _runtime.paged_sched_meta_consumer_route(static)
+        assert plan_t.route_name == consumer == f"{static}:table"
+        assert plan_t.program_names == [plan_t.route["stages"][0][1][arch]]
+        assert plan_t.program_names != plan.program_names
+        assert plan_t.sched_counters.data_ptr() == meta.table.data_ptr()
+        assert plan_t.sched_counters.numel() == 2 * (num_sms + 1) and plan_t.sched_counters.dtype == torch.uint32
+        assert not plan_t.rect and plan_t.grid_x == num_sms
+    else:
+        assert plan_t.route_name == plan.route_name and plan_t.program_names == plan.program_names
+        assert plan_t.sched_counters.numel() == plan.sched_counters.numel()
+        assert plan_t.sched_counters.data_ptr() != meta.table.data_ptr()
+    plan_t.output.fill_(float("nan"))
+    plan_t.run()
+    torch.cuda.synchronize()
+    _check(plan_t.logical_output, ref, ctx_2d, max_len, plan_t.output)
+    assert torch.equal(~torch.isnan(plan_t.logical_output), written)
+    assert torch.equal(plan_t.logical_output[written], default_bits[written])
+    # (v) the one-shot entry given the producer plan: the same bits (its CTA budget is the meta plan's)
+    if admitted:
+        shot = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
+    else:
+        shot = _validation_plan(
+            q, kv_cache, weights, ctx_2d, block_table, max_len, schedule_meta=meta
+        ).run()
+    torch.cuda.synchronize()
+    assert torch.equal(shot[written], default_bits[written])
+    # (vi) graph replay of producer + logits with changed contents
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            meta.run()
+            plan_t.run()
+    with torch.cuda.stream(stream):
+        weights.neg_()
+        ctx_2d.copy_((ctx_2d - 3).clamp_min(1))
+        plan_t.output.fill_(float("nan"))
+        meta.table.zero_()  # every CTA an empty walk until the replayed producer rewrites the table
+        graph.replay()
+    stream.synchronize()
+    assert meta.table.cpu().tolist() == _schedule_meta_reference(ctx_2d.cpu(), num_sms, split_kv)
+    ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
+    _check(plan_t.logical_output, ref, ctx_2d, max_len, plan_t.output)
+    eager = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, sm_count=num_sms)
+    assert eager.schedule_meta_used is False and eager.route_name == plan.route_name
+    eager.output.fill_(float("nan"))
+    eager.run()
+    torch.cuda.synchronize()
+    written = ~torch.isnan(eager.logical_output)
+    assert torch.equal(~torch.isnan(plan_t.logical_output), written)
+    assert torch.equal(plan_t.logical_output[written], eager.logical_output[written])
+
+
+def meta_program(route_name, arch):
+    """The producer program a ``paged:fp8:meta:v<N>`` route launches on ``arch``."""
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    return _catalog()["paged_routes"][route_name]["stages"][0][1][arch]
+
+
+def test_paged_schedule_meta_producer_plan():
+    """The producer side of the table path.  Host half: ``schedule_meta_bindings`` covers every producer program's launcher
+    contract; ``consumer_routes`` maps exactly the windowed static routes to ``:table`` routes catalogued with one logits
+    stage, a program of their own on the architectures whose windows name them and the static route's admission; a static
+    route without windows has no consumer.  Device half: ``out=`` reuse, the default CTA budget, the ``ValueError`` /
+    ``TypeError`` contract of the producer plan (1-D / CPU / non-int32 / non-contiguous lengths, a batch above the ceiling, an
+    ``out`` of the wrong dtype / shape / layout / device) and of a logits plan given one (another CTA budget, another
+    ``context_lens`` tensor, a foreign ``schedule_meta`` type), and a meta plan fixing the CTA budget of the plans that consume
+    it."""
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    catalog = _catalog()
+    record = _runtime.paged_sched_meta()
+    if record is None:
+        pytest.skip("catalog carries no schedule-meta producer record")
+    lens = torch.full((3, 2), 300, dtype=torch.int32)
+    table = torch.zeros((5, 2), dtype=torch.int32)
+    bindings = _runtime.schedule_meta_bindings(lens, table, num_sms=4)
+    assert (bindings["batch_size"], bindings["next_n"], bindings["num_sms"]) == (3, 2, 4)
+    assert (bindings["grid_x"], bindings["grid_y"], bindings["grid_z"]) == tuple(record["producer_args"]["grid"])
+    assert bindings["split_kv"] == int(_runtime.paged_policy()["split_kv"]) and bindings["num_next_n_atoms"] == 1
+    assert bindings["is_context_lens_2d"] == 1
+    assert bindings["schedule_meta"].data_ptr() == table.data_ptr() and bindings["schedule_meta"].ndim == 1
+    assert bindings["context_lens"].ndim == 1 and bindings["context_lens"].numel() == 6
+    for route in record["producer_programs"].values():
+        for arch, program in catalog["paged_routes"][route]["stages"][0][1].items():
+            missing = [name for _kind, name in catalog["programs"][program]["arg_plan"] if name not in bindings]
+            assert not missing, (route, arch, missing)
+    windows = _runtime.paged_sched_meta_windows()
+    consumers = record["consumer_routes"]
+    assert set(consumers) == {static for table in windows.values() for static in table}
+    for static, route in consumers.items():
+        assert route == f"{static}:table" and _runtime.paged_sched_meta_consumer_route(static) == route
+        rec = catalog["paged_routes"][route]
+        assert [stage for stage, _p in rec["stages"]] == ["logits"] and rec["sequence"] is None
+        assert set(rec["stages"][0][1]) == {arch for arch, table in windows.items() if static in table}, route
+        for arch, program in rec["stages"][0][1].items():
+            assert program != catalog["paged_routes"][static]["stages"][0][1][arch], (route, arch)
+            assert _runtime.paged_admission_rules(arch, route) == _runtime.paged_admission_rules(arch, static)
+    unwindowed = [
+        name for name in catalog["paged_routes"]
+        if not _is_meta_route(name) and ":" not in name.split(":n", 1)[1] and name not in consumers
+    ]
+    assert all(_runtime.paged_sched_meta_consumer_route(name) is None for name in unwindowed)
+    assert _runtime.paged_sched_meta_consumer_route("paged:fp8:h64:p64:n2:dyn") is None
+    if _catalogued_device_arch() is None:
+        return
+    _skip_unless_route(64, 64, 1)
+    q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, max_len = _inputs(64, 64, 1, 8, 2048)
+    arch, num_sms = _runtime._resolve_device(q, None)
+    device = q.device
+    split_kv = int(_runtime.paged_policy()["split_kv"])
+    out = torch.full((num_sms + 1, 2), -1, dtype=torch.int32, device=device)
+    meta = prepare_paged_mqa_schedule_meta(ctx_2d, num_sms=num_sms, out=out)
+    assert meta.table is out and meta.run() is out
+    torch.cuda.synchronize()
+    assert out.cpu().tolist() == _schedule_meta_reference(ctx_2d.cpu(), num_sms, split_kv)
+    assert meta.arch == arch and meta.version in record["producer_programs"] and meta.launch_count == 1
+    assert prepare_paged_mqa_schedule_meta(ctx_2d).num_sms == num_sms  # the device's SM count by default
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(ctx_2d.reshape(-1), num_sms=num_sms)  # 1-D lengths
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(ctx_2d.cpu(), num_sms=num_sms)  # CPU lengths (an operand error, not a device error)
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(ctx_2d.to(torch.int64), num_sms=num_sms)  # non-int32 lengths
+    strided = torch.zeros((ctx_2d.shape[0], 2), dtype=torch.int32, device=device)[:, : ctx_2d.shape[1]]
+    assert not strided.is_contiguous()
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(strided, num_sms=num_sms)  # non-contiguous lengths
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(
+            ctx_2d, num_sms=num_sms, out=torch.zeros((num_sms + 1, 2), dtype=torch.int32)
+        )  # out on another device
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(
+            ctx_2d, num_sms=num_sms, out=torch.zeros((num_sms + 1, 2), dtype=torch.int64, device=device)
+        )
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(
+            ctx_2d, num_sms=num_sms, out=torch.zeros((num_sms, 2), dtype=torch.int32, device=device)
+        )
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(
+            ctx_2d, num_sms=num_sms, out=torch.zeros((2, num_sms + 1), dtype=torch.int32, device=device).t()
+        )
+    too_many = torch.ones((int(_runtime.paged_policy()["max_batch"]) + 1, 1), dtype=torch.int32, device=device)
+    with pytest.raises(ValueError):
+        prepare_paged_mqa_schedule_meta(too_many, num_sms=num_sms)
+    # a meta plan is bound to its CTA budget and to its context_lens tensor; any other schedule_meta type is refused
+    with pytest.raises(ValueError):
+        _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, schedule_meta=meta, sm_count=num_sms - 1)
+    foreign = prepare_paged_mqa_schedule_meta(ctx_2d.clone(), num_sms=num_sms)
+    with pytest.raises(ValueError):
+        _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, schedule_meta=foreign)
+    with pytest.raises(TypeError):
+        _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, schedule_meta=object())
+    with pytest.raises(TypeError):
+        fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, object(), max_len)
+    # a meta plan fixes the CTA budget of the plans that consume it (sm_count defaults to the meta plan's)
+    smaller = prepare_paged_mqa_schedule_meta(ctx_2d, num_sms=num_sms - 1)
+    smaller.run()
+    plan = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, schedule_meta=smaller)
+    assert plan.num_sms == num_sms - 1 and plan.launch_count == 1
+    torch.cuda.synchronize()
