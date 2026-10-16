@@ -438,7 +438,10 @@ void append_paged_kv_cache_with_slot_mapping(TensorView append_key, TensorView a
   TVM_FFI_ICHECK(paged_v_cache.dtype() == append_key.dtype())
       << "paged_v_cache dtype must match append_value dtype";
 
-  const unsigned int nnz = static_cast<unsigned int>(slot_mapping.size(0));
+  TVM_FFI_ICHECK_GE(num_valid_tokens, 0) << "num_valid_tokens must be non-negative";
+  TVM_FFI_ICHECK_LE(num_valid_tokens, slot_mapping.size(0))
+      << "num_valid_tokens must be <= slot_mapping.size(0)";
+  const unsigned int nnz = static_cast<unsigned int>(num_valid_tokens);
   TVM_FFI_ICHECK_GE(append_key.size(0), nnz);
   TVM_FFI_ICHECK_GE(append_value.size(0), nnz);
 
@@ -447,15 +450,19 @@ void append_paged_kv_cache_with_slot_mapping(TensorView append_key, TensorView a
   head_dim = paged_k_cache.size(3);
   if (kv_layout == QKVLayout::kHND) {
     num_heads = paged_k_cache.size(1);
+    TVM_FFI_ICHECK_EQ(paged_k_cache.size(2), page_size)
+        << "paged_k_cache.size(2) must match page_size for HND layout";
   } else {
     num_heads = paged_k_cache.size(2);
+    TVM_FFI_ICHECK_EQ(paged_k_cache.size(1), page_size)
+        << "paged_k_cache.size(1) must match page_size for NHD layout";
   }
 
   TVM_FFI_ICHECK_EQ(append_key.size(1), num_heads);
   TVM_FFI_ICHECK_EQ(append_key.size(2), head_dim);
   TVM_FFI_ICHECK_EQ(append_value.size(1), num_heads);
   TVM_FFI_ICHECK_EQ(append_value.size(2), head_dim);
-  TVM_FFI_ICHECK_GT(head_dim % 16, 0) << "head_dim must be a multiple of 16 for vectorized access";
+  TVM_FFI_ICHECK_EQ(head_dim % 16, 0) << "head_dim must be a multiple of 16 for vectorized access";
 
   auto require_same_shape = [](TensorView lhs, TensorView rhs, const char* name) {
     TVM_FFI_ICHECK_EQ(lhs.ndim(), rhs.ndim()) << name << " ndim mismatch";

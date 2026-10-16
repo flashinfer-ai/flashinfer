@@ -1177,6 +1177,14 @@ def append_paged_kv_cache_with_slot_mapping(
         raise ValueError(
             f"append_key.shape[2]={append_key.shape[2]} must match head_dim={head_dim}"
         )
+    if append_value.shape[1] != num_heads:
+        raise ValueError(
+            f"append_value.shape[1]={append_value.shape[1]} must match num_heads={num_heads}"
+        )
+    if append_value.shape[2] != head_dim:
+        raise ValueError(
+            f"append_value.shape[2]={append_value.shape[2]} must match head_dim={head_dim}"
+        )
     if head_dim % 16 != 0:
         raise ValueError(
             f"head_dim={head_dim} must be a multiple of 16 for vectorized access"
