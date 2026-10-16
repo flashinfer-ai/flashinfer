@@ -176,6 +176,16 @@ from .cake_fused_norm_combine import (
     cake_fused_norm_combine_workspace_bytes as cake_fused_norm_combine_workspace_bytes,
 )
 
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce as cake_gemm_allreduce,
+)
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce_select_route as cake_gemm_allreduce_select_route,
+)
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce_workspace_bytes as cake_gemm_allreduce_workspace_bytes,
+)
+
 
 def __getattr__(name: str):
     if name == "quantized_all_reduce":
