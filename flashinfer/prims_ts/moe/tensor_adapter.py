@@ -407,16 +407,20 @@ def build_bf16_launch_io(
         raise ValueError(
             f"tile_idx/mn_limit capacity mismatch: {tile_idx.numel()} vs {mn_limit.numel()}"
         )
-    if not tile_idx.is_contiguous():
-        raise ValueError("tile_idx must be contiguous")
-    if not mn_limit.is_contiguous():
-        raise ValueError("mn_limit must be contiguous")
-    if not route_map.is_contiguous():
-        raise ValueError("route_map must be contiguous")
-    if not num_non_exiting_ctas.is_contiguous():
-        raise ValueError("num_non_exiting_ctas must be contiguous")
-    if not total_num_padded_tokens.is_contiguous():
-        raise ValueError("total_num_padded_tokens must be contiguous")
+    for name, tensor in (
+        ("hidden_states", hidden_states),
+        ("gemm1_weights", gemm1_weights),
+        ("gemm2_weights", gemm2_weights),
+        ("gemm1_output", gemm1_output),
+        ("gemm2_output", gemm2_output),
+        ("tile_idx", tile_idx),
+        ("mn_limit", mn_limit),
+        ("route_map", route_map),
+        ("num_non_exiting_ctas", num_non_exiting_ctas),
+        ("total_num_padded_tokens", total_num_padded_tokens),
+    ):
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     if num_non_exiting_ctas.numel() < 1:
         raise ValueError("num_non_exiting_ctas must contain the GPU active CGA count")
 
