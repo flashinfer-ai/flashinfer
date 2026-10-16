@@ -156,7 +156,7 @@ _COMPILED: dict = {}
 
 
 def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
-    key = (op.tactic, op.out_dtype, grid_x, sm_version)
+    key = (op.tactic, op.out_dtype, grid_x, sm_version, sample_args[1].shape[0] == 1)
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(op.build(grid_x), *sample_args)
@@ -165,7 +165,7 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
 
 
 def _validate_inputs(a_q, a_scale, b_q, b_scale, m_indptr, alpha):
-    tensors = (a_q, a_scale, b_q, b_scale, m_indptr, alpha)
+    tensors = (a_q, a_scale, b_q, b_scale, alpha, m_indptr)
     if any(t.device != a_q.device for t in tensors):
         raise ValueError("all inputs must be on the same device")
     if any(not t.is_cuda or not t.is_contiguous() for t in tensors):
