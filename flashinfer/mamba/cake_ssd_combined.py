@@ -282,8 +282,8 @@ _PREPROCESS_ARGS = (
     "checkpoint_state_count",
     "preprocess_status",
 )
-# Exact-scan main kernel, both families (the fused ``exact_*`` programs and the
-# two-kernel ``exactpre_*`` programs): the 41 start arguments followed by the
+# Exact-scan main kernel, both families (the fused ``exactfused_*`` programs and
+# the two-kernel ``exactpre_*`` programs): the 41 start arguments followed by the
 # three inputs the fused kernel takes over from the preprocess -- ``cu_seqlens``
 # and ``metadata_from_cu_seqlens`` (it derives the cu_seqlens segment tables
 # in-CTA) and the ``preprocess_status`` word it flags an invalid ``cu_seqlens``
@@ -1563,16 +1563,19 @@ class CakeSSDCombined:
     caller buffer for the ``cu_seqlens``-derived vector brings the fused
     program's preprocess back to publish it (two launches).
 
-    Four kernel families serve every call and are selected per call.  The
-    fused exact scan (``exact_*`` programs) runs one persistent CTA per
+    Five kernel families serve every call and are selected per call.  The
+    fused exact scan (``exactfused_*`` programs) runs one persistent CTA per
     (sequence, head) item over its chunks in order and computes delta /
     cumsum in-CTA; the two-kernel exact scan (``exactpre_*``) is the same
     persistent scan reading the delta / cumsum its preprocess wrote to the
-    HBM workspace -- the start two-launch form, kept for the calls the fused
+    HBM workspace -- the two-launch form, kept for the calls the fused
     program loses on (:func:`fused_selected`: batched calls with more than
     1024 (sequence, head) items, more than 16 chunks per sequence or more
     than 2048 chunk-items; packed-varlen calls with more than 256 items or
-    more than 512 packed chunk-items) and for the seq_idx triple form.  The
+    more than 512 packed chunk-items) and for the seq_idx triple form
+    without a trusted caller cumsum; two-kernel calls with one chunk per
+    (sequence, head) item run the retained start programs (``exact_*``,
+    :func:`two_kernel_family`) instead of ``exactpre_*``.  The
     look-back chunk-parallel program (``chunkpar_*``) runs one CTA per SM
     over item-major tile ranges with a decoupled look-back over the carried
     state: the same arithmetic with the carried state of later ranges
@@ -1659,8 +1662,9 @@ class CakeSSDCombined:
     cannot report ids the caller already consumed when building the table.
     """
 
-    #: Program of the most recent :meth:`run` (``exact_*``, ``exactpre_*``,
-    #: ``chunkpar_*`` or ``chunkpar3_*``); ``None`` before the first call.
+    #: Program of the most recent :meth:`run` (``exactfused_*``,
+    #: ``exactpre_*``, ``exact_*``, ``chunkpar_*`` or ``chunkpar3_*``);
+    #: ``None`` before the first call.
     last_program_name: Optional[str] = None
     #: Uncaptured per-shape workspaces a runner keeps (least recently used
     #: evicted first); captured workspaces are pinned in addition.  Read when
