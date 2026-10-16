@@ -128,3 +128,11 @@ checks precede timing; replay output and counter reset are checked afterward.
 JSON includes source hashes, absolute GPU microseconds and all timing samples.
 These remain warm synthetic **packing-plus-attention component** comparisons,
 separate from full-forward GPU intervals and serving throughput.
+
+The first 20-process raw matrix passed all numerical and post-replay checks,
+but selected original/packed controls varied by up to 5.0% between graph
+captures, exceeding the predeclared 1% repeat bound. A complete graph-primer
+round did not resolve this. Retain the raw samples as timing diagnostics;
+do not treat their ratios as a precise, independently qualified component gain.
+This limitation is separate from the paired FULL-forward GPU measurements
+reported in the PR, which passed their own same-implementation controls.
