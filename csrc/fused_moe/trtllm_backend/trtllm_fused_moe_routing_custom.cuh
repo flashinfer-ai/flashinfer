@@ -112,6 +112,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   // then wait on primary grid
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Downstream kernels wait on this grid before reading any routing output (the batched
+    // GEMMs guard every routing-dependent load with a grid dependency), so they can launch
+    // and run their prologue while this kernel computes the routing.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -313,14 +317,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
-  // The downstream kernels depend on all routing outputs being visible.
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
@@ -442,6 +438,10 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Downstream kernels wait on this grid before reading any routing output (the batched
+    // GEMMs guard every routing-dependent load with a grid dependency), so they can launch
+    // and run their prologue while this kernel computes the routing.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -651,12 +651,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
