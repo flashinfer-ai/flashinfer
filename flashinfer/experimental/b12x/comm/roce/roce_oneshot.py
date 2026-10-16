@@ -239,8 +239,15 @@ class RoceOneshotAllReduce:
         max_varlen_bytes: int = 0,
         varlen_blocks: int = DEFAULT_VARLEN_BLOCKS,
         varlen_chunk_bytes: int = DEFAULT_VARLEN_CHUNK_BYTES,
+        ring: bool = False,
     ) -> None:
         """Allocate the pinned region, build and connect the proxy, and start it.
+
+        ``ring=True`` connects only neighbors in rank order (2..16 ranks),
+        forwarding other writes through bounded native RDMA mailboxes along
+        the shorter path. Every rank must select the same mode. The proxy owns
+        about 2.01 MiB of additional registered host memory, allocated at setup.
+        This is a software relay, not ConnectX hardware hairpin forwarding.
 
         ``pipe_bytes`` (default 0: none) sizes the pipelined two-shot path, which
         serves all-reduces of at least ``pipe_threshold`` bytes (default
@@ -260,10 +267,15 @@ class RoceOneshotAllReduce:
         storage, which a native runtime restores at that address and drives
         from ``native_description``).  The runtime zeroes it.
         """
+        if type(ring) is not bool:
+            raise TypeError("ring must be a boolean")
+        self.ring = ring
         self.device = _normalize_device(device)
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
         self._group = exchange_group
+        if ring and not 2 <= self.world_size <= 16:
+            raise ValueError("experimental ring requires 2..16 ranks")
         self._closed = False
         self._lock = threading.Lock()
         self._proxy: Optional[Proxy] = None
@@ -423,6 +435,7 @@ class RoceOneshotAllReduce:
                 slot_bytes=slot_bytes,
                 pipe_bytes=self._layout.pipe_bytes,
                 varlen_bytes=self._layout.varlen_bytes,
+                ring=ring,
             )
             blob = self._proxy.local_blob()
             endpoints = local_endpoints(self.hca_names, self.gid_index)
@@ -438,6 +451,7 @@ class RoceOneshotAllReduce:
             if error is None
             else None,
             "world_size": self.world_size,
+            "ring": self.ring,
             "max_rails": MAX_RAILS,
             "traffic_class": self._proxy.traffic_class if error is None else None,
             "slot_bytes": slot_bytes,
@@ -479,7 +493,9 @@ class RoceOneshotAllReduce:
         try:
             all_endpoints = [s[3] for s in statuses]
             self.rail_count = min(MAX_RAILS, *(len(e) for e in all_endpoints))
-            self.routes = plan_routes(all_endpoints, self.rank, self.rail_count)
+            self.routes = plan_routes(
+                all_endpoints, self.rank, self.rail_count, ring=self.ring
+            )
             self._proxy.connect([s[1] for s in statuses], self.routes)
             self._proxy.start()
         except Exception as exc:  # noqa: BLE001
@@ -528,6 +544,7 @@ class RoceOneshotAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         eager_buffer_bytes: Optional[int] = None,
         max_gather_bytes: int = DEFAULT_MAX_GATHER_BYTES,
+        ring: bool = False,
         **_ignored: Any,
     ) -> "RoceOneshotAllReduce":
         """Mirror ``comm.pcie.AllReduce.from_exchange_group``; PCIe-only knobs are ignored."""
@@ -538,6 +555,7 @@ class RoceOneshotAllReduce:
             device=device,
             max_size=capacity,
             max_gather_bytes=max_gather_bytes,
+            ring=ring,
         )
 
     @classmethod
@@ -548,11 +566,14 @@ class RoceOneshotAllReduce:
         device: torch.device | int | str,
         max_size: int = DEFAULT_MAX_SIZE,
         max_input_bytes: Optional[int] = None,
+        ring: bool = False,
         **_ignored: Any,
     ) -> "RoceOneshotAllReduce":
         """Build a runtime from a process group used for both rank identity and the setup exchange."""
         capacity = max(int(max_size), int(max_input_bytes or 0))
-        return cls(exchange_group=process_group, device=device, max_size=capacity)
+        return cls(
+            exchange_group=process_group, device=device, max_size=capacity, ring=ring
+        )
 
     # -- policy -----------------------------------------------------------------
 
@@ -927,6 +948,10 @@ class RoceOneshotAllReduce:
         verified; a restoring host must expose the same devices.  The proxy
         ABI pins the region layout and the doorbell protocol.  The kernel's
         error word is ``ctrl_offset + 8`` in the region.
+
+        ``ring`` records the neighbor transport mode. A restoring runtime must
+        call ``roce_enable_ring`` before exchanging connection blobs when set;
+        its private relay buffers are newly allocated, not restored graph data.
         """
         if self._proxy is None:
             raise RuntimeError("RoCE runtime is closed")
@@ -935,6 +960,7 @@ class RoceOneshotAllReduce:
             "proxy_abi": _load_proxy_library().roce_abi_version(),
             "world_size": self.world_size,
             "rank": self.rank,
+            "ring": self.ring,
             "region": {
                 "address": self._region.data_ptr(),
                 "nbytes": layout.total_bytes,
@@ -1317,6 +1343,7 @@ class RoceOneshotAllReduce:
         info: dict[str, Any] = {
             "world_size": self.world_size,
             "rank": self.rank,
+            "ring": self.ring,
             "hcas": list(self.hca_names),
             "max_size": self.max_size,
             "max_gather_bytes": self.max_gather_bytes,

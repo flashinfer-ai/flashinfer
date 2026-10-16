@@ -23,7 +23,7 @@ _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 # Region layout and doorbell protocol of ``_roce_proxy.c``; native runtimes vendor the same file.
-ABI_VERSION = 8
+ABI_VERSION = 9
 
 
 def _traffic_class() -> int:
@@ -126,6 +126,8 @@ def load() -> ctypes.CDLL:
             ctypes.c_char_p,
             u64,
         ]
+        lib.roce_enable_ring.restype = ctypes.c_int
+        lib.roce_enable_ring.argtypes = [p]
         lib.roce_local_blob.restype = ctypes.c_int
         lib.roce_local_blob.argtypes = [p, p, u64]
         lib.roce_connect.restype = ctypes.c_int
@@ -240,6 +242,7 @@ class Proxy:
         slot_bytes: int,
         pipe_bytes: int = 0,
         varlen_bytes: int = 0,
+        ring: bool = False,
     ) -> None:
         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         self.traffic_class = _traffic_class()
@@ -265,6 +268,11 @@ class Proxy:
             raise RuntimeError(
                 f"RoCE proxy setup failed: {err.value.decode(errors='replace')}"
             )
+        self.ring = ring
+        if ring and self._lib.roce_enable_ring(self._ctx) != 0:
+            message = self.error()
+            self.close()
+            raise RuntimeError(f"RoCE ring setup failed: {message}")
         self.world_size = int(world_size)
         self.rank = int(rank)
         self.hca_names = tuple(hca_names)
@@ -291,12 +299,21 @@ class Proxy:
         rails = max(len(r) for r in routes)
         flat = []
         for peer, rail_links in enumerate(routes):
-            if peer != self.rank and len(rail_links) != rails:
+            relayed = getattr(self, "ring", False) and peer not in {
+                self.rank,
+                (self.rank + 1) % self.world_size,
+                (self.rank - 1) % self.world_size,
+            }
+            if relayed and rail_links:
+                raise RuntimeError("ring routes must leave non-neighbors unconnected")
+            if peer != self.rank and not relayed and len(rail_links) != rails:
                 raise RuntimeError(
                     f"RoCE routes to rank {peer} have {len(rail_links)} rails, expected {rails}"
                 )
             for k in range(rails):
-                flat.extend(rail_links[k] if peer != self.rank else (0, 0))
+                flat.extend(
+                    rail_links[k] if peer != self.rank and not relayed else (0, 0)
+                )
         table = (ctypes.c_int32 * len(flat))(*flat)
         joined = b"".join(blobs)
         buf = ctypes.create_string_buffer(joined, len(joined))
@@ -325,6 +342,8 @@ class Proxy:
         """Counters: ops posted, RDMA writes completed, last posted sequence."""
         return {
             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
+            "ring_forwarded": int(self._lib.roce_stat(self._ctx, 3)),
+            "connected_peers": int(self._lib.roce_stat(self._ctx, 4)),
             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
             "last_seq": int(self._lib.roce_stat(self._ctx, 2)),
             "writes_completed_per_hca": [

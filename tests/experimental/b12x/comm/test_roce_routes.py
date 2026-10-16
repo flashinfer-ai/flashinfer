@@ -213,3 +213,53 @@ def test_local_endpoints_uses_gid_netdev_prefix(
     actual = _routes.local_endpoints(("rdma0", "missing"), 3, root=tmp_path)
     assert actual == (ep("rdma0", expected), ep("missing"))
     assert seen == (["eth7"] if "ffff" in gid else [])
+
+
+@pytest.mark.parametrize("switched", [False, True])
+def test_four_rank_ring_opens_only_neighbors_and_mirrors_every_rail(switched):
+    def rank(r):
+        if switched:
+            return [ep("f0", f"10.1.0.{r + 1}/24"), ep("f1", f"10.2.0.{r + 1}/24")]
+        previous = (r + 3) % 4
+        return [
+            ep("p0f0", f"10.{r + 1}.0.1/30"),
+            ep("p0f1", f"10.{r + 1}.1.1/30"),
+            ep("p1f0", f"10.{previous + 1}.0.2/30"),
+            ep("p1f1", f"10.{previous + 1}.1.2/30"),
+        ]
+
+    endpoints = [rank(r) for r in range(4)]
+    # Device enumeration need not be identical across hosts.
+    endpoints[1].reverse()
+    endpoints[3] = endpoints[3][1:] + endpoints[3][:1]
+    plans = [plan_routes(endpoints, r, 2, ring=True) for r in range(4)]
+    for r in range(4):
+        assert plans[r][r] == plans[r][(r + 2) % 4] == []
+        for peer in ((r + 1) % 4, (r + 3) % 4):
+            assert len(plans[r][peer]) == 2
+            assert plans[r][peer] == [(b, a) for a, b in plans[peer][r]]
+            assert all(_link(endpoints, r, peer, a, b) for a, b in plans[r][peer])
+    if not switched:
+        with pytest.raises(RuntimeError, match="0 of 2"):
+            plan_routes(endpoints, 0, 2)
+
+
+@pytest.mark.parametrize("world", [0, 1, 17])
+def test_experimental_ring_refuses_other_world_sizes(world):
+    with pytest.raises(ValueError, match="2..16"):
+        plan_routes([[ep("f0", "10.0.0.1/24")]] * world, 0, 1, ring=True)
+
+
+@pytest.mark.parametrize("world", [2, 3, 5, 6, 8, 16])
+def test_ring_planning_uses_the_configured_rank_count(world):
+    endpoints = [
+        [ep("f0", f"10.1.0.{r + 1}/24"), ep("f1", f"10.2.0.{r + 1}/24")]
+        for r in range(world)
+    ]
+    for rank in range(world):
+        routes = plan_routes(endpoints, rank, 2, ring=True)
+        assert len(routes) == world
+        assert {p for p, links in enumerate(routes) if links} == {
+            (rank - 1) % world,
+            (rank + 1) % world,
+        }

@@ -68,6 +68,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,7 +82,7 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 8
+#define ROCE_ABI_VERSION 9
 #define ROCE_MAX_CHUNKS 64
 #define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
@@ -105,8 +106,29 @@
 // every collective on the graph's critical path.
 #define ROCE_IDLE_SPINS 20000000
 
+// Experimental neighbor transport in rank order. Only the two cable-neighbor QPs
+// connect. Non-neighbor writes cross CPU-driven, bounded RDMA mailboxes.
+// No GPU program or captured address depends on these startup-owned buffers.
+#define RING_CHUNK_BYTES 65536
+#define RING_COMPLETION (UINT64_C(1) << 63)
+typedef struct {
+  uint64_t serial, target, offset, flag_offset, flag_value, nbytes, previous;
+  uint8_t padding[72];
+} ring_descriptor_t;
+typedef struct {
+  ring_descriptor_t descriptor;
+  uint8_t data[RING_CHUNK_BYTES];
+} ring_mailbox_t;
+typedef struct {
+  ring_mailbox_t inbox[ROCE_MAX_PEERS][ROCE_MAX_RAILS];
+  uint64_t ack[ROCE_MAX_PEERS][ROCE_MAX_RAILS];
+  ring_descriptor_t outgoing[ROCE_MAX_PEERS][ROCE_MAX_RAILS];
+} ring_region_t;
+
 typedef struct {
   uint64_t region_addr;
+  uint64_t ring_addr;
+  uint32_t ring_rkey[ROCE_MAX_HCAS];
   uint32_t rkey[ROCE_MAX_HCAS];
   uint16_t lid[ROCE_MAX_HCAS];
   uint8_t gid[ROCE_MAX_HCAS][16];
@@ -163,8 +185,28 @@ typedef struct {
   uint32_t last_seq;
   uint64_t ops_posted;
   uint64_t writes_completed;
+  ring_region_t* ring;
+  struct ibv_mr* ring_mr[ROCE_MAX_HCAS];
+  uint64_t ring_addr[ROCE_MAX_PEERS];
+  uint32_t ring_rkey[ROCE_MAX_RAILS][ROCE_MAX_PEERS];
+  uint64_t ring_serial[ROCE_MAX_RAILS];
+  uint64_t ring_seen[ROCE_MAX_PEERS][ROCE_MAX_RAILS];
+  int ring_pending[ROCE_MAX_PEERS][ROCE_MAX_RAILS];
+  uint64_t ring_forwarded;
   char err[512];
 } roce_ctx_t;
+
+static int drain_all(roce_ctx_t* c);
+static int ring_complete(roce_ctx_t* c, int src, int rail);
+static int ring_next(const roce_ctx_t* c, int target) {
+  int clockwise = (target - c->rank + c->world) % c->world;
+  int counter = (c->rank - target + c->world) % c->world;
+  return clockwise <= counter ? (c->rank + 1) % c->world : (c->rank + c->world - 1) % c->world;
+}
+static int ring_relayed(const roce_ctx_t* c, int peer) {
+  return c->ring != NULL && peer != c->rank && peer != (c->rank + 1) % c->world &&
+         peer != (c->rank + c->world - 1) % c->world;
+}
 
 void roce_destroy(roce_ctx_t* c);
 
@@ -376,6 +418,31 @@ roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n
   return c;
 }
 
+// Enable before exchanging blobs; startup allocation, never during replay.
+int roce_enable_ring(roce_ctx_t* c) {
+  if ((c->world < 2 || c->world > ROCE_MAX_PEERS) || c->started || c->ring != NULL) {
+    snprintf(c->err, sizeof(c->err), "experimental ring requires 2..16 ranks before connect");
+    return -1;
+  }
+  void* memory = NULL;
+  int rc = posix_memalign(&memory, 4096, sizeof(ring_region_t));
+  if (rc != 0) {
+    set_err(c, "ring mailbox allocation", rc);
+    return -1;
+  }
+  c->ring = memory;
+  memset(c->ring, 0, sizeof(*c->ring));
+  for (int h = 0; h < c->n_hca; h++) {
+    c->ring_mr[h] = ibv_reg_mr(c->hca[h].pd, c->ring, sizeof(*c->ring),
+                               IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (c->ring_mr[h] == NULL) {
+      set_err(c, "register ring mailboxes", errno);
+      return -1;
+    }
+  }
+  return 0;
+}
+
 int roce_local_blob(roce_ctx_t* c, void* out, uint64_t out_len) {
   if (out_len < sizeof(roce_blob_t)) {
     return -1;
@@ -383,8 +450,10 @@ int roce_local_blob(roce_ctx_t* c, void* out, uint64_t out_len) {
   roce_blob_t blob;
   memset(&blob, 0, sizeof(blob));
   blob.region_addr = (uint64_t)(uintptr_t)c->region;
+  blob.ring_addr = (uint64_t)(uintptr_t)c->ring;
   for (int h = 0; h < c->n_hca; h++) {
     blob.rkey[h] = c->hca[h].mr->rkey;
+    blob.ring_rkey[h] = c->ring == NULL ? 0 : c->ring_mr[h]->rkey;
     blob.lid[h] = c->hca[h].lid;
     blob.mtu[h] = (uint32_t)c->hca[h].mtu;
     memcpy(blob.gid[h], c->hca[h].gid.raw, 16);
@@ -458,7 +527,15 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
   }
   const roce_blob_t* all = (const roce_blob_t*)blobs;
   for (int p = 0; p < c->world; p++) {
-    if (p == c->rank) {
+    if ((all[p].ring_addr != 0) != (c->ring != NULL)) {
+      snprintf(c->err, sizeof(c->err), "ranks disagree on experimental ring transport");
+      return -1;
+    }
+    c->peer_addr[p] = all[p].region_addr;
+    c->ring_addr[p] = all[p].ring_addr;
+  }
+  for (int p = 0; p < c->world; p++) {
+    if (p == c->rank || ring_relayed(c, p)) {
       continue;
     }
     for (int k = 0; k < n_rail; k++) {
@@ -479,7 +556,7 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
   }
   c->n_rail = n_rail;
   for (int p = 0; p < c->world; p++) {
-    if (p == c->rank) {
+    if (p == c->rank || ring_relayed(c, p)) {
       continue;
     }
     c->peer_addr[p] = all[p].region_addr;
@@ -487,6 +564,7 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
       int h = c->rail_hca[p][k];
       int r = routes[(p * n_rail + k) * 2 + 1];
       c->peer_rkey[k][p] = all[p].rkey[r];
+      c->ring_rkey[k][p] = all[p].ring_rkey[r];
       if (connect_qp(c, h, r, p, &all[p]) != 0) {
         return -1;
       }
@@ -503,26 +581,30 @@ static int drain_cq(roce_ctx_t* c, int h) {
     return -1;
   }
   for (int i = 0; i < n; i++) {
+    int relayed = (wc[i].wr_id & RING_COMPLETION) != 0;
+    int src = (int)((wc[i].wr_id >> 8) & 255);
+    int rail = (int)(wc[i].wr_id & 255);
+    int peer = relayed ? (int)c->ring->inbox[src][rail].descriptor.target : (int)wc[i].wr_id;
     if (wc[i].status != IBV_WC_SUCCESS) {
       snprintf(c->err, sizeof(c->err), "RDMA write to rank %u failed: %s (vendor_err 0x%x, seq %u)",
-               (unsigned)wc[i].wr_id, ibv_wc_status_str(wc[i].status), wc[i].vendor_err,
-               c->last_seq);
+               (unsigned)peer, ibv_wc_status_str(wc[i].status), wc[i].vendor_err, c->last_seq);
       return -1;
     }
-    c->hca[h].outstanding[wc[i].wr_id] -= 1;
+    c->hca[h].outstanding[peer] -= 1;
     c->hca[h].writes_completed += 1;
     c->writes_completed += 1;
+    if (relayed && ring_complete(c, src, rail) != 0) return -1;
   }
   return 0;
 }
 
-// Wait until HCA h can take one more stripe to peer p.  Two work requests per
-// stripe; keep the queue at most a quarter full so a provider that needs extra
-// entries can never fail a post.
+// Wait until HCA h can take one more stripe to peer p. Direct stripes need two
+// requests and relay packets need three. A quarter of the queue leaves room
+// for provider overhead and per-origin acks posted while draining completions.
 static int reserve(roce_ctx_t* c, int h, int p) {
   roce_hca_t* hca = &c->hca[h];
   while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
-    if (drain_cq(c, h) != 0) {
+    if (drain_all(c) != 0) {
       return -1;
     }
     // A peer that stopped acknowledging keeps the QP retrying for
@@ -537,12 +619,220 @@ static int reserve(roce_ctx_t* c, int h, int p) {
   return 0;
 }
 
+// Each original sender has a private mailbox per rail at every relay. It
+// admits one packet per rail until an end-to-end ack returns. Different
+// senders never hold each other's mailbox credit, so a cycle of active senders
+// cannot deadlock. A packet's remaining shortest-path distance decreases at
+// every hop. Its header and payload remain live until the downstream ack.
+static int ring_complete(roce_ctx_t* c, int origin, int rail) {
+  ring_descriptor_t* d = &c->ring->inbox[origin][rail].descriptor;
+  int previous = (int)d->previous;
+  int h = c->rail_hca[previous][rail];
+  uint64_t serial = d->serial;
+  struct ibv_sge sge = {.addr = (uintptr_t)&serial, .length = 8};
+  struct ibv_send_wr wr = {0}, *bad = NULL;
+  wr.wr_id = (uint64_t)previous;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = c->ring_addr[previous] + offsetof(ring_region_t, ack) +
+                           (origin * ROCE_MAX_RAILS + rail) * sizeof(uint64_t);
+  wr.wr.rdma.rkey = c->ring_rkey[rail][previous];
+  int rc = ibv_post_send(c->hca[h].qp[previous], &wr, &bad);
+  if (rc != 0) {
+    set_err(c, "ring ack", rc);
+    return -1;
+  }
+  c->hca[h].outstanding[previous]++;
+  c->ring_seen[origin][rail] = serial;
+  c->ring_pending[origin][rail] = 0;
+  c->ring_forwarded++;
+  return 0;
+}
+
+// The caller reserves queue capacity; this function never progresses another
+// packet recursively. In particular a forwarding mailbox is marked pending
+// before any subsequent progress call can inspect it again.
+static int ring_submit(roce_ctx_t* c, int origin, int rail, int next, const uint8_t* payload,
+                       uint32_t lkey, const ring_descriptor_t* descriptor) {
+  int h = c->rail_hca[next][rail];
+  ring_descriptor_t* d = &c->ring->outgoing[origin][rail];
+  *d = *descriptor;
+  d->previous = (uint64_t)c->rank;
+  uint64_t serial = d->serial;
+  uint64_t mailbox = c->ring_addr[next] + offsetof(ring_region_t, inbox) +
+                     (origin * ROCE_MAX_RAILS + rail) * sizeof(ring_mailbox_t);
+  struct ibv_sge data = {.addr = (uintptr_t)payload, .length = (uint32_t)d->nbytes, .lkey = lkey};
+  struct ibv_sge header = {
+      .addr = (uintptr_t)d + 8, .length = sizeof(*d) - 8, .lkey = c->ring_mr[h]->lkey};
+  struct ibv_sge bell = {.addr = (uintptr_t)&serial, .length = 8};
+  struct ibv_send_wr a = {0}, b = {0}, z = {0}, *bad = NULL;
+  a.wr_id = b.wr_id = z.wr_id = (uint64_t)next;
+  a.sg_list = &data;
+  a.num_sge = 1;
+  a.opcode = IBV_WR_RDMA_WRITE;
+  a.wr.rdma.remote_addr = mailbox + offsetof(ring_mailbox_t, data);
+  a.wr.rdma.rkey = c->ring_rkey[rail][next];
+  a.next = &b;
+  b.sg_list = &header;
+  b.num_sge = 1;
+  b.opcode = IBV_WR_RDMA_WRITE;
+  b.wr.rdma.remote_addr = mailbox + 8;
+  b.wr.rdma.rkey = c->ring_rkey[rail][next];
+  b.next = &z;
+  z.sg_list = &bell;
+  z.num_sge = 1;
+  z.opcode = IBV_WR_RDMA_WRITE;
+  z.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+  z.wr.rdma.remote_addr = mailbox;
+  z.wr.rdma.rkey = c->ring_rkey[rail][next];
+  int rc = ibv_post_send(c->hca[h].qp[next], d->nbytes ? &a : &b, &bad);
+  if (rc != 0) {
+    set_err(c, "ring submit", rc);
+    return -1;
+  }
+  c->hca[h].outstanding[next]++;
+  c->hca[h].bytes_posted += d->nbytes;
+  return 0;
+}
+
+static int ring_distance(int a, int b, int world) {
+  int cw = (b - a + world) % world, ccw = (a - b + world) % world;
+  return cw < ccw ? cw : ccw;
+}
+
+static int ring_service(roce_ctx_t* c) {
+  if (c->ring == NULL) return 0;
+  for (int origin = 0; origin < c->world; origin++) {
+    if (origin == c->rank) continue;
+    for (int rail = 0; rail < c->n_rail; rail++) {
+      ring_mailbox_t* box = &c->ring->inbox[origin][rail];
+      ring_descriptor_t* d = &box->descriptor;
+      uint64_t serial = __atomic_load_n(&d->serial, __ATOMIC_ACQUIRE);
+      if (c->ring_pending[origin][rail] == 2) {
+        if (__atomic_load_n(&c->ring->ack[origin][rail], __ATOMIC_ACQUIRE) == serial &&
+            ring_complete(c, origin, rail) != 0)
+          return -1;
+        continue;
+      }
+      if (serial == c->ring_seen[origin][rail] || c->ring_pending[origin][rail]) continue;
+      int target = (int)d->target, previous = (int)d->previous;
+      if (serial < c->ring_seen[origin][rail] || d->target >= (uint64_t)c->world ||
+          d->previous >= (uint64_t)c->world || previous == c->rank || ring_relayed(c, previous) ||
+          target == c->rank ||
+          ring_distance(previous, target, c->world) !=
+              ring_distance(c->rank, target, c->world) + 1 ||
+          d->nbytes > RING_CHUNK_BYTES || d->offset > c->region_bytes ||
+          d->nbytes > c->region_bytes - d->offset ||
+          (d->flag_offset != UINT64_MAX &&
+           (d->flag_offset > c->region_bytes - 4 || d->flag_value > UINT32_MAX))) {
+        snprintf(c->err, sizeof(c->err), "invalid ring mailbox from origin %d rail %d", origin,
+                 rail);
+        return -1;
+      }
+      int next = ring_next(c, target);
+      int h = c->rail_hca[next][rail];
+      if (c->hca[h].outstanding[next] >= ROCE_SEND_DEPTH / 4) continue;
+      if (next != target) {
+        if (ring_submit(c, origin, rail, next, box->data, c->ring_mr[h]->lkey, d) != 0) return -1;
+        c->ring_pending[origin][rail] = 2;
+        continue;
+      }
+      struct ibv_sge data = {
+          .addr = (uintptr_t)box->data, .length = (uint32_t)d->nbytes, .lkey = c->ring_mr[h]->lkey};
+      uint32_t value = (uint32_t)d->flag_value;
+      struct ibv_sge flag = {.addr = (uintptr_t)&value, .length = 4};
+      struct ibv_send_wr write = {0}, mark = {0}, *bad = NULL;
+      uint64_t id = RING_COMPLETION | ((uint64_t)origin << 8) | (uint64_t)rail;
+      write.wr_id = id;
+      write.sg_list = &data;
+      write.num_sge = 1;
+      write.opcode = IBV_WR_RDMA_WRITE;
+      write.send_flags = IBV_SEND_SIGNALED;
+      write.wr.rdma.remote_addr = c->peer_addr[target] + d->offset;
+      write.wr.rdma.rkey = c->peer_rkey[rail][target];
+      struct ibv_send_wr* first = &write;
+      if (d->flag_offset != UINT64_MAX) {
+        mark.wr_id = id;
+        mark.sg_list = &flag;
+        mark.num_sge = 1;
+        mark.opcode = IBV_WR_RDMA_WRITE;
+        mark.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+        mark.wr.rdma.remote_addr = c->peer_addr[target] + d->flag_offset;
+        mark.wr.rdma.rkey = c->peer_rkey[rail][target];
+        if (d->nbytes) {
+          write.next = &mark;
+          write.send_flags = 0;
+        } else
+          first = &mark;
+      } else if (!d->nbytes) {
+        snprintf(c->err, sizeof(c->err), "empty ring write without a flag");
+        return -1;
+      }
+      int rc = ibv_post_send(c->hca[h].qp[target], first, &bad);
+      if (rc != 0) {
+        set_err(c, "ring forward", rc);
+        return -1;
+      }
+      c->ring_pending[origin][rail] = 1;
+      c->hca[h].outstanding[target]++;
+      c->hca[h].bytes_posted += d->nbytes;
+    }
+  }
+  return 0;
+}
+
+static int ring_post(roce_ctx_t* c, int target, const uint8_t* send, uint64_t offset,
+                     uint32_t packs, uint64_t flag_offset, uint32_t value) {
+  int next = ring_next(c, target);
+  uint32_t pack_offset = 0;
+  for (int rail = 0; rail < c->n_rail; rail++) {
+    uint32_t count = packs / (uint32_t)c->n_rail + ((uint32_t)rail < packs % (uint32_t)c->n_rail);
+    uint32_t bytes = count * 16;
+    uint64_t stripe_offset = (uint64_t)pack_offset * 16;
+    uint32_t posted = 0;
+    do {
+      uint32_t length = bytes - posted;
+      if (length > RING_CHUNK_BYTES) length = RING_CHUNK_BYTES;
+      int last = posted + length == bytes;
+      int h = c->rail_hca[next][rail];
+      if (reserve(c, h, next) != 0) return -1;
+      uint64_t serial = ++c->ring_serial[rail];
+      ring_descriptor_t d = {
+          .serial = serial,
+          .target = (uint64_t)target,
+          .offset = offset + stripe_offset + posted,
+          .nbytes = length,
+          .flag_offset = last ? flag_offset + (uint64_t)rail * ROCE_FLAG_STRIDE : UINT64_MAX,
+          .flag_value = value};
+      if (ring_submit(c, c->rank, rail, next, send + stripe_offset + posted, c->hca[h].mr->lkey,
+                      &d) != 0)
+        return -1;
+      while (__atomic_load_n(&c->ring->ack[c->rank][rail], __ATOMIC_ACQUIRE) != serial) {
+        if (drain_all(c) != 0) return -1;
+        uint32_t* ctrl = (uint32_t*)(c->region + c->ctrl_off);
+        if (!atomic_load_explicit(&c->running, memory_order_relaxed) ||
+            __atomic_load_n(&ctrl[CTRL_ERROR], __ATOMIC_ACQUIRE)) {
+          snprintf(c->err, sizeof(c->err), "ring stopped waiting for rank %d via rank %d", target,
+                   next);
+          return -1;
+        }
+      }
+      posted += length;
+    } while (posted < bytes);
+    pack_offset += count;
+  }
+  return 0;
+}
+
 // Write `packs` 16-byte packs from local `send` to peer p at region offset
 // `remote_off`, striped across every rail, each stripe followed on its QP by a
 // 4-byte seq write to `flag_off + rail * ROCE_FLAG_STRIDE`.  An empty payload
 // still writes every flag, so receivers wait the same way for every chunk.
 static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remote_off,
                         uint32_t packs, uint64_t flag_off, uint32_t seq) {
+  if (ring_relayed(c, p)) return ring_post(c, p, send, remote_off, packs, flag_off, seq);
   uint32_t seq_copy = seq;
   uint32_t pack_offset = 0;
   uint64_t remote = c->peer_addr[p];
@@ -611,7 +901,7 @@ static int drain_all(roce_ctx_t* c) {
       return -1;
     }
   }
-  return 0;
+  return ring_service(c);
 }
 
 // Post one-shot op seq to every peer: the whole payload, one stripe plus its flag
@@ -749,8 +1039,8 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
       break;
     }
     if (ctrl[CTRL_ERROR] != 0) {
-      snprintf(c->err, sizeof(c->err), "two-shot op %u abandoned: kernel timed out at seq %u",
-               seq, ctrl[CTRL_ERROR]);
+      snprintf(c->err, sizeof(c->err), "two-shot op %u abandoned: kernel timed out at seq %u", seq,
+               ctrl[CTRL_ERROR]);
       return -1;
     }
     if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
@@ -940,6 +1230,10 @@ uint64_t roce_stat(roce_ctx_t* c, int which) {
       return c->writes_completed;
     case 2:
       return c->last_seq;
+    case 3:
+      return c->ring_forwarded;
+    case 4:
+      return c->ring == NULL ? c->world - 1 : (c->world == 2 ? 1 : 2);
     default:
       return 0;
   }
@@ -977,6 +1271,7 @@ void roce_destroy(roce_ctx_t* c) {
     if (hca->mr != NULL) {
       ibv_dereg_mr(hca->mr);
     }
+    if (c->ring_mr[h] != NULL) ibv_dereg_mr(c->ring_mr[h]);
     if (hca->pd != NULL) {
       ibv_dealloc_pd(hca->pd);
     }
@@ -984,5 +1279,6 @@ void roce_destroy(roce_ctx_t* c) {
       ibv_close_device(hca->ctx);
     }
   }
+  free(c->ring);
   free(c);
 }

@@ -63,6 +63,32 @@ def test_route_table_matches_native_peer_rail_pair_order():
         proxy._ctx = None
 
 
+def test_ring_route_table_leaves_non_neighbors_unconnected():
+    from b12x.comm.roce._proxy import Proxy
+
+    class Native:
+        def roce_blob_bytes(self):
+            return 4
+
+        def roce_connect(self, ctx, blobs, size, table, rails):
+            assert ctx == 123 and size == 16 and rails == 2
+            assert list(table) == [0, 0, 0, 0, 0, 1, 2, 3, 0, 0, 0, 0, 1, 0, 3, 2]
+            return 0
+
+    proxy = Proxy.__new__(Proxy)
+    proxy._ctx, proxy._lib = 123, Native()
+    proxy.world_size, proxy.rank, proxy.ring = 4, 0, True
+    blobs = [b"aaaa", b"bbbb", b"cccc", b"dddd"]
+    routes = [[], [(0, 1), (2, 3)], [], [(1, 0), (3, 2)]]
+    try:
+        proxy.connect(blobs, routes)
+        routes[2] = [(0, 0), (1, 1)]
+        with pytest.raises(RuntimeError, match="non-neighbors"):
+            proxy.connect(blobs, routes)
+    finally:
+        proxy._ctx = None
+
+
 def test_layout_places_two_shot_area_after_control():
     """The two-shot area follows the control record; without one the region is unchanged."""
     from b12x.comm.roce._proxy import Layout, load
@@ -95,7 +121,7 @@ def test_layout_places_variable_length_area_after_two_shot():
         lib = load()
     except RuntimeError as exc:  # no C compiler or libibverbs headers
         pytest.skip(str(exc))
-    assert lib.roce_abi_version() == ABI_VERSION == 7
+    assert lib.roce_abi_version() == ABI_VERSION == 9
     piped = Layout(4, 2 << 20, 64 << 20)
     assert piped.varlen_bytes == 0
     assert piped.varlen_recv_off == piped.varlen_flag_off == piped.total_bytes
