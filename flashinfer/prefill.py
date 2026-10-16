@@ -345,8 +345,8 @@ def _materialize_nvfp4_kv_for_trtllm_gen(
     """Return ``(k_cache, v_cache, block_tables)`` for an FP8 copy of the pages.
 
     The tensor-level K/V scales already folded into ``bmm1_scale`` and
-    ``bmm2_scale`` stay valid, since only block scales are applied here. The
-    returned block table indexes the copy with shared K/V page indices.
+    ``bmm2_scale`` stay valid, since only block scales are applied here.
+    The returned block table indexes the copy with shared K/V page indices.
     """
     if query.dtype != torch.float8_e4m3fn:
         raise ValueError(
