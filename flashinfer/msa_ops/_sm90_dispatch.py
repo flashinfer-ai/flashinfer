@@ -29,9 +29,8 @@ planner coordinates without a program, sparse prefill of GQA groups 1 / 2 /
 32 / 64 or above 4096 pages).  The fp8 proxy-score CuTe kernels re-view the
 index cache with a one-head page stride and select no KV head, so an fp8
 index cache with several heads raises in both regimes instead of scoring the
-wrong pages.  The proxy-score prefill regime has no f32-accumulating CuTe
-kernel: ``use_fp32_acc=True`` (the default) raises for the classes without a
-Cake program instead of silently returning f16-accumulated scores.
+wrong pages.  Both proxy-score prefill backends support f32 accumulation by default and
+explicit f16 accumulation through ``use_fp32_acc=False``.
 """
 
 import functools
@@ -274,8 +273,8 @@ def proxy_score_sm90(
     )
 
     # Cake programs serve fp8 prefill scoring of a one-head index cache in
-    # both accumulation precisions; the CuTe DSL kernel (f16 accumulation)
-    # serves the same one-head class, so several index heads raise in both.
+    # both accumulation precisions; the CuTe DSL kernel serves the same
+    # one-head class in both precisions, so several index heads raise in both.
     if proxy_prefill_route_available(
         q_dtype=q.dtype, num_kv_heads=k.shape[1], use_fp32_acc=use_fp32_acc
     ):
@@ -291,18 +290,11 @@ def proxy_score_sm90(
             q_offset=(_i32(q_offset) if q_offset is not None else None),
             use_fp32_acc=use_fp32_acc,
         )
-    if use_fp32_acc:
-        raise NotImplementedError(
-            "SM90 proxy-score prefill with f32 accumulation (use_fp32_acc=True) "
-            f"serves fp8 q with a one-head index cache; got q {q.dtype} with "
-            f"{k.shape[1]} index heads. Pass use_fp32_acc=False for the "
-            "f16-accumulating kernel."
-        )
     if k.shape[1] != 1:
         # The CuTe prefill kernel rebuilds K as (page, d, num_pages) with a
         # one-head page stride and its grid has no KV-head axis.
         raise NotImplementedError(
-            "SM90 proxy-score prefill with f16 accumulation (use_fp32_acc=False) "
+            "SM90 proxy-score prefill "
             f"serves a one-head index cache; got {k.shape[1]} index heads"
         )
     from .cute_dsl.proxy_score_prefill_sm90 import run as _prefill
@@ -312,7 +304,17 @@ def proxy_score_sm90(
         if q_offset is not None
         else _prefix_lens(cu, sk)
     )
-    _prefill(q, k, cu, pt, sk, pfx, per_head, max_seqlen_q=max_seqlen_q)
+    _prefill(
+        q,
+        k,
+        cu,
+        pt,
+        sk,
+        pfx,
+        per_head,
+        max_seqlen_q=max_seqlen_q,
+        use_fp32_acc=use_fp32_acc,
+    )
     return per_head
 
 
