@@ -191,6 +191,7 @@ class PCIeAllReduce:
             device=device,
             max_size=max_size,
             algorithm_override=algorithm_override,
+            ipc=ipc,
         )
         return cls(
             runtime,
@@ -206,6 +207,7 @@ class PCIeAllReduce:
         device: torch.device | int | str,
         max_size: int,
         algorithm_override: str,
+        ipc: object = None,
     ) -> Any:
         """Attach the equal-quarter runtime after an explicit policy opt-in.
 
@@ -231,6 +233,7 @@ class PCIeAllReduce:
                 exchange_group=exchange_group,
                 device=device,
                 max_elements=elements - (elements % 2),
+                ipc=ipc,
             )
         except RuntimeError as exc:
             if dist.get_rank(group=exchange_group) == 0:
