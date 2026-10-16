@@ -213,6 +213,8 @@ from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import mm_fp8_lora as mm_fp8_lora
+from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
 from .gemm import svdquant_linear as svdquant_linear
 from .gemm import mm_bf16_fp4 as mm_bf16_fp4
@@ -261,6 +263,18 @@ from .cake_rmsnorm_train import (
 )
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
+)
+from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
+from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
+from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
+from .norm import (
+    supports_gated_residual_next_rmsnorm as supports_gated_residual_next_rmsnorm,
+)
+from .norm import (
+    supports_gated_residual_rmsnorm as supports_gated_residual_rmsnorm,
+)
+from .norm import (
+    supports_rmsnorm_sigmoid_gate as supports_rmsnorm_sigmoid_gate,
 )
 from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
 from .nvfp4_attention_sm120 import (
@@ -442,3 +456,4 @@ from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
 from .kda_prefill import (
     kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
 )
+from . import megamoe as megamoe

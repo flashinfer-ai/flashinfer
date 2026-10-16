@@ -70,11 +70,15 @@ from .gemm_mm_mxfp8_cute_dsl import (
 )
 from ..experimental.cake_nvfp4_per_token.support import cake_mm_fp4_requirement
 from .kernels.utils import (
-    _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
+    _CLUSTER_SHAPE_MN_CANDIDATES,
     _SM100_MMA_TILER_MN_CANDIDATES,
+    _SM107_MXFP8_MMA_INST_SHAPE_K,
+    _SM107_MXFP8_MMA_TILER_K,
+    _get_sm107_mxfp8_tactics,
     _rank_mm_fp4_autotune_tactics,
     _select_sm100_mm_fp4_cute_dsl_tactic,
     _select_sm107_mm_fp4_cute_dsl_tactic,
+    _select_sm107_mm_mxfp8_cute_dsl_tactic,
 )
 from ..utils import (
     get_device_index,
@@ -647,6 +651,9 @@ def _heuristic_func_mm_bf16(
         if "cublaslt" in suitable_backends:
             heuristic_backends.append("cublaslt")
 
+    if "cute-dsl" in suitable_backends:
+        heuristic_backends.append("cute-dsl")
+
     if "tinygemm" in suitable_backends and out_dtype == torch.bfloat16:
         heuristic_backends.append("tinygemm")
 
@@ -727,8 +734,7 @@ def mm_bf16(
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
         (direct, cluster Split-K and warp Split-K) and cuBLASLt above that.
-        It is never auto-selected; serving frameworks must select it
-        explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
+        Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
         with at most 64 K tiles; requires CuTe DSL >= 4.7), and
@@ -3450,8 +3456,8 @@ class SegmentGEMMWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The workspace buffer for the kernels, we use it for storing intermediate
-            results in cutlass segment GEMM kernels.  Encouraged size is 128 MiB.
+            The workspace buffer is used to store intermediate results in
+            CUTLASS segment GEMM kernels. The recommended size is 128 MiB.
         backend : str
             Backend selector.  ``"auto"`` (default) lets the runtime pick the best
             available implementation (CUTLASS Hopper if available, otherwise the
@@ -3495,8 +3501,8 @@ class SegmentGEMMWrapper:
     ) -> torch.Tensor:
         r"""Run the segment GEMM kernel.
 
-        Compute the matrix multiplication between a batch of input tensor (with variable number of rows, but fixed
-        number of columns) and a batch of weight tensor with fixed number of rows and columns:
+        Compute the matrix multiplication between a batch of input tensors (with a variable number of rows but a fixed
+        number of columns) and a batch of weight tensors with fixed numbers of rows and columns:
 
         .. math::
 
@@ -3511,7 +3517,7 @@ class SegmentGEMMWrapper:
 
         We use Ragged Tensor to represent the input tensor :attr:`x` and the output tensor :attr:`y`, and each x[i]
         is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details.
-        We use a ``seg_len`` or ``seg_indptr`` tensor (either would work) to indicate the start and end of each segment,
+        We use a ``seg_lens`` or ``seg_indptr`` tensor (either would work) to indicate the start and end of each segment,
         where the ``seg_indptr`` is the cumulative sum of the ``seg_lens`` tensor (with an additional 0 at the beginning):
 
         .. math::
@@ -6278,7 +6284,7 @@ def _get_sm100_block_scaled_tactics(
 
     valid_tactics = []
     for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
-        for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+        for cluster_shape_mn in _CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in (False, True):
                 if not n_aligned:
                     continue
@@ -6384,6 +6390,7 @@ def _cute_dsl_gemm_mxfp8_runner(
     sm_minor: int,
     enable_pdl: bool,
     out_dtype: torch.dtype,
+    warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
 ):
     import cutlass
 
@@ -6426,6 +6433,15 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             n = b.shape[1]
             real_k = a.shape[1]
+            warp_serves = warp_splitk_supports is not None and warp_splitk_supports(
+                inputs
+            )
+            if warp_serves and m <= 8:
+                # Keep the default tactic as the fallback if every warp split-K
+                # tactic fails to profile.
+                return [
+                    (split_k_kernel_cls.mma_tiler_mn_for_m(m), (1, 1), True, False, 1)
+                ]
             ab_dtype = cutlass.Float8E4M3FN
             base_tactics = _get_sm100_block_scaled_tactics(
                 m=m,
@@ -6442,6 +6458,8 @@ def _cute_dsl_gemm_mxfp8_runner(
                 return valid_tactics
 
             for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
+                if warp_serves and real_k < 4096:
+                    continue
                 if split_k_kernel_cls.is_valid_tactic(
                     m,
                     real_k,
@@ -6641,6 +6659,269 @@ def _cute_dsl_gemm_mxfp8_runner(
             return out
 
     return CuteDSLMxfp8GemmRunner()
+
+
+@functools.cache
+def _sm107_mxfp8_cute_dsl_kernel():
+    """The SM107 CuTe-DSL block-scaled GEMM kernel class, or None if the installed
+    CuTe DSL lacks the Rubin API it is built on (CuTe DSL >= 4.8)."""
+    from ..cute_dsl.availability import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        return None
+    from .kernels.dense_blockscaled_gemm_sm107 import (
+        Sm107BlockScaledPersistentDenseGemmKernel,
+    )
+
+    return Sm107BlockScaledPersistentDenseGemmKernel
+
+
+def _use_sm107_mxfp8_cute_dsl(
+    major: int, minor: int, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+) -> bool:
+    """Whether mm_mxfp8(backend="cute-dsl") runs the SM107 kernel.
+
+    On SM107 the SM100 kernels only serve what the SM107 kernel cannot run: a
+    non-contiguous out, or an N or K that breaks its 16-byte alignment.
+    """
+    return (
+        (major, minor) == (10, 7)
+        and out.is_contiguous()
+        and b.shape[1] % 8 == 0
+        and a.shape[1] % 16 == 0
+        and _sm107_mxfp8_cute_dsl_kernel() is not None
+    )
+
+
+_CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
+    """CuTe-DSL mm_mxfp8 runner for Sm107BlockScaledPersistentDenseGemmKernel.
+
+    Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m). The
+    kernel has no PDL support, so unlike the SM100 runner it takes no enable_pdl.
+    """
+    import cutlass
+
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
+            "Supported: torch.bfloat16, torch.float16."
+        )
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
+    Sm107Kernel = _sm107_mxfp8_cute_dsl_kernel()
+
+    class CuteDSLMxfp8Sm107GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            _, _, _, _, _, out, _ = inputs
+            return (str(out.dtype),)
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            a, b, _, _, _, _, _ = inputs
+            return _get_sm107_mxfp8_tactics(
+                a.shape[0], b.shape[1], a.shape[1], c_cutlass_dtype
+            )
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (a, b, a_descale, b_descale, _, out, _) = inputs
+            m = a.shape[0]
+            real_k = a.shape[1]
+            n = b.shape[1]
+
+            if tactic is None or tactic == -1:
+                tactic = _select_sm107_mm_mxfp8_cute_dsl_tactic(
+                    m, n, real_k, get_device_sm_count(a.device)
+                )
+                if tactic is None:
+                    raise ValueError(
+                        f"The SM107 CuTe-DSL kernel cannot run mm_mxfp8 with "
+                        f"m={m}, n={n}, k={real_k}."
+                    )
+            mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m = tactic
+
+            sf_vec_size = 32
+            if swap_ab:
+                kernel_m, kernel_n = n, m
+                kernel_a, kernel_b = b.T, a
+                kernel_a_sf, kernel_b_sf = b_descale, a_descale
+            else:
+                kernel_m, kernel_n = m, n
+                kernel_a, kernel_b = a, b.T
+                kernel_a_sf, kernel_b_sf = a_descale, b_descale
+
+            sf_m = (kernel_m + 127) // 128
+            sf_n = (kernel_n + 127) // 128
+            sf_k = (real_k // sf_vec_size + 3) // 4
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE,
+                (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype),
+                lambda: Sm107Kernel(
+                    sf_vec_size,
+                    (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXFP8_MMA_INST_SHAPE_K),
+                    (mma_tiler_mn[0], mma_tiler_mn[1], _SM107_MXFP8_MMA_TILER_K),
+                    cluster_shape_mn,
+                ),
+                ab_cutlass_dtype=cutlass.Float8E4M3FN,
+                sf_dtype=cutlass.Float8E8M0FNU,
+                c_cutlass_dtype=c_cutlass_dtype,
+                ab_assumed_align=16,
+                cluster_shape_mn=cluster_shape_mn,
+                swap_ab=swap_ab,
+                sf_m=sf_m,
+                sf_n=sf_n,
+                sf_k=sf_k,
+                batch_size=1,
+            )
+
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
+            compiled_gemm(
+                kernel_a,
+                kernel_b,
+                launch_out,
+                sf_m,
+                sf_n,
+                sf_k,
+                kernel_a_sf.data_ptr(),
+                kernel_b_sf.data_ptr(),
+                _prepare_alpha_for_launch(None, a.device),
+            )
+            return out
+
+    return CuteDSLMxfp8Sm107GemmRunner()
+
+
+@functools.cache
+def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
+    """Warp split-K MXFP8 runner for ``backend="cute-dsl"`` (M <= 16, K <= 5120).
+
+    Registered next to ``CuteDSLMxfp8GemmRunner`` so one autotune call profiles
+    both; it offers no tactics for a profile it cannot serve.
+    """
+    from .kernels.dense_mxfp8_gemm_warp_splitk import (
+        MxFp8WarpSplitKTactic,
+        autotune_tactics,
+        default_tactic,
+        run_mxfp8_warp_splitk,
+        validate_inputs,
+        validate_tactic,
+    )
+
+    class CuteDSLMxfp8WarpSplitKRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            _, _, _, _, _, out, _ = inputs
+            return (str(out.dtype), enable_pdl)
+
+        def supports_inputs(
+            self, inputs: List[torch.Tensor], check_m: bool = True
+        ) -> bool:
+            a, b, a_descale, b_descale, _, out, _ = inputs
+            try:
+                validate_inputs(a, b, a_descale, b_descale, out, check_m)
+            except ValueError:
+                return False
+            return True
+
+        def is_tactic_compatible(
+            self, inputs: List[torch.Tensor], tactic: object
+        ) -> bool:
+            if tactic == -1:
+                return True
+            if not isinstance(tactic, (tuple, list)):
+                return False
+            a, b, *_ = inputs
+            try:
+                validate_tactic(
+                    MxFp8WarpSplitKTactic(*tactic), a.shape[0], b.shape[1], a.shape[1]
+                )
+            except (TypeError, ValueError):
+                return False
+            return True
+
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> list[tuple[int, int, int, int, int]]:
+            if not self.supports_inputs(inputs):
+                return []
+            a, b, *_ = inputs
+            with torch.cuda.device(a.device):
+                return [
+                    astuple(config)
+                    for config in autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
+                ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, a_descale, b_descale, _, out, _ = inputs
+            with torch.cuda.device(a.device):
+                if tactic == -1:
+                    tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+                else:
+                    try:
+                        tactic = MxFp8WarpSplitKTactic(*tactic)
+                    except TypeError as error:
+                        raise ValueError(
+                            "CuTeDSL MXFP8 warp split-K tactics must be "
+                            "(output_tile, token_tile, k_tile, stages, "
+                            "b_loader_warps)."
+                        ) from error
+                return run_mxfp8_warp_splitk(
+                    a, b, a_descale, b_descale, out, enable_pdl, tactic
+                )
+
+    return CuteDSLMxfp8WarpSplitKRunner()
+
+
+def _cute_dsl_mxfp8_runners(
+    sm_major: int,
+    sm_minor: int,
+    enable_pdl: bool,
+    out_dtype: torch.dtype,
+    inputs: List[torch.Tensor],
+) -> List[TunableRunner]:
+    """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default."""
+    from ..cute_dsl.availability import is_cute_dsl_experimental_available
+
+    # Older DSLs lack cutlass.experimental; only the block-scaled runner remains.
+    if not is_cute_dsl_experimental_available():
+        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
+    warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl)
+    # One autotune call profiles every M bucket with these runners, so whether the
+    # warp runner is registered must not depend on M; per profile it offers
+    # tactics only for the M it serves.
+    if not warp.supports_inputs(inputs, check_m=False):
+        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
+    tcgen05 = _cute_dsl_gemm_mxfp8_runner(
+        sm_major,
+        sm_minor,
+        enable_pdl,
+        out_dtype,
+        warp_splitk_supports=warp.supports_inputs,
+    )
+    m, k = inputs[0].shape
+    if warp.supports_inputs(inputs) and (m <= 8 or k <= 2048):
+        return [warp, tcgen05]
+    return [tcgen05, warp]
 
 
 def _cudnn_mm_mxfp8_runner():
@@ -6945,33 +7226,6 @@ def mm_mxfp8(
 
     major, minor = get_compute_capability(a.device)
 
-    backend_to_runner_factory = {
-        "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
-            major
-        ).cutlass_mxfp8_gemm_runner(),
-        "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
-            use_8x4_sf_layout
-        ),
-        "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
-        "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
-            major * 10 + minor, True
-        ),
-        "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
-        "b12x": lambda: _b12x_gemm_mxfp8_runner(major, minor, True, out_dtype),
-    }
-
-    runners: List[TunableRunner] = [
-        backend_to_runner_factory[cur_backend]() for cur_backend in backends
-    ]
-
-    tuner = AutoTuner.get()
-
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
-        else _MM_MXFP8_TUNING_CONFIG
-    )
-
     inputs = [
         a,
         b,
@@ -6982,12 +7236,52 @@ def mm_mxfp8(
         workspace_buffer,
     ]
 
+    backend_to_runner_factory = {
+        "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
+            major
+        ).cutlass_mxfp8_gemm_runner(),
+        "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+            use_8x4_sf_layout
+        ),
+        "cute-dsl": lambda: (
+            _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
+            if _use_sm107_mxfp8_cute_dsl(major, minor, a, b, out)
+            else _cute_dsl_mxfp8_runners(major, minor, True, out_dtype, inputs)
+        ),
+        "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
+            major * 10 + minor, True
+        ),
+        "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
+        "b12x": lambda: _b12x_gemm_mxfp8_runner(major, minor, True, out_dtype),
+    }
+
+    runners: List[TunableRunner] = []
+    for cur_backend in backends:
+        built = backend_to_runner_factory[cur_backend]()
+        runners.extend(built if isinstance(built, list) else [built])
+
+    tuner = AutoTuner.get()
+
+    tuning_config = (
+        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
+        else _MM_MXFP8_TUNING_CONFIG
+    )
+
     runner, tactic = tuner.choose_one(
         custom_op="mxfp8_gemm",
         runners=runners,
         tuning_config=tuning_config,
         inputs=inputs,
     )
+
+    # A cached warp split-K entry is keyed by M bucket, so it can come from an M the
+    # kernel does not serve or carry a tactic illegal for this shape. Fall back to
+    # the first runner's default, as the autotuner itself does.
+    if hasattr(runner, "is_tactic_compatible") and not (
+        runner.supports_inputs(inputs) and runner.is_tactic_compatible(inputs, tactic)
+    ):
+        runner, tactic = runners[0], -1
 
     runner(inputs=inputs, tactic=tactic)
     return out
@@ -8145,7 +8439,7 @@ def _cute_dsl_gemm_fp4_runner(
                 ]
 
                 for mma_tiler_mn in sm103_mma_tiler_candidates:
-                    for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+                    for cluster_shape_mn in _CLUSTER_SHAPE_MN_CANDIDATES:
                         for swap_ab in (False, True):
                             if not swap_ab and not n_aligned:
                                 continue
@@ -8213,7 +8507,7 @@ def _cute_dsl_gemm_fp4_runner(
                             mma_inst_shape_k,
                         )
 
-                        for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+                        for cluster_shape_mn in _CLUSTER_SHAPE_MN_CANDIDATES:
                             for swap_ab in (False, True):
                                 if not swap_ab and not n_aligned:
                                     continue
@@ -8968,6 +9262,8 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
 _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     _MM_MXFP8_TUNING_CONFIG,
     use_cuda_graph=True,
+    # Rank the runners from a cold L2, as the BF16 cute-dsl config does.
+    use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
 )
 
@@ -9080,7 +9376,7 @@ def mm_fp4(
 
     Notes
     -----
-    When cudnn/cutlass backend is used, both a and b should quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
+    When the cudnn/cutlass backend is used, both a and b should use the 128x4 scale factor layout: nvfp4_quantize(..., do_shuffle=False) when use_nvfp4=True, or mxfp4_quantize(...) when use_nvfp4=False.
     When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
     When cute_dsl backend is used, both a and b should be quantized with 128x4 scale factor layout:
     nvfp4_quantize(..., do_shuffle=False) for NVFP4, or mxfp4_quantize(...) for MXFP4.
@@ -9616,7 +9912,7 @@ def gemm_fp8_nt_groupwise(
 
     b_scale: torch.Tensor
         if the backend is ``cutlass``:
-            Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
+            Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_mode is ``K``
             or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
         if the backend is ``trtllm``:
             scale_major_mode should be None, the scale tensor should be (k // block_size, n // block_size),
@@ -10134,8 +10430,8 @@ def group_gemm_fp8_nt_groupwise(
         or shape ``(k // block_size, cum_m)`` if scale_major_mode is ``MN``, data type is ``torch.float32``.
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape ``(batch_size, n // block_size, k // block_size)`` if scale_major_mode is ``K``
-        shape ``(batch_size, k // block_size, n // block_size)`` if scale_major_mode is ``MN``, data type is ``torch.float32``.
+        Row-major scale tensor for b, shape ``(batch_size, n // block_size, k // block_size)`` if scale_major_mode is ``K``,
+        or shape ``(batch_size, k // block_size, n // block_size)`` if scale_major_mode is ``MN``, with data type ``torch.float32``.
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
@@ -10407,7 +10703,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
 
     tile_n: int
         The tile size for the N dimension, must be 32, 64, 128, 192, or 256.
-        Only 32, 64, 128 is supported on SM120/121.
+        Only 32, 64, and 128 are supported on SM120/121.
         Only 64, 128, 192, 256 is supported on SM100, SM103, and SM110.
 
     tile_k: int
@@ -11231,14 +11527,14 @@ def batch_deepgemm_fp8_nt_groupwise(
     r"""Perform batch matrix multiplication with FP8 data types using DeepGEMM backend.
 
     This function performs a batch GEMM operation where each group in tensor `b` is multiplied
-    with the corresponding group of rows in tensor `a`. The results of each group is masked by
-    the `masked_m` tensor, which specifies which group each row belongs to. This is particularly
+    with the corresponding group of rows in tensor `a`. The results of each group are masked by
+    the `masked_m` tensor, which specifies how many rows are used in each group. This is particularly
     useful for scenarios like mixture of experts (MoE) where different tokens are routed to different experts.
 
     The operation can be conceptualized as:
 
     >>> for i in range(num_groups):
-    >>>     output[i] = a[i][:masked_m[i]] @ b[i][:masked_m[i]].T
+    >>>     output[i, :masked_m[i]] = a[i, :masked_m[i]] @ b[i].T
 
     Currently only supported on NVIDIA Blackwell (SM100) architecture.
 

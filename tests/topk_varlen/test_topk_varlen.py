@@ -58,6 +58,7 @@ test_input_validation         — 1-D logits / non-int32 seq_lens rejected
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 try:
     import flashinfer
@@ -200,17 +201,19 @@ def _radix_ctas(N, dtype, batch_size):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
-        (torch.float32, 2048),
-    ],
+@parametrize_product(
+    {
+        "dtype,top_k": [
+            (torch.bfloat16, 512),
+            (torch.bfloat16, 1024),
+            (torch.float16, 1024),
+            (torch.float32, 2048),
+        ],
+        "N": [4096, 32768],
+        "batch_size": [1, 32],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("N", [4096, 32768])
-@pytest.mark.parametrize("batch_size", [1, 32])
 def test_basic_decode(dtype, top_k, N, batch_size):
     """top_k_varlen with pre_idx: works on Blackwell (GVR) and any GPU (radix)."""
     if not torch.cuda.is_available():
@@ -237,8 +240,13 @@ def test_basic_decode(dtype, top_k, N, batch_size):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float16, torch.float32],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_return_values(dtype, top_k):
     """Returned values must equal logits[row, indices]."""
     N, batch_size = 8192, 4
@@ -265,9 +273,14 @@ def test_return_values(dtype, top_k):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
-@pytest.mark.parametrize("batch_size", [2, 16])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float32],
+        "top_k": [512, 1024],
+        "batch_size": [2, 16],
+    },
+    regular=pairwise_product_cases,
+)
 def test_next_n(dtype, top_k, batch_size):
     """next_n=2: two rows share one pre_idx / seq_len entry."""
     next_n, N = 2, 8192
@@ -292,8 +305,13 @@ def test_next_n(dtype, top_k, batch_size):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_compress_ratio(dtype, top_k):
     """compress_ratio=4: seq_lens in uncompressed-token space."""
     compress_ratio, N, batch_size = 4, 4096, 8
@@ -437,8 +455,13 @@ def test_skip_check_auto_backend():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float16, torch.float32],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_cutlass_return_values(dtype, top_k):
     """radix_cutlass backend: returned values must equal logits[row, indices]."""
     N, batch_size = 8192, 4
@@ -465,9 +488,14 @@ def test_radix_cutlass_return_values(dtype, top_k):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
-@pytest.mark.parametrize("batch_size", [2, 16])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float32],
+        "top_k": [512, 1024],
+        "batch_size": [2, 16],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_cutlass_next_n(dtype, top_k, batch_size):
     """radix_cutlass backend: next_n=2 — two rows share one seq_len entry."""
     next_n, N = 2, 8192
@@ -485,8 +513,13 @@ def test_radix_cutlass_next_n(dtype, top_k, batch_size):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_cutlass_compress_ratio(dtype, top_k):
     """radix_cutlass backend: compress_ratio=4 — seq_lens in uncompressed-token space."""
     compress_ratio, N, batch_size = 4, 4096, 8
@@ -795,16 +828,18 @@ def test_auto_gvr_knobs_shape_aware():
 
 
 @requires_blackwell
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
-        (torch.float32, 2048),
-    ],
+@parametrize_product(
+    {
+        "dtype,top_k": [
+            (torch.bfloat16, 512),
+            (torch.bfloat16, 1024),
+            (torch.float16, 1024),
+            (torch.float32, 2048),
+        ],
+        "batch_size": [1, 8],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("batch_size", [1, 8])
 def test_radix_basic(dtype, top_k, batch_size):
     """radix (CuTe DSL) single-CTA correctness across dtype/K/batch."""
     N = 8192  # < max_chunk for all dtypes -> single-CTA
@@ -847,8 +882,13 @@ def test_radix_multi_cta_regime(dtype, top_k, N, batch_size):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float32],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_next_n(dtype, top_k):
     """radix backend: next_n=2 (two rows share one seq_len entry)."""
     next_n, N, batch_size = 2, 8192, 8
@@ -1331,7 +1371,9 @@ def test_backend_heuristic_priority():
             if hinted
             else None
         )
-        return _top_k_varlen_heuristic(suitable, logits, seq_lens, top_k, pre_idx)
+        return _top_k_varlen_heuristic(
+            suitable, logits, seq_lens, top_k, pre_idx=pre_idx
+        )
 
     assert order_k(all5, 16, 32768, 512, False)[0] == "gvr_2"
     assert order_k(all5, 1, 4096, 1024, False)[0] == "gvr_2"

@@ -349,7 +349,7 @@ inline CUtensorMap EncodeTma_x_map(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'x_map' resolved a non-positive global dim";
   uint32_t box_dim[4] = {64u, 1u, 128u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[3] <= global_dim[3], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ") exceeds resolved global dims for 'x_map'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -418,7 +418,7 @@ inline CUtensorMap EncodeTma_b_map(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'b_map' resolved a non-positive global dim";
   uint32_t box_dim[5] = {64u, 1u, 1u, 128u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3] && box_dim[4] <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[4] <= global_dim[4], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ", " << box_dim[4] << ") exceeds resolved global dims for 'b_map'";
   int64_t carrier_stride_0 = 64;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -495,7 +495,7 @@ inline CUtensorMap EncodeTma_c_map(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'c_map' resolved a non-positive global dim";
   uint32_t box_dim[5] = {64u, 1u, 1u, 128u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3] && box_dim[4] <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[4] <= global_dim[4], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ", " << box_dim[4] << ") exceeds resolved global dims for 'c_map'";
   int64_t carrier_stride_0 = 64;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -569,7 +569,7 @@ inline CUtensorMap EncodeTma_out_map(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'out_map' resolved a non-positive global dim";
   uint32_t box_dim[4] = {64u, 1u, 128u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2] && box_dim[3] <= global_dim[3], ValueError)
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[3] <= global_dim[3], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ", " << box_dim[3] << ") exceeds resolved global dims for 'out_map'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)

@@ -22,6 +22,9 @@
 #                 Set to 1 when baking container-save images for torchrun jobs
 #                 (lazy JIT under torchrun outlives the NCCL watchdog); PR CI
 #                 doesn't exercise the prewarmed modules.
+#
+# Without root, callers must also prepend the NCCL wheel's lib directory to
+# LD_LIBRARY_PATH in the process that launches their tests or application.
 set -euo pipefail
 
 # Derive the CUDA major (cu12 / cu13 / ...) from the base image's torch so the
@@ -74,21 +77,21 @@ PIP_CONSTRAINT="" pip install --no-cache-dir \
 # off nccl4py. Persist it too, so later `srun`/exec shells in a saved container
 # inherit it.
 NCCL_WHEEL_LIB="$(python -c "import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], 'lib'))")"
-# ldconfig, not just LD_LIBRARY_PATH: an `export` here dies with this script
-# and never reaches whatever runs the tests, and /etc/profile.d is only read by
-# login shells. Registering the directory in the loader cache makes EVERY
-# process in the image resolve libnccl.so.2 to the wheel's copy with no env
-# plumbing at all. LD_LIBRARY_PATH is still exported for the rest of THIS
-# script, and profile.d is kept as a belt-and-braces for interactive shells.
-echo "${NCCL_WHEEL_LIB}" > /etc/ld.so.conf.d/000-flashinfer-nccl.conf
-ldconfig
-export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
-cat > /etc/profile.d/flashinfer-nccl.sh <<EOF
-export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+# Image builds persist the library selection. An unprivileged test job must
+# pass LD_LIBRARY_PATH to its test process instead.
+if [ "${EUID}" -eq 0 ]; then
+    echo "${NCCL_WHEEL_LIB}" > /etc/ld.so.conf.d/000-flashinfer-nccl.conf
+    ldconfig
+    cat > /etc/profile.d/flashinfer-nccl.sh <<EOF
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 EOF
-chmod +x /etc/profile.d/flashinfer-nccl.sh
-echo "== libnccl pinned to ${NCCL_WHEEL_LIB} =="
-ldconfig -p | grep -E "libnccl\.so\.2" || true
+    chmod +x /etc/profile.d/flashinfer-nccl.sh
+    ldconfig -p | grep -E "libnccl\.so\.2" || true
+else
+    echo "== non-root setup: pass ${NCCL_WHEEL_LIB} in LD_LIBRARY_PATH to subsequent processes =="
+fi
+echo "== using libnccl from ${NCCL_WHEEL_LIB} =="
 
 python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep (nccl-extensions) + nccl.core (nccl4py) import OK')"
 
@@ -109,7 +112,8 @@ assert got >= (2, 30, 7), (
 PYEOF
 
 # Same check with LD_LIBRARY_PATH cleared: proves the ldconfig pin holds for
-# processes that do not inherit this script's environment (e.g. the test suite).
+# processes that do not inherit the image-build script's environment.
+if [ "${EUID}" -eq 0 ]; then
 env -u LD_LIBRARY_PATH python - <<'PYEOF'
 import ctypes
 lib = ctypes.CDLL("libnccl.so.2")
@@ -123,6 +127,7 @@ assert got >= (2, 30, 7), (
     "pin in /etc/ld.so.conf.d/000-flashinfer-nccl.conf did not take effect"
 )
 PYEOF
+fi
 
 echo "== install DeepGEMM + NVSHMEM / CUTLASS DSL deps =="
 PIP_CONSTRAINT="" python -m pip install --no-cache-dir \

@@ -1313,7 +1313,7 @@ _PUBLIC_COMPILE_FLAGS = {
     "--use_fast_math",
     "-Xptxas=--register-usage-level=10",
 }
-# The NVFP4 decode swap / tile / pv schedules ship as one kernel-template unit each.  A
+# The NVFP4 decode swap / tile / tile_h64 / pv schedules ship as one kernel-template unit each.  A
 # variant's module compiles that unit with two preprocessor defines (a public nvcc option):
 # the member's select macro and the variant's own instance macro, so it instantiates only
 # its kernel.  Every instantiation is proven SASS-identical to the per-knob program it
@@ -1321,7 +1321,7 @@ _PUBLIC_COMPILE_FLAGS = {
 _TEMPLATE_SELECT_DEFINE = re.compile(
     r"-DCAKE_DSV4_NVFP4_(?P<member>[A-Z0-9_]+)_SELECT=1"
 )
-_TEMPLATE_MEMBERS = {"DECODE_SWAP", "DECODE_TILE", "DECODE_PV"}
+_TEMPLATE_MEMBERS = {"DECODE_SWAP", "DECODE_TILE", "DECODE_TILE_H64", "DECODE_PV"}
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -1348,9 +1348,9 @@ def test_registered_compile_flags_are_public(arch):
     its softmax chain is not what paces the item and the pinned build reads
     1-2 % slower on the uniform decode rows, so the flag must stay off there.
 
-    The kernel-template members (NVFP4 decode swap, tile, pv) additionally
+    The kernel-template members (NVFP4 decode swap, tile, tile_h64, pv) additionally
     carry their select and instance defines: the select macro names one of
-    the three members and the variant, the instance macro is the variant's
+    the four members and the variant, the instance macro is the variant's
     own; nothing else may be added.
     """
     pin = "-Xptxas=--register-usage-level=10"

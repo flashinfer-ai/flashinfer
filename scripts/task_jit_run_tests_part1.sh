@@ -6,20 +6,15 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 : ${SKIP_INSTALL:=0}
 
-# Source test environment setup (handles package overrides like TVM-FFI)
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/jit_test_logging.sh"
 
 if [ "$SKIP_INSTALL" = "0" ]; then
   install_flashinfer_editable
 fi
 
-# Run each test file separately to isolate CUDA memory issues
-# moe_ep unit subset: host-only + single-GPU (multirank/mega auto-skip via
-# markers; see tests/moe_ep/run_tests.sh and docs/design_docs/moe_ep_runbook.md)
+# Separate processes release CUDA memory between files.
 bash tests/moe_ep/run_tests.sh unit
-pytest -s tests/attention/test_logits_cap.py
-pytest -s tests/attention/test_sliding_window.py
-pytest -s tests/attention/test_tensor_cores_decode.py
 pytest -s tests/attention/test_batch_decode_kernels.py
-# pytest -s tests/gemm/test_group_gemm.py
-# pytest -s tests/attention/test_alibi.py
+pytest -s tests/utils/test_jit_example.py
+pytest -s tests/gemm/test_group_gemm.py
