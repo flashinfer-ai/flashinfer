@@ -293,9 +293,8 @@ def select_fused_plan(
     num_experts_per_rank = num_experts // num_ranks
     if num_experts_per_rank * num_ranks != num_experts:
         raise ValueError("num_experts must be divisible by num_ranks")
-    supported_experts_per_rank = (32, 48) if num_ranks == 8 else (64, 96)
-    if num_experts_per_rank not in supported_experts_per_rank:
-        raise ValueError(f"unsupported experts per rank: {num_experts_per_rank}")
+    if num_experts_per_rank < 1:
+        raise ValueError("every rank needs at least one local expert")
     if not 0 < num_tokens <= num_max_tokens_per_rank:
         raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
     # Compile-time shape requirements of the fused kernel (scheduler / combine static asserts).
@@ -372,6 +371,8 @@ def select_fused_plan(
         and num_tokens <= _PUSH_MAX_TOKENS
         and block_m <= _PUSH_MAX_BLOCK_M
         and hidden % 1024 == 0  # push row copy: two 512-element chunks per lane
+        and num_experts_per_rank
+        <= num_sms  # SM e publishes local expert e's arrival counts
     )
     no_clean = no_clean and push
 

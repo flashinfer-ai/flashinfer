@@ -97,6 +97,10 @@ def test_counter_policy_limits(num_sms):
         (8192, 2048, 256, 8),
         (4096, 2048, 384, 8),
         (512, 256, 256, 6),
+        (5120, 1536, 160, 8),  # GLM-4.6 / 4.7
+        (4096, 1408, 128, 8),  # GLM-4.5-Air
+        (2048, 768, 128, 8),  # Qwen3-30B-A3B
+        (4096, 1024, 512, 10),  # Qwen3.5-397B-A17B
     ],
 )
 def test_untuned_geometry_plans_are_legal(num_sms, hidden, intermediate, experts, topk):
@@ -121,3 +125,11 @@ def test_untuned_geometry_plans_are_legal(num_sms, hidden, intermediate, experts
 def test_unsupported_fused_shapes_raise(hidden, intermediate):
     with pytest.raises(ValueError):
         select_fused_plan(132, 8, 256, 6, hidden, intermediate, 4096, 1)
+
+
+def test_push_needs_one_publishing_sm_per_local_expert():
+    # Local expert e is published by SM e, so push needs experts per rank <= SMs.
+    plan = select_fused_plan(78, 8, 1024, 8, 4096, 1024, 4096, 1)
+    assert not plan.push_dispatch
+    plan = select_fused_plan(132, 8, 1024, 8, 4096, 1024, 4096, 1)
+    assert plan.push_dispatch
