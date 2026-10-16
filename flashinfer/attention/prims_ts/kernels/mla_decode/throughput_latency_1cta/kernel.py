@@ -1929,7 +1929,11 @@ class ThroughputLatencyMlaDecodeTs:
             cluster=cluster_shape,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=acc_o is not None,
+            # The dense kernel never executes griddepcontrol.wait, so it must
+            # not be a programmatic dependent of the preceding grid: it reads
+            # Q, KV, page tables and sequence lengths that grid may still be
+            # writing. The reducers below carry the PDL edge to this kernel.
+            use_pdl=False,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.use_parallel_reduction):

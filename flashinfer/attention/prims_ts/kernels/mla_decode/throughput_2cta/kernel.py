@@ -1175,7 +1175,8 @@ class MlaDecodeTs:
         )
         # A one-wave producer can publish its dependent reducer launch while
         # retiring, hiding launch latency without admitting reducer CTAs into
-        # an actively grid-striding persistent producer.
+        # an actively grid-striding persistent producer. The flag applies to
+        # the reducer launch only.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
         self.split_kv_kernel(
@@ -1205,7 +1206,11 @@ class MlaDecodeTs:
             cluster=cfg.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=use_one_wave_reducer_pdl,
+            # The producer never executes griddepcontrol.wait, so it must not
+            # be a programmatic dependent of the preceding grid: it reads Q,
+            # KV, page tables and sequence lengths that grid may still be
+            # writing.
+            use_pdl=False,
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
