@@ -128,13 +128,13 @@ def mma_epilogue(
             for i in cutlass.range_constexpr(cute.size(acc)):
                 cq, ck = tCcS[i]
                 if ck > cutlass.min(cq + delta, kmax):
-                    acc[i] = cutlass.Float16(float("-inf"))
+                    acc[i] = acc.element_type(float("-inf"))
     acc_mn = cute.make_tensor(acc.iterator, acc_mn_layout)
     for i in cutlass.range_constexpr(n_rows):
         s_max[i] = cutlass.Float32(
             acc_mn[i, None]
             .load()
-            .reduce(cute.ReductionOp.MAX, cutlass.Float16(float("-inf")), 0)
+            .reduce(cute.ReductionOp.MAX, acc.element_type(float("-inf")), 0)
         )
     for i in cutlass.range_constexpr(n_rows):
         for r in cutlass.range_constexpr(red_rank):
@@ -170,6 +170,7 @@ class MsaProxyScore:
         hq=1,
         use_tma_q=True,
         fold=0,
+        use_fp32_acc=True,
     ):
         """Record the tile geometry and TMA options this body is built for."""
         self.hq = hq
@@ -188,7 +189,7 @@ class MsaProxyScore:
         self.n_mma_threads = 128 * self.n_mma_wg
         self.n_threads = self.n_mma_threads + 32
         self.producer_warp = self.n_mma_threads // 32
-        self.acc_dtype = cutlass.Float16
+        self.acc_dtype = cutlass.Float32 if use_fp32_acc else cutlass.Float16
         self.ab_dtype = cutlass.Float8E4M3FN
         self.tile_mnk = (128, page, head_dim)
 
@@ -284,7 +285,13 @@ class MsaProxyScore:
         ).launch(
             grid=[hq * n_mtiles, nkchunk, B],
             block=[self.n_threads, 1, 1],
-            min_blocks_per_mp=2,
+            # 288 threads at two blocks/SM leaves ptxas ~113 registers/thread,
+            # which the fp32 accumulator does not fit: it capped at 96 and spilled
+            # 5.5 GB to local memory for one launch, idling the tensor pipe at
+            # 7.9% against 96.1% for fp16. One block/SM doubles the budget to
+            # ~227. The grid is under one wave here, so the occupancy given up is
+            # far cheaper than the spill traffic.
+            min_blocks_per_mp=1 if self.acc_dtype is cutlass.Float32 else 2,
             stream=stream,
         )
 
@@ -863,7 +870,15 @@ _CACHE: dict = {}
 
 
 def run(
-    q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score, max_seqlen_q=None
+    q,
+    k,
+    cu_seqlens_q,
+    page_table,
+    seqused_k,
+    prefix_lens,
+    max_score,
+    max_seqlen_q=None,
+    use_fp32_acc=True,
 ):
     """Compute MSA proxy scores for a prefill batch. Writes ``ma``."""
     total_q, hq, _ = q.shape
@@ -893,7 +908,7 @@ def run(
     use_tma_q = sq_max % 128 == 0 and total_q % batch_size == 0
     fold = 1 if n_mtiles * 16 >= nkt else 0
 
-    key = (hq, k.shape[2], k.shape[3], use_tma_q, fold)
+    key = (hq, k.shape[2], k.shape[3], use_tma_q, fold, use_fp32_acc)
     op = _CACHE.get(key)
     if op is None:
         kern = MsaProxyScore(
@@ -903,6 +918,7 @@ def run(
             head_dim=k.shape[3],
             hq=hq,
             use_tma_q=use_tma_q,
+            use_fp32_acc=use_fp32_acc,
             fold=fold,
         )
         args = (
