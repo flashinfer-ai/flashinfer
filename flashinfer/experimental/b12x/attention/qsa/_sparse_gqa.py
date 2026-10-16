@@ -50,12 +50,16 @@ def _validate_launch(
     softmax_scale: float,
     block_n: int,
     splits: int,
+    output_gate: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if not query.is_cuda:
         raise ValueError("QSA sparse GQA requires CUDA tensors")
     device = query.device
+    from ..paged._selected_forward import _output_gate_stride
+
     if query.ndim != 3:
         raise ValueError("query must have shape [rows, q_heads, head_dim]")
+    _output_gate_stride(output_gate, query)
     rows, q_heads, head_dim = map(int, query.shape)
     if rows <= 0:
         raise ValueError("query must contain at least one active row")
@@ -217,6 +221,7 @@ def compile_sparse_paged_gqa(
     selected_positions: torch.Tensor,
     direct_kv_warps: int,
     return_lse: bool = False,
+    output_gate: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Compile both legal QSA sparse-GQA ABIs and retain their raw carriers."""
     from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
@@ -229,6 +234,7 @@ def compile_sparse_paged_gqa(
             value_cache=value_cache,
             request_ids=request_ids,
             direct_output=direct,
+            output_gate=output_gate if direct else None,
             return_lse=return_lse if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
             selection_width=int(selected_positions.shape[-1]),
@@ -262,6 +268,7 @@ def compile_sparse_paged_gqa(
         partial_lse=partial_lse,
         output=output,
         output_lse=output_lse,
+        output_gate=output_gate,
         rows=int(query.shape[0]),
         splits=1,
     )
@@ -281,6 +288,7 @@ def launch_sparse_paged_gqa(
     query_positions: torch.Tensor,
     output: torch.Tensor,
     output_lse: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
     partial_output: torch.Tensor | None,
     partial_lse: torch.Tensor | None,
     softmax_scale: float,
@@ -300,6 +308,7 @@ def launch_sparse_paged_gqa(
             value_cache=value_cache,
             request_ids=request_ids,
             direct_output=direct,
+            output_gate=output_gate if direct else None,
             return_lse=output_lse is not None if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
             selection_width=int(selected_positions.shape[-1]),
@@ -315,6 +324,7 @@ def launch_sparse_paged_gqa(
                 partial_lse=partial_lse,
                 output=output,
                 output_lse=output_lse,
+                output_gate=output_gate,
                 rows=int(query.shape[0]),
                 splits=splits,
             )
@@ -331,6 +341,7 @@ def launch_sparse_paged_gqa(
         query_positions=query_positions,
         output=output,
         output_lse=output_lse,
+        output_gate=output_gate,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=softmax_scale,
@@ -394,6 +405,9 @@ def launch_sparse_paged_gqa(
                 if direct
                 else _pointer(partial_lse, Float32),
                 _pointer(output, BFloat16),
+                _pointer(output_gate, BFloat16)
+                if output_gate is not None
+                else _fake_pointer(BFloat16),
                 (),
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
@@ -421,6 +435,9 @@ def launch_sparse_paged_gqa(
                     _pointer(output_lse, Float32)
                     if output_lse is not None
                     else _fake_pointer(Float32),
+                    _pointer(output_gate, BFloat16)
+                    if output_gate is not None
+                    else _fake_pointer(BFloat16),
                     int(rows),
                     int(splits),
                     current_cuda_stream(),
@@ -442,6 +459,7 @@ def launch_sparse_paged_gqa(
             query_positions=query_positions,
             output=output,
             output_lse=output_lse,
+            output_gate=output_gate,
             softmax_scale=softmax_scale,
             kv_warps=int(direct_kv_warps),
         )
@@ -489,6 +507,7 @@ def launch_sparse_paged_gqa(
         partial_lse=partial_lse,
         output=output,
         output_lse=output_lse,
+        output_gate=output_gate,
         rows=rows,
         splits=splits,
     )
