@@ -88,6 +88,11 @@ if [[ ${USE_GPU} == "true" ]]; then
     export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/test_sharding"
     DOCKER_ENV="${DOCKER_ENV} -e PYTEST_ADDOPTS"
 
+    # Forward CI_GPU_NAME so summary.py can record the lane without a torch import.
+    if [[ -n "${CI_GPU_NAME:-}" ]]; then
+        DOCKER_ENV="${DOCKER_ENV} -e CI_GPU_NAME=${CI_GPU_NAME}"
+    fi
+
     # An unset host mask should leave the container's GPUs visible. Preserve
     # explicitly configured masks, including an intentionally empty one.
     if [[ -v CUDA_VISIBLE_DEVICES ]]; then

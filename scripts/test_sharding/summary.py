@@ -713,15 +713,13 @@ def _cudnn_backend_version() -> str:
 
 @lru_cache(maxsize=1)
 def _detect_gpu_name() -> str:
-    """Return the full GPU name from ``torch.cuda.get_device_name(0)``, or ``'unknown'``."""
-    try:
-        import torch
+    """Return the GPU name from the ``CI_GPU_NAME`` environment variable.
 
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_name(0)
-    except Exception:
-        pass
-    return "unknown"
+    This variable is set by the CI workflow matrix and forwarded into the
+    Docker container, avoiding the cost of initialising a CUDA context just
+    to query the device name.
+    """
+    return os.environ.get("CI_GPU_NAME", "unknown") or "unknown"
 
 
 @lru_cache(maxsize=1)

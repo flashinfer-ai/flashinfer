@@ -252,6 +252,7 @@ jobs:
                 jq -nc --arg shard "$shard" '{
                   name: "JIT Unittest \($shard) (A10G)",
                   kind: "gpu",
+                  gpu_name: "A10G",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
                   cuda: "cu129",
                   script: "task_jit_run_tests_part\($shard).sh",
@@ -262,6 +263,7 @@ jobs:
               jq -nc '{
                 name: "JIT Unittest (T4)",
                 kind: "gpu",
+                gpu_name: "T4",
                 runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
                 cuda: "cu129",
                 script: "task_jit_run_tests_t4.sh",
@@ -271,6 +273,7 @@ jobs:
               jq -nc '{
                 name: "JIT Unittest (H100)",
                 kind: "h100",
+                gpu_name: "H100",
                 runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
                 cuda: "cu129",
                 script: "task_run_unit_tests.sh",
@@ -295,6 +298,7 @@ jobs:
                 jq -nc --arg test_path "${A10G_SCOPE}" '{
                   name: "Targeted Unittest (A10G)",
                   kind: "gpu",
+                  gpu_name: "A10G",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
                   cuda: "cu129",
                   script: "task_run_unit_tests.sh",
@@ -306,6 +310,7 @@ jobs:
                 jq -nc --arg test_path "${T4_SCOPE}" '{
                   name: "Targeted Unittest (T4)",
                   kind: "gpu",
+                  gpu_name: "T4",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
                   cuda: "cu129",
                   script: "task_run_unit_tests.sh",
@@ -316,6 +321,7 @@ jobs:
               jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
                 name: "Targeted Unittest (H100)",
                 kind: "h100",
+                gpu_name: "H100",
                 runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
                 cuda: "cu129",
                 script: "task_run_unit_tests.sh",
@@ -353,6 +359,7 @@ jobs:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
       MATRIX_ARCH: ${{ matrix.runner[2] }}
       MATRIX_CUDA: ${{ matrix.cuda }}
+      CI_GPU_NAME: ${{ matrix.gpu_name }}
       TEST_SCRIPT: ${{ matrix.script }}
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
