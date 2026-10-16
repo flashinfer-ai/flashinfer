@@ -1,0 +1,132 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""CPU: the geometry, the support probe (never raises), the version probe and the vendored manifest's digests."""
+
+import hashlib
+import json
+import pathlib
+import pytest
+import torch
+
+
+def test_geometry_validation():
+    from flashinfer.qwen_3_5_block import Qwen35BlockGeometry
+
+    g = Qwen35BlockGeometry(d_model=4096, num_qo_heads=32, num_kv_heads=2)
+    assert (
+        g.group == 16
+        and g.n_qkvg == 17408
+        and g.scale == 0.0625
+        and g.unsupported_reason() is None
+    )
+    assert (
+        Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2).n_qkvg
+        == 13312
+    )
+    with pytest.raises(ValueError, match="multiple of num_kv_heads"):
+        Qwen35BlockGeometry(d_model=4096, num_qo_heads=30, num_kv_heads=4)
+    with pytest.raises(ValueError, match="rope_dim"):
+        Qwen35BlockGeometry(d_model=4096, num_qo_heads=32, num_kv_heads=2, rope_dim=65)
+    with pytest.raises(ValueError, match="positive int"):
+        Qwen35BlockGeometry(d_model=0, num_qo_heads=32, num_kv_heads=2)
+    assert (
+        "head_dim=256"
+        in Qwen35BlockGeometry(
+            d_model=4096, num_qo_heads=32, num_kv_heads=2, head_dim=128
+        ).unsupported_reason()
+    )
+    assert (
+        "multiple of 256"
+        in Qwen35BlockGeometry(
+            d_model=4000, num_qo_heads=32, num_kv_heads=2
+        ).unsupported_reason()
+    )
+
+
+def test_support_probe_on_cpu_never_raises_and_names_the_device():
+    from flashinfer.qwen_3_5_block import Qwen35BlockGeometry, qwen_3_5_block_support
+
+    g = Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
+    # the opt-in: calling the decorated function (it warns ExperimentalWarning once per process; the policy test pins the decorator)
+    sup = qwen_3_5_block_support(torch.device("cpu"), g)
+    assert qwen_3_5_block_support.is_experimental is True
+    assert sup.served is False and sup.forms == () and "SM107" in sup.reason
+    assert (
+        sup.prefill.served is False
+        and sup.extend.reason == sup.reason
+        and sup.decode.reason == sup.reason
+    )
+    assert (
+        sup.page_sizes == (16, 32, 64, 128)
+        and sup.kv_layouts == ("NHD", "HND")
+        and sup.decode_max_q_len == 4
+        and sup.decode_max_rows == 32
+    )
+    assert sup.dtypes == (torch.bfloat16,) and sup.cutedsl_required == "4.8.0"
+    assert (
+        "bfloat16"
+        in qwen_3_5_block_support(torch.device("cpu"), g, dtype=torch.float16).reason
+    )
+    assert (
+        "head_dim=256"
+        in qwen_3_5_block_support(
+            torch.device("cpu"),
+            Qwen35BlockGeometry(
+                d_model=2560, num_qo_heads=24, num_kv_heads=2, head_dim=128
+            ),
+        ).reason
+    )
+
+
+def test_support_probe_on_the_local_device():
+    """Wherever this runs: the probe answers; served exactly on SM107 with a Rubin-capable DSL; the per-form records agree."""
+    from flashinfer.qwen_3_5_block import Qwen35BlockGeometry, qwen_3_5_block_support
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    g = Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
+    sup = qwen_3_5_block_support(torch.device("cuda", 0), g)
+    cc = torch.cuda.get_device_capability(0)
+    assert sup.device_cc == cc
+    if cc != (10, 7):
+        assert not sup.served and f"SM{cc[0]}{cc[1]}" in sup.reason
+    elif not sup.cutedsl_ok:
+        assert not sup.served and "cutlass-dsl" in sup.reason
+    else:
+        assert sup.served and sup.forms == ("prefill", "extend", "decode")
+        assert (
+            sup.extend.declines
+            and sup.decode.declines
+            and "head_dim" in sup.decode.declines
+        )
+
+
+def test_version_probe_and_vendored_manifest_digests():
+    from flashinfer.qwen_3_5_block import qwen_3_5_block_support
+    from flashinfer.experimental.qwen_3_5_block import support
+
+    src = support.source()
+    assert src.origin == "https://github.com/NVIDIA/cudnn-frontend"
+    assert (
+        src.commit.startswith("fe8b50da0")
+        and src.version == "1.32.0"
+        and src.files == 95
+    )
+    assert (
+        src.validated_cutedsl == "4.8.0"
+        and src.validated_compute_capability == "10.7"
+        and len(src.manifest_sha256) == 64
+    )
+    root = pathlib.Path(support.__file__).parent / "_cudnn_frost"
+    manifest = json.loads((root / "VENDOR_MANIFEST.json").read_text())
+    for rec in manifest["files"]:
+        assert (
+            hashlib.sha256((root / rec["path"]).read_bytes()).hexdigest()
+            == rec["vendored_sha256"]
+        ), rec["path"]
+        assert rec["license"] in ("MIT", "Apache-2.0", "Apache-2.0 AND MIT"), rec
+    assert (
+        manifest["binder_module"]
+        == "flashinfer.experimental.qwen_3_5_block._sdpa_binder"
+    )
+    assert qwen_3_5_block_support.is_experimental is True
