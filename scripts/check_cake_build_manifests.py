@@ -9,17 +9,32 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 ``sources.json``) reference the manifest entries by an architecture-free
 ``library`` stem: entry ``<library>[<specialization tag>]_<arch>``.
 
+The manifest's ``package`` field is the dotted import path of the package
+directory (``flashinfer.experimental.cake_mok_bf16``,
+``flashinfer.cake_rmsnorm_train_backend``): the one spelling every exporter
+writes and this checker compares (``Package.name``); a directory path is not
+accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
+not unique (two entries of one program and architecture, for example two tile
+specialisations of a stage, share the bundle's closure) and is not checked for
+uniqueness.  ``common.requires.cuda_toolkit.min`` is the lowest
+``libraries[].min_cuda`` -- the floor below which nothing in the package
+builds -- not the toolkit that builds every entry: each entry's own
+``min_cuda`` gates it (a warm-up or the vendored gate skips an entry above the
+toolkit, "skip min_cuda > toolkit").
+
 The checker is deliberately dependency-free: it parses the registry literals
 with ``ast`` and never imports ``flashinfer`` (no CUDA probe, no compiler).
 
 In-tree checks (``--in-tree``, the default):
 
-* manifest schema -- required fields, ``path == aot/<name>.so``, ``arch`` in
-  ``arch_flags``, ``name`` ends in ``_<arch>``, ``sources`` package-relative
-  under ``csrc/`` and present, ``sha256`` keyed by the sources and equal to the
-  file digests, 64-hex ``closure_sha256``, ``entry == "run"``;
+* manifest schema -- required fields, ``package`` == the dotted import path,
+  ``path == aot/<name>.so``, ``arch`` in ``arch_flags``, ``name`` ends in
+  ``_<arch>``, ``sources`` package-relative under ``csrc/`` and present,
+  ``sha256`` keyed by the sources and equal to the file digests, 64-hex
+  ``closure_sha256``, ``min_cuda`` as ``X.Y``, ``entry == "run"``;
 * entry names unique and equal to the set the registry references, so every
   registry stem has its per-architecture entries and no entry is orphaned;
+* ``common.requires.cuda_toolkit.min`` == the lowest ``libraries[].min_cuda``;
 * package-data coverage in ``pyproject.toml`` for ``build.json``,
   ``csrc/cake_ffi_checks.h`` and every manifest source (wheels ship them);
 * the ``cake_build.py`` files of all checked packages are byte-identical;
@@ -30,7 +45,10 @@ Not implemented yet (TODO, exit code 2 when requested):
 * ``--vendored-gate``: per package, copy the package directory to a temporary
   location, compile every manifest entry with plain ``nvcc`` from the manifest
   flags only (skip ``min_cuda`` above the toolkit) into ``<copy>/aot/``, write
-  ``aot/build_info.json``, then in a fresh ``python -I`` subprocess with
+  ``aot/build_info.json`` with ``arches`` = every architecture compiled into
+  the copy (the sidecar rule ``cake_build.record_cuda_version`` applies: an
+  arch absent from the sidecar takes the JIT path), then in a fresh
+  ``python -I`` subprocess with
   ``sys.modules["flashinfer"] = None`` import the package, load every library
   through ``cake_build`` and run one smoke launch, asserting the module came
   from ``aot/`` and that every entry reports one ``build_cuda_version``.
@@ -200,15 +218,16 @@ def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
 
 @dataclass(frozen=True)
 class Package:
-    name: str  # dotted import name
+    name: str  # dotted import path of ``path``; build.json ``package`` must equal it
     path: str  # repository-relative directory
     loader: str  # registry file inside the package
     refs: Callable[[Path, str], set[str]]
 
 
-# TODO(#6553, Lane D): dsa_train, dsa_indexer and the rmsnorm backend are read with the generic
-# walker (a mapping carrying ``library`` under an ``arches`` / ``arch`` scope); tighten to their
-# exact slimmed registry shapes once the Cake exporters deliver them.
+# dsa_train, dsa_indexer and the rmsnorm backend are read with the generic walker (a mapping
+# carrying ``library`` under an ``arches`` / ``arch`` scope).  Their exporters' registry shapes
+# fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm
+# MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_train_backend",
@@ -279,7 +298,10 @@ def check_manifest(
     if manifest["schema"] != SCHEMA:
         note(f"schema {manifest['schema']!r} != {SCHEMA!r}")
     if manifest["package"] != package.name:
-        note(f"package {manifest['package']!r} != {package.name!r}")
+        note(
+            f"package {manifest['package']!r} != {package.name!r} "
+            f"(the dotted import path of {package.path})"
+        )
     if not isinstance(manifest["generator"], dict) or GENERATOR_KEYS - set(
         manifest["generator"]
     ):
@@ -311,6 +333,9 @@ def check_manifest(
     if not isinstance(libraries, list) or not libraries:
         note("libraries is not a non-empty list")
         return found
+    # ``name`` is the unique key.  ``closure_sha256`` is deliberately not checked
+    # for uniqueness: two entries of one program and architecture (for example
+    # two tile specialisations of a stage) share the bundle's closure.
     names = [entry.get("name") for entry in libraries]
     duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
@@ -392,6 +417,39 @@ def _check_entry(
             ):
                 note(f"sha256 of {source!r} does not match the file")
     return found
+
+
+def _version_key(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in str(text).split("."))
+
+
+def check_cuda_toolkit_floor(
+    package: Package, manifest: dict[str, Any]
+) -> list[Finding]:
+    """``common.requires.cuda_toolkit.min`` is the lowest ``libraries[].min_cuda``: the floor below which
+    no entry of the package builds, not the toolkit that builds every entry (each entry's ``min_cuda``
+    gates it; a warm-up skips an entry above the local toolkit)."""
+    floors = [
+        entry["min_cuda"]
+        for entry in manifest.get("libraries", [])
+        if isinstance(entry, dict)
+        and re.match(r"^\d+\.\d+$", str(entry.get("min_cuda")))
+    ]
+    if not floors:
+        return []  # entries without a well-formed min_cuda are reported by check_manifest
+    lowest = min(floors, key=_version_key)
+    common = manifest.get("common")
+    requires = common.get("requires") if isinstance(common, dict) else None
+    declared = requires.get("cuda_toolkit") if isinstance(requires, dict) else None
+    if declared != {"min": lowest}:
+        return [
+            Finding(
+                package.name,
+                f"common.requires.cuda_toolkit {declared!r} != {{'min': {lowest!r}}} "
+                "(the lowest libraries[].min_cuda)",
+            )
+        ]
+    return []
 
 
 def check_references(
@@ -587,6 +645,7 @@ def run_in_tree(root: Path, packages: list[Package]) -> list[Finding]:
             continue
         checked[package.name] = package_dir
         findings.extend(check_manifest(package, package_dir, manifest))
+        findings.extend(check_cuda_toolkit_floor(package, manifest))
         findings.extend(check_references(package, package_dir, manifest))
         findings.extend(check_package_data(package, manifest, table))
         findings.extend(check_tvm_ffi_pin(package, manifest, root / "requirements.txt"))
