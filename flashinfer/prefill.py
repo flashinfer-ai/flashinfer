@@ -868,9 +868,9 @@ def get_batch_prefill_module(backend, *args):
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             )
         elif backend == "fa2":
-            assert (
-                not is_float8(q)
-                or q.dtype == paged_k_cache.dtype == torch.float8_e4m3fn
+            assert not is_float8(q) or (
+                q.dtype == paged_k_cache.dtype == torch.float8_e4m3fn
+                and get_compute_capability(q.device) == (12, 0)
             )
             if tuple(paged_k_cache.stride()) == tuple(paged_v_cache.stride()):
                 routed_paged_run_func = paged_run_func
