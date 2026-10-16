@@ -451,9 +451,11 @@ def recurrent_kda(
             replays. Requires ptxas >= 13.2 and TVM FFI. Capture requires a
             caller-owned warmed workspace and output; packed offsets must stay
             unchanged during capture/replay. See ``docs/api/kda.rst``.
-            ``"auto"`` selects the bundled small-BH
-            CuTe DSL kernel for eligible SM100-family calls whose logical batch
-            size times head count does not exceed half the device's SM count. It
+            ``"auto"`` sends an eligible ordinary prefill inside the measured
+            SM100 / SM103 tile region to cuDNN (``docs/api/cudnn.rst``) and
+            otherwise selects the bundled small-BH CuTe DSL kernel for
+            SM100-family calls whose logical batch size times head count does
+            not exceed half the device's SM count. It
             selects other architecture-appropriate CuTe DSL kernels for
             supported ordinary multi-token prefill, including the SM120
             backend and SM100-family state checkpoints, and otherwise falls

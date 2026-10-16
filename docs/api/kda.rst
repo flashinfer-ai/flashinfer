@@ -19,11 +19,12 @@ and serves decode and speculative decode through the same shared decode
 dispatcher that :ref:`apikda_decode` uses, while dispatching eligible ordinary
 multi-token prefill to the optimized backend described in
 :ref:`apikda_prefill`. The automatic prefill selection depends on the device
-and workload: eligible SM100a and SM103a calls with small logical
-batch-times-head count use the bundled small-BH CuTe-DSL kernel; other calls
-follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
-backend of its own. These prefill routes leave decode and speculative-decode
-dispatch unchanged.
+and workload: on SM100a and SM103a, ``auto`` sends a call inside the measured
+tile region below to cuDNN and every other call to its native route, the
+bundled small-BH CuTe-DSL kernel for a small logical batch-times-head count
+and the standard SM100-family CuTe-DSL/Cake policy for the rest. SM120a uses a
+CuTe-DSL backend of its own. These prefill routes leave decode and
+speculative-decode dispatch unchanged.
 
 Automatic prefill policy on GB200 and GB300
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
