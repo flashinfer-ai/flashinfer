@@ -1084,7 +1084,7 @@ def append_paged_kv_cache_with_slot_mapping(
     flat cache slot. ``slot_mapping[i]`` is interpreted as
     ``page_id * page_size + entry_idx``. Negative slots are padding and are
     ignored. ``append_key`` and ``append_value`` may contain additional padded
-    rows; only ``slot_mapping.shape[0]`` rows are considered.
+    rows; only ``num_valid_tokens`` rows are written.
 
     Parameters
     ----------
@@ -1131,12 +1131,24 @@ def append_paged_kv_cache_with_slot_mapping(
         raise ValueError(
             f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
         )
+    if num_valid_tokens is None:
+        num_valid_tokens = slot_mapping.shape[0]
+
+    if num_valid_tokens < 0:
+        raise ValueError(
+            f"num_valid_tokens must be non-negative, got {num_valid_tokens}"
+        )
+    if num_valid_tokens > slot_mapping.shape[0]:
+        raise ValueError(
+            f"num_valid_tokens={num_valid_tokens} must be <= slot_mapping.shape[0]={slot_mapping.shape[0]}"
+        )
     if (
-        append_key.shape[0] < slot_mapping.shape[0]
-        or append_value.shape[0] < slot_mapping.shape[0]
+        append_key.shape[0] < num_valid_tokens
+        or append_value.shape[0] < num_valid_tokens
     ):
         raise ValueError(
-            "append_key and append_value must have at least slot_mapping.shape[0] rows"
+            f"append_key and append_value must have at least num_valid_tokens={num_valid_tokens} rows, "
+            f"got append_key.shape[0]={append_key.shape[0]}, append_value.shape[0]={append_value.shape[0]}"
         )
 
     paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
@@ -1157,9 +1169,6 @@ def append_paged_kv_cache_with_slot_mapping(
             page_size = paged_k_cache.shape[2]
         else:
             page_size = paged_k_cache.shape[1]
-
-    if num_valid_tokens is None:
-        num_valid_tokens = slot_mapping.shape[0]
 
     # Validate shapes
     if kv_layout == "HND":
