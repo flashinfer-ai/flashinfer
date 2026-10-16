@@ -1,9 +1,8 @@
 """Strict cold-L2 CUPTI benchmark for grouped MXFP8 quantization kernels.
 
-All arms (``cuda``, ``cutile``, ``cake``) use preallocated outputs and prepared
-scheduling metadata.  The timed boundary contains exactly one quantization-kernel
-launch; cuTile prefix construction and all Python/output-allocation work stay
-outside that boundary.
+All arms use preallocated outputs and prepared scheduling metadata.  The
+timed boundary contains exactly one quantization-kernel launch; cuTile prefix
+construction and all Python/output-allocation work stay outside that boundary.
 CUDA-event and CUDA-graph timing fallbacks are deliberately rejected.
 """
 
@@ -174,7 +173,7 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
     cuda_module = gen_mxfp8_quantization_sm100_module().build_and_load()
 
     def run_cuda_kernel():
-        # The CUDA kernel pads K itself, so it reads the unpadded input; PDL off.
+        # use_silu_and_mul=False, enable_pdl=False; the kernel pads K, so it reads x.
         cuda_module.silu_and_mul_mxfp8_experts_quantize(
             x, mask, cuda_q, cuda_sf, False, False
         )

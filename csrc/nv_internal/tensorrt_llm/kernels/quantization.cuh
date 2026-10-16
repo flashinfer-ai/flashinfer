@@ -722,11 +722,10 @@ cvt_fp16_to_fp4_expert(
 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-// Quantizes one MXFP8 block of 32 values held by a single thread (vecs[0] holds values 0-15,
-// vecs[1] values 16-31) and returns its 32 E4M3 bytes; sfByte receives the UE8M0 scale. The result
-// matches cvt_warp_fp16_to_mxfp8 with CLAMP_NAN_TO_MAX off bit for bit, at fewer instructions per
-// value: no cross-thread max, the absolute value folds into the fp32 min/max, the reciprocal scale
-// comes from the exponent instead of MUFU.RCP, and value pairs use packed fp32 multiplies.
+// Quantizes a 32-value block held by one thread (vecs[0]: values 0-15, vecs[1]: 16-31) into 32 e4m3
+// bytes and the UE8M0 scale sfByte. For a block without NaN it matches cvt_warp_fp16_to_mxfp8 with
+// CLAMP_NAN_TO_MAX off bit for bit (both flush float32 subnormals under the module's
+// -use_fast_math), in fewer instructions: no cross-thread max, no MUFU.RCP for the output scale.
 template <class Type>
 __device__ __forceinline__ PackedU32x8 cvt_block32_to_mxfp8(PackedVec<Type, 16> const (&vecs)[2],
                                                             uint8_t& sfByte) {
@@ -741,7 +740,7 @@ __device__ __forceinline__ PackedU32x8 cvt_block32_to_mxfp8(PackedVec<Type, 16> 
       vals[i] = make_float2(__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u));
     }
   }
-  // fmaxf skips NaN, so only an all-NaN block has a NaN maximum, as with the bf16x2 max.
+  // fmaxf skips NaN, so only an all-NaN block has a NaN maximum.
   float amax = fabsf(vals[0].x);
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
@@ -751,13 +750,11 @@ __device__ __forceinline__ PackedU32x8 cvt_block32_to_mxfp8(PackedVec<Type, 16> 
   sf.__x = __nv_cvt_float_to_e8m0(amax * reciprocal_approximate_ftz(448.0f), __NV_SATFINITE,
                                   cudaRoundPosInf);
   sfByte = sf.__x;
-  // 1 / 2^(e - 127) has exponent field 254 - e. Flush-to-zero in cvt_warp_fp16_to_mxfp8 treats the
-  // scale 2^-127 (e = 0) and the reciprocal of 2^127 (e = 254) as zero, so those blocks get a zero
-  // output scale here too: their finite values quantize to zero, and the infinity that gives a
-  // block e = 254 to NaN. e = 255 (an all-NaN block) gives NaN.
+  // 1 / 2^(e - 127) has exponent field 254 - e. e = 0 and e = 254 get output scale 0, as in
+  // cvt_warp_fp16_to_mxfp8, which flushes 2^-127 to zero: finite values become zero and an infinity
+  // NaN. e = 255 comes only from an all-NaN block, which stays NaN.
   uint32_t const e = sf.__x;
-  float const outputScale = e - 1u < 253u ? __uint_as_float((254u - e) << 23)
-                                          : (e == 255u ? __uint_as_float(0x7fffffffu) : 0.f);
+  float const outputScale = e - 1u < 253u ? __uint_as_float((254u - e) << 23) : 0.f;
   float2 const scale2 = make_float2(outputScale, outputScale);
   PackedU32x8 out;
 #pragma unroll
@@ -773,23 +770,20 @@ __device__ __forceinline__ PackedU32x8 cvt_block32_to_mxfp8(PackedVec<Type, 16> 
 
 // MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul.
 //
-// in:    [numExperts, numRows, numCols], or [numExperts, numRows, 2 * numCols] when
-//        USE_SILU_AND_MUL is set; each row then holds the gate values followed by the up values
-//        and silu(gate) * up is quantized.
-// out:   [numExperts, numRows, numPaddedCols] e4m3; columns [numCols, numPaddedCols) are zero.
-// SFout: per expert, UE8M0 scales of the [numRows, numPaddedCols / 32] SF matrix in the 128x4
-//        swizzled layout, with rows padded to a multiple of 128.
+// in:    [numExperts, numRows, numCols], or [numExperts, numRows, 2 * numCols] (gate then up)
+//        when USE_SILU_AND_MUL is set, which quantizes silu(gate) * up.
+// out:   [numExperts, numRows, numPaddedCols] e4m3; padded columns of written rows are zero.
+// SFout: per expert, [round_up(numRows, 128), numPaddedCols / 32] UE8M0 scales in the 128x4
+//        swizzled layout; padded columns get scale byte 0.
 // mask:  [numExperts]; only the first min(mask[e], numRows) rows of expert e are read and written.
 //
-// blockIdx.x is the expert; blockIdx.y and threadIdx.y stride over its rows, and threadIdx.x over
-// the scale blocks of a row. The plain quantization is bandwidth bound: each thread converts a
-// whole 32-value scale block (cvt_block32_to_mxfp8), which takes the fewest instructions per value.
-// The SiLU makes every value costly, so with SiLU-and-mul two threads share a block (16 values
-// each, cvt_warp_fp16_to_mxfp8): twice the threads hide more of that latency when few rows are
-// valid. That path needs blockDim.x to be a multiple of 32 and every lane to run every column
-// iteration, so each warp maps to a single row and the scale reduction sees a full warp.
-// USE_SILU_AND_MUL is a template parameter, so the plain quantization reserves no registers for the
-// up values.
+// blockIdx.x is the expert; blockIdx.y and threadIdx.y stride over its rows, threadIdx.x over the
+// scale blocks of a row. The plain path is bandwidth bound, so a thread converts a whole block in
+// the fewest instructions (cvt_block32_to_mxfp8). SiLU makes every value costly, so the SiLU path
+// splits a block over two threads (cvt_warp_fp16_to_mxfp8) to hide more latency when few rows are
+// valid; its scale reduction shuffles within a warp, so blockDim.x is a multiple of 32 and every
+// lane runs every column iteration. USE_SILU_AND_MUL is a template parameter so that each path
+// gets its own register count.
 template <class Type, bool USE_SILU_AND_MUL>
 __global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32_t numPaddedCols,
                                          Type const* in, int32_t const* mask, uint8_t* out,
@@ -826,7 +820,7 @@ __global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32
           loadPackedVec(upVec, inRow + numHalfBlocks + colIdx);
           silu_and_mul<Type, SF_VEC_SIZE / 2>(vec, upVec);
         } else {
-          // Padded columns quantize to zero values with a zero scale.
+          // Padded columns quantize to zero values with scale byte 0.
           reinterpret_cast<PackedU32x8&>(vec) = PackedU32x8{};
         }
         uint8_t* sfOut = nullptr;
@@ -853,7 +847,7 @@ __global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32
           loadPackedVec(vecs[0], inRow + 2 * colIdx);
           loadPackedVec(vecs[1], inRow + 2 * colIdx + 1);
         } else {
-          // Padded columns quantize to zero values with a zero scale.
+          // Padded columns quantize to zero values with scale byte 0.
           reinterpret_cast<PackedU32x8&>(vecs[0]) = PackedU32x8{};
           reinterpret_cast<PackedU32x8&>(vecs[1]) = PackedU32x8{};
         }

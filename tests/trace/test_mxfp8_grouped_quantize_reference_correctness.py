@@ -22,7 +22,11 @@ from tests.trace.reference_utils import (
 def test_mxfp8_grouped_quantize_reference_correctness(shape_kwargs):
     _skip_if_not_sm100()
     import flashinfer
+    from flashinfer.cutile import is_cuda_tile_available
     from flashinfer.trace.templates.quantize import mxfp8_grouped_quantize_trace
+
+    if not is_cuda_tile_available():
+        pytest.skip("cuda.tile is not available")
 
     inputs = mxfp8_grouped_quantize_trace.init(**shape_kwargs)
     a = inputs["a"]

@@ -849,11 +849,9 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 }
 
 // Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
-// A scale block that holds an infinity gets the scale 2^127, whose reciprocal flushes to zero, so
-// the infinity scales to NaN and the block's finite values to zero. The e4m3 conversion saturates
-// finite values above 448 to +/-448 and keeps NaN. CLAMP_NAN_TO_MAX first clamps every scaled value
-// to [-448, 448], which maps NaN (including the NaN from an infinity) to 448, at four min/max
-// instructions per value pair.
+// A block with an infinity and no NaN gets scale 2^127, whose reciprocal flushes to zero, so the
+// infinity becomes NaN and the finite values zero. Finite values saturate at +/-448;
+// CLAMP_NAN_TO_MAX also maps NaN to +448, otherwise NaN stays NaN.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool CLAMP_NAN_TO_MAX = true>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {

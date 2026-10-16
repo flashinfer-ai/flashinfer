@@ -602,7 +602,7 @@ with contextlib.suppress(Exception):
         kv_layout="HND",
     )
 
-# Grouped MXFP8 (SM100+): [B, M, K] -> masked grouped GEMM layout.
+# Grouped MXFP8 (cuTile, SM100+): [B, M, K] -> masked grouped GEMM layout.
 with contextlib.suppress(Exception):
     grouped_a = torch.randn(2, 256, quant_K, dtype=torch.bfloat16, device=device)
     grouped_mask = torch.full((2,), 256, dtype=torch.int32, device=device)

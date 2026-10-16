@@ -259,10 +259,9 @@ void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_
   TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(output) % kOutputAlignment == 0,
                        "output must be %zu-byte aligned", kOutputAlignment);
 
-  // Each column thread converts a 32-value scale block, or half of one with SiLU-and-mul (see
-  // cvt_fp16_to_mxfp8_expert). A block row covers a matrix row in the fewest passes of at most
-  // kMaxBlockThreads threads, with its width balanced across the passes; the SiLU path pairs lanes
-  // inside a warp, so its width is warp aligned. Narrow rows stack several rows per block along y.
+  // A thread converts a 32-value scale block, or half of one with SiLU-and-mul. blockDim.x covers
+  // a row in the fewest passes of at most kMaxBlockThreads, balanced across the passes, and is warp
+  // aligned on the SiLU path, which pairs lanes within a warp. Narrow rows stack along y.
   constexpr int kMaxBlockThreads = 256;
   int const numColThreads = padded_n / (use_silu_and_mul ? 16 : 32);
   int const numColPasses = (numColThreads + kMaxBlockThreads - 1) / kMaxBlockThreads;
@@ -273,11 +272,10 @@ void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_
   int const blockY = std::max(1, kMaxBlockThreads / blockX);
   dim3 const block(blockX, blockY);
 
-  // The mask lives on the device, so size the grid for the full capacity m and let blocks past
-  // mask[e] exit early. Cap the total at the number of resident blocks, so a fully valid batch
-  // runs in a single wave. Experts vary fastest across the grid, so when few rows are valid the
-  // active (low row-block) blocks of all experts are consecutive in launch order and spread over
-  // all SMs.
+  // The mask is on the device, so the grid is sized for all m rows and blocks past mask[e] exit
+  // early. Row blocks per expert are capped so the grid fits one wave of resident blocks, keeping
+  // at least one per expert. Experts vary fastest, so with few valid rows the active blocks of all
+  // experts are adjacent in launch order and spread over all SMs.
   auto const kernel =
       use_silu_and_mul ? cvt_fp16_to_mxfp8_expert<T, true> : cvt_fp16_to_mxfp8_expert<T, false>;
   int numBlocksPerSM = 0;
@@ -853,6 +851,7 @@ template void invokeSiluAndMulMxFP8Quantization<__nv_bfloat16>(
     int numExperts, int m, int n, int padded_n, __nv_bfloat16 const* input, int32_t const* mask,
     bool use_silu_and_mul, uint8_t* output, uint32_t* SFOutput, int multiProcessorCount,
     bool enable_pdl, cudaStream_t stream);
+
 #endif
 
 #ifdef ENABLE_FP8
