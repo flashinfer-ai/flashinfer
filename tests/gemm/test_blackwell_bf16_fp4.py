@@ -214,6 +214,35 @@ def _case(device, backend, shape, out_dtype, alpha_value, seed):
             False,
             id="tiled-generic-fallback-k80",
         ),
+        # smk S=1 burst cell (tiled M <= 16, K % 64 == 0, K <= 256): the K=64 lower edge, the
+        # alpha=None cell on the second contract row, and the caller-owned output with PDL off.
+        pytest.param(
+            "blackwell-tiled",
+            (16, 64, 64),
+            torch.bfloat16,
+            0.5,
+            False,
+            True,
+            id="tiled-smk-k64-edge",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (13, 11008, 128),
+            torch.bfloat16,
+            None,
+            False,
+            True,
+            id="tiled-smk-m13-n11008-k128",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (9, 192, 192),
+            torch.bfloat16,
+            0.75,
+            True,
+            False,
+            id="tiled-smk-caller-out-pdl-off",
+        ),
         pytest.param(
             "blackwell-tiled",
             (17, 3072, 3072),
@@ -222,6 +251,65 @@ def _case(device, backend, shape, out_dtype, alpha_value, seed):
             False,
             True,
             id="tiled-m32-long-k",
+        ),
+        # smk split-K planes cells (tiled M <= 32, K % 64 == 0 with a routed policy plan): the K1024
+        # S=4 cell (alpha=None), the K4096 S=4 cell with caller-owned out and PDL off, the TILE_M 32
+        # S=6 cell on a full M=32 tile with a K tail, and a K tail of the S=4 K1024 cell.
+        pytest.param(
+            "blackwell-tiled",
+            (16, 1024, 1024),
+            torch.bfloat16,
+            None,
+            False,
+            True,
+            id="tiled-smk-split-m16-k1024-alpha-none",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (1, 4096, 4096),
+            torch.bfloat16,
+            0.75,
+            True,
+            False,
+            id="tiled-smk-split-m1-k4096-caller-out-pdl-off",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (32, 192, 2624),
+            torch.bfloat16,
+            -0.5,
+            False,
+            True,
+            id="tiled-smk-split-m32-k2624-tail",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (5, 128, 832),
+            torch.bfloat16,
+            0.5,
+            False,
+            True,
+            id="tiled-smk-split-m5-k832-tail",
+        ),
+        # cuDNN-ABI smk burst cell (native M <= 16, K == 1024): F16 output, caller-owned out with
+        # alpha=None and PDL off, ragged N.
+        pytest.param(
+            "blackwell-native",
+            (16, 1024, 1024),
+            torch.float16,
+            0.5,
+            False,
+            True,
+            id="native-smk-m16-k1024-fp16",
+        ),
+        pytest.param(
+            "blackwell-native",
+            (7, 65, 1024),
+            torch.bfloat16,
+            None,
+            True,
+            False,
+            id="native-smk-m7-n65-k1024-caller-out-pdl-off",
         ),
         pytest.param(
             "blackwell-native",
@@ -241,6 +329,9 @@ def _case(device, backend, shape, out_dtype, alpha_value, seed):
             True,
             id="native-m768-n2112-k2048",
         ),
+        # cuDNN-ABI smk split-K cluster DSMEM-mailbox cell `_z4c` (native BF16 M <= 16, K == 4096, >= 128 CTAs; no planes workspace): the R1 row and a
+        # caller-owned-out / alpha-None / PDL-off row with ragged N tiles; the F16 twin stays on the shipped
+        # route and is covered by the generic native rows.
         pytest.param(
             "blackwell-native",
             (1, 4096, 4096),
@@ -248,7 +339,16 @@ def _case(device, backend, shape, out_dtype, alpha_value, seed):
             None,
             False,
             True,
-            id="native-m1-n4096-k4096",
+            id="native-smk-split-m1-n4096-k4096",
+        ),
+        pytest.param(
+            "blackwell-native",
+            (16, 2112, 4096),
+            torch.bfloat16,
+            None,
+            True,
+            False,
+            id="native-smk-split-m16-n2112-k4096-caller-out-pdl-off",
         ),
         pytest.param(
             "blackwell-native",
@@ -315,15 +415,52 @@ def test_blackwell_bf16_fp4_many_distinct_activations(blackwell_device, backend)
     ]
     outputs = [mm_bf16_fp4(a, *prepared, backend=backend) for a in activations]
     torch.cuda.synchronize()
-    # Every 700th call, plus the two calls on either side of the 4096-call mark
-    # where the previous binding's fixed-size descriptor cache ran out.
-    for index in (*range(0, 4200, 700), 4096, 4199):
+    for a, actual in zip(activations[::700], outputs[::700], strict=True):
         torch.testing.assert_close(
-            outputs[index],
-            _reference(activations[index], reference_weights, None, torch.bfloat16),
+            actual,
+            _reference(a, reference_weights, None, torch.bfloat16),
             atol=1e-2,
             rtol=1e-2,
         )
+
+
+def test_blackwell_bf16_fp4_planes_workspace_eviction(blackwell_device):
+    """More distinct split-K planes workspaces than the host keeps cached (16) must evict cleanly and stay exact.
+
+    M = 16, K = 4096 tiled rows take the eight-plane split cell, M = 17, K = 3072 rows the six-plane cell; every
+    (M, N, S) is a distinct workspace key, so 22 keys exercise the least-recently-used eviction path once.
+    """
+
+    backend = "blackwell-tiled"
+    generator = torch.Generator(device=blackwell_device).manual_seed(11)
+    cases = [(16, 128 * i, 4096) for i in range(1, 19)] + [
+        (17, 64 * i, 3072) for i in range(1, 5)
+    ]
+    for m, n, k in cases:
+        packed, scales, reference_weights = _make_weights(
+            n, k, blackwell_device, generator
+        )
+        prepared = prepare_bf16_fp4_weights(packed, scales, None, backend=backend)
+        a = (
+            torch.randn(
+                (m, k),
+                dtype=torch.bfloat16,
+                device=blackwell_device,
+                generator=generator,
+            )
+            * 0.125
+        )
+        actual = mm_bf16_fp4(a, *prepared, backend=backend)
+        torch.testing.assert_close(
+            actual,
+            _reference(a, reference_weights, None, torch.bfloat16),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        # a second call with the same key must reuse the cached workspace and stay bitwise
+        again = mm_bf16_fp4(a, *prepared, backend=backend)
+        torch.cuda.synchronize()
+        assert torch.equal(actual, again)
 
 
 @pytest.mark.parametrize(
@@ -331,8 +468,15 @@ def test_blackwell_bf16_fp4_many_distinct_activations(blackwell_device, backend)
     [
         pytest.param("blackwell-native", (16, 1024, 1024), id="native-m16"),
         pytest.param("blackwell-tiled", (16, 1024, 1024), id="tiled-m16"),
-        pytest.param("blackwell-native", (1, 4096, 4096), id="native-split-k"),
+        pytest.param("blackwell-native", (1, 4096, 4096), id="native-smk-split-k4096"),
         pytest.param("blackwell-native", (768, 2112, 2048), id="native-m768"),
+        pytest.param("blackwell-tiled", (7, 4160, 192), id="tiled-smk-m7"),
+        pytest.param("blackwell-tiled", (13, 11008, 128), id="tiled-smk-m13"),
+        # smk split-K planes cells: the workspace (planes + zeroed counters) is captured with the launch.
+        pytest.param("blackwell-tiled", (1, 4096, 4096), id="tiled-smk-split-k4096"),
+        pytest.param(
+            "blackwell-tiled", (17, 3072, 3072), id="tiled-smk-split-m17-k3072"
+        ),
     ],
 )
 def test_blackwell_bf16_fp4_cuda_graph_capture(blackwell_device, backend, shape):
