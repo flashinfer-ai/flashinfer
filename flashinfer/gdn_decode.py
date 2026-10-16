@@ -34,6 +34,7 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from .jit.core import logger
+from .utils import get_compute_capability
 
 try:
     from .jit import cake_gdn as _cake_gdn
@@ -77,6 +78,17 @@ except (ImportError, RuntimeError):
     _GDN_DECODE_BF16_STATE_AVAILABLE = False
     _gated_delta_rule_bf16_state = None
     _gated_delta_rule_bf16_state_mtp = None
+
+# Rubin (SM107) T=1 BF16 state kernel - optional backend
+try:
+    from .gdn_kernels.gdn_decode_bf16_state_rubin import (
+        gated_delta_rule_t1_rubin as _gated_delta_rule_t1_rubin,
+    )
+
+    _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE = False
+    _gated_delta_rule_t1_rubin = None
 
 # Pretranspose decode kernel (V-major state, T=1)
 try:
@@ -516,7 +528,7 @@ def gated_delta_rule_decode_pretranspose(
     output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
-    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
+    backend: Literal["auto", "flashinfer", "cake_gdn", "rubin"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -579,10 +591,16 @@ def gated_delta_rule_decode_pretranspose(
     disable_state_update : bool
         Skip final-state writeback for verify calls. Supported only for
         ``T > 1``. Default: ``False``.
-    backend : {"auto", "flashinfer", "cake_gdn"}
+    backend : {"auto", "flashinfer", "cake_gdn", "rubin"}
         ``auto`` selects GDN non-CP only for an exact frozen manifest row and
-        otherwise uses the existing FlashInfer implementation. Explicit
-        ``cake_gdn`` requests fail closed when the contract is unsupported.
+        otherwise uses the existing FlashInfer implementation; on Rubin
+        (compute capability 10.7) its T=1 bf16-state calls with
+        ``B * HV >= 512`` use the Rubin-tuned kernel, which gives the same
+        bits as the generic kernel there. ``flashinfer`` always uses the
+        generic FlashInfer kernels. Explicit ``cake_gdn`` requests fail
+        closed when the contract is unsupported. ``rubin`` forces the
+        Rubin-tuned T=1 kernel and raises ``ValueError`` on other GPUs or
+        outside T=1, bfloat16 state and K=V=128.
 
         **Padding / inactive sequences**: set the index to ``-1`` for any
         batch entry that should be treated as padding.  The two backends
@@ -614,6 +632,9 @@ def gated_delta_rule_decode_pretranspose(
     - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
       bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
       MTP for T>1); the pool+indices path routes through the MTP kernel.
+      On SM107 (Rubin), T=1 with ``B * HV >= 512`` uses the Rubin-tuned
+      kernel (``gdn_kernels/gdn_decode_bf16_state_rubin.py``) under
+      ``backend="auto"``.
     - Pool+indices (``initial_state`` / ``initial_state_indices``) are
       supported on both the bf16 fast path (K=V=128) and the float32 legacy
       path (T=1).  Both paths support ``-1`` padding indices (see
@@ -667,9 +688,22 @@ def gated_delta_rule_decode_pretranspose(
 
     # Backend: BF16 state kernel when bf16 state, K=V=128
     state_dtype = initial_state.dtype if use_pool else state.dtype
-    if backend not in ("auto", "flashinfer", "cake_gdn"):
+    if backend not in ("auto", "flashinfer", "cake_gdn", "rubin"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
-    if backend != "flashinfer":
+    if backend == "rubin":
+        if not _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE:
+            raise RuntimeError("the Rubin GDN decode kernel failed to import")
+        if get_compute_capability(q.device) != (10, 7):
+            raise ValueError(
+                'backend="rubin" needs compute capability 10.7 (Rubin), got '
+                f"{get_compute_capability(q.device)}"
+            )
+        if not (T == 1 and state_dtype == torch.bfloat16 and K == 128 and V == 128):
+            raise ValueError(
+                'backend="rubin" supports T=1 with bfloat16 state and K=V=128, got '
+                f"T={T}, state dtype {state_dtype}, K={K}, V={V}"
+            )
+    if backend not in ("flashinfer", "rubin"):
         if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
             if backend == "cake_gdn":
                 raise RuntimeError("the source-only Cake GDN backend is not installed")
@@ -737,7 +771,35 @@ def gated_delta_rule_decode_pretranspose(
         forward_output = (
             output if (output is not None and output.dtype == torch.bfloat16) else None
         )
-        if T == 1:
+        # Rubin (SM107): the Rubin-tuned T=1 kernel. It keeps the whole state tile in
+        # flight with fewer instructions and is bitwise equal to the generic T=1
+        # wide_vec kernel, which the generic dispatcher uses from B * HV >= 512.
+        use_rubin = backend == "rubin" or (
+            backend == "auto"
+            and T == 1
+            and B * HV >= 512
+            and _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE
+            and get_compute_capability(q.device) == (10, 7)
+        )
+        if use_rubin:
+            out = _gated_delta_rule_t1_rubin(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=bf16_pool,
+                initial_state_indices=bf16_indices,
+                output_state_indices=output_state_indices,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale_val,
+                output=forward_output,
+            )
+        elif T == 1:
             out = _gated_delta_rule_bf16_state(
                 A_log=A_log,
                 a=a,

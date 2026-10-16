@@ -17,6 +17,17 @@ recurrent gated delta-rule update for the current decode step.
     gated_delta_rule_mtp
     gated_delta_rule_replayssm_commit
 
+Rubin T=1 bf16-state decode (SM107)
+-----------------------------------
+
+On Rubin (compute capability 10.7), ``gated_delta_rule_decode_pretranspose``
+routes T=1 calls with a bfloat16 state, K=V=128 and ``B * HV >= 512`` to a
+Rubin-tuned kernel under ``backend="auto"``. It requests each 64-row state tile
+at once into shared memory, prefetches a later tile into L2 and issues fewer
+instructions; outputs and the updated state are bitwise equal to the generic
+kernel. ``backend="rubin"`` forces it (any batch size, Rubin only) and
+``backend="flashinfer"`` keeps the generic kernel.
+
 ReplaySSM speculative verification (SM100/SM103)
 ---------------------------------------------
 

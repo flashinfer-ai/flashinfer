@@ -216,9 +216,11 @@ def parse_gdn_args(line, parser):
         required=False,
         nargs="+",
         default=["flashinfer"],
-        choices=["flashinfer", "triton", "fla"],
+        choices=["flashinfer", "triton", "fla", "rubin"],
         help="Kernel backends to benchmark. 'triton' is available for "
-        "decode/MTP; 'fla' (flash-linear-attention) for prefill.",
+        "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
+        "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
+        "state. On decode, 'flashinfer' is the generic FlashInfer kernel.",
     )
 
     args = parser.parse_args(line)
@@ -291,8 +293,17 @@ def parse_gdn_args(line, parser):
             raise ValueError(
                 "The fla backend is only available for chunk_gated_delta_rule"
             )
+        if "rubin" in args.backends and (is_mtp or args.state_dtype != "bfloat16"):
+            raise ValueError(
+                "The rubin backend is only available for gated_delta_rule_decode "
+                "with --state_dtype bfloat16"
+            )
 
     if is_prefill:
+        if "rubin" in args.backends:
+            raise ValueError(
+                "The rubin backend is only available for gated_delta_rule_decode"
+            )
         if "triton" in args.backends:
             raise ValueError(
                 "The triton backend is only available for decode/MTP routines; "
@@ -606,6 +617,8 @@ def _testGdnDecodeLike(args, seq_len):
             # BF16 state always goes through the pool path with pre-allocated
             # indices: the non-pool API path synthesizes an arange index
             # tensor per call, whose tiny kernel would pollute CUPTI timing.
+            # backend="flashinfer": the generic kernel, also on SM107 where
+            # "auto" would pick the Rubin-tuned one (see the "rubin" backend).
             if pool_split or use_bf16_state:
                 return gated_delta_rule_decode_pretranspose(
                     q,
@@ -622,9 +635,40 @@ def _testGdnDecodeLike(args, seq_len):
                     initial_state=state,
                     initial_state_indices=initial_state_indices,
                     output_state_indices=output_state_indices,
+                    backend="flashinfer",
                 )[0]
             return gated_delta_rule_decode_pretranspose(
-                q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+                q,
+                k,
+                v,
+                state,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output,
+                use_qk_l2norm,
+                backend="flashinfer",
+            )[0]
+        elif backend == "rubin":
+            # Rubin-tuned T=1 bf16-state kernel (SM107), via the public API
+            return gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                None,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output,
+                use_qk_l2norm,
+                initial_state=state,
+                initial_state_indices=initial_state_indices,
+                output_state_indices=output_state_indices,
+                backend="rubin",
             )[0]
         elif backend == "triton":
             if is_mtp:
