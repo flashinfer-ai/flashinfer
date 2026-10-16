@@ -63,11 +63,71 @@ variant; requests outside the listed routes fail closed.
 
 Indexed prefill requires every state slot to be in `[0, pool_size)`.
 Indexed decode requires every initial/output state slot to be `-1` or in
-`[0, state.size(0))`. The prefill adapter validates CUDA-resident slots
-asynchronously on the caller stream before dispatch, including during CUDA
-Graph capture and replay. The decode adapters trust caller-provided slots
-by default (parity with the CuTe decode kernels) and perform the same
-asynchronous fail-closed check only when `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`.
+`[0, state.size(0))`. Both adapters trust caller-provided slots by default
+(parity with the CuTe kernels) and perform an asynchronous fail-closed check
+on the caller stream (device-side assert, also under CUDA Graph capture and
+replay) only when `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`.
+
+### Non-CP prefill: host-free launch
+
+The non-CP prefill route (`flashinfer/gdn_prefill.py::_run_cake_gdn_prefill`,
+`backend="cake_gdn"` with `use_cp=False`/`"auto"`) reads nothing back from
+the device. There is no host-int cache, no cached int32 copy and no
+capture-time "warm up eagerly first" error; the one-time `nvcc` compile and
+TVM-FFI load of a kernel variant is the only eager step before a CUDA Graph
+capture.
+
+- Host-known inputs. `num_seqs = cu_seqlens.numel() - 1` and
+  `total_tokens = q.shape[0]` are shapes. The kernel variant
+  (`flashinfer/jit/cake_gdn.py::select_cake_gdn_prefill_variant`, no
+  `seq_lens` argument) and the persistent grid follow an upper bound on the
+  longest sequence: the exact maximum from `cu_seqlens_cpu` when given, else
+  the public `max_seqlen` hint, else `total_tokens`. A loose bound is always
+  correct; it only changes the grid size and whether the stateless
+  single-chunk kernel (bound <= 64 tokens, no initial/final state, no
+  checkpoints) is eligible.
+- `cu_seqlens_cpu` (keyword-only on `chunk_gated_delta_rule`): an optional
+  host copy of `cu_seqlens` -- a one-dimensional int32/int64 CPU tensor or
+  a sequence of Python ints of length `num_seqs + 1` with the same values
+  (vLLM `query_start_loc_cpu`, the prefix sums of SGLang
+  `extend_seq_lens_cpu`). With it the host validates the offsets
+  (non-decreasing, first `0`, last `total_tokens`), rejects a `max_seqlen`
+  smaller than the exact maximum and checks the checkpoint count exactly,
+  all before any launch and without a synchronization. A CUDA tensor is
+  refused, not copied. Other backends ignore the parameter.
+- Device-side guard (kernel launch ABI v2). The kernel receives
+  `total_tokens` as a scalar after `num_seqs` and resolves `cu_seqlens` per
+  work tile: `begin = min(cu_seqlens[b], total_tokens)`,
+  `end = min(max(cu_seqlens[b + 1], begin), total_tokens)`. Offsets past the
+  token count are clamped and a non-monotonic pair becomes an empty sequence
+  -- a documented no-op (its output rows are untouched, its state slot keeps
+  the initial state), never an out-of-bounds access and never a trap. The
+  consistency of `checkpoint_cu_starts` with `cu_seqlens` and the interval
+  stays a caller precondition, as the public docstring states; the host does
+  not read it.
+- Grid rule (`_cake_gdn_prefill_grid_x(total_tiles, sm_count, dvsplit,
+  bound_tokens)`, one formula shared with the Cake program's
+  `_select_persistent_grid_ctas`): DV-split or `total_tiles <= 128` ->
+  `min(sm_count, total_tiles)`; else `G = min(sm_count, total_tiles)` when
+  `ceil(total_tiles / G) < ceil(total_tiles / 128)`, otherwise `128` (ties
+  keep 128). `bound_tokens` is validated but does not change the grid.
+  The host shim checks `0 < grid_x <= total_tiles` and the tensor-map
+  workspace size (`512` bytes per CTA, cached per device, stream and grid).
+- Metadata dtypes. The kernels take int32 offsets and slots. Int32
+  `cu_seqlens`, `state_indices` and `checkpoint_cu_starts` reach the kernel
+  as is (zero-copy path); int64 metadata is cast on the caller's stream at
+  every call (one small device kernel, recorded into the graph under
+  capture). Nothing is cached by tensor identity, so a buffer rewritten in
+  place -- an inference-mode tensor without a version counter, a persistent
+  engine buffer, or the inputs of a captured graph between replays -- is
+  always what the kernel reads.
+- CUDA Graph. Capture needs no prior eager call for the same metadata; replay
+  reads the live `cu_seqlens`, `state_indices`, `checkpoint_cu_starts` and
+  data buffers. Tests: `tests/gdn/test_cake_gdn_prefill_gpu.py` (zero-sync
+  proof under `torch.cuda.set_sync_debug_mode("error")` plus a profiler
+  check, cold capture, in-place rewrite replay, chunked state carry, int64 /
+  int32 equivalence, malformed-metadata no-op) and the CPU contract tests in
+  `tests/gdn/test_cake_gdn_prefill.py`.
 
 Use the GDN prefill API with `backend="cake_gdn"` to select this backend
 explicitly; automatic prefill dispatch continues to select CuTe.  Under

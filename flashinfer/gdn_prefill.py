@@ -15,11 +15,12 @@ limitations under the License.
 """
 
 import math
+import operator
 import os
 import warnings
 import collections
 import functools
-import weakref
+from collections.abc import Sequence
 from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
@@ -65,16 +66,6 @@ _GDN_CP_STATE_DTYPES: tuple[torch.dtype, ...] = (
 )
 
 
-# Resolved cu_seqlens / metadata ints keyed by tensor identity; bounded LRU so
-# a long-running server with rotating metadata tensors cannot grow it without
-# limit.  One entry per distinct live metadata tensor is all a replay needs.
-_CAKE_GDN_HOST_INTS_MAX = 1024
-_CAKE_GDN_HOST_INTS: collections.OrderedDict[
-    tuple[int, int, Optional[int], int],
-    tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]],
-] = collections.OrderedDict()
-
-
 @functools.cache
 def _cake_gdn_arch(device_index: int) -> "_cake_gdn.CakeGDNArch":
     """Resolve the Cake GDN architecture of one CUDA device once."""
@@ -118,117 +109,139 @@ def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(1, dtype=dtype, device=torch.device("cuda", device_index))
 
 
-# Int32 device copies of int64 ``cu_seqlens`` / ``checkpoint_cu_starts``, keyed exactly
-# like the host-int cache above.  Those two tensors are already immutable by this
-# adapter's contract (their values are host-resolved once per live tensor), so one
-# int32 copy per live tensor is as safe as the cached host ints.  ``state_indices`` is
-# dynamic device data (slot ids the caller may rewrite in place) and is converted per call.  The
-# kernels take int32 offsets / slots; converting on every call launched one extra
-# kernel ahead of the main kernel (and exposed the main launch gap in eager mode)
-# for int64 callers.
-_CAKE_GDN_I32_COPIES: collections.OrderedDict[
-    tuple[int, int, Optional[int], int],
-    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor, int, torch.cuda.Event],
-] = collections.OrderedDict()
-
-_cake_gdn_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+# Unit gates for the public routes without ``g``/``beta``: the kernel variant
+# selected for them still reads FP32 gate tensors of ones, so the host keeps a
+# bounded LRU of those tensors per device and [tokens, heads] shape instead of
+# filling a new one on every call (one allocation plus one fill kernel per call
+# otherwise, which the export allocation probe rejects).  A tensor first built
+# under CUDA Graph capture is only filled when that graph replays, so it is
+# handed to the capture and not cached.
+_CAKE_GDN_UNIT_GATES: "collections.OrderedDict[tuple[int, int, int], torch.Tensor]" = (
+    collections.OrderedDict()
+)
+_CAKE_GDN_UNIT_GATES_LIMIT = 8
 
 
-def _cake_gdn_current_raw_stream(device_index: int) -> int:
-    """Handle of the current CUDA stream on one device (cheap, no Stream object)."""
+def _cake_gdn_unit_gates(
+    device_index: int, total_seq_len: int, num_o_heads: int
+) -> torch.Tensor:
+    """FP32 ones of shape [total_seq_len, num_o_heads], reused across calls."""
 
-    if _cake_gdn_raw_stream is not None:
-        return int(_cake_gdn_raw_stream(device_index))
-    return int(torch.cuda.current_stream(device_index).cuda_stream)
+    key = (device_index, total_seq_len, num_o_heads)
+    cached = _CAKE_GDN_UNIT_GATES.get(key)
+    if cached is not None:
+        _CAKE_GDN_UNIT_GATES.move_to_end(key)
+        return cached
+    ones = torch.ones(
+        (total_seq_len, num_o_heads),
+        dtype=torch.float32,
+        device=torch.device("cuda", device_index),
+    )
+    if torch.cuda.is_current_stream_capturing():
+        return ones
+    _CAKE_GDN_UNIT_GATES[key] = ones
+    while len(_CAKE_GDN_UNIT_GATES) > _CAKE_GDN_UNIT_GATES_LIMIT:
+        _CAKE_GDN_UNIT_GATES.popitem(last=False)
+    return ones
 
 
-def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
-    """Return contract-immutable metadata as int32, converting an int64 tensor once.
+# Host-free launch metadata.  The non-CP Cake prefill route reads
+# nothing back from the device: ``num_seqs`` and the token count are tensor
+# shapes, the kernel variant and the persistent grid follow an upper bound on
+# the longest sequence, and the kernel resolves ``cu_seqlens`` (and
+# ``checkpoint_cu_starts``) on the device at every launch, clamping every
+# offset into ``[0, total_tokens]`` and treating a non-monotonic pair as an
+# empty sequence (a documented no-op, never an out-of-bounds access).  There
+# is no host-int cache and no cached int32 copy: a metadata buffer the caller
+# rewrites in place (a persistent engine buffer, a CUDA Graph replay) is
+# always read live.  ``cu_seqlens_cpu`` is the optional host copy engines
+# already hold (vLLM ``query_start_loc_cpu``, the prefix sums of SGLang's
+# ``extend_seq_lens_cpu``): it tightens the host validation and the launch
+# bound without a synchronization.
 
-    Only for ``cu_seqlens`` and ``checkpoint_cu_starts``, whose values this adapter
-    already resolves once per live tensor (``_cake_gdn_host_ints``).  Int32 tensors
-    are returned as is.  During CUDA Graph capture the cast is always recorded, so
-    the graph's private pool owns the int32 copy and replay re-reads the live tensor;
-    the cache is neither consulted nor filled then.  Eagerly, the copy is reused while
-    the same tensor object (same storage, same version for non-inference tensors) is
-    passed again.  A copy consumed on a stream other than the one that produced it
-    first waits for the producing cast (an event recorded right after it) and is
-    recorded on the consuming stream, so the bounded LRU can drop it safely.
+
+def _cake_gdn_prefill_host_offsets(
+    cu_seqlens_cpu: Union[Sequence[int], torch.Tensor],
+    *,
+    num_seqs: int,
+    total_tokens: int,
+) -> tuple[int, ...]:
+    """Validate the host copy of ``cu_seqlens`` and return it as a tuple of ints.
+
+    Accepts a one-dimensional int32/int64 CPU tensor or a sequence of Python
+    ints of length ``num_seqs + 1`` whose values are non-decreasing, start at
+    zero and end at ``total_tokens``; anything else raises
+    ``CakeGDNUnsupportedError`` before any launch.  A CUDA tensor is rejected
+    rather than copied: that copy would be the device-to-host synchronization
+    this parameter exists to avoid.
     """
 
-    if values.dtype == torch.int32:
-        return values
-    if torch.cuda.is_current_stream_capturing():
-        return values.to(torch.int32)
-    device_index = int(values.device.index or 0)
-    version = None if values.is_inference() else int(values._version)
-    key = (device_index, int(values.data_ptr()), version, int(values.numel()))
-    raw_stream = _cake_gdn_current_raw_stream(device_index)
-    cached = _CAKE_GDN_I32_COPIES.get(key)
-    if cached is not None and cached[0]() is values:
-        _CAKE_GDN_I32_COPIES.move_to_end(key)
-        converted = cached[1]
-        if cached[2] != raw_stream:
-            consumer = torch.cuda.current_stream(device_index)
-            consumer.wait_event(cached[3])
-            converted.record_stream(consumer)
-        return converted
-    converted = values.to(torch.int32)
-    ready = torch.cuda.Event()
-    ready.record(torch.cuda.current_stream(device_index))
-    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted, raw_stream, ready)
-    while len(_CAKE_GDN_I32_COPIES) > _CAKE_GDN_HOST_INTS_MAX:
-        _CAKE_GDN_I32_COPIES.popitem(last=False)
-    return converted
-
-
-def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
-    """Resolve immutable CUDA integer metadata once, outside Graph capture."""
-
-    # Inference tensors intentionally have no version counter.  Their metadata
-    # is immutable by this adapter's contract, so object identity and storage
-    # identity are the available cache key during inference and Graph replay.
-    version = None if values.is_inference() else int(values._version)
-    key = (
-        int(values.device.index or 0),
-        int(values.data_ptr()),
-        version,
-        int(values.numel()),
-    )
-    cached = _CAKE_GDN_HOST_INTS.get(key)
-    if cached is not None and cached[0]() is values:
-        _CAKE_GDN_HOST_INTS.move_to_end(key)
-        return cached[1]
-    if torch.cuda.is_current_stream_capturing():
+    if isinstance(cu_seqlens_cpu, torch.Tensor):
+        if (
+            cu_seqlens_cpu.device.type != "cpu"
+            or cu_seqlens_cpu.ndim != 1
+            or cu_seqlens_cpu.dtype not in (torch.int32, torch.int64)
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "cu_seqlens_cpu must be a one-dimensional int32/int64 CPU tensor"
+            )
+        values = cu_seqlens_cpu.tolist()
+    else:
+        values = []
+        for value in cu_seqlens_cpu:
+            if isinstance(value, bool):
+                raise _cake_gdn.CakeGDNUnsupportedError(
+                    "cu_seqlens_cpu must hold integer offsets, not bools"
+                )
+            try:
+                values.append(operator.index(value))
+            except TypeError as exc:
+                raise _cake_gdn.CakeGDNUnsupportedError(
+                    "cu_seqlens_cpu must be a CPU integer tensor or a sequence of ints"
+                ) from exc
+    offsets = tuple(int(value) for value in values)
+    if len(offsets) != num_seqs + 1:
         raise _cake_gdn.CakeGDNUnsupportedError(
-            f"GDN non-CP prefill requires one eager {purpose} resolution before CUDA Graph capture"
+            f"cu_seqlens_cpu must have num_seqs + 1 = {num_seqs + 1} entries, "
+            f"got {len(offsets)}"
         )
-    resolved = tuple(int(value) for value in values.detach().cpu().tolist())
-    _CAKE_GDN_HOST_INTS[key] = (weakref.ref(values), resolved)
-    while len(_CAKE_GDN_HOST_INTS) > _CAKE_GDN_HOST_INTS_MAX:
-        _CAKE_GDN_HOST_INTS.popitem(last=False)
-    return resolved
-
-
-def _cake_gdn_prefill_seq_lens(
-    cu_seqlens: torch.Tensor, total_seq_len: int
-) -> tuple[int, ...]:
-    """Resolve immutable launch metadata once, outside CUDA Graph capture."""
-
-    offsets = _cake_gdn_host_ints(cu_seqlens, purpose="cu_seqlens metadata")
     if (
-        len(offsets) < 2
-        or offsets[0] != 0
-        or offsets[-1] != total_seq_len
+        offsets[0] != 0
+        or offsets[-1] != total_tokens
         or any(end < start for start, end in zip(offsets, offsets[1:], strict=False))
     ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires monotonic cu_seqlens spanning all input tokens"
         )
-    seq_lens = tuple(
-        end - start for start, end in zip(offsets, offsets[1:], strict=False)
+    return offsets
+
+
+def _cake_gdn_prefill_grid_x(
+    total_tiles: int, sm_count: int, dvsplit: bool, bound_tokens: int
+) -> int:
+    """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
+
+    One copy of the host-known grid rule lives in ``flashinfer/jit/cake_gdn.py``
+    (the variant resolver's gate-stream rule reads the same grid); it mirrors
+    the Cake program's ``_select_persistent_grid_ctas`` exactly and the
+    exporter's mirror test keeps the copies identical.
+    """
+
+    return _cake_gdn._cake_gdn_prefill_grid_x(
+        total_tiles, sm_count, dvsplit, bound_tokens
     )
-    return seq_lens
+
+
+def _cake_gdn_prefill_i32(values: torch.Tensor) -> torch.Tensor:
+    """Int32 launch metadata: pass-through for int32, a per-call cast for int64.
+
+    The cast is one small device kernel on the caller's stream (no host
+    synchronization; recorded into the graph under capture) and is never
+    cached, so an in-place rewrite of the caller's buffer is always what the
+    kernel reads.  Int32 metadata is the zero-copy path.
+    """
+
+    return values if values.dtype == torch.int32 else values.to(torch.int32)
 
 
 # Per-call device-side slot validation, same default as ``gdn_decode.py``: the
@@ -299,8 +312,16 @@ def _run_cake_gdn_prefill(
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     state_indices: Optional[torch.Tensor],
+    max_seqlen: Optional[int] = None,
+    cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Launch one exact manifest-backed GDN non-CP non-CP prefill row."""
+    """Launch one exact manifest-backed GDN non-CP prefill row without a device read.
+
+    ``max_seqlen`` is an upper bound on the longest sequence (validated by the
+    public entry); ``cu_seqlens_cpu`` is the optional host copy of
+    ``cu_seqlens``.  The launch bound is the exact maximum from the host copy
+    when given, else ``max_seqlen``, else the packed token count.
+    """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
         raise RuntimeError("the source-only Cake GDN backend is not installed")
@@ -365,22 +386,46 @@ def _run_cake_gdn_prefill(
         cu_seqlens.ndim != 1
         or cu_seqlens.dtype not in (torch.int32, torch.int64)
         or not cu_seqlens.is_contiguous()
+        or int(cu_seqlens.numel()) < 2
     ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires contiguous int32/int64 cu_seqlens"
         )
-    seq_lens = _cake_gdn_prefill_seq_lens(cu_seqlens, total_seq_len)
-    num_seqs = len(seq_lens)
+    # Host-known metadata only (see the module note): the sequence count is a
+    # shape, the per-sequence lengths are known only through the host copy.
+    num_seqs = int(cu_seqlens.numel()) - 1
+    seq_lens: Optional[tuple[int, ...]] = None
+    if cu_seqlens_cpu is not None:
+        offsets = _cake_gdn_prefill_host_offsets(
+            cu_seqlens_cpu, num_seqs=num_seqs, total_tokens=total_seq_len
+        )
+        seq_lens = tuple(
+            end - start for start, end in zip(offsets, offsets[1:], strict=False)
+        )
+    if max_seqlen is not None and (
+        type(max_seqlen) is not int or max_seqlen <= 0 or max_seqlen > total_seq_len
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill max_seqlen must be an int in [1, total tokens]"
+        )
+    if seq_lens is not None:
+        bound_tokens = max(seq_lens)
+        if max_seqlen is not None and bound_tokens > max_seqlen:
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "max_seqlen is smaller than the longest sequence in cu_seqlens_cpu"
+            )
+    elif max_seqlen is not None:
+        bound_tokens = max_seqlen
+    else:
+        bound_tokens = total_seq_len
     gates_present = g is not None and beta is not None
 
     gate = g
-    if gate is None:
-        gate = torch.ones(
-            (total_seq_len, num_o_heads), dtype=torch.float32, device=q.device
-        )
     update_gate = beta
-    if update_gate is None:
-        update_gate = torch.ones_like(gate)
+    if gate is None or update_gate is None:
+        unit = _cake_gdn_unit_gates(q.device.index, total_seq_len, num_o_heads)
+        gate = unit if gate is None else gate
+        update_gate = unit if update_gate is None else update_gate
     for name, tensor in (("g", gate), ("beta", update_gate)):
         if (
             tensor.dtype != torch.float32
@@ -463,30 +508,32 @@ def _run_cake_gdn_prefill(
             raise _cake_gdn.CakeGDNUnsupportedError(
                 "GDN non-CP checkpoint prefill requires contiguous state/cumulative buffers"
             )
-        checkpoint_counts = tuple(
-            length // checkpoint_every_n_tokens for length in seq_lens
+        # Host shapes only.  With ``cu_seqlens_cpu`` the checkpoint count is
+        # exact; otherwise ``state_checkpoints.shape[0]`` is taken as given.
+        # The contents of ``checkpoint_cu_starts`` (consistent with
+        # ``cu_seqlens`` and the interval) stay the documented caller
+        # precondition the kernel guards on the device: verifying them here
+        # would be the device-to-host read this route no longer performs.
+        if int(checkpoint_cu_starts.numel()) != num_seqs + 1:
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "GDN non-CP checkpoint_cu_starts must have num_seqs + 1 entries"
+            )
+        expected_checkpoints = (
+            None
+            if seq_lens is None
+            else sum(length // checkpoint_every_n_tokens for length in seq_lens)
         )
-        expected_checkpoint_cu_list = [0]
-        for count in checkpoint_counts:
-            expected_checkpoint_cu_list.append(expected_checkpoint_cu_list[-1] + count)
-        expected_checkpoint_cu = tuple(expected_checkpoint_cu_list)
-        if tuple(state_checkpoints.shape) != (
-            expected_checkpoint_cu[-1],
-            num_o_heads,
-            128,
-            128,
+        if (
+            state_checkpoints.ndim != 4
+            or tuple(state_checkpoints.shape[1:]) != (num_o_heads, 128, 128)
+            or (
+                expected_checkpoints is not None
+                and int(state_checkpoints.shape[0]) != expected_checkpoints
+            )
         ):
             raise _cake_gdn.CakeGDNUnsupportedError(
                 "GDN non-CP state_checkpoints must have shape "
                 "[sum(floor(seq_len/interval)),H,128,128]"
-            )
-        observed_checkpoint_cu = _cake_gdn_host_ints(
-            checkpoint_cu_starts,
-            purpose="checkpoint cumulative metadata",
-        )
-        if observed_checkpoint_cu != expected_checkpoint_cu:
-            raise _cake_gdn.CakeGDNUnsupportedError(
-                "GDN non-CP checkpoint_cu_starts does not match cu_seqlens and checkpoint interval"
             )
 
     route = _cake_gdn.select_cake_gdn_prefill_variant(
@@ -495,7 +542,7 @@ def _run_cake_gdn_prefill(
         state_dtype=state_dtype_name,
         num_seqs=num_seqs,
         total_seq_len=total_seq_len,
-        max_seq_len=max(seq_lens),
+        max_seq_len=bound_tokens,
         num_q_heads=num_q_heads,
         num_k_heads=num_k_heads,
         num_v_heads=num_v_heads,
@@ -504,33 +551,21 @@ def _run_cake_gdn_prefill(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_state_indices=state_indices is not None,
         gates_present=gates_present,
-        seq_lens=seq_lens,
     )
     entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
-    active_clusters = _cake_gdn_sm_count(device_index)
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = num_seqs * num_o_heads * (2 if dvsplit else 1)
-    if dvsplit or total_tiles <= 128:
-        grid_x = min(active_clusters, total_tiles)
-    else:
-        max_chunks = max((length + 63) // 64 for length in seq_lens)
-        if max_chunks <= 8:
-            grid_x = min(128, total_tiles)
-        elif active_clusters in (148, 160, 212) and total_tiles == 256:
-            # 212 = Rubin R200; balanced two tiles per CTA.
-            grid_x = 128
-        else:
-            grid_x = min(active_clusters, total_tiles)
+    grid_x = _cake_gdn_prefill_grid_x(
+        total_tiles, _cake_gdn_sm_count(device_index), dvsplit, bound_tokens
+    )
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
-    cu_seqlens_i32 = _cake_gdn_i32(cu_seqlens)
-    if state_indices is None:
-        state_indices_i32 = empty_i32
-    elif state_indices.dtype == torch.int32:
-        state_indices_i32 = state_indices
-    else:
-        # Slots are dynamic device data the caller may rewrite in place: convert per call.
-        state_indices_i32 = state_indices.to(torch.int32)
+    # The kernels take int32 offsets and slots; int64 metadata is cast per call
+    # on the caller's stream (``_cake_gdn_prefill_i32``), never cached.
+    cu_seqlens_i32 = _cake_gdn_prefill_i32(cu_seqlens)
+    state_indices_i32 = (
+        empty_i32 if state_indices is None else _cake_gdn_prefill_i32(state_indices)
+    )
     empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
     launch_output_state = (
@@ -544,7 +579,7 @@ def _run_cake_gdn_prefill(
     cu_checkpoints_i32 = (
         empty_i32
         if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
-        else _cake_gdn_i32(checkpoint_cu_starts)
+        else _cake_gdn_prefill_i32(checkpoint_cu_starts)
     )
     tensormap_workspace = _cake_gdn_tensormap_workspace(
         device_index, torch.cuda.current_stream(device_index).cuda_stream, grid_x
@@ -572,6 +607,8 @@ def _run_cake_gdn_prefill(
         checkpoint_every_n_tokens,
         scale,
         num_seqs,
+        # Launch ABI v2: the token count bounds every cu_seqlens read on the device.
+        total_seq_len,
         num_q_heads,
         num_v_heads,
         total_tiles,
@@ -651,11 +688,15 @@ _CAKE_GDN_CP_SM100_BAND_MIN_MAX_SEQLEN = 4096
 
 
 def _cake_gdn_cp_band_max_seqlen(
-    max_seqlen: Optional[int], total_seq_len: int, num_seqs: int
+    max_seqlen: Optional[int],
+    total_seq_len: int,
+    num_seqs: int,
+    cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
 ) -> int:
     """The longest-sequence bound the SM100/SM103 band rule is evaluated on.
 
-    With the caller's ``max_seqlen`` hint the rule sees the exact bound, the
+    With the caller's ``max_seqlen`` hint (or the exact host prefix ``cu_seqlens_cpu``)
+    the rule sees the exact bound, the
     quantity the Cake dispatcher and the export plan read from the host
     sequence lengths.  Without a hint the host cannot read ``cu_seqlens``
     back, so the band uses the balanced-batch estimate
@@ -669,6 +710,20 @@ def _cake_gdn_cp_band_max_seqlen(
 
     if max_seqlen is not None:
         return int(max_seqlen)
+    if cu_seqlens_cpu is not None:
+        # The host prefix (``cu_seqlens_cpu``) carries the exact longest sequence; it is validated
+        # against ``cu_seqlens`` by the non-CP route before any launch, and read here without a device sync.
+        starts = (
+            cu_seqlens_cpu.tolist()
+            if isinstance(cu_seqlens_cpu, torch.Tensor)
+            else [int(v) for v in cu_seqlens_cpu]
+        )
+        if len(starts) >= 2:
+            longest = max(
+                int(b) - int(a) for a, b in zip(starts[:-1], starts[1:], strict=False)
+            )
+            if longest > 0:
+                return longest
     return -(-int(total_seq_len) // int(num_seqs))
 
 
@@ -936,6 +991,7 @@ def chunk_gated_delta_rule(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1073,7 +1129,10 @@ def chunk_gated_delta_rule(
         4096``; without a ``max_seqlen`` hint the band estimates the longest
         sequence as ``ceil(total_seq_len / num_seqs)``) or the SM107 band.
         Explicit Cake requests fail for unsupported inputs without falling
-        back to another backend.
+        back to another backend. The Cake non-CP route performs no
+        device-to-host synchronization and no eager warm-up call before CUDA
+        Graph capture (the one-time kernel compile/load per variant is the
+        only eager step); see ``cu_seqlens_cpu``.
         The explicit ``cake_gdn`` non-CP route serves ``head_size == 128``
         with BF16 or FP16 I/O (one dtype for Q/K/V/output, caller-normalized
         Q/K, FP32 gates). State dtypes: FP32 with either I/O dtype; BF16,
@@ -1101,9 +1160,14 @@ def chunk_gated_delta_rule(
         back from the GPU. When omitted, CP uses ``total_seq_len``, which is
         correct for any batch; passing the exact maximum of a batched call
         lets CP launch smaller grids.  The SM100/SM103 ``use_cp="auto"``
-        band reads the hint as the longest sequence and, without it, the
-        balanced-batch estimate ``ceil(total_seq_len / num_seqs)``; pass the
-        exact maximum so the band decision matches the Cake dispatcher's.
+        band reads the hint (or the exact maximum from ``cu_seqlens_cpu``) as
+        the longest sequence and, without either, the balanced-batch estimate
+        ``ceil(total_seq_len / num_seqs)``; pass the exact maximum so the band
+        decision matches the Cake dispatcher's. ``backend="cake_gdn"`` without
+        CP uses the same bound (or the exact maximum from ``cu_seqlens_cpu``)
+        to select its kernel variant and persistent grid; a loose bound is
+        always correct and only affects the grid size and whether the
+        single-chunk kernel is eligible.
     gate_domain : {"linear", "log"}
         Domain of precomputed ``g``: linear alpha (default) or natural-log
         alpha. ``None`` still means no decay. Ignored when use_gate_in_kernel
@@ -1119,6 +1183,26 @@ def chunk_gated_delta_rule(
         Apply sigmoid to beta in FP32, round to beta's input dtype, then
         accumulate in FP32. cuDNN fuses the transform; other backends
         materialize it. The default accepts precomputed beta.
+    cu_seqlens_cpu : Sequence[int] or torch.Tensor, optional
+        Host copy of ``cu_seqlens``: a one-dimensional int32/int64 CPU tensor
+        or a sequence of Python ints of length ``num_seqs + 1`` holding the
+        same values (vLLM's ``query_start_loc_cpu``, the prefix sums of
+        SGLang's ``extend_seq_lens_cpu``). Used by ``backend="cake_gdn"``
+        without CP and ignored by every other route. When given, the Cake
+        route validates it on the host (non-decreasing, first entry ``0``,
+        last entry ``total_seq_len``; a mismatch raises before any launch),
+        takes the exact longest sequence as the bound for variant selection
+        and the persistent grid, and checks the checkpoint count exactly.
+        When omitted the route still reads nothing back from the device: the
+        bound is ``max_seqlen`` (or ``total_seq_len``) and ``cu_seqlens`` is
+        resolved by the kernel at every launch, which clamps every offset
+        into ``[0, total_seq_len]`` and treats a non-monotonic pair as an
+        empty sequence -- a documented no-op, never an out-of-bounds access
+        (``checkpoint_cu_starts`` consistency stays a caller precondition).
+        Int32 ``cu_seqlens`` reaches the kernel as is; int64 is cast on the
+        stream at every call. Nothing is cached by tensor identity, so a
+        buffer rewritten in place is always read live, including on CUDA
+        Graph replay.
 
     Returns
     -------
@@ -1416,7 +1500,7 @@ def chunk_gated_delta_rule(
             num_seqs=num_seqs,
             num_sab_heads=num_sab_heads,
             max_seqlen=_cake_gdn_cp_band_max_seqlen(
-                max_seqlen, total_seq_len, num_seqs
+                max_seqlen, total_seq_len, num_seqs, cu_seqlens_cpu=cu_seqlens_cpu
             ),
             num_sms=_sm_count,
             io_dtype=q.dtype,
@@ -1621,6 +1705,8 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_indices=state_indices,
+            max_seqlen=cp_max_seqlen,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
     if _arch_major == 10:
