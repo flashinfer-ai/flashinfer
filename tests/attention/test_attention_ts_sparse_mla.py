@@ -39,7 +39,6 @@ def _reference(
     extra_lengths=None,
     q_scale=1.0,
     kv_scale=1.0,
-    extra_kv_scale=1.0,
     output_scale=1.0,
     sinks=None,
     softmax_scale=512**-0.5,
@@ -52,9 +51,9 @@ def _reference(
     for start in range(0, rows, 32):
         end = min(start + 32, rows)
         values, masks = [], []
-        for cache, ids, lens, scale in (
-            (kv_cache, indices, lengths, kv_scale),
-            (extra_kv_cache, extra_indices, extra_lengths, extra_kv_scale),
+        for cache, ids, lens in (
+            (kv_cache, indices, lengths),
+            (extra_kv_cache, extra_indices, extra_lengths),
         ):
             if cache is None:
                 continue
@@ -67,7 +66,7 @@ def _reference(
                 )
             safe = ids.masked_fill(~valid, 0).long()
             value = (
-                cache[safe // cache.shape[1], safe % cache.shape[1]].double() * scale
+                cache[safe // cache.shape[1], safe % cache.shape[1]].double() * kv_scale
             )
             values.append(value.masked_fill(~valid[..., None], 0))
             masks.append(valid)
@@ -165,30 +164,22 @@ def _pack_ts_metadata(
     cl,
     routes,
     lengths,
-    counts,
     scales,
     sinks,
     sm,
     qs,
     ss,
-    cs,
     os,
     KS: tl.constexpr,
     KC: tl.constexpr,
-    ROWS: tl.constexpr,
     HEADS: tl.constexpr,
     CAP: tl.constexpr,
-    INDEPENDENT: tl.constexpr,
     BLOCK: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    slot = tl.program_id(1)
     ls = tl.load(sl + row)
     lc = tl.load(cl + row) if KC else 0
-    if INDEPENDENT:
-        ls = tl.where(slot == 0, ls, 0)
-        lc = tl.where(slot == 1, lc, 0)
     span_s = tl.cdiv(ls, 128) * 128
     span_c = tl.cdiv(lc, 128) * 128
     col = tl.arange(0, BLOCK)
@@ -206,15 +197,12 @@ def _pack_ts_metadata(
             b = tl.full((BLOCK,), 0x7FFFFFFF, tl.int32)
         b = b | -2147483648
         word = tl.where(p < span_s, a, b)
-        tl.store(routes + (slot * ROWS + row) * CAP + p, word, p < CAP)
-    tl.store(lengths + slot * ROWS + row, tl.maximum(span_s + span_c, 1))
-    tl.store(counts + slot * ROWS + row, ls + lc)
-    scale_base = scales + slot * (2 + HEADS + ROWS)
+        tl.store(routes + row * CAP + p, word, p < CAP)
+    tl.store(lengths + row, tl.maximum(span_s + span_c, 1))
+    scale_base = scales
     tl.store(scale_base + 2 + HEADS + row, (ls + lc).to(tl.float32))
     if row == 0:
         kv_scale = tl.load(ss)
-        if INDEPENDENT:
-            kv_scale = tl.where(slot == 1, tl.load(cs), kv_scale)
         tl.store(scale_base, tl.load(sm) * tl.load(qs) * kv_scale)
         tl.store(scale_base + 1, tl.load(os) * kv_scale)
         h = tl.arange(0, HEAD_BLOCK)
@@ -235,7 +223,6 @@ def prepare_sparse_mla_metadata(
     softmax_scale=512**-0.5,
     q_scale=1.0,
     kv_scale=1.0,
-    extra_kv_scale=None,
     output_scale=1.0,
     sinks=None,
     out=None,
@@ -252,14 +239,6 @@ def prepare_sparse_mla_metadata(
         raise ValueError("a prepared attention plan is required")
     rows = query.numel() // (state["heads"] * 512)
     ks, kc, cap = state["ks"], state["kc"], state["capacity"]
-    extra_kv_scale = kv_scale if extra_kv_scale is None else extra_kv_scale
-    shared = extra_kv_scale is kv_scale or (
-        not isinstance(kv_scale, torch.Tensor)
-        and not isinstance(extra_kv_scale, torch.Tensor)
-        and kv_scale == extra_kv_scale
-    )
-    independent = kc > 0 and not shared
-    passes = 2 if independent else 1
     device = query.device
 
     def empty(shape, dtype=torch.int32):
@@ -271,10 +250,9 @@ def prepare_sparse_mla_metadata(
             lengths=empty((rows,)),
             extra_indices=empty((rows, kc)) if kc else None,
             extra_lengths=empty((rows,)) if kc else None,
-            routes=empty((passes, rows, cap)),
-            execution_lengths=empty((passes, rows)),
-            valid_counts=empty((passes, rows)),
-            scale_params=empty((passes, 2 + state["heads"] + rows), torch.float32),
+            routes=empty((rows, cap)),
+            execution_lengths=empty((rows,)),
+            scale_params=empty((2 + state["heads"] + rows,), torch.float32),
         )
 
     def map_pool(cache, idx, lens, width, dst, count):
@@ -307,28 +285,24 @@ def prepare_sparse_mla_metadata(
             (softmax_scale, "softmax_scale"),
             (q_scale, "q_scale"),
             (kv_scale, "kv_scale"),
-            (extra_kv_scale, "extra_kv_scale"),
             (output_scale, "output_scale"),
         )
     ]
     if rows:
-        _pack_ts_metadata[(rows, passes)](
+        _pack_ts_metadata[(rows,)](
             out.indices,
             out.extra_indices,
             out.lengths,
             out.extra_lengths,
             out.routes,
             out.execution_lengths,
-            out.valid_counts,
             out.scale_params,
             state["default_sinks"] if sinks is None else sinks,
             *scalars,
             ks,
             kc,
-            rows,
             state["heads"],
             cap,
-            independent,
             256,
             triton.next_power_of_2(state["heads"]),
             num_warps=4,
@@ -358,30 +332,30 @@ def _dequant_output(output, scales, block_size):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
-    "batch,queries,heads,topk,block,fmt,packed,independent",
+    "batch,queries,heads,topk,block,fmt,packed",
     [
-        (64, 1, 128, 513, 32, "ue8m0", False, False),
-        (64, 1, 128, 513, 128, "fp32", False, False),
-        (128, 1, 8, 513, 32, "fp32", False, False),
-        (128, 1, 16, 513, 128, "ue8m0", False, False),
-        (32, 1, 32, 513, 32, "ue8m0", False, False),
-        (32, 1, 32, 513, 128, "fp32", False, False),
-        (1, 1, 16, 513, 128, "ue8m0", False, False),
-        (1, 1, 8, 8193, 32, "fp32", False, False),
-        (2, 2, 24, 513, 32, "ue8m0", True, True),
-        (1, 3, 64, 129, 128, "ue8m0", False, False),
-        (1, 1, 128, 2049, 128, "fp32", False, False),
+        (64, 1, 128, 513, 32, "ue8m0", False),
+        (64, 1, 128, 513, 128, "fp32", False),
+        (128, 1, 8, 513, 32, "fp32", False),
+        (128, 1, 16, 513, 128, "ue8m0", False),
+        (32, 1, 32, 513, 32, "ue8m0", False),
+        (32, 1, 32, 513, 128, "fp32", False),
+        (1, 1, 16, 513, 128, "ue8m0", False),
+        (1, 1, 8, 8193, 32, "fp32", False),
+        (2, 2, 24, 513, 32, "ue8m0", True),
+        (1, 3, 64, 129, 128, "ue8m0", False),
+        (1, 1, 128, 2049, 128, "fp32", False),
         # T == G and T != G, T > 1: token-major and group-major differ here.
-        (16, 1, 128, 513, 128, "ue8m0", False, False),
-        (5, 1, 128, 513, 32, "fp32", False, False),
-        (5, 1, 16, 513, 128, "ue8m0", False, False),
+        (16, 1, 128, 513, 128, "ue8m0", False),
+        (5, 1, 128, 513, 32, "fp32", False),
+        (5, 1, 16, 513, 128, "ue8m0", False),
         # Short lists on the H128 2CTA schedule (capacity 256), fused output.
-        (80, 1, 128, 64, 128, "fp32", False, False),
-        (80, 1, 128, 64, 32, "ue8m0", False, True),
-        (1, 161, 128, 64, 128, "fp32", False, False),
-        (1, 161, 64, 513, 32, "ue8m0", False, False),
+        (80, 1, 128, 64, 128, "fp32", False),
+        (80, 1, 128, 64, 32, "ue8m0", False),
+        (1, 161, 128, 64, 128, "fp32", False),
+        (1, 161, 64, 513, 32, "ue8m0", False),
         # Packed multiwave queries reuse the quantized output's shared stages.
-        (2, 81, 128, 513, 32, "fp32", True, False),
+        (2, 81, 128, 513, 32, "fp32", True),
     ],
 )
 def test_rope_quant_graph(
@@ -393,7 +367,6 @@ def test_rope_quant_graph(
     block,
     fmt,
     packed,
-    independent,
     groups=None,
     output_padding=0,
 ):
@@ -416,9 +389,6 @@ def test_rope_quant_graph(
     sinks[0] = torch.inf
     descales = dict(
         kv_scale=0.5 if dtype == torch.float8_e4m3fn else 1.0,
-        extra_kv_scale=(1.5 if independent else 0.5)
-        if dtype == torch.float8_e4m3fn
-        else 1.0,
         output_scale=0.75,
     )
     positions = (torch.arange(rows, device="cuda", dtype=torch.int32) * 3 + 19).view(
@@ -736,7 +706,6 @@ def test_rope_quant_group_layout(heads, groups, block, fmt):
         block,
         fmt,
         False,
-        False,
         groups=groups,
         output_padding=3,
     )
@@ -766,46 +735,28 @@ def test_rope_quant_plan_options():
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
-    "batch,queries,heads,topk,extra,packed,independent,prefix",
+    "batch,queries,heads,topk,extra,packed,prefix",
     [
-        pytest.param(1, 3, 8, 129, True, False, False, False, id="small-head-tail"),
-        pytest.param(
-            2, 2, 24, 513, True, True, False, False, id="packed-partial-heads"
-        ),
-        pytest.param(
-            2, 2, 6, 65, True, True, True, False, id="odd-head-independent-scales"
-        ),
-        pytest.param(2, 3, 64, 129, False, False, False, False, id="single-source"),
-        pytest.param(4, 1, 64, 513, True, False, False, True, id="wide-query"),
-        pytest.param(64, 1, 128, 513, True, False, False, True, id="two-cta"),
-        pytest.param(
-            16, 1, 128, 2049, True, False, False, False, id="small-grid-wide-kv"
-        ),
-        pytest.param(0, 1, 96, 513, True, False, False, True, id="partial-wide-heads"),
-        pytest.param(
-            0, 1, 8, 513, True, False, False, True, id="single-stream-short-kv"
-        ),
-        pytest.param(
-            0, 2, 8, 2049, True, False, False, True, id="small-head-long-kv-reuse"
-        ),
-        pytest.param(1, 0, 64, 513, True, False, False, True, id="multiwave-prefill"),
-        pytest.param(0, 4, 128, 2049, True, False, False, True, id="multiwave-decode"),
+        pytest.param(1, 3, 8, 129, True, False, False, id="small-head-tail"),
+        pytest.param(2, 2, 24, 513, True, True, False, id="packed-partial-heads"),
+        pytest.param(2, 2, 6, 65, True, True, False, id="odd-head-packed"),
+        pytest.param(2, 3, 64, 129, False, False, False, id="single-source"),
+        pytest.param(4, 1, 64, 513, True, False, True, id="wide-query"),
+        pytest.param(64, 1, 128, 513, True, False, True, id="two-cta"),
+        pytest.param(16, 1, 128, 2049, True, False, False, id="small-grid-wide-kv"),
+        pytest.param(0, 1, 96, 513, True, False, True, id="partial-wide-heads"),
+        pytest.param(0, 1, 8, 513, True, False, True, id="single-stream-short-kv"),
+        pytest.param(0, 2, 8, 2049, True, False, True, id="small-head-long-kv-reuse"),
+        pytest.param(1, 0, 64, 513, True, False, True, id="multiwave-prefill"),
+        pytest.param(0, 4, 128, 2049, True, False, True, id="multiwave-decode"),
         # Short lists (capacity 256 and 384) with enough rows for the H128 2CTA tile.
-        pytest.param(
-            0, 1, 128, 64, True, False, False, True, id="short-two-cta-decode"
-        ),
-        pytest.param(
-            1, 0, 128, 64, True, False, False, True, id="short-two-cta-prefill"
-        ),
-        pytest.param(0, 1, 128, 256, True, False, True, True, id="short-two-cta-384"),
-        pytest.param(
-            1, 3, 8, 8193, True, False, False, False, id="long-split-reduction"
-        ),
+        pytest.param(0, 1, 128, 64, True, False, True, id="short-two-cta-decode"),
+        pytest.param(1, 0, 128, 64, True, False, True, id="short-two-cta-prefill"),
+        pytest.param(0, 1, 128, 256, True, False, True, id="short-two-cta-384"),
+        pytest.param(1, 3, 8, 8193, True, False, False, id="long-split-reduction"),
     ],
 )
-def test_native_graph(
-    dtype, batch, queries, heads, topk, extra, packed, independent, prefix
-):
+def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix):
     # Scale throughput cases with hardware, without asserting exact
     # tiles, split counts, register budgets or private policy identities.
     sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -837,11 +788,6 @@ def test_native_graph(
     kv_scale = torch.tensor(
         0.75 if dtype == torch.float8_e4m3fn else 1.0, device="cuda"
     )
-    extra_scale = (
-        torch.tensor(1.5 if dtype == torch.float8_e4m3fn else 1.0, device="cuda")
-        if independent
-        else kv_scale
-    )
     q_scale = torch.tensor(1.25 if dtype == torch.float8_e4m3fn else 1.0, device="cuda")
     offsets = (
         torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32) if packed else None
@@ -866,9 +812,7 @@ def test_native_graph(
         return_lse=True,
         assume_valid_prefix=prefix,
     )
-    scales = dict(
-        q_scale=q_scale, kv_scale=kv_scale, extra_kv_scale=extra_scale, sinks=sinks
-    )
+    scales = dict(q_scale=q_scale, kv_scale=kv_scale, sinks=sinks)
 
     def prepare(out=None):
         return prepare_sparse_mla_metadata(
@@ -913,7 +857,6 @@ def test_native_graph(
             extra_lengths=bl.reshape(prefix_shape) if extra else None,
             q_scale=q_scale.item(),
             kv_scale=kv_scale.item(),
-            extra_kv_scale=extra_scale.item(),
             sinks=sinks,
         )
         if dtype == torch.float8_e4m3fn:
@@ -947,9 +890,9 @@ def test_native_graph(
     assert torch.isneginf(lse.reshape(rows, heads)[-1]).all()
     if packed:
         unaligned = torch.empty(lse.numel() + 1, device=q.device)[1:].view_as(lse)
-        run(target_lse=unaligned)
-        check(unaligned)
-    if packed and independent and dtype == torch.bfloat16:
+        with pytest.raises(ValueError, match="16-byte-aligned"):
+            run(target_lse=unaligned)
+    if packed and heads == 6 and dtype == torch.bfloat16:
         empty_meta = prepare_sparse_mla_metadata(
             w,
             q[:0],
@@ -977,7 +920,7 @@ def test_large_query_native_graph(dtype):
     # A long Q grid exercises persistent work-tile advancement, including
     # BF16's static scheduler and FP8's CLC scheduler on the same public inputs.
     sms = torch.cuda.get_device_properties(0).multi_processor_count
-    test_native_graph(dtype, 1, 8 * sms, 32, 513, True, False, False, True)
+    test_native_graph(dtype, 1, 8 * sms, 32, 513, True, False, True)
 
 
 def test_caller_workspace_single_source_and_eager_api():
@@ -993,6 +936,10 @@ def test_caller_workspace_single_source_and_eager_api():
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
     wrapper.plan(**args)
     metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
+    with pytest.raises(TypeError, match="extra_kv_scale"):
+        wrapper.run(q, kv, metadata, extra_kv_scale=2.0)
+    with pytest.raises(ValueError, match="prepared routes"):
+        wrapper.run(q, kv, metadata._replace(routes=metadata.routes.unsqueeze(0)))
     result, lse = wrapper.run(q, kv, metadata)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
     eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(

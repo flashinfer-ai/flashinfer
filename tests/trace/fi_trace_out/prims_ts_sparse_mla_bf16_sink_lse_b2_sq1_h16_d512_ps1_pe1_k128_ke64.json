@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_sparse_mla_bf16_sink_lse_b2_sq1_h16_d512_ps1_pe1_k128_ke64",
-  "description": "Native D512 sparse attention with caller-prepared storage-row metadata. One primary KV pool and optional extra pool; preparation excluded. LSE excludes sinks.",
+  "description": "Native D512 sparse attention with caller-prepared storage-row metadata. One primary KV pool and optional extra pool; both pools share kv_scale; preparation excluded. LSE excludes sinks.",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchSparseMLADecodePagedTSWrapper.run",
@@ -55,9 +55,6 @@
       "type": "var"
     },
     "extra_pages": {
-      "type": "var"
-    },
-    "passes": {
       "type": "var"
     },
     "scale_words": {
@@ -147,7 +144,6 @@
     },
     "routes": {
       "shape": [
-        "passes",
         "rows",
         "route_capacity"
       ],
@@ -156,15 +152,6 @@
     },
     "execution_lengths": {
       "shape": [
-        "passes",
-        "rows"
-      ],
-      "dtype": "int32",
-      "optional": true
-    },
-    "valid_counts": {
-      "shape": [
-        "passes",
         "rows"
       ],
       "dtype": "int32",
@@ -172,7 +159,6 @@
     },
     "scale_params": {
       "shape": [
-        "passes",
         "scale_words"
       ],
       "dtype": "float32",
@@ -189,11 +175,6 @@
       "optional": true
     },
     "kv_scale": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
-    },
-    "extra_kv_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
