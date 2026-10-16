@@ -129,10 +129,14 @@ def test_software_special_values(fp16_sr_sw):
     bits = torch.cat((positive, positive | 0x80000000)).to(torch.int32)
     values = bits.view(torch.float32).repeat_interleave(8192).cuda()
     noise = torch.arange(8192, dtype=torch.int32).repeat(len(bits)).cuda()
-    expected = torch.tensor(
-        [0x7C00, 0x7E00, 0x7E00, 0x7E00, 0xFC00, 0xFE00, 0xFE00, 0xFE00],
-        dtype=torch.int32,
-    ).to(torch.int16).repeat_interleave(8192)
+    expected = (
+        torch.tensor(
+            [0x7C00, 0x7E00, 0x7E00, 0x7E00, 0xFC00, 0xFE00, 0xFE00, 0xFE00],
+            dtype=torch.int32,
+        )
+        .to(torch.int16)
+        .repeat_interleave(8192)
+    )
     actual = fp16_sr_sw.convert(values, noise, 0)
     torch.testing.assert_close(actual.view(torch.int16).cpu(), expected, rtol=0, atol=0)
 

@@ -196,8 +196,8 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
   // Subnormals use fixed spacing 2^-24; exp < 90 cannot round up. Guard the
   // shift so it is only evaluated in [1, 23]. Keep the common normal path
   // in this same add-and-truncate expression instead of an early-return branch.
-  uint32_t scaled = exp >= 113 ? abs_bits - (112u << 23)
-                              : (exp >= 90 ? mantissa >> (113 - exp) : 0u);
+  uint32_t scaled =
+      exp >= 113 ? abs_bits - (112u << 23) : (exp >= 90 ? mantissa >> (113 - exp) : 0u);
   uint32_t f16_bits = min((scaled + (rand13 & 0x1FFFu)) >> 13, 0x7C00u);
   // Classify the original input: noise must not turn infinity into NaN or
   // finite overflow into NaN, nor carry a NaN payload into another exponent.
