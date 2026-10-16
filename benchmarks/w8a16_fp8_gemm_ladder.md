@@ -1022,6 +1022,46 @@ slower everywhere else.  The register-sourced conversion runs once per activatio
 and multicast change nothing measurable.  Patch kept in `h4-parked/step3_2b_64x64_64x32_probe.patch`;
 table in `hopper-mail/step3_2b_narrow_tiles.md`.
 
+### Version H8: und.kv tp1 / tp2 at M = 1024, cuBLAS's tile shapes, not landed (Thu 15 Oct 2026)
+
+Target: und.kv tp1 (N = 1024) and tp2 (N = 512), K = 5120, M = 1024, at 1.07 and 1.12 of cuBLAS.
+Goal was 1.02.  Recipe: 50 x 3, three repeats (spread 0.4%).  The farm was too hot for the
+steady-state recipe: ipp2-0129 / 0162 / 0128 hit 630-850 MHz and SW thermal.  At 10-30 us
+kernels the two recipes agree within 0.5%.
+
+cuBLAS splits neither cell.  It fills one wave of 128 CTAs with a tile fitted to N: 128x64 with a
+1x2 cluster on tp1, 64x64 with 13 stages and a 2x1 cluster on tp2.  ncu shows ours runs the same
+grid and the same tensor-pipe share, but issues 2.2x the instructions (the conversion).
+
+Probe tiles (ours / cuBLAS, median of 3):
+
+| algo | tp1 | tp2 |
+|---|---|---|
+| auto (unchanged) | 1.067 (64x128) | 1.119 (128x128 split 4) |
+| 64x64, no split | 1.767 | 1.369 |
+| 128x64 cooperative, no split | 1.388 | 1.898 |
+| 128x64, cluster 1x2 weight multicast | 1.382 | 1.884 |
+| 64x128 split-K (2) | 1.309 | 1.133 |
+| 64x256 split-K (2 / 4) | 1.122 | 1.122 |
+| + reduce as a programmatic dependent launch | 1.116 | 1.111 |
+| CUTLASS stream-K, any mode / reduction | >= 1.48 | >= 1.78 |
+
+- **cuBLAS's tiles lose to the conversion.** 128x64 and 64x64 convert each weight tile for only 64
+  activation rows: 12.1M / 6.4M instructions vs cuBLAS's 2.9M / 2.2M.  The 1x2 multicast saves
+  the weight load but not the conversion (1.382 vs 1.388).
+- **The split-K mainloop already beats cuBLAS** (ncu): 64x256 split 2 takes 20.0 us vs 21.2 us
+  on tp1, split 4 takes 14.2 us vs 17.9 us on tp2.  The second launch eats the gain: the fp32
+  partials round trip plus a 3-6 us reduce.  PDL (`griddepcontrol`, the GEMM releases the reduce
+  at its last tile) saves 1-2%, not 10%.  CUTLASS stream-K is 1.5-2.9x.
+- The cost model's split choice matched the best pinned split in every case.
+
+Measured reason for missing 1.02: at this size the conversion rules out cuBLAS's narrow tiles.
+The wide tiles that amortize the conversion leave too few tiles for one wave without a split, and
+the split's reduce costs more than the mainloop wins.  Closing it needs either an in-kernel
+reduction (cluster / DSMEM, or the last CTA of a tile summing the partials) or the
+smem-sourced conversion redesign.  Patch: `h4-parked/step_h8_64x64_128x64_ca2_64splitk_pdl_probe.patch`.
+Tables: `hopper-mail/kv1024_step1_ncu.md`, `kv1024_step2_tiles.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
