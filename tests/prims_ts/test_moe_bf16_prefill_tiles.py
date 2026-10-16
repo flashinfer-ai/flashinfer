@@ -25,6 +25,13 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
 from flashinfer.utils import is_sm100a_supported
 
 
+# The major-10 guard below also admits SM107; these quantized BatchM paths do not.
+_requires_non_sm107_prims_ts = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+    reason="Prims-TS quantized BatchM kernels support SM100 and SM103, not SM107",
+)
+
+
 def test_bf16_prefill_tactics_have_consistent_token_geometry():
     seen = set()
     for tactic in valid_prims_ts_bf16_moe_tactics(
@@ -202,6 +209,7 @@ def test_one_stage_work_queue_does_not_alias_live_epilogue(fc):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.parametrize("dtype", ["fp8", "nvfp4", "mxfp4", "mxfp8"])
 @pytest.mark.parametrize("gated", [False, True])
+@_requires_non_sm107_prims_ts
 def test_shuffled_batch_m_is_not_bf16_specific(dtype, gated):
     _check_shuffled_batch_m(dtype, gated=gated)
 
@@ -209,6 +217,7 @@ def test_shuffled_batch_m_is_not_bf16_specific(dtype, gated):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.parametrize("tile_k", [256, 512])
 @pytest.mark.parametrize("cluster_m", [1, 2])
+@_requires_non_sm107_prims_ts
 def test_nvfp4_batch_m_sfb_copy_tile_geometry(tile_k, cluster_m):
     # N128 needs a contiguous SFB copy for both four and eight K groups.
     _check_shuffled_batch_m("nvfp4", 128, tile_k, cluster_m)
@@ -216,6 +225,7 @@ def test_nvfp4_batch_m_sfb_copy_tile_geometry(tile_k, cluster_m):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.parametrize("gated", [False, True])
+@_requires_non_sm107_prims_ts
 def test_nvfp4_batch_m_wide_sfb_tma(gated):
     _check_shuffled_batch_m("nvfp4", 256, 256, 1, gated=gated)
 
