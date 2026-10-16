@@ -471,17 +471,19 @@ def run(args):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     performance = benchmark(first, 3) if args.benchmark else None
-    package = (
-        Path(__file__).resolve().parents[1] / "flashinfer/experimental/cake_mok_bf16"
-    )
-    source_registry = json.loads((package / "sources.json").read_text())
-    from flashinfer.experimental.cake_mok_bf16.jit import target_arch
+    from flashinfer.experimental.cake_mok_bf16 import cake_build
+    from flashinfer.experimental.cake_mok_bf16.jit import library_name, target_arch
 
     arch = target_arch(device)
+    capability = torch.cuda.get_device_capability(device)
+    # build.json (``cake_build``) is the only record of the sources and digests of
+    # the fused libraries this run exercised; sources.json names their stems only.
+    libraries = {entry["name"]: entry for entry in cake_build._manifest()["libraries"]}
     fused = [
         role + ("_mxfp8" if args.mxfp8 else "") + ("_clamped" if limit else "")
         for role in ("forward", "backward")
     ]
+    fused_entries = {k: libraries[library_name(k, capability)[0]] for k in fused}
     passed = all(e["pass"] for row in reports for e in row["errors"].values())
     record = dict(
         status="PASS" if passed else "FAIL",
@@ -505,13 +507,9 @@ def run(args):
         three_replays_bitwise_identical=True,
         earlier_graph_identical=True,
         performance=performance,
-        fused_source_sha256={
-            k: next(
-                v["sha256"]
-                for v in source_registry[k]["variants"]
-                if arch in v["arches"]
-            )
-            for k in fused
+        fused_source_sha256={k: entry["sha256"] for k, entry in fused_entries.items()},
+        fused_closure_sha256={
+            k: entry["closure_sha256"] for k, entry in fused_entries.items()
         },
     )
     (rank_dir / "summary.json").write_text(json.dumps(record, indent=2) + "\n")
