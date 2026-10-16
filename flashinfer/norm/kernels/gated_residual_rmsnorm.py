@@ -133,6 +133,7 @@ def _gated_residual_rmsnorm_kernel(
     LOWREG: cutlass.Constexpr,
     GAIN_CENTER: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
+    ENABLE_PDL: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     row, seg, _ = cute.arch.block_idx()
@@ -144,6 +145,9 @@ def _gated_residual_rmsnorm_kernel(
     el = cute.make_layout((VEC, T, CJ, S, M), stride=(1, VEC, VEC * T, VEC * T * CJ, H))
     evl = cute.make_layout((VEC, T, CJ, S), stride=(1, VEC, VEC * T, VEC * T * CJ))
     STAGED: cutlass.Constexpr = S >= 2
+
+    if cutlass.const_expr(ENABLE_PDL):
+        cute.arch.griddepcontrol_wait()
 
     # ---- issue every global load first: one memory round trip for the kernel ----
     gBa = cute.make_tensor(mBranch.iterator, rrl)[(None, tidx, None, row)]
@@ -297,6 +301,9 @@ def _gated_residual_rmsnorm_kernel(
     fO.store(y)
     cute.autovec_copy(fO, gO, l1c_evict_priority=FIRST)
 
+    if cutlass.const_expr(ENABLE_PDL):
+        cute.arch.griddepcontrol_launch_dependents()
+
 
 @cute.jit
 def _gated_residual_rmsnorm_launch(
@@ -317,6 +324,7 @@ def _gated_residual_rmsnorm_launch(
     SMEM: cutlass.Constexpr,
     MBPM: cutlass.Constexpr,
     CX: cutlass.Constexpr,
+    ENABLE_PDL: cutlass.Constexpr,
 ):
     M = cute.size(mBranch, mode=[0])
     if cutlass.const_expr(MBPM > 0):
@@ -334,12 +342,14 @@ def _gated_residual_rmsnorm_launch(
             LOWREG,
             GAIN_CENTER,
             EPS,
+            ENABLE_PDL,
         ).launch(
             grid=[M, S, 1],
             block=[T, 1, 1],
             smem=SMEM,
             stream=cuda_stream,
             cluster=[1, CX, 1],
+            use_pdl=ENABLE_PDL,
             min_blocks_per_mp=MBPM,
         )
     else:
@@ -357,12 +367,14 @@ def _gated_residual_rmsnorm_launch(
             LOWREG,
             GAIN_CENTER,
             EPS,
+            ENABLE_PDL,
         ).launch(
             grid=[M, S, 1],
             block=[T, 1, 1],
             smem=SMEM,
             stream=cuda_stream,
             cluster=[1, CX, 1],
+            use_pdl=ENABLE_PDL,
         )
 
 
@@ -403,6 +415,7 @@ def _get_compiled(
     eps,
     mbpm,
     cx,
+    enable_pdl,
 ):
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
@@ -431,6 +444,7 @@ def _get_compiled(
             f"eps{_float_key(eps)}",
             f"mb{mbpm}",
             f"cx{cx}",
+            f"pdl{int(enable_pdl)}",
         )
     )
     return build_and_load_cute_dsl_kernel(
@@ -455,13 +469,25 @@ def _get_compiled(
             128 + (4 * H // s if s >= 2 else 0),
             mbpm,
             cx,
+            enable_pdl,
             options="--enable-tvm-ffi",
         ),
         extra_key_files=(__file__,),
     )
 
 
-def run(branch, stream, norm_weight, alpha, beta, eps, gain_center, mode, output):
+def run(
+    branch,
+    stream,
+    norm_weight,
+    alpha,
+    beta,
+    eps,
+    gain_center,
+    mode,
+    output,
+    enable_pdl=False,
+):
     if branch.shape[0] == 0:  # empty invocation: nothing to launch
         return
     mode_i = int(mode)
@@ -491,6 +517,7 @@ def run(branch, stream, norm_weight, alpha, beta, eps, gain_center, mode, output
         float(eps),
         mbpm,
         cx,
+        bool(enable_pdl),
     )
     # Launch on the caller's current stream so the kernel is graph capturable.
     fn(branch, stream, norm_weight, alpha, beta, output)
@@ -506,6 +533,7 @@ def gated_residual_rmsnorm(
     gain_center: float,
     mode: int,
     output: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Run the fixed-width fused gated residual RMSNorm kernel."""
     if output is None:
@@ -520,5 +548,6 @@ def gated_residual_rmsnorm(
         gain_center,
         mode,
         output,
+        enable_pdl,
     )
     return output

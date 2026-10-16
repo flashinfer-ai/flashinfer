@@ -763,6 +763,14 @@ def _path_worker(
 
             call()
             check()
+            # The build falls back to the staged path when a fast path cannot
+            # run; require the selected path so a silent fallback fails here.
+            key = module._program_key(
+                num_tokens, rows, weights, weight_before_norm, 1e-8, gain
+            )
+            built = module._PROGRAMS[key].path
+            selected = module._select_path(num_tokens, module._WS.nsm)
+            assert built == selected, f"{path=} {num_tokens=}: built {built}"
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):

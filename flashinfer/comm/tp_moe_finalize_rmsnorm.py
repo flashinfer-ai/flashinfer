@@ -80,6 +80,7 @@ from cutlass.cutlass_dsl import T as MLIR_T
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ..api_logging import flashinfer_api
+from ..cute_dsl.availability import is_cute_dsl_arch_supported
 from ..trace.templates.comm import tp_moe_finalize_rmsnorm_trace
 from ..utils import register_custom_op, register_fake_op
 from .mnnvl_cutedsl.cute_dsl_primitives import (
@@ -1625,13 +1626,17 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
 
     device = torch.device("cuda", torch.accelerator.current_device_index())
     props = torch.cuda.get_device_properties(device)
-    local_supported = (props.major, props.minor) in _COMPUTE_CAPABILITIES
-    local_supported = local_supported and props.multi_processor_count <= NSLOT
+    capability = (props.major, props.minor)
+    local_supported = (
+        capability in _COMPUTE_CAPABILITIES
+        and is_cute_dsl_arch_supported(*capability)
+        and props.multi_processor_count <= NSLOT
+    )
     if not collective_support(local_supported, group, device):
         if not local_supported:
             logger.warning(
-                "TP MoE finalize requires SM100/SM103/SM107 and at most %d SMs; got SM%d%d "
-                "with %d SMs.",
+                "TP MoE finalize requires SM100/SM103/SM107, a CuTe DSL that "
+                "targets it, and at most %d SMs; got SM%d%d with %d SMs.",
                 NSLOT,
                 props.major,
                 props.minor,
@@ -1767,11 +1772,13 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
 
 
 class _Program:
-    __slots__ = ("fn", "ffi")
+    __slots__ = ("fn", "ffi", "path")
 
-    def __init__(self, fn, ffi):
+    def __init__(self, fn, ffi, path):
         self.fn = fn
         self.ffi = ffi
+        # The transport actually compiled; differs from the key on fallback.
+        self.path = path
 
     def __call__(self, a, b, c, d, e, stream):
         if self.ffi:
@@ -1843,7 +1850,7 @@ def _grid_fits(compiled, *, split, groups, nthr, smem, stream):
         _drv.cuModuleUnload(module)
 
 
-def _compile(host, a, b, c, d, e, stream, options):
+def _compile(host, a, b, c, d, e, stream, options, path):
     try:
         args = [
             from_dlpack(x, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
@@ -1854,7 +1861,7 @@ def _compile(host, a, b, c, d, e, stream, options):
         compiled = cute.compile(
             host, *args, stream, options=f"--enable-tvm-ffi {options}"
         )
-        return _Program(compiled, True)
+        return _Program(compiled, True, path)
     except Exception as error:
         logger.warning(
             "TVM-FFI compilation failed for TP MoE finalize; using the "
@@ -1865,7 +1872,7 @@ def _compile(host, a, b, c, d, e, stream, options):
             from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=x.ndim - 1)
             for x in (a, b, c, d, e)
         ]
-        return _Program(cute.compile(host, *args, stream, options=options), False)
+        return _Program(cute.compile(host, *args, stream, options=options), False, path)
 
 
 def _build(key, a, b, c, d, e, stream):
@@ -1905,12 +1912,20 @@ def _build(key, a, b, c, d, e, stream):
             push=push or None,
         )
         if path == "token":
-            program = _compile(host, a, b, c, d, e, stream, "")
+            program = _compile(host, a, b, c, d, e, stream, "", path)
             ok = True
         else:
             with tempfile.TemporaryDirectory() as dump_dir:
                 program = _compile(
-                    host, a, b, c, d, e, stream, f"--keep-cubin --dump-dir={dump_dir}"
+                    host,
+                    a,
+                    b,
+                    c,
+                    d,
+                    e,
+                    stream,
+                    f"--keep-cubin --dump-dir={dump_dir}",
+                    path,
                 )
             groups = tiles * _WS.ws if path == "token1" else grid_y
             experts = K_EXPERTS // (xpar if path == "token1" else _WS.ws)
@@ -1935,7 +1950,26 @@ def _build(key, a, b, c, d, e, stream):
         raise RuntimeError("TP MoE finalize compilation failed on at least one rank")
     # All ranks choose the staged transport together. Kernel boundaries remove
     # the requirement that the full grid be resident at once.
+    logger.warning(
+        "TP MoE finalize %s path is unavailable for %d padded tokens; "
+        "using the staged token path.",
+        path,
+        rows,
+    )
     return _build(("token", rows, 1, 0, 0, *key[5:]), a, b, c, d, e, stream)
+
+
+def _program_key(
+    n_tok, gemm2_permuted, expert_weights, weight_before_norm, eps, gain_center
+):
+    return (
+        *_config(n_tok),
+        gemm2_permuted.stride(0),
+        int(expert_weights.dtype == torch.float32),
+        int(weight_before_norm),
+        float(eps),
+        float(gain_center),
+    )
 
 
 def _run(
@@ -1953,13 +1987,8 @@ def _run(
         return
     if not _WS.available:
         raise RuntimeError("TP MoE finalize workspace was not initialized")
-    key = (
-        *_config(n_tok),
-        gemm2_permuted.stride(0),
-        int(expert_weights.dtype == torch.float32),
-        int(weight_before_norm),
-        float(eps),
-        float(gain_center),
+    key = _program_key(
+        n_tok, gemm2_permuted, expert_weights, weight_before_norm, eps, gain_center
     )
     capturing = torch.cuda.is_current_stream_capturing()
     stream = _cur_stream(_WS.dev_ord)
@@ -1987,39 +2016,6 @@ def _run(
         norm_weight,
         output,
         stream,
-    )
-
-
-def run(
-    gemm2_permuted,
-    expert_weights,
-    expanded_idx_to_permuted_idx,
-    norm_weight,
-    eps,
-    gain_center,
-    weight_before_norm,
-    output,
-):
-    """Direct entry point with the same ordering contract as the public API."""
-    if not init_tp_moe_finalize_rmsnorm():
-        raise RuntimeError("TP multicast finalize is unavailable")
-    if not supports_tp_moe_finalize_rmsnorm(
-        gemm2_permuted,
-        expert_weights,
-        expanded_idx_to_permuted_idx,
-        norm_weight,
-        output,
-    ):
-        raise ValueError("tensors do not satisfy the TP MoE finalize contract")
-    _run(
-        gemm2_permuted,
-        expert_weights,
-        expanded_idx_to_permuted_idx,
-        norm_weight,
-        eps,
-        gain_center,
-        weight_before_norm,
-        output,
     )
 
 
@@ -2145,7 +2141,7 @@ def tp_moe_finalize_rmsnorm(
     gain_center: float,
     weight_before_norm: bool,
 ) -> None:
-    """Gather and finalize TP expert rows, then apply per-expert RMSNorm.
+    """TP MoE finalize plus per-expert RMSNorm, for hidden size 4096 and top-k 8.
 
     ``gemm2_permuted`` contains the raw, unweighted GEMM2 rows in physical
     expert order. ``expanded_idx_to_permuted_idx[t, k]`` selects the physical
@@ -2163,6 +2159,32 @@ def tp_moe_finalize_rmsnorm(
     the caller must order their work with synchronization or event dependencies;
     this operation does not insert synchronization between streams. Warm up every
     specialization outside CUDA graph capture before capturing it.
+
+    Parameters
+    ----------
+    gemm2_permuted : torch.Tensor
+        BF16 GEMM2 output of shape ``(rows, >= 4096)`` in physical expert order.
+        Rows may be padded, but the last dimension must have unit stride and the
+        row stride must be a multiple of 8 elements.
+    expert_weights : torch.Tensor
+        BF16 or FP32 routing weights of shape ``(num_tokens, 8)``.
+    expanded_idx_to_permuted_idx : torch.Tensor
+        Int32 tensor of shape ``(num_tokens, 8)`` mapping each (token, top-k slot)
+        to a row of ``gemm2_permuted``.
+    norm_weight : torch.Tensor
+        BF16 RMSNorm weight of shape ``(4096,)``.
+    output : torch.Tensor
+        BF16 destination of shape ``(num_tokens, 4096)``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    gain_center : float
+        Constant added to ``norm_weight`` in FP32.
+    weight_before_norm : bool
+        Whether ``norm_weight`` scales the activations before the RMS reduction
+        instead of after normalization.
+
+    All tensors must be contiguous (except the padded ``gemm2_permuted``),
+    16-byte aligned, and on the device the workspace was initialized on.
     """
     _tp_moe_finalize_impl(
         gemm2_permuted,

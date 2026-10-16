@@ -170,6 +170,11 @@ _FUSED_NORM_ALIGNMENT = 16
 _DUAL_NORM_ALIGNMENT = 32
 
 
+def _fused_norm_arch_supported(device: torch.device) -> bool:
+    cap = torch.cuda.get_device_capability(device)
+    return cap in _GATED_RESIDUAL_COMPUTE_CAPABILITIES and _cute_dsl_supports_arch(*cap)
+
+
 def _is_aligned(tensor: torch.Tensor, alignment: int = _FUSED_NORM_ALIGNMENT) -> bool:
     return tensor.data_ptr() % alignment == 0
 
@@ -212,8 +217,7 @@ def supports_gated_residual_rmsnorm(
                 and _is_aligned(weight)
             )
         )
-        and torch.cuda.get_device_capability(branch.device)
-        in _GATED_RESIDUAL_COMPUTE_CAPABILITIES
+        and _fused_norm_arch_supported(branch.device)
     )
 
 
@@ -264,8 +268,7 @@ def supports_gated_residual_next_rmsnorm(
             and _is_aligned(tensor, _DUAL_NORM_ALIGNMENT)
             for tensor in tensors
         )
-        and torch.cuda.get_device_capability(branch.device)
-        in _GATED_RESIDUAL_COMPUTE_CAPABILITIES
+        and _fused_norm_arch_supported(branch.device)
     )
 
 
@@ -286,7 +289,7 @@ def gated_residual_next_rmsnorm(
     post_gain_center: float = 0.0,
     enable_pdl: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Blend a normalized branch and apply the next RMSNorm in one launch.
+    r"""Gated residual RMSNorm plus the next RMSNorm in one launch, for hidden size 8192.
 
     This computes ``residual_out = alpha * residual + beta * RMSNorm(branch)``
     in FP32. It then computes ``ffn_input = RMSNorm(residual_out) *
@@ -451,8 +454,10 @@ def gated_residual_rmsnorm(
     eps: float = 1e-6,
     gain_center: float = 0.0,
     out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
-    r"""Apply RMSNorm and blend a branch into a gated residual stream.
+    r"""Gated residual RMSNorm for hidden size 8192: blend a normalized branch into the stream.
 
     The operation is ``alpha * residual + beta * RMSNorm(branch)``. When
     ``weight`` is supplied, ``weight + gain_center`` is applied to ``branch``
@@ -476,6 +481,9 @@ def gated_residual_rmsnorm(
         Constant added to ``weight`` in FP32.
     out : Optional[torch.Tensor]
         Optional FP32 output tensor with the same shape and layout as ``residual``.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it.
 
     Returns
     -------
@@ -507,6 +515,7 @@ def gated_residual_rmsnorm(
         eps,
         gain_center,
         weight is not None,
+        enable_pdl,
     )
     return out
 
@@ -522,7 +531,10 @@ def _gated_residual_rmsnorm_impl(
     eps: float,
     gain_center: float,
     apply_weight_before_norm: bool,
+    enable_pdl: bool = True,
 ) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(branch.device)
     _gated_residual_rmsnorm_cute(
         branch,
         residual,
@@ -533,6 +545,7 @@ def _gated_residual_rmsnorm_impl(
         gain_center,
         int(apply_weight_before_norm),
         out,
+        enable_pdl,
     )
 
 
@@ -547,6 +560,7 @@ def _gated_residual_rmsnorm_fake(
     eps: float,
     gain_center: float,
     apply_weight_before_norm: bool,
+    enable_pdl: bool = True,
 ) -> None:
     return None
 
@@ -559,14 +573,25 @@ def rmsnorm_sigmoid_gate(
     *,
     enable_pdl: bool = True,
 ) -> None:
-    r"""Apply per-head RMSNorm and a sigmoid gate to ``input`` in place.
+    r"""Per-head RMSNorm and sigmoid gate, in place, for head dim 64.
 
     The last dimension is normalized independently, multiplied by
     ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
     supports contiguous BF16 head rows of width 64 on SM100, SM103, and SM107 GPUs.
 
-    Programmatic dependent launch is enabled by default. Pass
-    ``enable_pdl=False`` to disable it.
+    Parameters
+    ----------
+    input : torch.Tensor
+        BF16 tensor of shape ``(rows, 64)`` or ``(rows, heads, 64)``, normalized
+        in place. The last dimension must be contiguous, heads must be packed,
+        and the row stride must be a multiple of 8 elements.
+    gate : torch.Tensor
+        BF16 gate tensor with the same shape and layout constraints as ``input``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it.
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")

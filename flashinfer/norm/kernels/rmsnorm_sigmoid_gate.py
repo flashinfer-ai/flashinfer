@@ -10,6 +10,7 @@ import functools
 
 import torch
 
+from ...cute_dsl.availability import is_cute_dsl_arch_supported
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 try:
@@ -427,4 +428,7 @@ def supports_rmsnorm_sigmoid_gate(
         resolved_device.type == "cuda"
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability(resolved_device) in _COMPUTE_CAPABILITIES
+        and is_cute_dsl_arch_supported(
+            *torch.cuda.get_device_capability(resolved_device)
+        )
     )
