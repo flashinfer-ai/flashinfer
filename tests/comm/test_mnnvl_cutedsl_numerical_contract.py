@@ -584,3 +584,68 @@ def test_ll_lamport_variant_graph_replay(distributed_group, variant, apply_rms_n
                     _assert_norm_contract("ll", norm[m], prenorm[m], reference, gamma)
     finally:
         workspace.destroy()
+
+
+@torch.inference_mode()
+def test_ll_two_shot_mailboxes_cover_their_routes(distributed_group):
+    """Each two-shot collective sizes its mailboxes to the token counts routed
+    to it, and the routes still match the rank-ordered reduction bit for bit."""
+    group = distributed_group
+    rank = dist.get_rank(group)
+    tp_size = dist.get_world_size(group)
+    hidden_size = 8192
+    capacity_m = 64
+    small = LLAllReduceTuning(
+        two_shot=True, collective=LLCollectiveTuning(cluster_size=4, threads=128)
+    )
+    large = LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT
+    assert small.collective != large.collective
+    profile = StaticProfile(
+        tp_size=tp_size,
+        hidden_size=hidden_size,
+        top_k=10,
+        dtype=torch.bfloat16,
+        finalize_routes=MRangeDispatch(
+            upper_bounds=(None,),
+            targets=(KernelTarget(ProtocolKind.LL, LLFinalizeTuning()),),
+        ),
+        all_reduce_routes=MRangeDispatch(
+            upper_bounds=(8, None),
+            targets=(
+                KernelTarget(ProtocolKind.LL, small),
+                KernelTarget(ProtocolKind.LL, large),
+            ),
+        ),
+    )
+    workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
+        tp_size=tp_size,
+        tp_rank=rank,
+        max_token_num=capacity_m,
+        hidden_dim=hidden_size,
+        dtype=torch.bfloat16,
+        group=group,
+        add_residual=False,
+        apply_rms_norm=False,
+        config=MNNVLCuteDSLConfig(profiles=(profile,), applies_rms_norm=False),
+    )
+    try:
+        kernels = workspace._protocols[ProtocolKind.LL].all_reduce_kernels
+        for tuning, route_capacity in ((small, 8), (large, capacity_m)):
+            state = kernels[tuning]._state
+            assert state.scatter_mailbox.tensor.shape[2] == route_capacity
+            assert state.gather_mailbox.tensor.shape[1] == route_capacity
+        local = _order_sensitive_local(capacity_m, rank, tp_size, hidden_size)
+        expected = _protocol_prenorm("ll", local, torch.zeros_like(local), group, None)
+        for m in (8, 64, 3, 9, 1, 64, 8):
+            out = torch.empty((m, hidden_size), dtype=torch.bfloat16, device="cuda")
+            allreduce_fusion(
+                input=local[:m],
+                workspace=workspace,
+                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+                launch_with_pdl=True,
+                residual_out=out,
+                rms_eps=workspace.rms_eps,
+            )
+            _assert_prenorm_contract("ll", out, expected[:m])
+    finally:
+        workspace.destroy()

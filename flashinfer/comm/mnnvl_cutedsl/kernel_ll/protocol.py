@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypedDict, cast
 
@@ -553,7 +554,11 @@ class LLProtocol:
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
         dynamic_fp8: bool = False,
+        all_reduce_capacities: Mapping[LLAllReduceTuning, int] | None = None,
     ) -> None:
+        """``all_reduce_capacities`` maps an all-reduce tuning to the largest
+        ``m`` it serves (at most ``capacity_m``, the default); a two-shot
+        tuning sizes its own mailboxes to it."""
         self.hidden_size = hidden_size
         self.top_k = top_k
         self.tp_size = tp_size
@@ -631,21 +636,36 @@ class LLProtocol:
         )
         # A two-shot variant derives its mailbox slots and per-CTA Lamport
         # generations from its own CTA-to-fragment mapping, so each collective
-        # shape owns its mailboxes; variants never share a slot.
-        two_shot_cache: dict[LLCollectiveTuning, tuple[Any, _TwoShotState]] = {}
+        # shape owns its mailboxes; variants never share a slot. The
+        # mailboxes only cover the token counts routed to that shape.
+        capacities = all_reduce_capacities or {}
+        two_shot_capacities: dict[LLCollectiveTuning, int] = {}
+        for tuning in all_reduce_tunings:
+            if tuning.two_shot:
+                route_capacity = min(capacities.get(tuning, capacity_m), capacity_m)
+                if route_capacity <= 0:
+                    raise ValueError("all-reduce capacities must be positive")
+                two_shot_capacities[tuning.collective] = max(
+                    two_shot_capacities.get(tuning.collective, 0), route_capacity
+                )
+        two_shot_cache = {
+            collective: (
+                self._compile_two_shot(collective, two_shot_capacity),
+                self._create_two_shot_state(group, collective, two_shot_capacity),
+            )
+            for collective, two_shot_capacity in two_shot_capacities.items()
+        }
         for tuning in dict.fromkeys(all_reduce_tunings):
             if not tuning.two_shot:
                 continue
-            if tuning.collective not in two_shot_cache:
-                two_shot_cache[tuning.collective] = (
-                    self._compile_two_shot(tuning.collective),
-                    self._create_two_shot_state(group, tuning.collective),
-                )
             compiled, two_shot_state = two_shot_cache[tuning.collective]
             self.all_reduce_kernels[tuning] = TwoShotAllReduceRMSNormLLKernel(
                 compiled=compiled,
                 two_shot_state=two_shot_state,
-                **self._path_kwargs(),
+                **{
+                    **self._path_kwargs(),
+                    "capacity_m": two_shot_capacities[tuning.collective],
+                },
             )
 
     def _path_kwargs(self) -> _PathKwargs:
@@ -760,12 +780,12 @@ class LLProtocol:
         )
         return cute.compile(device_kernel, *args)
 
-    def _compile_two_shot(self, collective: LLCollectiveTuning):
+    def _compile_two_shot(self, collective: LLCollectiveTuning, capacity_m: int):
         device_kernel = _LamportTwoShotDeviceKernel(
             hidden=self.hidden_size,
             tp=self.tp_size,
             rank=self.rank,
-            capacity_m=self.capacity_m,
+            capacity_m=capacity_m,
             cluster_size=collective.cluster_size,
             threads=collective.threads,
             rms_epsilon=self.rms_epsilon,
@@ -775,7 +795,7 @@ class LLProtocol:
             apply_rms_norm=self.apply_rms_norm,
             enable_pdl=collective.enable_pdl,
         )
-        activation = self.capacity_m * self.hidden_size
+        activation = capacity_m * self.hidden_size
         args = (
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
@@ -812,23 +832,26 @@ class LLProtocol:
             fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(
                 Int32,
-                (self.capacity_m * collective.cluster_size,),
+                (capacity_m * collective.cluster_size,),
                 assumed_align=4,
             ),
-            Int32(self.capacity_m),
+            Int32(capacity_m),
             current_cu_stream(),
         )
         return cute.compile(device_kernel, *args)
 
     def _create_two_shot_state(
-        self, group: dist.ProcessGroup, collective: LLCollectiveTuning
+        self,
+        group: dist.ProcessGroup,
+        collective: LLCollectiveTuning,
+        capacity_m: int,
     ) -> _TwoShotState:
         device = torch.device("cuda", torch.cuda.current_device())
         scatter = SymmetricBuffer.allocate(
             (
                 LAMPORT_GENERATIONS,
                 self.tp_size,
-                self.capacity_m,
+                capacity_m,
                 self.hidden_size,
             ),
             torch.bfloat16,
@@ -837,7 +860,7 @@ class LLProtocol:
             materialize_peer_addresses=True,
         )
         gather = SymmetricBuffer.allocate(
-            (LAMPORT_GENERATIONS, self.capacity_m, self.hidden_size),
+            (LAMPORT_GENERATIONS, capacity_m, self.hidden_size),
             torch.bfloat16,
             device,
             group,
@@ -849,7 +872,7 @@ class LLProtocol:
             scatter_mailbox=scatter,
             gather_mailbox=gather,
             generations=torch.zeros(
-                (self.capacity_m * collective.cluster_size,),
+                (capacity_m * collective.cluster_size,),
                 dtype=torch.int32,
                 device=device,
             ),

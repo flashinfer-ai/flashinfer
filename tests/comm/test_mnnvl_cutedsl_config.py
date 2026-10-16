@@ -607,3 +607,45 @@ def test_only_configs_select_one_protocol(
 
     for routes in (profile.finalize_routes, profile.all_reduce_routes):
         assert all(target.protocol is expected_protocol for target in routes.targets)
+
+
+@pytest.mark.parametrize(
+    "compute_capability,capacity_m,expected",
+    (
+        (_RUBIN, 16384, {LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT: 384}),
+        (_RUBIN, 200, {LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT: 200}),
+        (_RUBIN, 100, {}),
+        (
+            _GB300,
+            16384,
+            {
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64: 64,
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192: 192,
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320: 320,
+            },
+        ),
+        (
+            _GB300,
+            100,
+            {
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64: 64,
+                LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192: 100,
+            },
+        ),
+    ),
+    ids=("rubin", "rubin-capped", "rubin-unreached", "gb300", "gb300-capped"),
+)
+def test_two_shot_capacities_follow_routes(compute_capability, capacity_m, expected):
+    """Each LL two-shot preset is sized to the largest token count routed to it."""
+    from flashinfer.comm.mnnvl_cutedsl_ar import _preset_capacities
+
+    profile = _tp4_h8192(NO_NORM_CONFIG, compute_capability)
+    capacities = _preset_capacities(
+        profile.all_reduce_routes, ProtocolKind.LL, capacity_m
+    )
+    two_shot = {
+        preset: capacity
+        for preset, capacity in capacities.items()
+        if getattr(preset, "two_shot", False)
+    }
+    assert two_shot == expected

@@ -30,7 +30,7 @@ from .mnnvl_cutedsl import (
     MNNVLCuteDSLConfig,
     ProtocolKind,
 )
-from .mnnvl_cutedsl.config import StaticProfile
+from .mnnvl_cutedsl.config import KernelTarget, MRangeDispatch, StaticProfile
 from .mnnvl_cutedsl.kernel_bt import BTAllReduceTuning, BTFinalizeTuning
 from .mnnvl_cutedsl.kernel_bt.protocol import BTProtocol
 from .mnnvl_cutedsl.kernel_ht import HTAllReduceTuning, HTFinalizeTuning
@@ -217,6 +217,22 @@ def _resolve_profile(
     ):
         raise ValueError("the LL two-shot all-reduce has no dynamic FP8 output")
     return profile
+
+
+def _preset_capacities(
+    routes: MRangeDispatch[KernelTarget[Any]], protocol: ProtocolKind, capacity_m: int
+) -> dict[Any, int]:
+    """Largest token count each ``protocol`` preset of ``routes`` serves."""
+    capacities: dict[Any, int] = {}
+    lower_bound = 1
+    for upper_bound, target in zip(routes.upper_bounds, routes.targets, strict=True):
+        if lower_bound > capacity_m:
+            break
+        upper = capacity_m if upper_bound is None else min(upper_bound, capacity_m)
+        if target.protocol is protocol:
+            capacities[target.preset] = max(capacities.get(target.preset, 0), upper)
+        lower_bound = upper + 1
+    return capacities
 
 
 def _probe_support(
@@ -457,6 +473,9 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                     **common,
                     finalize_tunings=finalize_tunings,
                     all_reduce_tunings=all_reduce_tunings,
+                    all_reduce_capacities=_preset_capacities(
+                        self.profile.all_reduce_routes, protocol, capacity
+                    ),
                 )
             elif protocol is ProtocolKind.BT:
                 instance = BTProtocol(
