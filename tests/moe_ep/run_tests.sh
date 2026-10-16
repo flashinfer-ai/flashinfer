@@ -122,6 +122,7 @@ run_unit() {
   pytest_no_finalize tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
+    --ignore=tests/moe_ep/test_nvlink_one_sided.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
@@ -185,7 +186,9 @@ run_unit() {
 run_comm() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_moe_ep_communication_multirank.py -v
+    tests/moe_ep/test_moe_ep_communication_multirank.py -v || return 1
+  # Spawns one process per EP rank itself; cases needing more GPUs skip.
+  "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" tests/moe_ep/test_nvlink_one_sided.py -v
 }
 
 run_multirank() {

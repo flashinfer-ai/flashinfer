@@ -182,6 +182,8 @@ def _radix_cutlass_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -195,8 +197,8 @@ def _radix_cutlass_top_k_varlen_check(
     """Radix masked-fallback: runs on all supported SM tiers, on contiguous
     logits (the CUDA launcher checks contiguity; gating here lets ``auto``
     pick a backend that handles strided views instead)."""
-    if row_starts is not None:
-        return False  # windowed (prefill) mode is served by gvr_2 only
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
     return logits.is_contiguous()
 
 
@@ -243,6 +245,8 @@ def _gvr_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -258,8 +262,8 @@ def _gvr_top_k_varlen_check(
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
-    if row_starts is not None:
-        return False  # windowed (prefill) mode is served by gvr_2 only
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
     if not (
         _cute_dsl_ready(logits.device)
         and pre_idx is not None
@@ -295,6 +299,8 @@ def _gvr2_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -356,6 +362,8 @@ def _top_k_varlen_heuristic(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
+    page_table=None,
+    page_size: Optional[int] = None,
     compress_ratio: Optional[int] = None,
     next_n: Optional[int] = None,
     pre_idx=None,
@@ -1123,6 +1131,8 @@ def _run_gvr2(
     row_starts: Optional[torch.Tensor] = None,
     max_window_len: Optional[int] = None,
     absolute_indices: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Self-sampling GVR V2: one launch for the whole batch via the per-row
     in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
@@ -1168,6 +1178,8 @@ def _run_gvr2(
         top_k=top_k,
         row_starts=row_starts,
         absolute_indices=absolute_indices,
+        page_table=page_table,
+        page_size=page_size,
     )
     return out_indices, (out_values if return_output_values else None)
 
@@ -1304,6 +1316,8 @@ def _radix_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -1317,8 +1331,8 @@ def _radix_top_k_varlen_check(
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
     Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
     contract, so they are gated here and ``auto`` falls through."""
-    if row_starts is not None:
-        return False  # windowed (prefill) mode is served by gvr_2 only
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
     if logits.dim() == 2 and logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
         return False
     return _cute_dsl_ready(logits.device)
@@ -1449,6 +1463,8 @@ def _radix_filter_top_k_varlen_check(
     row_starts=None,
     max_window_len=None,
     absolute_indices=False,
+    page_table=None,
+    page_size=None,
     compress_ratio=None,
     next_n=None,
     pre_idx=None,
@@ -1470,8 +1486,8 @@ def _radix_filter_top_k_varlen_check(
     input, so a hinted caller can use (or be routed by ``auto`` to) any
     hint-free backend.
     """
-    if row_starts is not None:
-        return False  # windowed (prefill) mode is served by gvr_2 only
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
     if not _cute_dsl_ready(logits.device):
         return False
     if not _radix_filter_kernel_dsl_ok():
@@ -1581,6 +1597,8 @@ def top_k_varlen(
     row_starts: Optional[torch.Tensor] = None,
     max_window_len: Optional[int] = None,
     absolute_indices: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
     compress_ratio: Optional[int] = None,
     next_n: Optional[int] = None,
     pre_idx: Optional[torch.Tensor] = None,
@@ -1609,7 +1627,8 @@ def top_k_varlen(
     where a row has fewer valid columns than ``top_k``, and with
     ``return_values=True`` also the selected scores. In decode mode, an index
     is the logits column, which is also the key's position in its request's
-    cache. In windowed (prefill) mode, an index is by default the position
+    cache, or the key's physical KV slot when ``page_table`` is given. In
+    windowed (prefill) mode, an index is by default the position
     inside the window: ``0`` is ``row_starts[r]``, the request's first key, so
     a window position addresses the request's cache exactly like a decode
     index. With ``absolute_indices=True`` an index is instead the logits column
@@ -1745,6 +1764,21 @@ def top_k_varlen(
         directly; a paged consumer keeps the default and maps the local
         position through its page table. ``True`` without ``row_starts``
         raises ``ValueError``. Default ``False``.
+    page_table : torch.Tensor, optional
+        Decode mode only. The request's page map: an ``int32`` tensor,
+        contiguous, with one row per request and at least
+        ``ceil(num_cols / page_size)`` columns (one entry per page of the
+        request's cache, so every column of ``logits`` maps through it);
+        columns and ``page_size`` are in the units of ``logits``. When given,
+        each selected column ``c`` of request ``q`` is written as the physical
+        KV slot ``page_table[q, c // page_size] * page_size + c % page_size``
+        instead of the column; ``-1`` padding is unchanged. The backends that
+        serve it, and their limits, are listed under ``backend``. Default
+        ``None``.
+    page_size : int, optional
+        Columns per ``page_table`` entry, a power of two up to ``2**30``. Any
+        value but ``None`` without ``page_table`` raises ``ValueError``.
+        Default ``None``, meaning ``1``.
     compress_ratio : int, optional
         Decode mode only: KV-index compression factor (``1`` for DSv3.2, ``4``
         for DSv4), every logit column standing for ``compress_ratio``
@@ -1851,7 +1885,12 @@ def top_k_varlen(
                               returns the bytes freed; graphs captured against
                               them must then be re-captured after a fresh
                               warm-up. A caller-provided ``"gvr2_workspace"``
-                              (see ``workspace``) replaces the slab.
+                              (see ``workspace``) replaces the slab. Paged
+                              output (``page_table``) is decode mode only,
+                              hint-free (no ``pre_idx``) and indices only (no
+                              ``return_values``); ``page_size`` is part of its
+                              warm-up key, so warm up each paged geometry with
+                              one eager paged call on the capturing stream.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K.
                               Every GPU FlashInfer supports (SM75 and up).
                               fp32, bf16 or fp16; contiguous ``logits``; no
@@ -1918,7 +1957,12 @@ def top_k_varlen(
         ``max_window_len`` or ``absolute_indices=True`` without it); if
         ``row_starts`` is not a contiguous 1-D ``int32`` tensor with one entry
         per row, ``max_window_len`` not a positive ``int`` or
-        ``absolute_indices`` not a ``bool``; if an ``out_indices`` /
+        ``absolute_indices`` not a ``bool``; if ``page_table`` comes with
+        ``row_starts``, ``pre_idx`` or ``return_values``, is not a contiguous
+        2-D ``int32`` tensor with one row per request covering the buffer
+        width, or ``page_size`` is given without ``page_table`` or is not a
+        power of two up to ``2**30``; if an
+        ``out_indices`` /
         ``out_values`` buffer is outside the contract above; or if an explicit
         backend's checker rejects the problem (reported as "Problem size is
         not supported").
@@ -2097,6 +2141,56 @@ def top_k_varlen(
             "windowed (prefill) mode, and in decode every row starts at column "
             "0 and num_cols already bounds it"
         )
+    if page_table is None and page_size is not None:
+        raise ValueError(
+            "page_size requires page_table: it is the page granularity of that "
+            "table and has no meaning without it; do not pass it, not even 1"
+        )
+    if page_size is None:
+        page_size = 1  # the paged default, resolved before the checks below
+    if page_table is not None:
+        if not (
+            isinstance(page_table, torch.Tensor)
+            and page_table.is_cuda
+            and page_table.device == logits.device
+            and page_table.dim() == 2
+            and page_table.dtype == torch.int32
+            and page_table.is_contiguous()
+        ):
+            raise ValueError(
+                f"page_table must be a contiguous 2-D int32 CUDA tensor on {logits.device}"
+            )
+        if page_table.shape[0] * next_n != num_rows:
+            raise ValueError(
+                f"page_table has {page_table.shape[0]} rows, expected one per request "
+                f"({num_rows} rows / next_n={next_n} = {num_rows // next_n})"
+            )
+        if row_starts is not None:
+            raise ValueError(
+                "page_table (paged decode output) cannot be combined with row_starts"
+            )
+        if pre_idx is not None:
+            raise ValueError(
+                "page_table requires pre_idx=None (hint-free gvr_2 engines)"
+            )
+        if return_values:
+            raise ValueError("page_table cannot be combined with return_values")
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+            or page_size > (1 << 30)
+            or page_size & (page_size - 1)
+        ):
+            raise ValueError(
+                f"page_size must be a power of two in [1, 2**30], got {page_size!r}"
+            )
+        need = (logits.shape[1] + page_size - 1) // page_size
+        if page_table.shape[1] < need:
+            raise ValueError(
+                f"page_table has {page_table.shape[1]} pages per request but the logits "
+                f"width {logits.shape[1]} needs {need} at page_size={page_size}"
+            )
 
     # A malformed hint is discarded, loudly: the call runs hint-free (the
     # checkers above already treated it as absent, so `auto` never selected a
@@ -2165,14 +2259,15 @@ def top_k_varlen(
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
-    if row_starts is not None and backend != "gvr_2":
+    if (row_starts is not None or page_table is not None) and backend != "gvr_2":
         # reachable under skip_check=True only (every other checker refuses
-        # row_starts): refuse BEFORE dispatch -- a radix / gvr run would
-        # silently rank the row prefix [0, seq_len) instead of the window
+        # row_starts and page_table): refuse BEFORE dispatch -- a radix / gvr
+        # run would silently rank the row prefix [0, seq_len) instead of the
+        # window, or return raw columns where physical slots were requested
         raise BackendSupportedError(
-            f"backend={backend!r} does not serve windowed (prefill) mode, which "
-            "row_starts selects; "
-            "use backend='gvr_2' or 'auto'"
+            f"backend={backend!r} does not serve windowed (prefill) mode or "
+            "paged output, which row_starts and page_table select; use "
+            "backend='gvr_2' or 'auto'"
         )
     if pre_idx is None and backend == "gvr":
         # reachable under skip_check=True (the checkers did not run) with a
@@ -2247,6 +2342,8 @@ def top_k_varlen(
             row_starts=row_starts,
             max_window_len=max_window_len,
             absolute_indices=absolute_indices,
+            page_table=page_table,
+            page_size=page_size,
         )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(

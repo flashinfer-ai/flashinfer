@@ -23,7 +23,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.experimental.dense_projection_gemm import cake_backend, cake_jit
+from flashinfer.experimental.dense_projection_gemm import (
+    cake_backend,
+    cake_build,
+    cake_jit,
+)
 from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     ARCH_RULE_DEFAULTS,
     BLOCK_K,
@@ -37,7 +41,6 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     SK_DUMMY_BASE,
     SK_MIN_ITERS,
     SMEM_OPT_IN,
-    SUPPORTED_COMPUTE_CAPABILITIES,
     arch_for,
     bind_launch,
     convenience_key,
@@ -691,14 +694,19 @@ def _assert_mirrors_cake(plan, cake_template, where, arch):
 
 
 def _device_supported() -> bool:
-    return torch.cuda.is_available() and (
-        torch.cuda.get_device_capability(0) in SUPPORTED_COMPUTE_CAPABILITIES
+    """A device this checkout registers generated programs for (``build.json`` ships
+    ``sm_100a`` and ``sm_107a`` builds: compute capability 10.0 or 10.7; see README)."""
+    return torch.cuda.is_available() and generated_program_available(
+        torch.device("cuda")
     )
 
 
 def _require_program(template: str):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     if not generated_program_available(torch.device("cuda"), template):
         pytest.skip(f"generated instance {template!r} not registered for this device")
 
@@ -708,7 +716,10 @@ def _registered_knobs(v, *candidates):
     The per-arch export only ships the instances its measured rules route to, so a test that pins a tile
     family takes whichever family's instance this device has; skips when none is registered."""
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     templates = [_plan_template(v, **knobs) for knobs in candidates]
     for knobs, template in zip(candidates, templates, strict=True):
         if generated_program_available(torch.device("cuda"), template):
@@ -756,24 +767,35 @@ def test_registry_records_are_well_formed():
     assert {record["arg_plan"] for record in cake_jit.MODULES.values()} == set(
         cake_jit.ARG_PLANS
     )
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>``
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(cake_jit.KERNELS) == set(cake_jit.ARCHES) == set(manifest["arch_flags"])
     for arch, table in cake_jit.KERNELS.items():
-        assert arch in cake_jit.ARCH_NVCC_FLAGS
         for template, name in table.items():
             record = cake_jit.MODULES[name]
             assert arch in record["arches"] and record["template"] == template
             assert cake_jit.select_module(arch, template) == name
     for name, record in cake_jit.MODULES.items():
-        # architecture-neutral programs: one source pair, registered for every arch it serves
+        # architecture-neutral programs: one source pair, built for every arch it serves
         assert record["arches"] and record["arches"] == sorted(record["arches"])
+        assert record["library"] == name
         for arch in record["arches"]:
-            assert arch in cake_jit.ARCH_NVCC_FLAGS
+            assert arch in cake_jit.ARCHES
             assert cake_jit.KERNELS[arch][record["template"]] == name
-        assert len(record["sources"]) == 2
-        assert all(
-            s.startswith("cake_dense_projection_gemm/") and "/sm_" not in s
-            for s in record["sources"]
-        )
-        assert len(record["closure_sha256"]) == 64
+            entry = libraries[cake_jit.library_name(name, arch)]
+            assert entry["arch"] == arch and entry["entry"] == record["ffi_entry"]
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_dense_projection_gemm/") and "/sm_" not in s
+                for s in entry["sources"]
+            )
+            assert all(
+                (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
+            )
+            assert len(entry["closure_sha256"]) == 64
         assert (
             "tma_workspace_bytes" not in record
         )  # by-value TMA ABI: no descriptor workspace
@@ -803,6 +825,12 @@ def test_registry_records_are_well_formed():
         assert int(launch["block"][0]) % 32 == 0  # whole warps
     with pytest.raises(NotImplementedError, match="not registered"):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_not_a_template")
+    # every manifest entry belongs to a registered (program, arch) pair
+    assert set(libraries) == {
+        cake_jit.library_name(name, arch)
+        for name, record in cake_jit.MODULES.items()
+        for arch in record["arches"]
+    }
 
 
 def test_registry_literals_follow_the_export_contract():
@@ -4903,9 +4931,7 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
         "arches": ["sm_100a"],
         "template": "dense_proj_gemm_kk_n256",
         "kernel": "kernel_fake",
-        "cache_name": "fake",
-        "sources": [],
-        "compile_flags": [],
+        "library": "cake_dense_projection_gemm_fake",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -4914,7 +4940,6 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "0" * 64,
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
     }
     monkeypatch.setitem(cake_jit.MODULES, "cake_dense_projection_gemm_fake", record)
@@ -5249,7 +5274,10 @@ def _plan_template(v, **knobs):
 @pytest.mark.parametrize("row, op, out_dtype, T", GPU_ROWS)
 def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED)
     _require_program(_plan_template(v))
     if op == "wgrad":
@@ -5268,7 +5296,10 @@ def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
 @pytest.mark.parametrize("op", ["fwd", "dgrad", "wgrad"])
 def test_mla_batched_rows_match_fp64_reference(row, op):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _make_inputs("mla", row, op, "bf16", 257, seed=SEED + 1)
     _require_program(_plan_template(v))
     prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"])
@@ -5281,7 +5312,10 @@ def test_mla_batched_rows_match_fp64_reference(row, op):
 
 def test_strided_views_and_storage_offsets_match_fp64_reference():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 2)
     T, K, N = 301, 704, 264
@@ -5337,7 +5371,10 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
 
 def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     # a swapped weight gradient on a half-width synthetic row (N = 32, K = 3072, T = 1001): stream-K "auto"
     # two-part split of a single partial wave with the deterministic in-kernel fixup.  The round-9 rules route
     # the GLM small-N weight gradients to whole tiles on sm_100a (64-row family: 48 tiles, which 74 pairs cannot
@@ -5378,7 +5415,10 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
 
 def test_convenience_path_reuses_its_planned_launch_without_allocation():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 6)
     T, K, N = (
@@ -5427,7 +5467,10 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     geometry reuses them without a memset (the kernel resets every counter it uses), stays allocation-free
     and reproduces the first result bit for bit."""
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 7)
     T, K, N = (
@@ -5491,7 +5534,10 @@ def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
 )
 def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _router_inputs(op, T, seed=SEED + 4)
     plan, *_ = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
     _require_program(plan.template)

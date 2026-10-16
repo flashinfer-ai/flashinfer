@@ -16,6 +16,7 @@ limitations under the License.
 
 import contextlib
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +27,12 @@ from flashinfer.dsa_sparse_attention import (
     dsa_sparse_attention,
     dsa_sparse_attention_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import cake_backend, cake_jit, cake_launch
+from flashinfer.experimental.cake_dsa_train import (
+    cake_backend,
+    cake_build,
+    cake_jit,
+    cake_launch,
+)
 from flashinfer.experimental.cake_dsa_train.cake_backend import (
     D_LATENT,
     D_QK,
@@ -575,7 +581,12 @@ def _host_inputs(total_q=8, total_k=16, topk=5):
 def test_registry_record_is_well_formed():
     record = cake_jit.record()
     assert cake_jit.STAGES[0] == "fwd" and cake_jit.PROGRAM == "cake_dsa_h64_train"
-    assert set(record["arches"]) <= set(cake_jit.ARCH_NVCC_FLAGS)
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>`` per stage
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(record["arches"]) <= set(manifest["arch_flags"])
     stages = cake_jit.registered_stages()
     assert stages[0] == "fwd" and tuple(record["stages"]) == stages
     if any(stage in stages for stage in KEY_PASS_STAGES):
@@ -612,10 +623,19 @@ def test_registry_record_is_well_formed():
         } <= set(cake_launch.STAGE_ARGS["bwd_main_natural"])
     for stage in stages:
         physical = record[stage]
-        assert len(physical["sources"]) == 2
-        assert all(s.startswith("cake_dsa_h64_train/") for s in physical["sources"])
-        assert all(physical["module"] in s for s in physical["sources"])
-        assert len(physical["closure_sha256"]) == 64 and physical["ffi_entry"]
+        assert physical["library"] == physical["module"] and physical["ffi_entry"]
+        for arch in record["arches"]:
+            entry = libraries[f"{physical['library']}_{arch}"]
+            assert entry["arch"] == arch and entry["entry"] == physical["ffi_entry"]
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_dsa_h64_train/") for s in entry["sources"]
+            )
+            assert all(physical["module"] in s for s in entry["sources"])
+            assert all(
+                (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
+            )
+            assert len(entry["closure_sha256"]) == 64
         launch = physical["launch"]
         assert len(launch["cluster"]) == 3 and all(
             int(c) >= 1 for c in launch["cluster"]
