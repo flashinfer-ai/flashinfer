@@ -1,0 +1,344 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""Lightweight admission for the Qwen 3.5 gated attention block: the geometry, the device / DSL gates, the version probe.
+
+Imports torch and FlashInfer's own probes only -- never the kernels, the CuTe DSL or the vendored cuDNN Frontend tree --
+so a serving stack's init-time dispatch question (:func:`qwen_3_5_block_support`) costs nothing when the answer is no.
+The per-form decline table is read from the vendored tree only once every lighter gate has passed.
+"""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import importlib.metadata
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from flashinfer.cute_dsl.availability import (
+    is_cute_dsl_available,
+    is_rubin_cute_dsl_available,
+)
+
+FEATURE = "Qwen 3.5 gated attention block (bf16)"
+SUPPORTED_CC: Tuple[int, int] = (10, 7)
+HEAD_DIM = 256
+CUTEDSL_REQUIRED = "4.8.0"
+FORMS: Tuple[str, ...] = ("prefill", "extend", "decode")
+PAGE_SIZES: Tuple[int, ...] = (16, 32, 64, 128)
+PAGE_SIZE_ALIGN = 16
+KV_LAYOUTS: Tuple[str, ...] = ("NHD", "HND")
+DECODE_MAX_Q_LEN = 4  # the claimed envelope: the packed Rubin d256 decode tile
+DECODE_MAX_ROWS = (
+    32  # routed (the unpacked tile) and declared up to here; a typed decline past it
+)
+DTYPES: Tuple[torch.dtype, ...] = (torch.bfloat16,)
+KV_CACHE_DTYPES: Tuple[torch.dtype, ...] = (torch.bfloat16,)
+# The forced 256-wide projection GEMM tile: every projected width must be a multiple of it.
+_PROJ_TILE = 256
+
+_VENDORED = Path(__file__).resolve().parent / "_cudnn_frost"
+
+
+@dataclass(frozen=True)
+class Qwen35BlockGeometry:
+    """The sub-layer's shape at THIS tensor-parallel rank (Qwen3.5-397B at TP 1: ``d_model=4096, num_qo_heads=32,
+    num_kv_heads=2``; ``24 / 2`` at ``d_model=2560`` for the 27B-class shards).  ``is_causal`` with the bottom-right
+    diagonal, no window and no soft-cap are fixed, not parameters."""
+
+    d_model: int
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int = HEAD_DIM
+    rope_dim: int = 64
+    qk_norm: bool = True
+    qk_norm_eps: float = 1e-6
+    sm_scale: Optional[float] = None
+
+    def __post_init__(self):
+        for name in ("d_model", "num_qo_heads", "num_kv_heads", "head_dim", "rope_dim"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(
+                    f"Qwen35BlockGeometry.{name} must be a positive int, got {v!r}"
+                )
+        if self.num_qo_heads % self.num_kv_heads:
+            raise ValueError(
+                f"Qwen35BlockGeometry: num_qo_heads={self.num_qo_heads} must be a multiple of num_kv_heads={self.num_kv_heads} (GQA groups)"
+            )
+        if self.rope_dim % 2 or self.rope_dim > self.head_dim:
+            raise ValueError(
+                f"Qwen35BlockGeometry: rope_dim={self.rope_dim} must be even and at most head_dim={self.head_dim}"
+            )
+        if not self.qk_norm_eps > 0.0:
+            raise ValueError(
+                f"Qwen35BlockGeometry: qk_norm_eps must be > 0, got {self.qk_norm_eps}"
+            )
+        if self.sm_scale is not None and not (float(self.sm_scale) > 0.0):
+            raise ValueError(
+                f"Qwen35BlockGeometry: sm_scale must be positive or None, got {self.sm_scale}"
+            )
+
+    @property
+    def group(self) -> int:
+        """Query heads per KV head."""
+        return self.num_qo_heads // self.num_kv_heads
+
+    @property
+    def n_qkvg(self) -> int:
+        """Columns of the fused ``W_qkvg`` (``Q | GATE | K | V`` bands)."""
+        return (2 * self.num_qo_heads + 2 * self.num_kv_heads) * self.head_dim
+
+    @property
+    def scale(self) -> float:
+        return (
+            float(self.sm_scale)
+            if self.sm_scale is not None
+            else float(self.head_dim) ** -0.5
+        )
+
+    def unsupported_reason(self) -> Optional[str]:
+        """Why the kernels do not serve this geometry (``None`` = served): the geometry envelope, independent of the device."""
+        if self.head_dim != HEAD_DIM:
+            return f"the Qwen 3.5 block kernels serve head_dim={HEAD_DIM} only (the Rubin d256 flavor); got head_dim={self.head_dim}"
+        if self.d_model % _PROJ_TILE:
+            return f"d_model must be a multiple of {_PROJ_TILE} (the forced projection GEMM tile); got d_model={self.d_model}"
+        if self.rope_dim == 0:
+            return "rope_dim must be positive (the fused norm + RoPE projection rotates a leading slice of every head)"
+        return None
+
+    def frost(self):
+        """The vendored cuDNN Frontend geometry (imports the vendored tree)."""
+        from ._cudnn_frost.gated_attention_block import GatedAttentionBlockGeometry
+
+        return GatedAttentionBlockGeometry(
+            d_model=self.d_model,
+            h_q=self.num_qo_heads,
+            h_kv=self.num_kv_heads,
+            d_head=self.head_dim,
+            rope_dim=self.rope_dim,
+            qk_norm_eps=self.qk_norm_eps,
+            attn_scale=self.sm_scale,
+            is_causal=True,
+            causal_bottom_right=True,
+            qk_norm=self.qk_norm,
+        )
+
+
+@dataclass(frozen=True)
+class Qwen35BlockSource:
+    """Where the kernels come from: the vendored cuDNN Frontend commit and version (``VENDOR_MANIFEST.json``), the CuTe DSL and
+    compute capability they were validated with, and the manifest's own digest."""
+
+    origin: str
+    commit: str
+    version: str
+    files: int
+    manifest_sha256: str
+    validated_cutedsl: str = CUTEDSL_REQUIRED
+    validated_compute_capability: str = "10.7"
+
+
+@functools.lru_cache(maxsize=1)
+def source() -> Qwen35BlockSource:
+    """The version probe (cached): read once from the vendored manifest, no kernel import."""
+    path = _VENDORED / "VENDOR_MANIFEST.json"
+    raw = path.read_bytes()
+    m = json.loads(raw)
+    return Qwen35BlockSource(
+        origin=str(m.get("origin", "")),
+        commit=str(m.get("commit", "")),
+        version=str(m.get("cudnn_frontend_version", "")),
+        files=len(m.get("files", [])),
+        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def cutedsl_version() -> Optional[str]:
+    """The installed ``nvidia-cutlass-dsl`` version, or ``None``."""
+    for dist in ("nvidia-cutlass-dsl", "nvidia_cutlass_dsl"):
+        try:
+            return importlib.metadata.version(dist)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return None
+
+
+def _version_tuple(v: str) -> Tuple[int, ...]:
+    out = []
+    for part in v.split("+")[0].split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def cutedsl_reason() -> Optional[str]:
+    """Why the installed CuTe DSL cannot serve the block (``None`` = it can): absent, below the floor, or without the Rubin target."""
+    if not is_cute_dsl_available():
+        return f"nvidia-cutlass-dsl is not installed; the Qwen 3.5 block kernels need nvidia-cutlass-dsl >= {CUTEDSL_REQUIRED} (the sm_107a target)"
+    version = cutedsl_version()
+    if version is not None and _version_tuple(version) < _version_tuple(
+        CUTEDSL_REQUIRED
+    ):
+        return f"nvidia-cutlass-dsl {version} is below the {CUTEDSL_REQUIRED} the Qwen 3.5 block kernels need (the first wheel with the sm_107a target)"
+    if not is_rubin_cute_dsl_available():
+        return (
+            f"the installed nvidia-cutlass-dsl ({version or 'unknown version'}) has no Rubin target (cutlass.utils.rubin_helpers); "
+            f"the Qwen 3.5 block kernels need nvidia-cutlass-dsl >= {CUTEDSL_REQUIRED}"
+        )
+    return None
+
+
+def device_cc(device) -> Optional[Tuple[int, int]]:
+    """``(major, minor)`` of a CUDA device, ``None`` for anything else (never raises)."""
+    try:
+        dev = torch.device(device)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return None
+        index = dev.index if dev.index is not None else torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(index)
+        return int(major), int(minor)
+    except Exception:  # noqa: BLE001 - a probe never raises
+        return None
+
+
+def device_reason(device) -> Optional[str]:
+    cc = device_cc(device)
+    if cc != SUPPORTED_CC:
+        found = "no CUDA device" if cc is None else f"SM{cc[0]}{cc[1]}"
+        return f"the Qwen 3.5 block targets SM{SUPPORTED_CC[0]}{SUPPORTED_CC[1]} (Rubin, cc 10.7) only; found {found}"
+    return None
+
+
+def dtype_reason(dtype: torch.dtype) -> Optional[str]:
+    if dtype not in DTYPES:
+        return f"the bf16 entry points serve torch.bfloat16 activations, weights and pools only; got {dtype}"
+    return None
+
+
+@dataclass(frozen=True)
+class Qwen35BlockFormSupport:
+    form: str
+    served: bool
+    reason: Optional[str] = None
+    #: every typed decline the form can raise at plan time, by name, with its message (the FE decline table, verbatim)
+    declines: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Qwen35BlockSupport:
+    """The static answer to "can this process run the block for this geometry / dtype on this device" -- read once at init by a
+    serving stack's dispatch predicate instead of catching exceptions.  CPU-constructible; never raises for an unsupported device."""
+
+    served: bool
+    reason: Optional[str]
+    device_cc: Optional[Tuple[int, int]]
+    cutedsl_version: Optional[str]
+    cutedsl_ok: bool
+    forms: Tuple[str, ...]
+    prefill: Qwen35BlockFormSupport
+    extend: Qwen35BlockFormSupport
+    decode: Qwen35BlockFormSupport
+    source: Qwen35BlockSource
+    cutedsl_required: str = CUTEDSL_REQUIRED
+    page_sizes: Tuple[int, ...] = PAGE_SIZES
+    kv_layouts: Tuple[str, ...] = KV_LAYOUTS
+    decode_max_q_len: int = DECODE_MAX_Q_LEN
+    decode_max_rows: int = DECODE_MAX_ROWS
+    dtypes: Tuple[torch.dtype, ...] = DTYPES
+    kv_cache_dtypes: Tuple[torch.dtype, ...] = KV_CACHE_DTYPES
+
+    def form(self, name: str) -> Qwen35BlockFormSupport:
+        if name not in FORMS:
+            raise ValueError(f"form must be one of {FORMS}, got {name!r}")
+        return getattr(self, name)
+
+
+def _frost_form_table(
+    geometry: Qwen35BlockGeometry, dtype: torch.dtype, device
+) -> Dict[str, Any]:
+    """The vendored tree's own envelope for the two paged forms (imports the vendored tree: called after the light gates passed)."""
+    from ._cudnn_frost.gated_attention_block import GatedAttentionBlockFwd
+
+    env = GatedAttentionBlockFwd.serving_envelope(
+        geometry.frost(), dtype, torch.device(device), device_cc=SUPPORTED_CC
+    )
+    return {
+        "extend": (env.extend.served, env.extend.reason, dict(env.extend.declines)),
+        "decode": (env.decode.served, env.decode.reason, dict(env.decode.declines)),
+    }
+
+
+def qwen_3_5_block_support(
+    device, geometry: Qwen35BlockGeometry, *, dtype: torch.dtype = torch.bfloat16
+) -> Qwen35BlockSupport:
+    """See :func:`flashinfer.qwen_3_5_block.qwen_3_5_block_support` (the public, decorated entry)."""
+    if not isinstance(geometry, Qwen35BlockGeometry):
+        raise TypeError(
+            f"geometry must be a Qwen35BlockGeometry, got {type(geometry).__name__}"
+        )
+    cc = device_cc(device)
+    version = cutedsl_version()
+    dsl_reason = cutedsl_reason()
+    common = (
+        geometry.unsupported_reason()
+        or dtype_reason(dtype)
+        or device_reason(device)
+        or dsl_reason
+    )
+    forms: Dict[str, Qwen35BlockFormSupport] = {}
+    if common is not None:
+        for name in FORMS:
+            forms[name] = Qwen35BlockFormSupport(name, False, common)
+    else:
+        try:
+            table = _frost_form_table(geometry, dtype, device)
+        except Exception as exc:  # noqa: BLE001 - the probe reports, never raises
+            why = f"the vendored cuDNN Frontend tree could not answer: {type(exc).__name__}: {exc}"
+            table = {name: (False, why, {}) for name in ("extend", "decode")}
+        forms["prefill"] = Qwen35BlockFormSupport("prefill", True, None)
+        for name in ("extend", "decode"):
+            served, reason, declines = table[name]
+            forms[name] = Qwen35BlockFormSupport(name, bool(served), reason, declines)
+    served_forms = tuple(name for name in FORMS if forms[name].served)
+    return Qwen35BlockSupport(
+        served=bool(served_forms),
+        reason=common
+        if common is not None
+        else (None if served_forms else forms["decode"].reason),
+        device_cc=cc,
+        cutedsl_version=version,
+        cutedsl_ok=dsl_reason is None,
+        forms=served_forms,
+        prefill=forms["prefill"],
+        extend=forms["extend"],
+        decode=forms["decode"],
+        source=source(),
+    )
+
+
+def require_served(
+    device, geometry: Qwen35BlockGeometry, dtype: torch.dtype, form: str
+) -> None:
+    """The plan-time gate: a typed ``NotImplementedError`` naming the device, the DSL version, the dtype or the geometry."""
+    if form not in FORMS:
+        raise ValueError(f"form must be one of {FORMS}, got {form!r}")
+    reason = (
+        geometry.unsupported_reason()
+        or dtype_reason(dtype)
+        or device_reason(device)
+        or cutedsl_reason()
+    )
+    if reason is not None:
+        raise NotImplementedError(f"qwen_3_5_block ({form}): {reason}")
