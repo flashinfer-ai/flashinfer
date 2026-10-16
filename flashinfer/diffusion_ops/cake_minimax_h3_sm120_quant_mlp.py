@@ -210,8 +210,18 @@ def prepare_minimax_h3_fc2_weight_fp8(
     output channel (row) is quantized to E4M3 with ``scale = RN(max(amax(row), 1e-12) / 448)`` (true
     IEEE division) and ``q = RN_sat(row / scale)``; the row order is unchanged.
 
-    Returns ``(fc2_weight_q, fc2_weight_scale)``: ``float8_e4m3fn`` ``[5376, 14336]`` and ``float32``
-    ``[5376]``.
+    Parameters
+    ----------
+    fc2_weight : torch.Tensor
+        CUDA ``bfloat16`` ``[5376, 14336]`` FC2 weight matrix.
+    chunk_rows : int
+        Number of output channels quantized per chunk (default: ``1024``).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fc2_weight_q, fc2_weight_scale)``: ``float8_e4m3fn`` ``[5376, 14336]`` weights and
+        ``float32`` ``[5376]`` per-row scales.
     """
     _check_fc2_weight(fc2_weight)
     weight_q = torch.empty(
@@ -245,10 +255,20 @@ def prepare_minimax_h3_fc2_weight_nvfp4_sm120(
     consecutive K elements: UE4M3 scale = ``E4M3_RN(g * absmax / 6)`` saturating at 448, E2M1
     round-to-nearest with saturation of ``w * g / scale``).
 
-    Returns ``(fc2_weight_q, fc2_weight_sf)``: packed E2M1 ``uint8`` ``[5376, 7168]`` weights (even
-    element in the low nibble) and a flat ``uint8`` tensor of ``5376 * 896`` bytes holding the block
-    scales in the FlashInfer 128x4 swizzled layout (the GEMM streams them as 42 output tiles of 448
-    rows x 256 bytes).
+    Parameters
+    ----------
+    fc2_weight : torch.Tensor
+        CUDA ``bfloat16`` ``[5376, 14336]`` FC2 weight matrix.
+    w_global_scale : float or torch.Tensor
+        Global weight scale (``448 * 6 / absmax``), supplied as a scalar or one-element tensor.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fc2_weight_q, fc2_weight_sf)``: packed E2M1 ``uint8`` ``[5376, 7168]`` weights (even
+        element in the low nibble) and a flat ``uint8`` tensor of ``5376 * 896`` bytes holding the
+        block scales in the FlashInfer 128x4 swizzled layout (the GEMM streams them as 42 output
+        tiles of 448 rows x 256 bytes).
     """
     from ..quantization.fp4_quantization import nvfp4_quantize
     from ..tllm_enums import SfLayout

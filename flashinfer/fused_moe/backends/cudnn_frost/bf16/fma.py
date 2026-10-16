@@ -110,7 +110,17 @@ def compile():
 
 
 @functools.cache
-def _source(tokens, hidden, intermediate, experts, topk, first, activation="swiglu"):
+def _source(
+    tokens,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    first,
+    activation="swiglu",
+    *,
+    source_identity,
+):
     from .....jit.env import FLASHINFER_GEN_SRC_DIR
 
     name = _KERNELS[0 if first else 1]
@@ -118,7 +128,7 @@ def _source(tokens, hidden, intermediate, experts, topk, first, activation="swig
     activation = activation if first else "identity"
     source = (
         (_ROOT / name).read_text()
-        + f"\n# FMA source identity: {source_digest()}\n_FMA_CONFIG = {config!r}\n"
+        + f"\n# FMA source identity: {source_identity}\n_FMA_CONFIG = {config!r}\n"
         + f"_ACTIVATION = {activation!r}\n_GATED = {is_gated(activation)!r}\n"
         + _COMPILE
     )
@@ -143,9 +153,19 @@ def build(tokens, hidden, intermediate, experts, topk, device, activation="swigl
         tokens, hidden, intermediate, experts, topk, activation
     ):
         raise ValueError("Unsupported BF16 FMA geometry/architecture")
+    source_identity = source_digest.__wrapped__()
     return tuple(
         common._load_source(
-            *_source(tokens, hidden, intermediate, experts, topk, first, activation),
+            *_source(
+                tokens,
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                first,
+                activation,
+                source_identity=source_identity,
+            ),
             arch,
             device.index,
         )

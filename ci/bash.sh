@@ -83,6 +83,11 @@ fi
 
 # Use nvidia-docker if the container is GPU.
 if [[ ${USE_GPU} == "true" ]]; then
+    # Keep CPU-only sharding infrastructure tests out of GPU CI collection.
+    # Forward by name so Docker preserves spaces in existing pytest options.
+    export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/test_sharding"
+    DOCKER_ENV="${DOCKER_ENV} -e PYTEST_ADDOPTS"
+
     # An unset host mask should leave the container's GPUs visible. Preserve
     # explicitly configured masks, including an intentionally empty one.
     if [[ -v CUDA_VISIBLE_DEVICES ]]; then

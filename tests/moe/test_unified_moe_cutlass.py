@@ -71,6 +71,10 @@ from flashinfer.utils import (
 )
 
 
+# Cold H100 CI compilation reached 153.2 GiB host RSS.
+pytestmark = pytest.mark.host_memory_heavy
+
+
 _CUTLASS_ACTIVATIONS = (
     SwiGLU(),
     SwiGLUStep(),
@@ -1394,6 +1398,9 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
 
         def build(self):
             events.append("build")
+
+        def accepts(self, act_pack, weight_pack):
+            return True
 
         def pack_inputs(self, act_pack, weight_pack):
             events.append("pack_inputs")

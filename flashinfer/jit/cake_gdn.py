@@ -300,6 +300,60 @@ def _power_of_two_log2(value: int) -> int:
     return value.bit_length() - 1 if value > 0 and value & (value - 1) == 0 else -1
 
 
+def _cake_gdn_prefill_grid_x(
+    total_tiles: int, sm_count: int, dvsplit: bool, bound_tokens: int
+) -> int:
+    """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
+
+    Mirrors the Cake generator program's ``_select_persistent_grid_ctas``
+    exactly; the exporter's mirror test keeps the copies identical.  ``bound_tokens`` is an
+    upper bound on the longest sequence (exact from ``cu_seqlens_cpu``, else
+    the ``max_seqlen`` hint, else the packed token count); it is part of the
+    contract signature and validated by the caller, but the rule below does
+    not depend on it, so a loose bound never changes the grid and the host
+    shim's ``0 < grid_x <= total_tiles`` holds for every input.  DV-split
+    launches and at most 128 tiles take one CTA per tile up to the SM count;
+    otherwise the residency cap G in {128, sm_count} with the smaller per-CTA
+    tile quantum ceil(total_tiles / G) wins and ties keep 128 (grid A/B:
+    1024-tile rows 9-10 % faster on 152 CTAs, 512/256-tile rows ~2 % faster
+    on 128).  The launch (``gdn_prefill.py``) and the variant
+    resolver below (the gate-stream rule) share this one copy.
+    """
+
+    if dvsplit or total_tiles <= 128:
+        return min(sm_count, total_tiles)
+    g_short = min(128, total_tiles)
+    g_sm = min(sm_count, total_tiles)
+    if -(-total_tiles // g_sm) < -(-total_tiles // g_short):
+        return g_sm
+    return g_short
+
+
+# Mirror of the Cake program rule ``gate_stream_flat_default`` (exporter ``_prefill_plan``), same constants: the
+# full-DV stateful bodies take their ``_gatestream_full`` twin (the epilogue warp streams the strided successor
+# tile's gate/beta prologue during the current tile) when a CTA owns at least two work tiles under the grid rule
+# and the mean sequence length is at most 512 tokens; single-chunk and indexed-state launches and every other key
+# stay on their base.  Host scalars only.
+_GATE_STREAM_FULL_MIN_TILES_PER_CTA = 2
+_GATE_STREAM_FULL_MAX_MEAN_SEQ_LEN = 512
+_GATE_STREAM_FULL_BASES = frozenset(
+    {
+        "flashinfer_blackwell_gdn_prefill_initial",
+        "flashinfer_blackwell_gdn_prefill_initial_bf16state",
+    }
+)
+
+
+def _cake_gdn_prefill_gate_stream_full(
+    *, num_seqs: int, total_seq_len: int, total_tiles: int, grid_x: int
+) -> bool:
+    tiles_per_cta = -(-total_tiles // grid_x)
+    return (
+        tiles_per_cta >= _GATE_STREAM_FULL_MIN_TILES_PER_CTA
+        and total_seq_len <= _GATE_STREAM_FULL_MAX_MEAN_SEQ_LEN * num_seqs
+    )
+
+
 def _prefill_schedule_attr(
     *,
     dvsplit: bool,
@@ -309,6 +363,9 @@ def _prefill_schedule_attr(
     single_chunk: bool,
     gatepipe4: bool,
     fullgrid_vhold: bool,
+    sm100a_state_inp_late: bool,
+    sm103a_role_rebalanced: bool,
+    gate_stream_full: bool,
 ) -> str:
     if gatepipe4:
         return "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4"
@@ -340,7 +397,25 @@ def _prefill_schedule_attr(
         pieces.append("f16io")
     if state_dtype == "bfloat16":
         pieces.append("bf16state")
-    return "_".join(pieces)
+    name = "_".join(pieces)
+    if sm100a_state_inp_late:
+        # The four bf16-I/O DV-split bodies keep the pre-L2 (late ``state_inp_ready``) state epilogue on sm_100a.
+        name += "_sm100a_state_inp_late"
+    if sm103a_role_rebalanced:
+        # The exact SM103a Hq16/Hv16 fp16 stateful DV-split key builds the 224/56 register role-split body.
+        name += "_sm103a_role_rebalanced"
+    if gate_stream_full and name in _GATE_STREAM_FULL_BASES:
+        # The full-DV stateful bodies with several short tiles per CTA stream the successor's gate prologue.
+        name += "_gatestream_full"
+    return name
+
+
+def _serves_arch(record: dict[str, Any], arch: CakeGDNArch) -> bool:
+    """Whether a manifest record lists ``arch`` and carries a kernel body for it."""
+
+    return arch in record["architectures"] and any(
+        arch in output["architectures"] for output in record["outputs"]
+    )
 
 
 # Rubin (sm_107a) twins of the sequential (non-CP) prefill kernel, routed per (architecture,
@@ -393,8 +468,20 @@ def cake_gdn_prefill_seq_schedule(
 
 
 def _variant_for(
-    *, domain: str, schedule_attr: str, specializations: dict[str, int | float]
+    *,
+    arch: CakeGDNArch,
+    domain: str,
+    schedule_attr: str,
+    specializations: dict[str, int | float],
 ) -> dict[str, Any]:
+    """The one frozen record ``arch`` runs for an exact (schedule, specializations) key.
+
+    A record that does not list ``arch`` (or has no body for it) is not a
+    match: an architecture the row was never exported for fails closed here
+    with ``CakeGDNUnsupportedError`` instead of surfacing as a ``ValueError``
+    from the cubin loader.
+    """
+
     source_schedule = {
         "decode": "flashinfer.cake_gdn.generated.decode",
         "prefill": "flashinfer.cake_gdn.generated.prefill",
@@ -408,13 +495,35 @@ def _variant_for(
         and record["source_schedule"] == expected_source
         and record["specializations"] == specializations
         and record["tma_abi"] == expected_tma_abi
+        and _serves_arch(record, arch)
     ]
     if len(matches) != 1:
         raise CakeGDNUnsupportedError(
             "no exact frozen Cake GDN variant for "
-            f"{expected_source} with {specializations!r}"
+            f"{expected_source} with {specializations!r} on {arch}"
         )
     return matches[0]
+
+
+def _has_variant(
+    *,
+    arch: CakeGDNArch,
+    domain: str,
+    schedule_attr: str,
+    specializations: dict[str, int | float],
+) -> bool:
+    """Whether the manifest ships exactly one record for the key on ``arch`` (see :func:`_variant_for`)."""
+
+    try:
+        _variant_for(
+            arch=arch,
+            domain=domain,
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+    except CakeGDNUnsupportedError:
+        return False
+    return True
 
 
 @functools.lru_cache(maxsize=4096)
@@ -434,9 +543,28 @@ def select_cake_gdn_prefill_variant(
     checkpoint_every_n_tokens: int,
     use_state_indices: bool,
     gates_present: bool,
-    seq_lens: tuple[int, ...] | None = None,
 ) -> CakeGDNRoute:
-    """Resolve host-visible non-CP metadata to one frozen GDN non-CP variant."""
+    """Resolve host-visible non-CP metadata to one frozen GDN non-CP variant.
+
+    Every input is host-known: the dtypes, head counts and flags come from the
+    call, ``num_seqs`` and ``total_seq_len`` from tensor shapes, and
+    ``max_seq_len`` is an *upper bound* on the longest sequence -- exact when
+    the caller knows the lengths (``cu_seqlens_cpu``), otherwise the public
+    ``max_seqlen`` hint or ``total_seq_len``.  Nothing here is read back from
+    the device, so the resolution is CUDA Graph capture safe.
+
+    ``single_chunk`` (the ``SINGLE_CHUNK_NO_STATE`` schedule) is selected only
+    when the bound is at most 64 tokens and the row carries no initial state,
+    no final state and no checkpoints.  A loose bound resolves the general
+    stateless specialization instead, which fails closed when the manifest
+    does not ship it (like any other unshipped specialization): stateless
+    callers whose packed batch exceeds 64 tokens pass ``max_seqlen`` or
+    ``cu_seqlens_cpu`` to reach the single-chunk kernel.  The SGLang TP4 BF16
+    indexed checkpoint route is admitted on structural conditions alone
+    (BF16 I/O and state, heads (4, 4, 8), interval 64, indexed initial and
+    final state, DV-split); ``cu_seqlens`` / ``checkpoint_cu_starts``
+    consistency is a caller precondition the kernel guards on the device.
+    """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
@@ -504,11 +632,6 @@ def select_cake_gdn_prefill_variant(
         and use_state_indices
         and checkpoint_every_n_tokens == 64
         and (num_q_heads, num_k_heads, num_v_heads) == (4, 4, 8)
-        and seq_lens is not None
-        and len(seq_lens) == num_seqs
-        and all(length >= 0 for length in seq_lens)
-        and sum(seq_lens) == total_seq_len
-        and max(seq_lens, default=0) == max_seq_len
         and dvsplit
     )
     if enable_checkpoints and not (
@@ -522,6 +645,9 @@ def select_cake_gdn_prefill_variant(
         raise CakeGDNUnsupportedError(
             "low-precision state requires the DV-split physical schedule"
         )
+    # Bound-based: with an exact ``max_seq_len`` this is the stock rule; a
+    # loose bound (``total_seq_len``) only fires when the whole batch fits one
+    # chunk, which is always correct (every sequence is then <= 64 tokens).
     single_chunk = (
         max_seq_len <= 64
         and not use_initial_state
@@ -554,17 +680,51 @@ def select_cake_gdn_prefill_variant(
         and state_dtype == "float32"
         and not use_state_indices
     )
-    schedule_attr = _prefill_schedule_attr(
-        dvsplit=dvsplit,
-        use_initial_state=use_initial_state,
-        io_dtype=io_dtype,
-        state_dtype=state_dtype,
-        single_chunk=single_chunk,
-        gatepipe4=gatepipe4,
-        fullgrid_vhold=fullgrid_vhold,
+    # Mirror of the Cake program rule ``state_inp_early_dvsplit_default_for_arch`` (exporter ``_prefill_plan``):
+    # on sm_100a the bf16-I/O DV-split bodies (fp32 / bf16 state) are the late-``state_inp_ready`` twins; f16 I/O
+    # (gatepipe4 / fullgrid_vhold included), low-precision state, single-chunk and indexed-state routes stay base.
+    sm100a_state_inp_late = (
+        arch == "sm_100a"
+        and dvsplit
+        and not single_chunk
+        and io_dtype == "bfloat16"
+        and state_dtype in ("float32", "bfloat16")
+        and not use_state_indices
     )
-    schedule_attr = cake_gdn_prefill_seq_schedule(
-        arch, schedule_attr, use_state_indices=use_state_indices
+    # Mirror of the Cake program rule ``_should_use_sm103a_initial_state_role_rebalance`` (exporter ``_prefill_plan``):
+    # on sm_103a the exact Hq16/Hv16 fp16-I/O fp32-state DV-split key with initial + final state (no checkpoints, no
+    # state indices, not single-chunk, not the gatepipe4 schedule) is the 224/56 register role-split twin
+    # ``..._dvsplit_initial_f16io_sm103a_role_rebalanced``; every other key and architecture stays on its base.
+    sm103a_role_rebalanced = (
+        arch == "sm_103a"
+        and dvsplit
+        and not single_chunk
+        and not gatepipe4
+        and use_initial_state
+        and store_final_state
+        and not enable_checkpoints
+        and io_dtype == "float16"
+        and state_dtype == "float32"
+        and not use_state_indices
+        and num_q_heads >= num_v_heads
+        and num_o_heads == 16
+        and num_o_heads == min_heads
+    )
+    # Mirror of the Cake program rule ``gate_stream_flat_default`` (exporter ``_prefill_plan``): the launch grid
+    # from the architecture's active-cluster count (the same host-static count that decides ``dvsplit``), then the
+    # ``_gatestream_full`` twin for the full-DV stateful bases whose CTAs own several short tiles.
+    grid_x = _cake_gdn_prefill_grid_x(
+        total_tiles, _ARCH_ACTIVE_CLUSTERS[arch], dvsplit, max_seq_len
+    )
+    gate_stream_full = (
+        not single_chunk
+        and not use_state_indices
+        and _cake_gdn_prefill_gate_stream_full(
+            num_seqs=num_seqs,
+            total_seq_len=total_seq_len,
+            total_tiles=total_tiles,
+            grid_x=grid_x,
+        )
     )
     specializations: dict[str, int | float] = {
         "ENABLE_CHECKPOINTS": int(enable_checkpoints),
@@ -577,7 +737,48 @@ def select_cake_gdn_prefill_variant(
         "USE_INITIAL_STATE": int(use_initial_state),
         "USE_STATE_INDICES": int(use_state_indices),
     }
+
+    def _schedule_attr(*, gate_stream_full: bool) -> str:
+        return _prefill_schedule_attr(
+            dvsplit=dvsplit,
+            use_initial_state=use_initial_state,
+            io_dtype=io_dtype,
+            state_dtype=state_dtype,
+            single_chunk=single_chunk,
+            gatepipe4=gatepipe4,
+            fullgrid_vhold=fullgrid_vhold,
+            sm100a_state_inp_late=sm100a_state_inp_late,
+            sm103a_role_rebalanced=sm103a_role_rebalanced,
+            gate_stream_full=gate_stream_full,
+        )
+
+    schedule_attr = _schedule_attr(gate_stream_full=gate_stream_full)
+    if (
+        gate_stream_full
+        and schedule_attr.endswith("_gatestream_full")
+        and not _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+    ):
+        # The gate-stream twin is a performance specialization of the base body: the exporter
+        # ships it for the head geometries its representative rows reach (the Hq16/Hv32,
+        # Hq8/Hv16 and Hq4/Hv8 families).  A key whose twin is not in the manifest runs its
+        # base record, exactly as the route did before the twin existed; only a missing base
+        # fails closed below.
+        gate_stream_full = False
+        schedule_attr = _schedule_attr(gate_stream_full=False)
+    # The sm_107a sequential twin of the resolved schedule (`CAKE_GDN_PREFILL_SEQ_ARCH_BODIES`):
+    # a record of its own, selected after the gate-stream fallback so the twin shadows exactly
+    # the schedule the base rule settled on (the routed keys are DV-split; the gate-stream
+    # twins are full-DV, so the two rules never meet).
+    schedule_attr = cake_gdn_prefill_seq_schedule(
+        arch, schedule_attr, use_state_indices=use_state_indices
+    )
     record = _variant_for(
+        arch=arch,
         domain="prefill",
         schedule_attr=schedule_attr,
         specializations=specializations,
@@ -591,6 +792,84 @@ def select_cake_gdn_prefill_variant(
     return CakeGDNRoute(
         f"{route}.{'dvsplit' if dvsplit else 'full_dv'}", record["name"]
     )
+
+
+def cake_gdn_prefill_geometries(
+    *,
+    arch: CakeGDNArch,
+    io_dtype: str,
+    state_dtype: str,
+    use_initial_state: bool,
+    store_final_state: bool,
+    dvsplit: bool,
+) -> frozenset[tuple[int, int, int]]:
+    """Frozen ``(HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2)`` triples of one prefill contract on ``arch``.
+
+    The contract is the plain non-CP prefill route of one physical schedule
+    (DV-split or full-DV) for the given I/O and state dtypes with or without
+    an initial and a final state: no checkpoints, packed (non-indexed) state,
+    gates taken at runtime.  The triples are read from the manifest records
+    the resolver can select on ``arch``; nothing is tabulated here.  A head
+    pair maps to ``HEAD_GROUP_LOG2 = log2(max(Hq, Hv) / min(Hq, Hv))``,
+    ``IS_GQA = int(Hq >= Hv)`` and ``NUM_O_HEADS_LOG2 = log2(max(Hq, Hv))``;
+    ``-1`` marks a head count that is not a power of two (a dynamic-head body
+    takes it at runtime).
+    """
+
+    if arch not in _ARCH_ACTIVE_CLUSTERS:
+        raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
+    if io_dtype not in {"float16", "bfloat16"}:
+        raise CakeGDNUnsupportedError(f"unsupported I/O dtype {io_dtype}")
+    if state_dtype not in {
+        "float32",
+        "bfloat16",
+        "float16",
+        "float8_e4m3fn",
+        "float8_e5m2",
+    }:
+        raise CakeGDNUnsupportedError(f"unsupported state dtype {state_dtype}")
+    # The base template of the contract: every performance twin the resolver
+    # may substitute on ``arch`` (sm_100a late state input, sm_103a role
+    # rebalance, gate-stream full) is exported for exactly the geometry
+    # triples of its base record, so the base records enumerate the contract.
+    schedule_attr = _prefill_schedule_attr(
+        dvsplit=dvsplit,
+        use_initial_state=use_initial_state,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        single_chunk=False,
+        gatepipe4=False,
+        fullgrid_vhold=False,
+        sm100a_state_inp_late=False,
+        sm103a_role_rebalanced=False,
+        gate_stream_full=False,
+    )
+    expected_source = f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
+    fixed: dict[str, int] = {
+        "ENABLE_CHECKPOINTS": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": int(store_final_state),
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": int(use_initial_state),
+        "USE_STATE_INDICES": 0,
+    }
+    geometry_keys = ("HEAD_GROUP_LOG2", "IS_GQA", "NUM_O_HEADS_LOG2")
+    geometries: set[tuple[int, int, int]] = set()
+    for record in _manifest()["variants"]:
+        specializations = record["specializations"]
+        if (
+            record["domain"] != "prefill"
+            or record["source_schedule"] != expected_source
+            or record["tma_abi"] != "grid_constant"
+            or not _serves_arch(record, arch)
+            or set(specializations) != set(fixed) | set(geometry_keys)
+            or any(specializations[key] != value for key, value in fixed.items())
+        ):
+            continue
+        geometries.add(
+            tuple(int(specializations[key]) for key in geometry_keys)  # type: ignore[arg-type]
+        )
+    return frozenset(geometries)
 
 
 # BF16-state T=1 decode: every per-rank (H, HV) geometry is admitted at any
@@ -943,6 +1222,7 @@ def select_cake_gdn_decode_variant(
             body, tile_v = cake_gdn_bf16_t1_route(batch_size, num_v_heads, arch)
             if body == "wide":
                 record = _variant_for(
+                    arch=arch,
                     domain="decode",
                     schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
                     specializations={
@@ -963,6 +1243,7 @@ def select_cake_gdn_decode_variant(
                     record["name"],
                 )
             record = _variant_for(
+                arch=arch,
                 domain="decode",
                 schedule_attr=f"gdn_decode_pretranspose_t1_bf16state_{body}",
                 specializations={
@@ -1036,6 +1317,7 @@ def select_cake_gdn_decode_variant(
             # tile-v16 kernel with T_STEPS specialized (the `tile16_vpre` body on
             # sm_107a), B>=5 falls through to wide32.
             record = _variant_for(
+                arch=arch,
                 domain="decode",
                 schedule_attr=cake_gdn_bf16_verify_tile16_schedule(arch),
                 specializations={
@@ -1064,6 +1346,7 @@ def select_cake_gdn_decode_variant(
             }
             route = "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
             record = _variant_for(
+                arch=arch,
                 domain="decode",
                 schedule_attr=schedule_attr,
                 specializations=specializations,
@@ -1074,6 +1357,7 @@ def select_cake_gdn_decode_variant(
         tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         update_state = not cache_intermediate_states
         record = _variant_for(
+            arch=arch,
             domain="decode",
             schedule_attr=cake_gdn_bf16_wide_schedule(arch, seq_len),
             specializations={
@@ -1161,6 +1445,7 @@ def select_cake_gdn_decode_variant(
                 }
             )
         record = _variant_for(
+            arch=arch,
             domain="decode",
             schedule_attr=schedule_attr,
             specializations=mtp_specializations,
@@ -1187,6 +1472,7 @@ def select_cake_gdn_decode_variant(
     else:
         raise CakeGDNUnsupportedError(f"unsupported decode state layout {layout}")
     record = _variant_for(
+        arch=arch,
         domain="decode",
         schedule_attr=schedule_attr,
         specializations={"H": num_q_heads, "HV": num_v_heads, "SCALE": scale},
@@ -1212,6 +1498,7 @@ __all__ = [
     "CakeGDNRoute",
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
+    "cake_gdn_prefill_geometries",
     "cake_gdn_prefill_seq_schedule",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
