@@ -852,6 +852,43 @@ def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
     )
 
 
+@pytest.mark.parametrize("hidden_size", [768])
+def test_mxfp4_mxfp8_prims_ts_unpadded_scale_row(hidden_size, cache_permute_indices):
+    """Compact MXFP8 activation scales whose row (hidden_size // 32) is not a
+    multiple of 16 bytes go through the flat Prims-TS op correctly."""
+    _skip_prims_ts_on_sm107()
+    intermediate_size = 512
+    run_moe_test(
+        num_tokens=32,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+        routing_config={
+            "num_experts": 8,
+            "top_k": 2,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [intermediate_size],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
 def test_mxfp4_mxfp8_kimi_k3_situ_reference(moe_gemm_backend, cache_permute_indices):
     """Kimi K3 SiTU matches the dequantized reference on both backends."""
     num_tokens = 32
