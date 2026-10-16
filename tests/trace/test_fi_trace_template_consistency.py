@@ -444,6 +444,26 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
     for p, parts in tuple_parts.items():
         kwargs[p] = tuple(parts)
 
+    if template.name_prefix and template.name_prefix.startswith("ulysses_scatter_qkv_"):
+        # The real workspace is collectively prepared. Schema-only tests read
+        # its metadata without allocating GPU storage or initializing a group.
+        head_dim = template.axes["head_dim"].value
+        if head_dim is None:  # Inferred Const axes need a valid sample input.
+            head_dim = 64
+        q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+        kwargs.update(
+            q=q,
+            k=q,
+            v=q,
+            workspace=SimpleNamespace(world_size=8, used_sequence=513),
+        )
+
+    if template.name_prefix == "ulysses_exchange_chunks":
+        kwargs.update(
+            self=SimpleNamespace(world_size=1),
+            x=torch.empty(1, 1, 1, axis_size, dtype=torch.uint8),
+        )
+
     return kwargs
 
 
@@ -1638,6 +1658,31 @@ _E2E_IDS = [label for _, _, label in _E2E_PAIRS]
 def test_fi_trace_complete(func, template, label):
     """fi_trace with auto-generated CPU tensors must return a complete definition."""
     assert_fi_trace_complete(func, template, label=label)
+
+
+@pytest.mark.parametrize("layout", ["sage2_sm90", "sage2_sm89_sm120"])
+@pytest.mark.parametrize(
+    "declared_head_dim,expected_head_dim", [(None, 64), (64, 64), (128, 128)]
+)
+def test_ulysses_qkv_sample_head_dim(layout, declared_head_dim, expected_head_dim):
+    from copy import copy
+
+    from flashinfer.trace.templates.comm import ulysses_scatter_qkv_trace_dispatch
+
+    template = copy(
+        ulysses_scatter_qkv_trace_dispatch(workspace=SimpleNamespace(layout=layout))
+    )
+    template.axes = {
+        **template.axes,
+        "head_dim": Const(value=declared_head_dim, abbrev="d"),
+    }
+    kwargs = _make_sample_kwargs(template)
+    for name in ("q", "k", "v"):
+        assert kwargs[name].shape == (1, 65, 8, expected_head_dim)
+    definition = template.build_fi_trace_fn(
+        "flashinfer.comm.ulysses.UlyssesCommunicator.scatter_qkv"
+    )(**kwargs)
+    assert definition["axes"]["head_dim"]["value"] == expected_head_dim
 
 
 # ---------------------------------------------------------------------------
