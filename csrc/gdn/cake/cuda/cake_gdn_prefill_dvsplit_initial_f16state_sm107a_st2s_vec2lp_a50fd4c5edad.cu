@@ -94,14 +94,14 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_BETA_STRIDE 256
 #define SMEM_TOTAL 226048
 #define THREADS 384
-#define NUM_O_HEADS_LOG2 5
-#define HEAD_GROUP_LOG2 1
+#define NUM_O_HEADS_LOG2 0
+#define HEAD_GROUP_LOG2 0
 #define SINGLE_CHUNK_NO_STATE 0
 #define UNIT_GATES 0
 #define USE_INITIAL_STATE 1
 #define STORE_FINAL_STATE 1
 #define ENABLE_CHECKPOINTS 0
-#define IS_GQA 0
+#define IS_GQA 1
 #define USE_STATE_INDICES 0
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -284,7 +284,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2lp(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __half* __restrict__ initial_state, __half* __restrict__ output_state, __half* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int num_q_heads, int num_v_heads, int total_tiles)
+kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_st2s_vec2lp(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __half* __restrict__ initial_state, __half* __restrict__ output_state, __half* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int num_q_heads, int num_v_heads, int total_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -3120,31 +3120,51 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_sm107a_l7b_vec2
                     long long state_base_idx_top_cg1 = output_state_head_base_cg1 + (long long)(value_split_idx_1 * 64 + state_row_top_cg1) * 128;
                     long long state_base_idx_bot_cg1 = output_state_head_base_cg1 + (long long)(value_split_idx_1 * 64 + state_row_bot_cg1) * 128;
                     if (state_warp_id_in_role_cg1 < 4) {
-                        #pragma unroll
-                        for (int state_col_half_cg1 = 0; state_col_half_cg1 < 2; state_col_half_cg1++) {
-                            int final_state_addr_cg1 = taddr + (unsigned int)state_tmem_row_base_cg1 + (unsigned int)(state_col_half_cg1 * 64);
-                            float _tmem_load_16[32];
-                            asm volatile(
-                                "tcgen05.ld.sync.aligned.16x256b.x8.b32"
-                                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[31]))
-                                : "r"(final_state_addr_cg1));
-                            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                        int st2_lane_quad = lane & 3;
+                        int st2_row_xor = lane / 4;
+                        int st2_row_local_top = (state_warp_id_in_role_cg1 & 1) * 16 + lane / 4;
+                        int st2_stage_base = smem_v_mma_addr + (unsigned int)((state_warp_id_in_role_cg1 >> 1) * 16384) + 8192;
+                        int st2_tid = state_warp_id_in_role_cg1 * 32 + lane;
+                        {
+                            asm volatile("barrier.sync 14, 128;" ::: "memory");
                             #pragma unroll
-                            for (int state_col_group_cg1 = 0; state_col_group_cg1 < 8; state_col_group_cg1++) {
-                                int state_col_pair_cg1 = state_col_half_cg1 * 64 + state_col_group_cg1 * 8 + (lane & 3) * 2;
-                                const int state_reg_base_cg1 = state_col_group_cg1 * 4;
-                                {
+                            for (int st2_half = 0; st2_half < 2; st2_half++) {
+                                float _tmem_load_16[32];
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.16x256b.x8.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_16[31]))
+                                    : "r"(taddr + (unsigned int)state_tmem_row_base_cg1 + (unsigned int)(st2_half * 64)));
+                                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                                uint32_t _tmem_load_16_f16[16];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 16; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_16[_lp*2 + 0], _tmem_load_16[_lp*2+1 + 0]));
+                                    _tmem_load_16_f16[_lp] = *(uint32_t*)&_h2;
+                                }
+                                #pragma unroll
+                                for (int st2_g = 0; st2_g < 8; st2_g++) {
+                                    int st2_phys = ((st2_row_xor ^ st2_half * 8 + st2_g) << 4) + st2_lane_quad * 4;
                                     {
-                                        __half2 _pk = __floats2half2_rn(_tmem_load_16[state_reg_base_cg1 + 0], _tmem_load_16[state_reg_base_cg1 + 1]);
-                                        ((__half*)(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1)))[0 + 0] = __low2half(_pk);
-                                        ((__half*)(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1)))[0 + 1] = __high2half(_pk);
+                                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(st2_stage_base + st2_row_local_top * 256 + st2_phys), "r"((_tmem_load_16_f16[st2_g * 2])));
+                                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(st2_stage_base + (st2_row_local_top + 8) * 256 + st2_phys), "r"((_tmem_load_16_f16[st2_g * 2 + 1])));
                                     }
-                                    {
-                                        __half2 _pk = __floats2half2_rn(_tmem_load_16[state_reg_base_cg1 + 2 + 0], _tmem_load_16[state_reg_base_cg1 + 2 + 1]);
-                                        ((__half*)(output_state + (state_base_idx_bot_cg1 + (long long)state_col_pair_cg1)))[0 + 0] = __low2half(_pk);
-                                        ((__half*)(output_state + (state_base_idx_bot_cg1 + (long long)state_col_pair_cg1)))[0 + 1] = __high2half(_pk);
-                                    }
+                                }
+                            }
+                            asm volatile("barrier.sync 14, 128;" ::: "memory");
+                            {
+                                #pragma unroll
+                                for (int st2_i = 0; st2_i < 8; st2_i++) {
+                                    int st2_cid = st2_tid + st2_i * 128;
+                                    int st2_row = st2_cid >> 4;
+                                    int st2_j = st2_cid & 15;
+                                    int st2_src = smem_v_mma_addr + (unsigned int)((st2_row >> 5) * 16384) + 8192 + (unsigned int)((st2_row & 31) * 256) + (unsigned int)((st2_row & 7 ^ st2_j) << 4);
+                                    unsigned int st2_words_out[4];
+                                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&st2_words_out[0])), "=r"(*reinterpret_cast<uint32_t*>(&st2_words_out[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&st2_words_out[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&st2_words_out[(0) + 3]))
+                                        : "r"(st2_src));
+                                    long long st2_dst_idx = output_state_head_base_cg1 + (long long)(value_split_idx_1 * 64 + st2_row) * 128 + (long long)(st2_j * 8);
+                                    reinterpret_cast<int4*>(output_state + st2_dst_idx)[0] = reinterpret_cast<int4*>(st2_words_out)[0];
                                 }
                             }
                         }
