@@ -216,11 +216,13 @@ def parse_gdn_args(line, parser):
         required=False,
         nargs="+",
         default=["flashinfer"],
-        choices=["flashinfer", "triton", "fla", "rubin"],
+        choices=["flashinfer", "triton", "fla", "rubin", "rubin_ugpu"],
         help="Kernel backends to benchmark. 'triton' is available for "
         "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
         "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
-        "state. On decode, 'flashinfer' is the generic FlashInfer kernel.",
+        "state; 'rubin_ugpu' is 'rubin' with uGPU localization (each die's half "
+        "of the batch and of the state pool on that die). On decode, "
+        "'flashinfer' is the generic FlashInfer kernel.",
     )
 
     args = parser.parse_args(line)
@@ -293,14 +295,18 @@ def parse_gdn_args(line, parser):
             raise ValueError(
                 "The fla backend is only available for chunk_gated_delta_rule"
             )
-        if "rubin" in args.backends and (is_mtp or args.state_dtype != "bfloat16"):
+        if any(x in args.backends for x in ("rubin", "rubin_ugpu")) and (
+            is_mtp or args.state_dtype != "bfloat16"
+        ):
             raise ValueError(
-                "The rubin backend is only available for gated_delta_rule_decode "
-                "with --state_dtype bfloat16"
+                "The rubin / rubin_ugpu backends are only available for "
+                "gated_delta_rule_decode with --state_dtype bfloat16"
             )
+        if "rubin_ugpu" in args.backends and args.pool_mode != "single":
+            raise ValueError("The rubin_ugpu backend supports --pool_mode single")
 
     if is_prefill:
-        if "rubin" in args.backends:
+        if any(x in args.backends for x in ("rubin", "rubin_ugpu")):
             raise ValueError(
                 "The rubin backend is only available for gated_delta_rule_decode"
             )
@@ -565,6 +571,18 @@ def _testGdnDecodeLike(args, seq_len):
     state_writeback = True if (not is_mtp or use_bf16_state) else args.update_state
     disable_state_update = not state_writeback
 
+    # uGPU localization: a copy of the pool whose slot halves live in the two dies'
+    # memory; batch rows below the split read slots on die 0.
+    ugpu_pool, ugpu_row_split = None, None
+    if "rubin_ugpu" in backends:
+        from flashinfer.green_ctx import empty_by_locality_domain
+
+        ugpu_pool, row_starts = empty_by_locality_domain(
+            tuple(state_pool.shape), state_pool.dtype, device
+        )
+        ugpu_pool.copy_(state_pool)
+        ugpu_row_split = row_starts[1]
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] Mode: {'MTP' if is_mtp else 'decode'} (T={T})")
         print(f"[VVERBOSE] {q.shape = }, {q.dtype = }")
@@ -650,6 +668,27 @@ def _testGdnDecodeLike(args, seq_len):
                 output,
                 use_qk_l2norm,
                 backend="flashinfer",
+            )[0]
+        elif backend == "rubin_ugpu":
+            # Rubin kernel with uGPU localization; refcheck passes a fresh copy of
+            # the pool, timing passes state_pool itself (state then evolves in place)
+            if state is not state_pool:
+                ugpu_pool.copy_(state)
+            return gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                None,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output,
+                use_qk_l2norm,
+                initial_state=ugpu_pool,
+                initial_state_indices=initial_state_indices,
+                ugpu_row_split=ugpu_row_split,
             )[0]
         elif backend == "rubin":
             # Rubin-tuned T=1 bf16-state kernel (SM107), via the public API

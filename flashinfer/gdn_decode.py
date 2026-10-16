@@ -28,6 +28,7 @@ APIs:
 - gated_delta_rule_replayssm_commit: Commit the accepted ReplaySSM prefix
 """
 
+import functools
 import os
 from typing import Literal, Optional, Tuple
 
@@ -89,6 +90,51 @@ try:
 except (ImportError, RuntimeError):
     _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE = False
     _gated_delta_rule_t1_rubin = None
+
+
+@functools.cache
+def _ugpu_streams(device_index: int):
+    """One green-context stream per locality domain (cached: create it before CUDA graph capture)."""
+    from .green_ctx import split_device_green_ctx_by_locality_domain
+
+    streams, resources = split_device_green_ctx_by_locality_domain(
+        torch.device("cuda", device_index)
+    )
+    return streams, [int(r.sm.smCount) for r in resources]
+
+
+def _run_rubin_t1_ugpu(row_split: int, output: torch.Tensor, **kw) -> torch.Tensor:
+    """uGPU localization: rows [0, row_split) on locality domain 0's SMs, the rest on domain 1's,
+    as two launches of the Rubin T=1 kernel forked from and joined back to the current stream."""
+    q = kw["q"]
+    B = q.shape[0]
+    streams, sm_counts = _ugpu_streams(q.device.index)
+    main = torch.cuda.current_stream(q.device)
+    fork = torch.cuda.Event()
+    fork.record(main)
+    joins = []
+    per_row = ("q", "k", "v", "a", "b", "initial_state_indices", "output_state_indices")
+    for domain, (lo, hi) in enumerate(((0, row_split), (row_split, B))):
+        if hi <= lo:
+            continue
+        part = {
+            n: (t[lo:hi] if n in per_row and t is not None else t)
+            for n, t in kw.items()
+        }
+        stream = streams[domain]
+        stream.wait_event(fork)
+        with torch.cuda.stream(stream):
+            # L2 prefetch distance for this domain's share of the SMs
+            _gated_delta_rule_t1_rubin(
+                output=output[lo:hi], pf_dist=sm_counts[domain] * 25 // 3, **part
+            )
+        done = torch.cuda.Event()
+        done.record(stream)
+        joins.append(done)
+    for done in joins:
+        main.wait_event(done)
+    return output
+
 
 # Pretranspose decode kernel (V-major state, T=1)
 try:
@@ -529,6 +575,7 @@ def gated_delta_rule_decode_pretranspose(
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
     backend: Literal["auto", "flashinfer", "cake_gdn", "rubin"] = "auto",
+    ugpu_row_split: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -601,6 +648,19 @@ def gated_delta_rule_decode_pretranspose(
         closed when the contract is unsupported. ``rubin`` forces the
         Rubin-tuned T=1 kernel and raises ``ValueError`` on other GPUs or
         outside T=1, bfloat16 state and K=V=128.
+    ugpu_row_split : int, optional
+        uGPU localization on Rubin (compute capability 10.7, two locality
+        domains): batch rows ``[0, ugpu_row_split)`` run on locality domain 0's
+        SMs and rows ``[ugpu_row_split, B)`` on domain 1's, as two launches of
+        the Rubin-tuned T=1 kernel on per-domain green-context streams (forked
+        from and joined back to the current stream; CUDA-graph capturable once
+        the streams exist, i.e. after one eager call). For the full benefit the
+        state slots of each row must live in that domain's memory, e.g. a pool
+        from :func:`flashinfer.green_ctx.empty_by_locality_domain` with
+        ``ugpu_row_split`` set to the row whose slots start domain 1; then no
+        state byte crosses the die-to-die link. Results do not depend on the
+        placement. Requires T=1, bfloat16 state, K=V=128 and ``backend`` in
+        ``{"auto", "rubin"}``.
 
         **Padding / inactive sequences**: set the index to ``-1`` for any
         batch entry that should be treated as padding.  The two backends
@@ -690,6 +750,16 @@ def gated_delta_rule_decode_pretranspose(
     state_dtype = initial_state.dtype if use_pool else state.dtype
     if backend not in ("auto", "flashinfer", "cake_gdn", "rubin"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if ugpu_row_split is not None:
+        if backend not in ("auto", "rubin"):
+            raise ValueError(
+                f'ugpu_row_split needs backend "auto" or "rubin", got {backend!r}'
+            )
+        if not 0 <= ugpu_row_split <= B:
+            raise ValueError(
+                f"ugpu_row_split must be in [0, {B}], got {ugpu_row_split}"
+            )
+        backend = "rubin"
     if backend == "rubin":
         if not _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE:
             raise RuntimeError("the Rubin GDN decode kernel failed to import")
@@ -781,7 +851,32 @@ def gated_delta_rule_decode_pretranspose(
             and _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE
             and get_compute_capability(q.device) == (10, 7)
         )
-        if use_rubin:
+        if ugpu_row_split is not None:
+            out = _run_rubin_t1_ugpu(
+                ugpu_row_split,
+                forward_output
+                if forward_output is not None
+                else torch.empty(B, 1, HV, V, device=q.device, dtype=torch.bfloat16),
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=bf16_pool,
+                initial_state_indices=bf16_indices,
+                output_state_indices=(
+                    None
+                    if output_state_indices is initial_state_indices
+                    else output_state_indices
+                ),
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale_val,
+            )
+        elif use_rubin:
             out = _gated_delta_rule_t1_rubin(
                 A_log=A_log,
                 a=a,

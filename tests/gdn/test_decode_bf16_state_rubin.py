@@ -33,6 +33,7 @@ import flashinfer.gdn_decode as gdn_decode
 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule as generic
 from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import gated_delta_rule_t1_rubin
+from flashinfer.green_ctx import empty_by_locality_domain
 
 pytestmark = pytest.mark.arch_rubin
 
@@ -93,7 +94,7 @@ def _call(fn, inp, state, idx, out_idx, l2norm, **extra):
     return out
 
 
-def _api(inp, state, idx, out_idx, backend):
+def _api(inp, state, idx, out_idx, backend, **extra):
     return gated_delta_rule_decode_pretranspose(
         q=inp["q"],
         k=inp["k"],
@@ -109,6 +110,7 @@ def _api(inp, state, idx, out_idx, backend):
         initial_state_indices=idx,
         output_state_indices=out_idx,
         backend=backend,
+        **extra,
     )[0]
 
 
@@ -323,4 +325,84 @@ def test_rubin_api_int64_indices_fp16_inputs(pool_mode):
     o = _api(inp, st, idx64, out_idx64, "rubin")
     torch.cuda.synchronize()
     assert torch.equal(o, o_ref)
+    assert torch.equal(st, st_ref)
+
+
+def _ugpu_pool(state):
+    pool, row_starts = empty_by_locality_domain(
+        tuple(state.shape), state.dtype, state.device
+    )
+    pool.copy_(state)
+    return pool, row_starts[1]
+
+
+@pytest.mark.parametrize("B,HV", [(8, 64), (64, 32), (512, 64)])
+@pytest.mark.parametrize("pool_mode", ["single", "split"])
+def test_rubin_ugpu_matches_whole_gpu(B, HV, pool_mode):
+    """uGPU localization (per-die launches, pool split across the dies' memory): the same
+    bits as the one-launch Rubin kernel."""
+    pool, idx, out_idx = _pool(B, pool_mode)
+    inp = _inputs(B, 16, 16, HV, pool, seed=B + HV + 3)
+    st_ref = inp["state"].clone()
+    o_ref = _api(inp, st_ref, idx, out_idx, "rubin")
+    st, slot_split = _ugpu_pool(inp["state"])
+    o = _api(inp, st, idx, out_idx, "auto", ugpu_row_split=min(slot_split, B))
+    torch.cuda.synchronize()
+    assert torch.equal(o, o_ref)
+    assert torch.equal(st, st_ref)
+
+
+@pytest.mark.parametrize("row_split", [0, 3, 64])
+def test_rubin_ugpu_any_row_split(row_split):
+    """Correctness does not depend on the split or on where the pool lives."""
+    B, HV = 64, 64
+    inp = _inputs(B, 16, 16, HV, B, seed=row_split + 1)
+    idx = torch.arange(B, dtype=torch.int32, device="cuda")
+    st_ref = inp["state"].clone()
+    st = inp["state"].clone()
+    o_ref = _api(inp, st_ref, idx, None, "rubin")
+    o = _api(inp, st, idx, None, "rubin", ugpu_row_split=row_split)
+    torch.cuda.synchronize()
+    assert torch.equal(o, o_ref)
+    assert torch.equal(st, st_ref)
+
+
+def test_rubin_ugpu_cuda_graph():
+    """The per-die fork / join is captured into a CUDA graph and replays correctly."""
+    B, HV = 64, 64
+    inp = _inputs(B, 16, 16, HV, B, seed=5)
+    idx = torch.arange(B, dtype=torch.int32, device="cuda")
+    st_ref = inp["state"].clone()
+    for _ in range(3):
+        o_ref = _api(inp, st_ref, idx, None, "rubin")
+    st, slot_split = _ugpu_pool(inp["state"])
+    out = torch.empty(B, 1, HV, D, device="cuda", dtype=torch.bfloat16)
+
+    def step():
+        gated_delta_rule_decode_pretranspose(
+            q=inp["q"],
+            k=inp["k"],
+            v=inp["v"],
+            state=None,
+            A_log=inp["A_log"],
+            a=inp["a"],
+            dt_bias=inp["dt_bias"],
+            b=inp["b"],
+            scale=1.0 / math.sqrt(D),
+            output=out,
+            use_qk_l2norm=True,
+            initial_state=st,
+            initial_state_indices=idx,
+            ugpu_row_split=slot_split,
+        )
+
+    step()  # eager call: creates the per-die green contexts outside capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, o_ref)
     assert torch.equal(st, st_ref)

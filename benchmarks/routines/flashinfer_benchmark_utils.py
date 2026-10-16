@@ -1200,7 +1200,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["flashinfer", "triton"],
         "10.0": ["flashinfer", "triton"],
         "10.3": ["flashinfer", "triton"],
-        "10.7": ["flashinfer", "triton", "rubin"],
+        "10.7": ["flashinfer", "triton", "rubin", "rubin_ugpu"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],

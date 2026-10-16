@@ -206,3 +206,41 @@ def test_split_device_green_ctx_by_sm_count_alignment(
                 f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}"
             )
         raise
+
+
+def _need_locality_domains(dev):
+    if green_ctx.get_locality_domain_count(dev) < 2:
+        pytest.skip("needs a GPU with at least two locality domains (uGPUs)")
+
+
+def test_split_device_green_ctx_by_locality_domain():
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    n = green_ctx.get_locality_domain_count(dev)
+    total = green_ctx.get_device_resource(green_ctx.get_cudevice(dev)).sm.smCount
+    streams, resources = green_ctx.split_device_green_ctx_by_locality_domain(dev)
+    assert len(streams) == len(resources) == n
+    assert all(r.sm.smCount == total // n for r in resources)
+    x = torch.randn(1 << 20, device=dev)
+    for s in streams:
+        with torch.cuda.stream(s):
+            y = x * 2
+        s.synchronize()
+        torch.testing.assert_close(y, x * 2)
+
+
+@pytest.mark.parametrize("rows", [1, 37, 256])
+def test_empty_by_locality_domain(rows):
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    n = green_ctx.get_locality_domain_count(dev)
+    t, row_starts = green_ctx.empty_by_locality_domain(
+        (rows, 32, 128, 128), torch.bfloat16, dev
+    )
+    assert t.shape == (rows, 32, 128, 128) and t.is_contiguous()
+    assert len(row_starts) == n + 1 and row_starts[0] == 0 and row_starts[-1] == rows
+    assert row_starts == sorted(row_starts)
+    ref = torch.randn(rows, 32, 128, 128, device=dev).to(torch.bfloat16)
+    t.copy_(ref)
+    assert torch.equal(t, ref)
+    del t
