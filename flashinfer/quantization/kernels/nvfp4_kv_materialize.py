@@ -16,16 +16,19 @@
 
 This is the fallback used when an FP8 attention kernel exists for a shape but
 no kernel consumes NVFP4 K/V directly (for example trtllm-gen context attention
-at head_dim 512). The kernel gathers the pages referenced by a block table and
-writes a compact FP8 K/V cache plus a block table that indexes it.
+at head_dim 512). One kernel gathers the pages referenced by a block table,
+writes them to an FP8 K/V cache, and writes the block table that indexes it.
 
 Only the per-block E4M3 scale is applied (``E2M1 * E4M3 -> E4M3``, the same
 rounding the fused PrimTS decode path performs). The tensor-level K/V scales
 stay with the caller, who passes them to the FP8 attention kernel exactly as
 for a native NVFP4 kernel.
 
-All metadata is computed on the device: there is no host synchronization, and
-the launch shape depends only on ``batch_size`` and ``max_kv_len``.
+Request ``b``'s page ``j`` lands in output page ``page_indptr[b] + j + 1``.
+Callers that know each request's page count on the host pass that prefix sum
+so the FP8 copy holds only active pages; otherwise ``page_indptr[b]`` is
+``b * max_pages``. There is no host synchronization, and the launch shape
+depends only on ``batch_size`` and ``max_kv_len``.
 """
 
 import functools
@@ -48,12 +51,9 @@ from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..quantization_cute_dsl_utils import NVFP4_SF_VEC_SIZE, WARP_SIZE
 
 
-# Memory-bound grid-stride loop with one scale block per thread, so the block
-# size itself is free; throughput tracks resident threads per SM. On B200,
-# filling the SM (2048 threads) was ~15% faster than 1024 threads for large
-# caches, independent of the warps-per-block split. Size the grid like
-# csrc/nv_internal/cpp/kernels/quantization.cu (2048 / block threads).
-_WARPS_PER_BLOCK = 8
+# Memory-bound: each CTA converts one page at a time, so throughput tracks
+# resident threads per SM and larger CTAs loop fewer times per page.
+_WARPS_PER_BLOCK = 32
 _THREADS_PER_BLOCK = _WARPS_PER_BLOCK * WARP_SIZE
 _MAX_THREADS_PER_SM = 2048
 _BLOCKS_PER_SM = _MAX_THREADS_PER_SM // _THREADS_PER_BLOCK
@@ -129,11 +129,14 @@ def _dequantize_block(packed_0: Uint32, packed_1: Uint32, sf: Int32):
 
 class NVFP4KVMaterializeKernel:
     """Gather NVFP4 K/V pages and write them as FP8 in the trtllm-gen layout.
-
-    One thread owns one 16-element scale block of K and the matching block of
-    V. Compact page ``i`` is written to output page ``i + 1``; output page 0 is
-    a zero page that padded block-table entries point to. Compact pages at or
-    beyond ``num_active_pages[0]`` are skipped.
+    Each CTA processes one output page at a time (grid-stride over pages); its
+    threads walk the page's 16-element scale blocks of K and V. Page 0 is
+    zeroed for padded block-table entries. Output page ``p >= 1`` belongs to
+    the request ``b`` with ``page_indptr[b] <= p - 1 < page_indptr[b + 1]``
+    (one binary search per page), column ``j = p - 1 - page_indptr[b]``.
+    Pages past the request's length are skipped, so the work tracks the
+    reserved pages. Thread 0 writes the block-table entry of each active page;
+    the host zero-fills the table beforehand.
     """
 
     def __init__(self, head_dim: int):
@@ -152,11 +155,13 @@ class NVFP4KVMaterializeKernel:
         mVData: cute.Tensor,
         mKScales: cute.Tensor,
         mVScales: cute.Tensor,
-        mKPageIds: cute.Tensor,
-        mVPageIds: cute.Tensor,
-        mNumActivePages: cute.Tensor,
+        mKTables: cute.Tensor,
+        mVTables: cute.Tensor,
+        mSeqLens: cute.Tensor,
+        mPageIndptr: cute.Tensor,
         mOutput: cute.Tensor,
-        total_sf_blocks: Int32,
+        mBlockTables: cute.Tensor,
+        num_out_pages: Int32,
         num_blocks: Int32,
         stream,
     ):
@@ -165,11 +170,13 @@ class NVFP4KVMaterializeKernel:
             mVData,
             mKScales,
             mVScales,
-            mKPageIds,
-            mVPageIds,
-            mNumActivePages,
+            mKTables,
+            mVTables,
+            mSeqLens,
+            mPageIndptr,
             mOutput,
-            total_sf_blocks,
+            mBlockTables,
+            num_out_pages,
         ).launch(
             grid=[num_blocks, 1, 1],
             block=[_THREADS_PER_BLOCK, 1, 1],
@@ -185,11 +192,13 @@ class NVFP4KVMaterializeKernel:
         mVData: cute.Tensor,
         mKScales: cute.Tensor,
         mVScales: cute.Tensor,
-        mKPageIds: cute.Tensor,
-        mVPageIds: cute.Tensor,
-        mNumActivePages: cute.Tensor,
+        mKTables: cute.Tensor,
+        mVTables: cute.Tensor,
+        mSeqLens: cute.Tensor,
+        mPageIndptr: cute.Tensor,
         mOutput: cute.Tensor,
-        total_sf_blocks: Int32,
+        mBlockTables: cute.Tensor,
+        num_out_pages: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -197,82 +206,128 @@ class NVFP4KVMaterializeKernel:
 
         num_heads = Int32(mKData.shape[1])
         page_size = Int32(mKData.shape[2])
-        rows_per_page = num_heads * page_size
-        num_active_pages = Int32(mNumActivePages[0])
-        # The host guarantees total_sf_blocks + grid size < 2**31, so the
-        # grid-stride index below cannot overflow.
-        sf_idx = bidx * _THREADS_PER_BLOCK + tidx
-        stride = grid_dim_x * _THREADS_PER_BLOCK
-        while sf_idx < total_sf_blocks:
-            row_idx = sf_idx // self.blocks_per_row
-            block_idx = sf_idx % self.blocks_per_row
-            compact_page = row_idx // rows_per_page
-            if compact_page < num_active_pages:
-                row_in_page = row_idx % rows_per_page
-                head_idx = row_in_page // page_size
-                token_idx = row_in_page % page_size
-                k_page = Int32(mKPageIds[compact_page])
-                v_page = Int32(mVPageIds[compact_page])
+        batch_size = Int32(mSeqLens.shape[0])
+        sf_per_page = num_heads * page_size * Int32(self.blocks_per_row)
+        zero = Uint32(0)
+        # Each CTA owns one output page at a time; its threads walk the page's
+        # scale blocks, so page lookup happens once per page, not per block.
+        out_page = bidx
+        while out_page < num_out_pages:
+            if out_page == Int32(0):
+                e = tidx
+                while e < sf_per_page:
+                    row = e // self.blocks_per_row
+                    output_byte = (e % self.blocks_per_row) * Int32(NVFP4_SF_VEC_SIZE)
+                    head_idx = row // page_size
+                    token_idx = row % page_size
+                    st_global_v4_u32(
+                        get_ptr_as_int64(
+                            mOutput[Int32(0), Int32(0), head_idx, token_idx, None],
+                            output_byte,
+                        ),
+                        zero,
+                        zero,
+                        zero,
+                        zero,
+                    )
+                    st_global_v4_u32(
+                        get_ptr_as_int64(
+                            mOutput[Int32(0), Int32(1), head_idx, token_idx, None],
+                            output_byte,
+                        ),
+                        zero,
+                        zero,
+                        zero,
+                        zero,
+                    )
+                    e = e + _THREADS_PER_BLOCK
+            else:
+                slot = out_page - Int32(1)
+                # Largest req with page_indptr[req] <= slot (uniform per CTA).
+                lo = Int32(0)
+                hi = batch_size
+                while hi - lo > Int32(1):
+                    mid = (lo + hi) // Int32(2)
+                    if Int32(mPageIndptr[mid]) <= slot:
+                        lo = mid
+                    else:
+                        hi = mid
+                req = lo
+                col = slot - Int32(mPageIndptr[req])
+                # col < ceil(seq_len / page_size) without a division. Since
+                # seq_len <= max_kv_len, active columns fit the block table.
+                if col * page_size < Int32(mSeqLens[req]):
+                    if tidx == Int32(0):
+                        mBlockTables[req, col] = out_page
+                    k_page = Int32(mKTables[req, col])
+                    v_page = Int32(mVTables[req, col])
+                    e = tidx
+                    while e < sf_per_page:
+                        row = e // self.blocks_per_row
+                        block_idx = e % self.blocks_per_row
+                        head_idx = row // page_size
+                        token_idx = row % page_size
 
-                input_byte = block_idx * Int32(8)
-                k_input_ptr = get_ptr_as_int64(
-                    mKData[k_page, head_idx, token_idx, None], input_byte
-                )
-                v_input_ptr = get_ptr_as_int64(
-                    mVData[v_page, head_idx, token_idx, None], input_byte
-                )
-                k_packed_0 = ld_global_nc_u32(k_input_ptr)
-                k_packed_1 = ld_global_nc_u32(k_input_ptr + Int32(4))
-                v_packed_0 = ld_global_nc_u32(v_input_ptr)
-                v_packed_1 = ld_global_nc_u32(v_input_ptr + Int32(4))
+                        input_byte = block_idx * Int32(8)
+                        k_input_ptr = get_ptr_as_int64(
+                            mKData[k_page, head_idx, token_idx, None], input_byte
+                        )
+                        v_input_ptr = get_ptr_as_int64(
+                            mVData[v_page, head_idx, token_idx, None], input_byte
+                        )
+                        k_packed_0 = ld_global_nc_u32(k_input_ptr)
+                        k_packed_1 = ld_global_nc_u32(k_input_ptr + Int32(4))
+                        v_packed_0 = ld_global_nc_u32(v_input_ptr)
+                        v_packed_1 = ld_global_nc_u32(v_input_ptr + Int32(4))
 
-                k_sf = _broadcast_low_byte(
-                    Int32(mKScales[k_page, head_idx, token_idx, block_idx])
-                )
-                # V block scales use trtllm-gen's 4-token-interleaved layout.
-                # Map the logical (token, block) coordinate to it directly.
-                v_token_idx = (token_idx // Int32(4)) * Int32(
-                    4
-                ) + block_idx // self.scale_quarter
-                v_scale_idx = (block_idx % self.scale_quarter) * Int32(
-                    4
-                ) + token_idx % Int32(4)
-                v_sf = _broadcast_low_byte(
-                    Int32(mVScales[v_page, head_idx, v_token_idx, v_scale_idx])
-                )
+                        k_sf = _broadcast_low_byte(
+                            Int32(mKScales[k_page, head_idx, token_idx, block_idx])
+                        )
+                        # V block scales use trtllm-gen's 4-token-interleaved
+                        # layout. Map the logical (token, block) coordinate.
+                        v_token_idx = (token_idx // Int32(4)) * Int32(
+                            4
+                        ) + block_idx // self.scale_quarter
+                        v_scale_idx = (block_idx % self.scale_quarter) * Int32(
+                            4
+                        ) + token_idx % Int32(4)
+                        v_sf = _broadcast_low_byte(
+                            Int32(mVScales[v_page, head_idx, v_token_idx, v_scale_idx])
+                        )
 
-                k_out = _dequantize_block(k_packed_0, k_packed_1, k_sf)
-                v_out = _dequantize_block(v_packed_0, v_packed_1, v_sf)
-
-                output_byte = block_idx * Int32(NVFP4_SF_VEC_SIZE)
-                out_page = compact_page + Int32(1)
-                st_global_v4_u32(
-                    get_ptr_as_int64(
-                        mOutput[out_page, Int32(0), head_idx, token_idx, None],
-                        output_byte,
-                    ),
-                    Uint32(k_out[0]),
-                    Uint32(k_out[1]),
-                    Uint32(k_out[2]),
-                    Uint32(k_out[3]),
-                )
-                st_global_v4_u32(
-                    get_ptr_as_int64(
-                        mOutput[out_page, Int32(1), head_idx, token_idx, None],
-                        output_byte,
-                    ),
-                    Uint32(v_out[0]),
-                    Uint32(v_out[1]),
-                    Uint32(v_out[2]),
-                    Uint32(v_out[3]),
-                )
-            sf_idx = sf_idx + stride
+                        k_out = _dequantize_block(k_packed_0, k_packed_1, k_sf)
+                        v_out = _dequantize_block(v_packed_0, v_packed_1, v_sf)
+                        output_byte = block_idx * Int32(NVFP4_SF_VEC_SIZE)
+                        st_global_v4_u32(
+                            get_ptr_as_int64(
+                                mOutput[out_page, Int32(0), head_idx, token_idx, None],
+                                output_byte,
+                            ),
+                            Uint32(k_out[0]),
+                            Uint32(k_out[1]),
+                            Uint32(k_out[2]),
+                            Uint32(k_out[3]),
+                        )
+                        st_global_v4_u32(
+                            get_ptr_as_int64(
+                                mOutput[out_page, Int32(1), head_idx, token_idx, None],
+                                output_byte,
+                            ),
+                            Uint32(v_out[0]),
+                            Uint32(v_out[1]),
+                            Uint32(v_out[2]),
+                            Uint32(v_out[3]),
+                        )
+                        e = e + _THREADS_PER_BLOCK
+            out_page = out_page + grid_dim_x
 
 
 @functools.cache
 def _get_compiled_kernel(head_dim: int) -> Callable:
     physical_pages = cute.sym_int()
-    capacity = cute.sym_int()
+    batch_size = cute.sym_int()
+    table_cols = cute.sym_int()
+    max_pages = cute.sym_int()
     output_pages = cute.sym_int()
     num_heads = cute.sym_int()
     page_size = cute.sym_int(divisibility=4)
@@ -294,9 +349,13 @@ def _get_compiled_kernel(head_dim: int) -> Callable:
             assumed_align=_ALIGNMENT_BYTES,
         )
 
-    def fake_page_ids():
-        return cute.runtime.make_fake_compact_tensor(
-            Int32, (capacity,), stride_order=(0,), assumed_align=4
+    def fake_page_table():
+        # Row-strided views such as block_tables[:, 0] of a [B, 2, C] table.
+        return cute.runtime.make_fake_tensor(
+            Int32,
+            (batch_size, table_cols),
+            stride=(cute.sym_int(), 1),
+            assumed_align=4,
         )
 
     output_fake = cute.runtime.make_fake_tensor(
@@ -312,8 +371,14 @@ def _get_compiled_kernel(head_dim: int) -> Callable:
         ),
         assumed_align=_ALIGNMENT_BYTES,
     )
-    num_active_fake = cute.runtime.make_fake_compact_tensor(
-        Int32, (1,), stride_order=(0,), assumed_align=4
+    seq_lens_fake = cute.runtime.make_fake_compact_tensor(
+        Int32, (batch_size,), stride_order=(0,), assumed_align=4
+    )
+    page_indptr_fake = cute.runtime.make_fake_compact_tensor(
+        Int32, (cute.sym_int(),), stride_order=(0,), assumed_align=4
+    )
+    block_tables_fake = cute.runtime.make_fake_compact_tensor(
+        Int32, (batch_size, max_pages), stride_order=(1, 0), assumed_align=4
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel_obj = NVFP4KVMaterializeKernel(head_dim)
@@ -328,10 +393,12 @@ def _get_compiled_kernel(head_dim: int) -> Callable:
             fake_paged(data_dim),
             fake_paged(scale_dim),
             fake_paged(scale_dim),
-            fake_page_ids(),
-            fake_page_ids(),
-            num_active_fake,
+            fake_page_table(),
+            fake_page_table(),
+            seq_lens_fake,
+            page_indptr_fake,
             output_fake,
+            block_tables_fake,
             Int32(1),
             Int32(1),
             stream_fake,
@@ -356,47 +423,6 @@ def _check_aligned(name: str, tensor: torch.Tensor) -> None:
         )
 
 
-def _compact_page_metadata(
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_size: int,
-    max_pages_per_seq: int,
-    uses_shared_paged_kv_idx: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(k_page_ids, v_page_ids, num_active_pages, compact_block_tables)``.
-
-    Active pages are numbered request by request starting at 1; padded
-    block-table entries map to page 0. Computed on the device without a host
-    synchronization.
-    """
-    batch_size = seq_lens.shape[0]
-    capacity = batch_size * max_pages_per_seq
-    device = seq_lens.device
-    num_pages = (seq_lens + (page_size - 1)) // page_size
-    columns = torch.arange(max_pages_per_seq, dtype=torch.int32, device=device)
-    active = (columns[None, :] < num_pages[:, None]).reshape(-1)
-    compact_ids = torch.cumsum(active, dim=0, dtype=torch.int32)
-    compact_block_tables = torch.where(active, compact_ids, 0).view(
-        batch_size, max_pages_per_seq
-    )
-    # Scatter physical ids of active pages to their compact slot; inactive
-    # entries go to a trailing dump slot.
-    destination = torch.where(active, compact_ids - 1, capacity).long()
-
-    def gather_ids(table: torch.Tensor) -> torch.Tensor:
-        ids = torch.zeros(capacity + 1, dtype=torch.int32, device=device)
-        ids.scatter_(0, destination, table[:, :max_pages_per_seq].reshape(-1))
-        return ids[:capacity]
-
-    if uses_shared_paged_kv_idx:
-        k_page_ids = v_page_ids = gather_ids(block_tables)
-    else:
-        k_page_ids = gather_ids(block_tables[:, 0])
-        v_page_ids = gather_ids(block_tables[:, 1])
-    num_active_pages = compact_ids[-1:]
-    return k_page_ids, v_page_ids, num_active_pages, compact_block_tables
-
-
 @flashinfer_api
 def nvfp4_kv_materialize_fp8(
     k_cache: torch.Tensor,
@@ -408,6 +434,8 @@ def nvfp4_kv_materialize_fp8(
     max_kv_len: int,
     uses_shared_paged_kv_idx: bool = True,
     out: Optional[torch.Tensor] = None,
+    kv_page_indptr: Optional[torch.Tensor] = None,
+    num_pages: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Materialize the pages referenced by a paged NVFP4 KV cache as FP8.
 
@@ -438,16 +466,26 @@ def nvfp4_kv_materialize_fp8(
     out : Optional[torch.Tensor]
         Optional contiguous ``float8_e4m3fn`` workspace with the returned
         shape, reused across calls.
+    kv_page_indptr : Optional[torch.Tensor]
+        Optional ``int32 [batch_size + 1]`` CUDA prefix sum of the pages each
+        request reserves in the FP8 copy, starting at 0. Request ``b`` must get
+        at least ``ceil(seq_lens[b] / page_size)`` pages. With mixed lengths
+        this sizes the copy by the active pages instead of
+        ``batch_size * max_pages_per_seq``. Requires ``num_pages``.
+    num_pages : Optional[int]
+        Host-side ``kv_page_indptr[-1]``: the number of pages in the FP8 copy.
 
     Returns
     -------
     kv_cache_fp8 : torch.Tensor
-        ``[batch_size * max_pages_per_seq + 1, 2, num_kv_heads, page_size,
-        head_dim]`` with ``max_pages_per_seq = ceil(max_kv_len / page_size)``.
-        Page 0 is zero; only active pages are written.
-    compact_block_tables : torch.Tensor
-        ``int32 [batch_size, max_pages_per_seq]`` page table into
-        ``kv_cache_fp8``, for use with ``uses_shared_paged_kv_idx=True``.
+        ``[num_pages + 1, 2, num_kv_heads, page_size, head_dim]``. Without
+        ``kv_page_indptr``, ``num_pages = batch_size * max_pages_per_seq`` with
+        ``max_pages_per_seq = ceil(max_kv_len / page_size)``. Request ``b``'s
+        page ``j`` is at ``kv_page_indptr[b] + j + 1`` (``b * max_pages_per_seq + j + 1``
+        by default); page 0 is zero. Pages past each request's length are not written.
+    fp8_block_tables : torch.Tensor
+        ``int32 [batch_size, max_pages_per_seq]`` page table into ``kv_cache_fp8``
+        (padded entries are 0), for use with ``uses_shared_paged_kv_idx=True``.
 
     Note
     ----
@@ -502,8 +540,8 @@ def nvfp4_kv_materialize_fp8(
 
     if seq_lens.ndim != 1 or seq_lens.dtype != torch.int32:
         raise ValueError("seq_lens must be a 1D torch.int32 tensor")
-    if block_tables.dtype != torch.int32:
-        raise ValueError("block_tables must be a torch.int32 tensor")
+    if block_tables.dtype != torch.int32 or block_tables.stride(-1) != 1:
+        raise ValueError("block_tables must be torch.int32 with unit last-dim stride")
     if seq_lens.device != device or block_tables.device != device:
         raise ValueError("all inputs must be on the same CUDA device")
     batch_size = seq_lens.shape[0]
@@ -524,8 +562,31 @@ def nvfp4_kv_materialize_fp8(
             f"ceil(max_kv_len / page_size) = {max_pages_per_seq}"
         )
 
-    capacity = batch_size * max_pages_per_seq
-    out_shape = (capacity + 1, 2, num_kv_heads, page_size, head_dim)
+    if kv_page_indptr is None:
+        if num_pages is not None:
+            raise ValueError("num_pages is only used together with kv_page_indptr")
+        num_pages = batch_size * max_pages_per_seq
+        kv_page_indptr = torch.arange(
+            0,
+            num_pages + 1,
+            max_pages_per_seq,
+            dtype=torch.int32,
+            device=device,
+        )
+    else:
+        if num_pages is None or num_pages <= 0:
+            raise ValueError("kv_page_indptr requires a positive num_pages")
+        if (
+            kv_page_indptr.dtype != torch.int32
+            or kv_page_indptr.shape != (batch_size + 1,)
+            or kv_page_indptr.device != device
+            or not kv_page_indptr.is_contiguous()
+        ):
+            raise ValueError(
+                "kv_page_indptr must be a contiguous int32 [batch_size + 1] "
+                "tensor on the input device"
+            )
+    out_shape = (num_pages + 1, 2, num_kv_heads, page_size, head_dim)
     if out is None:
         out = torch.empty(out_shape, dtype=torch.float8_e4m3fn, device=device)
     else:
@@ -538,37 +599,31 @@ def nvfp4_kv_materialize_fp8(
             raise ValueError("out must be a contiguous tensor on the input device")
         _check_aligned("out", out)
 
-    total_sf_blocks = capacity * num_kv_heads * page_size * scale_dim
-    num_blocks = min(
-        (total_sf_blocks + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK,
-        get_num_sm(device) * _BLOCKS_PER_SM,
-    )
-    if total_sf_blocks + num_blocks * _THREADS_PER_BLOCK >= 2**31:
-        raise ValueError(
-            f"workspace has too many scale blocks for 32-bit indexing: "
-            f"{total_sf_blocks}"
-        )
+    # One extra output page: page 0 is zeroed by the same launch.
+    num_out_pages = num_pages + 1
+    if num_out_pages >= 2**31:
+        raise ValueError(f"too many pages for 32-bit indexing: {num_pages}")
+    num_blocks = min(num_out_pages, get_num_sm(device) * _BLOCKS_PER_SM)
 
-    k_page_ids, v_page_ids, num_active_pages, compact_block_tables = (
-        _compact_page_metadata(
-            block_tables,
-            seq_lens,
-            page_size,
-            max_pages_per_seq,
-            uses_shared_paged_kv_idx,
-        )
+    if uses_shared_paged_kv_idx:
+        k_tables = v_tables = block_tables
+    else:
+        k_tables, v_tables = block_tables[:, 0], block_tables[:, 1]
+    fp8_block_tables = torch.zeros(
+        (batch_size, max_pages_per_seq), dtype=torch.int32, device=device
     )
-    out[0].zero_()
     _get_compiled_kernel(head_dim)(
         k_cache,
         v_cache,
         k_block_scales,
         v_block_scales,
-        k_page_ids,
-        v_page_ids,
-        num_active_pages,
+        k_tables,
+        v_tables,
+        seq_lens,
+        kv_page_indptr,
         out,
-        total_sf_blocks,
+        fp8_block_tables,
+        num_out_pages,
         num_blocks,
     )
-    return out, compact_block_tables
+    return out, fp8_block_tables
