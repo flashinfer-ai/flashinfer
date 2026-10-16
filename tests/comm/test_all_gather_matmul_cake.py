@@ -145,6 +145,10 @@ def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_
     assert loader.SM_COUNT_BY_ARCH == {"sm_100a": 148, "sm_103a": 148}
     assert loader.N128_MAX_WAVES_BY_ARCH == {"sm_100a": 2, "sm_103a": 1}
     assert loader.SM_PUSH_BANDS_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 1024, 1619]]}
+    assert loader.PUSH_LAUNCH_ROWS_BY_ARCH == {
+        "sm_100a": [],
+        "sm_103a": [[4, 512, 16, 8]],
+    }
     assert loader.MAIN_BLOCK_NS == (256, 128) and loader.BLOCK_N == 256
     for arch in loader.ARCH_FLAGS:
         classes = _n128_classes(arch)
@@ -180,6 +184,12 @@ _CG2_REGIONS = {
         # rows of arm a2 are not routed (export gate blocked at the frozen 0.60 SM-clock floor, GAP-15c).
         [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
         [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+        # The three measured ws2 M=1024 rows (N = 2048), as points: the bf16 n_major
+        # class (its M=1000 row pads to the same point), the bf16 k_major class and
+        # the fp16 k_major class at exactly 1024 padded rows.
+        [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
+        [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
+        [2, "float16", "k_major", 1024, 1024, 2048, 2048],
     ],
 }
 _CG2_CLASSES = {
@@ -190,6 +200,8 @@ _CG2_CLASSES = {
     },
     "sm_103a": {
         (2, "bfloat16", "n_major"),
+        (2, "bfloat16", "k_major"),
+        (2, "float16", "k_major"),
         (4, "bfloat16", "k_major"),
         (8, "bfloat16", "k_major"),
     },
@@ -198,16 +210,19 @@ _CG2_CLASSES = {
 
 def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture():
     """The CTA-pair twin is delivered for the classes with a measured rectangle:
-    on sm_103a the ws2 bf16 n_major class at 2048..5760 padded rows / N <= 2048,
-    the ws4 bf16 k_major class at 1024..1536 padded rows / N <= 6058 and at its
-    gate_up point (exactly 512 padded rows at N = 14336), and the ws8 bf16
-    k_major class at its gate_up point (exactly 512 padded rows at N = 7168; the
-    M=2048 gate_up rows of arm a2 are not routed); on sm_100a the ws2 bf16
-    n_major class at its two measured points (exactly 2048 or 4096 padded rows at
-    N = 2048), the ws4 bf16 k_major class at its five (exactly 1024, 1152 or
-    2048 padded rows at N = 2560; exactly 512 or 1024 padded rows at N = 14336)
-    and the ws8 bf16 k_major class at its two (exactly 512 or 1024 padded rows
-    at N = 7168). The rule inputs are the kernel module's (clusters of two)."""
+    on sm_103a the ws2 bf16 n_major class at 2048..5760 padded rows / N <= 2048
+    and at its M=1024 point (exactly 1024 padded rows at N = 2048), the ws2 bf16
+    k_major and fp16 k_major classes at their M=1024 points (exactly 1024 padded
+    rows at N = 2048), the ws4 bf16 k_major class at 1024..1536 padded rows /
+    N <= 6058 and at its gate_up point (exactly 512 padded rows at N = 14336),
+    and the ws8 bf16 k_major class at its gate_up point (exactly 512 padded rows
+    at N = 7168; the M=2048 gate_up rows of arm a2 are not routed); on sm_100a
+    the ws2 bf16 n_major class at its two measured points (exactly 2048 or 4096
+    padded rows at N = 2048), the ws4 bf16 k_major class at its five (exactly
+    1024, 1152 or 2048 padded rows at N = 2560; exactly 512 or 1024 padded rows
+    at N = 14336) and the ws8 bf16 k_major class at its two (exactly 512 or 1024
+    padded rows at N = 7168). The rule inputs are the kernel module's (clusters
+    of two)."""
 
     assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
     assert loader.CG2_REGIONS == _CG2_REGIONS
@@ -325,9 +340,12 @@ def test_every_program_is_delivered_for_both_architectures():
             if (world_size, dtype_name, b_layout) in _n128_classes(arch)
         ), twin
     # A ``_cg2`` main likewise (the ws2 bf16 n_major, ws4 bf16 k_major and ws8
-    # bf16 k_major classes have pair-routed rows on both architectures).
+    # bf16 k_major classes have pair-routed rows on both architectures; the ws2
+    # bf16 / fp16 k_major classes on sm_103a alone).
     assert sorted(_cg2_programs()) == [
+        (2, "bfloat16", "k_major"),
         (2, "bfloat16", "n_major"),
+        (2, "float16", "k_major"),
         (4, "bfloat16", "k_major"),
         (8, "bfloat16", "k_major"),
     ]
@@ -338,7 +356,10 @@ def test_every_program_is_delivered_for_both_architectures():
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout) in _cg2_classes(arch)
         ), pair
-        assert loader.PROGRAMS[pair]["arches"] == ["sm_100a", "sm_103a"], pair
+        sm103a_only = (world_size, b_layout) == (2, "k_major")
+        assert loader.PROGRAMS[pair]["arches"] == (
+            ["sm_103a"] if sm103a_only else ["sm_100a", "sm_103a"]
+        ), pair
     sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
     loader.spec.cache_clear()
     try:
@@ -360,26 +381,77 @@ def test_barrier_and_push_programs_use_static_shared_memory_only():
 
 def test_push_launch_follows_the_per_peer_payload():
     # 128 padded rows x K x 2 B = 2 MiB per peer keep the 32-CTA launch; 512 rows
-    # (8 MiB) take the wide launch; the threshold itself is on the wide side.
+    # (8 MiB) take the wide launch; the threshold itself is on the wide side. The
+    # eight-rank calls have no launch row on either architecture.
     assert loader.push_payload_bytes(128, 2) == 2 * 1024 * 1024
     assert loader.push_payload_bytes(512, 2) == 8 * 1024 * 1024
-    assert loader.push_launch(128, 2) == ("peer_push", 32, 1)
-    assert loader.push_launch(512, 2) == ("peer_push_wide", 8, 8)
-    assert loader.push_launch(128, 2)[1:] == (
-        loader.PUSH_CTAS_PER_PEER,
-        loader.PUSH_UNROLL,
-    )
-    assert loader.push_launch(512, 2)[1:] == (
-        loader.PUSH_WIDE_CTAS_PER_PEER,
-        loader.PUSH_WIDE_UNROLL,
-    )
-    threshold_rows = loader.PUSH_PAYLOAD_THRESHOLD_BYTES // (loader.K * 2)
-    assert threshold_rows % loader.BLOCK_M == 0
-    assert loader.push_launch(threshold_rows, 2)[0] == "peer_push_wide"
-    assert loader.push_launch(threshold_rows - loader.BLOCK_M, 2)[0] == "peer_push"
+    for arch in _BOTH:
+        rule = lambda rows, world_size=8, arch=arch: loader.push_launch(  # noqa: E731
+            rows, 2, world_size=world_size, arch=arch
+        )
+        assert rule(128) == ("peer_push", 32, 1)
+        assert rule(512) == ("peer_push_wide", 8, 8)
+        assert rule(128)[1:] == (loader.PUSH_CTAS_PER_PEER, loader.PUSH_UNROLL)
+        assert rule(512)[1:] == (
+            loader.PUSH_WIDE_CTAS_PER_PEER,
+            loader.PUSH_WIDE_UNROLL,
+        )
+        threshold_rows = loader.PUSH_PAYLOAD_THRESHOLD_BYTES // (loader.K * 2)
+        assert threshold_rows % loader.BLOCK_M == 0
+        assert rule(threshold_rows)[0] == "peer_push_wide"
+        assert rule(threshold_rows - loader.BLOCK_M)[0] == "peer_push"
+        assert rule(128, world_size=4) == ("peer_push", 32, 1)
     for key in ("peer_push", "peer_push_wide"):
         assert loader.ROUTES[key] in loader.PROGRAMS
     assert loader.PUSH_CARVEOUT == -1
+
+
+def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_ctas():
+    """``PUSH_LAUNCH_ROWS_BY_ARCH`` replaces the payload rule for exactly the listed
+    (world size, padded rows): on ``sm_103a`` the four-rank calls of exactly 512
+    padded rows launch 16 CTAs per peer of the wide program (the rule's 8 x 8
+    elsewhere); the four-rank 128-row calls keep 32 x 1, every eight-rank call and
+    every ``sm_100a`` call the payload rule. An arch outside the table raises."""
+
+    assert loader.push_launch_rows("sm_103a") == ((4, 512, 16, 8),)
+    assert loader.push_launch_rows("sm_100a") == ()
+    assert loader.push_launch(512, 2, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    # Keyed on the padded row count, not the payload.
+    assert loader.push_launch(512, 4, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(512, 2, world_size=4, arch="sm_100a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    assert loader.push_launch(512, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    assert loader.push_launch(128, 2, world_size=4, arch="sm_103a") == (
+        "peer_push",
+        32,
+        1,
+    )
+    for rows in (256, 384, 640, 1024):
+        assert loader.push_launch(rows, 2, world_size=4, arch="sm_103a") == (
+            "peer_push_wide",
+            8,
+            8,
+        )
+    for arch in ("sm_90a", "sm_120a", ""):
+        with pytest.raises(ValueError, match="no SM push launch rows"):
+            loader.push_launch(512, 2, world_size=4, arch=arch)
+        with pytest.raises(ValueError, match="no SM push launch rows"):
+            loader.push_launch_rows(arch)
 
 
 def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
@@ -766,9 +838,22 @@ _INVENTORY_ROWS = (
         (16384, 2048, 8, "float16", "n_major"),
         _N256,
     ),
+    # The ws2 M=1024 rows (N = 2048; the M=1000 row pads to 1024): on sm_103a the
+    # measured points route them to the CTA-pair twin (the ws2 k_major classes'
+    # only twins), on sm_100a they keep the one-CTA program.
     (
         "perf_bf16_m1024",
         (1024, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "tail_ws2_bf16_m1000_n2048",
+        (1000, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "kmajor_ws2_bf16_m1024_n2048",
+        (1024, 2048, 2, "bfloat16", "k_major"),
         _N256,
     ),
     (
@@ -817,7 +902,9 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     """The loader's ``main_form`` on the inventory is the frozen region rule:
     the CTA-pair form for an N256 row whose padded rows and N lie inside some
     measured rectangle of its class on the architecture -- on sm_103a
-    perf_bf16_m2048 / m4096 (ws2 bf16 n_major), llama_tp4_qkv_bf16_m1024 /
+    perf_bf16_m1024 / m2048 / m4096 and tail_ws2_bf16_m1000_n2048 (ws2 bf16
+    n_major), kmajor_ws2_bf16_m1024_n2048 (ws2 bf16 k_major),
+    kmajor_ws2_fp16_m1024_n2048 (ws2 fp16 k_major), llama_tp4_qkv_bf16_m1024 /
     m1025_kmajor and llama_tp4_gate_up_bf16_m512_kmajor (ws4 bf16 k_major) and
     llama_tp8_gate_up_bf16_m512_kmajor (ws8 bf16 k_major); on sm_100a
     perf_bf16_m2048 / m4096 (ws2 bf16 n_major), llama_tp4_qkv_bf16_m1024 /
@@ -852,8 +939,12 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
             label
             in {
                 "sm_103a": {
+                    "perf_bf16_m1024",
                     "perf_bf16_m2048",
                     "perf_bf16_m4096",
+                    "tail_ws2_bf16_m1000_n2048",
+                    "kmajor_ws2_bf16_m1024_n2048",
+                    "kmajor_ws2_fp16_m1024_n2048",
                     "llama_tp4_qkv_bf16_m1024_kmajor",
                     "llama_tp4_qkv_bf16_m1025_kmajor",
                     "llama_tp4_gate_up_bf16_m512_kmajor",
@@ -1006,15 +1097,34 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 assert rule(512, n=7168, block_n=128) == "cg1"
             continue
         assert arch == "sm_103a"
-        if world_size == 2:
-            # (2, bfloat16, n_major): 2048..5760 padded rows and N <= 2048.
+        if (world_size, b_layout) == (2, "n_major"):
+            # (2, bfloat16, n_major): 2048..5760 padded rows and N <= 2048, plus the
+            # M=1024 point (exactly 1024 padded rows at N = 2048; 897..1023 pad onto
+            # it, 1025 pads to 1152 and leaves, 1920 padded rows stay one-CTA).
             assert [
-                rule(rows) for rows in (1, 1024, 1920, 5761, 6000, 8192, 65536)
-            ] == ["cg1"] * 7
-            assert [rule(rows) for rows in (1921, 2048, 3000, 4096, 5760)] == [
-                "cg2"
-            ] * 5
+                rule(rows)
+                for rows in (1, 896, 1025, 1152, 1920, 5761, 6000, 8192, 65536)
+            ] == ["cg1"] * 9
+            assert [
+                rule(rows)
+                for rows in (897, 1000, 1023, 1024, 1921, 2048, 3000, 4096, 5760)
+            ] == ["cg2"] * 9
             assert rule(2048, n=1792) == "cg2" and rule(2048, n=2304) == "cg1"
+            assert rule(1024, n=1792) == "cg1" and rule(1024, n=2304) == "cg1"
+        elif world_size == 2:
+            # (2, bfloat16, k_major) and (2, float16, k_major): exactly 1024 padded
+            # rows at exactly N = 2048 (897..1023 pad onto the point; 1025 pads to
+            # 1152 and leaves); the classes have no other rectangle.
+            assert dtype_name in ("bfloat16", "float16") and b_layout == "k_major"
+            assert [rule(rows) for rows in (897, 1000, 1023, 1024)] == ["cg2"] * 4
+            assert [
+                rule(rows)
+                for rows in (1, 896, 1025, 1152, 1921, 2048, 4096, 5760, 8192, 65536)
+            ] == ["cg1"] * 10
+            assert rule(1024, n=1792) == "cg1" and rule(1024, n=2304) == "cg1"
+            for cols in (2047, 2049):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(1024, n=cols)
         elif world_size == 4:
             # (4, bfloat16, k_major) R2 rectangle: 1024..1536 padded rows, N <= 6058.
             assert [rule(rows) for rows in (1, 512, 896, 1537, 2048, 4096, 65536)] == [
@@ -1316,7 +1426,7 @@ def test_sm_push_bands_route_the_sm_103a_eight_rank_1024_row_calls_up_to_n_1619(
     )
     # The band row's per-peer payload (1024 x 8192 x 2 B = 16 MiB) selects the wide push launch.
     assert loader.push_payload_bytes(1024, 2) == 16 * 1024 * 1024
-    assert loader.push_launch(1024, 2) == (
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
         "peer_push_wide",
         loader.PUSH_WIDE_CTAS_PER_PEER,
         loader.PUSH_WIDE_UNROLL,
@@ -2170,6 +2280,18 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
         (1000, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
         (1025, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (2048, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        # The measured ws2 M=1024 points on sm_103a: bf16 n_major, bf16 k_major and
+        # fp16 k_major at exactly 1024 padded rows and N = 2048 (1000 pads to 1024
+        # and takes the twin; 1025 pads to 1152 and leaves); the same calls keep
+        # the one-CTA program on sm_100a.
+        (1024, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
+        (1000, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
+        (1024, 2048, 2, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (1024, 2048, 2, "sm_103a", "float16", "k_major", "run", 256, 1),
+        (1025, 2048, 2, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (1536, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
+        (1024, 2048, 2, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1024, 2048, 2, "sm_100a", "float16", "k_major", "run", 256, 0),
         # Outside every rectangle or another class: the one-CTA N256 main.
         (8192, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
         (2048, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),

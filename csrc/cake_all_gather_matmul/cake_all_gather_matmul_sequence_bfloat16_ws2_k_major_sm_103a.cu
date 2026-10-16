@@ -64,6 +64,12 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_bb046ade8e857469f0c6(
     __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
     unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
     int remote_order);
+extern "C" __global__ void kernel_cake_all_gather_matmul_d0fc2abec5d93b9a81ec(
+    const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
+    const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
+    unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
+    int remote_order);
 
 namespace cake_host_shim_seq_e68ff7dc1d24a48a {
 
@@ -288,6 +294,175 @@ namespace cg2 {
 using namespace cg2_absent;
 }  // namespace cg2
 
+namespace cg2 {
+// 3D TMA descriptor for buffer 'A_local' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_A_local(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'A_local' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'A_local' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'A_local' trailing dims must be positive";
+  int64_t outer1 = t.numel() / (d1);
+  check_dense_leading_dims(t, 1, "A_local");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'A_local' physical strides must be positive";
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'A_local' extent " << d1 << " must divide exactly by " << 64;
+  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'A_local' resolved a non-positive global dim";
+  uint32_t box_dim[3] = {64u, 128u, 1u};
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2], ValueError)
+      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2]
+      << ") exceeds resolved global dims for 'A_local'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'A_local' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'A_local' resolved global stride 1 zero while global dimension 1 is "
+         "not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'A_local' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'A_local' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'A_local' resolved global stride 2 zero while global dimension 2 is "
+         "not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'A_local' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+                                      const_cast<void*>(tensor_base), global_dim, global_strides,
+                                      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'A_local') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+// 3D TMA descriptor for buffer 'A_scratch' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_A_scratch(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'A_scratch' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'A_scratch' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'A_scratch' trailing dims must be positive";
+  int64_t outer1 = t.numel() / (d1);
+  check_dense_leading_dims(t, 1, "A_scratch");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'A_scratch' physical strides must be positive";
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'A_scratch' extent " << d1 << " must divide exactly by " << 64;
+  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved a non-positive global dim";
+  uint32_t box_dim[3] = {64u, 128u, 1u};
+  TVM_FFI_CHECK(
+      box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2],
+      ValueError)
+      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2]
+      << ") exceeds resolved global dims for 'A_scratch'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved global stride 1 zero while global dimension 1 is "
+         "not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved global stride 2 zero while global dimension 2 is "
+         "not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'A_scratch' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+                                      const_cast<void*>(tensor_base), global_dim, global_strides,
+                                      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'A_scratch') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+// 3D TMA descriptor for buffer 'B' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_B(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'B' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'B' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'B' trailing dims must be positive";
+  int64_t outer1 = t.numel() / (d1);
+  check_dense_leading_dims(t, 1, "B");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'B' physical strides must be positive";
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'B' extent " << d1 << " must divide exactly by " << 64;
+  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'B' resolved a non-positive global dim";
+  uint32_t box_dim[3] = {64u, 128u, 1u};
+  TVM_FFI_CHECK(
+      box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2],
+      ValueError)
+      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2]
+      << ") exceeds resolved global dims for 'B'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'B' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'B' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'B' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'B' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'B' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'B' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+                                      const_cast<void*>(tensor_base), global_dim, global_strides,
+                                      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'B') failed: CUresult=" << (int)r;
+  return tm;
+}
+}  // namespace cg2
+
 constexpr int64_t kK = 8192;
 constexpr int64_t kBlockM = 128;
 constexpr int64_t kChunkRows = 2432;
@@ -299,8 +474,8 @@ constexpr bool kHasMainN128 = false;
 // admitted only then, at block_n = kBlockN. The twin is launched with the cluster
 // dimensions of its source build (the pair) and, when the build asked for it, the
 // SPREAD cluster scheduling policy, on an even grid of at most two CTAs per pair tile.
-constexpr bool kHasMainCg2 = false;
-constexpr unsigned kMainCg2ClusterX = 1u;
+constexpr bool kHasMainCg2 = true;
+constexpr unsigned kMainCg2ClusterX = 2u;
 constexpr unsigned kMainCg2ClusterY = 1u;
 constexpr unsigned kMainCg2ClusterZ = 1u;
 constexpr bool kMainCg2Spread = false;
@@ -344,7 +519,7 @@ constexpr unsigned kBarrierThreads = 32u;
 constexpr unsigned kMainThreads = 192u;
 constexpr unsigned kMainDynamicSmem = 197632u;
 constexpr unsigned kMainN128DynamicSmem = 0u;
-constexpr unsigned kMainCg2DynamicSmem = 0u;
+constexpr unsigned kMainCg2DynamicSmem = 197632u;
 
 // A tensor map is a pure function of the source's address, extents and
 // strides, so the encoder output is cached on that key: the bound weight and
@@ -457,7 +632,7 @@ inline MainProgram main_program() {
     if constexpr (!kHasMainCg2) {
       TVM_FFI_THROW(RuntimeError) << "this route ships no CTA-pair main";
     }
-    program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_bb046ade8e857469f0c6);
+    program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_d0fc2abec5d93b9a81ec);
     program.dynamic_smem = kMainCg2DynamicSmem;
   } else if constexpr (BlockN == 128) {
     if constexpr (!kHasMainN128) {
@@ -747,18 +922,33 @@ void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, 
 }
 
 constexpr unsigned kPushThreads = 128u;
-// The SM push launch is chosen per call from the per-peer payload of the padded local shard
-// (padded rows x K x element bytes). Below kPushPayloadThresholdBytes a call takes the 32-CTA
-// launch: kPushCtasPerPeer CTAs per remote peer of the push program that keeps one 16-byte vector
-// in flight per lane. At or above it a call takes the wide launch: kPushWideCtasPerPeer CTAs per
-// peer of the push program that keeps eight vectors in flight per lane (fewer CTAs leave most SMs
-// to the main grid, which then starts at the barrier, while the deeper memory-level parallelism
-// keeps the NVLink egress; measured faster only on the large payloads). Both programs write the
-// same 16-byte vectors to the same addresses and the readiness ticket chain counts gridDim.x CTAs
-// at runtime, so the outputs are identical whichever launch a call takes.
+// The SM push launch is chosen per call: this sequence's launch rows first (below), else from the
+// per-peer payload of the padded local shard (padded rows x K x element bytes). Below
+// kPushPayloadThresholdBytes a call takes the 32-CTA launch: kPushCtasPerPeer CTAs per remote peer
+// of the push program that keeps one 16-byte vector in flight per lane. At or above it a call
+// takes the wide launch: kPushWideCtasPerPeer CTAs per peer of the push program that keeps eight
+// vectors in flight per lane (fewer CTAs leave most SMs to the main grid, which then starts at the
+// barrier, while the deeper memory-level parallelism keeps the NVLink egress; measured faster only
+// on the large payloads). Both programs write the same 16-byte vectors to the same addresses and
+// the readiness ticket chain counts gridDim.x CTAs at runtime, so the outputs are identical
+// whichever launch a call takes.
 constexpr unsigned kPushCtasPerPeer = 32u;
 constexpr unsigned kPushWideCtasPerPeer = 8u;
 constexpr int64_t kPushPayloadThresholdBytes = 4194304;
+// The SM push launch rows of this sequence's world size and architecture (the exported
+// per-architecture table): a call of exactly kPushLaunchRowRows[i] padded rows launches
+// kPushLaunchRowCtas[i] CTAs per peer of the wide program (kPushLaunchRowWide[i]) or of the
+// one-vector program, whatever its payload (a trailing 0 entry keeps an empty table well-formed).
+constexpr int kPushLaunchRowCount = 0;
+constexpr int64_t kPushLaunchRowRows[kPushLaunchRowCount + 1] = {0};
+constexpr unsigned kPushLaunchRowCtas[kPushLaunchRowCount + 1] = {0u};
+constexpr bool kPushLaunchRowWide[kPushLaunchRowCount + 1] = {false};
+constexpr int push_launch_row(int64_t padded_rows) {
+  for (int i = 0; i < kPushLaunchRowCount; ++i) {
+    if (kPushLaunchRowRows[i] == padded_rows) return i;
+  }
+  return -1;
+}
 // Preferred shared-memory carveout of both push kernels (cudaFuncAttributePreferredSharedMemoryCarveout;
 // -1 = driver default). The push kernels use no shared memory, but their CTAs land on the SMs before
 // the main grid dispatches (programmatic dependent launch) and an SM's L1/shared split is fixed while
@@ -865,16 +1055,21 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
                      &v_rank, &v_rows,    &v_chunk_rows, &v_num_chunks};
     static const bool carveout_ready = set_push_carveout();
     (void)carveout_ready;
-    // The launch of this call: the per-peer payload of the padded shard selects the grid and the
-    // push program (both take the same arguments).
+    // The launch of this call: this sequence's launch row of exactly the call's padded rows when
+    // it lists one, else the per-peer payload of the padded shard; the row or the payload selects
+    // the grid and the push program (both take the same arguments).
     const int64_t push_payload_bytes =
         call.padded_rows * kK * static_cast<int64_t>(inp.dtype().bits / 8);
-    const bool wide_push = push_payload_bytes >= kPushPayloadThresholdBytes;
+    const int launch_row = push_launch_row(call.padded_rows);
+    const bool wide_push = launch_row >= 0 ? kPushLaunchRowWide[launch_row]
+                                           : push_payload_bytes >= kPushPayloadThresholdBytes;
+    const unsigned push_ctas_per_peer =
+        launch_row >= 0 ? kPushLaunchRowCtas[launch_row]
+                        : (wide_push ? kPushWideCtasPerPeer : kPushCtasPerPeer);
     const void* push_kernel = wide_push ? reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3)
                                         : reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5);
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(wide_push ? kPushWideCtasPerPeer : kPushCtasPerPeer,
-                          static_cast<uint32_t>(kWorldSize - 1), 1u);
+    config.gridDim = dim3(push_ctas_per_peer, static_cast<uint32_t>(kWorldSize - 1), 1u);
     config.blockDim = dim3(kPushThreads, 1u, 1u);
     config.dynamicSmemBytes = 0u;
     config.stream = call.main_stream;
