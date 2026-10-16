@@ -262,7 +262,7 @@ def decode_accumulate(
     (the static scale of pre-quantised NVFP4 records).
     """
     rows = values_u8.shape[0]
-    if isinstance(row_scale, (float, int)):
+    if isinstance(row_scale, float | int):
         rs = torch.full(
             (rows,), float(row_scale), dtype=torch.float32, device=values_u8.device
         )
