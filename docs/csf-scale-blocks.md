@@ -131,6 +131,20 @@ the captured operation sees the complete tuning workload. Trial graphs and
 their buffers are released after selection. Graph-timed requests use distinct
 selection keys from direct-launch requests.
 
+`python scripts/encode_csf.py SOURCE OUTPUT --quantization mxfp4 --workers 8`
+encodes dense expert scale bytes directly, using only NumPy and safetensors.
+Use `--quantization nvfp4` for E4M3 scales. The encoder chooses each row's
+palette to minimize exceptions, breaking ties toward the smallest base.
+It selects expert `weight_scale` or `scale` tensors and checks their packed
+weight geometry; `--scale-pattern` can specify other tensor names. Every
+encoded matrix is reconstructed exactly, and all written tensor data is
+reread and compared. Packed weights, calibration, and other tensors retain
+their bytes. The quantization config retains its existing numerical recipe
+and adds `weight_scale_encoding: "csf_32x2_v1"`; inference requires a loader
+supporting that encoding. The source is read-only, and the output directory
+appears only after all shards pass. CPU-only tests run with
+`pytest --confcutdir=scripts scripts/tests/test_encode_csf.py`.
+
 `scripts/convert_csf_blocks.py SOURCE OUTPUT` converts slab-format checkpoint
 scales into this representation. It preserves packed weights and calibration,
 compares every converted logical scale byte, and writes a standard safetensors
