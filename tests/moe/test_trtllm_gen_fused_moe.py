@@ -1082,6 +1082,66 @@ def test_bf16_prims_ts_identity_activation(cache_permute_indices):
     )
 
 
+@pytest.mark.parametrize("entry", ["logits", "routed"])
+def test_bf16_prims_ts_rejects_noncontiguous_hidden_states(entry):
+    """A row-strided hidden_states view must be rejected, not read as packed rows."""
+    from flashinfer.fused_moe import prims_ts_bf16_moe, prims_ts_bf16_routed_moe
+    from flashinfer.prims_ts.utils import is_prims_ts_available
+
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("Prims-TS BF16 MoE requires SM100 or SM103")
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, hidden_size, intermediate_size = 64, 1024, 512
+    num_experts, top_k = 8, 2
+    gemm1_weights = 0.05 * torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.bfloat16)
+    gemm2_weights = 0.05 * torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.bfloat16)
+    routing_logits = torch.randn(num_tokens, num_experts, device=device)
+    topk_logits, topk_indices = routing_logits.topk(top_k, dim=-1)
+    packed_topk_ids = pack_topk_for_routed_moe(
+        topk_indices, torch.softmax(topk_logits, dim=-1)
+    )
+
+    def run(hidden_states):
+        common = dict(
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routing_method_type=RoutingMethodType.Renormalize,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK,
+        )
+        if entry == "logits":
+            return prims_ts_bf16_moe(
+                routing_logits, None, hidden_states=hidden_states, **common
+            )
+        return prims_ts_bf16_routed_moe(
+            packed_topk_ids, hidden_states=hidden_states, **common
+        )
+
+    # x[:, :H] of a [T, 2H] buffer: row stride is 2H, not H.
+    wide = torch.randn(num_tokens, 2 * hidden_size, device=device).to(torch.bfloat16)
+    hidden_states = wide[:, :hidden_size]
+    assert not hidden_states.is_contiguous()
+
+    run(hidden_states.contiguous())
+    with pytest.raises(ValueError, match="hidden_states must be contiguous"):
+        run(hidden_states)
+
+
 @pytest.mark.parametrize("num_tokens", [32])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [512])
