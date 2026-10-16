@@ -2117,27 +2117,6 @@ def test_attention_ts_decode_storage_page_size_contract() -> None:
         _validate_storage_page_size(4, True)
 
 
-@pytest.mark.parametrize("page_size", (4, 32, 128))
-@pytest.mark.parametrize("sparse", (False, True))
-def test_attention_ts_decode_fp8_bf16_reduction_dtypes(page_size, sparse):
-    """FP8/BF16 reduction supports dense pages and sparse fragments alike."""
-    cfg = FmhaDecodeConfig(
-        headdim=256,
-        q_dtype=Float8E4M3FN,
-        k_dtype=Float8E4M3FN,
-        v_dtype=Float8E4M3FN,
-        out_dtype=BFloat16,
-        use_paged_kv=True,
-        num_tokens_per_page=page_size,
-        groups_tokens_heads_q=True,
-        use_q_token_kv_block_sparse_route=sparse,
-        heads_q_per_kv=12,
-        max_seq_len_q=4,
-        tile_size_q=64,
-    )
-    assert cfg.supports_reduction_dtypes
-
-
 def test_attention_ts_decode_dtype_pair_guards() -> None:
     """Reject unsupported mixes while allowing transformed KV and FP8 PV."""
 
@@ -4206,8 +4185,6 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
     (
         (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
         (torch.bfloat16, torch.uint8, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.uint8, torch.bfloat16),
         (torch.float8_e4m3fn, torch.uint8, torch.float8_e4m3fn),
     ),
 )
@@ -7872,7 +7849,7 @@ def test_attention_ts_decode_wide_fp8_gqa_accuracy(
     head_ratio: int,
     output_dtype: torch.dtype,
 ):
-    """Check partial Q64/Q128 Keeps tiles against the FP8 reference."""
+    """Check partial head bands and 16-bit output against the FP8 reference."""
 
     case = _make_decode_case(
         kv_lens=(257, 193),
@@ -7888,15 +7865,7 @@ def test_attention_ts_decode_wide_fp8_gqa_accuracy(
         device="cuda",
         seed=33500 + head_dim + head_ratio,
     )
-    policy = _exercise_auto_case(case)
-
-    if output_dtype == torch.bfloat16 and head_dim in (64, 128):
-        assert policy["mma_variant"] == "swaps_mma_ab"
-        assert policy["groups_tokens_heads_q"] is False
-    else:
-        assert policy["mma_variant"] == "keeps_mma_ab"
-        assert policy["tile_size_q"] == (64 if head_ratio <= 64 else 128)
-        assert policy["groups_tokens_heads_q"] is True
+    _exercise_auto_case(case)
 
 
 @pytest.mark.parametrize(

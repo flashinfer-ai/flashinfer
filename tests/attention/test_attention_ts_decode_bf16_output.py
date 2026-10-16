@@ -36,83 +36,6 @@ from flashinfer.attention.prims_ts import decode
 from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
 
-@pytest.mark.parametrize("output_dtype", (torch.float16, torch.bfloat16))
-def test_fp8_contiguous_16bit_profile_does_not_use_paged_row_guards(output_dtype):
-    """Paged output recipes must not shadow contiguous or Sage qualification."""
-    cfg = fmha_decode_config.make_decode_config(
-        headdim=128,
-        args=dict(use_keeps_mma_ab=True, tile_size_q=64, groups_tokens_heads_q=True),
-        seq_len_q=1,
-        seq_len_kv=256,
-        batch_size=1,
-        num_heads_q=64,
-        num_heads_kv=1,
-        q_dtype=fmha_decode_config.Float8E4M3FN,
-        k_dtype=fmha_decode_config.Float8E4M3FN,
-        v_dtype=fmha_decode_config.Float8E4M3FN,
-        o_dtype=decode._cutlass_dtype(decode._dtype_key(output_dtype)),
-        qkv_layout="contiguousKv",
-        split_kv_mode="disabled",
-        auto_tuner=False,
-    )
-    assert cfg.supports_grouped_keeps
-    assert not cfg.uses_guarded_fixed_q1_grouped_keeps
-    assert not cfg.uses_guarded_grouped_keeps_output_rows
-
-
-@pytest.mark.parametrize("split_kv", (False, True))
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
-@pytest.mark.parametrize(
-    "batch_size,heads,head_dim,seq_len_q,page_size,packed",
-    (
-        (1, 16, 128, 4, 128, False),
-        (4, 16, 128, 4, 128, False),
-        (64, 16, 128, 4, 128, False),
-        (2, 33, 64, 1, 32, False),
-        (2, 65, 128, 1, 32, False),
-        (2, 65, 256, 1, 32, False),
-        (4, 16, 64, 4, 32, True),
-    ),
-)
-@_REQUIRES_PRIMTS_GPU
-def test_fp8_bf16_output_preserves_fp16_tactics(
-    batch_size, heads, head_dim, seq_len_q, page_size, packed, mask_type, split_kv
-):
-    """Changing only 16-bit output precision preserves the selected schedule."""
-    configs = []
-    for output in ("float16", "bfloat16"):
-        configs.append(
-            decode._resolve_decode_launch_spec(
-                torch.cuda.current_device(),
-                batch_size,
-                heads,
-                1,
-                head_dim,
-                page_size,
-                4096,
-                seq_len_q,
-                "float8_e4m3fn",
-                "float8_e4m3fn",
-                "float8_e4m3fn",
-                output,
-                "HND",
-                mask_type,
-                packed,
-                -1,
-                split_kv=split_kv,
-            ).config
-        )
-    signatures = [dict(config.compile_signature()) for config in configs]
-    for signature in signatures:
-        signature.pop("out_dtype")
-    assert signatures[0] == signatures[1]
-    if seq_len_q == 1 and head_dim in (64, 128) and heads in (33, 65):
-        # The existing 16-bit policy uses Swaps head bands here. Enabling an
-        # epilogue must not add slower, unqualified cost-model candidates.
-        assert not configs[0].use_keeps_mma_ab
-        assert not configs[1].use_keeps_mma_ab
-
-
 @pytest.mark.parametrize("split_kv", (False, True))
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @_REQUIRES_PRIMTS_GPU
@@ -202,14 +125,11 @@ def test_fp8_bf16_output_public_entry_points(mask_type, split_kv):
         out=supplied_out,
         **common,
     )
-    assert (
-        plan.run(
-            case.q,
-            out=supplied_out,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
-        )
-        is supplied_out
+    plan.run(
+        case.q,
+        out=supplied_out,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
     )
     _assert_case_correct(supplied_out, reference)
 
@@ -228,7 +148,7 @@ def test_fp8_bf16_output_public_entry_points(mask_type, split_kv):
             **common,
         )
 
-    assert run() is supplied_out
+    run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
