@@ -38,7 +38,12 @@
 // need one copy only: a rank leaves op N after every peer's all-gather of N
 // arrived, which every peer sent after reducing all of our N chunks, and a peer
 // sends its N + 1 all-gather only after our N + 1 reduce-scatter, which we post
-// after our N kernel finished reading.
+// after our N kernel finished reading.  pipe_send is the exception: our own
+// all-gather of N reads our reduced shard from it, and that send is not part of
+// what lets our kernel N finish.  So once every write of op N completed, this
+// thread sets ctrl pipe_done = seq, and the kernel publishes its epoch only after
+// seeing it; otherwise our next two-shot op could stage over the shard while it
+// was still to be sent, and peers would gather that input as our reduced values.
 //
 // A variable-length all-gather (ctrl kind[slot] = 2) streams each rank's contribution, whose size
 // the kernel reads from device memory, through
@@ -76,7 +81,7 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 7
+#define ROCE_ABI_VERSION 8
 #define ROCE_MAX_CHUNKS 64
 #define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
@@ -88,6 +93,7 @@
 #define CTRL_SLOT_KIND 8
 #define CTRL_SLOT_CHUNK_PACKS 10
 #define CTRL_SLOT_CHUNKS 12
+#define CTRL_PIPE_DONE 48
 #define CTRL_READY_RS 64
 #define CTRL_READY_AG 128
 #define CTRL_READY_VL 256
@@ -727,7 +733,33 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
     }
   }
   c->ops_posted += 1;
-  return drain_all(c);
+  // Release pipe_send: wait until every posted write, our all-gather included,
+  // completed, so the NIC no longer reads the shard the next op will overwrite.
+  for (;;) {
+    if (drain_all(c) != 0) {
+      return -1;
+    }
+    uint32_t pending = 0;
+    for (int h = 0; h < c->n_hca; h++) {
+      for (int p = 0; p < c->world; p++) {
+        pending += c->hca[h].outstanding[p];
+      }
+    }
+    if (pending == 0) {
+      break;
+    }
+    if (ctrl[CTRL_ERROR] != 0) {
+      snprintf(c->err, sizeof(c->err), "two-shot op %u abandoned: kernel timed out at seq %u",
+               seq, ctrl[CTRL_ERROR]);
+      return -1;
+    }
+    if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
+      snprintf(c->err, sizeof(c->err), "RoCE proxy stopped releasing two-shot op %u", seq);
+      return -1;
+    }
+  }
+  __atomic_store_n(&ctrl[CTRL_PIPE_DONE], seq, __ATOMIC_RELEASE);
+  return 0;
 }
 
 // Run variable-length all-gather op seq: post each chunk of our contribution, from our row of

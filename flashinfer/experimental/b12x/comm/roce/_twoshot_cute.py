@@ -63,6 +63,7 @@ from ._oneshot_cute import _DTYPE_NAMES, _RoceOneshotLaunch, PACK_BYTES
 _CTRL_SLOT_KIND = 8
 _CTRL_SLOT_CHUNK_PACKS = 10
 _CTRL_SLOT_CHUNKS = 12
+_CTRL_PIPE_DONE = 48
 _CTRL_READY_RS = 64
 _CTRL_READY_AG = 128
 _PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
@@ -350,7 +351,9 @@ class _RoceTwoshotLaunch(_RoceOneshotLaunch):
                                 )
                                 gather_index += stride
 
-        # 5. the last block to finish publishes the next epoch
+        # 5. the last block to finish publishes the next epoch, once the proxy
+        # released pipe_send: our all-gather of this op still reads our reduced
+        # shard from it, and the next two-shot op stages over it.
         fence_sc_gpu()
         cute.arch.sync_threads()
         if Int32(tidx) == Int32(0):
@@ -358,7 +361,15 @@ class _RoceTwoshotLaunch(_RoceOneshotLaunch):
             if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
                 fence_sc_gpu()
                 if ld_relaxed_sys_u32(ctrl_base + Int64(8)) == Uint32(0):
-                    st_release_gpu_u32(epoch_ptr, seq)
+                    released = spin_until_eq_acquire_sys(
+                        ctrl_base + Int64(4 * _CTRL_PIPE_DONE), seq, spin_limit
+                    )
+                    if released != Uint32(0):
+                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(self._rank))
+                        st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
+                        st_release_gpu_u32(poison_ptr, seq)
+                    else:
+                        st_release_gpu_u32(epoch_ptr, seq)
 
 
 def _dummy(dtype, alignment: int):

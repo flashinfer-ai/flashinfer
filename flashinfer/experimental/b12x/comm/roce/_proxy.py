@@ -23,7 +23,7 @@ _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 # Region layout and doorbell protocol of ``_roce_proxy.c``; native runtimes vendor the same file.
-ABI_VERSION = 7
+ABI_VERSION = 8
 
 
 def _traffic_class() -> int:
