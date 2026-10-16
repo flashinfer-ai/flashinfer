@@ -188,6 +188,15 @@ def test_cache_exact_identity_constraints_and_invalid_record(tmp_path, monkeypat
     )[0]["schedule_policy"] == ("grouped", 333)
     data = json.loads(path.read_text())
     assert data["entries"][0]["device"] == "legacy"
+    current_revision = data["entries"][-1]["backend_revision"]
+    data["entries"][-1]["backend_revision"] = "sm100-genphase-c8c67ae7-auto-v1"
+    path.write_text(json.dumps(data))
+    assert (
+        cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300")[1]
+        == "heuristic"
+    )
+    assert cache.live_token_buckets(cfg, device="B300") == []
+    data["entries"][-1]["backend_revision"] = current_revision
     data["entries"][-1]["knobs"]["apply_topk_at_fc1"] = False
     path.write_text(json.dumps(data))
     assert (

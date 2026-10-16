@@ -42,6 +42,10 @@ RAGGED_E4 = [300, 0, 1, 700]
 RAGGED_E6 = [1, 257, 511, 4099, 0, 33]
 TINY_E5 = [1, 2, 3, 0, 4]
 LONG_E3 = [6145, 0, 12289]
+# Groups shorter than one 64-row k-step: every output tile is a single k-step, and
+# a CTA switches group at almost every tile (the shape of flashinfer-ai/flashinfer#6570).
+SMALL_E512 = [32] * 512
+SMALL_GROUP_LAUNCHES = 200
 
 
 def _require_program(op, out_dtype=None):
@@ -240,6 +244,32 @@ def test_wgrad_long_reduction_selects_a_valid_tile(out_dtype):
     else:
         assert ((out - ref).norm() / ref.norm()).item() <= FP32_REL_L2
     assert torch.equal(out[1], torch.zeros_like(out[1]))
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_wgrad_short_groups_never_include_the_next_group(out_dtype):
+    """A tile of a group shorter than one k-step must not add the rows of the group
+    the same CTA reduces next (#6570). Repeated launches of one prepared call,
+    checked block by block against the per-group reference."""
+    device = _require_program("wgrad", out_dtype)
+    n, k = 512, 3072
+    x, _w, g, offs = _inputs(SMALL_E512, n, k, device, seed=6)
+    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    ref = torch.stack(
+        [g[s:t].float().T @ x[s:t].float() for s, t in _bounds(SMALL_E512)]
+    )
+    blocks = ref.view(len(SMALL_E512), n // 128, 128, k // 128, 128)
+    scale = blocks.abs().amax(dim=(2, 4), keepdim=True)
+    wrong = []
+    for call in range(SMALL_GROUP_LAUNCHES):
+        out = launch.launch().float().view_as(blocks)
+        bad = ((out - blocks).abs() > scale * 2.0**-6 + 1e-6).any(dim=4).any(dim=2)
+        if bool(bad.any()):
+            wrong.append((call, bad.nonzero()[:4].tolist()))
+    assert not wrong, (
+        f"{len(wrong)} of {SMALL_GROUP_LAUNCHES} launches have wrong 128 x 128 blocks "
+        f"(call, [group, n block, k block]): {wrong[:3]}"
+    )
 
 
 def test_prepared_launch_reuses_buffers_without_allocation():

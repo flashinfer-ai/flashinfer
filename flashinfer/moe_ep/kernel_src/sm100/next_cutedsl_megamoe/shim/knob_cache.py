@@ -20,7 +20,7 @@ from typing import Any
 
 from .tuning import KNOB_KEYS, is_valid_sm100_genphase_knobs, sm100_genphase_candidates
 
-_REVISION = "sm100-genphase-c8c67ae7-auto-v1"
+_REVISION = "sm100-genphase-6b9a6e2e-auto-v2"
 
 
 def knob_cache_path() -> str | None:
