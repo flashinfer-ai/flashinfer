@@ -5,9 +5,10 @@
 ``sources.json`` maps every kernel role to one or more variants.  A variant
 lists the exact targets it was generated for (``arches``), the argument plan of
 its entry (``arguments``) and the architecture-free stem of its library
-(``library``).  ``build.json`` -- read by :mod:`cake_build` -- names the
-per-architecture build ``<library>_<arch>`` and is the only record of what to
-compile (translation units, digests, nvcc flags).  Kernels whose generated code
+(``library``, ``cake_mok_<role>``).  ``build.json`` -- read by
+:mod:`cake_build` -- names the per-architecture build ``<library>_<arch>``
+(``cake_mok_<role>_<arch>``) and is the only record of what to compile
+(translation units, digests, nvcc flags).  Kernels whose generated code
 does not depend on the target share one variant, while kernels with
 target-specific schedules (for example the MXFP8 tile width, which follows the
 tensor-memory capacity) carry one variant per target group.  The variant is
@@ -62,22 +63,31 @@ def _registry():
     return json.loads((_PACKAGE / "sources.json").read_text())
 
 
-def library_name(role, capability):
-    """``(build.json entry, argument plan)`` of kernel ``role`` on a device of ``capability``."""
+def variant(role, capability):
+    """The ``sources.json`` record of kernel ``role`` generated for a device of
+    ``capability``: ``{"arches": [...], "arguments": [[kind, name], ...],
+    "library": "cake_mok_<role>"}``."""
     arch = _target(capability)
     record = next(
         (v for v in _registry()[role]["variants"] if arch in v["arches"]), None
     )
     if record is None:
         raise RuntimeError(f"MoK kernel {role!r} has no generated {arch} variant")
-    return f"{record['library']}_{arch}", record["arguments"]
+    return record
+
+
+def library_name(role, capability):
+    """``build.json`` entry of kernel ``role`` on a device of ``capability``:
+    ``<library>_<arch>``, for example ``cake_mok_forward_sm_100a``."""
+    return f"{variant(role, capability)['library']}_{_target(capability)}"
 
 
 @functools.cache
 def _load(role, device):
     with torch.cuda.device(device):
-        name, arguments = library_name(role, torch.cuda.get_device_capability(device))
-        return _Kernel(cake_build.load_library(name), arguments)
+        capability = torch.cuda.get_device_capability(device)
+        module = cake_build.load_library(library_name(role, capability))
+        return _Kernel(module, variant(role, capability)["arguments"])
 
 
 def load_kernel(role):

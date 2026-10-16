@@ -119,9 +119,13 @@ memory, not work.
 
 `sources.json` lists every kernel role with the exact targets each variant
 was generated for, its argument plan and its architecture-free `library`
-stem; `build.json` (schema `cake-build/1`) records the sources, digests and
-nvcc flags of every `<library>_<arch>` build, and the shared `cake_build.py`
-loader loads it (prebuilt from `aot/`, else JIT). The bindings include the
+stem (`cake_mok_<role>`); `build.json` (schema `cake-build/1`) records the
+sources, digests and nvcc flags of every `<library>_<arch>` build
+(`cake_mok_<role>_<arch>`, for example `cake_mok_forward_sm_100a`), and the
+shared `cake_build.py` loader loads it (prebuilt from `aot/`, else JIT).
+`jit.variant(role, capability)` returns the record selected by the device
+compute capability and `jit.library_name(role, capability)` the name of its
+`build.json` entry, a plain string like the other Cake loaders. The bindings include the
 package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The BF16 kernels, scheduler, communication and
 epilogue sources are shared by SM100a, SM103a and SM107a. The MXFP8 fused
 kernels have target-specific schedules: SM100a/SM103a (512 tensor-memory

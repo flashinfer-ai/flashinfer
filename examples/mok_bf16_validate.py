@@ -483,7 +483,7 @@ def run(args):
         role + ("_mxfp8" if args.mxfp8 else "") + ("_clamped" if limit else "")
         for role in ("forward", "backward")
     ]
-    fused_entries = {k: libraries[library_name(k, capability)[0]] for k in fused}
+    fused_entries = {k: libraries[library_name(k, capability)] for k in fused}
     passed = all(e["pass"] for row in reports for e in row["errors"].values())
     record = dict(
         status="PASS" if passed else "FAIL",
