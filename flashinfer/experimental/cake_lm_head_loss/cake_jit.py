@@ -160,7 +160,14 @@ def _expand_registry(
     arg_plans: dict[str, list[list[str]]],
     launches: dict[str, dict[str, list[int]]],
 ) -> dict[str, dict[str, Any]]:
-    """The per-stage physical records of every program from the compact tables."""
+    """The per-stage physical records of every program from the compact tables.
+
+    Self-contained by contract with the Cake exporter: ``exports/lm_head_loss/export.py``
+    ``_scaffold_expansion`` executes only ``STAGE_ROW_FIELDS`` and this function (extracted from the
+    scaffold at ``TARGET_REVISION``) to check that the compact tables it renders expand to the physical
+    records, so this body may use its parameters, ``STAGE_ROW_FIELDS`` and builtins only -- no other
+    module-level name (``library_stem`` is spelled out as the f-string below for that reason).
+    """
     modules: dict[str, dict[str, Any]] = {}
     for name, compact in registry.items():
         arch = compact["arch"]
@@ -181,7 +188,7 @@ def _expand_registry(
             )
             physical: dict[str, Any] = {
                 "module": f"cake_lm_head_loss_{unit}",
-                "library": library_stem(unit),
+                "library": f"cake_lm_head_loss_{unit}",
                 "ffi_entry": extra.pop("ffi_entry", "run"),
                 "arg_plan": [list(item) for item in arg_plans[plan]],
                 "tma_workspace_bytes": int(extra.pop("tma_workspace_bytes", 0)),
