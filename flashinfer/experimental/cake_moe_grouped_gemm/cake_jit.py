@@ -169,8 +169,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": {
-            "sm_100a": "a2501a9dd9f096e86e33979783a7657ad57612f4cd9f5c3fd02f46f2d7524ba8",
-            "sm_103a": "6c4bfb542324ff834e0e6792c3de4f57c95e6727e66ad067f5f76f5aedb0acd5",
+            "sm_100a": "39386f1dc339419bb3f6222994e917d840e9f25d235d46b9cc932369bfe9ded8",
+            "sm_103a": "6bf2ac1b3644c1f0c8b342933fa832e73ed16df0519ea82a90a7122eaef52946",
         },
     },
     "cake_moe_grouped_gemm_7ac85aef90878e42ea02": {
@@ -203,9 +203,9 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "closure_sha256": {
-            "sm_100a": "501248dac9185c73e467d78f7c77df10a17644d06a3d32bc9f006c19d01cc993",
-            "sm_103a": "bf57e34d579b0492cd7d23b68eecdafda2c5a2c9b4d7cde7dd251599961e45b6",
-            "sm_107a": "8db8970dacc35f8217ea1a2696f779e7a535745fb0bf7c0b865372a63d24c83d",
+            "sm_100a": "faaf1db3e955f61855255922a9f6c91605f54057f46382194410b70efbe77c55",
+            "sm_103a": "71a89cf2996e30a30a94787f67663c080df39281b0ba5344d62fa19896d2a52f",
+            "sm_107a": "e2c2a69e1d3e7f4f9f8d5ad7f56e5178ec3fda84046589207cb5cd2d0fc02bed",
         },
     },
     "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c": {
@@ -270,8 +270,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": {
-            "sm_100a": "091f96e36df6d358e99d9248d7d5ec2a009d03b080b55f25aa6072302c26342d",
-            "sm_103a": "3532bfb9e74870c1b4222aa50a8e3467609f046c498d382830f8961c20810481",
+            "sm_100a": "042280f0088f3d85f54297503c051d6b8c0849442fe20a734d448423d666e207",
+            "sm_103a": "9373772f4982086b10ce549a55f7eb87344c302e7fc53480e87716033b494fbf",
         },
     },
     "cake_moe_grouped_gemm_ed9a74f36ba13a52183d": {
@@ -304,9 +304,9 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "closure_sha256": {
-            "sm_100a": "586d5d88ab38af1b2c810038ae5569f89abbaecc166dcc4745e31c7cef3546f2",
-            "sm_103a": "b96a5ba35bed13b0d3bc0d11b2b8644b48162ed302be145e1e7052a445f37c20",
-            "sm_107a": "ecc417eb94ed13dd4cfb64111991eb21a5bf99d72df8b243b0c0ec4d4862744e",
+            "sm_100a": "3942edc8283280f84d90b2b11362ed0b4a9196ce35a53d228efee5047aad77b9",
+            "sm_103a": "c2247708f998a7669f3a82661945196cc392ffbd2c88258f713d54bee06db623",
+            "sm_107a": "7e9e44e57903afe5ec70e767ea0ce4e0415bc39910d601bb49c79459ca020cfe",
         },
     },
 }
@@ -484,7 +484,7 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "cluster_m": 256,
     "epi_chunk": 16,
     "tmap_slot_bytes": 128,
-    "tmap_slots_per_cta": 16,
+    "tmap_slots_per_cta": 18,
     "k512_archs": ["sm_100a", "sm_103a"],
     "k512_min_rows_per_group": 20480,
     "wgrad_tail_split": 1,
