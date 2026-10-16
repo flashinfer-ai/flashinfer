@@ -50,6 +50,16 @@ import torch
 
 from flashinfer.api_logging import flashinfer_experimental_api
 
+from .sage import (
+    SAGE_K_BLOCK_SIZES,
+    SageAttentionConfig,
+    SageAttentionParams,
+    _SAGE_ATOM_TOKENS,
+    _SageScaleLayout,
+    sage_scale_shapes,
+    validate_sage_params,
+)
+
 
 if TYPE_CHECKING:
     from .kernels.fmha_context.fmha_resources import FmhaConfig
@@ -142,6 +152,21 @@ class _ContextPlanGeometry:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     head_dim_vo: int | None = None
+    # The plan's Sage recipe, part of the compile identity; ``None`` without
+    # Sage attention.
+    sage: SageAttentionConfig | None = None
+
+
+@dataclass(frozen=True)
+class _ContextSageState:
+    """A contiguous context plan's prepared Sage scale buffer."""
+
+    layout: _SageScaleLayout
+    # Expected shape of every scale tensor a run supplies, by field name.
+    scale_shapes: dict[str, tuple[int, ...]]
+    # The buffer the Sage prepare writes before attention (``_SageScaleLayout``).
+    scales: torch.Tensor
+    prepare: Callable[..., None]
 
 
 @dataclass(frozen=True)
@@ -156,6 +181,7 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
+    sage: Optional[_ContextSageState] = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +260,8 @@ class _ContextCompileSpec:
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
     two_cta_umma: bool = False
+    # A Sage plan's prepared scale layout; the kernel reads the scales.
+    sage_scale_layout: _SageScaleLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -281,6 +309,7 @@ def _make_context_kernel(
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
+    sage_scale_layout: _SageScaleLayout | None = None,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -333,6 +362,7 @@ def _make_context_kernel(
         use_blackwell_tma_oob_workaround=(
             torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
         ),
+        sage_scale_layout=sage_scale_layout,
         **paged_kwargs,
     )
     return fmha
@@ -1269,6 +1299,7 @@ def _resolve_context_plan_geometry(
     mask_type: str,
     window_left: int,
     output_dtype: torch.dtype,
+    sage: SageAttentionConfig | None = None,
 ) -> _ContextPlanGeometry:
     """Validate explicit static bounds for a reusable contiguous plan."""
 
@@ -1320,7 +1351,7 @@ def _resolve_context_plan_geometry(
     # Packed request lengths are run inputs, so select conservative compile
     # facts that remain valid for every request within the plan capacities.
     has_q_offset = mask_type == "causal" and (packed or max_seq_len_q != max_kv_len)
-    return _ContextPlanGeometry(
+    geometry = _ContextPlanGeometry(
         device=device,
         device_index=device_index,
         packed=packed,
@@ -1347,7 +1378,11 @@ def _resolve_context_plan_geometry(
             and max_kv_len <= _CONTEXT_KV_TILE_N
         ),
         packed_dense_k_mask=packed and mask_type == "dense",
+        sage=sage,
     )
+    if sage is not None:
+        _validate_context_sage_config(geometry, sage)
+    return geometry
 
 
 def _resolve_paged_geometry(
@@ -1677,6 +1712,152 @@ def _resolve_paged_context_scheduler(
     return "static_persistent"
 
 
+def _validate_context_sage_config(
+    geometry: _ContextPlanGeometry, sage: SageAttentionConfig
+) -> None:
+    """Reject a Sage recipe the contiguous context kernel does not run.
+
+    Sage attention covers the dense, fixed-length, query-paired D128 path with
+    E4M3 Q/K/V and a 16-bit output: the recipe quantizes Q/K/V and P, so an
+    FP8 output would discard the precision it keeps.
+    """
+
+    if not isinstance(sage, SageAttentionConfig):
+        raise TypeError("sage must be a SageAttentionConfig")
+    if geometry.mask_type != "dense" or geometry.packed or geometry.head_paired:
+        raise NotImplementedError(
+            "Sage attention requires a dense, fixed-length, query-paired context plan"
+        )
+    if geometry.head_dim != 128 or geometry.head_dim_vo not in (None, 128):
+        raise NotImplementedError("Sage attention requires head_dim 128")
+    if (
+        geometry.qk_dtype != torch.float8_e4m3fn
+        or geometry.pv_dtype != torch.float8_e4m3fn
+    ):
+        raise NotImplementedError(
+            "Sage attention requires float8_e4m3fn Q, K and V; "
+            f"got q/k {geometry.qk_dtype} and v {geometry.pv_dtype}"
+        )
+    if geometry.output_dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError(
+            "Sage attention requires a float16 or bfloat16 output; "
+            f"got {geometry.output_dtype}"
+        )
+    if sage.k_block_size not in SAGE_K_BLOCK_SIZES:
+        raise ValueError(f"sage.k_block_size must be one of {SAGE_K_BLOCK_SIZES}")
+
+
+def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
+    """Return the prepared scale layout of a contiguous context Sage plan.
+
+    The Q rows hold one Q tile row per token of one Q head (``_SageQSection``
+    without interleaved heads): the query-paired D128 tile.
+    """
+
+    sage = geometry.sage
+    return _SageScaleLayout(
+        seq_len_kv=geometry.max_seq_len_k,
+        k_block_size=sage.k_block_size,
+        num_summaries=0,
+        k_summary_block_size=sage.k_summary_block_size,
+        k_tokens_block_size=sage.k_block_size,
+        summaries_block_size=sage.k_summary_block_size,
+        seq_len_q=geometry.max_seq_len_q,
+        q_block_size=sage.q_block_size,
+        heads_q_per_kv=geometry.num_qo_heads // geometry.num_kv_heads,
+        q_tokens_per_tile=_CONTEXT_TILE_SIZE_Q,
+        q_heads_interleaved=False,
+        headdim=geometry.head_dim,
+        v_mean=sage.v_mean,
+        k_tile_atoms=_CONTEXT_KV_TILE_N // _SAGE_ATOM_TOKENS,
+    )
+
+
+@functools.cache
+def _get_compiled_sage_prepare(
+    device_index: int,
+    layout: _SageScaleLayout,
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> Callable[..., None]:
+    """Compile the launch that writes a context plan's prepared Sage scales.
+
+    The compiled callable takes ``(q_scale, k_scale, v_scale, v_mean, scales)``
+    torch tensors (``v_mean`` is ``None`` for a recipe without one) and runs on
+    the current stream. The batch size is a runtime extent, as for the
+    attention kernel, so plans of one layout share the compilation.
+    """
+
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda_drv
+
+    from .kernels.fmha_decode.sage_prepare import _PrepareSageScales
+
+    prepare = _PrepareSageScales(layout=layout, num_kv_heads=num_kv_heads)
+
+    @cute.jit
+    def prepare_adapter(
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor | None,
+        scales: cute.Tensor,
+        stream: cuda_drv.CUstream,
+    ) -> None:
+        prepare(q_scale, k_scale, None, v_scale, v_mean, scales, stream)
+
+    def fake_compact(shape):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=16,
+        )
+
+    v_rows_shape = (cute.sym_int(), num_kv_heads, layout.headdim)
+    with torch.cuda.device(device_index):
+        return cute.compile(
+            prepare_adapter,
+            fake_compact((num_qo_heads, cute.sym_int())),
+            fake_compact((num_kv_heads, cute.sym_int())),
+            fake_compact(v_rows_shape),
+            fake_compact(v_rows_shape) if layout.v_mean else None,
+            fake_compact((cute.sym_int(),)),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options=_COMPILE_OPTIONS,
+        )
+
+
+def _build_context_sage_state(geometry: _ContextPlanGeometry) -> _ContextSageState:
+    """Allocate a plan's prepared scale buffer and compile its prepare launch."""
+
+    layout = _context_sage_layout(geometry)
+    scale_shapes = sage_scale_shapes(
+        geometry.sage,
+        batch_size=geometry.batch_size,
+        seq_len_q=geometry.max_seq_len_q,
+        seq_len_kv=geometry.max_seq_len_k,
+        num_qo_heads=geometry.num_qo_heads,
+        num_kv_heads=geometry.num_kv_heads,
+        head_dim=geometry.head_dim,
+    )
+    scales = torch.empty(
+        layout.total_words(geometry.batch_size * geometry.num_kv_heads),
+        dtype=torch.float32,
+        device=geometry.device,
+    )
+    prepare = _get_compiled_sage_prepare(
+        geometry.device_index, layout, geometry.num_qo_heads, geometry.num_kv_heads
+    )
+    return _ContextSageState(
+        layout=layout,
+        scale_shapes=scale_shapes,
+        scales=scales,
+        prepare=prepare,
+    )
+
+
 def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec:
     """Build the contiguous compile key, including separate QK and PV dtype keys."""
     return _ContextCompileSpec(
@@ -1700,6 +1881,9 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         packed_dense_k_mask=geometry.packed_dense_k_mask,
         scheduler=_resolve_context_scheduler(geometry),
         two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
+        sage_scale_layout=(
+            _context_sage_layout(geometry) if geometry.sage is not None else None
+        ),
     )
 
 
@@ -1755,6 +1939,7 @@ def _get_compiled_context(
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
     scheduler = compile_spec.scheduler
     two_cta_umma = compile_spec.two_cta_umma
+    sage_scale_layout = compile_spec.sage_scale_layout
 
     import cutlass
     import cutlass.cute as cute
@@ -1789,6 +1974,7 @@ def _get_compiled_context(
         two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        sage_scale_layout=sage_scale_layout,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1820,6 +2006,7 @@ def _get_compiled_context(
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
+        sage_scales: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1859,6 +2046,7 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                sage_scales=sage_scales,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1913,6 +2101,14 @@ def _get_compiled_context(
     variable_window_cta_starts_fake = fake_compact(
         cutlass.Int32, variable_window_cta_shape, 4
     )
+    # The prepared Sage scales span ``batch * Hkv`` sequences, so their length
+    # stays a runtime extent like the batch size; a plan without Sage has no
+    # scales.
+    sage_scales_fake = (
+        fake_compact(cutlass.Float32, (cute.sym_int(),), 16)
+        if sage_scale_layout is not None
+        else None
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1931,6 +2127,7 @@ def _get_compiled_context(
             variable_window_starts_fake,
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
+            sage_scales_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -2523,6 +2720,7 @@ class BatchPrefillTSWrapper:
         window_left: int = -1,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
+        sage: Optional[SageAttentionConfig] = None,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
@@ -2574,6 +2772,11 @@ class BatchPrefillTSWrapper:
             Softmax scale; defaults to the inverse square root of head size.
         output_scale : float
             Scale applied to the attention output.
+        sage : SageAttentionConfig, optional
+            Sage attention recipe: 8-bit Q/K with per-block scales, E4M3 V with
+            per-channel scales and FP8 P. Requires a dense, fixed-length,
+            head-dim-128 plan with ``float8_e4m3fn`` Q/K/V and a 16-bit output.
+            Every ``run`` then supplies the scales as ``SageAttentionParams``.
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
@@ -2598,6 +2801,7 @@ class BatchPrefillTSWrapper:
             mask_type=mask_type,
             window_left=window_left,
             output_dtype=resolved_out_dtype,
+            sage=sage,
         )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -2638,6 +2842,9 @@ class BatchPrefillTSWrapper:
         # making plan publication atomic, this lets compute-sanitizer patch the
         # generated attention kernel without interleaving later PyTorch setup
         # launches with the DSL compiler/runtime callbacks.
+        sage_state = (
+            _build_context_sage_state(geometry) if geometry.sage is not None else None
+        )
         compiled, policy = _get_compiled_context(_context_compile_spec(geometry))
         self._plan_state = _ContextPlanState(
             geometry=geometry,
@@ -2648,6 +2855,7 @@ class BatchPrefillTSWrapper:
             variable_window_cta_starts=variable_window_cta_starts,
             compiled=compiled,
             policy=policy,
+            sage=sage_state,
         )
 
     @flashinfer_experimental_api
@@ -2665,6 +2873,7 @@ class BatchPrefillTSWrapper:
         out: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        sage: Optional[SageAttentionParams] = None,
         validate: bool = True,
     ) -> torch.Tensor:
         """Launch the compiled specialization with per-request tensors.
@@ -2692,6 +2901,11 @@ class BatchPrefillTSWrapper:
             to the scale retained by the plan.
         output_scale : torch.Tensor, optional
             Per-run one-element float32 output scale. Defaults to the plan.
+        sage : SageAttentionParams, optional
+            Scale tensors of a Sage plan (``q_scale``, ``k_scale``, ``v_scale``
+            and, when the recipe sets ``v_mean``, ``v_mean``); required by a
+            Sage plan and rejected by any other. The prepare that gathers them
+            into the plan's buffer runs on the current stream ahead of attention.
         validate : bool
             Validate tensor structure and metadata values. Disable only when
             the caller guarantees these contracts. Output must not overlap
@@ -2729,6 +2943,13 @@ class BatchPrefillTSWrapper:
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
             )
+        if (sage is None) != (state.sage is None):
+            raise ValueError(
+                "sage=SageAttentionParams(...) is required by a Sage plan and "
+                "rejected by a plan without Sage attention"
+            )
+        if sage is not None and validate:
+            validate_sage_params(sage, state.sage.scale_shapes, device=geometry.device)
         if geometry.mask_type == "variable_window":
             if (
                 variable_window_token_starts is None
@@ -2805,6 +3026,13 @@ class BatchPrefillTSWrapper:
                 output_dtype=geometry.output_dtype,
                 head_dim_vo=geometry.head_dim_vo,
             )
+        if sage is not None:
+            state.sage.prepare(
+                sage.q_scale, sage.k_scale, sage.v_scale, sage.v_mean, state.sage.scales
+            )
+            runtime_sage_scales = state.sage.scales
+        else:
+            runtime_sage_scales = None
         state.compiled(
             q,
             k,
@@ -2817,6 +3045,7 @@ class BatchPrefillTSWrapper:
             runtime_window_starts,
             runtime_window_ends,
             runtime_window_cta_starts,
+            runtime_sage_scales,
         )
         return out
 

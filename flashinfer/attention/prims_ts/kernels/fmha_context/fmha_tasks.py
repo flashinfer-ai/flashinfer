@@ -2190,6 +2190,11 @@ def create_softmax_task(
         if smem_p is None:
             raise ValueError("p_in_smem requires the group's SMEM P resource")
         dst.append(smem_p)
+    # Sage attention reads its scales from the prepared buffer inside the
+    # softmax passes; it adds no resource to the task.
+    use_sage = tmem_sp.cfg.use_sage_attention
+    if use_sage and not p_in_smem:
+        raise ValueError("Sage attention requires P in SMEM")
 
     def softmax_schedule_body(
         sp: TmemSPResource,
@@ -2208,10 +2213,29 @@ def create_softmax_task(
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
 
-        def exp2_p(sp: TmemSPResource, *, row_max: Any, scale_softmax_log2: Any) -> Any:
+        def exp2_p(
+            sp: TmemSPResource,
+            *,
+            row_max: Any,
+            scale_softmax_log2: Any,
+            sage_q_scale: Any = None,
+            sage_k_block_scales: Any = None,
+        ) -> Any:
             """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
             with the half overlap the leading half is published behind ``pr``, else P goes
-            to the TMEM S/P stage."""
+            to the TMEM S/P stage. A Sage plan passes the work tile's ``sfQ`` and the
+            tile's per-block ``sfK`` from its max pass."""
+            if use_sage:
+                p_chunk = sp.sage_exp2_p_smem(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_block_scales=sage_k_block_scales,
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
             if p_in_smem:
                 # The S stage is released already, so exp2 and the P store are
                 # auxiliary work on the loaded S and the SMEM P tile.
@@ -2244,12 +2268,39 @@ def create_softmax_task(
             window_end = Int32(0)
             if tmem_sp.uses_variable_window:
                 window_start, window_end = sp.cache_variable_window_bounds()
+            sage_q_scale = sage_k_block_scales = None
+            if use_sage:
+                sage_q_scale, sage_k_first_atom = sp.cache_sage_scales()
+
+            def load_sage_k_scales(section: FmhaStage) -> Any:
+                """Issue the K tile's ``sfK`` loads before the wait for its scores.
+
+                The wait then hides their latency."""
+                return sp.load_sage_k_block_scales(
+                    sage_k_first_atom=sage_k_first_atom, section=section
+                )
+
+            def sage_row_max(row_max: Any, k_scales: Any, section: FmhaStage) -> Any:
+                """Row max of the dequantized scores."""
+                return sp.sage_row_max(
+                    row_max=row_max,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_block_scales=k_scales,
+                    section=section,
+                )
+
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
+                if use_sage:
+                    sage_k_block_scales = load_sage_k_scales(FmhaStage.Loop)
                 sp.wait()
                 # Compute row max and publish vec.
-                if tmem_sp.uses_variable_window:
+                if use_sage:
+                    old_row_max, row_max = sage_row_max(
+                        row_max, sage_k_block_scales, FmhaStage.Loop
+                    )
+                elif tmem_sp.uses_variable_window:
                     old_row_max, row_max = sp.variable_window_row_max(
                         row_max=row_max,
                         window_start=window_start,
@@ -2317,6 +2368,8 @@ def create_softmax_task(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_block_scales=sage_k_block_scales,
                 )
                 if s0s1_seq is None or early_token:
                     pass
@@ -2518,11 +2571,18 @@ def create_softmax_task(
                 vec.commit()
             elif tmem_sp.uses_fixed_dense_k_tail_mask:
                 # Dense tail: one more loop step with the zero-filled lanes masked out.
+                if use_sage:
+                    sage_k_block_scales = load_sage_k_scales(FmhaStage.Tail)
                 sp.wait()
-                old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                    row_max=row_max,
-                    section=FmhaStage.Tail,
-                )
+                if use_sage:
+                    old_row_max, row_max = sage_row_max(
+                        row_max, sage_k_block_scales, FmhaStage.Tail
+                    )
+                else:
+                    old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                        row_max=row_max,
+                        section=FmhaStage.Tail,
+                    )
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2541,6 +2601,8 @@ def create_softmax_task(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_block_scales=sage_k_block_scales,
                 )
                 if s0s1_seq is None:
                     pass

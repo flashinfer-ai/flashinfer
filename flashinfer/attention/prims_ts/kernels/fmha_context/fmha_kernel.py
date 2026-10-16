@@ -181,6 +181,8 @@ from .fmha_resources import (
     TmemStatsDoneResource,
     TmemPPrefixReadyResource,
 )
+from .sage_scales import validate_context_sage_layout
+from ...sage import _SageScaleLayout
 from .fmha_tasks import (
     PackedContextWorkQueue,
     create_correction_task,
@@ -695,6 +697,8 @@ def build_context_task_manager(
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
+    sage_scales: cute.Pointer | None = None,
+    num_kv_heads: int | Int32 = 0,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
     domain_n_kwargs: DomainKwargs,
@@ -716,6 +720,11 @@ def build_context_task_manager(
     SmemAllocation | None,
 ]:
     """Build the FMHA TaskManager with all resources, tasks, and dependency graph.
+
+    ``sage_scales`` is a Sage plan's prepared FP32 scale buffer
+    (``cfg.sage_scale_layout``), whose sequences are strided by
+    ``num_kv_heads``; the softmax groups and the correction warps read it in
+    place.
 
     ``scale_softmax_log2`` and ``output_scale`` are optional one-element
     float32 device tensors. Resource setup loads element 0 once before the K/V
@@ -1198,6 +1207,8 @@ def build_context_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         smem_p=smem_p0,
+        sage_scales=sage_scales,
+        num_kv_heads=num_kv_heads,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1221,6 +1232,8 @@ def build_context_task_manager(
         cfg=cfg,
         stage_idx=0,
         tmem_vec_resource=tmem_vec0,
+        sage_scales=sage_scales,
+        num_kv_heads=num_kv_heads,
         name="smem_o_0",
     )
     gmem_o_0 = GmemOResource(
@@ -1291,6 +1304,8 @@ def build_context_task_manager(
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             smem_p=smem_p1,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1306,6 +1321,8 @@ def build_context_task_manager(
             cfg=cfg,
             stage_idx=1,
             tmem_vec_resource=tmem_vec1,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
             name="smem_o_1",
         )
         gmem_o_1 = GmemOResource(
@@ -2145,6 +2162,36 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
     cfg.num_regs_other = 112
 
 
+def _configure_sage_attention(cfg: FmhaConfig, layout: _SageScaleLayout) -> None:
+    """Bind a Sage plan's scale layout to the dense query-paired FP8 schedule.
+
+    Sage attention runs on the dense query-paired D128 schedule with FP8 P
+    staged in SMEM, in its single-CTA or two-CTA UMMA form. Its row max
+    reduces 16-column score blocks, with LDTM.STAT where the hardware has it.
+    """
+    validate_context_sage_layout(layout, cfg.kv_tile_n)
+    if (
+        cfg.single_qkv_instance
+        or cfg.head_paired
+        or cfg.is_causal
+        or cfg.has_variable_window
+        or cfg.use_paged_kv
+        or cfg.split_kv_pipelines
+        or cfg.kv_tile_start_window_size_left > 0
+    ):
+        raise ValueError("Sage attention requires the dense query-paired D128 schedule")
+    if not cfg.p_in_smem:
+        raise ValueError(
+            "Sage attention requires E4M3 Q/K/V with a 16-bit output (P in SMEM)"
+        )
+    if (
+        layout.headdim != cfg.pv_mma_tiler[1]
+        or layout.q_tokens_per_tile != cfg.q_tile_m
+    ):
+        raise ValueError("the Sage scale layout does not match the kernel's tiles")
+    cfg.sage_scale_layout = layout
+
+
 def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
     """Stage fp8 P in SMEM for the dense query-paired D128 schedule with a 16-bit
     output. It needs a 128-byte P row, one SW128 atom, and an O tile stored in
@@ -2586,6 +2633,8 @@ def build_fmha_task_manager(
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
+    sage_scales: cute.Pointer | None = None,
+    num_kv_heads: int | Int32 = 0,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
@@ -2674,6 +2723,8 @@ def build_fmha_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        sage_scales=sage_scales,
+        num_kv_heads=num_kv_heads,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -2794,6 +2845,7 @@ class FmhaTs:
         exhaustive_deadlock_race_check: bool = True,
         d_v: int | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
+        sage_scale_layout: _SageScaleLayout | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3041,6 +3093,8 @@ class FmhaTs:
             window_size_left=window_size_left,
             has_variable_window=has_variable_window,
         )
+        if sage_scale_layout is not None:
+            _configure_sage_attention(cfg, sage_scale_layout)
 
     # ---------------------------------------------------------------------------
     # Host entry point
@@ -3065,6 +3119,7 @@ class FmhaTs:
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
+        sage_scales: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3072,8 +3127,11 @@ class FmhaTs:
         device tensors. Example host values are
         ``[math.log2(math.e) / math.sqrt(d)]`` for the softmax scale and
         ``[1.0]`` for FP16 output. FP8 callers may fold Q/K/V and output
-        quantization scales into these runtime tensors.
+        quantization scales into these runtime tensors. ``sage_scales`` is a
+        Sage plan's prepared FP32 scale buffer (``cfg.sage_scale_layout``).
         """
+        if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
+            raise ValueError("sage_scales is required by, and only by, a Sage kernel")
         cfg = self.cfg
         if cutlass.const_expr(
             cfg.use_paged_kv
@@ -3297,13 +3355,16 @@ class FmhaTs:
                 # k_cute is the page pool — its sequence axis is per-page,
                 # not the logical max_seq_len_kv. Caller must pass it in.
                 s_k = max_seqlen_k
+                h_kv = k_cute.shape[1]
             else:
                 s_k = k_cute.shape[1]
+                h_kv = k_cute.shape[2]
         else:
             b = cute.size(cum_seqlen_q) - 1
             s_q = max_seqlen_q
             h_q = o_cute.shape[1]
             s_k = max_seqlen_k
+            h_kv = k_cute.shape[1]
 
         num_seq_tiles = cute.ceil_div(s_q, cfg.cta_tiler[0])
         num_kv_tiles = cute.ceil_div(s_k, cfg.kv_tile_n)
@@ -3374,6 +3435,11 @@ class FmhaTs:
             if cutlass.const_expr(seq_lens_kv is not None)
             else None
         )
+        sage_scales_iter = (
+            sage_scales.iterator
+            if cutlass.const_expr(sage_scales is not None)
+            else None
+        )
 
         self.kernel(
             tma_q_desc,
@@ -3396,6 +3462,8 @@ class FmhaTs:
             variable_window_token_ends,
             variable_window_cta_starts,
             Int32(s_q),
+            sage_scales_iter,
+            Int32(h_kv),
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -3436,6 +3504,8 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None,
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
+        sage_scales: cute.Pointer | None,
+        num_kv_heads: Int32,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -3445,6 +3515,8 @@ class FmhaTs:
         device tensors passed through to the TS resources. The resources load
         element 0 in auxiliary setup before the K/V loop, so the hot loop uses
         the cached task-local values rather than reloading global memory.
+        ``sage_scales`` is a Sage plan's prepared scale buffer, whose
+        sequences are strided by ``num_kv_heads``.
 
         Structure:
         1. Prefetch TMA descriptors
@@ -3500,6 +3572,8 @@ class FmhaTs:
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
             q_offset=q_offset,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,

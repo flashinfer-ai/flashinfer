@@ -868,6 +868,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "window_left",
         "sm_scale",
         "output_scale",
+        "sage",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -887,9 +888,12 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "out",
         "scale_softmax_log2",
         "output_scale",
+        "sage",
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
+    assert plan_parameters["sage"].default is None
+    assert run_parameters["sage"].default is None
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
     assert run_parameters["variable_window_cta_starts"].kind is (
