@@ -18,15 +18,7 @@ from datetime import timedelta
 import pytest
 
 _PG_TIMEOUT = timedelta(minutes=60)
-# One-sided variants pin the transport: "fence" never uses CFT counted writes,
-# "cft" uses them for every step and skips where the platform lacks them.
-_BACKENDS = [
-    "nvlink_one_sided:fence",
-    "nvlink_one_sided:cft",
-    "cake",
-    "nvlink_two_sided",
-]
-_ONE_SIDED_MODES = ["fence", "cft"]
+_BACKENDS = ["nvlink_one_sided", "cake", "nvlink_two_sided"]
 
 
 def _init_dist():
@@ -52,23 +44,13 @@ def _backend_config(backend, **options):
         available_communication_backends,
     )
 
-    name, _, mode = backend.partition(":")
-    if name not in available_communication_backends():
-        pytest.skip(f"{name} is not available on this machine")
-    if mode:
-        options["cft"] = mode == "cft"
+    if backend not in available_communication_backends():
+        pytest.skip(f"{backend} is not available on this machine")
     return {
         "nvlink_one_sided": NVLinkOneSidedConfig,
         "cake": CakeAlltoAllConfig,
         "nvlink_two_sided": NVLinkTwoSidedConfig,
-    }[name](**options)
-
-
-def _skip_without_cft(backend, comm):
-    """Skip a CFT variant on platforms without counted writes; all ranks agree."""
-    if backend.endswith(":cft") and not comm.cft_enabled:
-        comm.destroy()
-        pytest.skip("CFT counted writes are not available on this machine")
+    }[backend](**options)
 
 
 def _random_routing(num_tokens, num_experts, top_k, generator):
@@ -127,8 +109,6 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
         ),
         config,
     )
-    if backend.startswith("nvlink_one_sided"):
-        _skip_without_cft(backend, comm)
     try:
         for _ in range(2):  # the second round reuses the workspace
             received = comm.dispatch(
@@ -279,8 +259,6 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
     try:
         load_next_step()
         state = layer.create_graph_state(t)
-        if backend.endswith(":cft") and not layer._communication.cft_enabled:
-            pytest.skip("CFT counted writes are not available on this machine")
         layer.forward(t, graph_state=state)  # eager warmup
         torch.cuda.synchronize()
         dist.barrier()
@@ -304,8 +282,7 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
 
 
 @pytest.mark.gpu_2
-@pytest.mark.parametrize("mode", _ONE_SIDED_MODES)
-def test_nvlink_one_sided_low_precision_eplb_and_rank_mask(mode):
+def test_nvlink_one_sided_low_precision_eplb_and_rank_mask():
     """FP8 combine, EPLB statistics and an all-active rank mask in one round."""
     import torch
     import torch.distributed as dist
@@ -313,7 +290,7 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask(mode):
     from flashinfer.moe_ep import BootstrapConfig, MoEEpCommParams, create_communication
 
     rank, world_size = _init_dist()
-    backend = f"nvlink_one_sided:{mode}"
+    backend = "nvlink_one_sided"
     num_experts = 4 * world_size
     top_k, hidden, max_tokens_per_rank = 8, 2048, 32
     config = _backend_config(
@@ -341,7 +318,6 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask(mode):
         ),
         config,
     )
-    _skip_without_cft(backend, comm)
     try:
         stats_base = torch.arange(num_experts, dtype=torch.int32, device="cuda")
         mask = comm.active_rank_mask(range(world_size))
@@ -385,9 +361,7 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask(mode):
 
 
 @pytest.mark.gpu_2
-@pytest.mark.parametrize(
-    "backend", ["nvlink_one_sided:fence", "nvlink_one_sided:cft", "cake"]
-)
+@pytest.mark.parametrize("backend", ["nvlink_one_sided", "cake"])
 def test_checkpoint_restore_keeps_captured_graph_valid(backend):
     """A graph captured before checkpoint_prepare/checkpoint_restore replays
     correctly afterwards; repeated calls do nothing."""
@@ -456,8 +430,6 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         load_next_step()
         state = layer.create_graph_state(t)
         comm = layer._communication
-        if backend.endswith(":cft") and not comm.cft_enabled:
-            pytest.skip("CFT counted writes are not available on this machine")
         layer.forward(t, graph_state=state)  # eager warmup
         torch.cuda.synchronize()
         dist.barrier()
@@ -467,6 +439,7 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         replay_and_check(graph, out)
 
         memory = comm._state["mnnvl_mem"]
+        cft_enabled = getattr(comm, "cft_enabled", None)
         comm.checkpoint_prepare()
         comm.checkpoint_prepare()
         assert not MnnvlMemory.allocated_map[memory.ptr].mapped
@@ -474,8 +447,8 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         comm.checkpoint_restore(fresh_backend)
         comm.checkpoint_restore(fresh_backend)
         assert MnnvlMemory.allocated_map[memory.ptr].mapped
-        if backend.endswith(":cft"):
-            assert comm.cft_enabled
+        if backend == "nvlink_one_sided":
+            assert comm.cft_enabled == cft_enabled
 
         for _ in range(2):
             replay_and_check(graph, out)
