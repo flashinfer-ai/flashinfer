@@ -478,7 +478,7 @@ def run(args):
     capability = torch.cuda.get_device_capability(device)
     # build.json (``cake_build``) is the only record of the sources and digests of
     # the fused libraries this run exercised; sources.json names their stems only.
-    libraries = {entry["name"]: entry for entry in cake_build._manifest()["libraries"]}
+    libraries = {entry["name"]: entry for entry in cake_build.manifest()["libraries"]}
     fused = [
         role + ("_mxfp8" if args.mxfp8 else "") + ("_clamped" if limit else "")
         for role in ("forward", "backward")

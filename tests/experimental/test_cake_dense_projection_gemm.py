@@ -762,7 +762,7 @@ def test_registry_records_are_well_formed():
     )
     # build.json (``cake_build``) is the only record of what to compile; the registry names its
     # entries ``<library>_<arch>``
-    manifest = cake_build._manifest()
+    manifest = cake_build.manifest()
     libraries = {entry["name"]: entry for entry in manifest["libraries"]}
     assert len(libraries) == len(manifest["libraries"])  # names unique
     assert set(cake_jit.KERNELS) == set(cake_jit.ARCHES) == set(manifest["arch_flags"])

@@ -583,7 +583,7 @@ def test_registry_record_is_well_formed():
     assert cake_jit.STAGES[0] == "fwd" and cake_jit.PROGRAM == "cake_dsa_h64_train"
     # build.json (``cake_build``) is the only record of what to compile; the registry names its
     # entries ``<library>_<arch>`` per stage
-    manifest = cake_build._manifest()
+    manifest = cake_build.manifest()
     libraries = {entry["name"]: entry for entry in manifest["libraries"]}
     assert len(libraries) == len(manifest["libraries"])  # names unique
     assert set(record["arches"]) <= set(manifest["arch_flags"])

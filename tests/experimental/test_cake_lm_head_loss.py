@@ -329,7 +329,7 @@ def test_registry_records_are_well_formed():
     assert set(CONTRACT_ALIASES.values()) <= set().union(*_STAGE_VALUES.values())
     # build.json (``cake_build``) is the only record of what to compile; the registry names its
     # entries ``<library>_<arch>`` per stage
-    manifest = cake_build._manifest()
+    manifest = cake_build.manifest()
     libraries = {entry["name"]: entry for entry in manifest["libraries"]}
     assert len(libraries) == len(manifest["libraries"])  # names unique
     package = Path(cake_jit.__file__).resolve().parent
@@ -2013,7 +2013,7 @@ def test_toolchain_workaround_flags():
     """The CUDA 13.0 ptxas workaround (``-Xptxas -O0``) is build data: every sm_103a entry of ``build.json``
     carries it under ``nvcc_flags_if`` for CUDA 13.0 only, and no sm_100a entry carries it."""
     workaround = {"cuda": "==13.0", "flags": ["-Xptxas", "-O0"]}
-    entries = cake_build._manifest()["libraries"]
+    entries = cake_build.manifest()["libraries"]
     for arch in sorted({record["arch"] for record in cake_jit.MODULES.values()}):
         of_arch = [entry for entry in entries if entry["arch"] == arch]
         assert of_arch, arch
