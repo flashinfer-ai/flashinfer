@@ -45,7 +45,7 @@ Paths below are relative to `src/blackwell_genphase_sources/`.
 | File | Blackwell port |
 | --- | --- |
 | `__init__.py` | Export only `BlackwellInferenceGenphaseMegaMoE` from the Blackwell subtree. |
-| `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Fix architecture to SM100, select native 1x MMA and the 512-column TMEM plan; admit MXFP8 E4M3, N128/CGA4 or N64/CGA2/CGA4, grouped scheduling and separate BF16 reduction. Include the architecture in the generated kernel identity. SM103 uses the same device plan with its native compiler target. |
+| `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Fix architecture to SM100, select native 1x MMA and the 512-column TMEM plan; admit MXFP8 E4M3, N128/CGA4 or N64/CGA2/CGA4, grouped scheduling and separate BF16 reduction. Include the architecture in the generated kernel identity. Query shared-memory capacity through the existing `cutlass.utils` import for DSL 4.7 compatibility. SM103 uses the same device plan with its native compiler target. |
 | `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | Use native K32 MMA (four instructions per K128 stage), two-dimensional Blackwell helper shapes, fixed N and static two-CTA B-row ownership. Remove Rubin helper imports and dynamic-N paths. Disable dynamic Gather for the fixed-N atom: load complete B tiles with static transaction counts. N64 uses seven disjoint accumulator stages and two gather warps at CGA4 (four at CGA2); N128 uses three stages and four gather warps. |
 | `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py` | Rename the independently owned workspace labels and architecture descriptions; preserve device computation. |
 | `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py` | Identify the Blackwell-owned adapter; preserve scheduling/tensor-view behavior. |
@@ -64,9 +64,11 @@ The six existing GenPhase names are also lazily re-exported by
 
 Supported: native SM100/SM103, MXFP8 E4M3, SwiGLU, BF16 combine with separate
 reduction, grouped N128/CGA4 or N64/CGA2/CGA4, early/late top-k weights and
-capacity at most 1024 per rank. N128/CGA4 remains the default; N64 requires an
-explicit tile/cluster selection. Blackwell's default backend heuristics do not
-select this path. NVFP4, dynamic N and in-kernel reduction are outside this port.
+capacity at most 1024 per rank. The low-level config retains N128/CGA4 defaults.
+The explicit GenPhase backend resolves performance knobs from an exact workload
+cache or geometry estimate and supports collective warmup tuning. Blackwell's
+default backend selection does not select this path. NVFP4, dynamic N and
+in-kernel reduction are outside this port.
 
 Native correctness is covered in the existing Blackwell workspace, oracle and
 multirank graph test files; no new test file is required. Host construction
@@ -77,3 +79,13 @@ The SM100 MXFP8 backend exposes this fork through the explicit
 pooling. Its default remains legacy inference. The GenPhase public API also
 exposes prequantized weight conversion and external-weight validation; these
 are host adapters and do not change the raw-source inventory above.
+
+
+## Shared-memory capacity API compatibility (2026-10-15)
+
+The isolated follow-up at PR head `c8c67ae67aeab08311b00c83005152e85217da4f`
+uses the already imported `cutlass.utils.get_smem_capacity_in_bytes` API.
+DSL 4.7.1 has no `cutlass.memory` module. Architecture and occupancy inputs,
+device code, vendor-drop identity and every other raw dependency are preserved.
+The same one-line change passed native B300 EP1/EP2 checks on the previous PR
+head; the new public-layer adapters are qualified separately.

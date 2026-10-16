@@ -506,7 +506,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     ) -> Tuple[BlockScaledSwapAbFc12MainloopGenSpecialized, SmemWorkspace]:
         # The communication component builds its own SMEM workspace for its own
         # launch, so nothing of it is charged against this kernel's budget.
-        smem_limit = cutlass.memory.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
+        smem_limit = utils.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
         smem_workspace = SmemWorkspace()
         self.scheduler.register_smem_regions(smem_workspace)
         self.epilogue.register_smem_regions(smem_workspace)

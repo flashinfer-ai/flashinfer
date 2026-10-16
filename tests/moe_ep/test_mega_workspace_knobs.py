@@ -123,7 +123,7 @@ def test_blackwell_genphase_backend_selects_own_workspace(
     monkeypatch.setattr(pkg, "Sm100GenphaseSymmBuffer", allocator)
     assert kernel._allocate_workspace(fleet) is mock.sentinel.workspace
     config = allocator.call_args.args[0]
-    assert config.resolved_mma_tiler_mnk == (tile or (256, 128, 128))
+    assert config.resolved_mma_tiler_mnk == (tile or (256, 64, 128))
     assert config.cluster_shape_mn == (cluster or (4, 1))
     assert config.fc2_use_bulk and not config.reduce_topk_in_kernel
     assert kernel._workspace_pool_key(fleet)[-1] == config
@@ -145,16 +145,95 @@ def test_blackwell_genphase_backend_selects_own_workspace(
 
 
 @pytest.mark.parametrize(
+    "tile,cluster,hint",
+    [
+        (None, None, 148),
+        ((256, 128, 128), (4, 1), 148),
+        ((256, 64, 128), (4, 1), 148),
+        ((256, 64, 128), (2, 1), 296),
+    ],
+)
+def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: mock.Mock(major=10, minor=3, multi_processor_count=148),
+    )
+
+    def make(**overrides):
+        params = dict(
+            intermediate_size=1024,
+            top_k=8,
+            kernel_variant="genphase",
+            mma_tiler_mnk=tile,
+            cluster_shape_mn=cluster,
+        )
+        params.update(overrides)
+        backend = create_mega_kernel(
+            Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(**params)
+        )
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False)
+        )
+        return backend
+
+    fleet = FleetParams(
+        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
+    )
+    kernel = make()
+    resolved = kernel._genphase_config(fleet)
+    assert resolved.schedule_policy == ("grouped", hint)
+    explicit = make(schedule_policy=("grouped", hint))
+    original = make(schedule_policy=("grouped", None))
+    assert kernel._workspace_pool_key(fleet) == explicit._workspace_pool_key(fleet)
+    assert kernel._workspace_pool_key(fleet) != original._workspace_pool_key(fleet)
+
+    assert original._genphase_config(fleet).schedule_policy == ("grouped", None)
+    # The rule depends on geometry and hardware, not one benchmark shape.
+    for kwargs in (
+        dict(top_k=6),
+        dict(intermediate_size=2048),
+        dict(gate_up_clamp=10.0),
+    ):
+        assert make(**kwargs)._genphase_config(fleet).schedule_policy == (
+            "grouped",
+            hint,
+        )
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {"kernel_variant": "unknown"},
         {"kernel_variant": "genphase", "capacity": 1025},
         {"kernel_variant": "genphase", "kind": "mxfp8_e5m2"},
-        {"kernel_variant": "genphase", "knobs": "auto"},
-        {"kernel_variant": "genphase", "knobs": {}},
+        {"kernel_variant": "genphase", "knobs": "bad"},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", 0)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", -1)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", True)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", 1.5)},
+        {"kernel_variant": "genphase", "schedule_policy": ("phase_interleave", None)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped",)},
+        {"kernel_variant": "genphase", "schedule_policy": ["grouped", 148]},
+        {"schedule_policy": ("grouped", None)},
+        {"kernel_variant": "genphase", "knobs": {"group_hint": 4}},
         {"kernel_variant": "genphase", "enable_in_kernel_fc2_reduce": True},
         {"kernel_variant": "genphase", "hidden": 192},
-        {"kernel_variant": "genphase", "cluster_shape_mn": (2, 1)},
+        {
+            "kernel_variant": "genphase",
+            "mma_tiler_mnk": (256, 128, 128),
+            "cluster_shape_mn": (2, 1),
+        },
         {"mma_tiler_mnk": (256, 64, 128)},
     ],
 )

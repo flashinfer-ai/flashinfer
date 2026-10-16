@@ -1186,3 +1186,157 @@ def test_mxfp8_cutedsl_mega_kernel_is_registered():
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
+
+
+@pytest.mark.arch_blackwell
+def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
+    """Real collective sweep, stable I/O, persisted selection and changing routes."""
+    import dataclasses
+    import tempfile
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    _require_cuda()
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/103")
+    rank, world = _launcher_ranks()
+    if world not in (1, 2, 4):
+        pytest.skip("EP1/2/4")
+    if world == 1:
+        monkeypatch.setenv("MEGA_NO_DIST", "1")
+    # Multi-rank CI runs on one node; every process reads the same cache file.
+    path = (
+        Path(tempfile.gettempdir())
+        / f"genphase-auto-{os.environ.get('MASTER_PORT', os.getpid())}-{world}.json"
+    )
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
+    capacity, tokens, hidden, intermediate, topk = 129, 17, 384, 192, 3
+    experts = 8 * world
+    fleet = FleetParams(
+        num_experts=experts,
+        max_tokens_per_rank=capacity,
+        token_hidden_size=hidden,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(717 + rank)
+    weights = MoEWeightPack(
+        (
+            torch.randn(8, 2 * intermediate, hidden, generator=generator, device="cuda")
+            / hidden**0.5
+        ).bfloat16(),
+        (
+            torch.randn(8, hidden, intermediate, generator=generator, device="cuda")
+            / intermediate**0.5
+        ).bfloat16(),
+    )
+    x = torch.randn(tokens, hidden, generator=generator, device="cuda").bfloat16()
+    ids = (
+        torch.arange(tokens * topk, device="cuda").reshape(tokens, topk) + 7 * rank
+    ) % experts
+    inputs = MoEEpTensors(
+        hidden_states=x,
+        topk_ids=ids.clone(),
+        topk_weights=torch.full((tokens, topk), 1 / topk, device="cuda"),
+    )
+    layers = []
+    try:
+
+        def create(knobs):
+            layer = MoEEpLayer(
+                BootstrapConfig(rank=rank, world_size=world),
+                fleet,
+                weights,
+                backend=MegaConfig(
+                    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                        intermediate, topk, kernel_variant="genphase", knobs=knobs
+                    )
+                ),
+            )
+            layers.append(layer)
+            return layer
+
+        with pytest.warns(UserWarning, match="COLLECTIVE"):
+            layer = create("auto")
+        if rank == 0:
+            path.unlink(missing_ok=True)
+        if world > 1:
+            dist.barrier()
+        ws = layer._ensure_workspace()
+        pointers = [
+            getattr(ws, n).data_ptr()
+            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
+        ]
+        layer.warmup(inputs)
+        winner = {
+            k: getattr(ws.config, k)
+            for k in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
+        }
+        assert pointers == [
+            getattr(ws, n).data_ptr()
+            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
+        ]
+        selected = layer.forward(inputs, return_workspace_view=True).clone()
+        cached = create(None)
+        assert cached.live_token_buckets(capacity) == [tokens]
+        handle = cached.create_workspace(capacity, live_tokens=tokens)
+        cached.warmup(inputs, workspace=handle)
+        cached_ws = handle._backend_workspace
+        assert all(getattr(cached_ws.config, k) == v for k, v in winner.items())
+        assert torch.equal(
+            selected,
+            cached.forward(inputs, workspace=handle, return_workspace_view=True),
+        )
+        # Force the other geometry before capture to exercise workspace resizing
+        # even when the heuristic happened to win the empirical sweep.
+        alternative = dict(
+            mma_tiler_mnk=(256, 128, 128),
+            cluster_shape_mn=(4, 1),
+            schedule_policy=("grouped", None),
+        )
+        if ws.config.resolved_mma_tiler_mnk[1] == 128:
+            alternative.update(mma_tiler_mnk=(256, 64, 128), cluster_shape_mn=(2, 1))
+        ws.retune(alternative)
+        assert dataclasses.replace(ws.config, **alternative) == ws.config
+        assert pointers == [
+            getattr(ws, n).data_ptr()
+            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
+        ]
+        assert torch.equal(selected, layer.forward(inputs, return_workspace_view=True))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = layer.forward(inputs, return_workspace_view=True)
+        for state in ("empty", "holes", "restored"):
+            inputs.topk_ids.copy_(ids)
+            if state == "empty":
+                inputs.topk_ids.fill_(-1)
+            elif state == "holes":
+                inputs.topk_ids[::2, 1:] = -1
+            for _ in range(65):
+                graph.replay()
+            torch.cuda.synchronize()
+            indices, expected = pkg.sampled_reference(ws, *layer._transformed, tokens)
+            error = torch.tensor(
+                pkg.output_error(output, indices, expected), device="cuda"
+            )
+            if world > 1:
+                dist.all_reduce(error, op=dist.ReduceOp.MAX)
+            assert error.item() < 0.02
+        del graph
+    finally:
+        for layer in reversed(layers):
+            layer.destroy()
+        if rank == 0:
+            path.unlink(missing_ok=True)
