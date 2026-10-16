@@ -28,12 +28,17 @@ instructions; outputs and the updated state are bitwise equal to the generic
 kernel. ``backend="rubin"`` forces it (any batch size, Rubin only) and
 ``backend="flashinfer"`` keeps the generic kernel.
 
-With ``ugpu_row_split=n`` the call is also localized per die: rows ``[0, n)`` run
-on die 0's SMs and the rest on die 1's (green contexts, two launches forked from
-and joined back to the current stream). Allocate the state pool with
-:func:`flashinfer.green_ctx.empty_by_locality_domain` and order the batch so that
-rows below ``n`` use slots in die 0's half; then no state byte crosses the
-die-to-die link. On Rubin VR200 this takes B=512, HV=64 from ~163 us to ~131 us.
+uGPU localization: Rubin is built from two dies, each with its own SMs and
+memory. Allocate the state pool with :func:`ugpu_state_pool` (layout
+``[pool_size, HV, 2, V // 2, K]``, half ``t`` of every state in die ``t``'s
+memory) and every T=1 call on Rubin runs half ``t`` on die ``t``'s SMs, so no
+state byte crosses the die-to-die link, whatever the batch order or slot
+indices. Results are bitwise equal to the one-launch kernel.
+
+.. autosummary::
+    :toctree: ../generated
+
+    ugpu_state_pool
 
 ReplaySSM speculative verification (SM100/SM103)
 ---------------------------------------------

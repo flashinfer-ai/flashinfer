@@ -330,7 +330,7 @@ def split_device_green_ctx_by_locality_domain(
     Create one green context per locality domain (uGPU) of ``dev`` and return its stream
     and ``CUdevResource``, in domain order. A kernel launched on stream ``i`` runs only on
     domain ``i``'s SMs, so together with memory placed in that domain
-    (:func:`empty_by_locality_domain`) its DRAM traffic stays on the die.
+    (:func:`empty_per_locality_domain`) its DRAM traffic stays on the die.
 
     Args:
         dev: The device to split.
@@ -377,7 +377,7 @@ def split_device_green_ctx_by_locality_domain(
 
 
 class _LocalizedAllocation:
-    """Owner of an :func:`empty_by_locality_domain` mapping; torch keeps it alive."""
+    """Owner of an :func:`empty_per_locality_domain` mapping; torch keeps it alive."""
 
     def __init__(self, ptr: int, nbytes: int, typestr: str):
         self.__cuda_array_interface__ = {
@@ -396,41 +396,39 @@ def _unmap_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
     checkCudaErrors(driver.cuMemAddressFree(ptr, va_bytes))
 
 
-def empty_by_locality_domain(
-    shape: Tuple[int, ...], dtype: torch.dtype, dev: torch.device
-) -> Tuple[torch.Tensor, List[int]]:
+def empty_per_locality_domain(
+    part_shape: Tuple[int, ...], dtype: torch.dtype, dev: torch.device
+) -> torch.Tensor:
     r"""
-    Allocate an uninitialized, contiguous tensor whose rows (dim 0) are split between the
-    locality domains of ``dev``: rows ``[row_starts[i], row_starts[i + 1])`` live in domain
-    ``i``'s memory. One virtual address range is mapped onto per-domain physical memory, so
-    the result is an ordinary tensor (e.g. a state pool indexed by slot).
+    Allocate an uninitialized tensor of shape ``[num_domains, *part_shape]`` whose part ``i``
+    lives in locality domain ``i``'s memory (one virtual address range over per-domain
+    physical memory). Each part is contiguous; the stride of dim 0 is the part size rounded
+    up to the allocation granularity. The memory is released when the tensor and all its
+    views are freed.
 
-    The split points are ``i * shape[0] // num_domains`` rounded down to the allocation
-    granularity. The memory is released when the tensor and all its views are freed.
+    Example: :func:`flashinfer.gdn_decode.ugpu_state_pool` builds a GDN state pool from two
+    parts, so that each die reads and writes only its own half of every state.
 
     Args:
-        shape: Tensor shape; dim 0 is split between the domains.
+        part_shape: Shape of one part.
         dtype: Element type.
         dev: CUDA device with at least two locality domains.
 
     Returns:
-        tensor: The tensor.
-        row_starts: ``num_domains + 1`` row boundaries (first is 0, last is ``shape[0]``).
+        The tensor.
     """
     num_domains = get_locality_domain_count(dev)
     if num_domains < 2:
         raise RuntimeError(
-            f"{dev} exposes {num_domains} locality domain(s); empty_by_locality_domain "
+            f"{dev} exposes {num_domains} locality domain(s); empty_per_locality_domain "
             "needs at least two"
         )
     dev = torch.device(
         "cuda", dev.index if dev.index is not None else torch.cuda.current_device()
     )
     cu_dev = get_cudevice(dev)
-    rows = shape[0]
-    row_bytes = torch.tensor([], dtype=dtype).element_size()
-    for s in shape[1:]:
-        row_bytes *= s
+    elem = torch.tensor([], dtype=dtype).element_size()
+    part_elems = math.prod(part_shape)
 
     def prop_for(domain: int):
         prop = driver.CUmemAllocationProp()
@@ -450,37 +448,29 @@ def empty_by_locality_domain(
             )
         )
     )
-    # rows per granularity-aligned chunk, so every domain except the last starts aligned
-    step = gran // math.gcd(row_bytes, gran) if row_bytes else 1
-    row_starts = [
-        ((i * rows) // num_domains) // step * step for i in range(num_domains)
-    ]
-    row_starts.append(rows)
-    sizes = [
-        round_up((row_starts[i + 1] - row_starts[i]) * row_bytes, gran)
-        for i in range(num_domains)
-    ]
-    va_bytes = max(sum(sizes), gran)
+    part_bytes = max(round_up(part_elems * elem, gran), gran)
+    va_bytes = num_domains * part_bytes
     ptr = int(checkCudaErrors(driver.cuMemAddressReserve(va_bytes, 0, 0, 0)))
     chunks = []
-    offset = 0
-    for i, size in enumerate(sizes):
-        if size == 0:
-            continue
-        handle = checkCudaErrors(driver.cuMemCreate(size, prop_for(i), 0))
-        checkCudaErrors(driver.cuMemMap(ptr + offset, size, 0, handle, 0))
-        chunks.append((offset, size, handle))
-        offset += size
+    for i in range(num_domains):
+        handle = checkCudaErrors(driver.cuMemCreate(part_bytes, prop_for(i), 0))
+        checkCudaErrors(driver.cuMemMap(ptr + i * part_bytes, part_bytes, 0, handle, 0))
+        chunks.append((i * part_bytes, part_bytes, handle))
     access = driver.CUmemAccessDesc()
     access.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
     access.location.id = int(cu_dev)
     access.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-    if offset:
-        checkCudaErrors(driver.cuMemSetAccess(ptr, offset, [access], 1))
-    nbytes = rows * row_bytes
-    owner = _LocalizedAllocation(ptr, nbytes, "|u1")
+    checkCudaErrors(driver.cuMemSetAccess(ptr, va_bytes, [access], 1))
+    owner = _LocalizedAllocation(ptr, va_bytes, "|u1")
     weakref.finalize(
         owner, _unmap_localized, dev.index, ptr, va_bytes, chunks
     ).atexit = False
-    flat = torch.as_tensor(owner, device=dev)
-    return flat.view(dtype).view(shape), row_starts
+    flat = torch.as_tensor(owner, device=dev).view(dtype)
+    inner = []
+    stride = 1
+    for size in reversed(part_shape):
+        inner.append(stride)
+        stride *= size
+    return torch.as_strided(
+        flat, (num_domains, *part_shape), (part_bytes // elem, *reversed(inner))
+    )

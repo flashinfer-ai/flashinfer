@@ -28,4 +28,4 @@ domain keeps its DRAM traffic off the die-to-die link.
 
     get_locality_domain_count
     split_device_green_ctx_by_locality_domain
-    empty_by_locality_domain
+    empty_per_locality_domain

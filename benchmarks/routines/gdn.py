@@ -220,8 +220,9 @@ def parse_gdn_args(line, parser):
         help="Kernel backends to benchmark. 'triton' is available for "
         "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
         "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
-        "state; 'rubin_ugpu' is 'rubin' with uGPU localization (each die's half "
-        "of the batch and of the state pool on that die). On decode, "
+        "state; 'rubin_ugpu' is 'rubin' with uGPU localization (a "
+        "ugpu_state_pool: each die updates the half of every state in its own "
+        "memory). On decode, "
         "'flashinfer' is the generic FlashInfer kernel.",
     )
 
@@ -302,8 +303,6 @@ def parse_gdn_args(line, parser):
                 "The rubin / rubin_ugpu backends are only available for "
                 "gated_delta_rule_decode with --state_dtype bfloat16"
             )
-        if "rubin_ugpu" in args.backends and args.pool_mode != "single":
-            raise ValueError("The rubin_ugpu backend supports --pool_mode single")
 
     if is_prefill:
         if any(x in args.backends for x in ("rubin", "rubin_ugpu")):
@@ -571,17 +570,18 @@ def _testGdnDecodeLike(args, seq_len):
     state_writeback = True if (not is_mtp or use_bf16_state) else args.update_state
     disable_state_update = not state_writeback
 
-    # uGPU localization: a copy of the pool whose slot halves live in the two dies'
-    # memory; batch rows below the split read slots on die 0.
-    ugpu_pool, ugpu_row_split = None, None
+    # uGPU localization: a copy of the pool in the [pool, HV, 2, V/2, K] layout whose
+    # halves live in the two dies' memory
+    ugpu_pool = None
     if "rubin_ugpu" in backends:
-        from flashinfer.green_ctx import empty_by_locality_domain
+        from flashinfer.gdn_decode import ugpu_state_pool
 
-        ugpu_pool, row_starts = empty_by_locality_domain(
-            tuple(state_pool.shape), state_pool.dtype, device
-        )
-        ugpu_pool.copy_(state_pool)
-        ugpu_row_split = row_starts[1]
+        ugpu_pool = ugpu_state_pool(pool_size, num_sab_heads, head_size, device)
+
+        def to_ugpu(src):
+            ugpu_pool.copy_(src.view(pool_size, num_sab_heads, 2, -1, head_size))
+
+        to_ugpu(state_pool)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] Mode: {'MTP' if is_mtp else 'decode'} (T={T})")
@@ -673,7 +673,7 @@ def _testGdnDecodeLike(args, seq_len):
             # Rubin kernel with uGPU localization; refcheck passes a fresh copy of
             # the pool, timing passes state_pool itself (state then evolves in place)
             if state is not state_pool:
-                ugpu_pool.copy_(state)
+                to_ugpu(state)
             return gated_delta_rule_decode_pretranspose(
                 q,
                 k,
@@ -688,7 +688,7 @@ def _testGdnDecodeLike(args, seq_len):
                 use_qk_l2norm,
                 initial_state=ugpu_pool,
                 initial_state_indices=initial_state_indices,
-                ugpu_row_split=ugpu_row_split,
+                output_state_indices=output_state_indices,
             )[0]
         elif backend == "rubin":
             # Rubin-tuned T=1 bf16-state kernel (SM107), via the public API

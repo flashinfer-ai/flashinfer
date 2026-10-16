@@ -1294,8 +1294,10 @@ def gated_delta_rule_t1_rubin(
     HV_val = v.shape[2]
     V_val = v.shape[3]
     assert T_val == 1, f"T=1 kernel, got T={T_val}"
-    assert K_val == 128 and V_val == 128
+    # V = 64: one half of every state (uGPU localization runs each half on its own die)
+    assert K_val == 128 and V_val in (64, 128)
     assert initial_state_source.dtype == torch.bfloat16
+    tile_v = min(tile_v, V_val)
     assert tile_v in (32, 64, 128) and (tile_v // NUM_GROUPS) % ILP_ROWS == 0
     target = gdn_device_target(q.device)
     if (target.major, target.minor) != (10, 7):

@@ -229,18 +229,16 @@ def test_split_device_green_ctx_by_locality_domain():
         torch.testing.assert_close(y, x * 2)
 
 
-@pytest.mark.parametrize("rows", [1, 37, 256])
-def test_empty_by_locality_domain(rows):
+@pytest.mark.parametrize("part_shape", [(1,), (37, 32, 128, 128)])
+def test_empty_per_locality_domain(part_shape):
     dev = torch.device("cuda:0")
     _need_locality_domains(dev)
     n = green_ctx.get_locality_domain_count(dev)
-    t, row_starts = green_ctx.empty_by_locality_domain(
-        (rows, 32, 128, 128), torch.bfloat16, dev
-    )
-    assert t.shape == (rows, 32, 128, 128) and t.is_contiguous()
-    assert len(row_starts) == n + 1 and row_starts[0] == 0 and row_starts[-1] == rows
-    assert row_starts == sorted(row_starts)
-    ref = torch.randn(rows, 32, 128, 128, device=dev).to(torch.bfloat16)
+    t = green_ctx.empty_per_locality_domain(part_shape, torch.bfloat16, dev)
+    assert t.shape == (n, *part_shape)
+    for i in range(n):
+        assert t[i].is_contiguous()
+    ref = torch.randn(n, *part_shape, device=dev).to(torch.bfloat16)
     t.copy_(ref)
     assert torch.equal(t, ref)
     del t

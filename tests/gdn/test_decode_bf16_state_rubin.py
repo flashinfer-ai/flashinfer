@@ -30,10 +30,9 @@ import pytest
 import torch
 
 import flashinfer.gdn_decode as gdn_decode
-from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose, ugpu_state_pool
 from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule as generic
 from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import gated_delta_rule_t1_rubin
-from flashinfer.green_ctx import empty_by_locality_domain
 
 pytestmark = pytest.mark.arch_rubin
 
@@ -329,42 +328,49 @@ def test_rubin_api_int64_indices_fp16_inputs(pool_mode):
 
 
 def _ugpu_pool(state):
-    pool, row_starts = empty_by_locality_domain(
-        tuple(state.shape), state.dtype, state.device
-    )
-    pool.copy_(state)
-    return pool, row_starts[1]
+    """A uGPU pool [pool, HV, 2, V/2, K] holding the contents of a [pool, HV, V, K] pool."""
+    P, HV = state.shape[:2]
+    pool = ugpu_state_pool(P, HV, D, state.device)
+    pool.copy_(state.view(P, HV, 2, D // 2, D))
+    return pool
 
 
-@pytest.mark.parametrize("B,HV", [(8, 64), (64, 32), (512, 64)])
-@pytest.mark.parametrize("pool_mode", ["single", "split"])
-def test_rubin_ugpu_matches_whole_gpu(B, HV, pool_mode):
-    """uGPU localization (per-die launches, pool split across the dies' memory): the same
-    bits as the one-launch Rubin kernel."""
+def _as_4d(pool):
+    P, HV = pool.shape[:2]
+    return pool.reshape(P, HV, D, D)
+
+
+@pytest.mark.parametrize("B,HV", [(1, 64), (8, 64), (64, 32), (512, 64)])
+@pytest.mark.parametrize("pool_mode", ["single", "split", "shuffled"])
+def test_rubin_ugpu_matches_one_launch(B, HV, pool_mode):
+    """A ugpu_state_pool makes the default call run each half of every state on its own die:
+    the same bits as one launch over an ordinary pool."""
     pool, idx, out_idx = _pool(B, pool_mode)
     inp = _inputs(B, 16, 16, HV, pool, seed=B + HV + 3)
     st_ref = inp["state"].clone()
     o_ref = _api(inp, st_ref, idx, out_idx, "rubin")
-    st, slot_split = _ugpu_pool(inp["state"])
-    o = _api(inp, st, idx, out_idx, "auto", ugpu_row_split=min(slot_split, B))
+    st = _ugpu_pool(inp["state"])
+    o = _api(inp, st, idx, out_idx, "auto")
     torch.cuda.synchronize()
     assert torch.equal(o, o_ref)
-    assert torch.equal(st, st_ref)
+    assert torch.equal(_as_4d(st), st_ref)
 
 
-@pytest.mark.parametrize("row_split", [0, 3, 64])
-def test_rubin_ugpu_any_row_split(row_split):
-    """Correctness does not depend on the split or on where the pool lives."""
-    B, HV = 64, 64
-    inp = _inputs(B, 16, 16, HV, B, seed=row_split + 1)
+def test_rubin_ugpu_negative_index():
+    B, HV = 16, 64
+    inp = _inputs(B, 16, 16, HV, B, seed=13)
     idx = torch.arange(B, dtype=torch.int32, device="cuda")
+    idx[5] = -1
     st_ref = inp["state"].clone()
-    st = inp["state"].clone()
     o_ref = _api(inp, st_ref, idx, None, "rubin")
-    o = _api(inp, st, idx, None, "rubin", ugpu_row_split=row_split)
+    st = _ugpu_pool(inp["state"])
+    o = _api(inp, st, idx, None, "auto")
     torch.cuda.synchronize()
-    assert torch.equal(o, o_ref)
-    assert torch.equal(st, st_ref)
+    good = torch.ones(B, dtype=torch.bool, device="cuda")
+    good[5] = False
+    good[0] = False
+    assert torch.equal(o[good], o_ref[good])
+    assert torch.equal(_as_4d(st)[good], st_ref[good])
 
 
 def test_rubin_ugpu_cuda_graph():
@@ -375,7 +381,7 @@ def test_rubin_ugpu_cuda_graph():
     st_ref = inp["state"].clone()
     for _ in range(3):
         o_ref = _api(inp, st_ref, idx, None, "rubin")
-    st, slot_split = _ugpu_pool(inp["state"])
+    st = _ugpu_pool(inp["state"])
     out = torch.empty(B, 1, HV, D, device="cuda", dtype=torch.bfloat16)
 
     def step():
@@ -393,7 +399,6 @@ def test_rubin_ugpu_cuda_graph():
             use_qk_l2norm=True,
             initial_state=st,
             initial_state_indices=idx,
-            ugpu_row_split=slot_split,
         )
 
     step()  # eager call: creates the per-die green contexts outside capture
@@ -405,4 +410,4 @@ def test_rubin_ugpu_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, o_ref)
-    assert torch.equal(st, st_ref)
+    assert torch.equal(_as_4d(st), st_ref)
