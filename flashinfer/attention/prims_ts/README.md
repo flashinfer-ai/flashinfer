@@ -48,7 +48,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md); FP8 Sage plans: [Sage attention](#sage-attention) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
@@ -314,7 +314,10 @@ Sage attention runs the contiguous decode kernel on 8-bit Q, K and V with
 dequantization scales, in the dense and block-sparse modes of
 `BlockSparseTSWrapper` and `block_sparse_attention`. The plan fixes the recipe
 with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
-`sage=SageAttentionParams(...)`:
+`sage=SageAttentionParams(...)`. The contiguous context kernel runs the FP8
+recipe on dense fixed-length plans of `BatchPrefillTSWrapper`
+(`plan(..., sage=SageAttentionConfig(...))`, `run(..., sage=SageAttentionParams(...))`;
+see [Context plans](#context-plans)):
 
 ```text
 S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
@@ -323,7 +326,9 @@ O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
 
 `h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
-tiles and block-sparse plans, and 0 elsewhere.
+tiles and block-sparse plans, and 0 elsewhere. The context kernel keeps its
+lazy correction, which lets `p` reach `2**8`, and stores P as `p` itself
+(`C = 1`).
 
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
@@ -384,6 +389,38 @@ when a mean is used).
 
 On B200 both recipes run faster than BF16 on the same plan; the gain depends
 on the shape, and K blocks of 4 and 1 tokens cost more than 16-token blocks.
+
+### Context plans
+
+`BatchPrefillTSWrapper.plan(..., sage=SageAttentionConfig(...))` runs the
+same quantization recipe on the dense, fixed-length `[B, S, H, D]` context
+path. The scale tensors and their flat layout are those of the table above;
+`k_summary_block_size` and `k_summary_scale` have no role, since the context
+kernel has no routes. Every `run(..., sage=SageAttentionParams(...))` first
+launches the scale prepare on the current stream, then attention.
+
+| Input | Supported values |
+| --- | --- |
+| Q/K/V dtype | `torch.float8_e4m3fn` for all three |
+| Output dtype | `torch.bfloat16` or `torch.float16` |
+| `q_block_size`, `k_block_size`, `v_mean` | As for the decode kernel |
+| Geometry | `head_dim=128`, `mask_type="dense"`, fixed `packed=False` storage, `window_left=-1` |
+
+The softmax reads the K scales straight from the prepared buffer. With
+16-token or coarser K blocks it scales each 16-column block's maximum and
+exp2 multiplier; 4- and 1-token blocks dequantize the scores in place, which
+costs more. On one dense layer (B=2, S=75600, 40 heads, D=128, attention
+kernel only, GPC-clock Mcycles per call) the context kernel measured:
+
+| Plan | GB300 | B200 |
+| --- | ---: | ---: |
+| Per-tensor FP8 (no Sage) | 162 | 261 |
+| Sage, 16-token K blocks | 169 | 252 |
+| Sage, 4-token K blocks | 209 | 295 |
+| Sage, 1-token K blocks | 336 | 430 |
+
+The decode kernel's dense Sage plan on the same layer takes 202, 220 and 260
+Mcycles on GB300 for the three block sizes.
 
 ### Example
 
