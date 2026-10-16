@@ -160,7 +160,7 @@ def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
 TUNING = TuningContract(
     component_id="attention.mla",
     query_schema_version=23,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(
         {
             "mode",
