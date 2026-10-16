@@ -2370,6 +2370,8 @@ class GenphaseTokenComm(KernelComponent):
             cute.copy(load_atom, staged_runs[None, run], staged_values)
             for atom in cutlass.range_constexpr(self.refine_atoms_per_stage):
                 cute.copy(store_atom, value_atoms[None, atom], run_output[(atom_row, atom_row_group), (None, atom)])
+            # Publish every writer's generic SMEM stores before the async bulk read.
+            cute.arch.fence_proxy(kind="async.shared", space="cta")
             cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
 
             # `sf_row_begin` is atom-aligned and the run starts on an atom

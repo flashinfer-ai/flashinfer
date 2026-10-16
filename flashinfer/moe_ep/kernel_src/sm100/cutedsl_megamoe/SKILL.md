@@ -42,8 +42,8 @@ kernel_src/sm100/cutedsl_megamoe/
 Core principle: **keep `src/` equal to the kernel-team drop except for the
 explicit pending-upstream patches in `VENDOR.md`.** Reapply and requalify those
 patches after a drop until upstream absorbs them. Every adaptation (path bootstrap, symbol re-exports, API
-shims) lives in `shim/`. A new drop is a pure replace of `src/`; the only work
-is updating `shim/` to whatever the new `src/` exposes.
+shims) lives in `shim/`. A new drop replaces the source baseline; reapply the
+pending patches and update `shim/` to whatever the new `src/` exposes.
 
 Layering: `moe_ep` backends import from the package (`__init__.py`) only →
 `__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
@@ -69,8 +69,8 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's five kernel packages — no injected
-   files, no edits (the drop is a full repo; copy only these four dirs):
+1. **Replace `src/`** with the drop's five kernel packages (the drop is a full
+   repo; copy only these dirs):
    ```bash
    rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab} \
@@ -78,6 +78,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
    `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`).
+   Reapply each pending-upstream patch in `VENDOR.md` that the drop has not
+   absorbed. Requalify them with the tests under "Sparse combine and tail-reset
+   contracts" below, in addition to the tests in step 5.
 
 2. **Path bootstrap needs nothing** — it lives in `shim/_paths.py` and points at
    the sibling `src/` dir, so a verbatim drop just works. (Ignore any bootstrap
