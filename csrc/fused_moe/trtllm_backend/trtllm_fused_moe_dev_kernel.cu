@@ -968,6 +968,14 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
   int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
   bool const active = vecIdx < numVecs;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Let the next kernel launch while this one runs; it waits on this grid before reading the
+  // output.
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+
   // The permutation and the expert weights come from routing, which completed before the GEMMs
   // this kernel depends on could start, so they are read before waiting on the primary kernel
   // (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
