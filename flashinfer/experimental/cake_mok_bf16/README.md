@@ -20,8 +20,9 @@ Shared-expert weight gradients remain source-rank local.
   every weight-gradient contribution into caller-owned FP32 accumulators.
 - **Unequal per-rank source counts**, including zero, as runtime inputs.
 
-The implementation uses standalone generated CUDA sources and FlashInfer's
-TVM-FFI JIT. It preserves the original launch boundaries: three scheduler
+The implementation uses standalone generated CUDA sources, loaded prebuilt
+from `aot/` when the package ships them and otherwise built by FlashInfer's
+TVM-FFI JIT from `build.json`. It preserves the original launch boundaries: three scheduler
 kernels, metadata gathering and peer barriers, one fused forward (or
 recompute), one fused backward, separate output/input-gradient epilogues, and
 empty-expert gradient zeroing. Dispatch, GEMMs, SwiGLU, quantization, combine
@@ -116,16 +117,20 @@ memory, not work.
 
 ## Targets
 
-`sources.json` lists every kernel role with the exact targets each source
-variant was generated for. The BF16 kernels, scheduler, communication and
+`sources.json` lists every kernel role with the exact targets each variant
+was generated for, its argument plan and its architecture-free `library`
+stem; `build.json` (schema `cake-build/1`) records the sources, digests and
+nvcc flags of every `<library>_<arch>` build, and the shared `cake_build.py`
+loader loads it (prebuilt from `aot/`, else JIT). The bindings include the
+package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The BF16 kernels, scheduler, communication and
 epilogue sources are shared by SM100a, SM103a and SM107a. The MXFP8 fused
 kernels have target-specific schedules: SM100a/SM103a (512 tensor-memory
 columns) use 256 x 256 routed tiles with a six-stage operand ring, and SM107a
 (576 columns) uses 256 x 512 tiles that compute and save gate and up in one
 tile, with the K=64 block-scaled MMA. The adapter selects the variant from the
-device compute capability (10.0, 10.3 or 10.7) and compiles it for that exact
-target; SM107a requires a CUDA toolkit that supports it. Every generated
-source is checksum-verified before compilation.
+device compute capability (10.0, 10.3 or 10.7) and loads its build for that
+exact target; on the JIT path SM107a requires a CUDA toolkit that supports it
+and every generated source is checksum-verified before compilation.
 
 ## Unequal source inputs
 
