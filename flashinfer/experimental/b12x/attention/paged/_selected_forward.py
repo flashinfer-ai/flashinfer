@@ -257,9 +257,13 @@ class _SelectedPositionPagedForwardKernel:
         x2 = Uint32(0)
         x3 = Uint32(0)
         if source_base >= Int64(0):
-            x0, x1, x2, x3 = ld_global_nc_v4_u32(
-                _pointer_as_int64(source, source_base + dimension_base.to(Int64))
-            )
+            if const_expr(self.circular):
+                address = source_base + dimension_base.to(Int64)
+            else:
+                address = _pointer_as_int64(
+                    source, source_base + dimension_base.to(Int64)
+                )
+            x0, x1, x2, x3 = ld_global_nc_v4_u32(address)
         y00, y01 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x0)
         y10, y11 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x1)
         y20, y21 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x2)
@@ -599,20 +603,49 @@ class _SelectedPositionPagedForwardKernel:
                     value_base = Int64(value_bases[token])
                 if dimension_base >= Int32(self.head_dim):
                     key_base = value_base = Int64(-1)
-                self._load_fp8_vector_to_bf16_shared(
-                    key_cache,
-                    key_base,
-                    shared_key,
-                    token,
-                    dimension_base,
-                )
-                self._load_fp8_vector_to_bf16_shared(
-                    value_cache,
-                    value_base,
-                    shared_value,
-                    token,
-                    dimension_base,
-                )
+                candidate = False
+                if const_expr(self.circular):
+                    if key_base >= Int64(0):
+                        position = (
+                            query_position
+                            - Int64(self.selection_width - 1)
+                            + tile.to(Int64) * Int64(self.tile_n)
+                            + token.to(Int64)
+                        )
+                        candidate = position >= continuation[2][request_id].to(Int64)
+                if candidate:
+                    # Circular candidates retain BF16 until accepted into FP8 history.
+                    for half in cutlass.range_constexpr(2):
+                        dimension = dimension_base + Int32(half * 8)
+                        key_address = key_base + dimension.to(Int64) * Int64(2)
+                        value_address = value_base + dimension.to(Int64) * Int64(2)
+                        key_words = ld_global_nc_v4_u32(key_address)
+                        value_words = ld_global_nc_v4_u32(value_address)
+                        key_destination = shared_ptr_to_u32(
+                            shared_key.iterator
+                            + cute.crd2idx((token, dimension), shared_key.layout)
+                        )
+                        value_destination = shared_ptr_to_u32(
+                            shared_value.iterator
+                            + cute.crd2idx((token, dimension), shared_value.layout)
+                        )
+                        st_shared_v4_u32(key_destination, *key_words)
+                        st_shared_v4_u32(value_destination, *value_words)
+                else:
+                    self._load_fp8_vector_to_bf16_shared(
+                        key_cache,
+                        key_base,
+                        shared_key,
+                        token,
+                        dimension_base,
+                    )
+                    self._load_fp8_vector_to_bf16_shared(
+                        value_cache,
+                        value_base,
+                        shared_value,
+                        token,
+                        dimension_base,
+                    )
         cute.arch.sync_threads()
 
         if thread < Int32(self.qk_warps * 32):
