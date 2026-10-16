@@ -190,39 +190,22 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
   uint32_t sign = bits & 0x80000000u;
   uint32_t abs_bits = bits & 0x7FFFFFFFu;
 
-  if (abs_bits < 0x38800000u) {  // Below the smallest normal fp16 value (2^-14).
-    uint32_t exp = abs_bits >> 23;
-    // Values below 2^-37 cannot round up with only 13 bits of random noise.
-    if (exp < 90) return static_cast<uint16_t>(sign >> 16);
-    uint32_t shift = 126 - exp;  // fp16 subnormal spacing is fixed at 2^-24.
-    uint64_t mantissa = (abs_bits & 0x7FFFFFu) | 0x800000u;
-    uint64_t noise = static_cast<uint64_t>(rand13 & 0x1FFFu) << (shift - 13);
-    // The carry may produce 0x400: the smallest normal fp16 value.
-    return static_cast<uint16_t>(sign >> 16) | static_cast<uint16_t>((mantissa + noise) >> shift);
+  uint32_t exp = abs_bits >> 23;
+  uint32_t mantissa = (abs_bits & 0x7FFFFFu) | 0x800000u;
+  // Express both ranges in units of 2^-13 fp16 ULPs before adding noise.
+  // Subnormals use fixed spacing 2^-24; exp < 90 cannot round up. Guard the
+  // shift so it is only evaluated in [1, 23]. Keep the common normal path
+  // in this same add-and-truncate expression instead of an early-return branch.
+  uint32_t scaled = exp >= 113 ? abs_bits - (112u << 23)
+                              : (exp >= 90 ? mantissa >> (113 - exp) : 0u);
+  uint32_t f16_bits = min((scaled + (rand13 & 0x1FFFu)) >> 13, 0x7C00u);
+  // Classify the original input: noise must not turn infinity into NaN or
+  // finite overflow into NaN, nor carry a NaN payload into another exponent.
+  if (abs_bits >= 0x7F800000u) {
+    f16_bits = abs_bits > 0x7F800000u ? 0x7E00u : 0x7C00u;
   }
 
-  // fp32 has 23 mantissa bits, fp16 has 10. The 13 LSBs are the remainder.
-  // Add 13-bit random noise at bits [12:0]. Carry into bit 13 → round up.
-  abs_bits += (rand13 & 0x1FFFu);
-
-  // Convert to fp16 by truncation.
-  uint32_t f32_exp = (abs_bits >> 23) & 0xFFu;
-  uint32_t f32_mantissa = abs_bits & 0x7FFFFFu;
-
-  uint16_t f16_bits;
-  if (f32_exp == 0xFF) {
-    f16_bits = (f32_mantissa != 0) ? 0x7E00u : 0x7C00u;  // NaN or Inf
-  } else if (f32_exp > 142) {                            // 127 + 15 = 142 → overflow to Inf
-    f16_bits = 0x7C00u;
-  } else if (f32_exp < 113) {  // 127 - 14 = 113 → underflow to zero
-    f16_bits = 0;
-  } else {
-    uint16_t f16_exp = static_cast<uint16_t>(f32_exp - 112);  // rebias: 127→15
-    uint16_t f16_mantissa = static_cast<uint16_t>(f32_mantissa >> 13);
-    f16_bits = (f16_exp << 10) | f16_mantissa;
-  }
-
-  return static_cast<uint16_t>(sign >> 16) | f16_bits;
+  return static_cast<uint16_t>(sign >> 16) | static_cast<uint16_t>(f16_bits);
 }
 
 // Forward declaration (defined below, after cvt_rs_f16x2_f32).

@@ -117,3 +117,32 @@ def test_subnormal_rounding_boundaries(fp16_sr_sw, conversion_mode):
     torch.testing.assert_close(
         actual.view(torch.int16).cpu(), expected_bits, rtol=0, atol=0
     )
+
+
+def test_software_special_values(fp16_sr_sw):
+    # Check both signs, including a NaN payload that would carry into the sign
+    # bit if noise were added before classification. Hardware NaN payloads are
+    # not constrained by this software-only canonical-NaN check.
+    positive = torch.tensor(
+        [0x7F800000, 0x7F800001, 0x7FC00000, 0x7FFFFFFF], dtype=torch.int64
+    )
+    bits = torch.cat((positive, positive | 0x80000000)).to(torch.int32)
+    values = bits.view(torch.float32).repeat_interleave(8192).cuda()
+    noise = torch.arange(8192, dtype=torch.int32).repeat(len(bits)).cuda()
+    expected = torch.tensor(
+        [0x7C00, 0x7E00, 0x7E00, 0x7E00, 0xFC00, 0xFE00, 0xFE00, 0xFE00],
+        dtype=torch.int32,
+    ).to(torch.int16).repeat_interleave(8192)
+    actual = fp16_sr_sw.convert(values, noise, 0)
+    torch.testing.assert_close(actual.view(torch.int16).cpu(), expected, rtol=0, atol=0)
+
+
+def test_finite_overflow_stays_infinite(fp16_sr_sw, conversion_mode):
+    positive = torch.tensor([0x7F7FFFFF, 0x47800000], dtype=torch.int64)
+    bits = torch.cat((positive, positive | 0x80000000)).to(torch.int32)
+    values = bits.view(torch.float32).repeat_interleave(8192).cuda()
+    noise = torch.arange(8192, dtype=torch.int32).repeat(len(bits)).cuda()
+    expected = torch.tensor([0x7C00, 0x7C00, 0xFC00, 0xFC00], dtype=torch.int32)
+    expected = expected.to(torch.int16).repeat_interleave(8192)
+    actual = fp16_sr_sw.convert(values, noise, conversion_mode)
+    torch.testing.assert_close(actual.view(torch.int16).cpu(), expected, rtol=0, atol=0)
