@@ -33,6 +33,7 @@ from flashinfer.comm.mnnvl_cutedsl import (
     StaticProfile,
 )
 from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
+    BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED,
     BTAllReduceTuning,
     BTFinalizeTuning,
 )
@@ -73,6 +74,12 @@ def _tunings(protocol: str, hidden_size: int):
         return ProtocolKind.LL, LLFinalizeTuning(), LLAllReduceTuning()
     if protocol == "bt":
         return ProtocolKind.BT, BTFinalizeTuning(), BTAllReduceTuning()
+    if protocol == "bt_fused":
+        return (
+            ProtocolKind.BT,
+            BTFinalizeTuning(),
+            BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED,
+        )
     if hidden_size % 8192 == 0:
         return ProtocolKind.HT, HTFinalizeTuning(), HTAllReduceTuning()
     shard = dict(consumer_threads=448, vectors_per_thread=1)
@@ -118,6 +125,8 @@ def _expected_fp8(norm: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         ("ll", True, 3584, 16),
         ("bt", False, 3584, 16),
         ("bt", True, 8192, 10),
+        ("bt_fused", False, 3584, 16),
+        ("bt_fused", True, 8192, 10),
         ("ht", False, 8192, 10),
         ("ht", True, 3584, 16),
     ],

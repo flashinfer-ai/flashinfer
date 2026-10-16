@@ -37,6 +37,8 @@ from ..runtime import (
 from ..symmetric_buffer import SymmetricBuffer
 from .device_kernels import (
     LAMPORT_GENERATIONS,
+    STAGE_STATE_WORDS,
+    _FusedAllReduceDeviceKernel,
     _MaterializeRMSNormDeviceKernel,
     _NarrowVectorFinalizeUnicastDeviceKernel,
     _OwnerReduceMulticastDeviceKernel,
@@ -62,11 +64,24 @@ class BTFinalizeTuning:
     collective: BTCollectiveTuning = BTCollectiveTuning()
 
 
+# Threads per CTA of the fused all-reduce; a 1024-thread CTA covers a
+# hidden-8192 token in one 16-byte vector per thread.
+_FUSED_THREADS = 1024
+
+
 @dataclass(frozen=True, slots=True)
 class BTAllReduceTuning:
     publish_threads: int = 128
     publish_vectors_per_thread: int = 1
     collective: BTCollectiveTuning = BTCollectiveTuning(reduction_threads=32)
+    # fused=True runs publish, owner reduce and materialize as one persistent
+    # launch of one 1024-thread CTA per SM (see _FusedAllReduceDeviceKernel);
+    # publish_* and the collective thread counts are then unused, while
+    # collective.enable_pdl still applies. fused_lag is the distance in rounds
+    # between consecutive stages of one token, so most data has landed before
+    # a stage waits on it.
+    fused: bool = False
+    fused_lag: int = 3
 
 
 BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0 = BTFinalizeTuning(
@@ -166,6 +181,16 @@ BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_1 = BTAllReduceTuning(
     collective=BTCollectiveTuning(reduction_threads=192, rms_threads=448),
 )
 
+# hidden_size=8192, bf16, TP4, measured separately on GB300 and Rubin.
+# PRESET_0 keeps the three-launch path, which has the lower fixed latency up to
+# a few hundred tokens; FUSED is the one-launch path, ahead from there up.
+BT_ALL_REDUCE_GB300_TP4_H8192_PRESET_0 = BTAllReduceTuning()
+BT_ALL_REDUCE_GB300_TP4_H8192_FUSED = BTAllReduceTuning(fused=True)
+BT_FINALIZE_GB300_TP4_H8192_K10 = BTFinalizeTuning()
+BT_ALL_REDUCE_RUBIN_TP4_H8192_PRESET_0 = BTAllReduceTuning()
+BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED = BTAllReduceTuning(fused=True)
+BT_FINALIZE_RUBIN_TP4_H8192_K10 = BTFinalizeTuning()
+
 
 @dataclass(slots=True)
 class BTProtocolState:
@@ -189,7 +214,7 @@ class _CompiledFinalize:
 @dataclass(frozen=True, slots=True)
 class _CompiledAllReduce:
     publish: Any
-    tail: _CompiledTail
+    tail: _CompiledTail | None
 
 
 class _PathKwargs(TypedDict):
@@ -233,7 +258,10 @@ class _BTPath:
     def _validate_state(self, state: BTProtocolState, m: int) -> None:
         if not 1 <= m <= self.capacity_m:
             raise ValueError(f"m must be in [1, {self.capacity_m}]")
-        if state.contribution_mailbox.peer_addresses is None:
+        if (
+            state.contribution_mailbox.peer_addresses is None
+            or state.prenorm_mailbox.peer_addresses is None
+        ):
             raise ValueError("BT contribution mailbox requires peer addresses")
         address = state.prenorm_mailbox.multicast_address
         if address is None or address % 16:
@@ -355,6 +383,19 @@ class AllReduceRMSNormBTKernel(_BTPath):
         self._validate_state(state, m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
         peers = cast(torch.Tensor, state.contribution_mailbox.peer_addresses)
+        if self._compiled.tail is None:
+            self._launch_fused(
+                local_contribution,
+                residual_source,
+                gamma,
+                state,
+                norm_output,
+                residual_output,
+                m,
+                norm_output_bf16,
+                output_scale,
+            )
+            return norm_output, residual_output
         self._compiled.publish(
             to_cute_dynamic(
                 local_contribution.flatten(),
@@ -378,6 +419,40 @@ class AllReduceRMSNormBTKernel(_BTPath):
             output_scale,
         )
         return norm_output, residual_output
+
+    def _launch_fused(
+        self,
+        local_contribution: torch.Tensor,
+        residual_source: torch.Tensor | None,
+        gamma: torch.Tensor,
+        state: BTProtocolState,
+        norm_output: torch.Tensor,
+        residual_output: torch.Tensor | None,
+        m: int,
+        norm_output_bf16: torch.Tensor | None,
+        output_scale: torch.Tensor | None,
+    ) -> None:
+        residual_arg = residual_source if residual_source is not None else gamma
+        residual_output_arg = residual_output if residual_output is not None else gamma
+        h = self.hidden_size
+        self._compiled.publish(
+            to_cute_dynamic(local_contribution.flatten(), 16, divisibility=h),
+            to_cute_dynamic(residual_arg.flatten(), 16, divisibility=h),
+            to_cute(gamma, 16),
+            to_cute_dynamic(residual_output_arg.flatten(), 16, divisibility=h),
+            to_cute_dynamic(norm_output.flatten(), 16, divisibility=h),
+            to_cute_dynamic(norm_output_bf16.flatten(), 16, divisibility=h)
+            if norm_output_bf16 is not None
+            else None,
+            output_scale_arg(output_scale),
+            to_cute(state.contribution_mailbox.tensor.flatten(), 16),
+            to_cute(cast(torch.Tensor, state.contribution_mailbox.peer_addresses), 8),
+            to_cute(state.prenorm_mailbox.tensor.flatten(), 16),
+            to_cute(cast(torch.Tensor, state.prenorm_mailbox.peer_addresses), 8),
+            to_cute(state.stage_state, 4),
+            Int32(m),
+            current_cu_stream(),
+        )
 
 
 class BTProtocol:
@@ -426,7 +501,7 @@ class BTProtocol:
             tuning: self._compile_tail(tuning)
             for tuning in {
                 *(item.collective for item in finalize_tunings),
-                *(item.collective for item in all_reduce_tunings),
+                *(item.collective for item in all_reduce_tunings if not item.fused),
             }
         }
         self.finalize_kernels = {
@@ -442,6 +517,11 @@ class BTProtocol:
         self.all_reduce_kernels = {
             tuning: AllReduceRMSNormBTKernel(
                 compiled=_CompiledAllReduce(
+                    publish=self._compile_fused_all_reduce(tuning),
+                    tail=None,
+                )
+                if tuning.fused
+                else _CompiledAllReduce(
                     publish=self._compile_all_reduce_publish(tuning),
                     tail=tail_cache[tuning.collective],
                 ),
@@ -505,12 +585,74 @@ class BTProtocol:
             *self._publish_compile_args(include_routed=False),
         )
 
+    def _compile_fused_all_reduce(self, tuning: BTAllReduceTuning):
+        if tuning.fused_lag < 1:
+            raise ValueError("fused_lag must be positive")
+        device = torch.device("cuda", torch.cuda.current_device())
+        # Every CTA spins on data from CTAs of other ranks, so the whole grid
+        # must be resident at once: one CTA per SM.
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        device_kernel = _FusedAllReduceDeviceKernel(
+            hidden_size=self.hidden_size,
+            tp_size=self.tp_size,
+            rank=self.rank,
+            capacity_m=self.capacity_m,
+            local_capacity=self.local_capacity,
+            threads=_FUSED_THREADS,
+            grid_ctas=sm_count,
+            lag=tuning.fused_lag,
+            add_residual=self.add_residual,
+            write_residual_output=self.write_residual_output,
+            apply_rms_norm=self.apply_rms_norm,
+            rms_epsilon=self.rms_epsilon,
+            weight_bias=self.weight_bias,
+            enable_pdl=tuning.collective.enable_pdl,
+            dynamic_fp8=self.dynamic_fp8,
+        )
+        activation = make_fake_dynamic_compact_tensor(
+            BFloat16, alignment=16, divisibility=self.hidden_size
+        )
+        return cute.compile(
+            device_kernel,
+            activation,
+            activation,
+            make_fake_compact_tensor(BFloat16, (self.hidden_size,), assumed_align=16),
+            activation,
+            make_fake_dynamic_compact_tensor(
+                Float8E4M3FN if self.output_dtype == torch.float8_e4m3fn else BFloat16,
+                alignment=16,
+                divisibility=self.hidden_size,
+            ),
+            activation if self.write_norm_output else None,
+            fake_output_scale(self.output_dtype),
+            make_fake_compact_tensor(
+                BFloat16,
+                (
+                    LAMPORT_GENERATIONS
+                    * self.tp_size
+                    * self.local_capacity
+                    * self.hidden_size,
+                ),
+                assumed_align=16,
+            ),
+            make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
+            make_fake_compact_tensor(
+                BFloat16,
+                (LAMPORT_GENERATIONS * self.capacity_m * self.hidden_size,),
+                assumed_align=16,
+            ),
+            make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
+            make_fake_compact_tensor(Int32, (STAGE_STATE_WORDS,), assumed_align=4),
+            Int32(self.capacity_m),
+            current_cu_stream(),
+        )
+
     def _publish_compile_args(self, *, include_routed: bool) -> tuple:
         activation = make_fake_dynamic_compact_tensor(
             BFloat16, alignment=16, divisibility=self.hidden_size
         )
         common = (
-            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (STAGE_STATE_WORDS,), assumed_align=4),
             make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -549,7 +691,7 @@ class BTProtocol:
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
-            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (STAGE_STATE_WORDS,), assumed_align=4),
             Int64(0),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -584,7 +726,7 @@ class BTProtocol:
             else None,
             fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(BFloat16, (self.hidden_size,), assumed_align=16),
-            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (STAGE_STATE_WORDS,), assumed_align=4),
             Int32(self.capacity_m),
             current_cu_stream(),
         )
@@ -619,10 +761,13 @@ class BTProtocol:
             device,
             group,
             require_multicast=True,
+            materialize_peer_addresses=True,
         )
         prenorm.tensor.view(torch.int16).fill_(-32768)
         return BTProtocolState(
             contribution_mailbox=contribution,
             prenorm_mailbox=prenorm,
-            stage_state=torch.zeros((2,), dtype=torch.int32, device=device),
+            stage_state=torch.zeros(
+                (STAGE_STATE_WORDS,), dtype=torch.int32, device=device
+            ),
         )

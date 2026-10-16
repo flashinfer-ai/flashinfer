@@ -33,6 +33,7 @@ from flashinfer.comm.mnnvl_cutedsl import (
     StaticProfile,
 )
 from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
+    BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED,
     BTAllReduceTuning,
     BTFinalizeTuning,
 )
@@ -69,6 +70,12 @@ def _tunings(protocol: str, hidden_size: int):
         return ProtocolKind.LL, LLFinalizeTuning(), LLAllReduceTuning()
     if protocol == "bt":
         return ProtocolKind.BT, BTFinalizeTuning(), BTAllReduceTuning()
+    if protocol == "bt_fused":
+        return (
+            ProtocolKind.BT,
+            BTFinalizeTuning(),
+            BT_ALL_REDUCE_RUBIN_TP4_H8192_FUSED,
+        )
     shard = (
         {}
         if hidden_size % 8192 == 0
