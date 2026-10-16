@@ -62,3 +62,62 @@ def test_h200_ep8_counter_policy(
         assert plan.no_clean_barrier == (
             rotated_from is not None and rotated_from <= tokens <= push_max
         ), tokens
+
+
+@pytest.mark.parametrize("num_sms", [78, 132])
+def test_counter_policy_limits(num_sms):
+    # Unmeasured geometry (H7168 / E256 / K8, DeepSeek-V3): push up to M=32, no rotated pool.
+    for tokens in (1, 16, 32, 33, 64):
+        plan = select_fused_plan(num_sms, 8, 256, 8, 7168, 2048, 4096, tokens)
+        assert plan.push_dispatch == (tokens <= 32), tokens
+        assert not plan.no_clean_barrier
+    # Forced counter dispatch is ignored outside the validated small-M plans.
+    for tokens in (65, 128, 256):
+        plan = select_fused_plan(
+            num_sms,
+            8,
+            256,
+            6,
+            4096,
+            2048,
+            4096,
+            tokens,
+            force_push_dispatch=True,
+            force_no_clean_barrier=True,
+        )
+        assert not plan.push_dispatch and not plan.no_clean_barrier, tokens
+
+
+@pytest.mark.parametrize("num_sms", [78, 132])
+@pytest.mark.parametrize(
+    "hidden,intermediate,experts,topk",
+    [
+        (7168, 2048, 256, 8),
+        (7168, 2048, 384, 8),
+        (8192, 2048, 256, 8),
+        (4096, 2048, 384, 8),
+        (512, 256, 256, 6),
+    ],
+)
+def test_untuned_geometry_plans_are_legal(num_sms, hidden, intermediate, experts, topk):
+    # Shapes outside the tuned set get the generic schedule (no H20 RS-only depth), a pipeline
+    # depth that fits shared memory, and push only where the push row copy supports the hidden size.
+    for tokens in range(1, 257):
+        plan = select_fused_plan(
+            num_sms, 8, experts, topk, hidden, intermediate, 4096, tokens
+        )
+        assert not plan.rs_swap_ab
+        legal = {8: (3, 4), 16: (3,), 24: (3,), 64: (3,)}[plan.block_m]
+        assert plan.num_stages in legal, (tokens, plan)
+        if plan.block_m == 8 and plan.num_stages == 4:
+            rows = hidden * (1 if plan.single_active_dispatch_warp else 2)
+            assert -(-experts * 4 // 1024) * 1024 + -(-rows // 1024) * 1024 <= 8400
+        assert not plan.push_dispatch or (hidden % 1024 == 0 and tokens <= 32), tokens
+
+
+@pytest.mark.parametrize(
+    "hidden,intermediate", [(4096, 2560), (4352, 2048), (4096, 1000)]
+)
+def test_unsupported_fused_shapes_raise(hidden, intermediate):
+    with pytest.raises(ValueError):
+        select_fused_plan(132, 8, 256, 6, hidden, intermediate, 4096, 1)
