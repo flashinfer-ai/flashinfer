@@ -406,9 +406,9 @@ __global__ void __launch_bounds__(512, 4)
   static_assert(NumCols % (4 * SF_VEC_SIZE) == 0);
   constexpr int NumSfCols = NumCols / SF_VEC_SIZE;
   constexpr int NumSfGroups = NumSfCols / 4;
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
   cudaGridDependencySynchronize();
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
   // Hot path: map a fixed number of complete rows onto each CTA. K=3072 uses two rows and 384
   // threads, so every thread owns exactly one 16-value scale block without a warp shuffle.
@@ -469,7 +469,6 @@ __global__ void __launch_bounds__(512, 4)
                                   Type const* pqs, float const* SFScale, uint32_t* out,
                                   uint32_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
   int const numPaddedRowsForSf = padUp(numRows, 128);
   int const numColsForSf = padUp(numPaddedCols, 4 * SF_VEC_SIZE);
   int const numColThreads = numCols / ELTS_PER_THREAD;
@@ -477,6 +476,7 @@ __global__ void __launch_bounds__(512, 4)
   int const numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
   cudaGridDependencySynchronize();
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
   for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
     bool const isRowPadding = (rowIdx >= numRows);
     for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
