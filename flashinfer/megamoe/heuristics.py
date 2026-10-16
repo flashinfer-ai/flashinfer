@@ -59,7 +59,7 @@ _H20_COUNTER_BUCKETS = (
 # H200 (EP8): push wins by about 10 us per call at small M (1.03-1.16x kernel time);
 # at BM64 it loses (0.89-0.95x at M=256). Bounds are the largest M that does not lose on
 # any measured router (uniform, global Zipf skew, hot experts on one rank). The rotated
-# pool only pays on Pro above M=32; the clean barrier is ~1 us on H200.
+# pool only pays on DeepSeek-V4-Pro above M=32; the clean barrier is ~1 us on H200.
 _H200_COUNTER_BUCKETS = (
     (4096, 256, 6, 1, 32, True, False),
     (6144, 384, 8, 1, 32, True, False),
@@ -340,7 +340,7 @@ def select_fused_plan(
     while epw < num_experts_per_rank and num_experts_per_rank % epw != 0:
         epw += 1
 
-    # Large hidden / expert counts do not fit 4 stages at BLOCK_M=8 (e.g. Pro, Kimi-K2).
+    # Large hidden / expert counts do not fit 4 stages at BLOCK_M=8 (e.g. DeepSeek-V4-Pro, Kimi-K2).
     if block_m == 8 and stages == 4:
         kib = lambda n: -(-n // 1024) * 1024  # noqa: E731
         dispatch_rows = hidden * (1 if single_warp else 2)
