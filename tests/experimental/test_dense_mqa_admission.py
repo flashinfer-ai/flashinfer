@@ -304,14 +304,17 @@ def test_dense_kvsplit_gate_is_published_and_shape_only():
     assert sorted(gate["sm_count"]) == sorted(catalog["arches"])
     assert set(gate["unreached_routes"]) == H64_UNREACHED_ROUTES
     assert not set(gate["unreached_routes"]) & set(catalog["routes"])
-    assert H64_KVSPLIT_ROUTES <= set(catalog["routes"])
+    assert set(catalog["routes"]) >= H64_KVSPLIT_ROUTES
     min_kv = int(gate["min_kv"])
     for arch in sorted(catalog["arches"]):
         sms = int(gate["sm_count"][arch])
         assert 1 <= sms <= int(gate["max_sms"])
         admitted = set(dense_mqa.dense_admission(arch)["admitted_routes"])
         # the block-count boundary at this architecture's count, the K bound's two sides, the plan bands' edges
-        assert _runtime.h64_kvsplit_plan(2 * (sms - 1), min_kv + 1, 64, arch=arch) == "qle2048"
+        assert (
+            _runtime.h64_kvsplit_plan(2 * (sms - 1), min_kv + 1, 64, arch=arch)
+            == "qle2048"
+        )
         assert _runtime.h64_kvsplit_plan(2 * sms - 1, min_kv + 1, 64, arch=arch) is None
         assert _runtime.h64_kvsplit_plan(37, min_kv, 64, arch=arch) is None
         assert _runtime.h64_kvsplit_plan(37, min_kv + 1, 64, arch=arch) == "qle128"
@@ -320,12 +323,19 @@ def test_dense_kvsplit_gate_is_published_and_shape_only():
         assert _runtime.h64_kvsplit_plan(65, 4137, 64, arch=arch) == "qle2048"
         assert _runtime.h64_kvsplit_plan(37, 4137, 32, arch=arch) is None
         served = _runtime.served_route("fp8", 2 * (sms - 1), 4137, 64, arch=arch)
-        assert served == _served_route("fp8:h64:full:qle2048:kvsplit", 2 * (sms - 1), admitted)
-        assert _runtime.served_route("fp8", 2 * sms - 1, 4137, 64, arch=arch) == "fp8:h64:partial:le1024"
+        assert served == _served_route(
+            "fp8:h64:full:qle2048:kvsplit", 2 * (sms - 1), admitted
+        )
+        assert (
+            _runtime.served_route("fp8", 2 * sms - 1, 4137, 64, arch=arch)
+            == "fp8:h64:partial:le1024"
+        )
         assert _runtime.served_route("fp8", 37, min_kv, 64, arch=arch) == _served_route(
             "fp8:h64:partial:short", 37, admitted
         )
-        assert not _runtime.served_route("fp8", 37, 4137, 32, arch=arch).endswith(":kvsplit")
+        assert not _runtime.served_route("fp8", 37, 4137, 32, arch=arch).endswith(
+            ":kvsplit"
+        )
     assert _runtime.route_owns_metadata("fp8:h64:q1:kvsplit", 64)
     assert _runtime.route_owns_metadata("fp8:h64:partial:qle128:kvsplit", 64)
     assert not _runtime.route_owns_metadata("fp8:h64:q1", 64)

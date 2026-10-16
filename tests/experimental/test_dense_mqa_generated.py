@@ -912,16 +912,25 @@ def test_dense_route_table_is_catalog_driven():
         # SM count take the production text under the plan of the query count; K <= 256 keeps the one-split /
         # grid-stride routes, at least as many blocks as SMs the grid-stride tier routes
         assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:qle128:kvsplit"
-        assert _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:qle128:kvsplit"
+        assert (
+            _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:qle128:kvsplit"
+        )
         assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1:kvsplit"
         assert _runtime.route_name("fp8", 1, 256, 64) == "fp8:h64:q1"
-        assert _runtime.route_name("fp8", 128, 4100, 64) == "fp8:h64:full:qle2048:kvsplit"
-        assert _runtime.route_name("fp8", 129, 4100, 64) == "fp8:h64:partial:qle2048:kvsplit"
+        assert (
+            _runtime.route_name("fp8", 128, 4100, 64) == "fp8:h64:full:qle2048:kvsplit"
+        )
+        assert (
+            _runtime.route_name("fp8", 129, 4100, 64)
+            == "fp8:h64:partial:qle2048:kvsplit"
+        )
         assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
         assert _runtime.route_name("fp8", 37, 37, 64) == "fp8:h64:partial:short"
         assert _runtime.route_name("fp8", 16, 16, 64) == "fp8:h64:full:short"
         assert _runtime.route_name("fp8", 2, 2, 64) == "fp8:h64:full:le8"
-        assert _runtime.route_name("fp8", 3, 257, 64) == "fp8:h64:partial:qle128:kvsplit"
+        assert (
+            _runtime.route_name("fp8", 3, 257, 64) == "fp8:h64:partial:qle128:kvsplit"
+        )
         # W-dense contract: single-stage programs, no metadata stage, no query bound; the ``:kvsplit`` plans own
         # the buffer their text writes in-kernel, the grid-stride / one-split programs have none.
         assert not _runtime.schedules_metadata(64) and _runtime.max_queries(64) is None
@@ -1217,16 +1226,19 @@ def test_h64_admission_matches_the_catalog_table():
         else set()
     )
     unreached = set(gate["unreached_routes"]) if gate is not None else set()
-    tiers = {
-        "fp8:h64:q1",
-        *(
-            f"fp8:h64:{kind}:{tier}"
-            for kind in ("full", "partial")
-            for tier in ("le8", "le64", "le1024", "any")
-        ),
-    } - unreached | {
-        f"fp8:h64:{kind}:short" for kind in ("full", "partial")
-    } | kvsplit
+    tiers = (
+        {
+            "fp8:h64:q1",
+            *(
+                f"fp8:h64:{kind}:{tier}"
+                for kind in ("full", "partial")
+                for tier in ("le8", "le64", "le1024", "any")
+            ),
+        }
+        - unreached
+        | {f"fp8:h64:{kind}:short" for kind in ("full", "partial")}
+        | kvsplit
+    )
     verdicts, sample = {}, {}
     for arch in arches:
         admission = _runtime.h64_admission(arch)
@@ -1279,12 +1291,20 @@ def test_h64_admission_matches_the_catalog_table():
             # point is decided per architecture and dense_route_available follows the served route.
             assert gate["fallback"] == "tier" and int(gate["min_kv"]) == max_kv
             sms = int(gate["sm_count"][arch])
-            assert _runtime.h64_kvsplit_plan(2 * (sms - 1), max_kv + 1, 64, arch=arch) == "qle2048"
-            assert _runtime.h64_kvsplit_plan(2 * sms - 1, max_kv + 1, 64, arch=arch) is None
+            assert (
+                _runtime.h64_kvsplit_plan(2 * (sms - 1), max_kv + 1, 64, arch=arch)
+                == "qle2048"
+            )
+            assert (
+                _runtime.h64_kvsplit_plan(2 * sms - 1, max_kv + 1, 64, arch=arch)
+                is None
+            )
             assert _runtime.h64_kvsplit_plan(37, max_kv, 64, arch=arch) is None
             for queries in (1, 2, 3, 37, 64, 65, 128, 2 * (sms - 1), 2 * sms - 1, 1024):
                 plan = _runtime.h64_kvsplit_plan(queries, max_kv + 1, 64, arch=arch)
-                served = _runtime.served_route("fp8", queries, max_kv + 1, 64, arch=arch)
+                served = _runtime.served_route(
+                    "fp8", queries, max_kv + 1, 64, arch=arch
+                )
                 kind = "full" if queries % 2 == 0 else "partial"
                 if plan is None:
                     assert not served.endswith(":kvsplit"), (arch, queries, served)
@@ -1299,13 +1319,22 @@ def test_h64_admission_matches_the_catalog_table():
                         if plan == "q1"
                         else f"fp8:h64:{kind}:{_runtime.metadata_tier(queries, 64)}"
                     )
-                    assert served == (logical if logical in admitted else fallback), (arch, queries, served)
-                assert _runtime.dense_route_available(64, queries, max_kv + 1, arch=arch) == (
-                    served in admitted
-                ), (arch, queries, served)
+                    assert served == (logical if logical in admitted else fallback), (
+                        arch,
+                        queries,
+                        served,
+                    )
+                assert _runtime.dense_route_available(
+                    64, queries, max_kv + 1, arch=arch
+                ) == (served in admitted), (arch, queries, served)
                 if served in admitted:
-                    record = _runtime.route_record("fp8", queries, max_kv + 1, 64, arch=arch)
-                    assert record["stages"][0][0] == "logits" and record["clean_logits"] == "raw"
+                    record = _runtime.route_record(
+                        "fp8", queries, max_kv + 1, 64, arch=arch
+                    )
+                    assert (
+                        record["stages"][0][0] == "logits"
+                        and record["clean_logits"] == "raw"
+                    )
         # 32 heads never take the 64-head one-split route: at this KV length a 32-head call takes its
         # single-launch route -- the v9 in-kernel scan class of its query count, or the r3 fused tiered
         # text where the published order of its tier puts that family first; above the le32 class's

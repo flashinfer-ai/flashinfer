@@ -279,7 +279,9 @@ def paged_rect_applicable(static_route, batch, max_context_len, num_sms):
     rect = paged_rect()
     if static_route not in rect["routes"]:
         return False
-    return paged_rect_units(batch, max_context_len, rect["split_kv"]) <= rect["max_waves"] * int(num_sms)
+    return paged_rect_units(batch, max_context_len, rect["split_kv"]) <= rect[
+        "max_waves"
+    ] * int(num_sms)
 
 
 def paged_rect_compact_kind(static_route, batch, max_context_len, num_sms):
@@ -398,19 +400,31 @@ def paged_sched_meta():
     if record is None:
         return None
     if "consumer_routes" not in record:
-        raise ValueError("sched_meta record lacks consumer_routes (static route -> table-consuming route)")
+        raise ValueError(
+            "sched_meta record lacks consumer_routes (static route -> table-consuming route)"
+        )
     consumers = {}
     for static, route in record["consumer_routes"].items():
         static, route = str(static), str(route)
         if ":" in static.split(":n", 1)[1] or not route.startswith(static + ":"):
-            raise ValueError(f"sched_meta consumer route {route!r} of {static!r}: expected a static route -> its ':table' route")
+            raise ValueError(
+                f"sched_meta consumer route {route!r} of {static!r}: expected a static route -> its ':table' route"
+            )
         consumers[static] = route
     selection = []
     for rule in record["selection"]:
         if not (isinstance(rule, (list, tuple)) and len(rule) == 3):
-            raise ValueError(f"sched_meta selection rule {rule!r}: expected [max_batch, max_sms_plus_1, version]")
+            raise ValueError(
+                f"sched_meta selection rule {rule!r}: expected [max_batch, max_sms_plus_1, version]"
+            )
         max_batch, max_sms_plus_1, version = rule
-        selection.append((int(max_batch), None if max_sms_plus_1 is None else int(max_sms_plus_1), int(version)))
+        selection.append(
+            (
+                int(max_batch),
+                None if max_sms_plus_1 is None else int(max_sms_plus_1),
+                int(version),
+            )
+        )
     programs = {int(v): str(route) for v, route in record["producer_programs"].items()}
     if {v for _b, _s, v in selection} != set(programs):
         raise ValueError(
@@ -445,7 +459,9 @@ def paged_sched_meta_producer_route(batch, num_sms):
         return None
     batch, num_sms = int(batch), int(num_sms)
     for max_batch, max_sms_plus_1, version in record["selection"]:
-        if batch <= max_batch and (max_sms_plus_1 is None or num_sms + 1 <= max_sms_plus_1):
+        if batch <= max_batch and (
+            max_sms_plus_1 is None or num_sms + 1 <= max_sms_plus_1
+        ):
             return record["producer_programs"][version]
     raise ValueError(f"no schedule-meta producer admits batch {batch} at {num_sms} SMs")
 
@@ -489,8 +505,14 @@ def paged_route_name(
             kind = paged_rect_compact_kind(static, batch, max_context_len, num_sms)
             if kind is not None:
                 rect = paged_rect()
-                route = rect["routes"][static] if kind == "rect" else rect["compact"]["routes"][static]
-                if arch is None or paged_route_admitted(arch, route, batch, max_context_len):
+                route = (
+                    rect["routes"][static]
+                    if kind == "rect"
+                    else rect["compact"]["routes"][static]
+                )
+                if arch is None or paged_route_admitted(
+                    arch, route, batch, max_context_len
+                ):
                     return route
     dynamic = paged_dynamic_scheduler()
     if static in dynamic["routes"] and int(batch) <= dynamic["max_batch"]:
@@ -693,7 +715,9 @@ def schedule_meta_bindings(context_lens, table, *, num_sms):
     """
     record = paged_sched_meta()
     if record is None:
-        raise RuntimeError("the catalog carries no schedule-meta producer record (policy.paged.sched_meta)")
+        raise RuntimeError(
+            "the catalog carries no schedule-meta producer record (policy.paged.sched_meta)"
+        )
     args = record["producer_args"]
     grid = [int(v) for v in args["grid"]]
     batch, next_n = (int(v) for v in context_lens.shape)
@@ -731,11 +755,15 @@ class PagedScheduleMetaPlan:
     def __init__(self, context_lens, *, num_sms=None, out=None):
         import torch
 
-        batch, next_n = _check_context_lens(context_lens)  # ValueError for every operand defect, a CPU tensor included
+        batch, next_n = _check_context_lens(
+            context_lens
+        )  # ValueError for every operand defect, a CPU tensor included
         arch, num_sms = _resolve_device(context_lens, num_sms)
         route_name = paged_sched_meta_producer_route(batch, num_sms)
         if route_name is None:
-            raise ValueError("the catalog carries no schedule-meta producer (policy.paged.sched_meta)")
+            raise ValueError(
+                "the catalog carries no schedule-meta producer (policy.paged.sched_meta)"
+            )
         record = _catalog()["paged_routes"][route_name]
         stages = list(record["stages"])
         if [stage for stage, _programs in stages] != ["schedule_meta"]:
@@ -755,13 +783,20 @@ class PagedScheduleMetaPlan:
                 f"out must be contiguous int32 {shape} on {context_lens.device} (the schedule table of a {num_sms}-CTA launch)"
             )
         program = stage_program(stages[0], arch)
-        bindings = {"schedule_meta": schedule_meta_bindings(context_lens, out, num_sms=num_sms)}
-        submit, loaded = _submission(arch, program, bindings, num_sms, stage="schedule_meta")
+        bindings = {
+            "schedule_meta": schedule_meta_bindings(context_lens, out, num_sms=num_sms)
+        }
+        submit, loaded = _submission(
+            arch, program, bindings, num_sms, stage="schedule_meta"
+        )
         self._submission, self._loaded = submit, loaded
         self.table, self.context_lens = out, context_lens
         self.batch, self.next_n, self.num_sms, self.arch = batch, next_n, num_sms, arch
         self.route_name, self.program_name = route_name, program
-        self.version = {route: version for version, route in paged_sched_meta()["producer_programs"].items()}[route_name]
+        self.version = {
+            route: version
+            for version, route in paged_sched_meta()["producer_programs"].items()
+        }[route_name]
 
     @property
     def launch_count(self):
@@ -851,7 +886,9 @@ class PagedMqaPlan:
         import torch
 
         if sm_count is None and isinstance(schedule_meta, PagedScheduleMetaPlan):
-            sm_count = schedule_meta.num_sms  # a meta plan fixes the CTA budget of the plans that consume it
+            sm_count = (
+                schedule_meta.num_sms
+            )  # a meta plan fixes the CTA budget of the plans that consume it
         arch, num_sms = _resolve_device(q, sm_count)
         batch, next_n = _check_context_lens(context_lens)
         if (
@@ -946,13 +983,18 @@ class PagedMqaPlan:
             same = (
                 schedule_meta.context_lens.data_ptr() == context_lens.data_ptr()
                 and tuple(schedule_meta.context_lens.shape) == tuple(context_lens.shape)
-                and tuple(schedule_meta.context_lens.stride()) == tuple(context_lens.stride())
+                and tuple(schedule_meta.context_lens.stride())
+                == tuple(context_lens.stride())
                 and schedule_meta.context_lens.device == context_lens.device
             )
             if not same:
-                raise ValueError("schedule meta must be produced from this plan's context_lens tensor")
+                raise ValueError(
+                    "schedule meta must be produced from this plan's context_lens tensor"
+                )
             static = paged_route_name(num_heads, block_kv, next_n, logits_dtype)
-            if route_name == static and paged_sched_meta_admitted(arch, static, batch, max_context_len):
+            if route_name == static and paged_sched_meta_admitted(
+                arch, static, batch, max_context_len
+            ):
                 consumer = paged_sched_meta_consumer_route(static)
                 if consumer is None:
                     raise ValueError(
@@ -998,9 +1040,15 @@ class PagedMqaPlan:
         # adoption) keeps that grid and maps its units through the in-kernel prefix; every other program partitions its
         # walk over num_sms CTAs
         rect = paged_rect()
-        self.rect = route_name in rect["routes"].values() or route_name in rect["compact"]["routes"].values()
+        self.rect = (
+            route_name in rect["routes"].values()
+            or route_name in rect["compact"]["routes"].values()
+        )
         self.grid_x = (
-            min(int(num_sms), paged_rect_units(batch, int(block_table.shape[1]) * block_kv))
+            min(
+                int(num_sms),
+                paged_rect_units(batch, int(block_table.shape[1]) * block_kv),
+            )
             if self.rect
             else int(num_sms)
         )
@@ -1033,7 +1081,12 @@ class PagedMqaPlan:
             self._programs.append(loaded)
         self.output, self.schedule_meta = output, schedule_meta
         self.logical_output = output[:, :max_context_len]
-        self._retained = (*tensors, output, self.sched_counters, *((schedule_meta,) if used else ()))
+        self._retained = (
+            *tensors,
+            output,
+            self.sched_counters,
+            *((schedule_meta,) if used else ()),
+        )
 
     @property
     def launch_count(self):
