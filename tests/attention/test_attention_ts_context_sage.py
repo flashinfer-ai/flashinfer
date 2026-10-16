@@ -138,8 +138,6 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float)
         (1, 1024, 1024, 8, 8, 1, 16, False),
         (2, 300, 1004, 8, 4, 2, 16, True),
         (1, 256, 4096, 4, 4, 128, 64, True),
-        (2, 300, 1004, 8, 4, 2, 4, True),
-        (1, 512, 1000, 4, 4, 1, 1, False),
     ],
 )
 @torch.no_grad()
@@ -237,6 +235,8 @@ def test_context_sage_plan_rejects_unsupported_recipes() -> None:
         _plan(sage=config, q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, **shape)
     with pytest.raises(NotImplementedError, match="dense, fixed-length"):
         _plan(sage=config, mask_type="causal", **shape)
+    with pytest.raises(NotImplementedError, match="one K scale per 16 tokens"):
+        _plan(sage=SageAttentionConfig(k_block_size=4), **shape)
     with pytest.raises(TypeError, match="SageAttentionConfig"):
         _plan(sage=SageAttentionParams, **shape)
 
