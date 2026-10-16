@@ -1848,8 +1848,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 
     On SM103, ``backend="auto"`` may select a CuTe DSL small-head kernel for
     ordinary FP8 decode with 16 heads and 1/2/4 query rows, or 32 heads and 1/2
-    rows, using width640 physical-offset sparse indices. This uses the caller's
-    workspace and requires CuTe DSL4.8+ and PDL. Unsupported calls, a supplied
+    rows, using width-640 physical-offset sparse indices. This uses the caller's
+    workspace and requires CuTe DSL 4.8+ and PDL. Unsupported calls, a supplied
     native counter, or a shape first seen during graph capture retain the native
     route. Explicit ``backend="trtllm-gen"`` always retains the cubin backend.
 
