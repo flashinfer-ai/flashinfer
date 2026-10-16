@@ -1338,38 +1338,50 @@ flashinfer.kda_decode.fused_kda_decode(
 )
 
 # ── packed fused Kimi K3 speculative decode (conv + KDA + gated RMSNorm) ────
-fkp_N, fkp_T = 2, 3
-fkp_rows = fkp_N * fkp_T
-fkp_slots = fkp_rows + 1
-fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
-fkp_conv_storage = torch.zeros(
-    fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
-)
-fkp_conv_state = fkp_conv_storage.transpose(1, 2)
-fkp_raw_gate = torch.randn(1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
-fkp_indices = torch.arange(fkp_rows, 0, -1, dtype=torch.int32, device=device).reshape(
-    fkp_N, fkp_T
-)
-fkp_query_start = torch.arange(0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device)
-fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
-fkp_state = torch.zeros(fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
-fkp_output_gate = torch.randn(fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-flashinfer.kda_decode.packed_fused_kda_decode(
-    fkp_x,
-    fk_weight,
-    fkp_conv_state,
-    fkp_raw_gate,
-    fkp_raw_beta,
-    fk_A_log,
-    fk_dt_bias,
-    fkp_indices,
-    fkp_state,
-    fkp_output_gate,
-    fk_norm_weight,
-    query_start_loc=fkp_query_start,
-    num_accepted_tokens=fkp_accepted,
-)
+# T>1 packed decode is SM10x-only.
+if torch.cuda.get_device_capability(device)[0] == 10:
+    fkp_N, fkp_T = 2, 3
+    fkp_rows = fkp_N * fkp_T
+    fkp_slots = fkp_rows + 1
+    fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+    fkp_conv_storage = torch.zeros(
+        fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
+    )
+    fkp_conv_state = fkp_conv_storage.transpose(1, 2)
+    fkp_raw_gate = torch.randn(
+        1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
+    )
+    fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
+    fkp_indices = torch.arange(
+        fkp_rows, 0, -1, dtype=torch.int32, device=device
+    ).reshape(fkp_N, fkp_T)
+    fkp_query_start = torch.arange(
+        0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device
+    )
+    fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
+    fkp_state = torch.zeros(
+        fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device
+    )
+    fkp_output_gate = torch.randn(
+        fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
+    )
+    flashinfer.kda_decode.packed_fused_kda_decode(
+        fkp_x,
+        fk_weight,
+        fkp_conv_state,
+        fkp_raw_gate,
+        fkp_raw_beta,
+        fk_A_log,
+        fk_dt_bias,
+        fkp_indices,
+        fkp_state,
+        fkp_output_gate,
+        fk_norm_weight,
+        query_start_loc=fkp_query_start,
+        num_accepted_tokens=fkp_accepted,
+    )
+else:
+    print("Skipping packed fused KDA example: requires SM10x")
 
 # ── AlphaMoE fused router (SM100/SM103) ──────────────────────────────────────
 _alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
