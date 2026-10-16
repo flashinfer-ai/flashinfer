@@ -72,3 +72,59 @@ These synthetic padded-cache measurements are component GPU comparisons, not
 model traffic or serving token throughput. The benchmark reports warm-cache
 results only; cold-cache and full-model results require their own matched
 protocols and must not be combined with these absolute times.
+
+## Raw-index integration before framework packing
+
+`flashinfer.mla.try_batch_decode_sparse_mla_dsv4_raw` accepts the logical SWA
+indices, request-local compressed indices, request IDs, compressed page table
+and token-validity flags before a framework materializes physical sparse indices.
+The partial attention kernel translates these addresses during its gather. Its
+QK/PV arithmetic and split merge match the packed CuTeDSL implementation.
+
+```mermaid
+flowchart LR
+    R[Logical sparse metadata] --> P[Framework index packing]
+    P --> A[Native or packed CuTe attention]
+    R --> F[Raw-index translation and attention gather]
+    F --> M[CuTe split merge]
+```
+
+This helper has query/output shape `[rows, heads, 512]`, normalized HND FP8 pools,
+SWA page size 32 and compressed page size 64 or 128. It supports the same H16 and
+H32 row counts listed above. Obtain scratch bytes with
+`get_dsv4_raw_decode_workspace_size(rows, heads)`; sufficiently large serialized
+native scratch can also be reused. The function returns `True` after enqueueing
+into the supplied output, or `False` before GPU work for unsupported metadata or
+an unwarmed capture. Compilation and execution errors propagate. The caller
+retains its original packing-plus-attention path on `False`.
+
+The compressed length uses the count of nonnegative IDs as a prefix, including
+interior holes. Invalid-token rows suppress compressed attention only. Request
+IDs and nonnegative compressed IDs/page entries must be in bounds even for a
+masked row, because address translation precedes masking. See the API docstring
+for complete value, layout, non-aliasing and workspace-lifetime requirements.
+
+Existing eligible packed-index callers using `backend="auto"` need no API
+change. The pinned vLLM ordinary-decode call supplies `cum_seq_lens_q`, which
+keeps that call on native fallback; upgrading FlashInfer alone does not activate
+the packed route there. Removing index packing requires the paired framework
+call to the raw helper before that producer runs.
+
+The raw comparison requires vLLM's `build_flashinfer_mixed_sparse_indices` API
+(tested runtime: `0.32.0rc1.dev100+g77154ca61`). It does not load model weights:
+
+```bash
+pytest tests/mla/test_dsv4_smallhead_raw.py -v
+python benchmarks/bench_dsv4_smallhead_raw.py --heads 16 --rows 1 --page 128 --output /tmp/raw-first.json
+python benchmarks/bench_dsv4_smallhead_raw.py --heads 16 --rows 1 --page 128 --reverse --output /tmp/raw-reverse.json
+```
+
+Repeat for H16 rows 1/2/4, H32 rows 1/2, and compressed pages 64/128. Every
+baseline invocation includes the actual vLLM packing kernel followed by native
+or packed CuTeDSL attention. Native controls retain five scheduling budgets,
+PDL off/on and owned counters, plus the default native path. The raw arm uses
+the same input, output and workspace storage. Independent FP64 and metadata
+checks precede timing; replay output and counter reset are checked afterward.
+JSON includes source hashes, absolute GPU microseconds and all timing samples.
+These remain warm synthetic **packing-plus-attention component** comparisons,
+separate from full-forward GPU intervals and serving throughput.

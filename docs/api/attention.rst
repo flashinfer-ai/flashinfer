@@ -226,6 +226,8 @@ PageAttention for MLA
     trtllm_batch_decode_with_kv_cache_mla
     trtllm_prefill_with_kv_cache_mla
     trtllm_batch_decode_sparse_mla_dsv4
+    get_dsv4_raw_decode_workspace_size
+    try_batch_decode_sparse_mla_dsv4_raw
     nvfp4_quantize_pack_sparse_mla_cache
     nvfp4_quantize_append_sparse_mla_cache
     dsv41_fp4_quantize_pack_sparse_mla_cache
