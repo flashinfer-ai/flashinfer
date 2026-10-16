@@ -713,35 +713,12 @@ def _cudnn_backend_version() -> str:
 
 @lru_cache(maxsize=1)
 def _detect_gpu_name() -> str:
-    """Return a short GPU name like 'H100' or 'A10G', or 'unknown'."""
+    """Return the full GPU name from ``torch.cuda.get_device_name(0)``, or ``'unknown'``."""
     try:
         import torch
 
         if torch.cuda.is_available():
-            full = torch.cuda.get_device_name(0)
-            # Normalize common names: "NVIDIA H100 80GB HBM3" → "H100"
-            for short in (
-                "H100",
-                "H200",
-                "A100",
-                "A10G",
-                "A10",
-                "T4",
-                "L4",
-                "L40",
-                "V100",
-                "B100",
-                "B200",
-                "B300",
-                "GB200",
-                "GB300",
-            ):
-                if short in full:
-                    return short
-                # We can't use a substring to map "NVIDIA Vera Rubin NVL72" → "VR NVL72" because we add a prefix.
-                if "NVL72" in full:
-                    return "VR NVL72"
-            return full
+            return torch.cuda.get_device_name(0)
     except Exception:
         pass
     return "unknown"
