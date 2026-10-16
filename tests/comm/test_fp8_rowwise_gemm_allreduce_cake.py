@@ -24,8 +24,10 @@ numerical test lives in ``test_fp8_rowwise_gemm_allreduce_cake_e2e.py``.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -548,6 +550,26 @@ def test_package_exports_the_public_names():
     )
 
 
+def test_public_entrypoints_carry_the_flashinfer_api_decorator():
+    dispatcher = importlib.import_module(
+        "flashinfer.comm.fp8_rowwise_gemm_allreduce.fp8_rowwise_gemm_allreduce"
+    )
+    decorated = set()
+    for node in ast.parse(inspect.getsource(dispatcher)).body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        names = set()
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            names.add(getattr(target, "id", getattr(target, "attr", None)))
+        if "flashinfer_api" in names:
+            decorated.add(node.name)
+    assert decorated == {
+        "fp8_rowwise_gemm_allreduce",
+        "prepare_fp8_rowwise_gemm_allreduce",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Symmetric memory: rendezvous guard and workspace allocation
 # --------------------------------------------------------------------------- #
@@ -887,6 +909,44 @@ def test_prepare_requires_the_capacity_to_cover_the_sample(monkeypatch):
         backend.prepare_fp8_rowwise_gemm_allreduce_cake(
             *_operands(256), _fake_group(4, 0), backend="cake", max_rows=100
         )
+
+
+def test_capacity_agreement_names_every_rank_that_differs(monkeypatch):
+    table = {0: 4133, 1: 4133, 2: 4133, 3: 4160}
+
+    def fake_all_gather(outputs, value, group):
+        assert group.group_name == "g" and value.dtype == torch.int64
+        for rank, output in enumerate(outputs):
+            output.copy_(torch.tensor([table[rank]], dtype=torch.int64))
+
+    monkeypatch.setattr(backend.dist, "all_gather", fake_all_gather)
+    cpu = torch.device("cpu")
+    with pytest.raises(ValueError, match="rank 2: 4133, rank 3: 4160"):
+        backend._agree_capacity(_fake_group(4, 2), 4133, world_size=4, device=cpu)
+    table[3] = 4133
+    backend._agree_capacity(_fake_group(4, 2), 4133, world_size=4, device=cpu)
+
+
+def test_prepare_agrees_the_capacity_before_any_allocation(monkeypatch):
+    _patch_distributed(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(backend, "_LAUNCH_STATES", {})
+    agreed = []
+
+    def disagree(group, capacity, *, world_size, device):
+        agreed.append((capacity, world_size, device))
+        raise ValueError("max_rows must be identical on every rank of the group")
+
+    monkeypatch.setattr(backend, "_agree_capacity", disagree)
+    monkeypatch.setattr(
+        backend, "_allocate_workspace", lambda *args, **kwargs: pytest.fail("allocated")
+    )
+    with pytest.raises(ValueError, match="identical on every rank"):
+        backend.prepare_fp8_rowwise_gemm_allreduce_cake(
+            *_operands(256), _fake_group(4, 0), backend="cake", max_rows=4133
+        )
+    assert agreed == [(4133, 4, torch.device("cuda", 0))]
+    assert backend._LAUNCH_STATES == {}
 
 
 def test_launch_refuses_a_workspace_smaller_than_the_call_without_poisoning():

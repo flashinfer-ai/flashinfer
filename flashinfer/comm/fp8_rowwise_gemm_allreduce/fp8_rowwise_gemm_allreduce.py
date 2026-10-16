@@ -35,8 +35,10 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from flashinfer.api_logging import flashinfer_api
 
 
+@flashinfer_api
 def fp8_rowwise_gemm_allreduce(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -69,6 +71,7 @@ def fp8_rowwise_gemm_allreduce(
     )
 
 
+@flashinfer_api
 def prepare_fp8_rowwise_gemm_allreduce(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -82,8 +85,10 @@ def prepare_fp8_rowwise_gemm_allreduce(
     """Bind ``group``, ``N``, ``K_l`` and a row capacity once; return a capturable launcher.
 
     The sample operands fix ``N`` and ``K_l``; ``max_rows`` (default: the rows
-    of ``a``) sizes the symmetric workspace in this single collective. The
-    returned ``launcher(a, a_scale, w, w_scale, *, out=None)`` serves any
+    of ``a``) sizes the symmetric workspace in this single collective and must
+    be identical on every rank: the preparation checks it in that collective
+    and raises ``ValueError`` on every rank when it differs. The returned
+    ``launcher(a, a_scale, w, w_scale, *, out=None)`` serves any
     operands of the bound ``N`` and ``K_l`` with at most ``max_rows`` rows
     without another collective and is CUDA-graph capturable. Both
     ``backend="auto"`` and ``backend="cake"`` select the Cake route (SM100,

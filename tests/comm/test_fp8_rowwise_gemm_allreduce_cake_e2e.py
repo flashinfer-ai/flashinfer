@@ -216,6 +216,10 @@ def _run_cake_group(rank: int, port: int, symm_backend: str):
     assert launcher.max_rows == 4133 and launcher.n == N and launcher.k_l == K_L
     assert launcher.workspace_bytes == 2 * N * 4 * 4224
     assert launcher.max_active_clusters == workspace.max_clusters
+    # Every rank must prepare with the same capacity: a differing max_rows is
+    # refused on every rank by the prepare-time agreement, before any allocation.
+    with pytest.raises(ValueError, match="max_rows must be identical"):
+        prepare_fp8_rowwise_gemm_allreduce(*sample, group, max_rows=4133 + rank)
     for served_rows in (1, 129, 4133):
         served = _inputs(served_rows, N, K_L, device, generator)
         served_out = launcher(*served)

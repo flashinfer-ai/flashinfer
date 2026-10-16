@@ -714,6 +714,27 @@ class _PreparedLauncher:
         return out
 
 
+def _agree_capacity(
+    group: dist.ProcessGroup, capacity: int, *, world_size: int, device: torch.device
+) -> None:
+    """Collective: refuse a ``max_rows`` that differs between the ranks of ``group``.
+
+    The chunk capacity derived from ``max_rows`` sizes the receive slots and the
+    readiness words a rank addresses in its peers' workspaces, so every rank must
+    prepare with the same value. One int64 all-gather, before any allocation.
+    """
+
+    mine = torch.tensor([int(capacity)], dtype=torch.int64, device=device)
+    theirs = [torch.empty_like(mine) for _ in range(world_size)]
+    dist.all_gather(theirs, mine, group=group)
+    values = [int(value.item()) for value in theirs]
+    if any(value != capacity for value in values):
+        raise ValueError(
+            "max_rows must be identical on every rank of the group, got "
+            + ", ".join(f"rank {rank}: {value}" for rank, value in enumerate(values))
+        )
+
+
 def prepare_fp8_rowwise_gemm_allreduce_cake(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -724,7 +745,12 @@ def prepare_fp8_rowwise_gemm_allreduce_cake(
     backend: str,
     max_rows: Optional[int] = None,
 ) -> _PreparedLauncher:
-    """Bind ``group``, ``N`` and ``K_l`` and size a dedicated workspace for ``max_rows`` (default ``a.shape[0]``) once."""
+    """Bind ``group``, ``N`` and ``K_l`` and size a dedicated workspace for ``max_rows`` (default ``a.shape[0]``) once.
+
+    ``max_rows`` must be identical on every rank of ``group``: the preparation
+    all-gathers it once and raises ``ValueError`` on every rank when the values
+    differ, before any allocation.
+    """
 
     if backend != "cake":
         raise ValueError("backend must be exactly 'cake'")
@@ -735,6 +761,13 @@ def prepare_fp8_rowwise_gemm_allreduce_cake(
             f"max_rows={capacity} is smaller than the sample input's {call.m} rows"
         )
     loader.validate_shape(capacity, call.n, call.k_l)
+    _refuse_capture()
+    _agree_capacity(
+        group,
+        capacity,
+        world_size=call.world_size,
+        device=torch.device("cuda", call.device_index),
+    )
     state = _launch_state(call, group)
     with state.lock:
         if state.poisoned:

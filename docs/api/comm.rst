@@ -99,6 +99,9 @@ operands of the bound ``N`` and ``K_l`` with at most ``max_rows`` rows and
 never runs another collective. The launcher is CUDA-graph capturable: a
 captured call allocates nothing but its output and replays interleave with
 eager calls; a call that exceeds the capacity raises before any launch.
+``max_rows`` must be identical on every rank of the group: the preparation
+checks it in that collective and raises ``ValueError`` on every rank when the
+values differ.
 
 .. autosummary::
     :toctree: ../generated
