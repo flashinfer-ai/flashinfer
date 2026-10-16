@@ -16,10 +16,11 @@ limitations under the License.
 
 import functools
 import math
+from typing import Optional
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .jit.mhc import gen_mhc_module
 from .trace.templates.mhc import (
     mhc_post_trace,
@@ -566,3 +567,159 @@ def _mhc_pre_big_fuse_with_prenorm_impl_fake(
     block_size: int,
 ) -> None:
     pass
+
+
+@flashinfer_experimental_api
+def mhc_pre_big_fuse_with_norm(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    post_mix: Optional[torch.Tensor] = None,
+    comb_mix: Optional[torch.Tensor] = None,
+    layer_input: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""mHC pre-map big-fuse from split-K partials, with the output RMSNorm fused in.
+
+    ``rms = rsqrt(sum_s gemm_out_sqrsum[s] / (4 H) + rms_eps)``,
+    ``mixes = (sum_s gemm_out_mul[s]) * rms``; ``pre = sigmoid(mixes[0:4] * hc_scale[0]
+    + hc_base[0:4]) + hc_pre_eps``, ``post_mix = sigmoid(mixes[4:8] * hc_scale[1] +
+    hc_base[4:8]) * hc_post_mult_value``, ``comb_mix`` = ``sinkhorn_repeat``-iteration
+    Sinkhorn of ``softmax(mixes[8:24].view(4, 4) * hc_scale[2] + hc_base[8:24])``;
+    ``ol = sum_j pre[j] * residual[:, j]`` (fp32), ``layer_input = bf16(float(bf16(ol)) *
+    rsqrt(mean(ol^2) + norm_eps) * norm_weight)``.
+
+    On SM100 / SM103, ``H = 4096`` decode calls (``1 <= T <= 32``, ``NS`` in ``{8, 64}``,
+    ``rms_eps = norm_eps = 1e-5``, ``hc_pre_eps = hc_sinkhorn_eps = 1e-6``,
+    ``hc_post_mult_value = 2``, ``sinkhorn_repeat = 20``, dense 16-byte aligned tensors) run a
+    thread-block-cluster kernel; every other call runs a composable fp32 PyTorch
+    implementation of the same contract.
+
+    Parameters
+    ----------
+    gemm_out_mul : torch.Tensor
+        fp32 ``[NS, T, 24]`` split-K partial projection logits.
+    gemm_out_sqrsum : torch.Tensor
+        fp32 ``[NS, T]`` split-K partial sums of squares of the residual.
+    hc_scale, hc_base : torch.Tensor
+        fp32 ``[3]`` and ``[24]`` logit scales / biases.
+    residual : torch.Tensor
+        bf16 ``[T, 4, H]`` residual streams.
+    norm_weight : torch.Tensor
+        bf16 ``[H]`` RMSNorm weight applied to the collapsed stream.
+    rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_eps
+        Model constants (no defaults: they are part of the numerical contract).
+    post_mix, comb_mix, layer_input : Optional[torch.Tensor]
+        Optional destination buffers (fp32 ``[T, 4]``, fp32 ``[T, 16]`` or ``[T, 4, 4]``,
+        bf16 ``[T, H]``); allocated when omitted.
+    enable_pdl : Optional[bool]
+        Launch the cluster kernel with programmatic dependent launch. ``None`` (default)
+        launches without it, which is the faster choice for an isolated call; a caller whose
+        producer kernel triggers its dependents early may pass ``True``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(post_mix, comb_mix, layer_input)``.
+
+    Notes
+    -----
+    :func:`mhc_pre_big_fuse_with_norm_supported` reports whether the cluster kernel serves a
+    call, and :func:`mhc_pre_big_fuse_with_norm_warmup` loads it ahead of CUDA-graph capture
+    (it is never built during capture). ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the
+    composable implementation at call time.
+    """
+    if residual.dim() != 3:
+        raise ValueError("residual must have shape [T, 4, H]")
+    if residual.shape[1] != _MHC_HC:
+        raise ValueError(f"residual.shape[1] / HC must be 4, got {residual.shape[1]}")
+
+    from .experimental.mhc_pre_big_fuse_with_norm import run
+
+    return run(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+        post_mix=post_mix,
+        comb_mix=comb_mix,
+        layer_input=layer_input,
+        enable_pdl=enable_pdl,
+    )
+
+
+@flashinfer_experimental_api
+def mhc_pre_big_fuse_with_norm_supported(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: Optional[torch.Tensor],
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    post_mix: Optional[torch.Tensor] = None,
+    comb_mix: Optional[torch.Tensor] = None,
+    layer_input: Optional[torch.Tensor] = None,
+) -> bool:
+    r"""Return True when :func:`mhc_pre_big_fuse_with_norm` runs its cluster kernel for
+    exactly these arguments.
+
+    The decision is made at call time: the ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
+    switch, the supported shapes and model constants, dtypes, strides, 16-byte alignment,
+    the device architecture and -- under CUDA-graph capture -- whether the kernel module is
+    already loaded. Callers that have their own fast path for the op should keep it whenever
+    this returns False.
+    """
+    from .experimental.mhc_pre_big_fuse_with_norm import supported
+
+    return supported(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+        post_mix=post_mix,
+        comb_mix=comb_mix,
+        layer_input=layer_input,
+    )
+
+
+@flashinfer_experimental_api
+def mhc_pre_big_fuse_with_norm_warmup(device: Optional[torch.device] = None) -> bool:
+    r"""Load the cluster kernel of :func:`mhc_pre_big_fuse_with_norm` outside CUDA-graph
+    capture.
+
+    Returns True when the kernel is usable on ``device`` (default: the current CUDA device).
+    """
+    from .experimental.mhc_pre_big_fuse_with_norm import warmup
+
+    return warmup(device)
