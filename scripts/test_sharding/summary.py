@@ -719,7 +719,15 @@ def _detect_gpu_name() -> str:
     Docker container, avoiding the cost of initialising a CUDA context just
     to query the device name.
     """
-    return os.environ.get("CI_GPU_NAME", "unknown") or "unknown"
+    name = os.environ.get("CI_GPU_NAME", "") or ""
+    if not name:
+        print(
+            "WARNING: CI_GPU_NAME is not set; gpu_name will be 'unknown'. "
+            "Ensure the workflow matrix sets gpu_name and ci/bash.sh forwards it.",
+            file=sys.stderr,
+        )
+        return "unknown"
+    return name
 
 
 @lru_cache(maxsize=1)
