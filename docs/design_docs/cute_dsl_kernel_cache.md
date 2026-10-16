@@ -225,10 +225,54 @@ The benchmark command
 `flashinfer_benchmark.py --routine nvfp4_quantize ... --backends cuda cute-dsl`
 compiles on the first run and is compile-free on every subsequent run.
 
-## 5. Limitations and future work
+## 5. SM100-family MXFP8 startup
 
-- **Adoption**: persistent caching is wired into CuTe-DSL call sites including nvfp4 quantization, FP4 GEMM, top-k, and SM12x MoE. The SM90 BF16/FP16 fused MoE uses direct `cute.compile` calls with module-local process caches instead. Other persistent-cache call sites should follow the pattern here: wrap the existing `cute.compile` call in a closure and name the specialization. The kernel name is the **sole per-kernel cache key** (`meta.json` guards only module-wide facts), so a name function must encode every codegen parameter — new adopters should replicate the naming tests in `tests/jit/test_cute_dsl_cache.py` (signature coverage of the kernel getters + per-argument perturbation) for their own name functions.
+`mm_mxfp8(backend="cute-dsl")` persists the SM100-family persistent and
+tcgen05 split-K GEMMs. The key includes tile and cluster geometry, swap/prefetch,
+PDL, output dtype, split-K count, batch size, and active-cluster count. It uses a
+separate `mm_mxfp8` namespace from FP4. Source invalidation also covers the
+split-K kernel and the parallel compiler's constructor choices.
+
+Before profiling, the runner precompiles missing tactics using up to four
+spawned processes. `FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS` sets the upper
+bound; CPU affinity and available host/cgroup memory can lower it. Values 0 or 1
+use ordinary on-demand compilation. A lock per cache directory coordinates
+precompile pools across TP ranks sharing that cache. Each waiting rank rechecks
+the artifacts after acquiring the lock. Separate caches do not coordinate.
+Worker failures fall back to the normal compile path; disabling JIT or the
+CuTe-DSL disk cache also disables precompilation.
+
+`FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=0` preserves the full search and its
+order. Positive values opt into the FP4 analytical ranking for persistent
+tactics, while retaining every eligible split-K tactic. The budget must fit
+those split-K tactics plus at least one persistent candidate. This ranking
+needs MXFP8 workload validation before becoming a default: a startup reduction
+alone does not establish steady-state performance parity. The newer warp
+split-K runner and SM107/SM12x paths are outside this change.
+
+Use the following regression harness with a **new** output directory:
+
+```bash
+python benchmarks/bench_mxfp8_startup.py --output-dir /tmp/mxfp8-startup-full
+python benchmarks/bench_mxfp8_startup.py --output-dir /tmp/mxfp8-startup-top32 --top-n 32
+```
+
+The harness runs each case in a fresh process and records tuning wall time,
+process wall time, parent compile calls, artifact count, graph-replay numerics,
+and GPU execution time. Warm cases fail if GEMM compilation is attempted.
+Three cache states matter: an empty kernel cache; cached kernels with tuning
+still required; cached kernels **and** saved tuning winners. The baseline uses
+the same current kernels with persistence and precompilation disabled, so this
+is a component comparison, not a reproduction of an older release or a full
+model's startup. The default K=7168 avoids the separate warp split-K path.
+Track these cases on target hardware along with full vLLM TP startup: unique
+profiles/tactics, compilation versus profiling time, rank waits, and correctness.
+
+## 6. Limitations and future work
+
+- **Adoption**: persistent caching is wired into CuTe-DSL call sites including nvfp4 quantization, FP4 and SM100 MXFP8 GEMM, top-k, and SM12x MoE. The SM90 BF16/FP16 fused MoE uses direct `cute.compile` calls with module-local process caches instead. Other persistent-cache call sites should follow the pattern here: wrap the existing `cute.compile` call in a closure and name the specialization. The kernel name is the **sole per-kernel cache key** (`meta.json` guards only module-wide facts), so a name function must encode every codegen parameter — new adopters should replicate the naming tests in `tests/jit/test_cute_dsl_cache.py` (signature coverage of the kernel getters + per-argument perturbation) for their own name functions.
 - **No `JitSpecRegistry` / AOT integration**: the registry now *accepts* any `JitSpec` backend, but cute-dsl kernels do not register themselves yet (only `gen_jit_spec()` registers), so they are invisible to the `flashinfer` CLI's module listing and to `flashinfer aot` / `flashinfer-jit-cache` packaging. (`FLASHINFER_DISABLE_JIT` *is* honored — it comes free from the shared `build_and_load()` template method.) AOT support would additionally require the spec to become declarative data (a factory reference + parameters) instead of a compile closure, so specs can be enumerated and prebuilt offline; then prebuild the module directories or link them into `.so`s (see 3.1).
 - **Cross-compile keying**: the arch key mirrors `CUTE_DSL_ARCH`-else-device, but a per-compile `gpu_arch` override passed through `cute.compile` options would not be reflected. No current call site does this.
 - **Single-target-arch assumption (heterogeneous multi-GPU)**: the cache key records what `cute.compile` actually compiles for — the DSL's resolved target (`CUTE_DSL_ARCH`, else the *current* device). Compiling for a non-current device in a mixed-arch process is not supported: it would require steering the compilation itself (per-compile `gpu_arch`) together with the key, not just parameterizing the key. The in-process `@functools.cache` level has the same current-device assumption today, so the disk cache does not regress multi-GPU behavior.
 - **Module-granular wipes**: a single source edit recompiles every cached specialization of that module on next use. Acceptable for development (matches nvcc behavior); irrelevant for deployments with immutable packages.
+- **Portable prebuilt CuTe-DSL artifacts**: the current source hash includes absolute file paths. Shipping these kernels in `flashinfer-jit-cache` needs a portable source identity, compiler/architecture compatibility checks, and a loader for packaged artifacts; copying objects from a developer's writable cache is insufficient.

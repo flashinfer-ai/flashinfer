@@ -57,13 +57,17 @@ from ..fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from .gemm_mm_fp4_cute_dsl import (
+    _blockscaled_mxfp8_gemm_cache_key_files,
     _compile_block_scaled_gemm,
+    _mxfp8_blockscaled_kernel_disk_name,
     _mm_fp4_cache_key,
     mm_fp4_l2_policy,
+    _mm_mxfp8_cache_key,
     _prepare_alpha_for_launch,
     per_token_alpha_mode,
     precompile_mm_fp4_tactics,
 )
+from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
@@ -76,6 +80,7 @@ from .kernels.utils import (
     _SM107_MXFP8_MMA_TILER_K,
     _get_sm107_mxfp8_tactics,
     _rank_mm_fp4_autotune_tactics,
+    _rank_mm_mxfp8_autotune_tactics,
     _select_sm100_mm_fp4_cute_dsl_tactic,
     _select_sm107_mm_fp4_cute_dsl_tactic,
     _select_sm107_mm_mxfp8_cute_dsl_tactic,
@@ -6455,7 +6460,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             )
             valid_tactics = [(*tactic, 1) for tactic in base_tactics]
             if not out.is_contiguous():
-                return valid_tactics
+                return self._rank_tactics(valid_tactics, a, n, real_k)
 
             for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
                 if warp_serves and real_k < 4096:
@@ -6475,7 +6480,38 @@ def _cute_dsl_gemm_mxfp8_runner(
                             split_k_slices,
                         )
                     )
-            return valid_tactics
+            return self._rank_tactics(valid_tactics, a, n, real_k)
+
+        def _rank_tactics(self, tactics, a, n, real_k):
+            budget = int(
+                os.environ.get("FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS", "0")
+            )
+            if budget < 0:
+                raise ValueError("MXFP8 tactic budget must be nonnegative")
+            if budget == 0:
+                return tactics
+            return _rank_mm_mxfp8_autotune_tactics(
+                tactics, a.shape[0], n, real_k, get_device_sm_count(a.device), budget
+            )
+
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs) -> bool:
+            a, b = inputs[:2]
+            try:
+                precompile_mm_mxfp8_tactics(
+                    [tactic for tactic in tactics if tactic != -1],
+                    a.shape[0],
+                    b.shape[1],
+                    a.shape[1],
+                    enable_pdl,
+                    out_dtype,
+                    _CUTE_DSL_MM_MXFP8_KERNEL_CACHE,
+                    a.device,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MXFP8 precompilation failed; compiling on demand: %s", exc
+                )
+            return True
 
         def forward(
             self,
@@ -6488,6 +6524,9 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             real_k = a.shape[1]
             n = b.shape[1]
+
+            if do_preparation:
+                return out
 
             sf_vec_size = 32
             sf_dtype = cutlass.Float8E8M0FNU
@@ -6593,7 +6632,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = (
+            cache_key = _mm_mxfp8_cache_key(
                 sf_vec_size,
                 mma_tiler_mn,
                 cluster_shape_mn,
@@ -6637,6 +6676,10 @@ def _cute_dsl_gemm_mxfp8_runner(
                 sf_k=sf_k,
                 batch_size=batch_size,
                 cluster_shape_k=split_k_slices,
+                cache_module_name="mm_mxfp8",
+                device_index=get_device_index(a.device),
+                disk_kernel_name_fn=_mxfp8_blockscaled_kernel_disk_name,
+                cache_key_files_fn=_blockscaled_mxfp8_gemm_cache_key_files,
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
