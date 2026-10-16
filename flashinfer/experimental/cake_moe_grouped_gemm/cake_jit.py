@@ -17,18 +17,9 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from pathlib import Path
 from typing import Any, Optional
 
-from ...jit import env as jit_env
-from ...jit.core import (
-    current_compilation_context,
-    gen_jit_spec,
-    refresh_current_compilation_context,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
-    sm107a_nvcc_flags,
-)
+from . import cake_build
 
 # Registry of the generated ragged grouped GEMM programs (filled verbatim by the
 # Cake generated-program export; do not edit the literals by hand).
@@ -36,9 +27,13 @@ from ...jit.core import (
 # ``PROGRAMS``: one record per physical program -- one kernel source plus its
 # host binding, shared by every architecture in ``arches`` (genuine
 # per-architecture lowering differences live inside the source under exact
-# ``__CUDA_ARCH__`` regions) -- with its compile flags, FFI entry, argument
-# plan, launch shape and per-architecture closure identity.  A program is
-# JIT-compiled once per (architecture, compile-line specialization).
+# ``__CUDA_ARCH__`` regions) -- with its architecture-free ``library`` stem, FFI
+# entry, argument plan and launch shape.  What to compile (the translation
+# units, the compile flags, the per-architecture closure digest) is recorded in
+# ``build.json`` (see ``cake_build``), whose entry for a program is
+# ``<library>[<specialization tag>]_<arch>``; a program is built once per
+# (architecture, compile-line specialization), prebuilt under ``aot/`` or by
+# FlashInfer's JIT.
 #
 # ``ROUTES``: one record per public route -- ``fwd``, ``dgrad`` and
 # ``wgrad_{bf16,f32}_k{256,512}`` -- naming its architectures, host plan and
@@ -500,13 +495,6 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 OPS = ("fwd", "dgrad", "wgrad")
-# Exact-architecture payloads (tcgen05 / TMEM): one build per exact target with
-# FlashInfer's exact flag sets, never a family target.
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-    "sm_107a": sm107a_nvcc_flags,
-}
 
 
 def record_name(
@@ -587,35 +575,6 @@ def select_module(
     return name
 
 
-def build_target_arches() -> frozenset[str]:
-    """Exact architectures FlashInfer builds for, restricted to ``ARCHES``.
-
-    Follows ``FLASHINFER_CUDA_ARCH_LIST`` when set and the visible devices
-    otherwise (``flashinfer.compilation_context.CompilationContext``); the
-    loader never probes ``nvcc`` or the device itself.
-    """
-    context = current_compilation_context
-    if not context.TARGET_CUDA_ARCHS:
-        context = refresh_current_compilation_context()
-    targets = {f"sm_{major}{minor}" for major, minor in context.TARGET_CUDA_ARCHS}
-    return frozenset(targets) & frozenset(ARCHES)
-
-
-def _header_dirs():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return installed
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return source
-    raise FileNotFoundError("FlashInfer binding headers were not found")
-
-
 def stage_binding(name: str, stage: str) -> dict[str, Any]:
     """The ``{"name", "program", "specializations"}`` record of ``stage`` of route ``name``."""
     route = ROUTES[name]
@@ -633,52 +592,39 @@ def _specialization_items(
     return tuple(sorted(specializations.items()))
 
 
-@functools.cache
-def _gen_module(program: str, arch: str, specializations: tuple[tuple[str, Any], ...]):
+def specialization_tag(specializations: tuple[tuple[str, Any], ...]) -> str:
+    """Library-name suffix of a compile-line specialization set: ``_wgrad_tile256`` for
+    ``{"WGRAD_TILE": 256}``, empty for none.  ``build.json`` names a specialized build
+    ``<library><tag>_<arch>`` and carries its ``-D<KEY>=<value>`` defines in that entry's ``nvcc_flags``."""
+    return "".join(f"_{key.lower()}{value}" for key, value in specializations)
+
+
+def library_name(
+    program: str, arch: str, specializations: Optional[dict[str, Any]] = None
+) -> str:
+    """``build.json`` entry of ``program`` built for ``arch`` under ``specializations``."""
     record = PROGRAMS[program]
     if arch not in record["arches"]:
         raise ValueError(f"program {program!r} is not delivered for {arch}")
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in record["sources"]]
-    tag = "".join(f"_{key.lower()}{value}" for key, value in specializations)
-    return gen_jit_spec(
-        # The spec name carries the exact target, the compile-line specialization
-        # values and the sealed closure identity, so a changed closure or value
-        # never reuses a stale extension.
-        name=f"{program}_{arch}{tag}_" + record["closure_sha256"][arch][:20],
-        sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[arch],
-            *record["compile_flags"],
-            *[f"-D{key}={value}" for key, value in specializations],
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
-        use_fast_math=False,
-    )
-
-
-def gen_module(
-    program: str, arch: str, specializations: Optional[dict[str, Any]] = None
-):
-    """JIT spec of one physical program for ``arch`` under ``specializations``."""
-    return _gen_module(program, arch, _specialization_items(specializations or {}))
+    tag = specialization_tag(_specialization_items(specializations or {}))
+    return f"{record['library']}{tag}_{arch}"
 
 
 @functools.cache
 def _load_module(program: str, arch: str, specializations: tuple[tuple[str, Any], ...]):
-    targets = build_target_arches()
-    if arch not in targets:
-        raise RuntimeError(
-            f"generated program {program!r} is requested for {arch}, which is not a "
-            f"FlashInfer build target (targets: {sorted(targets) or 'none'}); set "
-            "FLASHINFER_CUDA_ARCH_LIST to include it"
-        )
-    return _gen_module(program, arch, specializations).build_and_load()
+    return cake_build.load_library(library_name(program, arch, dict(specializations)))
 
 
 def load_module(
     program: str, arch: str, specializations: Optional[dict[str, Any]] = None
 ):
-    """Build (once per target and specialization) and load one physical program."""
+    """Load (once per program, exact target and specialization) one physical program: the prebuilt
+    library under ``aot/`` when the package ships it, else FlashInfer's JIT build of its ``build.json``
+    entry."""
     return _load_module(program, arch, _specialization_items(specializations or {}))
+
+
+def specs_for_arch(arch: str):
+    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
+    ``flashinfer.jit.build_jit_specs`` warm-up)."""
+    return cake_build.jit_specs(arch)
