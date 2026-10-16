@@ -27,6 +27,7 @@ from ..cute_dsl_primitives import (
     NEGATIVE_ZERO_BF16_BITS,
     VEC_BF16,
     WARP_SIZE,
+    atomic_add_global_i32,
     bf16x2_to_packed_u32,
     bf16x4_to_packed_u32x2,
     bf16x8_to_packed_u32x4,
@@ -60,7 +61,6 @@ from ..cute_dsl_primitives import (
     store_shared_u32x4_address,
 )
 from ..dynamic_fp8_epilogue import store_dynamic_fp8_cta_row
-from ....cute_dsl.fp4_common import atomic_add_global_i32
 from ..static_fp8_epilogue import store_rmsnorm_output
 
 LAMPORT_GENERATIONS = 3
@@ -1343,18 +1343,31 @@ class _FusedAllReduceDeviceKernel:
     unit ``(r - lag) * G + c`` (a ``1/tp`` slice of one owned token) and
     broadcasts the result, and materializes token ``(r - 2 * lag) * G + c``.
     Readiness is detected with the negative-zero Lamport sentinels of the
-    three-launch path, so no grid barrier is needed. The grid never exceeds
-    one wave because every CTA of every rank spins on data from CTAs of other
-    ranks.
+    three-launch path, so no grid barrier is needed.
 
-    Every CTA starts with ticket ``cta`` and then claims the next unclaimed
-    ticket from a per-stage counter, so CTAs that run ahead take over work
-    instead of idling; a fixed round-robin share would let independent groups
-    of CTAs drift apart, and the slowest group would set the end of the call.
-    Deadlock freedom: tickets are claimed in order on every rank, a ticket
-    publishes before it waits, and it only waits on work of tickets at least
-    ``lag * G - tp`` smaller, so the smallest unfinished ticket over all ranks
-    can always make progress.
+    Every CTA claims each of its tickets, the first one included, from a
+    per-stage counter, so CTAs that run ahead take over work instead of
+    idling; a fixed round-robin share would let independent groups of CTAs
+    drift apart, and the slowest group would set the end of the call. A CTA
+    claims its next ticket while it works on the current one, which hides the
+    atomic's latency.
+
+    Progress needs only one resident CTA per rank. A ticket publishes before
+    it waits, and it only waits on work of tickets at least
+    ``lag * G - tp + 1`` smaller: the reduce of unit ``u`` waits on token
+    ``(u // tp) * tp + rank`` of every peer, at most ``u + tp - 1``, and the
+    materialize of token ``t`` waits on the reduce of units at most
+    ``t + tp - 1``. Tickets are claimed in order, only by running CTAs, and a
+    CTA holding two tickets is blocked on the smaller one only. So the
+    smallest unfinished ticket over all ranks is either held by a running CTA
+    that can finish it, or is the next one a running CTA of its rank claims.
+    CTAs beyond what the GPU can hold at once (MPS limits, SM partitions,
+    other kernels) start when earlier ones exit and find the work done. The
+    grid is one CTA per SM so that, normally, every SM moves data. The
+    exception is a rank with no resident CTA at all, for example when another
+    spinning collective that fills the GPU runs concurrently on a different
+    stream and waits on peers that wait on this one; two such collectives must
+    not run concurrently on different streams.
 
     Compared with the three-launch path, the NVLink traffic of publish and
     broadcast overlaps, the HBM pass of materialization hides under it, and
@@ -1367,11 +1380,11 @@ class _FusedAllReduceDeviceKernel:
     ``(tp - 1) / tp`` of the slab in each direction per rank, whereas a
     multicast store delivers a full slab into every rank, including the
     issuing one, so together with the publish traffic unicast has the smaller
-    per-direction volume. The first published token is staged before the stage
-    index is read.
+    per-direction volume.
 
     All CTAs read the stage index, then the last CTA to arrive on a counter
-    advances it for the next call.
+    advances it for the next call; a CTA that starts late still reads the
+    index of this call because the counter only completes after it arrives.
     """
 
     def __init__(
@@ -1422,7 +1435,7 @@ class _FusedAllReduceDeviceKernel:
         # a round stages into one while the previous round's copies drain.
         self.smem_bytes = (
             self.warps * 4 * (2 if dynamic_fp8 else 1)
-            + 8
+            + 12
             + 256
             + 2 * self.fragments * 16
             + 128
@@ -1494,7 +1507,8 @@ class _FusedAllReduceDeviceKernel:
         warp_maxima = warp_sums
         if cutlass.const_expr(self.dynamic_fp8):
             warp_maxima = smem.allocate_array(Float32, self.warps)
-        ticket_slots = smem.allocate_array(Int32, 2)
+        # Two ticket slots and the stage index.
+        ticket_slots = smem.allocate_array(Int32, 3)
         publish_buffer = Int32(
             smem.allocate_array(
                 Uint32, 2 * self.fragments * 4, byte_alignment=128
@@ -1528,21 +1542,6 @@ class _FusedAllReduceDeviceKernel:
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
 
-        # The first ticket (always ``cta``) stages its publish data while the
-        # stage index is read; only the copy destination depends on it.
-        if cta < m:
-            self._stage_publish(local_contribution, cta, tidx, publish_buffer)
-        stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
-        cute.arch.barrier()
-        if tidx == 0:
-            self._arrive(stage_state, stage)
-        if cutlass.const_expr(self.enable_pdl):
-            # A dependent launch still waits for this grid to complete before
-            # it reads anything; triggering here only hides its launch latency.
-            cute.arch.griddepcontrol_launch_dependents()
-
-        contribution_base = Int64(contribution_mailbox.iterator.toint())
-        prenorm_base = Int64(prenorm_mailbox.iterator.toint())
         local_tokens = (m + Int32(self.tp_size - 1)) // Int32(self.tp_size)
         reduce_units = local_tokens * Int32(self.tp_size)
         token_groups = (m + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
@@ -1552,10 +1551,36 @@ class _FusedAllReduceDeviceKernel:
         ) + Int32(self.lag)
         if reduce_rounds > rounds:
             rounds = reduce_rounds
-
         total_tickets = rounds * Int32(self.grid_ctas)
+
+        if tidx == 0:
+            # The claim's address depends on the stage index, so the index is
+            # read before the arrival below can advance it. Both atomics are
+            # issued before either result is used, so their latencies overlap.
+            first_stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
+            first_counter = stage_state.iterator + (
+                Int32(TICKET_COUNTERS) + Int32(first_stage)
+            )
+            first_ticket = atomic_add_global_i32(Int64(first_counter.toint()), Int32(1))
+            arrived = atomic_add_global_i32(
+                Int64((stage_state.iterator + ARRIVAL_COUNTER).toint()), Int32(1)
+            )
+            self._release_ticket_counter(first_counter, first_ticket, total_tickets)
+            self._advance_stage(stage_state, first_stage, arrived)
+            # Slot 1 is next written at the end of the second iteration.
+            cute.arch.store((ticket_slots + Int32(1)).llvm_ptr, first_ticket)
+            cute.arch.store((ticket_slots + Int32(2)).llvm_ptr, Int32(first_stage))
+        cute.arch.barrier()
+        stage = Uint32(cute.arch.load((ticket_slots + Int32(2)).llvm_ptr, Int32))
         ticket_counter = stage_state.iterator + (Int32(TICKET_COUNTERS) + Int32(stage))
-        ticket = cta
+        if cutlass.const_expr(self.enable_pdl):
+            # A dependent launch still waits for this grid to complete before
+            # it reads anything; triggering here only hides its launch latency.
+            cute.arch.griddepcontrol_launch_dependents()
+
+        contribution_base = Int64(contribution_mailbox.iterator.toint())
+        prenorm_base = Int64(prenorm_mailbox.iterator.toint())
+        ticket = cute.arch.load((ticket_slots + Int32(1)).llvm_ptr, Int32)
         iteration = Int32(0)
         while ticket < total_tickets:
             round_index = ticket // Int32(self.grid_ctas)
@@ -1571,8 +1596,7 @@ class _FusedAllReduceDeviceKernel:
                 self.slice_fragments * 16
             )
             token = round_index * Int32(self.grid_ctas) + virtual_cta
-            # Round 0 was staged before the stage index was read.
-            if token < m and round_index > Int32(0):
+            if token < m:
                 self._stage_publish(local_contribution, token, tidx, publish_slot)
             fence_proxy_async_shared_cta()
             cute.arch.barrier()
@@ -1653,12 +1677,8 @@ class _FusedAllReduceDeviceKernel:
                 # rounds back is reused after this wait.
                 bulk_wait_group_read(1)
             if tidx == 0:
-                next_ticket = claimed + Int32(self.grid_ctas)
-                cute.arch.store((ticket_slots + buffer_slot).llvm_ptr, next_ticket)
-                # Every CTA stops at its first ticket past the end, so the G-th
-                # such claim is the last use of the counter.
-                if next_ticket == total_tickets + Int32(self.grid_ctas - 1):
-                    store_global_u32(ticket_counter, Uint32(0))
+                self._release_ticket_counter(ticket_counter, claimed, total_tickets)
+                cute.arch.store((ticket_slots + buffer_slot).llvm_ptr, claimed)
             # Keeps the warps of a CTA on the same ticket: warps that run ahead
             # only add publish traffic for tokens nobody can reduce yet, which
             # delays the broadcasts the other ranks are waiting for.
@@ -1669,10 +1689,19 @@ class _FusedAllReduceDeviceKernel:
         bulk_wait_group_read(0)
 
     @cute.jit
-    def _arrive(self, stage_state: cute.Tensor, stage: Uint32) -> None:
-        arrived = atomic_add_global_i32(
-            Int64((stage_state.iterator + ARRIVAL_COUNTER).toint()), Int32(1)
-        )
+    def _release_ticket_counter(
+        self, ticket_counter: cute.Pointer, claimed: Int32, total_tickets: Int32
+    ) -> None:
+        # Every CTA claims until it draws a ticket past the end, so a call
+        # makes total_tickets + G claims and the largest is the last use of
+        # the counter, which is next used three calls later.
+        if claimed == total_tickets + Int32(self.grid_ctas - 1):
+            store_global_u32(ticket_counter, Uint32(0))
+
+    @cute.jit
+    def _advance_stage(
+        self, stage_state: cute.Tensor, stage: Uint32, arrived: Int32
+    ) -> None:
         if arrived == Int32(self.grid_ctas - 1):
             store_global_u32(stage_state.iterator + ARRIVAL_COUNTER, Uint32(0))
             store_global_u32(stage_state.iterator + ACTIVE_STAGE, stage)

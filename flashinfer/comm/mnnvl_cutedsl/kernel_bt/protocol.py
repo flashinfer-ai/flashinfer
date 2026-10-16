@@ -69,13 +69,23 @@ class BTFinalizeTuning:
 _FUSED_THREADS = 1024
 
 
+def _fused_grid_ctas(device: torch.device) -> int:
+    """Grid size of the fused all-reduce: one CTA per SM.
+
+    The schedule only needs one resident CTA per rank to make progress; one
+    per SM lets every SM move data.
+    """
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 @dataclass(frozen=True, slots=True)
 class BTAllReduceTuning:
     publish_threads: int = 128
     publish_vectors_per_thread: int = 1
     collective: BTCollectiveTuning = BTCollectiveTuning(reduction_threads=32)
     # fused=True runs publish, owner reduce and materialize as one persistent
-    # launch of one 1024-thread CTA per SM (see _FusedAllReduceDeviceKernel);
+    # launch of one 1024-thread CTA per SM (see _FusedAllReduceDeviceKernel)
+    # that needs at least one of its CTAs resident on every rank;
     # publish_* and the collective thread counts are then unused, while
     # collective.enable_pdl still applies. fused_lag is the distance in rounds
     # between consecutive stages of one token, so most data has landed before
@@ -589,9 +599,6 @@ class BTProtocol:
         if tuning.fused_lag < 1:
             raise ValueError("fused_lag must be positive")
         device = torch.device("cuda", torch.cuda.current_device())
-        # Every CTA spins on data from CTAs of other ranks, so the whole grid
-        # must be resident at once: one CTA per SM.
-        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         device_kernel = _FusedAllReduceDeviceKernel(
             hidden_size=self.hidden_size,
             tp_size=self.tp_size,
@@ -599,7 +606,7 @@ class BTProtocol:
             capacity_m=self.capacity_m,
             local_capacity=self.local_capacity,
             threads=_FUSED_THREADS,
-            grid_ctas=sm_count,
+            grid_ctas=_fused_grid_ctas(device),
             lag=tuning.fused_lag,
             add_residual=self.add_residual,
             write_residual_output=self.write_residual_output,
@@ -609,6 +616,20 @@ class BTProtocol:
             enable_pdl=tuning.collective.enable_pdl,
             dynamic_fp8=self.dynamic_fp8,
         )
+        # The kernel spins on peers, so one CTA of it must fit on an SM. The
+        # block size is static, so the compiler limits the registers to what a
+        # 1024-thread CTA can get (reqntid); shared memory is the remaining
+        # per-CTA limit.
+        shared_memory_limit = torch.cuda.get_device_properties(
+            device
+        ).shared_memory_per_block_optin
+        if device_kernel.smem_bytes > shared_memory_limit:
+            raise ValueError(
+                f"the fused BT all-reduce needs {device_kernel.smem_bytes} bytes "
+                f"of shared memory per CTA for hidden_size={self.hidden_size}, "
+                f"but the device allows {shared_memory_limit}; use a "
+                "three-launch BT preset (fused=False)"
+            )
         activation = make_fake_dynamic_compact_tensor(
             BFloat16, alignment=16, divisibility=self.hidden_size
         )

@@ -753,6 +753,27 @@ def fence_proxy_async_shared_cta(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def atomic_add_global_i32(address: Int64, value: Int32, *, loc=None, ip=None) -> Int32:
+    """Relaxed GPU-scope atomic add on a global int32; returns the old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(address).ir_value(loc=loc, ip=ip),
+                Int32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def remote_release_add1_u32(address: Int64, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
