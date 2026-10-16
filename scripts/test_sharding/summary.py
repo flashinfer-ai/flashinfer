@@ -578,7 +578,7 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     )
     capacity = _capacity_for_latest_attempt(plan, attempt_paths)
     summary: RunSummary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "complete": not scan.pending,
         "gpu_name": _detect_gpu_name(),
         "planned_nodes": len(plan.nodes),
@@ -713,38 +713,13 @@ def _cudnn_backend_version() -> str:
 
 @lru_cache(maxsize=1)
 def _detect_gpu_name() -> str:
-    """Return a short GPU name like 'H100' or 'A10G', or 'unknown'."""
-    try:
-        import torch
+    """Return the GPU name from the ``CI_GPU_NAME`` environment variable.
 
-        if torch.cuda.is_available():
-            full = torch.cuda.get_device_name(0)
-            # Normalize common names: "NVIDIA H100 80GB HBM3" → "H100"
-            for short in (
-                "H100",
-                "H200",
-                "A100",
-                "A10G",
-                "A10",
-                "T4",
-                "L4",
-                "L40",
-                "V100",
-                "B100",
-                "B200",
-                "B300",
-                "GB200",
-                "GB300",
-            ):
-                if short in full:
-                    return short
-                # We can't use a substring to map "NVIDIA Vera Rubin NVL72" → "VR NVL72" because we add a prefix.
-                if "NVL72" in full:
-                    return "VR NVL72"
-            return full
-    except Exception:
-        pass
-    return "unknown"
+    This variable is set by the CI workflow matrix and forwarded into the
+    Docker container, avoiding the cost of initialising a CUDA context just
+    to query the device name.
+    """
+    return os.environ.get("CI_GPU_NAME", "unknown") or "unknown"
 
 
 @lru_cache(maxsize=1)
