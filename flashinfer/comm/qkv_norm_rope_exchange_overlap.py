@@ -306,13 +306,33 @@ class QkvNormRopeExchangeOverlap:
         architecture).  Both paths store identical bits.  Must be uniform across the ranks of the group; not
         accepted with ``backend="nccl"``.
 
+    The Cake backend selects its producer build per architecture and world size
+    (``flashinfer.jit.cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``: SM100 groups of
+    8 ranks run the ``bulk_ow256`` build -- wide operand loads and bulk row stores --, SM100 groups of 4 ranks and
+    SM103 groups of 8 or 4 ranks the ``ow256`` build -- wide operand loads --, groups of 2 ranks and SM90 the
+    baseline build).  Every build stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
+    and norm-weight tensors (a misaligned view raises and names the opt-out).  The environment variable
+    ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` / ``shipped`` / a delivered build name) overrides the
+    selection for a session, rank-uniformly; the baseline build is delivered beside every variant, and a build that
+    is not delivered for the session's tile width raises and names the delivered ones.  The host plan's group
+    scaling follows the same keying (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``: ``2`` on SM100
+    groups of 4 and 2 ranks and on SM103, ``1`` otherwise; it applies to grouped rows with ``hidden >= 6144`` and
+    changes the tile order only); ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` (``auto`` / ``1`` / ``2`` / ``4``)
+    overrides it for a session, rank-uniformly.
+
     The Cake backend also applies per-architecture row-count gates to each call's host plan
     (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``
     rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
-    destination run; SM90: no gates).  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
-    (``auto`` / ``off`` / ``words_capacity_small_m=N,per_dest_large_m=N``, ``0`` = never) overrides them for a
-    session, rank-uniformly; ``describe()`` reports the resolved gates (``shape_gates``) and every prepared row's
-    verdict (``prepared_row_plans``).  The gates change neither the tile table nor the stored bits.
+    destination run; SM90: a call with ``>= 16384`` rows runs the persistent producer grid over every SM --
+    ``reserved_sms_large_m = 16384``, no reserved SMs --, the other two gates off).  The environment variable
+    ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
+    ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``, ``0`` = never) overrides them for a
+    session, rank-uniformly.  ``describe()`` reports the resolved build (``producer_variant``), scale
+    (``group_m_scale``) and gates (``shape_gates``), each with its value, source, environment variable and default,
+    and every prepared row's verdict (``prepared_row_plans``, including ``reserved_sms`` and ``part_grids``).  The
+    gates change neither the tile table nor the stored bits.  The largest 2-rank shape of the evaluation grid
+    (``S_global = 131072``, ``hidden = 8192``) is not supported on an 80 GB H100: its operands and receive slots
+    exceed the device memory.
     """
 
     def __init__(
