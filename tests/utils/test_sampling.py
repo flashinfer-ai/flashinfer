@@ -22,7 +22,10 @@ from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
-from tests.test_helpers.sampling import required_num_trials
+from tests.test_helpers.sampling import (
+    required_num_collision_rows,
+    required_num_trials,
+)
 
 
 # H100 CI peak GPU memory: 39.5 GiB.
@@ -1464,9 +1467,13 @@ def test_sampling_from_logits_seed_offset_reproducibility(batch_size, vocab_size
 def test_sampling_different_seed_offset_produces_different_results(vocab_size):
     """Test that different seed/offset values produce different samples."""
     torch.manual_seed(42)
-    batch_size = 1000
+    # Size the two all-match checks before drawing outputs. Larger batch shapes
+    # remain covered by the seed/offset reproducibility tests above.
+    batch_size = 16
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    num_rows = required_num_collision_rows(normalized_prob)
+    normalized_prob = normalized_prob[:num_rows]
 
     samples_seed1 = flashinfer.sampling.sampling_from_probs(
         normalized_prob, seed=12345, offset=0
