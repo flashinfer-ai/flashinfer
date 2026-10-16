@@ -28,6 +28,7 @@ summary; no route payload is constructed.
 
 import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
@@ -54,6 +55,29 @@ _BSR_ERROR_INDEX_OUT_OF_RANGE = 2
 _BSR_ERROR_INVALID_INDPTR = 3
 _ERROR_INVALID_SEQ_LEN = 4
 _ERROR_INVALID_PHYSICAL_PAGE_ID = 5
+
+
+@dataclass(frozen=True)
+class _BlockSparseInspectCompileSpec:
+    """Static BSR geometry shared by equivalent inspection specializations."""
+
+    batch_size: int
+    num_pattern_heads: int
+    num_q_block_rows: int
+    num_kv_blocks: int
+
+
+@dataclass(frozen=True)
+class _PagedBlockSparseInspectCompileSpec:
+    """Static BSR geometry, paging divisors, and request-validation bounds."""
+
+    batch_size: int
+    num_pattern_heads: int
+    num_q_block_rows: int
+    minimum_seq_len_kv: int
+    max_seq_len_kv: int
+    kv_block_size: int
+    page_size: int
 
 
 @cute.jit
@@ -473,6 +497,12 @@ def compile_block_sparse_inspection(
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
     num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
+    compile_spec = _BlockSparseInspectCompileSpec(
+        batch_size=batch_size,
+        num_pattern_heads=num_pattern_heads,
+        num_q_block_rows=num_q_block_rows,
+        num_kv_blocks=num_kv_blocks,
+    )
     logical_nnz = cute.sym_int()
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = _InspectBlockSparseBsr(
@@ -503,12 +533,7 @@ def compile_block_sparse_inspection(
         return build_and_load_attention_kernel(
             "block_sparse",
             "inspect",
-            (
-                batch_size,
-                num_pattern_heads,
-                num_q_block_rows,
-                num_kv_blocks,
-            ),
+            compile_spec,
             _COMPILE_OPTIONS,
             compile_kernel,
             extra=(),
@@ -536,6 +561,15 @@ def compile_paged_block_sparse_metadata_inspection(
     """
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
+    compile_spec = _PagedBlockSparseInspectCompileSpec(
+        batch_size=batch_size,
+        num_pattern_heads=num_pattern_heads,
+        num_q_block_rows=num_q_block_rows,
+        minimum_seq_len_kv=minimum_seq_len_kv,
+        max_seq_len_kv=max_seq_len_kv,
+        kv_block_size=kv_block_size,
+        page_size=page_size,
+    )
     logical_nnz = cute.sym_int()
     runtime_page_columns = cute.sym_int()
     runtime_page_row_stride = cute.sym_int64(divisibility=1)
@@ -587,15 +621,7 @@ def compile_paged_block_sparse_metadata_inspection(
         return build_and_load_attention_kernel(
             "block_sparse",
             "inspect_paged",
-            (
-                batch_size,
-                num_pattern_heads,
-                num_q_block_rows,
-                minimum_seq_len_kv,
-                max_seq_len_kv,
-                kv_block_size,
-                page_size,
-            ),
+            compile_spec,
             _COMPILE_OPTIONS,
             compile_kernel,
             extra=(),
