@@ -103,9 +103,12 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   runs. The tile raster inside a group follows the per-wave operand footprint
   (`wgrad_raster_rows`).
 - Workspaces (allocated at preparation, retained by the launch object): the
-  per-CTA TMA descriptor slots of the weight gradient and its fp32 tail
-  partials. The operand descriptors are launch arguments; there is no
-  descriptor workspace and no descriptor upload kernel.
+  per-CTA TMA descriptor slots of the weight gradient (a ring of nine
+  descriptor pairs per CTA: a group switch edits the next pair and warms the
+  one after it, never a pair an in-flight load may still read) and its fp32
+  tail partials. The operand
+  descriptors are launch arguments; there is no descriptor workspace and no
+  descriptor upload kernel.
 
 `GroupedGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
 `raster_rows` and `launches` for inspection and tests.

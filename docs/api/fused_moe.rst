@@ -71,8 +71,8 @@ are designed to co-exist, and neither supersedes the other.
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
-Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
-on SM120a. Its four configs are included in the default backend list and can
+Frost is a stable ``MoELayer`` backend on SM107a and SM120a. Its four configs
+are included in the default backend list and can
 also be selected through ``BackendOptions``. Candidates with unavailable weight
 views or unsupported input shapes are skipped. It does not require
 ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
@@ -128,8 +128,12 @@ when both exist, the Frost-named view takes precedence. The public API is:
 The backend requires precomputed routing with contiguous int32 expert IDs and
 FP32 routing weights, and returns finalized BF16 output. It supports the default
 activation contracts; bias, expert parallelism, shared experts, custom activation
-parameters, and routing from logits are unsupported. BF16 uses the measured
-model shortlist. Quantized hidden/intermediate sizes must be divisible by 128.
+parameters, and routing from logits are unsupported. Hidden/intermediate sizes
+must be positive multiples of 128. All four dtypes use measured model shortlists
+where available and a bounded, factorized tactic search for other supported
+shapes. Local expert counts are limited to 1024 and token counts to the configured
+tuning ceiling, at most 2**20. Kernel identities describe implementation content,
+independently of model dimensions.
 
 Quantized FC1 weight scales accept expert-major or branch-major storage and may
 be updated in place. For CUDA Graph replay, keep tensor pointers, shapes and
@@ -141,6 +145,8 @@ layer.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
+The SM120 kernels were validated with PyTorch 2.14.0, CuTe DSL 4.7.1, TVM-FFI
+0.1.13.post3, and CUDA 13.4 with the bundled assembler.
 Runtime checks additionally require the DSL
 primitives and PyTorch CUDA Graph resource-retention APIs used by the backend.
 Older dependencies remain usable by other FlashInfer backends; these requirements
@@ -156,15 +162,30 @@ skips unavailable Frost candidates; explicit selection reports the missing requi
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
 There is no patch-level minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
-SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
+SM120 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.
 
 Prepare and optionally autotune before CUDA Graph capture. Frozen device sources
 ship in the wheel and are compiled for the requested geometry into the writable
 FlashInfer cache. The four fixed routing/finalize adapters are also registered
-for SM107 AOT builds, and the BF16 adapter is registered for SM120 AOT builds.
+for SM107 and SM120 AOT builds.
 Geometry-specialized DSL kernels retain source/JIT delivery.
 No runtime cuDNN Frontend installation is required.
+
+Artifact catalogs use schema v4. Each architecture shares tile definitions;
+gated/non-gated activation groups and compatible store policies expand into
+kernel descriptors during preparation. Sources share exact activation fragments.
+Device occupancy, L2 budget, pipeline stages and workspace are derived once from
+the preparation device. Kernels support symbolic problem sizes with explicit
+alignment and bounds; measured shortlists accelerate selection for known shapes,
+and bounded heuristics supply candidates for other shapes.
+
+Kernel IDs identify logical configurations. Source and compiler fingerprints
+qualify compiled kernels and persisted tuning choices. Artifact tooling should use
+``cudnn_frost.manifest.read_manifest`` and ``write_manifest`` to read expanded
+records and preserve existing dimension catalogs. The reader also accepts schema
+v2/v3 exports; ``dimension_catalog.write_catalog`` factors complete exports into
+the dimension format.
 
 Finalized precomputed ``MoELayer`` calls support ``FLASHINFER_TRACE_DUMP=1`` and
 ``MoELayer.__call__.fi_trace(self=layer, act_pack=activations, weight_pack=weights)``.
@@ -697,7 +718,7 @@ These symbols are defined in the backend modules and re-exported from
 Standalone TRT-LLM Gen Routing
 ------------------------------
 
-The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs is
 exposed on its own so expert selection and the permutation/padding bookkeeping
 can be used (and tested) independently of quantization and GEMM configuration.
 

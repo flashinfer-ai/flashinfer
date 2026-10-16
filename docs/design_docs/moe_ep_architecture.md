@@ -306,6 +306,12 @@ BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoE
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
+After an automatic warmup, `layer.get_tuned_knobs()` returns a copy of the
+selected knob dictionary. Pass it as `knobs` when constructing a fixed layer
+with the same kernel configuration and capacity. The getter performs no tuning
+or file access and raises before a successful automatic search or after layer
+destruction. `warmup()` continues to return `None`.
+
 For serving several token capacities with one layer and one transformed weight
 set, allocate explicit profiles before capture:
 
@@ -324,13 +330,21 @@ decode_view = layer.forward(
 )
 ```
 
+Pass `knobs=selected_knobs` to `create_workspace()` to use a fixed dictionary
+for that capacity while sharing the layer's transformed weights. The dictionary
+is copied. Omitting `knobs` or passing `None` inherits the layer's configuration.
+The layer must use fixed knobs. An override for the default capacity must be
+supplied before that workspace is allocated.
+
 Creation and destruction are collective across EP ranks and must occur in the
-same order. A handle belongs to the layer that created it and accepts any live
-token count up to its capacity. Only one live handle per capacity is allowed on
-a layer. If an explicit handle is created for the
+same order, with matching capacities and knobs. A handle belongs to the layer
+that created it and accepts any live
+token count up to its capacity. Only one live handle per `(capacity, live_tokens)`
+is allowed on a layer. If an explicit handle is created for the
 `FleetParams.max_tokens_per_rank` capacity, it becomes the same logical profile
 selected by `workspace=None`; FlashInfer transfers/reuses the default allocation
-rather than acquiring an aliasing pool reference. `workspace=` selects capacity
+when knobs are inherited, rather than acquiring an aliasing pool reference.
+`workspace=` selects capacity and knobs
 but preserves the existing owned-output default; request
 `return_workspace_view=True` explicitly when a supported backend and CUDA Graph
 need a stable borrowed output address.

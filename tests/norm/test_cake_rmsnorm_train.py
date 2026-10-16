@@ -44,7 +44,7 @@ from flashinfer.cake_rmsnorm_train import (
     cake_rmsnorm_train_forward,
     is_cake_rmsnorm_train_supported,
 )
-from flashinfer.jit import cake_rmsnorm_train as loader
+from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 

@@ -33,6 +33,10 @@ from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
+# H100 CI peak GPU memory: 62.6 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 def head_dim_512_supported() -> bool:
     # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
     return get_compute_capability(torch.device("cuda:0"))[0] >= 8
