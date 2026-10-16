@@ -58,6 +58,7 @@ from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
+from ..helpers.sparse_indices import SparseKVIndices
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -714,7 +715,10 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
             row = stage_info.work_tile.tile_idx[2]
             self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
             self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
@@ -726,8 +730,11 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         k_index = stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
         token = k_index * Int32(128) + lane * Int32(4)
         row = stage_info.work_tile.tile_idx[2]
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
-            routes = self.page_offsets.for_request(
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
+            routes = self.page_offsets.bind_query_row(
                 row, self.request_lengths[0], self.request_lengths[1]
             )
         else:
@@ -2250,7 +2257,10 @@ class TmemSResource(HighThroughputMlaResource):
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
         """Cache live source lengths once per query tile, including graph replay."""
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
             row = stage_info.work_tile.tile_idx[2]
             self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
             self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
@@ -2496,8 +2506,11 @@ class TmemSResource(HighThroughputMlaResource):
 
         if cutlass.const_expr(cfg.page_size == 1):
             group_needs_mask = True
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
-            mask_page_offsets = self.page_offsets.for_request(
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
+            mask_page_offsets = self.page_offsets.bind_query_row(
                 work_tile.tile_idx[2], self.request_lengths[0], self.request_lengths[1]
             )
         else:
@@ -2510,8 +2523,10 @@ class TmemSResource(HighThroughputMlaResource):
                 group_needs_mask = (cached_mask_low | cached_mask_high) != Int32(0)
         else:
             raw_mask_routes = (
-                mask_page_offsets.mask_for_tile(tile_offset_k, work_tile.tile_idx[2])
-                if cutlass.const_expr(hasattr(self.page_offsets, "mask_for_tile"))
+                mask_page_offsets.select_source_tile(
+                    tile_offset_k, work_tile.tile_idx[2], for_mask=True
+                )
+                if cutlass.const_expr(isinstance(mask_page_offsets, SparseKVIndices))
                 else self.page_offsets
             )
             mask_routes = (

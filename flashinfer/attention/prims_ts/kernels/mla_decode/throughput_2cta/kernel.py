@@ -1576,7 +1576,7 @@ class MlaDecodeTs:
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
-            from ..sparse_views import bind_sparse_views
+            from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sm, qs, ss, os, sinks = block_split_kvs
             capacity = cutlass.const_expr(
@@ -1597,13 +1597,13 @@ class MlaDecodeTs:
                     tile_sched_params.problem_shape_b_fdd,
                 )
                 request = Int64(row)
-            page_offsets, cache_seqs = bind_sparse_views(
+            page_offsets, cache_seqs = bind_sparse_kv_indices(
                 si,
                 ci,
                 sl,
                 cl,
                 capacity,
-                request=request,
+                query_row=request,
                 assume_valid_prefix=self.assume_valid_prefix,
             )
             if cutlass.const_expr(not self.direct_static_scales):

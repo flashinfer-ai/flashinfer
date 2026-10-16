@@ -537,7 +537,7 @@ class SmemPageOffsetsResource(MlaResource):
             )
             tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
             tile_start = tile_idx * pages_per_tile
-            routes = self.page_offsets.routes_for_tile(tile_start, batch_idx)
+            routes = self.page_offsets.select_source_tile(tile_start, batch_idx)
             position = lane_idx * Int32(4)
             smem_offset = (
                 stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
@@ -545,12 +545,12 @@ class SmemPageOffsetsResource(MlaResource):
             )
             if cutlass.const_expr(cfg.tile_size_kv < 128):
                 if position < pages_per_tile:
-                    quad = routes.mapped_quad(tile_start + position)
+                    quad = routes.load_quad(tile_start + position)
                     self._smem_page_offsets.data_ptr(smem_offset).store(
                         quad.load(0, 4), alignment=16
                     )
             else:
-                quad = routes.mapped_quad(tile_start + position)
+                quad = routes.load_quad(tile_start + position)
                 self._smem_page_offsets.data_ptr(smem_offset).store(
                     quad.load(0, 4), alignment=16
                 )

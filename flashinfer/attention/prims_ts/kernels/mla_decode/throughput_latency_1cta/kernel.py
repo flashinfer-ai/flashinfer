@@ -2393,19 +2393,19 @@ class ThroughputLatencyMlaDecodeTs:
         cfg = self._make_config()
 
         if cutlass.const_expr(cfg.sparse_direct):
-            from ..sparse_views import bind_sparse_views
+            from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sm, qs, ss, os, sinks = sparse_scale_params
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
-            page_offsets, cache_seqs = bind_sparse_views(
+            page_offsets, cache_seqs = bind_sparse_kv_indices(
                 si,
                 ci,
                 sl,
                 cl,
                 cfg.total_kv_tiles * cfg.tile_size_kv,
-                request=request,
+                query_row=request,
             )
             if cutlass.const_expr(not cfg.sparse_static_scales):
                 softmax_scale_log2 = (

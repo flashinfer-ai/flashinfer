@@ -1029,6 +1029,87 @@ def test_direct_metadata_without_packed_fields_graph():
     assert torch.count_nonzero(out) == 0 and torch.isneginf(lse).all()
 
 
+@pytest.mark.parametrize("heads,prefix", [(8, False), (128, True)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_source_tile_boundary_graph(heads, prefix, dtype):
+    """Move the extra-source boundary between 128/256 during graph replay."""
+    batch = (
+        1 if heads == 8 else torch.cuda.get_device_properties(0).multi_processor_count
+    )
+    q = torch.zeros((batch, 1, heads, 512), device="cuda", dtype=dtype)
+    # Distinct pool values expose selection of the wrong source descriptor.
+    primary = torch.ones((129, 1, 512), device="cuda", dtype=dtype)
+    extra = torch.full((5, 1, 512), 8, device="cuda", dtype=dtype)
+    indices = torch.arange(129, device="cuda", dtype=torch.int32).repeat(batch, 1)
+    extra_indices = torch.arange(5, device="cuda", dtype=torch.int32).repeat(batch, 1)
+    lengths = torch.full((batch,), 127, device="cuda", dtype=torch.int32)
+    extra_lengths = torch.full_like(lengths, 5)
+    kv_scale = 0.5 if dtype == torch.float8_e4m3fn else 1.0
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        q.device,
+        batch,
+        heads,
+        max_topk=129,
+        max_extra_topk=5,
+        q_data_type=dtype,
+        return_lse=True,
+        assume_valid_prefix=prefix,
+    )
+
+    def prepare(out=None):
+        return prepare_sparse_mla_metadata(
+            wrapper,
+            q,
+            primary,
+            indices,
+            lengths,
+            extra_kv_cache=extra,
+            extra_indices=extra_indices,
+            extra_lengths=extra_lengths,
+            kv_scale=kv_scale,
+            out=out,
+        )
+
+    metadata = prepare()
+    out, lse = wrapper.run(q, primary, metadata, extra, kv_scale=kv_scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prepare(out=metadata)
+        wrapper.run(
+            q,
+            primary,
+            metadata,
+            extra,
+            kv_scale=kv_scale,
+            out=out,
+            lse=lse,
+            validate=False,
+        )
+    for primary_length, extra_length in (
+        (127, 5),
+        (129, 5),
+        (128, 5),
+        (0, 5),
+        (129, 0),
+        (0, 0),
+    ):
+        lengths.fill_(primary_length)
+        extra_lengths.fill_(extra_length)
+        graph.replay()
+        count = primary_length + extra_length
+        expected = (
+            kv_scale * (primary_length + 8 * extra_length) / count if count else 0
+        )
+        torch.testing.assert_close(
+            out.float(), torch.full_like(out.float(), expected), rtol=0.01, atol=0.002
+        )
+        expected_lse = torch.tensor(float(count), device=q.device).log()
+        torch.testing.assert_close(
+            lse, expected_lse.expand_as(lse), rtol=1e-4, atol=2e-4
+        )
+
+
 @pytest.mark.parametrize("heads", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_softmax_score_jumps(heads, dtype):
