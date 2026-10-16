@@ -251,6 +251,7 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.situ_linear_beta,
         grid_x,
         sm_version,
+        sample_args[1].shape[0] == 1,
     )
     hit = _COMPILED.get(key)
     if hit is None:

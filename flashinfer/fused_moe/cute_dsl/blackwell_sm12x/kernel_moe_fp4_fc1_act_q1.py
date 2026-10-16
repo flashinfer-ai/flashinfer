@@ -837,6 +837,9 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
             cute.size(gB_e, mode=[1]),
             cute.size(gB_e, mode=[2]),
         )
+        self.single_expert = False
+        if cutlass.const_expr(cute.is_static(E)):
+            self.single_expert = E == 1
         gQ = cute.recast_tensor(gQ_u8, cutlass.Float4E2M1FN)
         gSFQ = cute.make_tensor(gSFQ_u8.iterator, cute.make_layout(cute.size(gSFQ_u8)))
         sfq_cols = cute.size(gSFQ_u8, mode=[1])
@@ -1027,8 +1030,9 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
         pm, pn = (bn, bm) if cutlass.const_expr(swap) else (bm, bn)
         M, N = cute.size(gQ, mode=[0]), cute.size(gQ, mode=[1])
         K = cute.size(tma_tensor_a, mode=[1])
-        num_groups = cute.size(offsets, mode=[0]) - 1
-        num_n_blocks = ceil_div(N, pn)
+        if cutlass.const_expr(not self.single_expert):
+            num_groups = cute.size(offsets, mode=[0]) - 1
+            num_n_blocks = ceil_div(N, pn)
         k_tile_count = ceil_div(K, bk)
         sfa_tile_m = cfg.load_sf.sfa_tile_m(bm)
         sfa_tiles_per_block = cfg.load_sf.sfa_tiles_per_block(bm)
@@ -1094,23 +1098,51 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
             cute.arch.setmaxregister_decrease(self.reg_prod)
 
             if warp_idx == self.sched_warp:
-                sched = moe_scheduler.MoeTileScheduler.create(
-                    pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
-                )
                 prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
-                has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
-                while has:
-                    if cutlass.const_expr(swap):
-                        m_tile, n_tile = n_tile, m_tile
-                    prod.publish(
-                        sWork,
-                        sfull,
-                        sempty,
-                        moe_scheduler.MoeWorkTile(
-                            m_tile, n_tile, e, m_off, m_bnd, i32(1)
-                        ),
+                if cutlass.const_expr(self.single_expert):
+                    sched = moe_scheduler.StaticTileScheduler.create(
+                        moe_scheduler.GemmType.NORMAL,
+                        pm,
+                        pn,
+                        M,
+                        N,
+                        1,
+                        self.grid_x,
+                        bidx,
+                    )
+                    has, dense_m, dense_n = sched.get_next_block()
+                    while has:
+                        m_tile, n_tile = dense_m, dense_n
+                        if cutlass.const_expr(swap):
+                            m_tile, n_tile = n_tile, m_tile
+                        prod.publish(
+                            sWork,
+                            sfull,
+                            sempty,
+                            moe_scheduler.MoeWorkTile(
+                                m_tile, n_tile, i32(0), i32(0), M, i32(1)
+                            ),
+                        )
+                        has, dense_m, dense_n = sched.get_next_block()
+                else:
+                    sched = moe_scheduler.MoeTileScheduler.create(
+                        pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
                     )
                     has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
+                    while has:
+                        if cutlass.const_expr(swap):
+                            m_tile, n_tile = n_tile, m_tile
+                        prod.publish(
+                            sWork,
+                            sfull,
+                            sempty,
+                            moe_scheduler.MoeWorkTile(
+                                m_tile, n_tile, e, m_off, m_bnd, i32(1)
+                            ),
+                        )
+                        has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(
+                            offsets
+                        )
                 prod.publish_sentinel(sWork, sfull, sempty)
 
             if warp_idx == self.load_warp_0:
@@ -1430,11 +1462,19 @@ def make_args(
     sf = lambda tensor: from_dlpack(
         tensor.contiguous(), assumed_align=16
     ).mark_layout_dynamic()
+    if b_q.shape[0] == 1:
+        b_arg = (
+            from_dlpack(b_q)
+            .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1, 2))
+            .mark_compact_shape_dynamic(mode=2, stride_order=(0, 1, 2))
+        )
+    else:
+        b_arg = from_dlpack(b_q).mark_layout_dynamic()
     del epi_cfg, tile
     out_arg = from_dlpack(out_q, assumed_align=16).mark_layout_dynamic()
     return (
         from_dlpack(a_q).mark_layout_dynamic(),
-        from_dlpack(b_q).mark_layout_dynamic(),
+        b_arg,
         sf(a_scale),
         sf(b_scale),
         out_arg,
