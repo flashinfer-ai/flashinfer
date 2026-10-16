@@ -886,7 +886,6 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         config.workspace_buffer,
                         out=out,
                         max_seq_len_kv=config.max_seq_len_kv,
-                        bmm1_scale=sm_scale,
                         qo_indptr=qo_indptr,
                         group_size=config.group_size,
                         sparse_block_size=config.kv_block_size,

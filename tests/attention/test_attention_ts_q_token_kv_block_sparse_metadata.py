@@ -2504,6 +2504,99 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("group_size", (1, 4))
+def test_q_token_kv_block_sparse_wrapper_default_sm_scale_ignores_earlier_runs(
+    group_size: int,
+) -> None:
+    """``run()`` without ``sm_scale`` uses ``head_dim**-0.5`` after any earlier run."""
+
+    torch.manual_seed(2028)
+    blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
+    num_routes, num_qo_heads, head_dim = 2, 12, 256
+    max_seq_len_kv = table.shape[1] * storage_page_size
+    query = torch.randn(
+        num_routes,
+        1,
+        group_size,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k_cache = torch.randn(
+        int(table.max().item()) + 1,
+        1,
+        storage_page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+
+    def make_wrapper() -> QTokenKvBlockSparsePagedTSWrapper:
+        workspace = torch.empty(
+            get_prims_ts_q_token_kv_block_sparse_workspace_size(
+                query,
+                k_cache,
+                table,
+                group_size=group_size,
+                block_topk=blocks.shape[1],
+                max_seq_len_kv=max_seq_len_kv,
+                out_dtype=query.dtype,
+            ),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        wrapper = QTokenKvBlockSparsePagedTSWrapper()
+        wrapper.plan(
+            num_routes,
+            num_qo_heads,
+            1,
+            head_dim,
+            4,
+            storage_page_size,
+            blocks.shape[1],
+            max_seq_len_kv,
+            device=query.device,
+            workspace_buffer=workspace,
+            group_size=group_size,
+            q_data_type=query.dtype,
+        )
+        return wrapper
+
+    def run(
+        wrapper: QTokenKvBlockSparsePagedTSWrapper, sm_scale: float | None = None
+    ) -> torch.Tensor:
+        out = torch.empty_like(query)
+        wrapper.run(
+            query,
+            (k_cache, v_cache),
+            table,
+            blocks,
+            requests,
+            positions,
+            sm_scale=sm_scale,
+            out=out,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    expected_default = run(make_wrapper())
+    expected_default_again = run(make_wrapper(), sm_scale=head_dim**-0.5)
+    torch.testing.assert_close(
+        expected_default, expected_default_again, rtol=1e-2, atol=1e-2
+    )
+
+    wrapper = make_wrapper()
+    explicit = run(wrapper, sm_scale=0.5)
+    assert not torch.allclose(explicit, expected_default, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(run(wrapper), expected_default, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        run(wrapper, sm_scale=0.5), explicit, rtol=1e-2, atol=1e-2
+    )
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("requested_group_size", (None, 1, 3, 8))
 def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
     requested_group_size: int | None,
