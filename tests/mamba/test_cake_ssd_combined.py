@@ -683,7 +683,7 @@ def test_cake_ssd_combined_updates_caller_buffers():
     cake = runner._cake_runner
     # ``_case``'s triple form carries the caller's trusted table
     # (``update_seq_chunk_cumsum=False``): no kernel publishes metadata, so
-    # the call runs the fused single-launch program (CAKE-956 round 6 F1b);
+    # the call runs the fused single-launch program (trusted-table fused route);
     # 2 sequences x 8 heads over 256 tokens sit inside the fused window.
     allocated = runner.run(*tensors, **arguments)
     program_trusted = cake.last_program_name
@@ -1190,7 +1190,7 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(
     those of the clean problem and correct against CuTe / fp64, and a clean
     call afterwards leaves the reset word at 0.
 
-    The bitwise clause is a same-program statement.  CAKE-956 round 6 c9
+    The bitwise clause is a same-program statement.  The two-kernel route
     picks the two-kernel program on the host from the mean chunks per item
     (``two_kernel_family``), and that quantity counts the out-of-range tail
     tokens too (whether an id is out of range is only known on the device),
@@ -1423,7 +1423,7 @@ def _assert_two_forms_p6(
     monkeypatch, *, lengths, state_dtype, initial_states, programs
 ):
     """P6 reading of the two packed-varlen metadata forms where they run
-    different arithmetic (CAKE-956 round 6 c9): on the K fixed seeds run the
+    different arithmetic (the host two-kernel route): on the K fixed seeds run the
     seq_idx triple form and the cu_seqlens form of the same inputs on the
     forced exact scan plus the forced three-phase program (bitwise the
     round-5 scan, the baseline reading), and judge each form's output and
@@ -1519,8 +1519,8 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     every sequence geometry, with ``seq_idx`` optional and never read; the
     status word stays clear.
 
-    Where both forms run the same arithmetic they are bitwise.  CAKE-956
-    round 6 c9 routes the two-kernel form of one-chunk items to the retained
+    Where both forms run the same arithmetic they are bitwise.  The host
+    route sends the two-kernel form of one-chunk items to the retained
     round-5 start program (``two_kernel_family``), while a cu_seqlens call
     inside the fused window runs the round-6 fused program (single-rounding
     FMA state update): those two forms differ by that rounding, so each form
@@ -1535,7 +1535,7 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     (no caller table).  With the caller's trusted table instead
     (``_case``'s default, ``update_seq_chunk_cumsum=False``) nothing is
     published, so the triple runs the fused program of the cu_seqlens form
-    wherever the fused window admits it (CAKE-956 round 6 F1b) and the two
+    wherever the fused window admits it (trusted-table fused route) and the two
     forms are then bitwise again; outside the window it runs the two-kernel
     program of the derived triple (last block)."""
 
@@ -1571,7 +1571,7 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # grid is 0, i.e. in the cu_seqlens form: the triple runs the two-kernel
     # program of the same variant -- ``exactpre`` (round-6 arithmetic, the
     # fused program's) from two chunks per item, the retained start ``exact``
-    # program for one-chunk items (CAKE-956 round 6 c9).
+    # program for one-chunk items (the host two-kernel route).
     same_arithmetic = True
     fused = False
     if program_triple.startswith("chunkpar_"):
@@ -4814,8 +4814,8 @@ def test_source_chunk_parallel_selection_rule(
 def test_source_chunk_parallel_family_rule(
     capability, batch, nheads, nchunks, varlen, expected
 ):
-    """The three-way family rule at 148 SMs on both capabilities (CAKE-956
-    round 6 option A): the cost rule decides exact scan vs chunk-parallel
+    """The three-way family rule at 148 SMs on both capabilities: the cost
+    rule decides exact scan vs chunk-parallel
     (the faster of the two chunk-parallel predictions against the exact
     scan's), then the measured-region rule picks the chunk-parallel family --
     the three-phase program for batched calls with at most 256 tiles or with
@@ -6331,7 +6331,7 @@ def test_source_fused_route_mirrors_the_seed_rule():
 
 
 def test_source_two_kernel_route_mirrors_the_seed_rule():
-    """``two_kernel_family`` (CAKE-956 round 6 c9) mirrors the seed module's
+    """``two_kernel_family`` mirrors the seed module's
     ``two_kernel_route``: a two-kernel call takes the round-6 ``exactpre``
     program where the host-known chunks per work item reach two -- batched
     ``ceil(seqlen / 128)``, varlen ``ceil(ceil(packed_tokens / num_sequences)
@@ -6360,7 +6360,7 @@ def test_source_two_kernel_route_mirrors_the_seed_rule():
 
 def test_source_retained_start_programs_are_the_round5_files():
     """The ``exact_*`` programs are the round-5 start files retained byte for
-    byte (CAKE-956 round 6 c9): the 12 device sources the start loader bound,
+    byte: the 12 device sources the start loader bound,
     its host launcher (41 main arguments, ``_MAIN_ARGS_START``) and its main
     dynamic SMEM literals.  The Cake export pins the same digests
     (``_MAMBA_SSD_COMBINED_RETAINED_START_FILES``)."""
@@ -6465,7 +6465,7 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
     (round-6 pre-acceptance gate, 15 rows).  With a caller table the
     preprocess does not rewrite (``update_seq_chunk_cumsum=False``) nothing
     is published, so the fused program is one launch reading the caller's
-    tables (CAKE-956 round 6 F1b; ``_WorkspaceKey.caller_cumsum``).  Outside
+    tables (``_WorkspaceKey.caller_cumsum``).  Outside
     the window the trusted table still runs the two-kernel program.  The
     same call in the cu_seqlens form takes the fused program (next test)."""
 

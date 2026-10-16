@@ -45,9 +45,9 @@ _DEVICE_DIR = Path("generated") / "device"
 # main kernel takes six more arguments than the exact scan
 # (``_MAIN_ARGS_CHUNKPAR``), the three-phase chunk-parallel main kernel four
 # more (``_MAIN_ARGS_CHUNKPAR3``).
-# The start two-kernel exact-scan programs (``exact_*``, CAKE-956 round 5: the
-# retained files, 41 main arguments ``_MAIN_ARGS_START``) keep their original
-# launcher; the fused programs (``exactfused_*``, round 6) have their own.
+# The start two-kernel exact-scan programs (``exact_*``: the retained files,
+# 41 main arguments ``_MAIN_ARGS_START``) keep their original launcher; the
+# fused programs (``exactfused_*``) have their own.
 _HOST_TEMPLATE = Path("generated") / "host" / "mamba_ssd_combined_sequence.cpp"
 _EXACTFUSED_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_fused_sequence.cpp"
@@ -123,7 +123,7 @@ class _Program:
 # the single place the Cake export refreshes; every program binding below
 # derives from it.  Five kernel families ship, each x {bf16, f16, f32 state}
 # x {batched, varlen}, plus one preprocess shared by all: the fused exact scan
-# (``exactfused_*``, CAKE-956 round 6 item 2: delta / cumsum computed in-CTA,
+# (``exactfused_*``: delta / cumsum computed in-CTA,
 # one launch), the two-kernel exact scan (``exactpre_*``: the start pre+scan
 # form with the round-6 single-rounding state update, which the fused route
 # keeps for saturated / long-item calls and for the seq_idx triple form whose
@@ -131,7 +131,7 @@ class _Program:
 # START two-kernel exact scan (``exact_*``: the
 # round-5 programs retained byte for byte -- the export never refreshes
 # ``_SCAN_MODULES`` -- which :func:`two_kernel_family` keeps for one-chunk
-# items, CAKE-956 round 6 c9), the look-back chunk-parallel program
+# items), the look-back chunk-parallel program
 # (``chunkpar_*``, round 6 item 1a) and the three-phase chunk-parallel
 # program (``chunkpar3_*``, the three-phase program kept as the second
 # chunk-parallel family).  The three exact-scan families ship two schedule
@@ -681,7 +681,7 @@ _CHUNK_PARALLEL_SMALL_ITEMS = 32
 _CHUNK_PARALLEL_LARGE_ITEMS = 128
 _CHUNK_PARALLEL_SELECTION_MARGIN = 1.05
 _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
-# Third cost arm (CAKE-956 round 6 option A): the three-phase program's own
+# Third cost arm: the three-phase program's own
 # calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
 # module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
 # 4), copied verbatim; they take part in the exact-vs-chunk-parallel gate only
@@ -1101,9 +1101,9 @@ def chunk_parallel_selected(
     )
 
 
-# Fused-program route (CAKE-956 round 6 item 2, lane i2 rule v4), mirrored from
-# ``fused_route`` of
-# ``loom.examples.weave.flashinfer_blackwell_mamba_ssd_combined_exact_scan_seed_v1``
+# Fused-program route, mirrored from ``fused_route`` of the Cake backend's
+# exact-scan seed module
+# (``flashinfer_blackwell_mamba_ssd_combined_exact_scan_seed_v1``)
 # and read on the same host-known quantities: ``items = sequences x heads`` is
 # the persistent work count; batched calls take the fused program when
 # ``items <= 1024``, chunks per sequence ``<= 16`` and ``items x chunks <=
@@ -1117,7 +1117,7 @@ _FUSED_ROUTE_MAX_CHUNKS_BATCHED = 16
 _FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED = 2048
 _FUSED_ROUTE_MAX_ITEMS_VARLEN = 256
 _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN = 512
-# Two-kernel program choice (CAKE-956 round 6 c9 host route; mirrors the seed
+# Two-kernel program choice (host route; mirrors the seed
 # module's ``two_kernel_route`` / ``TWO_KERNEL_ROUTE_MIN_CHUNKS``): the round-6
 # ``exactpre_*`` render carries lever 1b (the per-item decay-factor table and
 # the single-rounding FMA state update), whose fixed cost per work item is
@@ -1382,7 +1382,7 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 # no per-sequence lengths and no device synchronisation, so prepared / captured
 # shapes keep their program.
 #
-# CAKE-956 round 6 recalibration (lane i5a) on the round-6 exact-scan programs
+# Recalibration on the current exact-scan programs
 # (Cake 370cc1dc7941 + the adopted 1b(ii) prescale factor table, which changes
 # the per-chunk cost of BOTH variants): scan-kernel time ring / ``_noring``,
 # the two variants of the same program as the two arms, CUPTI, cold L2, 3 and 5

@@ -232,7 +232,7 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     replays reproduce the eager run bit for bit -- for the exact family in
     batched bf16-state form, for a packed-varlen ``cu_seqlens`` shape, for
     the seq_idx triple with the caller's trusted ``seq_chunk_cumsum`` (the
-    fused single-launch program, CAKE-956 round 6 F1b: ``prepare`` and the
+    fused single-launch program of the trusted-table route: ``prepare`` and the
     captured ``run`` resolve the same program from the same arguments) and
     for the chunk-parallel program forced through the override.
 
@@ -597,8 +597,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     and the following ``run`` is a pure launch of that program; a ``run``
     that asks the preprocess to rewrite the table is another shape with the
     two-kernel program; the ``cu_seqlens`` form with a caller buffer is still
-    prepared as the publishing call (its only reading).  CAKE-956 round 6
-    F1b."""
+    prepared as the publishing call (its only reading)."""
 
     module = _module()
     calls, loads = [], []
