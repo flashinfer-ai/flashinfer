@@ -2320,7 +2320,7 @@ def test_source_public_api_signatures_are_stable():
         False,
         False,
         torch.int64,
-        "cute",
+        "auto",
     )
     assert _signature_contract(module.SSDCombined) == tuple(
         zip(
@@ -2394,7 +2394,11 @@ def test_source_public_api_signatures_are_stable():
         _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True)
         == expected_run
     )
-    assert _signature_contract(module.ssd_combined_fwd) == expected_run
+    # The functional entry alone grows a trailing backend selector; the
+    # runner methods keep the Cake contract.
+    assert _signature_contract(module.ssd_combined_fwd) == expected_run + (
+        ("backend", positional, "auto"),
+    )
 
     # The prepared (CUDA-graph-capturable) submission entry: keyword-only,
     # the shape-determining subset of ``run``'s arguments, identical on the
@@ -2530,7 +2534,9 @@ def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
     assert runner._backend == "cake"
     assert runner._cake_runner.__class__ is CakeRunner
 
-    with pytest.raises(ValueError, match="backend must be 'cute' or 'cake'"):
+    with pytest.raises(
+        ValueError, match="backend must be 'auto', 'cute', 'cake' or 'cudnn'"
+    ):
         module.SSDCombined(128, 8, 64, 128, 8, backend="unknown")
 
 

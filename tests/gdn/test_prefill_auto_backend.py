@@ -3,15 +3,26 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Keep default GDN prefill calls on the established FlashInfer kernels."""
+"""The default GDN prefill backend is ``auto``: it matches an explicit
+``auto`` call kernel for kernel, follows the cuDNN policy region on SM100 and
+keeps the FlashInfer kernels everywhere else."""
 
 import json
 
 import pytest
 import torch
 
+from flashinfer import gdn_prefill
+from flashinfer.cudnn import linear_attention
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.utils import is_sm100a_supported
+
+
+@pytest.fixture
+def native_auto_policy():
+    """This module exercises the auto resolution itself, so the native-only
+    pin of the directory's conftest does not apply here."""
+    yield
 
 
 @pytest.mark.parametrize(
@@ -85,9 +96,29 @@ def test_prefill_default_backend_preserves_flashinfer_graph(
         assert kernels, "CUDA profiling must capture the prefill kernel launches"
         results.append((output, state, kernels))
 
-    expected_output, expected_state, expected_kernels = results[0]
-    for output, state, kernels in results[1:]:
-        # Numerical checks alone miss a slower, numerically valid backend.
-        assert kernels == expected_kernels
-        torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
-        torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+    native_output, native_state, native_kernels = results[0]
+    auto_output, auto_state, auto_kernels = results[1]
+    default_output, default_state, default_kernels = results[2]
+    # The default backend is "auto": the same kernels and the same bits.
+    assert default_kernels == auto_kernels
+    torch.testing.assert_close(default_output, auto_output, atol=0, rtol=0)
+    torch.testing.assert_close(default_state, auto_state, atol=0, rtol=0)
+    # Numerical checks alone miss a slower, numerically valid backend, so the
+    # kernel list is the routing check in both directions.
+    prefer_cudnn = (
+        linear_attention._linear_attention_auto_available()
+        and gdn_prefill._prefer_cudnn_gdn_prefill(q, v, cu_seqlens, False)
+    )
+    if prefer_cudnn:
+        assert auto_kernels != native_kernels
+
+        def rel_err(actual, expected):
+            diff = (actual.float() - expected.float()).norm()
+            return (diff / expected.float().norm().clamp_min(1e-6)).item()
+
+        assert rel_err(auto_output, native_output) < 5e-3
+        assert rel_err(auto_state, native_state) < 5e-3
+    else:
+        assert auto_kernels == native_kernels
+        torch.testing.assert_close(auto_output, native_output, atol=0, rtol=0)
+        torch.testing.assert_close(auto_state, native_state, atol=0, rtol=0)

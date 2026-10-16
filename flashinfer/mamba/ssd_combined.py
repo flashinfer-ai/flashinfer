@@ -40,6 +40,39 @@ from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 from .ssd_kernel import SSDKernel
 
 
+# cuDNN's Mamba-2 engine serves the SM100 family; auto admits the chips with
+# backend measurements.
+_CUDNN_SSD_AUTO_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+
+
+@functools.cache
+def _cudnn_ssd_available() -> bool:
+    from ..cudnn.linear_attention import _mamba2_auto_available
+
+    return _mamba2_auto_available()
+
+
+def _ssd_auto_prefers_cudnn(io_dtype, state_dtype, headdim, dstate, device) -> bool:
+    """``backend="auto"``: cuDNN's fused Mamba-2 engine wherever it serves the call.
+
+    The engine needs cudnn-frontend 1.32+ (the ``graph.mamba2`` node), an
+    SM100 / SM103 device, ``headdim == 64``, ``dstate == 128``, bfloat16 or
+    float16 activations and a bfloat16, float32 or float16 state.
+    ``backend="cute"`` / ``"cake"`` select the native kernels explicitly.
+    """
+    if headdim != 64 or dstate != 128:
+        return False
+    if io_dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if state_dtype not in (torch.bfloat16, torch.float32, torch.float16):
+        return False
+    from ..utils import get_compute_capability
+
+    if get_compute_capability(device) not in _CUDNN_SSD_AUTO_CAPABILITIES:
+        return False
+    return _cudnn_ssd_available()
+
+
 @functools.cache
 def _get_seq_chunk_cumsum_module():
     """Get cached seq_chunk_cumsum JIT module."""
@@ -302,7 +335,7 @@ class SSDCombined:
         has_varlen: bool = False,
         has_z: bool = False,
         seq_idx_dtype=torch.int64,
-        backend: str = "cute",
+        backend: str = "auto",
     ):
         from ..utils import get_compute_capability
 
@@ -329,12 +362,37 @@ class SSDCombined:
         self._has_z = has_z
         self._io_torch_dtype = io_dtype
         self._state_torch_dtype = state_dtype
-        self._backend = backend
 
-        if backend not in ("cute", "cake"):
+        if backend not in ("auto", "cute", "cake", "cudnn"):
             raise ValueError(
-                f"SSDCombined backend must be 'cute' or 'cake', got {backend!r}"
+                "SSDCombined backend must be 'auto', 'cute', 'cake' or 'cudnn', "
+                f"got {backend!r}"
             )
+        if backend == "auto":
+            # cuDNN wherever its engine serves the configuration, else the
+            # CuTe kernel this class has always defaulted to.
+            backend = (
+                "cudnn"
+                if _ssd_auto_prefers_cudnn(
+                    io_dtype, state_dtype, headdim, dstate, torch.device("cuda")
+                )
+                else "cute"
+            )
+        self._backend = backend
+        if backend == "cudnn":
+            # cuDNN's fused SM100 Mamba-2 engine; graphs build on first use.
+            if io_dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    f"SSDCombined backend='cudnn' takes bfloat16 or float16 io, got {io_dtype}"
+                )
+            if state_dtype not in (torch.bfloat16, torch.float32, torch.float16):
+                raise ValueError(
+                    "SSDCombined backend='cudnn' carries the state at bfloat16, "
+                    f"float32 or float16, got {state_dtype}"
+                )
+            self._seq_cumsum_key = None
+            self._seq_cumsum_buf = None
+            return
         if backend == "cake":
             from .cake_ssd_combined import CakeSSDCombined
 
@@ -459,8 +517,9 @@ class SSDCombined:
 
         if self._backend != "cake":
             raise NotImplementedError(
-                "SSDCombined.prepare requires backend='cake'; the CuTe backend has "
-                "no graph-capturable prepared submission"
+                "SSDCombined.prepare requires backend='cake'; the CuTe and cuDNN "
+                "backends have no prepared submission (a cuDNN shape is capturable "
+                "after one eager call built its graph)"
             )
         return self._cake_runner.prepare(
             x=x,
@@ -714,15 +773,16 @@ class SSDCombined:
         chunk_size = self.chunk_size
         batch, seqlen, nheads, headdim = x.shape
         cake = self._backend == "cake"
+        cute = self._backend == "cute"
         nchunks = seqlen // chunk_size
-        if not cake:
+        if cute:
             assert seqlen % chunk_size == 0, (
                 f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
             )
         assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
         if out is not None:
             expected_out: Tuple[int, ...]
-            if cake:
+            if not cute:
                 expected_out = (batch, seqlen, nheads, headdim)
                 layout = "(B, S, EH, D)"
             else:
@@ -787,7 +847,7 @@ class SSDCombined:
                 f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
             )
         if (
-            not cake
+            cute
             and seq_idx is not None
             and chunk_indices is not None
             and chunk_offsets is not None
@@ -835,6 +895,59 @@ class SSDCombined:
         ):
             raise ValueError(
                 "selective checkpoint state outputs require SSDCombined backend='cake'"
+            )
+        if self._backend == "cudnn":
+            if seq_chunk_cumsum is not None and update_seq_chunk_cumsum:
+                # The caller-owned table is filled for parity with the CuTe
+                # backend; the engine derives its boundaries from cu_seqlens.
+                if seq_idx is None or chunk_indices is None or chunk_offsets is None:
+                    raise ValueError(
+                        "update_seq_chunk_cumsum needs the seq_idx / chunk_indices / "
+                        "chunk_offsets triple"
+                    )
+                count = (
+                    num_seqs
+                    if num_seqs is not None
+                    else initial_states.shape[0]
+                    if initial_states is not None
+                    else seq_chunk_cumsum.numel() - 1
+                )
+                self.compute_seq_chunk_cumsum(
+                    seq_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                    chunk_size,
+                    count,
+                    seq_chunk_cumsum,
+                )
+            if (
+                num_seqs is None
+                and seq_idx is not None
+                and initial_states is None
+                and seq_chunk_cumsum is not None
+            ):
+                num_seqs = seq_chunk_cumsum.numel() - 1
+            from ..cudnn import cudnn_ssd_combined_fwd
+
+            return cudnn_ssd_combined_fwd(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                out=out,
+                return_final_states=return_final_states,
+                num_seqs=num_seqs,
+                cu_seqlens=cu_seqlens,
             )
         if num_seqs is not None:
             raise ValueError(
@@ -1070,8 +1183,9 @@ def ssd_combined_fwd(
     return_final_states: bool = True,
     num_seqs: Optional[int] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    backend: str = "auto",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run the source-built Cake SSDCombined backend.
+    """Run the Mamba-2 SSD forward on cuDNN's engine or the source-built Cake backend.
 
     Args:
         x: BF16 input tensor of shape
@@ -1131,6 +1245,14 @@ def ssd_combined_fwd(
             the segment metadata themselves (no ``chunk_indices`` /
             ``chunk_offsets``; ``seq_idx`` optional).  See
             :meth:`SSDCombined.run`.
+        backend: ``"auto"`` (default) runs cuDNN's fused SM100 Mamba-2 engine
+            wherever it serves the call (cudnn-frontend 1.32+, SM100 / SM103,
+            ``headdim == 64``, ``dstate == 128``, bfloat16 or float16
+            activations, a bfloat16, float32 or float16 state, no ``checkpoint_*``
+            capture) and the source-built Cake programs otherwise. ``"cake"``
+            and ``"cudnn"`` select one explicitly; cuDNN runs through
+            :func:`flashinfer.cudnn.cudnn_ssd_combined_fwd` and takes the same
+            arguments except the selective ``checkpoint_*`` capture.
 
     Returns:
         A pair containing the token-major output ``out`` with shape
@@ -1139,6 +1261,10 @@ def ssd_combined_fwd(
         ``return_final_states`` is false.
     """
 
+    if backend not in ("auto", "cake", "cudnn"):
+        raise ValueError(
+            f"ssd_combined_fwd backend must be 'auto', 'cake' or 'cudnn', got {backend!r}"
+        )
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     state_dtype = (
@@ -1148,6 +1274,16 @@ def ssd_combined_fwd(
         if checkpoint_states is not None
         else torch.bfloat16
     )
+    if backend == "auto":
+        # The selective checkpoint capture is Cake's alone.
+        backend = (
+            "cudnn"
+            if checkpoint_states is None
+            and checkpoint_token_indices is None
+            and checkpoint_state_slots is None
+            and _ssd_auto_prefers_cudnn(x.dtype, state_dtype, headdim, dstate, x.device)
+            else "cake"
+        )
     config = _SSDCombinedRunnerConfig(
         chunk_size=128,
         nheads=nheads,
@@ -1162,7 +1298,7 @@ def ssd_combined_fwd(
         has_varlen=seq_idx is not None or cu_seqlens is not None,
         has_z=z is not None,
         seq_idx_dtype=seq_idx.dtype if seq_idx is not None else torch.int64,
-        backend="cake",
+        backend=backend,
     )
     device_index = x.device.index
     if device_index is None:

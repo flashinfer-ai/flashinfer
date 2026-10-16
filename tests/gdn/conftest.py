@@ -20,6 +20,20 @@ import pytest
 import torch
 
 
+@pytest.fixture(autouse=True)
+def native_auto_policy(monkeypatch):
+    """The native kernel suites test FlashInfer's own GDN prefill, so
+    ``backend="auto"`` stays on the native route here even where the cuDNN
+    policy region would take it (an SM100 box with cudnn-frontend 1.31+).
+    Same mechanism as the benchmark's ``dispatch_policy``; a module that
+    tests the auto resolution itself overrides this fixture by name."""
+    from flashinfer import gdn_prefill
+
+    monkeypatch.setattr(
+        gdn_prefill, "_prefer_cudnn_gdn_prefill", lambda *args, **kwargs: False
+    )
+
+
 def multidist_randn(
     num_dists, dim, mean_mean=0.0, mean_std=1.0, scale_lower=0.5, scale_upper=1.5
 ):

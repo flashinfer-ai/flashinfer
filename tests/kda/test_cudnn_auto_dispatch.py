@@ -31,6 +31,15 @@ from tests.test_helpers.cudnn_linear_attention import assert_rel_close
 from tests.test_helpers.kda_prefill import packed_prefill_inputs
 
 kda = importlib.import_module("flashinfer.kda")
+
+
+@pytest.fixture
+def native_auto_policy():
+    """This module exercises the auto resolution itself, so the native-only
+    pin of the directory's conftest does not apply here."""
+    yield
+
+
 cudnn_adapter = importlib.import_module("flashinfer.cudnn")
 
 
@@ -93,11 +102,11 @@ def _force_native_route(monkeypatch, native, seen):
     def cudnn(q, k, v, g, beta, **kwargs):
         seen.append(("cudnn", dict(q=q, k=k, v=v, g=g, beta=beta, **kwargs)))
         kwargs["output"].copy_(q + v)
-        kwargs["initial_state"].add_(1)
-        return (
-            kwargs["output"],
-            kwargs["initial_state"] if kwargs["output_final_state"] else None,
-        )
+        state = kwargs["initial_state"]
+        if state is None:
+            state = kwargs["output_state"]
+        state.add_(1)
+        return (kwargs["output"], state if kwargs["output_final_state"] else None)
 
     monkeypatch.setattr(cudnn_adapter, "cudnn_recurrent_kda", cudnn)
 
@@ -137,7 +146,6 @@ def test_auto_preserves_math_dtype_and_fresh_bindings(
 @pytest.mark.parametrize(
     "excluded",
     [
-        "ssm_state_indices",
         "initial_state_source",
         "initial_state_indices",
         "num_accepted_tokens",
@@ -199,6 +207,75 @@ def test_workspace_is_unused_by_cudnn_and_retained_for_fallback(
         assert bound["prefill_workspace"] is workspace
     else:
         assert "prefill_workspace" not in bound
+
+
+@pytest.mark.parametrize(
+    "form",
+    ["pool", "caller_normalized_qk", "post_sigmoid_beta", "pool_and_both_forms"],
+)
+def test_auto_admits_state_pools_and_argument_forms(monkeypatch, form):
+    """A contiguous pool with contiguous int32 slots, caller-normalized q/k and
+    post-sigmoid beta follow the same auto policy as the plain call and cross
+    to cuDNN as given (measured 2026-10-15: the cuDNN pool path costs what its
+    dense path costs while FlashInfer's pool route forgoes small-BH)."""
+    seen = []
+    _force_native_route(monkeypatch, "cute-dsl", seen)
+    values = _inputs()
+    if "pool" in form:
+        values["initial_state"] = torch.zeros(5, 4, 128, 128, dtype=torch.bfloat16)
+        values["ssm_state_indices"] = torch.tensor([3], dtype=torch.int32)
+    if form in ("caller_normalized_qk", "pool_and_both_forms"):
+        values["use_qk_l2norm_in_kernel"] = False
+    if form in ("post_sigmoid_beta", "pool_and_both_forms"):
+        values["beta_is_logit"] = False
+        values["beta"] = values["beta"].float().sigmoid().to(values["beta"].dtype)
+    result = kda.recurrent_kda(**values, backend="auto")
+    provider, bound = seen[-1]
+    assert provider == "cudnn"
+    assert bound["state_indices"] is values.get("ssm_state_indices")
+    assert bound["use_qk_l2norm_in_kernel"] is values["use_qk_l2norm_in_kernel"]
+    assert bound["beta_is_logit"] is values["beta_is_logit"]
+    assert bound["initial_state"] is values["initial_state"]
+    assert result[1] is values["initial_state"]
+
+
+def test_auto_cudnn_returns_bfloat16_final_state_without_input_state(monkeypatch):
+    """The native routes allocate a bfloat16 final state when no state comes
+    in; the cuDNN substitute hands its adapter the same buffer, so the dtype a
+    caller gets back does not depend on which provider served the call."""
+    seen = []
+    _force_native_route(monkeypatch, "cute-dsl", seen)
+    values = _inputs()
+    values["initial_state"] = None
+    result = kda.recurrent_kda(**values, backend="auto")
+    provider, bound = seen[-1]
+    assert provider == "cudnn"
+    assert bound["initial_state"] is None
+    assert bound["output_state"].dtype == torch.bfloat16
+    assert tuple(bound["output_state"].shape) == (1, 4, 128, 128)
+    assert result[1] is bound["output_state"]
+
+
+@pytest.mark.parametrize("problem", ["int64_slots", "slot_count", "padded_pool"])
+def test_auto_keeps_other_pool_forms_native(monkeypatch, problem):
+    """Pool forms cuDNN's adapter would reject stay on the native route
+    instead of raising: int64 slots, a slot per sequence missing, a padded
+    slot stride."""
+    seen = []
+    _force_native_route(monkeypatch, "cute-dsl", seen)
+    values = _inputs()
+    values["initial_state"] = torch.zeros(5, 4, 128, 128, dtype=torch.bfloat16)
+    values["ssm_state_indices"] = torch.tensor([3], dtype=torch.int32)
+    if problem == "int64_slots":
+        values["ssm_state_indices"] = torch.tensor([3], dtype=torch.int64)
+    elif problem == "slot_count":
+        values["ssm_state_indices"] = torch.tensor([3, 1], dtype=torch.int32)
+    elif problem == "padded_pool":
+        values["initial_state"] = torch.zeros(10, 4, 128, 128, dtype=torch.bfloat16)[
+            ::2
+        ]
+    kda.recurrent_kda(**values, backend="auto")
+    assert [provider for provider, _ in seen] == ["native"]
 
 
 @pytest.mark.parametrize("order", ["valid", "dtype", "shape", "device"])
@@ -458,44 +535,36 @@ def test_performance_policy_excludes_state_copy_compatibility_path(
         requires_grad=requires_grad,
         is_inference=lambda: inference,
     )
+    v = SimpleNamespace(shape=(1, 8192, 4, 128))
     offsets = SimpleNamespace(numel=lambda: 2)
     monkeypatch.setattr(kda, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(torch, "is_inference_mode_enabled", lambda: False)
-    assert not kda._prefer_cudnn_kda_prefill(q, state, offsets)
+    assert not kda._prefer_cudnn_kda_prefill(q, v, state, offsets, None)
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
 @pytest.mark.parametrize(
-    "heads,tokens,state_dtype,sm100,sm103",
+    "heads,tokens,state_dtype,native",
     [
-        (8, 1024, torch.bfloat16, "small-bh", "small-bh"),
-        (8, 4096, torch.bfloat16, "cudnn", "cudnn"),
-        (12, 4096, torch.bfloat16, "small-bh", "small-bh"),
-        (12, 8192, torch.bfloat16, "cudnn", "cudnn"),
-        (12, 65536, torch.bfloat16, "cudnn", "cudnn"),
-        (12, 1024, torch.float32, "cute-dsl", "cute-dsl"),
-        (12, 4096, torch.float32, "cudnn", "cudnn"),
-        (64, 65536, torch.bfloat16, "small-bh", "small-bh"),
-        (64, 1024, torch.float32, "cute-dsl-persistent", "cute-dsl-persistent"),
-        (64, 4096, torch.float32, "cudnn", "cudnn"),
-        (64, 8192, torch.float32, "cudnn", "cute-dsl-persistent"),
-        (64, 16384, torch.float32, "cudnn", "cudnn"),
-        (64, 65536, torch.float32, "cudnn", "cudnn"),
-        (65, 1024, torch.bfloat16, "cudnn", "cudnn"),
-        (96, 1024, torch.bfloat16, "cudnn", "cudnn"),
-        (96, 4096, torch.bfloat16, "cudnn", "cudnn"),
-        (96, 8192, torch.bfloat16, "cudnn", "cudnn"),
-        (96, 65536, torch.bfloat16, "cudnn", "cudnn"),
-        (96, 65536, torch.float32, "cute-dsl-persistent", "cute-dsl-persistent"),
-        (97, 8192, torch.bfloat16, None, None),
-        (65, 8192, torch.float32, None, None),
-        (64, 1023, torch.float32, None, None),
-        (64, 65537, torch.float32, None, None),
+        (8, 1024, torch.bfloat16, "small-bh"),
+        (12, 65536, torch.bfloat16, "small-bh"),
+        (64, 4096, torch.bfloat16, "small-bh"),
+        (65, 1024, torch.bfloat16, "cake"),
+        (96, 8192, torch.bfloat16, "cake"),
+        (12, 1024, torch.float32, "cute-dsl"),
+        (16, 65536, torch.float32, "cute-dsl"),
+        (24, 8192, torch.float32, "cute-dsl-persistent"),
+        (64, 4096, torch.float32, "cute-dsl-persistent"),
+        (96, 65536, torch.float32, "cute-dsl-persistent"),
+        (97, 8192, torch.bfloat16, None),
+        (65, 8192, torch.float32, None),
+        (64, 1023, torch.float32, None),
+        (64, 65537, torch.float32, None),
     ],
 )
-def test_measured_prefill_policy(
-    monkeypatch, cc, heads, tokens, state_dtype, sm100, sm103
-):
+def test_native_fallback_selection(monkeypatch, cc, heads, tokens, state_dtype, native):
+    """The native backend a single-sequence call takes when auto does not send
+    it to cuDNN; cuDNN's share of auto is covered by test_cudnn_auto_policy."""
     q = SimpleNamespace(
         is_cuda=True,
         dtype=torch.bfloat16,
@@ -507,12 +576,7 @@ def test_measured_prefill_policy(
     )
     offsets = SimpleNamespace(numel=lambda: 2)
     monkeypatch.setattr(kda, "get_compute_capability", lambda device: cc)
-    assert kda._select_kda_prefill_backend(q, state, offsets) == (
-        sm100 if cc == (10, 0) else sm103
-    )
-    assert (
-        kda._select_kda_prefill_backend(q, state, offsets, allow_cudnn=False) != "cudnn"
-    )
+    assert kda._select_kda_prefill_backend(q, state, offsets) == native
 
 
 @pytest.mark.parametrize("option", ["ragged", "unpacked", "sm90", "fp16", "no_state"])
@@ -622,11 +686,19 @@ def test_measured_routes_match_native_and_replay(
         values["prefill_workspace"] = RecurrentKDAPrefillWorkspace(device=device)
     if decline_cudnn:
         monkeypatch.setattr(kda, "_try_cudnn_kda_prefill", lambda **kwargs: None)
-    selected = kda._select_kda_prefill_backend(
-        values["q"],
-        values["initial_state"],
-        values["cu_seqlens"],
-        allow_cudnn=not decline_cudnn,
+    selected = (
+        "cudnn"
+        if not decline_cudnn
+        and kda._prefer_cudnn_kda_prefill(
+            values["q"],
+            values["v"],
+            values["initial_state"],
+            values["cu_seqlens"],
+            None,
+        )
+        else kda._select_kda_prefill_backend(
+            values["q"], values["initial_state"], values["cu_seqlens"]
+        )
     )
     persistent = importlib.import_module("flashinfer.kda_prefill_persistent")
     module, name = {

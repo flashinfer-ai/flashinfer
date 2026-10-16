@@ -35,7 +35,11 @@ try:
 except (ImportError, RuntimeError):
     _cake_gdn = None
     _CAKE_GDN_AVAILABLE = False
-from .utils import get_compute_capability, get_device_name, get_device_sm_count
+from .utils import (
+    get_compute_capability,
+    get_device_name,
+    get_device_sm_count,
+)
 from .gdn_kernels import (
     _chunk_gated_delta_rule_gdn_cp_sm100,
     chunk_gated_delta_rule_sm90,
@@ -893,53 +897,128 @@ def _cudnn_gdn_prefill_available() -> bool:
     return _linear_attention_auto_available()
 
 
-def _prefer_cudnn_gdn_prefill(q, v, cu_seqlens) -> bool:
-    # B200 raw-gate measurements include the existing fused-gate native path.
-    # Higher-head GVA was near parity, so retain its native policy for now.
-    return (
-        q.is_cuda
-        and q.shape[1:] == (4, 128)
-        and v.shape[1:] == (8, 128)
-        and 128 <= q.shape[0] <= 8192
-        and 2 <= cu_seqlens.numel() <= 3
-        and get_compute_capability(q.device) == (10, 0)
-    )
+# cuDNN's FROST engines serve the SM100 family; auto admits the chips with
+# native-vs-cuDNN measurements.
+_CUDNN_GDN_AUTO_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_CUDNN_GDN_HEAD_DIMS = (64, 128)
+
+
+def _prefer_cudnn_gdn_prefill(q, v, cu_seqlens, use_gate_in_kernel=False) -> bool:
+    """Measured performance policy, separate from the contract check."""
+    if (
+        not q.is_cuda
+        or q.shape[2] not in _CUDNN_GDN_HEAD_DIMS
+        or v.shape[2] not in _CUDNN_GDN_HEAD_DIMS
+    ):
+        return False
+    return get_compute_capability(q.device) in _CUDNN_GDN_AUTO_CAPABILITIES
+
+
+_CUDNN_GDN_GATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+_CUDNN_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
 def _is_cudnn_gdn_auto_eligible(
-    q, k, v, g, beta, A_log, dt_bias, initial_state, output_state, output, cu_seqlens
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    initial_state,
+    output_state,
+    output,
+    cu_seqlens,
+    *,
+    use_gate_in_kernel=True,
+    state_indices=None,
 ) -> bool:
-    """Keep automatic substitution within the measured compact inference contract."""
+    """Admit the calls cuDNN's GDN entry serves with the native call's semantics.
+
+    Packed bfloat16 or float16 q / k / v with dense 64- or 128-wide K and V
+    heads; per-head gates at float32, bfloat16 or float16 (raw gates bring
+    ``A_log`` and ``dt_bias``, precomputed gates may be absent); compact
+    ``[num_seqs, heads, V, K]`` states at float32, bfloat16 or float16, both in
+    one dtype, or with contiguous int32 ``state_indices`` a contiguous pool
+    ``[N_pool, heads, V, K]`` for both the initial and the (required) output
+    state, the output pool identical to the input pool or disjoint from it;
+    int32 or int64 ``cu_seqlens``; caller-owned buffers optional. No autograd,
+    no inference-mode mixing, and nothing written may alias anything read.
+    """
     if not q.is_cuda or q.ndim != 3 or v.ndim != 3:
         return False
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        return False
     total, _, dim = q.shape
-    heads = v.shape[1]
+    heads, v_dim = v.shape[1], v.shape[2]
     num_seqs = cu_seqlens.numel() - 1
-    tensors = (
-        (q, q.shape, torch.bfloat16),
-        (k, q.shape, torch.bfloat16),
-        (v, (total, heads, dim), torch.bfloat16),
-        (g, (total, heads), torch.bfloat16),
-        (beta, (total, heads), torch.bfloat16),
-        (A_log, (heads,), torch.float32),
-        (dt_bias, (heads,), torch.float32),
-        (initial_state, (num_seqs, heads, dim, dim), torch.float32),
-        (output_state, (num_seqs, heads, dim, dim), torch.float32),
-        (output, (total, heads, dim), torch.bfloat16),
-        (cu_seqlens, (num_seqs + 1,), torch.int64),
-    )
-    for tensor, shape, dtype in tensors:
-        if (
-            not isinstance(tensor, torch.Tensor)
-            or tensor.shape != shape
-            or tensor.dtype != dtype
-            or tensor.device != q.device
-            or not tensor.is_contiguous()
-            or tensor.requires_grad
+    state_rows = num_seqs
+    in_place_pool = False
+    if state_indices is not None:
+        if not (
+            isinstance(initial_state, torch.Tensor)
+            and isinstance(output_state, torch.Tensor)
+            and initial_state.ndim == 4
+            and output_state.shape == initial_state.shape
         ):
             return False
-    if not torch.is_inference_mode_enabled() and (
-        output.is_inference() or output_state.is_inference()
+        state_rows = initial_state.shape[0]
+        in_place_pool = (
+            output_state.data_ptr() == initial_state.data_ptr()
+            and output_state.stride() == initial_state.stride()
+            and output_state.dtype == initial_state.dtype
+        )
+    state_dtype = (
+        initial_state.dtype
+        if isinstance(initial_state, torch.Tensor)
+        else output_state.dtype
+        if isinstance(output_state, torch.Tensor)
+        else torch.float32
+    )
+    if state_dtype not in _CUDNN_GDN_STATE_DTYPES:
+        return False
+
+    def admitted(tensor, shape, dtypes):
+        return (
+            isinstance(tensor, torch.Tensor)
+            and tensor.shape == shape
+            and tensor.dtype in dtypes
+            and tensor.device == q.device
+            and tensor.is_contiguous()
+            and not tensor.requires_grad
+        )
+
+    required = [
+        (q, q.shape, (q.dtype,)),
+        (k, q.shape, (q.dtype,)),
+        (v, (total, heads, v_dim), (q.dtype,)),
+        (cu_seqlens, (num_seqs + 1,), (torch.int32, torch.int64)),
+    ]
+    if state_indices is not None:
+        required.append((state_indices, (num_seqs,), (torch.int32,)))
+    if use_gate_in_kernel:
+        required += [
+            (A_log, (heads,), _CUDNN_GDN_GATE_DTYPES),
+            (dt_bias, (heads,), _CUDNN_GDN_GATE_DTYPES),
+        ]
+    optional = [
+        (g, (total, heads), _CUDNN_GDN_GATE_DTYPES),
+        (beta, (total, heads), _CUDNN_GDN_GATE_DTYPES),
+        (initial_state, (state_rows, heads, v_dim, dim), (state_dtype,)),
+        (output_state, (state_rows, heads, v_dim, dim), (state_dtype,)),
+        (output, (total, heads, v_dim), (q.dtype,)),
+    ]
+    if not all(admitted(*item) for item in required):
+        return False
+    if not all(
+        tensor is None or admitted(tensor, shape, dtypes)
+        for tensor, shape, dtypes in optional
+    ):
+        return False
+    written = [tensor for tensor in (output, output_state) if tensor is not None]
+    if not torch.is_inference_mode_enabled() and any(
+        tensor.is_inference() for tensor in written
     ):
         return False
 
@@ -949,15 +1028,27 @@ def _is_cudnn_gdn_auto_eligible(
         begin = tensor.data_ptr()
         return begin, begin + tensor.numel() * tensor.element_size()
 
-    written = (span(output), span(output_state))
+    written_spans = tuple(span(tensor) for tensor in written)
+    # An in-place pool writes the rows it read; any other overlap declines.
     read = tuple(
         span(tensor)
-        for tensor in (q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens)
+        for tensor in (
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            None if in_place_pool else initial_state,
+            cu_seqlens,
+        )
+        if tensor is not None
     )
-    for i, (begin, end) in enumerate(written):
+    for i, (begin, end) in enumerate(written_spans):
         if any(
             begin < other_end and other_begin < end
-            for other_begin, other_end in (*read, *written[:i])
+            for other_begin, other_end in (*read, *written_spans[:i])
         ):
             return False
     return True
@@ -1114,12 +1205,20 @@ def chunk_gated_delta_rule(
         an explicit value must be a multiple of 64.
     backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
         ``auto`` uses the native SM90/SM100/SM120 kernels and context-parallel
-        routing, and may select cuDNN for measured SM100 raw-gate inference
-        workloads. Automatic cuDNN selection requires both gate-fusion flags,
-        BF16 inputs/gates, caller-normalized Q/K, separate compact float32
-        input/output states with ``output_final_state=True``, and a caller-owned
-        output. Explicit CP, pools and checkpoints retain native
-        routing. Requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
+        routing, and resolves to cuDNN on SM100 / SM103
+        (``_prefer_cudnn_gdn_prefill``, every call the engine serves) for every
+        contract cuDNN's entry serves: precomputed or raw gates, caller-normalized or in-kernel
+        normalized Q/K (``use_qk_l2norm_in_kernel=True`` is fused by cuDNN with
+        the same additive ``1e-6`` formula as the native pre-pass), bfloat16 or
+        float16 activations, a float32, bfloat16 or float16 compact state, int32 or
+        int64 ``cu_seqlens``, caller-owned or allocated buffers, with or
+        without a returned state, and a contiguous state pool addressed by
+        contiguous int32 ``state_indices`` with its output pool (identical or
+        disjoint). Explicit CP and checkpoints retain native routing, and a
+        cuDNN build decline falls back to the native route before anything
+        executes. Requires cuDNN frontend 1.31 GA and
+        CuTe DSL 4.7 or newer; ``backend="flashinfer"`` selects the native
+        kernels explicitly.
         Cake kernels require an explicit ``cake_gdn``
         request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
         SM100/SM103; ``use_cp=False`` retains Cake non-CP, and ``"auto"``
@@ -1220,8 +1319,9 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
-      path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
+    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The native
+      SM100 kernels require ``head_size == 128``; cuDNN also serves 64-wide K
+      or V heads, and ``auto`` routes those to it. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
       CUDA 12.9, and CUDA 13.
       Other SM100 CP DSL routes require CUDA 13 and
@@ -1313,17 +1413,14 @@ def chunk_gated_delta_rule(
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
 
+    # Explicit CP and checkpoints pin the native route; everything else cuDNN
+    # serves, state pools included, goes to it inside the measured region.
     cudnn_auto = (
         backend == "auto"
-        and use_gate_in_kernel
-        and beta_is_logit
-        and not use_qk_l2norm_in_kernel
-        and output_final_state
         and use_cp == "auto"
         and _cp_chunk_len is None
-        and state_indices is None
         and checkpoint_every_n_tokens == 0
-        and _prefer_cudnn_gdn_prefill(q, v, cu_seqlens)
+        and _prefer_cudnn_gdn_prefill(q, v, cu_seqlens, use_gate_in_kernel)
         and _is_cudnn_gdn_auto_eligible(
             q,
             k,
@@ -1336,6 +1433,8 @@ def chunk_gated_delta_rule(
             output_state,
             output,
             cu_seqlens,
+            use_gate_in_kernel=use_gate_in_kernel,
+            state_indices=state_indices,
         )
         and _cudnn_gdn_prefill_available()
     )
