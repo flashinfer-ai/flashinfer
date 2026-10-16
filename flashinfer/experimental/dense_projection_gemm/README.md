@@ -173,7 +173,10 @@ launcher's.
   library when `aot/` holds it and otherwise JIT-builds the entry through
   FlashInfer (`gen_jit_spec`, sources digest-verified first);
   `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
-  `flashinfer.jit.build_jit_specs`.
+  `flashinfer.jit.build_jit_specs`.  `cake_build.jit_spec(name)` /
+  `jit_specs(arch)` gate an entry on its `min_cuda` only (`sm_107a` entries
+  need CUDA 13.0): a 13.0 toolkit whose `nvcc` does not emit `compute_107a`
+  fails inside the JIT build with nvcc's own message.
 * `cake_backend.py` -- view validation, instance selection, stream-K
   planning, argument-plan binding, the prepared launches and the eager entry
   points.
