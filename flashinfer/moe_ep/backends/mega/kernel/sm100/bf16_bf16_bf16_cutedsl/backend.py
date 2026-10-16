@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_cutedsl_runtime_requirements
@@ -48,7 +48,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
-        self.supports_unfinalized_output = not config.do_finalize
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
@@ -113,6 +113,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -131,9 +132,10 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             knobs=self._workspace_knobs(fleet_params),
         )
-        if not config.do_finalize:
+        if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fleet_params.max_tokens_per_rank * config.top_k,
                 dtype=torch.int32,
@@ -142,7 +144,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             # Default BF16 folds routing into FC1; respect pinned frontend knobs.
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if workspace._frontend.config.apply_topk_in_fc1
+                if workspace._frontend.config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
         return workspace
@@ -190,7 +192,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe, staged_tokens
 
         if self.supports_unfinalized_output:
-            raise ValueError("do_finalize=False requires compute_unfinalized()")
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -242,7 +244,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
         if not self.supports_unfinalized_output:
-            raise ValueError("compute_unfinalized() requires do_finalize=False")
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
         num_tokens = staged_tokens(workspace.topk_idx)
         if num_tokens is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
@@ -250,19 +252,22 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         if clamp is not None:
             workspace._frontend.set_gate_up_clamp(clamp)
         # Launch at full capacity even when this rank has no live tokens.
-        partials = workspace._frontend.run(
+        workspace._frontend.run(
             MegaMoEBf16Inputs(
                 workspace.x,
                 workspace.topk_idx,
                 workspace.topk_weights,
                 transformed_weights[0][0],
                 transformed_weights[1][0],
-                workspace.combine_output,
+                workspace.output_activation,
             ),
             num_tokens=num_tokens,
         )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
         return (
-            partials.view(num_tokens * self._kernel_config.top_k, workspace.hidden),
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
             workspace._unfinalized_weights[:num_tokens],
             workspace._unfinalized_route_map[:num_tokens],
         )
@@ -287,7 +292,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
-            config.do_finalize,
+            config.finalize_mode,
             knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 

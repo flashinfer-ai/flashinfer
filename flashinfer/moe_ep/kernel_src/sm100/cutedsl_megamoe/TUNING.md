@@ -393,18 +393,19 @@ a shape comes in:
   one compiled slot, so callers can select a decode or prefill workspace
   whose capacity has an offline winner in the same knob cache.
 
-### Caller finalization for BF16 and W4A16
+### Caller finalization for BF16, MXFP8, BF16xMXFP8 and W4A16
 
-SM100 BF16 and W4A16 MegaMoE also accept `do_finalize=False` in their kernel
-configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
+SM100 BF16, MXFP8, BF16xMXFP8 and W4A16 MegaMoE also accept
+`finalize_mode=FinalizeMode.NONE` in their kernel configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
 BF16 `[T * top_k, hidden]` rows, FP32 `[T, top_k]` remaining routing weights,
 and an int32 `[T, top_k]` identity route map. Consume the results on the current
 stream before the pooled workspace is reused. EP communication completes even
 on zero-token ranks; warm up on all ranks before CUDA graph capture.
 
 BF16 applies routing weights in FC1 by default and returns remaining weights of one.
+MXFP8 and BF16xMXFP8 always apply them in FC1 and return ones.
 W4A16 returns the staged routing weights by default, or ones with
-`apply_topk_in_fc1=True`. Caller finalization can use:
+`apply_routing_weights_before_fc2=True`. Caller finalization can use:
 
 ```python
 rows, weights, route_map = layer.forward_unfinalized(t)
@@ -415,25 +416,26 @@ output = (partials * weights.unsqueeze(-1)).sum(dim=1).bfloat16()
 W4A16's built-in weighted reducer uses fused multiply-add. A caller's separate
 multiply and sum can therefore round differently despite identical per-route rows.
 
-Both backends require `enable_in_kernel_fc2_reduce=False` and reject
+These backends require `enable_in_kernel_fc2_reduce=False` and reject
 `knobs="auto"` in this mode. Use `knobs=None` or an explicit knob dictionary.
 The `--no-do-finalize` offline tuning CLI remains specific to SM100 NVFP4.
 
 ### Offline tuning for unfinalized NVFP4 output
 
 Use `--no-do-finalize` to tune SM100 NVFP4 for a serving configuration with
-`do_finalize=False`. EP communication completes; `forward_unfinalized()` returns
+`finalize_mode=FinalizeMode.NONE`. EP communication completes; `forward_unfinalized()` returns
 BF16 `[T * top_k, hidden]` GEMM2 rows, FP32 `[T, top_k]` remaining weights, and
 an int32 `[T, top_k]` identity map for the caller's final reduction. All three
 results borrow workspace storage. The default `--do-finalize`
 includes finalization. Match the serving configuration's routing-weight
-placement with `--apply-topk-in-fc1` (default) or `--no-apply-topk-in-fc1`:
+placement with `--apply-routing-weights-before-fc2` (default) or
+`--no-apply-routing-weights-before-fc2`:
 
 ```bash
 torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
     --arch sm100 --dtype nvfp4 --hidden 7168 --intermediate 2048 \
     --num-experts 256 --topk 8 --max-tokens 64 2048 \
-    --no-do-finalize --no-apply-topk-in-fc1
+    --no-do-finalize --no-apply-routing-weights-before-fc2
 ```
 
 This mode requires BF16 combine and deterministic reduction. Each candidate
@@ -447,7 +449,7 @@ output; entries from the removed explicit startup tuner are ignored.
 Use the actual per-rank workspace capacities for `--max-tokens`. With
 `--live-tokens`, the cache still keys on capacity, so distinct workload winners
 for the same capacity need separate cache files. Serving loads the winner with
-`knobs=None` and the matching `do_finalize` / `apply_topk_in_fc1` settings,
+`knobs=None` and the matching `finalize_mode` / `apply_routing_weights_before_fc2` settings,
 falling back to the heuristic on a cache miss. Retune NVFP4 entries previously
 recorded without the correct routing-weight placement.
 
@@ -600,7 +602,8 @@ plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
   large terms nearly cancel the agreement is bounded by the bf16 ULP of the
   largest TERM — validate with a row-scaled band (tests'
   `_assert_ikr_close`: K x 2^-8 x safety 8 x row max), never a flat
-  atol/rtol.  Requires `apply_topk_in_fc1=True` + bf16 combine wire.
+  atol/rtol. Requires `apply_routing_weights_before_fc2=True` + bf16 combine
+  wire.
 - `combine_dtype` — quantized cross-rank combine wire (`"mxfp8"` =
   `32e4m3xe8m0`, 2x less NVLink combine traffic; `"nvfp4"` = `16e2m1xbf16`,
   4x less).  Numerics tradeoff (wire-quantizes the per-topk fc2 outputs);

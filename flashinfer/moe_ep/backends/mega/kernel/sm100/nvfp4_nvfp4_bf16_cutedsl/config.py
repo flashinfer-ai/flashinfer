@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
+from flashinfer.moe_ep.config import FinalizeMode, validate_finalize_mode
+
 if TYPE_CHECKING:
     import torch
 
@@ -32,18 +34,23 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     fast_math: bool = True
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     # Enables in_kernel_fc2_reduce, knobs may still disable this if it is faster
     # In-flight top-k combine: cross-rank REDG atomic-add collapses the combine
     # as peer data arrives (no per-topk staging / explicit tail reduce).
     # ~1-2% faster and removes the multi-GB combine staging from the symmetric
-    # workspace.  Requires apply_topk_in_fc1=True and combine_dtype="bf16";
-    # accumulation order is nondeterministic (tolerance-compare outputs).
+    # workspace.  Requires apply_routing_weights_before_fc2=True and
+    # combine_dtype="bf16"; accumulation order is nondeterministic
+    # (tolerance-compare outputs).
     enable_in_kernel_fc2_reduce: bool = False
     # Cross-rank combine wire format: "bf16" (exact), "mxfp8" (2x less combine
     # traffic), "nvfp4" (4x less).  Quantized wires trade accuracy for NVLink
     # bandwidth and require enable_in_kernel_fc2_reduce=False.
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
+    # Caller-owned CUDA int32 (1,) live-token count the PERSISTENT finalize kernel
+    # reads; the workspace borrows it and never writes it. Update before every
+    # forward.
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None
     input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
@@ -58,20 +65,23 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
-    # False exposes per-route outputs through MoEEpMegaLayer.forward_unfinalized()
-    # for caller finalization. Requires fixed/offline-tuned knobs.
-    do_finalize: bool = True
+    # NONE makes MoEEpMegaLayer.forward return per-route outputs for caller
+    # finalization; it requires fixed/offline-tuned knobs.
+    finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
-        if not self.do_finalize:
+        validate_finalize_mode(
+            self.finalize_mode, tuple(FinalizeMode), self.num_valid_tokens_tensor
+        )
+        if self.finalize_mode is FinalizeMode.NONE:
             if self.enable_in_kernel_fc2_reduce or self.combine_dtype != "bf16":
                 raise ValueError(
-                    "do_finalize=False requires enable_in_kernel_fc2_reduce=False "
+                    "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False "
                     "and combine_dtype='bf16'."
                 )
             if self.knobs == "auto":
                 raise ValueError(
-                    "do_finalize=False requires fixed/offline-tuned knobs."
+                    "finalize_mode=NONE requires fixed/offline-tuned knobs."
                 )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")

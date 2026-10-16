@@ -77,9 +77,14 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
         ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
-        ["--arch", "sm107", "--no-apply-topk-in-fc1"],
+        ["--arch", "sm107", "--no-apply-routing-weights-before-fc2"],
         ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
-        ["--arch", "sm100", "--no-apply-topk-in-fc1", "--allow-nondeterministic"],
+        [
+            "--arch",
+            "sm100",
+            "--no-apply-routing-weights-before-fc2",
+            "--allow-nondeterministic",
+        ],
         ["--arch", "sm100", "--no-do-finalize", "--combine-dtype", "nvfp4"],
     ],
 )
@@ -108,12 +113,12 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
             "--arch",
             "sm100",
             *options,
-            "--no-apply-topk-in-fc1",
+            "--no-apply-routing-weights-before-fc2",
         ]
     )
     (args,) = received
     assert args.do_finalize == do_finalize
-    assert not args.apply_topk_in_fc1
+    assert not args.apply_routing_weights_before_fc2
 
 
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):

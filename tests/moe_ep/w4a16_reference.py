@@ -239,7 +239,7 @@ def w4a16_reference(
     fc1_alpha=None,
     fc2_alpha=None,
     fc1_norm_const=None,
-    apply_topk_in_fc1=False,
+    apply_routing_weights_before_fc2=False,
     in_kernel_fc2_reduce=False,
 ):
     """Compute on expert owners, transfer BF16 route bits, combine on sources.
@@ -306,7 +306,11 @@ def w4a16_reference(
                 activation = torch.empty(
                     (batch.numel(), intermediate), dtype=torch.bfloat16, device=x.device
                 )
-                routing = scores[batch, route_slots] if apply_topk_in_fc1 else None
+                routing = (
+                    scores[batch, route_slots]
+                    if apply_routing_weights_before_fc2
+                    else None
+                )
                 _swiglu_kernel()[((activation.numel() + 255) // 256,)](
                     fc1,
                     routing,
@@ -315,7 +319,7 @@ def w4a16_reference(
                     intermediate,
                     activation.numel(),
                     problem["gate_up_clamp"],
-                    apply_topk_in_fc1,
+                    apply_routing_weights_before_fc2,
                     problem.get("swiglu_alpha"),
                     problem.get("swiglu_beta"),
                     problem.get("situ_beta"),
@@ -324,7 +328,7 @@ def w4a16_reference(
                 fc2 = torch.mm(activation, w2.T, out_dtype=torch.float32)
                 fc2.mul_(fc2_alpha[expert])
                 term = fc2.bfloat16()
-                if in_kernel_fc2_reduce and not apply_topk_in_fc1:
+                if in_kernel_fc2_reduce and not apply_routing_weights_before_fc2:
                     term = (term.float() * scores[batch, route_slots, None]).bfloat16()
                 terms[batch, route_slots] = term.view(torch.int16).to(torch.int32)
     finally:
@@ -341,10 +345,10 @@ def w4a16_reference(
         return terms
     scores = problem["topk_weights"]
     output = terms[:, 0].float()
-    if not apply_topk_in_fc1:
+    if not apply_routing_weights_before_fc2:
         output = output * scores[:, 0, None]
     for slot in range(1, ids.shape[1]):
-        if apply_topk_in_fc1:
+        if apply_routing_weights_before_fc2:
             output = output + terms[:, slot].float()
         else:
             # PyTorch 2.12 addcmul(value=1) uses FP32 std::fma on CUDA.

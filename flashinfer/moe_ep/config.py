@@ -29,6 +29,49 @@ class EpAlgorithm(enum.Enum):
     HIGH_THROUGHPUT = 1
 
 
+class FinalizeMode(enum.Enum):
+    """How a MegaMoE kernel reduces the per-route GEMM2 rows over top-k.
+
+    * ``AUTO`` — ``CAKE`` if the backend's Cake reducer supports the
+      problem, else ``PERSISTENT`` if ``num_valid_tokens_tensor`` is set, else
+      ``DEFAULT``.
+    * ``DEFAULT`` — non-persistent finalize kernel.
+    * ``PERSISTENT`` — persistent finalize kernel that reads
+      ``num_valid_tokens_tensor``.
+    * ``CAKE`` — frozen Cake top-k reducer.
+    * ``NONE`` — no finalize: ``MoEEpMegaLayer.forward_unfinalized`` returns
+      ``(rows, weights, route_map)`` for caller finalization.
+
+    Each backend accepts the subset it implements.
+    """
+
+    AUTO = 0
+    DEFAULT = 1
+    PERSISTENT = 2
+    CAKE = 3
+    NONE = 4
+
+
+def validate_finalize_mode(
+    mode: FinalizeMode,
+    supported: Sequence[FinalizeMode],
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None,
+) -> None:
+    if not isinstance(mode, FinalizeMode):
+        raise TypeError(f"finalize_mode must be a FinalizeMode, got {mode!r}.")
+    if mode not in supported:
+        names = ", ".join(m.name for m in supported)
+        raise ValueError(
+            f"finalize_mode={mode.name} is unsupported; use one of {names}."
+        )
+    if mode is FinalizeMode.PERSISTENT and num_valid_tokens_tensor is None:
+        raise ValueError(
+            "finalize_mode=PERSISTENT requires num_valid_tokens_tensor: a "
+            "caller-owned CUDA int32 tensor of shape (1,) holding the live "
+            "token count."
+        )
+
+
 class EpLayout(enum.Enum):
     """LL receive-buffer layout, mirroring ``nccl.ep.Layout`` for the LL paths.
 

@@ -34,7 +34,6 @@ from typing import List, Optional, Tuple, Literal
 
 import cutlass
 import cutlass.cute as cute
-
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -413,12 +412,16 @@ class MoEStaticSchedulerParams(MoESchedulerParamsBase):
         # prototype (``self``), Int32 fields consume from ``values``.
         idx = 0
         if isinstance(self.expert_cnt, Int32):
-            result.expert_cnt = new_from_mlir_values(self.expert_cnt, [values[idx]])
+            result.expert_cnt = new_from_mlir_values(
+                self.expert_cnt, [values[idx]]
+            )
             idx += 1
         else:
             result.expert_cnt = self.expert_cnt
         if isinstance(self.intermediate, Int32):
-            result.intermediate = new_from_mlir_values(self.intermediate, [values[idx]])
+            result.intermediate = new_from_mlir_values(
+                self.intermediate, [values[idx]]
+            )
             idx += 1
         else:
             result.intermediate = self.intermediate
@@ -559,12 +562,16 @@ class MoEDynamicSchedulerParams(MoESchedulerParamsBase):
         # Type-discriminated rebind (see ``MoEStaticSchedulerParams``).
         idx = 0
         if isinstance(self.expert_cnt, Int32):
-            result.expert_cnt = new_from_mlir_values(self.expert_cnt, [values[idx]])
+            result.expert_cnt = new_from_mlir_values(
+                self.expert_cnt, [values[idx]]
+            )
             idx += 1
         else:
             result.expert_cnt = self.expert_cnt
         if isinstance(self.intermediate, Int32):
-            result.intermediate = new_from_mlir_values(self.intermediate, [values[idx]])
+            result.intermediate = new_from_mlir_values(
+                self.intermediate, [values[idx]]
+            )
             idx += 1
         else:
             result.intermediate = self.intermediate
@@ -1416,11 +1423,6 @@ class _ClcDynamicState:
 
     CLC coordinate semantics (unified across 2Dx2D and 2Dx3D after the
     WGrad linearization):
-        These store the **cluster origin** coordinates from the CLC response,
-        i.e., the grid position of the first CTA of the canceled cluster.
-        This matches the documented PTX clusterlaunchcontrol semantics:
-        the try_cancel response reports the first CTA of the canceled
-        cluster.
 
         Grid layouts produced by MoEDynamicSchedulerParams.get_grid_shape:
             Layout A (grid_z_lin <= 65535):  (cm,              cn, grid_z_lin)

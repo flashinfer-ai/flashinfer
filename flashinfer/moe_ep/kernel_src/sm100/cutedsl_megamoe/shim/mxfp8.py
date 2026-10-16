@@ -69,6 +69,8 @@ class MegaMoEMxfp8Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
+    use_persistent_finalize_kernel: bool = False
+    use_custom_finalize: bool = False
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
@@ -113,6 +115,16 @@ class MegaMoEMxfp8Config:
             raise ValueError(
                 "in_kernel_fc2_reduce and token_back_by_dispatch cannot both be True."
             )
+        if self.use_custom_finalize and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "use_custom_finalize requires in_kernel_fc2_reduce to be disabled."
+            )
+        if self.use_custom_finalize and self.use_persistent_finalize_kernel:
+            raise ValueError(
+                "use_custom_finalize and use_persistent_finalize_kernel cannot be used together."
+            )
         m, n, _k = self.mma_tiler_mnk
         if (m, n) != (256, 256) or not self.use_2cta_instrs:
             raise ValueError(
@@ -156,6 +168,21 @@ class MegaMoEMxfp8Config:
         return 2 * self.intermediate
 
 
+def _validate_num_valid_tokens(num_valid_tokens: Optional[torch.Tensor]) -> None:
+    if num_valid_tokens is None:
+        raise ValueError(
+            "use_persistent_finalize_kernel requires a caller-owned "
+            "live-token count; pass num_valid_tokens_tensor= to "
+            "get_symm_buffer_for_mxfp8_mega_moe()."
+        )
+    if (
+        not num_valid_tokens.is_cuda
+        or num_valid_tokens.dtype != torch.int32
+        or tuple(num_valid_tokens.shape) != (1,)
+    ):
+        raise ValueError("num_valid_tokens must be a CUDA int32 tensor of shape (1,).")
+
+
 @dataclasses.dataclass
 class MegaMoEMxfp8Inputs:
     """Per-rank tensors for one MXFP8 MegaMoE launch."""
@@ -171,6 +198,7 @@ class MegaMoEMxfp8Inputs:
     # Single 2D (T, hidden) bf16 output; the kernel reduces top-k internally
     # (the drop replaced the old form-A ``combine_output`` with this).
     output_activation: torch.Tensor
+    num_valid_tokens: Optional[torch.Tensor]
 
 
 class MegaMoEMxfp8Frontend:
@@ -285,6 +313,29 @@ class MegaMoEMxfp8Frontend:
             torch.cuda.synchronize()
         return mega.launch_output
 
+    def custom_finalize_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return the zero-copy per-route partials and their canonical root descriptor."""
+        if not self.config.use_custom_finalize:
+            raise RuntimeError("custom finalize mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "custom finalize workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.topk_reduce_input_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
+
     def make_launch_thunk(
         self,
         inputs: MegaMoEMxfp8Inputs,
@@ -341,6 +392,7 @@ class MegaMoEMxfp8Frontend:
             t.fc2_weight.data_ptr(),
             t.fc2_weight_sf.data_ptr(),
             t.output_activation.data_ptr(),
+            None if t.num_valid_tokens is None else t.num_valid_tokens.data_ptr(),
             num_tokens,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -367,6 +419,8 @@ class MegaMoEMxfp8Frontend:
             c.flag_batch,
             c.epi_flag_batch,
             c.in_kernel_fc2_reduce,
+            c.use_persistent_finalize_kernel,
+            c.use_custom_finalize,
             c.token_back_by_dispatch,
             self._gate_up_clamp,
             c.enable_iket,
@@ -384,7 +438,6 @@ class MegaMoEMxfp8Frontend:
 
         from common.megamoe_constants import Mxfp8BlockSize, SfPaddingBlock
         from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel
-        from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
 
         c = self.config
         static_expert_shape = (
@@ -405,7 +458,7 @@ class MegaMoEMxfp8Frontend:
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=group_hint,
-            token_padding_block=EpilogueTokenTile,
+            token_padding_block=SfPaddingBlock,
             sf_padding_block=SfPaddingBlock,
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=static_expert_shape,
@@ -420,6 +473,8 @@ class MegaMoEMxfp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
+            skip_topk_reduce=c.use_custom_finalize,
+            topk_reduce_persistent=c.use_persistent_finalize_kernel,
             # kernel renamed the bool token_back_by_dispatch -> token_back_mode enum:
             # dispatch-reuse maps to "reuse_dispatch_warps", default to "epi_warps".
             token_back_mode=(
@@ -437,6 +492,16 @@ class MegaMoEMxfp8Frontend:
             device="cuda",
         )
         shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+        col_quant_data = torch.zeros(
+            (kernel.pool_token_capacity, c.hidden),
+            dtype=c.torch_ab_dtype,
+            device="cuda",
+        )
+        col_quant_sf = torch.zeros(
+            (c.hidden * kernel.pool_token_capacity // Mxfp8BlockSize,),
+            dtype=torch.uint8,
+            device="cuda",
+        )
         symmetric_base, peer_offsets_list = _compute_peer_offsets(
             shared_workspace,
             c.world_size,
@@ -449,6 +514,8 @@ class MegaMoEMxfp8Frontend:
             shared_workspace=shared_workspace,
             symmetric_base=symmetric_base,
             peer_offsets_list=peer_offsets_list,
+            col_quant_data=col_quant_data,
+            col_quant_sf=col_quant_sf,
         )
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
@@ -520,6 +587,7 @@ class MegaMoEMxfp8Frontend:
             fc2_weight=inputs.fc2_weight,
             fc2_weight_sf=inputs.fc2_weight_sf,
             output_activation=inputs.output_activation[tok],
+            num_valid_tokens=inputs.num_valid_tokens,
         )
 
     def _validate_inputs(
@@ -601,6 +669,8 @@ class MegaMoEMxfp8Frontend:
                 "output_activation must be bfloat16, got "
                 f"{inputs.output_activation.dtype}."
             )
+        if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce:
+            _validate_num_valid_tokens(inputs.num_valid_tokens)
         if inputs.topk_idx.shape != (buf_tokens, c.num_topk):
             raise ValueError(
                 f"topk_idx must have shape ({buf_tokens}, {c.num_topk}), "
@@ -690,6 +760,8 @@ class MegaMoEMxfp8Frontend:
                 f"activation_sf.shape[-1] ({inputs.activation_sf.shape[-1]}) "
                 "must be a multiple of 4."
             )
+        if mega.col_quant_data is None or mega.col_quant_sf is None:
+            raise RuntimeError("MXFP8 column-requant output buffers are unavailable.")
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         peer_rank_ptr_mapper_host = SymBufferHost(
@@ -709,16 +781,30 @@ class MegaMoEMxfp8Frontend:
             fc2_weight=self._to_cute(inputs.fc2_weight),
             fc2_weight_sf=self._to_cute(inputs.fc2_weight_sf),
             output_activation=self._to_cute(inputs.output_activation),
+            col_quant_data=self._to_cute(mega.col_quant_data),
+            col_quant_sf=self._to_cute(mega.col_quant_sf),
             local_workspace=self._to_cute(
                 mega.local_workspace,
                 static_layout=True,
             ),
-            shared_workspace=self._to_cute(mega.shared_workspace),
+            shared_workspace=self._to_cute(
+                mega.shared_workspace,
+                static_layout=True,
+            ),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             # fc1_c is the optional in-kernel fc1-out C buffer (generate_c path);
             # None uses the kernel's internal staging (matches the drop default).
             fc1_c=None,
             stream=stream,
+            num_valid_tokens=(
+                self._to_cute(
+                    inputs.num_valid_tokens,
+                    assumed_align=4,
+                    static_layout=True,
+                )
+                if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce
+                else None
+            ),
         )
 
 
@@ -781,15 +867,21 @@ class MegaMoEMxfp8SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     output_activation: torch.Tensor
+    # Borrowed, caller-owned; never written or freed here.
+    num_valid_tokens: Optional[torch.Tensor]
 
     _frontend: MegaMoEMxfp8Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
         if self._destroyed:
             return
+        self._unfinalized_route_map = None
+        self._unfinalized_weights = None
         self._frontend.release()
         for root in self._sym_roots:
             free_sym_tensor(root)
@@ -814,6 +906,9 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
+    use_persistent_finalize_kernel: bool = False,
+    use_custom_finalize: bool = False,
+    num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
@@ -825,6 +920,10 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
     deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching NVFP4 and SGLang.
+    ``use_persistent_finalize_kernel`` forwards the actual token count to the
+    standalone top-k reducer, and requires ``num_valid_tokens_tensor``: a
+    caller-owned CUDA int32 ``(1,)`` tensor holding the live count. It is
+    ignored when that reducer is not used
 
     Expert weights are not allocated here; supply kernel-ready ``(weight, scale)``
     tuples to :func:`mxfp8_mega_moe` instead.
@@ -835,6 +934,10 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         )
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")
+    # Not gated on in_kernel_fc2_reduce: knobs may flip that off later and the
+    # buffer cannot acquire a caller tensor after allocation.
+    if use_persistent_finalize_kernel:
+        _validate_num_valid_tokens(num_valid_tokens_tensor)
 
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
@@ -852,6 +955,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         kind=kind,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+        use_custom_finalize=use_custom_finalize,
     )
     from .knob_cache import resolve_knobs
     from .tuner import with_knobs
@@ -870,6 +975,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            use_custom_finalize=use_custom_finalize,
         )
     # TODO Add explicit validity checks
     cfg = with_knobs(cfg, knobs)
@@ -928,6 +1034,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         output_activation=output_activation,
+        num_valid_tokens=num_valid_tokens_tensor,
         _frontend=frontend,
         _sym_roots=sym_roots,
     )
@@ -953,6 +1060,9 @@ def mxfp8_mega_moe(
     the **kernel-ready** fp8 + swizzled-SF layout (see ``mega_runner`` weight
     assembly).  Weights are always caller-supplied here — they are not owned by
     the symm buffer.
+
+    To benefit from ``use_persistent_finalize_kernel`` the caller must have
+    updated the count in ``symm_buffer.num_valid_tokens``
 
     ``y`` receives the top-k-reduced bf16 output for ``[:num_tokens]``.
     ``gate_up_clamp`` updates the kernel clamp for this session when set.
@@ -1026,13 +1136,18 @@ def mxfp8_mega_moe(
         fc2_weight=fc2_weight,
         fc2_weight_sf=fc2_weight_sf,
         output_activation=symm_buffer.output_activation,
+        num_valid_tokens=symm_buffer.num_valid_tokens,
     )
 
     # The kernel reduces the top-k combine internally and writes the final 2D
     # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
-    out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
+    out = symm_buffer._frontend.run(
+        inputs,
+        num_tokens=None,
+        sync=False,
+    )
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream
         # ordering (valid until the next launch on this session's buffers).
@@ -1074,6 +1189,7 @@ def mxfp8_mega_launch_thunk(
         fc2_weight=fc2_weight,
         fc2_weight_sf=fc2_weight_sf,
         output_activation=symm_buffer.output_activation,
+        num_valid_tokens=symm_buffer.num_valid_tokens,
     )
     return symm_buffer._frontend.make_launch_thunk(inputs)
 

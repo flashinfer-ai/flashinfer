@@ -118,7 +118,7 @@ def _allocate_reference_workspace(
     rank: int,
     world_size: int,
     *,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
 ):
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
@@ -133,8 +133,8 @@ def _allocate_reference_workspace(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
-        defer_topk_reduce=False,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        use_custom_finalize=False,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         combine_dtype="bf16",
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -191,8 +191,10 @@ def _public_pointer_snapshot(workspace) -> tuple[int, ...]:
     )
 
 
-def _deferred_pointer_snapshot(workspace) -> tuple[int, int, tuple[int, ...]]:
-    partials, root, descriptor = workspace._frontend.deferred_topk_reduce_workspace()
+def _custom_finalize_pointer_snapshot(
+    workspace,
+) -> tuple[int, int, tuple[int, ...]]:
+    partials, root, descriptor = workspace._frontend.custom_finalize_workspace()
     return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
 
 
@@ -206,7 +208,7 @@ def _assert_close(actual, expected) -> None:
 
 
 @pytest.mark.parametrize(
-    "backend,apply_topk_in_fc1",
+    "backend,apply_routing_weights_before_fc2",
     [
         ("nvfp4", False),
         ("nvfp4", True),
@@ -216,7 +218,7 @@ def _assert_close(actual, expected) -> None:
     ],
 )
 def test_external_weighted_reduction_live_rows_and_cuda_graph(
-    tmp_path, monkeypatch, backend, apply_topk_in_fc1
+    tmp_path, monkeypatch, backend, apply_routing_weights_before_fc2
 ):
     """Caller finalization works across backends, empty rounds, and graphs."""
     _require_cuda()
@@ -229,6 +231,7 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        FinalizeMode,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -268,8 +271,8 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
         config = _megakernel_config(
             problem,
             epilogue_via_config=True,
-            apply_topk_in_fc1=apply_topk_in_fc1,
-            do_finalize=False,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            finalize_mode=FinalizeMode.NONE,
             knobs=None,
         )
     else:
@@ -282,8 +285,12 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             intermediate_size=intermediate,
             top_k=topk,
             gate_up_clamp=1.5,
-            do_finalize=False,
-            **({"apply_topk_in_fc1": apply_topk_in_fc1} if backend == "w4a16" else {}),
+            finalize_mode=FinalizeMode.NONE,
+            **(
+                {"apply_routing_weights_before_fc2": apply_routing_weights_before_fc2}
+                if backend == "w4a16"
+                else {}
+            ),
         )
     layer = MoEEpMegaLayer(
         bootstrap=bootstrap,
@@ -322,9 +329,9 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
                     "--live-tokens",
                     "9",
                     "--no-do-finalize",
-                    "--apply-topk-in-fc1"
-                    if apply_topk_in_fc1
-                    else "--no-apply-topk-in-fc1",
+                    "--apply-routing-weights-before-fc2"
+                    if apply_routing_weights_before_fc2
+                    else "--no-apply-routing-weights-before-fc2",
                     "--sweep",
                     "schedule",
                     "--base-knobs",
@@ -344,7 +351,7 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
                 capacity,
                 rank,
                 world_size,
-                apply_topk_in_fc1=apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             )
             workspace = None
         else:
@@ -353,7 +360,9 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
                 fleet_params=FleetParams(8, capacity, hidden),
                 weights=MoEWeightPack(w13=w13, w2=w2),
                 backend=MegaConfig(
-                    megakernel=dataclasses.replace(config, do_finalize=True),
+                    megakernel=dataclasses.replace(
+                        config, finalize_mode=FinalizeMode.DEFAULT
+                    ),
                     quantize_input=False,
                     transformed_weights=layer._transformed,
                 ),
@@ -409,7 +418,9 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
                     )
                     # The built-in weighted reducer uses FMA; separate multiply/sum
                     # can cross a BF16 rounding boundary even with identical rows.
-                    weighted = backend == "w4a16" and not apply_topk_in_fc1
+                    weighted = (
+                        backend == "w4a16" and not apply_routing_weights_before_fc2
+                    )
                     torch.testing.assert_close(
                         actual,
                         expected,
@@ -547,8 +558,8 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         assert large.max_tokens_per_rank == 4096
         assert layer._kernel._uses_native_topk_reduce(small._fleet_params)
         assert layer._kernel._uses_native_topk_reduce(large._fleet_params)
-        assert small_raw._frontend.config.defer_topk_reduce
-        assert large_raw._frontend.config.defer_topk_reduce
+        assert small_raw._frontend.config.use_custom_finalize
+        assert large_raw._frontend.config.use_custom_finalize
         assert pooled_workspace_refcount(small_raw) == 1
         assert pooled_workspace_refcount(large_raw) == 1
         assert layer._preprocessing_count == 1
@@ -594,10 +605,10 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
             references[(num_tokens, capacity)] = reference
 
         assert is_cake_megamoe_topk_reduce_module_loaded()
-        small_deferred_ptrs = _deferred_pointer_snapshot(small_raw)
-        large_deferred_ptrs = _deferred_pointer_snapshot(large_raw)
-        assert small_deferred_ptrs[2] == (256, _TOP_K, _HIDDEN)
-        assert large_deferred_ptrs[2] == (4096, _TOP_K, _HIDDEN)
+        small_custom_finalize_ptrs = _custom_finalize_pointer_snapshot(small_raw)
+        large_custom_finalize_ptrs = _custom_finalize_pointer_snapshot(large_raw)
+        assert small_custom_finalize_ptrs[2] == (256, _TOP_K, _HIDDEN)
+        assert large_custom_finalize_ptrs[2] == (4096, _TOP_K, _HIDDEN)
 
         # Alternate profile selection after the faithful issue-shape pass.
         # The large handle deliberately runs a short live batch to prove that
@@ -697,8 +708,12 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
 
         assert _public_pointer_snapshot(small_raw) == small_public_ptrs
         assert _public_pointer_snapshot(large_raw) == large_public_ptrs
-        assert _deferred_pointer_snapshot(small_raw) == small_deferred_ptrs
-        assert _deferred_pointer_snapshot(large_raw) == large_deferred_ptrs
+        assert (
+            _custom_finalize_pointer_snapshot(small_raw) == small_custom_finalize_ptrs
+        )
+        assert (
+            _custom_finalize_pointer_snapshot(large_raw) == large_custom_finalize_ptrs
+        )
         assert layer._preprocessing_count == 1
 
         # Drop graphs before releasing their borrowed workspace addresses.

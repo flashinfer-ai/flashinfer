@@ -180,7 +180,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "after EP communication completes (SM100 NVFP4)",
     )
     parser.add_argument(
-        "--apply-topk-in-fc1",
+        "--apply-routing-weights-before-fc2",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="apply routing weights in FC1; disable for post-FC2 weighting (SM100 NVFP4)",
@@ -356,7 +356,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if not args.do_finalize or not args.apply_topk_in_fc1:
+    if not args.do_finalize or not args.apply_routing_weights_before_fc2:
         if family != "sm100" or args.dtype != "nvfp4":
             print(
                 "caller finalization and routing-weight placement require SM100 NVFP4",

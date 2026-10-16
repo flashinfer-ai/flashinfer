@@ -31,6 +31,8 @@ import os
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 # This test verifies the mega path only through the cutedsl_megamoe shim public
 # API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
@@ -1276,7 +1278,7 @@ def _run_nvfp4_routing_rounds(
     alpha_source="config",
     activation_params=None,
     with_norm=False,
-    apply_topk_in_fc1=False,
+    apply_routing_weights_before_fc2=False,
     check_graph=False,
     input_scale=1.0,
     num_experts=None,
@@ -1373,7 +1375,15 @@ def _run_nvfp4_routing_rounds(
                 enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 knobs={**knobs, "in_kernel_fc2_reduce": in_kernel_fc2_reduce},
                 **activation_params,
-                **({"apply_topk_in_fc1": apply_topk_in_fc1} if mode == "w4a16" else {}),
+                **(
+                    {
+                        "apply_routing_weights_before_fc2": (
+                            apply_routing_weights_before_fc2
+                        ),
+                    }
+                    if mode == "w4a16"
+                    else {}
+                ),
                 **(alphas if alpha_source == "config" else {}),
             )
         ),
@@ -1453,7 +1463,7 @@ def _run_nvfp4_routing_rounds(
                     weights,
                     mode=mode,
                     **alphas,
-                    apply_topk_in_fc1=apply_topk_in_fc1,
+                    apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 )
             elif mode == "w4a4":
@@ -1496,7 +1506,9 @@ def _run_nvfp4_routing_rounds(
                         weights,
                         mode=mode,
                         **alphas,
-                        apply_topk_in_fc1=apply_topk_in_fc1,
+                        apply_routing_weights_before_fc2=(
+                            apply_routing_weights_before_fc2
+                        ),
                     )
                     assert not torch.equal(y, reference)
                 graph.replay()
@@ -1516,7 +1528,7 @@ def _run_nvfp4_routing_rounds(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode,input_scale",
+    "activation_params,with_norm,alpha_source,apply_routing_weights_before_fc2,token_back_mode,input_scale",
     [
         pytest.param({}, True, "runtime", False, "epi_warps", 1.0, id="swiglu-norm"),
         pytest.param(
@@ -1601,7 +1613,7 @@ def test_nvfp4_w4a16_epilogue_contract(
     activation_params,
     with_norm,
     alpha_source,
-    apply_topk_in_fc1,
+    apply_routing_weights_before_fc2,
     token_back_mode,
     input_scale,
 ):
@@ -1622,7 +1634,7 @@ def test_nvfp4_w4a16_epilogue_contract(
         activation_params=activation_params,
         with_norm=with_norm,
         alpha_source=alpha_source,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         check_graph=True,
         input_scale=input_scale,
     )
@@ -1886,6 +1898,8 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
 )
 def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
     """Caller finalization is an explicit opt-in for each CuTe-DSL backend."""
+    import torch
+
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -1895,7 +1909,7 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
         top_k=2,
         enable_in_kernel_fc2_reduce=True,
     )
-    assert cfg.do_finalize is True
+    assert cfg.finalize_mode is FinalizeMode.AUTO
     kernel = create_mega_kernel(cfg)
     assert kernel.kernel_name() == kernel_name
     assert not kernel.supports_unfinalized_output
@@ -1903,11 +1917,26 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
     cfg_unfinalized = config_cls(
         intermediate_size=128,
         top_k=2,
-        do_finalize=False,
+        finalize_mode=FinalizeMode.NONE,
     )
     assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
 
     if kernel_name == "sm100_nvfp4_nvfp4_bf16_cutedsl":
+        num_valid_tokens_tensor = torch.zeros(1, dtype=torch.int32)
+        persistent_cfg = config_cls(
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.PERSISTENT,
+            num_valid_tokens_tensor=num_valid_tokens_tensor,
+        )
+        assert persistent_cfg.finalize_mode is FinalizeMode.PERSISTENT
+        assert persistent_cfg.num_valid_tokens_tensor is num_valid_tokens_tensor
+        with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+            config_cls(
+                intermediate_size=128,
+                top_k=2,
+                finalize_mode=FinalizeMode.PERSISTENT,
+            )
         assert cfg.combine_dtype == "bf16"
         cfg_q = config_cls(intermediate_size=128, top_k=2, combine_dtype="nvfp4")
         assert create_mega_kernel(cfg_q).kernel_name() == kernel_name
@@ -1931,11 +1960,11 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
 def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompatible):
     from flashinfer import moe_ep
 
-    with pytest.raises(ValueError, match="do_finalize=False requires"):
+    with pytest.raises(ValueError, match="finalize_mode=NONE requires"):
         getattr(moe_ep, config_name)(
             intermediate_size=128,
             top_k=2,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             **incompatible,
         )
 
@@ -1943,9 +1972,12 @@ def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompa
 def test_nvfp4_deferred_output_rejects_quantized_combine():
     from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
-    with pytest.raises(ValueError, match="do_finalize=False requires"):
+    with pytest.raises(ValueError, match="finalize_mode=NONE requires"):
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128, top_k=2, do_finalize=False, combine_dtype="mxfp8"
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.NONE,
+            combine_dtype="mxfp8",
         )
 
 
@@ -1962,13 +1994,13 @@ def test_w4a16_deferred_frontend_preserves_mode_when_applying_knobs():
         num_total_experts=2,
         hidden=128,
         intermediate=128,
-        defer_topk_reduce=True,
+        use_custom_finalize=True,
     )
-    with pytest.raises(ValueError, match="defer_topk_reduce requires"):
+    with pytest.raises(ValueError, match="use_custom_finalize requires"):
         dataclasses.replace(config, enable_in_kernel_fc2_reduce=True)
     frontend = bf16_nvfp4.MegaMoEBf16Nvfp4Frontend(config)
-    frontend.apply_knobs({"defer_topk_reduce": False})
-    assert frontend.config.defer_topk_reduce
+    frontend.apply_knobs({"use_custom_finalize": False})
+    assert frontend.config.use_custom_finalize
     with pytest.raises(ValueError, match="unsupported BF16/NVFP4 MegaMoE knobs"):
         frontend.apply_knobs({"in_kernel_fc2_reduce": True})
 
@@ -2024,8 +2056,12 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
             token_back_mode="reuse_dispatch_warps",
         )
     # ikr requires the topk score folded before fc2.
-    with pytest.raises(ValueError, match="apply_topk_in_fc1"):
-        MegaMoENvfp4Config(**base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False)
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
+        MegaMoENvfp4Config(
+            **base,
+            in_kernel_fc2_reduce=True,
+            apply_routing_weights_before_fc2=False,
+        )
     # ikr also needs the session's permission.
     with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
         MegaMoENvfp4Config(
