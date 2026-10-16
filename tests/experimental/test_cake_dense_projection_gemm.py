@@ -23,7 +23,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.experimental.dense_projection_gemm import cake_backend, cake_jit
+from flashinfer.experimental.dense_projection_gemm import (
+    cake_backend,
+    cake_build,
+    cake_jit,
+)
 from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     ARCH_RULE_DEFAULTS,
     BLOCK_K,
@@ -756,24 +760,35 @@ def test_registry_records_are_well_formed():
     assert {record["arg_plan"] for record in cake_jit.MODULES.values()} == set(
         cake_jit.ARG_PLANS
     )
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>``
+    manifest = cake_build._manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(cake_jit.KERNELS) == set(cake_jit.ARCHES) == set(manifest["arch_flags"])
     for arch, table in cake_jit.KERNELS.items():
-        assert arch in cake_jit.ARCH_NVCC_FLAGS
         for template, name in table.items():
             record = cake_jit.MODULES[name]
             assert arch in record["arches"] and record["template"] == template
             assert cake_jit.select_module(arch, template) == name
     for name, record in cake_jit.MODULES.items():
-        # architecture-neutral programs: one source pair, registered for every arch it serves
+        # architecture-neutral programs: one source pair, built for every arch it serves
         assert record["arches"] and record["arches"] == sorted(record["arches"])
+        assert record["library"] == name
         for arch in record["arches"]:
-            assert arch in cake_jit.ARCH_NVCC_FLAGS
+            assert arch in cake_jit.ARCHES
             assert cake_jit.KERNELS[arch][record["template"]] == name
-        assert len(record["sources"]) == 2
-        assert all(
-            s.startswith("cake_dense_projection_gemm/") and "/sm_" not in s
-            for s in record["sources"]
-        )
-        assert len(record["closure_sha256"]) == 64
+            entry = libraries[cake_jit.library_name(name, arch)]
+            assert entry["arch"] == arch and entry["entry"] == record["ffi_entry"]
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_dense_projection_gemm/") and "/sm_" not in s
+                for s in entry["sources"]
+            )
+            assert all(
+                (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
+            )
+            assert len(entry["closure_sha256"]) == 64
         assert (
             "tma_workspace_bytes" not in record
         )  # by-value TMA ABI: no descriptor workspace
@@ -803,6 +818,12 @@ def test_registry_records_are_well_formed():
         assert int(launch["block"][0]) % 32 == 0  # whole warps
     with pytest.raises(NotImplementedError, match="not registered"):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_not_a_template")
+    # every manifest entry belongs to a registered (program, arch) pair
+    assert set(libraries) == {
+        cake_jit.library_name(name, arch)
+        for name, record in cake_jit.MODULES.items()
+        for arch in record["arches"]
+    }
 
 
 def test_registry_literals_follow_the_export_contract():
@@ -4903,9 +4924,7 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
         "arches": ["sm_100a"],
         "template": "dense_proj_gemm_kk_n256",
         "kernel": "kernel_fake",
-        "cache_name": "fake",
-        "sources": [],
-        "compile_flags": [],
+        "library": "cake_dense_projection_gemm_fake",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -4914,7 +4933,6 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "0" * 64,
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
     }
     monkeypatch.setitem(cake_jit.MODULES, "cake_dense_projection_gemm_fake", record)

@@ -19,16 +19,9 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-from pathlib import Path
 from typing import Any
 
-from ...jit import env as jit_env
-from ...jit.core import (
-    gen_jit_spec,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
-    sm107a_nvcc_flags,
-)
+from . import cake_build
 
 # Registry of the generated GEMM programs (schema v2).  Populated verbatim by
 # the generated-program export; do not edit by hand.  Three literals, each
@@ -48,12 +41,14 @@ from ...jit.core import (
 #   layouts, the tile shape, the output kind, the epilogue path, the TMA L2
 #   eviction hints and the per-launch knobs -- see
 #   ``cake_backend.instance_symbol`` and ``cake_backend.router_symbol``).  A
-#   program is architecture-neutral (one source pair, compiled per device
-#   architecture); its record carries the kernel symbol, the JIT cache name,
-#   the translation units, the compile flags, the FFI entry, the ``arg_plan``
-#   key (``arg_plan_of`` resolves it; an inline plan list is still accepted),
-#   the launch geometry baked into the module (block, cluster), the
-#   architectures it serves and the closure identity.
+#   program is architecture-neutral (one source pair, built per device
+#   architecture); its record carries the kernel symbol, the architecture-free
+#   ``library`` stem (``build.json`` names the per-architecture build
+#   ``<library>_<arch>`` and records its translation units, compile flags and
+#   closure digest -- see ``cake_build``), the FFI entry, the ``arg_plan`` key
+#   (``arg_plan_of`` resolves it; an inline plan list is still accepted), the
+#   launch geometry baked into the module (block, cluster) and the
+#   architectures it serves.
 # * ``KERNELS``: ``arch -> template -> module name``, the table the host
 #   planner resolves a launch through.
 # fmt: off
@@ -164,16 +159,16 @@ KERNELS: dict[str, dict[str, str]] = {
 
 # Generated file list: the device / binding translation units of every registered
 # module live flat under ``csrc/cake_dense_projection_gemm/`` next to this file
-# (``<module>_kernel.cu`` / ``<module>_binding.cu``, one architecture-neutral pair
-# per program; each record's ``sources`` names them and ``arches`` lists the
-# architectures it is compiled for).  They are written by the Cake exporter
-# together with the three registries above.
+# (one architecture-neutral pair per program, built for every architecture in
+# the record's ``arches``); ``build.json`` lists them per library entry.  They
+# are written by the Cake exporter together with the three registries above and
+# the manifest.
 
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-    "sm_107a": sm107a_nvcc_flags,
-}
+# The architectures this checkout registers programs for (``KERNELS`` keys and
+# every record's ``arches`` are drawn from it).  SM103 (B300 / GB300) has no
+# registered program: a CC 10.3 device ends in ``NotImplementedError`` from
+# ``select_module``.
+ARCHES = ("sm_100a", "sm_107a")
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5677"
 
 
@@ -196,28 +191,10 @@ def arg_plan_of(record: dict[str, Any]) -> list[list[str]]:
             return ARG_PLANS[plan]
         except KeyError:
             raise KeyError(
-                f"registry record {record.get('cache_name', record.get('kernel'))!r} names the "
+                f"registry record {record.get('library', record.get('kernel'))!r} names the "
                 f"argument plan {plan!r}, which ARG_PLANS does not hold (keys: {sorted(ARG_PLANS)})"
             ) from None
     return [list(item) for item in plan]
-
-
-@functools.cache
-def toolchain_supports(arch: str) -> bool:
-    """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 / SM107 only.)
-
-    ``compute_107a`` (Rubin) needs a CUDA toolkit that lists it; a toolkit without it
-    must decline the sm_107a programs up front instead of failing inside the JIT build,
-    so a checkout that registers sm_107a programs stays importable and testable on a
-    toolkit that only knows 10.0 / 10.3 (same rule as ``msa_nvfp4_decode.cake_jit``).
-    """
-    if arch not in ARCH_NVCC_FLAGS:
-        return False
-    if arch == "sm_107a":
-        from ...compilation_context import _nvcc_supports_sm107
-
-        return bool(_nvcc_supports_sm107())
-    return True
 
 
 def registered_templates(arch: str) -> tuple[str, ...]:
@@ -247,51 +224,26 @@ def select_module(arch: str, template: str) -> str:
     return name
 
 
-def _header_dirs():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return installed
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return source
-    raise FileNotFoundError("FlashInfer binding headers were not found")
-
-
-@functools.cache
-def gen_cake_dense_projection_gemm_module(name: str, arch: str):
-    """JIT spec of program ``name`` compiled for ``arch`` (one architecture-neutral source pair
-    per program; the device architecture selects the nvcc flags and the cache entry)."""
+def library_name(name: str, arch: str) -> str:
+    """``build.json`` entry of program ``name`` built for ``arch``."""
     record = MODULES[name]
     if arch not in record["arches"]:
         raise ValueError(
             f"generated dense projection GEMM module {name!r} is not registered for {arch} "
             f"(registered: {list(record['arches'])})"
         )
-    if not toolchain_supports(arch):
-        raise RuntimeError(
-            f"generated dense projection GEMM module {name!r} targets {arch}, "
-            "which this checkout cannot compile"
-        )
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in record["sources"]]
-    return gen_jit_spec(
-        name=f"{record['cache_name']}_{arch}_" + record["closure_sha256"][:20],
-        sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[arch],
-            *record["compile_flags"],
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
-        use_fast_math=False,
-    )
+    return f"{record['library']}_{arch}"
 
 
 @functools.cache
 def load_cake_dense_projection_gemm_module(name: str, arch: str):
-    return gen_cake_dense_projection_gemm_module(name, arch).build_and_load()
+    """Load (once per program and architecture) the generated program ``name`` for ``arch``: the
+    prebuilt library under ``aot/`` when the package ships it, else FlashInfer's JIT build of its
+    ``build.json`` entry."""
+    return cake_build.load_library(library_name(name, arch))
+
+
+def specs_for_arch(arch: str):
+    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
+    ``flashinfer.jit.build_jit_specs`` warm-up)."""
+    return cake_build.jit_specs(arch)
