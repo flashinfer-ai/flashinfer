@@ -463,7 +463,8 @@ group of 16 tiles, so the row-max correction covers them. `VCAttentionPreprocess
 operands with the paper's V-Smooth schedule: grouping and demeaning run on the
 first `smooth_step_fraction` of the denoising steps, the permutation is
 refreshed every `perm_refresh_every` steps inside that window and kept
-afterwards. `vc_quantize` is the torch reference of the same preparation.
+afterwards. `vc_quantize` runs the same preparation without the schedule, and
+`vc_reference` is its torch reference.
 
 | Input | Supported values |
 | --- | --- |
