@@ -237,6 +237,28 @@ def test_rubin_t1_fused_qkv_views(B):
     assert torch.equal(st, st_ref)
 
 
+def test_rubin_t1_strided_pool_sizes():
+    """vLLM-style padded pool (slot stride > HV * V * K) at two pool sizes in a row: each
+    size gets its own build and the same bits as the generic kernel."""
+    HQ, HK, HV = 16, 16, 32
+    for B in (16, 32):
+        pool = 2 * B
+        inp = _inputs(B, HQ, HK, HV, pool, seed=B + 9)
+        idx = (torch.arange(B, dtype=torch.int32, device="cuda") * 2 + 1) % pool
+        states = []
+        for _ in range(2):
+            big = torch.empty(pool, HV + 1, D, D, dtype=torch.bfloat16, device="cuda")
+            st = big[:, :HV]
+            st.copy_(inp["state"])
+            assert not st.is_contiguous()
+            states.append(st)
+        o_ref = _call(generic, inp, states[0], idx, None, True)
+        o = _call(gated_delta_rule_t1_rubin, inp, states[1], idx, None, True)
+        torch.cuda.synchronize()
+        assert torch.equal(o, o_ref)
+        assert torch.equal(states[1], states[0])
+
+
 @pytest.mark.parametrize("B", [2048, 4096])
 def test_rubin_t1_bitwise_large_batch(B):
     HQ, HK, HV = 16, 16, 64
@@ -286,16 +308,19 @@ def test_rubin_api_routing(B, HV, pool_mode, monkeypatch):
         )
 
 
-def test_rubin_api_int64_indices_fp16_inputs():
-    """int64 read / write indices and fp16 q / k / v / a / b: same bits as the generic path."""
+@pytest.mark.parametrize("pool_mode", ["single", "split"])
+def test_rubin_api_int64_indices_fp16_inputs(pool_mode):
+    """int64 read / write indices and fp16 q / k / v / a / b: the same bits as the generic
+    path with int32 indices."""
     B, HV = 64, 64
-    inp = _inputs(B, 16, 16, HV, 2 * B, seed=21, dtype=torch.float16)
-    idx = torch.arange(B, dtype=torch.int64, device="cuda")
-    out_idx = torch.arange(B, 2 * B, dtype=torch.int64, device="cuda")
+    pool, idx, out_idx = _pool(B, pool_mode)
+    inp = _inputs(B, 16, 16, HV, pool, seed=21, dtype=torch.float16)
+    idx64 = idx.to(torch.int64)
+    out_idx64 = None if out_idx is None else out_idx.to(torch.int64)
     st_ref = inp["state"].clone()
     st = inp["state"].clone()
     o_ref = _api(inp, st_ref, idx, out_idx, "flashinfer")
-    o = _api(inp, st, idx, out_idx, "rubin")
+    o = _api(inp, st, idx64, out_idx64, "rubin")
     torch.cuda.synchronize()
     assert torch.equal(o, o_ref)
     assert torch.equal(st, st_ref)

@@ -1312,18 +1312,19 @@ def gated_delta_rule_t1_rubin(
             torch.cuda.get_device_properties(q.device).multi_processor_count * 25 // 3
         )
 
-    if output_state_indices is not None and output_state_indices.dtype != torch.int32:
-        output_state_indices = output_state_indices.to(
-            torch.int32
-        )  # as the generic kernel
     use_packed_fma = target.use_packed_fma
     same_pool = (
         output_state_indices is None or output_state_indices is initial_state_indices
     )
     if initial_state_indices is None:
         initial_state_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
-    if output_state_indices is None:
+    # The kernel reads int32 slot indices (int64 indices are converted, one small copy each)
+    if initial_state_indices.dtype != torch.int32:
+        initial_state_indices = initial_state_indices.to(torch.int32)
+    if output_state_indices is None or same_pool:
         output_state_indices = initial_state_indices
+    elif output_state_indices.dtype != torch.int32:
+        output_state_indices = output_state_indices.to(torch.int32)
     if output is None:
         output = torch.empty(
             B_val, 1, HV_val, V_val, device=q.device, dtype=torch.bfloat16
@@ -1375,7 +1376,10 @@ def gated_delta_rule_t1_rubin(
         K_val,
         V_val,
         contiguous_pool,
-        None if contiguous_pool else tuple(initial_state_source.stride()),
+        # a strided (e.g. padded) pool compiles with its static shape: key its size and strides
+        None
+        if contiguous_pool
+        else (initial_state_source.shape[0], tuple(initial_state_source.stride())),
         tile_v,
         stage_smem,
         qk_in_regs,
