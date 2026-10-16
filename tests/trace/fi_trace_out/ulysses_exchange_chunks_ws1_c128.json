@@ -1,0 +1,66 @@
+{
+  "name": "ulysses_exchange_chunks_ws1_c128",
+  "description": "Equal-length chunk all-to-all over an already-packed payload: chunk ``r`` goes to peer ``r`` and lands in slot ``rank`` there. Unlike the two head-axis transforms this one interleaves nothing, so it is the identity at world_size=1 by shape as well as by value. The reference models world_size=1; multi-rank correctness is exercised by tests/comm/.",
+  "op_type": "comm",
+  "tags": [
+    "fi_api:flashinfer.comm.ulysses.UlyssesCommunicator.exchange_chunks",
+    "status:experimental",
+    "stage:comm"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "const",
+      "value": 1,
+      "description": "Pinned to 1: one row per operand is what lets the transport address each peer's bytes contiguously."
+    },
+    "seq_len": {
+      "type": "const",
+      "value": 1,
+      "description": "Pinned to 1, as above."
+    },
+    "chunk_count": {
+      "type": "const",
+      "value": 1,
+      "description": "Chunks in the operand, one per peer, so equal to world_size by construction."
+    },
+    "world_size": {
+      "type": "const",
+      "value": 1,
+      "description": "fi_trace models the single-rank identity case only."
+    },
+    "chunk": {
+      "type": "const",
+      "value": 128,
+      "description": "Elements in one peer's chunk."
+    }
+  },
+  "constraints": [
+    "world_size == 1",
+    "chunk_count == world_size"
+  ],
+  "inputs": {
+    "x": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "chunk_count",
+        "chunk"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "chunk_count",
+        "chunk"
+      ],
+      "dtype": "bfloat16",
+      "param": "out"
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _ulysses_single_rank_reference(\n    x: torch.Tensor, out: torch.Tensor = None, **_unused\n) -> torch.Tensor:\n    \"\"\"Single-rank reference; multi-rank permutation is tested under tests/comm.\"\"\"\n    result = x.clone()\n    if out is not None:\n        out.copy_(result)\n        return out\n    return result\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
