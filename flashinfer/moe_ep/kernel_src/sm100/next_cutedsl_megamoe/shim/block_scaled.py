@@ -505,6 +505,21 @@ class BlockScaledSymmBuffer:
                 (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
             )
 
+        self._allocate_kernel_workspace(kernel)
+
+        self._compiled: Optional[Any] = None
+        self._launch_key: Optional[tuple] = None
+        self._launch_kwargs: Optional[dict] = None
+        self._launch_weights: Optional[
+            Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
+        ] = None
+        self._staged_tokens: Optional[int] = None
+        self._destroyed = False
+
+    def _allocate_kernel_workspace(self, kernel) -> None:
+        """Allocate kernel-owned storage; staging and output pointers stay stable."""
+        cfg = self.config
+        tokens = cfg.padded_tokens_per_rank
         workspace = kernel._device_workspace
         local_bytes = int(workspace.total_bytes("local"))
         shared_bytes = int(workspace.total_bytes("shared"))
@@ -546,15 +561,6 @@ class BlockScaledSymmBuffer:
         )
         self._symmetric_base = base
         self._peer_offsets = peer_offsets
-
-        self._compiled: Optional[Any] = None
-        self._launch_key: Optional[tuple] = None
-        self._launch_kwargs: Optional[dict] = None
-        self._launch_weights: Optional[
-            Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
-        ] = None
-        self._staged_tokens: Optional[int] = None
-        self._destroyed = False
 
     @classmethod
     def _build_kernel(cls, cfg: BlockScaledMoeConfig):

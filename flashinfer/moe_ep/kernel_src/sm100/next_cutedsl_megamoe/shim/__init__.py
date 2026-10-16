@@ -7,6 +7,7 @@ from ._paths import bootstrap_paths
 bootstrap_paths()
 
 from .genphase import (
+    concatenate_genphase_weights,
     Sm100GenphaseMoeConfig,
     Sm100GenphaseSymmBuffer,
     preprocess_genphase_weights,
@@ -19,6 +20,7 @@ from .genphase import (
 from .correctness import output_error, sampled_reference
 
 __all__ = [
+    "concatenate_genphase_weights",
     "Sm100GenphaseMoeConfig",
     "Sm100GenphaseSymmBuffer",
     "preprocess_genphase_weights",
@@ -30,4 +32,21 @@ __all__ = [
     "output_error",
     "sampled_reference",
     "bootstrap_paths",
+]
+
+from .autotune import autotune_sm100_genphase_mega_moe
+from .tuning import sm100_genphase_candidates, default_sm100_genphase_knobs
+from .knob_cache import (
+    resolve_knobs as resolve_genphase_knobs,
+    live_token_buckets as genphase_live_token_buckets,
+    knob_cache_path,
+)
+
+__all__ += [
+    "autotune_sm100_genphase_mega_moe",
+    "sm100_genphase_candidates",
+    "default_sm100_genphase_knobs",
+    "resolve_genphase_knobs",
+    "genphase_live_token_buckets",
+    "knob_cache_path",
 ]

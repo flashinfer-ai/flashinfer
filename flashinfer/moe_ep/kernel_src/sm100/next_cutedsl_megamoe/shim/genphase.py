@@ -24,6 +24,7 @@ from .block_scaled import (
 )
 
 from .kernel_helpers import (
+    concatenate_block_scaled_weights as concatenate_genphase_weights,
     preprocess_block_scaled_weights as preprocess_genphase_weights,
     preprocess_prequantized_block_scaled_weights as preprocess_genphase_prequantized_weights,
     quantize_mxfp8_block32 as quantize_genphase_mxfp8,
@@ -108,6 +109,33 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
             raise TypeError("Blackwell GenPhase requires Sm100GenphaseMoeConfig.")
         super().__init__(config)
 
+    def retune(self, knobs) -> None:
+        """Collectively replace kernel storage before capture, preserving I/O views.
+
+        Only performance knobs may change. The backend calls this once after
+        its explicit warmup sweep, on an unpooled workspace.
+        """
+        from . import comm
+        from .tuning import is_valid_sm100_genphase_knobs
+
+        comm.ensure_not_capturing("Blackwell GenPhase retune")
+        if self._destroyed:
+            raise RuntimeError("cannot retune a destroyed workspace")
+        if not is_valid_sm100_genphase_knobs(knobs, self.config):
+            raise ValueError("invalid Blackwell GenPhase tuning knobs")
+        config = dataclasses.replace(self.config, **knobs)
+        if config == self.config:
+            return
+        kernel = self._build_kernel(config)
+        torch.cuda.synchronize()
+        self._compiled = self._launch_key = self._launch_kwargs = None
+        self._launch_weights = None
+        self._pre_reduced_activation = self._pre_reduced_activation_sf = None
+        comm.free_sym_tensor(self.shared_workspace)
+        self.shared_workspace = self.local_workspace = None
+        self.config, self.kernel = config, kernel
+        self._allocate_kernel_workspace(kernel)
+
 
 def validate_genphase_weights(transformed, config, device: torch.device) -> None:
     """Validate external GenPhase weights without allocating a workspace.
@@ -126,6 +154,7 @@ def validate_genphase_weights(transformed, config, device: torch.device) -> None
 
 
 __all__ = [
+    "concatenate_genphase_weights",
     "Sm100GenphaseMoeConfig",
     "Sm100GenphaseSymmBuffer",
     "preprocess_genphase_weights",

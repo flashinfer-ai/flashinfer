@@ -126,7 +126,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--kernel-variant",
         choices=("inference", "genphase"),
         default="inference",
-        help="SM107 kernel composition; GenPhase requires at most 1024 tokens/rank",
+        help="SM107 or SM100 MXFP8 kernel composition; GenPhase capacity <= 1024",
     )
     parser.add_argument(
         "--gate-up-clamp",
@@ -380,8 +380,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
         return 2
 
-    if args.kernel_variant != "inference" and family != "sm107":
-        print("--kernel-variant genphase requires --arch sm107", file=sys.stderr)
+    if (
+        args.kernel_variant == "genphase"
+        and family != "sm107"
+        and not (
+            family == "sm100"
+            and args.dtype == "mxfp8_e4m3"
+            and not args.allow_nondeterministic
+        )
+    ):
+        print(
+            "GenPhase requires SM107 or SM100 MXFP8 E4M3 with deterministic reduction",
+            file=sys.stderr,
+        )
         return 2
 
     activation_requested = (
