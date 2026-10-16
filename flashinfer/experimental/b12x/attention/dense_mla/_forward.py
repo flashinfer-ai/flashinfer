@@ -468,8 +468,16 @@ class DenseMlaForwardKernel:
         valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
             CANDIDATES_PER_CHUNK
         )
-        split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
-        split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
+        # Spread each request's visible chunks over every launched split. The
+        # capture-static count is sized for the planned capacity, so fixed
+        # capacity-sized ranges would leave short contexts on a few CTAs.
+        chunks_per_split = (
+            valid_chunks - first_valid_chunk + active_splits - Int32(1)
+        ) // active_splits
+        if chunks_per_split < Int32(1):
+            chunks_per_split = Int32(1)
+        split_first_chunk = first_valid_chunk + split * chunks_per_split
+        split_last_chunk = split_first_chunk + chunks_per_split
         if split_last_chunk > valid_chunks:
             split_last_chunk = valid_chunks
         active_chunks = split_last_chunk - split_first_chunk
