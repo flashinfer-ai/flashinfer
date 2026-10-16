@@ -63,6 +63,7 @@ class DenseMlaForwardKernel:
         qk_dim: int,
         value_dim: int,
         window_size: int | None,
+        causal: bool = True,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -75,6 +76,7 @@ class DenseMlaForwardKernel:
         self.qk_dim = int(qk_dim)
         self.value_dim = int(value_dim)
         self.window_size = None if window_size is None else int(window_size)
+        self.causal = bool(causal)
         self.kv_stages = int(layout.kv_stages)
         self.math_warps = MATH_WARPS_PER_QUERY * self.query_tile
         self.math_threads = self.math_warps * 32
@@ -461,6 +463,8 @@ class DenseMlaForwardKernel:
             if visible_chunks_begin < Int32(0):
                 visible_chunks_begin = Int32(0)
             first_valid_chunk = visible_chunks_begin // Int32(CANDIDATES_PER_CHUNK)
+        if cutlass.const_expr(not self.causal):
+            visible_chunks_end = cache_length
         valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
             CANDIDATES_PER_CHUNK
         )
@@ -594,6 +598,9 @@ class DenseMlaForwardKernel:
                 visible_begin = visible_end - Int32(self.window_size)
                 if visible_begin < Int32(0):
                     visible_begin = Int32(0)
+
+            if cutlass.const_expr(not self.causal):
+                visible_end = cache_length
 
             score_scale = sm_scale_log2
             value_scale = Float32(1.0)

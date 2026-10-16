@@ -51,12 +51,14 @@ def dense_mla_reference(
     sm_scale: float = K3_SM_SCALE,
     v_head_dim: int | None = None,
     window_size: int | None = None,
+    causal: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute right-aligned causal dense MLA with an optional local window.
+    """Compute right-aligned dense MLA with optional causal and left-window masks.
 
     The cache already contains the current query chunk.  Query row ``i`` in a
     request of length ``Q`` therefore sees keys through
-    ``cache_len - Q + i`` (inclusive).
+    ``cache_len - Q + i`` (inclusive) when causal. Noncausal queries see all
+    later keys; the left-window bound retains the same query alignment.
     """
     if q.ndim != 3:
         raise ValueError("q must have shape [total_q, heads, head_dim]")
@@ -137,7 +139,7 @@ def dense_mla_reference(
         kv_len = lens_host[request]
         if q_len <= 0:
             raise ValueError("every request must contain at least one query row")
-        if kv_len < q_len:
+        if causal and kv_len < q_len:
             raise ValueError("cache length must include the complete query chunk")
         pages_needed = (kv_len + page_size - 1) // page_size
         if pages_needed > int(page_table.shape[1]):
@@ -155,6 +157,8 @@ def dense_mla_reference(
             visible_begin = (
                 0 if window_size is None else max(0, visible - int(window_size))
             )
+            if not causal:
+                visible = kv_len
             key = records[visible_begin:visible]
             logits = torch.einsum("hd,kd->hk", q_rows[local_q], key)
             logits = logits * float(sm_scale)

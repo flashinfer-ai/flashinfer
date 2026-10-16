@@ -329,6 +329,7 @@ def _query(caps: Caps, abi: FrozenMapping) -> DenseMlaQuery:
         cache_tokens=caps.max_cache_tokens,
         physical_record_width=caps.physical_record_width,
         window_size=caps.window_size,
+        causal=caps.causal,
         use_cuda_graph=caps.use_cuda_graph,
         max_page_table_width=caps.max_page_table_width,
         num_cache_pages=caps.num_cache_pages,
@@ -354,6 +355,7 @@ def _caps(query: DenseMlaQuery, config: DenseMlaConfig, device: torch.device) ->
         v_head_dim=query.v_head_dim,
         physical_record_width=query.physical_record_width,
         window_size=query.window_size,
+        causal=query.causal,
         use_cuda_graph=query.use_cuda_graph,
         partial_dtype=_dtype(query.partial_dtype),
         budget=__import__(

@@ -37,6 +37,7 @@ class DenseMlaQuery:
     max_page_table_width: int
     num_cache_pages: int
     abi: FrozenMapping
+    causal: bool = True
     partial_dtype: str = "bfloat16"
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
@@ -54,6 +55,7 @@ class DenseMlaQuery:
             "cache_tokens": self.cache_tokens,
             "physical_record_width": self.physical_record_width,
             "window_size": self.window_size,
+            "causal": self.causal,
             "use_cuda_graph": self.use_cuda_graph,
             "max_page_table_width": self.max_page_table_width,
             "num_cache_pages": self.num_cache_pages,
@@ -101,7 +103,10 @@ def _default_config(
     if query.window_size is not None:
         max_attended_tokens = min(
             query.cache_tokens,
-            query.window_size + query.page_size - 1,
+            query.window_size
+            + query.page_size
+            - 1
+            + (0 if query.causal else query.query_rows),
         )
     splits = choose_num_splits(
         max_cache_tokens=max_attended_tokens,
@@ -154,7 +159,7 @@ def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
 
 TUNING = TuningContract(
     component_id="attention.mla",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(
         {
@@ -170,6 +175,7 @@ TUNING = TuningContract(
             "cache_tokens",
             "physical_record_width",
             "window_size",
+            "causal",
             "use_cuda_graph",
             "max_page_table_width",
             "num_cache_pages",
