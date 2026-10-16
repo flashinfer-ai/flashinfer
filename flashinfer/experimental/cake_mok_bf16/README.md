@@ -201,7 +201,10 @@ to recreate the workspace.
   (checkpoint) under an unconditional 44 / 36, which is why only imbalanced
   steps switch; with 4 ranks at 2.4x +0.8 % (one screening round). The MXFP8
   threshold sits between the measured 2.4x and 3.0x. No row elsewhere.
-  `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
+  `MoKConfig.comm_split_log=True` (default `False`; `dataclasses.replace(config,
+  comm_split_log=True)` on the returned config) prints each split change per
+  rank to stderr; the `CAKE_MOK_COMM_SPLIT_LOG` environment variable that used
+  to select this no longer exists.
 - Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
   `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
   the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
@@ -240,10 +243,16 @@ Single-GPU tests:
 
 Distributed tests (`torchrun --standalone --nproc-per-node=4 -m pytest ...`):
 `test_mok_bf16_distributed.py` (toy), `test_mok_bf16_unequal.py` (unequal and
-empty ranks, graph reuse), `test_mok_bf16_capacity.py` (API guards) and
+empty ranks, graph reuse), `test_mok_bf16_capacity.py` (adapter guards) and
 `test_mok_training_distributed.py` (clamped SwiGLU, recompute versus saved
 context, FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
-over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter. The
+over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter.
+`test_mok_bf16.py`, `test_mok_mxfp8.py` and `test_mok_bf16_capacity.py` import the
+package only through `tests/test_helpers/cake_package.py`; the torchrun suites and
+`test_mok_bf16_tolerance.py` drive the `examples/mok_*.py` scripts, which use the
+`flashinfer.mok` wrapper;
+`test_mok_bf16_api.py` checks the `flashinfer.mok` wrapper itself (experimental
+marking, signatures, re-exports and argument forwarding). The
 runnable examples are `examples/mok_bf16_toy.py`,
 `examples/mok_bf16_unequal.py` and `examples/mok_training_features.py`.
 

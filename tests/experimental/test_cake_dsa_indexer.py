@@ -21,57 +21,57 @@ limitations under the License.
 # registered generated programs and skip otherwise.  Opt-in heavy variant:
 # ``FLASHINFER_CAKE_DSA_INDEXER_FULL=1`` runs the recorded packed key geometry
 # through the FP64 reference (minutes on B200).
+#
+# This suite exercises the package alone: it names the package once, through
+# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer,
+# so a build that vendors the package under another import path runs it
+# unchanged after pointing that table entry at its package.  The flashinfer
+# public entry point (``flashinfer.dsa_indexer``) and its experimental-API
+# warning contract are covered by ``test_cake_dsa_indexer_api.py``.
 
-import contextlib
 import os
-import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.experimental.cake_dsa_indexer import (
-    cake_backend,
-    cake_build,
-    cake_jit,
-    cake_policy,
-)
-from flashinfer.experimental.cake_dsa_indexer.cake_backend import (
-    ABI_CONTRACT,
-    CONTRACT_SCALARS,
-    CONTRACT_TENSORS,
-    HEAD_DIM,
-    MAX_TOP_K,
-    NUM_HEADS,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    ZERO_SIGN_POLICIES,
-    arch_for,
-    bind_program,
-    dsa_indexer_workspace_size,
-    generated_program_available,
-    plan_dsa_indexer_topk,
-    policy_for,
-    prepare_dsa_indexer_topk,
-    program_for,
-    record_zero_sign_policy,
-    validate_dsa_indexer_inputs,
-    visible_key_count,
-    visible_key_counts,
-)
-from flashinfer.experimental.cake_dsa_indexer.cake_policy import (
-    MERGE_KEY,
-    POLICY_FIELDS,
-    DispatchPolicy,
-    finalize_grid,
-    finalize_key,
-    scan_key,
-    select_program,
-    stage_slug,
-)
 
 from tests.test_helpers import cake_dsa_indexer_program_levers as levers
 from tests.test_helpers import cake_dsa_indexer_reference as ref
+from tests.test_helpers.cake_package import cake_package
+
+cake_backend = cake_package("cake_dsa_indexer", "cake_backend")
+cake_build = cake_package("cake_dsa_indexer", "cake_build")
+cake_jit = cake_package("cake_dsa_indexer", "cake_jit")
+cake_policy = cake_package("cake_dsa_indexer", "cake_policy")
+ABI_CONTRACT = cake_backend.ABI_CONTRACT
+CONTRACT_SCALARS = cake_backend.CONTRACT_SCALARS
+CONTRACT_TENSORS = cake_backend.CONTRACT_TENSORS
+HEAD_DIM = cake_backend.HEAD_DIM
+MAX_TOP_K = cake_backend.MAX_TOP_K
+NUM_HEADS = cake_backend.NUM_HEADS
+SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
+ZERO_SIGN_POLICIES = cake_backend.ZERO_SIGN_POLICIES
+arch_for = cake_backend.arch_for
+bind_program = cake_backend.bind_program
+dsa_indexer_workspace_size = cake_backend.dsa_indexer_workspace_size
+generated_program_available = cake_backend.generated_program_available
+plan_dsa_indexer_topk = cake_backend.plan_dsa_indexer_topk
+policy_for = cake_backend.policy_for
+prepare_dsa_indexer_topk = cake_backend.prepare_dsa_indexer_topk
+program_for = cake_backend.program_for
+record_zero_sign_policy = cake_backend.record_zero_sign_policy
+validate_dsa_indexer_inputs = cake_backend.validate_dsa_indexer_inputs
+visible_key_count = cake_backend.visible_key_count
+visible_key_counts = cake_backend.visible_key_counts
+MERGE_KEY = cake_policy.MERGE_KEY
+POLICY_FIELDS = cake_policy.POLICY_FIELDS
+DispatchPolicy = cake_policy.DispatchPolicy
+finalize_grid = cake_policy.finalize_grid
+finalize_key = cake_policy.finalize_key
+scan_key = cake_policy.scan_key
+select_program = cake_policy.select_program
+stage_slug = cake_policy.stage_slug
 
 FULL = os.environ.get("FLASHINFER_CAKE_DSA_INDEXER_FULL", "0") not in (
     "",
@@ -195,13 +195,6 @@ def _require_program():
         pytest.skip("generated DSA indexer programs not registered for this device")
 
 
-@contextlib.contextmanager
-def _quiet_experimental():
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        yield
-
-
 def _run(inputs: ref.IndexerInputs, **extra):
     out = cake_backend.dsa_indexer_topk(
         inputs.q,
@@ -259,12 +252,6 @@ def _independent_membership_check(
 # ---------------------------------------------------------------------------
 # Host-only: registry, dispatch policy, validation, binding
 # ---------------------------------------------------------------------------
-
-
-def test_public_api_is_marked_experimental():
-    from flashinfer.dsa_indexer import dsa_indexer_topk
-
-    assert dsa_indexer_topk.is_experimental
 
 
 def test_registry_records_are_well_formed():
@@ -2042,61 +2029,6 @@ def test_empty_rows_and_no_keys_are_all_padding():
     indices, scores = _run(inputs)
     assert bool((indices == -1).all()) and bool(torch.isneginf(scores).all())
     _judge_ok((indices, scores), ref.select_reference(inputs))
-
-
-def test_public_entry_point_matches_backend_and_warns_once():
-    _require_program()
-    from flashinfer.dsa_indexer import dsa_indexer_topk, dsa_indexer_topk_workspace_size
-
-    inputs = ref.make_random_inputs(
-        [200, 300], [200, 2500], top_k=128, seed=70, device="cuda"
-    )
-    expected = _run(inputs)
-    with pytest.warns(ExperimentalWarning):
-        got = dsa_indexer_topk(
-            inputs.q,
-            inputs.k,
-            inputs.w,
-            inputs.cu_seqlens_q,
-            inputs.cu_seqlens_k,
-            **inputs.kwargs(),
-        )
-    assert ref.same_bits(got, expected)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", ExperimentalWarning)
-        again = dsa_indexer_topk(
-            inputs.q,
-            inputs.k,
-            inputs.w,
-            inputs.cu_seqlens_q,
-            inputs.cu_seqlens_k,
-            **inputs.kwargs(),
-            max_seqlen_q=max(inputs.seg_q_len),
-            max_seqlen_k=max(inputs.seg_k_len),
-        )
-    assert ref.same_bits(again, expected)
-    assert dsa_indexer_topk_workspace_size(
-        inputs.num_queries,
-        inputs.num_keys,
-        inputs.num_segments,
-        top_k=128,
-        device=inputs.device,
-    ) == dsa_indexer_workspace_size(
-        inputs.num_queries,
-        inputs.num_keys,
-        inputs.num_segments,
-        top_k=128,
-        device=inputs.device,
-    )
-    with pytest.raises(ValueError, match="backend"), _quiet_experimental():
-        dsa_indexer_topk(
-            inputs.q,
-            inputs.k,
-            inputs.w,
-            inputs.cu_seqlens_q,
-            inputs.cu_seqlens_k,
-            backend="other",
-        )
 
 
 def test_persistent_rank_finalize_follows_the_architecture_cap():
