@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compile identity and device-local occupancy regression coverage."""
+"""PrimTS attention feature tests.
+
+Numerical attention coverage lives in the per-kernel test modules.
+"""
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -276,7 +279,7 @@ def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
     # Reuse the public numerical oracles for each distinct compiler entry.
     targets = [
         "test_attention_ts_decode.py::test_attention_ts_decode_compact_variable_k_acceptance[F7-fp8-sq4-q128-separate]",
-        "test_attention_ts_decode_bf16_output.py::test_fp8_bf16_output_public_entry_points[dense-True]",
+        "test_attention_ts_decode.py::test_attention_ts_decode_fixed_q_dtype_mask_product[sq2-dense-fp8-bf16]",
         "test_attention_ts_context.py::test_attention_ts_context_bounded_public_correctness_matrix[fixed-fp16-dense-mha-one-shot]",
         "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[d128-bf16-32]",
         "test_attention_ts_mla_decode.py::test_attention_ts_mla_decode_compact_variable_k_acceptance[bf16-1cta-direct]",
@@ -342,3 +345,57 @@ raise SystemExit(pytest.main(['-q', '--maxfail=1', *sys.argv[2:]]))
     artifacts = {path.parent.name for path in tmp_path.rglob("*.o")}
     for family in ("decode", "context", "mla_decode", "block_sparse"):
         assert any(name.startswith(f"prims_ts_{family}_") for name in artifacts)
+
+
+@pytest.mark.parametrize(
+    ("tile_offset_k", "tile_size_kv", "visible_begin", "visible_end", "expected"),
+    (
+        pytest.param(0, 128, 0, 128, True, id="exact-interval"),
+        pytest.param(128, 128, 0, 256, True, id="exact-right-boundary"),
+        pytest.param(0, 128, 0, 129, True, id="interior-with-short-remainder"),
+        pytest.param(128, 128, 0, 255, False, id="crosses-right-boundary"),
+        pytest.param(0, 128, 1, 256, False, id="crosses-window-left-boundary"),
+        pytest.param(128, 128, 128, 256, True, id="starts-at-window-boundary"),
+        pytest.param(128, 128, 160, 160, False, id="empty-intersection"),
+    ),
+)
+def test_kv_tile_is_fully_visible(
+    tile_offset_k: int,
+    tile_size_kv: int,
+    visible_begin: int,
+    visible_end: int,
+    expected: bool,
+) -> None:
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
+
+    assert (
+        kv_tile_is_fully_visible(
+            tile_offset_k,
+            tile_size_kv,
+            visible_begin,
+            visible_end,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("tile_offset_k", "tile_size_kv", "visible_end", "expected"),
+    (
+        pytest.param(0, 128, 128, False, id="exact-boundary"),
+        pytest.param(128, 128, 255, True, id="crosses-boundary"),
+    ),
+)
+def test_kv_tile_needs_right_mask(
+    tile_offset_k: int,
+    tile_size_kv: int,
+    visible_end: int,
+    expected: bool,
+) -> None:
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_needs_right_mask
+
+    assert (
+        kv_tile_needs_right_mask(tile_offset_k, tile_size_kv, visible_end) is expected
+    )
