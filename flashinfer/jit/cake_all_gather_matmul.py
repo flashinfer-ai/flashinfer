@@ -64,7 +64,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -72,7 +72,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -80,7 +80,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -329,6 +329,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -341,6 +342,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c27adeb3c14305afd206",
+            "main_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
         },
     },
     "bfloat16_ws2_n_major_sm_103a": {
@@ -374,6 +376,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a01c4436c21e679aaed9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -387,6 +390,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_a01c4436c21e679aaed9",
             "main_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
+            "main_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
         },
     },
     "bfloat16_ws4_k_major_sm_103a": {
@@ -464,6 +468,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a55baa3bdb6ce5b39f7e_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -477,6 +482,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
             "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
+            "main_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
         },
     },
     "bfloat16_ws8_k_major_sm_103a": {
@@ -840,7 +846,11 @@ SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
 # CTA-pair twin of the N256 main), per architecture; ``main_form`` selects the
 # twin only inside this table.
 CG2_CLASSES: dict[str, list[list[Any]]] = {
-    "sm_100a": [],
+    "sm_100a": [
+        [2, "bfloat16", "n_major"],
+        [4, "bfloat16", "k_major"],
+        [8, "bfloat16", "k_major"],
+    ],
     "sm_103a": [
         [2, "bfloat16", "n_major"],
         [4, "bfloat16", "k_major"],
@@ -855,7 +865,17 @@ CG2_CLASSES: dict[str, list[list[Any]]] = {
 # ``min_padded_rows <= ceil128(rows) <= max_padded_rows`` and
 # ``min_cols <= N <= max_cols``.
 CG2_REGIONS: dict[str, list[list[Any]]] = {
-    "sm_100a": [],
+    "sm_100a": [
+        [2, "bfloat16", "n_major", 2048, 2048, 2048, 2048],
+        [2, "bfloat16", "n_major", 4096, 4096, 2048, 2048],
+        [4, "bfloat16", "k_major", 1024, 1024, 2560, 2560],
+        [4, "bfloat16", "k_major", 1152, 1152, 2560, 2560],
+        [4, "bfloat16", "k_major", 2048, 2048, 2560, 2560],
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [4, "bfloat16", "k_major", 1024, 1024, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+        [8, "bfloat16", "k_major", 1024, 1024, 7168, 7168],
+    ],
     "sm_103a": [
         [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
         [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
