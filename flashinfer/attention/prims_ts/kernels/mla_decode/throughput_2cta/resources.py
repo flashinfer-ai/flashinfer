@@ -716,8 +716,8 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     def bind_sparse_request(self, stage_info: StageInfo):
         if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
             row = stage_info.work_tile.tile_idx[2]
-            self.request_lengths[0] = Int32(self.page_offsets.sl[row])
-            self.request_lengths[1] = Int32(self.page_offsets.cl[row])
+            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
+            self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
 
     @producer_work
     @cute.jit
@@ -2252,8 +2252,8 @@ class TmemSResource(HighThroughputMlaResource):
         """Cache live source lengths once per query tile, including graph replay."""
         if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
             row = stage_info.work_tile.tile_idx[2]
-            self.request_lengths[0] = Int32(self.page_offsets.sl[row])
-            self.request_lengths[1] = Int32(self.page_offsets.cl[row])
+            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
+            self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
 
     @producer_work
     @cute.jit

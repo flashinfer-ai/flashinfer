@@ -1,7 +1,7 @@
 # Task-Scheduled MLA Decode
 
 Native D512 two-source sparse MLA is available through
-`BatchSparseMLADecodePagedTSWrapper`; see [the sparse contract](SPARSE.md).
+`BatchSparseMLADecodePagedTSWrapper` (see its `plan()` / `run()` docstrings).
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent

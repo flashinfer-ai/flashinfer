@@ -2494,7 +2494,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 )
         finish = tuple(
             _compile_finish(device.index, num_heads, independent, output_quant)
-            for independent in (False, True)
+            for independent in ((False, True) if max_extra_topk else (False,))
         )
         self._state = dict(
             device=device,

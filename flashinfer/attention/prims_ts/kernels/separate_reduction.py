@@ -115,6 +115,15 @@ def attention_sink_scale(log2_lse, sink):
 
 
 class MergeMlaSourceStates:
+    """Finalize completed source states, after native split-KV reduction.
+
+    Independent KV descales use separate attention passes. Merge their
+    normalized O/log2-LSE states before applying sinks or output quantization;
+    their source-major buffers differ from the native split workspaces.
+    This also finishes an unfused single-pass result. The shared-scale fast
+    path finishes in the main kernel or native reducer and skips this launch.
+    """
+
     def __init__(self, independent_sources: bool, output_quant=None):
         self.independent_sources = independent_sources
         self.output_quant = output_quant
