@@ -53,6 +53,7 @@ from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache_flush import W_RING
 RING_DEPTHS = (32, 16)
 from flashinfer.gdn_kernels.gdn_prefix_materialize import (
     gdn_prefix_materialize,
+    ring_ty_torch,
     state_ty_torch,
 )
 
@@ -69,7 +70,9 @@ except ImportError:
 DEV = "cuda"
 H, HV, K, V = 16, 64, 128, 128
 STATE_DTYPE = state_ty_torch()
-RING_DTYPE = STATE_DTYPE
+# RING dtype, not STATE: under GDN_UCACHE_RING_DTYPE=fp16 they differ and the
+# wrapper's ring-dtype check rejects state-typed rings.
+RING_DTYPE = ring_ty_torch()
 # The fold accumulates `count` outer products in f32 and rounds once to the
 # state dtype; 2e-2 matches STATE_TOL in test_decode_ucache.py.
 STATE_TOL = 2e-2

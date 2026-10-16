@@ -98,7 +98,6 @@ import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.experimental  # noqa: F401  # registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -168,7 +167,7 @@ class GdnPrefixMaterializeKernel:
     def __init__(self, min_blocks_per_mp=8):
         self._min_blocks_per_mp = min_blocks_per_mp
 
-    @cute.experimental.jit
+    @cute.jit
     def __call__(
         self,
         gH0: cute.Tensor,
@@ -230,7 +229,7 @@ class GdnPrefixMaterializeKernel:
             min_blocks_per_mp=self._min_blocks_per_mp,
         )
 
-    @cute.experimental.kernel
+    @cute.kernel
     def kernel(
         self,
         gH0: cute.Tensor,

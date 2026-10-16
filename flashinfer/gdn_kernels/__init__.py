@@ -66,6 +66,11 @@ except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush = None  # type: ignore
 
 try:
+    from .gdn_prefix_materialize import gdn_prefix_materialize
+except (ImportError, RuntimeError):
+    gdn_prefix_materialize = None  # type: ignore
+
+try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
 except (ImportError, RuntimeError):
     run_pretranspose_decode = None  # type: ignore
@@ -117,6 +122,7 @@ __all__ = [
     "gated_delta_rule_mtp",
     "gated_delta_rule_mtp_ucache",
     "gated_delta_rule_mtp_ucache_flush",
+    "gdn_prefix_materialize",
     "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
     "gated_delta_rule_bf16state_cooprow_mtp",
