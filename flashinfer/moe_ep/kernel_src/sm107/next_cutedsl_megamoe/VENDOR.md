@@ -93,7 +93,11 @@ the older drop. At FlashInfer `0f710df8`, this export passed 187 host/CUDA check
 with no skips. See the
 [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
 for coverage and the separate reference-decoder regression.
-Tuning-cache entries use revision `sm107-block-scaled-1667b47a-runtime-options-v2`.
+Standard inference tuning entries retain revision
+`sm107-block-scaled-1667b47a-runtime-options-v1`. GenPhase writes
+`sm107-block-scaled-1667b47a-runtime-options-v2` and also accepts compatible
+grouped entries from v1. Unsupported GenPhase schedules are skipped with a
+warning in either revision.
 The cache identity includes the kernel variant and combine format, along with
 activation, beta parameters, and clamp settings.
 

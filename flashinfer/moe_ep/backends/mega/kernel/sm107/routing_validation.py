@@ -91,22 +91,29 @@ class _Entry:
 _COMPILED: dict[tuple, object] = {}
 
 
+def _dynamic_argument(tensor: torch.Tensor):
+    return cutlass_torch.from_dlpack(tensor, assumed_align=1).mark_layout_dynamic(
+        leading_dim=tensor.ndim - 1
+    )
+
+
 def check_routing(
     ids: torch.Tensor, weights: torch.Tensor, experts: int, workspace=None
 ) -> None:
     """Keep the existing asynchronous device assertion, including graph replay."""
     stream = torch.cuda.current_stream().cuda_stream
     ffi = os.environ.get("FLASHINFER_SM107_PREP_TVM_FFI", "1") != "0"
-    key = (
+    compile_key = (
         ids.device,
         ids.dtype,
         weights.dtype,
-        tuple(ids.shape),
+        ids.shape[1],
         tuple(ids.stride()),
         tuple(weights.stride()),
         ffi,
-        stream,
     )
+    # Reuse the kernel across row counts; keep each graph's buffers separate.
+    key = (*compile_key, tuple(ids.shape), stream)
     if workspace is not None and not hasattr(workspace, "_routing_checks"):
         workspace._routing_checks = {}
     entries = workspace._routing_checks if workspace is not None else {}
@@ -115,12 +122,9 @@ def check_routing(
         entries_count = ids.numel()
         blocks = (entries_count + 255) // 256 if entries_count > 1024 else 1
         result = torch.empty(blocks, dtype=torch.bool, device=ids.device)
-        compile_arguments = tuple(
-            cutlass_torch.from_dlpack(t, assumed_align=1)
-            for t in (ids, weights, result)
-        )
+        compile_arguments = tuple(_dynamic_argument(t) for t in (ids, weights, result))
         arguments = (ids, weights, result) if ffi else compile_arguments
-        compiled = _COMPILED.get(key[:-1])
+        compiled = _COMPILED.get(compile_key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm routing validation before CUDA graph capture")
@@ -131,7 +135,7 @@ def check_routing(
                 cuda.CUstream(stream),
                 options="--enable-tvm-ffi" if ffi else "",
             )
-            _COMPILED[key[:-1]] = compiled
+            _COMPILED[compile_key] = compiled
         entry = _Entry(compiled, result, (ids, weights), arguments)
         # The workspace owns this assertion buffer for every captured profile.
         # Releasing it while a graph can replay would invalidate the graph.
@@ -141,10 +145,7 @@ def check_routing(
         entry.arguments = (
             (ids, weights, entry.result)
             if ffi
-            else tuple(
-                cutlass_torch.from_dlpack(t, assumed_align=1)
-                for t in (ids, weights, entry.result)
-            )
+            else tuple(_dynamic_argument(t) for t in (ids, weights, entry.result))
         )
     entry.compiled(
         *entry.arguments,

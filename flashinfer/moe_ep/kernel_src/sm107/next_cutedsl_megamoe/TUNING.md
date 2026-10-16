@@ -267,8 +267,11 @@ GenPhase requires `schedule_policy=("grouped", None)` at every tile size and
 EP size. Phase-interleave can stall even at EP1 and is rejected before
 allocation or compilation. `is_valid_sm107` applies the same restriction
 during tuning; the schedule sweep compares grouped grid-stride and atomic
-work IDs. Cache entries from before this restriction are ignored; retune to
-populate the current cache revision. Generic inference schedules are unchanged.
+work IDs. Compatible grouped entries from the previous GenPhase cache revision
+remain usable. Entries with unsupported schedules are skipped with a warning;
+retune those profiles. Lookup leaves the cache file unchanged and prefers the
+current revision when both revisions cover the same bucket. Standard inference
+schedules and cache entries are unchanged.
 
 Retune to compare the additional candidates for your workload. The default
 kernel family remains `inference`; these candidates do not automatically

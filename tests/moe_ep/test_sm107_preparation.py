@@ -118,12 +118,80 @@ def test_routing_check_rebinds_inputs_and_replays(monkeypatch, ffi, dtype, shape
     ws = SimpleNamespace()
     validate_routing_values(ids, scores, 128, workspace=ws)
     torch.cuda.synchronize()
+
+    # Observe invalid replay inputs without poisoning the worker's CUDA context.
+    verdict = torch.empty((), dtype=torch.bool, device="cuda")
+
+    def observe_check(valid, message):
+        verdict.copy_(valid.reshape(()))
+
+    monkeypatch.setattr(torch, "_assert_async", observe_check)
+    original_ids, original_scores = ids, scores
+    ids, scores = ids.clone(), scores.clone()
+    original_ids.fill_(128)
+    original_scores.fill_(float("nan"))
+    validate_routing_values(ids, scores, 128, workspace=ws)
+    torch.cuda.synchronize()
+    assert verdict.item()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         validate_routing_values(ids, scores, 128, workspace=ws)
     ids.fill_(-1)
     graph.replay()
     torch.cuda.synchronize()
-    validate_routing_values(ids.clone(), scores.clone(), 128, workspace=ws)
-    torch.cuda.synchronize()
+    assert verdict.item()
+    if tokens:
+        ids[-1, -1] = 128
+        graph.replay()
+        torch.cuda.synchronize()
+        assert not verdict.item()
+        ids[-1, -1] = -1
+        scores[-1, -1] = float("nan")
+        graph.replay()
+        torch.cuda.synchronize()
+        assert not verdict.item()
+        scores.fill_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert verdict.item()
     graph.reset()
+
+
+@pytest.mark.parametrize("ffi", ["0", "1"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("topk", [1, 8, 32])
+def test_routing_check_reuses_kernel_across_row_counts(
+    monkeypatch, ffi, dtype, score_dtype, topk
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import routing_validation
+
+    monkeypatch.setenv("FLASHINFER_SM107_PREP_TVM_FFI", ffi)
+    monkeypatch.setattr(routing_validation, "_COMPILED", {})
+    ws = SimpleNamespace()
+    ids = torch.arange(topk, device="cuda", dtype=dtype).repeat(8, 1)
+    scores = torch.ones(8, topk, device="cuda", dtype=score_dtype)
+    routing_validation.check_routing(ids, scores, 128, workspace=ws)
+    torch.cuda.synchronize()
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("A new row count must reuse the warmed routing kernel")
+
+    monkeypatch.setattr(routing_validation.cute, "compile", unexpected_compile)
+    graphs = []
+    inputs = []
+    try:
+        for tokens in (0, 1, 129, 513, 1024):
+            ids = torch.arange(topk, device="cuda", dtype=dtype).repeat(tokens, 1)
+            scores = torch.ones(tokens, topk, device="cuda", dtype=score_dtype)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                routing_validation.check_routing(ids, scores, 128, workspace=ws)
+            graphs.append(graph)
+            inputs.append((ids, scores))
+        for graph in reversed(graphs):
+            graph.replay()
+            torch.cuda.synchronize()
+    finally:
+        for graph in graphs:
+            graph.reset()
