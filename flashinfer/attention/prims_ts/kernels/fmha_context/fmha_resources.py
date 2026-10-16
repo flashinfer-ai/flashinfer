@@ -94,7 +94,6 @@ from .vc_resources import (
     VC_MEAN_TILE_LBO,
     VC_MEAN_TILE_SBO,
     _expcast_e4m3_quad_relu,
-    _expcast_e4m3_quad_relu_init,
     _f16x2_sum4,
     _split_bf16_hi_lo_word,
 )
@@ -427,16 +426,13 @@ class FmhaConfig:
     two_cta_umma: bool = False
     # exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
     exp2_fma_pairs: int = 0
-    # VC-Attention-QK16. A nonzero ``vc_k_block_size`` (the 128-token K/V tile)
-    # stores E4M3 V as per-tile residuals whose bf16 tile means one K=16 UMMA
-    # step per tile restores into O.
-    vc_k_block_size: int = 0
-    # VC-Attention-QK16 V repair tiles after the whole K/V tiles. Non-zero
-    # replaces the tile-mean restoration.
-    vc_repair_tiles: int = 0
-    # Strides of the per-(batch, head, channel) VC output scale table.
-    vc_num_q_heads: int = 0
-    vc_head_dim_v: int = 128
+    # VC-Attention-QK16 mode on the 16-bit Q/K and E4M3 V kernel. V stores
+    # residuals around a per-tile mean and the output scale is a per-channel
+    # table. In "means" mode the kernel adds each tile mean back into the
+    # output with one UMMA step. In "outliers" mode the kernel skips the means
+    # and instead consumes extra K/V tiles of the largest residuals that
+    # follow the sequence. None turns VC-Attention off.
+    vc_attention: str | None = None
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -515,27 +511,15 @@ class FmhaConfig:
     # query-paired maps peers to two sequence tiles in one Q head, while
     # head-paired mode maps peers to two Q heads at one sequence tile.
     @property
-    def vc_attention(self) -> bool:
-        return self.vc_k_block_size != 0
-
-    @property
     def vc_restores_means(self) -> bool:
-        """Whether VC-Attention-QK16 restores the V tile means rather than using V repair rows."""
-        return self.vc_attention and self.vc_repair_tiles == 0
+        return self.vc_attention == "means"
 
     def validate_vc_profile(self) -> None:
         """Validate the VC-Attention-QK16 recipe against the configured kernel."""
-        if not self.vc_attention:
-            if self.vc_num_q_heads != 0:
-                raise ValueError("vc_num_q_heads requires vc_k_block_size")
+        if self.vc_attention is None:
             return
-        if self.vc_k_block_size != self.qk_mma_tiler[1]:
-            raise ValueError(
-                f"vc_k_block_size must equal the K/V tile ({self.qk_mma_tiler[1]}), "
-                f"got {self.vc_k_block_size}"
-            )
-        if self.vc_num_q_heads < 1:
-            raise ValueError("VC-Attention-QK16 requires vc_num_q_heads")
+        if self.vc_attention not in ("means", "outliers"):
+            raise ValueError(f"unknown vc_attention mode {self.vc_attention!r}")
         if (
             self.is_causal
             or self.has_variable_window
@@ -547,14 +531,9 @@ class FmhaConfig:
                 "VC-Attention-QK16 requires the dense contiguous query-paired context "
                 "kernel with equal Q and K/V head counts"
             )
-        if self.vc_head_dim_v != self.pv_mma_tiler[1]:
-            raise ValueError(
-                f"vc_head_dim_v must equal the V head dim ({self.pv_mma_tiler[1]}), "
-                f"got {self.vc_head_dim_v}"
-            )
         # The packed mean operand and the row-sum operand are laid out for 128
         # channels and 128 query rows.
-        if self.logical_head_dim_qk != 128 or self.vc_head_dim_v != 128:
+        if self.logical_head_dim_qk != 128 or self.pv_mma_tiler[1] != 128:
             raise ValueError("VC-Attention-QK16 requires head_dim 128")
         if self.q_dtype.width != 16 or self.v_dtype.width != 8:
             raise ValueError("VC-Attention-QK16 requires 16-bit Q/K and E4M3 V")
@@ -2699,11 +2678,18 @@ class TmemSPResource(MemoryResource):
         variable_window_q_stride: int | Int32 = 0,
         scale_softmax_log2: cute.Tensor | None = None,
         smem_p: Optional[SmemPResource] = None,
+        vc_repair_tiles: int = 0,
         **kwargs: Any,
     ) -> None:
-        """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata."""
+        """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata.
+
+        The repair tile count is a compile-time constant. It says how many
+        K/V tiles at the end of the loop are VC-Attention outlier tiles. It is
+        zero on plans that restore the tile means.
+        """
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
+        self.vc_repair_tiles = vc_repair_tiles
         self.tmem_s_offset = tmem_s_offset
         self.tmem_p_offset = tmem_p_offset
         self.q_half = q_half
@@ -3834,7 +3820,7 @@ class TmemSPResource(MemoryResource):
         )
         s_data = _tmem_sp_sdata.pop(id(self))
         packed_words: tuple[Any, ...] = ()
-        acc: list[Any] = [None] * 4
+        acc: list[Any] = [Int32(0)] * 4
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 4):
                 quad_idx = (chunk_idx * tmem_x + elem_idx) // 4
@@ -3852,12 +3838,9 @@ class TmemSPResource(MemoryResource):
                     (code_scale, code_scale),
                     (code_bias, code_bias),
                 )
-                if cutlass.const_expr(quad_idx < 2):
-                    word, acc_lo, acc_hi = _expcast_e4m3_quad_relu_init(c0, c1, c2, c3)
-                else:
-                    word, acc_lo, acc_hi = _expcast_e4m3_quad_relu(
-                        c0, c1, c2, c3, acc[chain], acc[chain + 1]
-                    )
+                word, acc_lo, acc_hi = _expcast_e4m3_quad_relu(
+                    c0, c1, c2, c3, acc[chain], acc[chain + 1], quad_idx < 2
+                )
                 acc[chain] = acc_lo
                 acc[chain + 1] = acc_hi
                 packed_words += (word,)
@@ -4624,7 +4607,7 @@ class TmemSPResource(MemoryResource):
         acc_scale = cute.math.exp2(old_row_max - row_max, fastmath=True)
         kept_chunk = p_chunk
         if cutlass.const_expr(not is_tail):
-            first_repair = Int32(stage_info.loop_end) - Int32(self.cfg.vc_repair_tiles)
+            first_repair = Int32(stage_info.loop_end) - Int32(self.vc_repair_tiles)
             if Int32(stage_info.loop_offset) >= first_repair:
                 kept_chunk = Float32(0.0)
         return (
@@ -5561,18 +5544,11 @@ class TmemOResource(MemoryResource):
         tmem_vec1_resource: TmemStatsResource | None = None,
         smem_p0_resource: Optional[SmemPResource] = None,
         smem_p1_resource: Optional[SmemPResource] = None,
-        vc_ctrl: cute.Tensor | None = None,
         **kwargs: Any,
     ) -> None:
-        """Bind O TMEM offsets, correction-stat resources, and SMEM P tiles.
-
-        ``vc_ctrl`` is the VC-Attention-QK16 run control word: element 0 is 1 when
-        the tile means are restored and 0 when the run is the plain low-bit
-        kernel (V-Smooth off), which skips the mean UMMA steps.
-        """
+        """Bind O TMEM offsets, correction-stat resources, and SMEM P tiles."""
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
-        self.vc_ctrl = vc_ctrl
         self.smem_p0_resource = smem_p0_resource
         self.smem_p1_resource = smem_p1_resource
         self.tmem_o0_offset = tmem_o0_offset
@@ -5614,9 +5590,9 @@ class TmemOResource(MemoryResource):
         )
         self.tmem_o_addr_base_cached = Int32(0)
         if cutlass.const_expr(self.cfg.vc_restores_means):
-            issue = self._vc_restore_means()
+            issue = cutlass.Boolean(True)
             if cutlass.const_expr(self.cfg.two_cta_umma):
-                issue = issue & (
+                issue = (
                     cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == 0
                 )
             self.vc_mean_issue_cached = issue
@@ -6005,13 +5981,6 @@ class TmemOResource(MemoryResource):
         return prims.CTAGroup.CTA_1
 
     @cute.jit
-    def _vc_restore_means(self) -> cutlass.Boolean:
-        """Whether this run restores the V tile means (``vc_ctrl[0] != 0``)."""
-        if cutlass.const_expr(self.vc_ctrl is None):
-            return cutlass.Boolean(True)
-        return self.vc_ctrl[0] != Int32(0)
-
-    @cute.jit
     def _vc_rowsum_desc(
         self, stage_info: StageInfo, smem_p: SmemPResource
     ) -> prims.Tcgen05SmemDesc:
@@ -6367,18 +6336,22 @@ class SmemOResource(MemoryResource):
         tidx, _, _ = cute.arch.thread_idx()
         tid_in_wg = tidx % (cute.arch.WARP_SIZE * num_correction_warps)
 
-        vc_scale_base = Int64(0)
-        vc_head_coord = Int32(0)
-        vc_batch_coord = Int32(0)
+        vc_scale_row = Int64(0)
         if cutlass.const_expr(self.cfg.vc_attention):
+            # Start of this batch and head row in the per-channel V scale table.
             assert self.tmem_vec_resource is not None
             assert self.tmem_vec_resource.output_scale is not None
             assert self.cfg.work_tile_q_heads == 1
-            vc_scale_base = self.tmem_vec_resource.output_scale.iterator.toint()
-            _, head_coord_wt, vc_batch_coord = _resolve_work_tile_coords(
+            vc_scale = self.tmem_vec_resource.output_scale
+            _, head_coord_wt, batch_coord = _resolve_work_tile_coords(
                 self.cfg, stage_info.work_tile.tile_idx
             )
-            vc_head_coord = head_coord_wt * self.cfg.work_tile_q_heads
+            vc_scale_row = vc_scale.iterator.toint() + Int64(
+                cute.crd2idx(
+                    (batch_coord, head_coord_wt * self.cfg.work_tile_q_heads, 0),
+                    vc_scale.layout,
+                )
+            ) * Int64(4)
 
         o_head_dim = self.cfg.epi_tile[1]
         tma_copy_o_iters = self.cfg.tma_copy_o_iters
@@ -6416,15 +6389,11 @@ class SmemOResource(MemoryResource):
             scale_vec = cutlass.vector.full_like(o_rmem, scale)
             o_rmem = o_rmem * scale_vec
             if cutlass.const_expr(self.cfg.vc_attention):
-                # Per-channel V residual scale s[b, h, d]. The tile means were
-                # stored divided by it, so the whole accumulator is rescaled.
+                # The tile means were stored divided by the per-channel V scale,
+                # so the whole accumulator is rescaled by it here.
                 col0 = head_dim_stage_idx * o_head_dim + i * tmem_x
-                chan_idx = (
-                    Int64(vc_batch_coord) * Int64(self.cfg.vc_num_q_heads)
-                    + Int64(vc_head_coord)
-                ) * Int64(self.cfg.vc_head_dim_v) + Int64(col0)
                 chan_scale = cutlass.inttoptr(
-                    vc_scale_base + chan_idx * 4, mem_space=1, dtype=Float32
+                    vc_scale_row + Int64(col0) * Int64(4), mem_space=1, dtype=Float32
                 ).load(count=tmem_x, alignment=64)
                 o_rmem = o_rmem * chan_scale
 
