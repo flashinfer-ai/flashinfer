@@ -1386,9 +1386,7 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 # (Cake 370cc1dc7941 + the adopted 1b(ii) prescale factor table, which changes
 # the per-chunk cost of BOTH variants): scan-kernel time ring / ``_noring``,
 # the two variants of the same program as the two arms, CUPTI, cold L2, 3 and 5
-# interleaved rounds, kernel band 0.005.  GB300 (nvl72d215-T02; steps
-# b2dfae6f4779984e576bc87f bf16 3 rounds, e6235314fb13dc4f3ea8b931 bf16 5 rounds,
-# 809b22098ffc542789a047b1 f32):
+# interleaved rounds, kernel band 0.005.  GB300 (bf16 at 3 and 5 rounds, f32):
 #   varlen, z, 64 tokens, bf16 state: nseq 1 0.940; nseq 2 / 3 / 4 / 5 1.003 /
 #     1.000 / 1.002 / 1.003 (5 rounds 0.989 / 1.001 / 1.000 / 1.005: ties);
 #     nseq 6 / 8 / 16 / 64 1.011 / 1.017 / 1.013 / 1.014 (5 rounds 1.008 / 1.021);
@@ -1397,13 +1395,13 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 #   varlen, z, 64 tokens, f32 state: nseq 1 / 2 / 3 / 4 / 5 / 6 / 8 / 16 / 64 =
 #     0.945 / 0.986 / 0.984 / 0.993 / 0.990 / 0.983 / 0.997 / 0.989 / 0.981 ->
 #     the ring program wins every f32 cell (nseq 8 a tie): the round-5 f32
-#     threshold (4 x 128 items) is retired; an f32 state never takes ``_noring``.
+#     threshold (4 x 128 items) is retired; an f32 state never takes ``_noring``
+#     on the varlen path.
 #   batched, no z, batch 2 x 25 / 50 / 60 / 75 / 90 / 100 tokens: bf16 0.997 /
 #     0.995 / 0.987 / 0.995 / 0.992 / 0.995 (5 rounds 1.003 / 0.987 / 0.997 /
 #     0.987 / 0.992 / 0.985), f32 0.977 / 0.982 / - / 0.990 / 0.973 / -;
 #     short_batched_2x50 0.992 / 0.995 -> no batched cell loses on GB300 any more.
-# B200 (nsc-svg-slurm-1-gpu-49; steps 46baa0c96214abfe53fe148d bf16 3 rounds,
-# e3377c73e383c429af13cd86 bf16 5 rounds, 4c210f860a87eeeb876dedcb f32):
+# B200 (bf16 at 3 and 5 rounds, f32):
 #   varlen, z, 64 tokens, bf16: nseq 1 0.932; 2 / 3 / 4 / 5 1.001 / 0.985 /
 #     0.998 / 0.996 (5 rounds 0.990 / 0.989 / 0.999 / 0.996); 6 / 8 / 16 / 64
 #     1.017 / 1.012 / 1.012 / 1.006 (5 rounds 1.003 / 1.013); 63 / 65 tokens
@@ -1417,10 +1415,11 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
 #     0.993 / 0.986), f32 0.993 / 0.995 / - / 0.995 / 0.984 / -;
 #     short_batched_2x50 0.995 / 1.000 -> the 50-75-token cells are ties on
 #     B200 (GB300 wins): not a two-arch win, so the batched window stays.
-# Round-6 rule change: an f32 state never takes the start schedule (the
-# bf16 / f16 varlen window and the batched window are unchanged).
+# Round-6 rule change: an f32 state never takes the start schedule on the
+# varlen path (the bf16 / f16 varlen window and the dtype-independent batched
+# window are unchanged).
 _EXACT_NORING_VARLEN_MIN_ITEMS = {  # sequences x heads, by state dtype; a state
-    # dtype absent here (f32, round 6) never takes the start schedule
+    # dtype absent here (f32, round 6) never takes the varlen start schedule
     torch.bfloat16: 2 * 128,
     torch.float16: 2 * 128,
 }

@@ -1437,8 +1437,8 @@ def _assert_two_forms_p6(
     candidates = {"cu_seqlens": {}, "triple": {}}
     baseline = {}
     # The forced modes below are scoped to this helper: the caller's later
-    # calls must run the runner's own program choice again (round 6 c9 B200
-    # fitests: a leaked ``three_phase`` made the caller's seq_idx ride-along
+    # calls must run the runner's own program choice again (a leaked
+    # ``three_phase`` once made the caller's seq_idx ride-along
     # call run the three-phase program and fail its bitwise clause).
     prior_mode = os.environ.get(_CHUNK_PARALLEL_ENV)
     for seed in _P6_SEEDS:
@@ -6045,8 +6045,8 @@ _VARIANT_CASES = (
     ((True, True, 128, 2, 2 * 64, 1, 2 * 64, "float32"), ""),
     # FI win_v1x64_float32 0.939 / 0.941
     ((True, True, 128, 1, 64, 1, 64, "float32"), ""),
-    # round 6 (1b-b programs): f32 g4x64z 0.993 / g6x64z 0.983 / g8x64z 0.997 ring wins -> an f32 state never
-    # takes the start schedule (lane i5a steps 809b22098ffc542789a047b1 GB300 / 4c210f860a87eeeb876dedcb B200)
+    # round 6 (prescale-table programs): f32 g4x64z 0.993 / g6x64z 0.983 / g8x64z 0.997 ring wins -> an f32
+    # state never takes the varlen start schedule (GB300 / B200 re-calibration)
     ((True, True, 128, 4, 4 * 64, 1, 4 * 64, "float32"), ""),
     (
         (True, True, 128, 8, 8 * 64, 1, 8 * 64, "float32"),
@@ -6087,9 +6087,8 @@ _VARIANT_CASES = (
     ((True, True, 8, 32, 32 * 64, 1, 32 * 64, "float32"), ""),
     # 512 work items at 64 tokens, f32 state: ring (round-6 f32 window closed)
     ((True, True, 8, 64, 64 * 64, 1, 64 * 64, "float32"), ""),
-    # short_batched_2x50 1.008 / 1.005 (round 5); round 6 (1b-b programs): GB300 wins 0.987-0.995 but B200 ties
-    # 0.998-1.002 (steps b2dfae6f4779984e576bc87f / e6235314fb13dc4f3ea8b931 GB300, 46baa0c96214abfe53fe148d /
-    # e3377c73e383c429af13cd86 B200) -> not a two-arch win: the batched window stays
+    # short_batched_2x50 1.008 / 1.005 (round 5); round 6 (prescale-table programs): GB300 wins 0.987-0.995
+    # but B200 ties 0.998-1.002 -> not a two-arch win: the batched window stays
     ((False, False, 128, 2, 100, 2, 50, "bfloat16"), "noring"),
     (
         (False, False, 128, 2, 150, 2, 75, "bfloat16"),
