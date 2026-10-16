@@ -18,6 +18,7 @@ alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
+decode_cp_a2a_lse_reduce_tokens_d512.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
@@ -192,6 +193,7 @@ from flashinfer.cake_minimax_h3 import (
 from flashinfer.comm import (
     PcieIpcAllGatherWorkspace,
     PcieIpcReduceScatterWorkspace,
+    decode_cp_a2a_lse_reduce,
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
@@ -210,6 +212,20 @@ generate_moe_layer_traces(SAVE_DIR)
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# DCP schema tracing needs tensor metadata, not a collective workspace.
+fi_trace(
+    decode_cp_a2a_lse_reduce,
+    partial_o=torch.empty((4, 2, 8, 512), dtype=torch.bfloat16, device="meta"),
+    partial_lse=torch.empty((4, 2, 8), dtype=torch.float32, device="meta"),
+    workspace=torch.empty(16, dtype=torch.uint8, device="meta"),
+    cp_rank=0,
+    cp_size=8,
+    lse_mode="base2",
+    mask=torch.empty(4, dtype=torch.bool, device="meta"),
+    save_dir=SAVE_DIR,
+)
+
 
 # PCIe traces need only world_size and tensor metadata, not an IPC allocation
 # or peer GPUs. Real collective execution must construct the workspace normally.

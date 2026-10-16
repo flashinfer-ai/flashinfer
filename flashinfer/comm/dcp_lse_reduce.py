@@ -31,7 +31,7 @@ import torch.distributed._symmetric_memory as symm_mem
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_dcp_lse_reduce_module
-from ..trace.templates.comm import decode_cp_a2a_lse_reduce_trace
+from ..trace.templates.comm import decode_cp_a2a_lse_reduce_trace_dispatch
 
 
 @dataclass
@@ -186,7 +186,7 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     return workspace
 
 
-@flashinfer_api(trace=decode_cp_a2a_lse_reduce_trace)
+@flashinfer_api(trace=decode_cp_a2a_lse_reduce_trace_dispatch)
 def decode_cp_a2a_lse_reduce(
     partial_o: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -194,6 +194,8 @@ def decode_cp_a2a_lse_reduce(
     cp_rank: int,
     cp_size: int,
     lse_mode: Literal["base2", "basee"] = "base2",
+    *,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fuse an NCCL LSA DCP A2A exchange with the LSE-weighted reduce.
 
@@ -210,11 +212,19 @@ def decode_cp_a2a_lse_reduce(
         ``[batch, heads, cp_size, head_dim]`` CUDA tensor (fp16 or bf16), or
         more generally ``[..., cp_size, head_dim]``.
         ``partial_o[..., peer, :]`` is the slice destined for that CP rank.
+        A 4-D input accepts nonnegative outer strides, with unit stride along
+        ``head_dim`` and 16-byte-aligned rows. For example, destination-major
+        ``[batch, cp_size * heads, head_dim]`` attention output can be viewed
+        with ``unflatten(1, (cp_size, heads)).transpose(1, 2)`` without copying.
+        Other dimensionalities must be contiguous. Read-only broadcast views
+        are supported; inputs must not alias the mutable workspace.
     partial_lse : torch.Tensor
         ``[batch, heads, cp_size]`` CUDA float32 tensor, or more generally
         ``[..., cp_size]``. Its leading dimensions must match ``partial_o``.
         ``heads`` is simply the number of heads present in the input; it may
         be local or total because this operation does not shard the head axis.
+        A 3-D input accepts independent nonnegative strides; other shapes must
+        be contiguous.
     workspace : torch.Tensor
         Rendezvoused NCCL symmetric-memory tensor from
         :func:`decode_cp_a2a_lse_reduce_create_workspace`. Reuse it only from
@@ -226,6 +236,17 @@ def decode_cp_a2a_lse_reduce(
     lse_mode : Literal["base2", "basee"]
         Logarithm base used by ``partial_lse``. ``"base2"`` is the default
         produced by FlashInfer MLA; ``"basee"`` selects natural-log LSE.
+
+    mask : Optional[torch.Tensor]
+        Optional contiguous CUDA bool ``[batch]`` on the input device, supported
+        for 4-D ``partial_o`` and 3-D ``partial_lse``. Each entry marks a token's
+        validity on this source CP rank, shared across heads and destinations.
+        False skips reading its O/LSE and sends O=0 and LSE=-inf while still
+        participating in collective synchronization. ``None`` disables token
+        masking. Nonfinite LSE also excludes its O without reading it; an
+        all-excluded row returns zero. Finite LSE with NaN O retains NaN
+        propagation. For CUDA graphs, keep mask storage alive and update its
+        contents on the ordered stream.
 
     Returns
     -------
@@ -245,6 +266,7 @@ def decode_cp_a2a_lse_reduce(
         cp_size,
         lse_mode == "basee",
         group_name,
+        mask,
     )
 
 

@@ -146,10 +146,44 @@ __device__ static inline float sanitize_lse(float l) {
 //   [src_rank][flattened batch/head entry][*]
 //
 // The grid is persistent and cooperatively launched:
-//   1. block 0 selects the graph-safe device epoch; grid sync;
+//   1. each block snapshots the graph-safe device epoch; block sync;
 //   2. blocks publish complete destination payloads and release-store flags;
 //   3. block 0 acquire-waits for every source flag; unconditional grid sync;
-//   4. blocks are reassigned to output rows and perform the LSE merge.
+//   4. block 0 advances the epoch; blocks perform the LSE merge.
+// Input strides are in elements. Workspace rows retain the original flattened
+// leading-dimension layout, independently of the source tensor's physical layout.
+struct InputGeometry {
+  int64_t heads;
+  int64_t o_token_stride, o_head_stride, o_peer_stride;
+  int64_t lse_token_stride, lse_head_stride, lse_peer_stride;
+};
+
+template <typename T>
+__device__ __forceinline__ void send_row(const T* partial_o, const float* partial_lse,
+                                         const bool* mask, InputGeometry input, int entry, int peer,
+                                         int head_dim, T* dst_out, float* dst_lse) {
+  const int64_t token = entry / input.heads;
+  const int64_t head = entry - token * input.heads;
+  const int64_t src_base =
+      token * input.o_token_stride + head * input.o_head_stride + peer * input.o_peer_stride;
+  float lse = -INFINITY;
+  // One lane per warp checks validity and loads LSE, avoiding an additional
+  // block barrier. Invalid rows still publish neutral data and readiness flags.
+  if ((threadIdx.x & 31) == 0 && (!mask || mask[token])) {
+    lse = partial_lse[token * input.lse_token_stride + head * input.lse_head_stride +
+                      peer * input.lse_peer_stride];
+  }
+  lse = __shfl_sync(0xffffffff, lse, 0);
+  const bool valid = isfinite(lse);
+  constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
+  const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
+  int4* dst4 = reinterpret_cast<int4*>(dst_out);
+  for (int d = threadIdx.x; d < head_dim / kVec; d += blockDim.x) {
+    dst4[d] = valid ? src4[d] : make_int4(0, 0, 0, 0);
+  }
+  if (threadIdx.x == 0) *dst_lse = valid ? lse : -INFINITY;
+}
+
 template <typename T, bool BASE_E, bool ROW_DISTRIBUTED>
 __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __restrict__ partial_lse,
                             unsigned char* __restrict__ workspace, ncclWindow_t window,
@@ -158,21 +192,19 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
                             size_t lse_region_window_offset, size_t lse_region_local_offset,
                             size_t slot_lse_bytes, T* __restrict__ combined_out, int rank,
                             int nranks, int num_tokens, int max_tokens, int local_heads,
-                            int head_dim) {
+                            int head_dim, InputGeometry input, const bool* mask) {
   extern __shared__ float smem[];  // [nranks] merge weights
   cg::grid_group grid = cg::this_grid();
   auto* state = reinterpret_cast<uint32_t*>(workspace);
   auto* ready = reinterpret_cast<uint32_t*>(workspace + kMetadataBytes);
 
-  // Keep epoch selection on device so CUDA graph replay advances the slot.
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const uint32_t epoch = state[0];
-    state[1] = epoch;
-    state[0] = epoch + 1;
-  }
-  grid.sync();
+  // Snapshot the epoch per block. Its update is deferred until every
+  // block reaches the receive barrier, avoiding an initial grid sync.
+  __shared__ uint32_t block_epoch;
+  if (threadIdx.x == 0) block_epoch = state[0];
+  __syncthreads();
 
-  const uint32_t epoch = state[1];
+  const uint32_t epoch = block_epoch;
   const uint32_t signal_value = epoch + 1;
   const uint32_t slot = epoch % kNumSlots;
   const int num_entries = num_tokens * local_heads;
@@ -188,18 +220,13 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
       const int tile = work - dst * num_entries;
       const int token = tile / local_heads;
       const int local_head = tile - token * local_heads;
-      const size_t src_base = ((static_cast<size_t>(tile) * nranks + dst) * head_dim);
       const size_t dst_row =
           ((static_cast<size_t>(rank) * max_tokens + token) * local_heads + local_head);
       T* dst_out = reinterpret_cast<T*>(
           ncclGetLsaPointer(window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
       float* dst_lse = reinterpret_cast<float*>(
           ncclGetLsaPointer(window, slot_lse_window_offset + dst_row * sizeof(float), dst));
-      constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
-      const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
-      int4* dst4 = reinterpret_cast<int4*>(dst_out);
-      for (int d = threadIdx.x; d < head_dim / kVec; d += blockDim.x) dst4[d] = src4[d];
-      if (threadIdx.x == 0) *dst_lse = partial_lse[static_cast<size_t>(tile) * nranks + dst];
+      send_row(partial_o, partial_lse, mask, input, tile, dst, head_dim, dst_out, dst_lse);
     }
     __threadfence_system();
     grid.sync();
@@ -216,18 +243,13 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
       for (int tile = 0; tile < num_entries; ++tile) {
         const int token = tile / local_heads;
         const int local_head = tile - token * local_heads;
-        const size_t src_base = ((static_cast<size_t>(tile) * nranks + dst) * head_dim);
         const size_t dst_row =
             ((static_cast<size_t>(rank) * max_tokens + token) * local_heads + local_head);
         T* dst_out = reinterpret_cast<T*>(ncclGetLsaPointer(
             window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
         float* dst_lse = reinterpret_cast<float*>(
             ncclGetLsaPointer(window, slot_lse_window_offset + dst_row * sizeof(float), dst));
-        constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
-        const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
-        int4* dst4 = reinterpret_cast<int4*>(dst_out);
-        for (int d = threadIdx.x; d < head_dim / kVec; d += blockDim.x) dst4[d] = src4[d];
-        if (threadIdx.x == 0) *dst_lse = partial_lse[static_cast<size_t>(tile) * nranks + dst];
+        send_row(partial_o, partial_lse, mask, input, tile, dst, head_dim, dst_out, dst_lse);
         __syncthreads();
       }
       __threadfence_system();
@@ -254,6 +276,11 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
     }
   }
   grid.sync();
+
+  // All blocks have captured this call's epoch. A workspace is bound
+  // to one ordered stream, so the next call observes this increment
+  // only after every block in this call has finished its merge.
+  if (blockIdx.x == 0 && threadIdx.x == 0) state[0] = epoch + 1;
 
   const T* recv_out =
       reinterpret_cast<const T*>(workspace + out_region_local_offset + slot * slot_out_bytes);
