@@ -401,6 +401,9 @@ def test_single_cta_reset_admission(world, count, ncu, expected, monkeypatch):
 def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
 
+    cutlass = pytest.importorskip("cutlass")
+    # DSL 4.6/4.7 expose the SMEM query through cutlass.utils only.
+    monkeypatch.delattr(cutlass, "memory", raising=False)
     cfg = pkg.Sm100GenphaseMoeConfig(
         num_total_experts=8 * world,
         max_tokens_per_rank=129,

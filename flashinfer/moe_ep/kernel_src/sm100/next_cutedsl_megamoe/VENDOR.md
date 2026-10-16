@@ -45,11 +45,12 @@ Paths below are relative to `src/blackwell_genphase_sources/`.
 | File | Blackwell port |
 | --- | --- |
 | `__init__.py` | Export only `BlackwellInferenceGenphaseMegaMoE` from the Blackwell subtree. |
-| `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Fix architecture to SM100, select native 1x MMA and the 512-column TMEM plan; admit MXFP8 E4M3, N128/CGA4 or N64/CGA2/CGA4, grouped scheduling and separate BF16 reduction. Include the architecture in the generated kernel identity. SM103 uses the same device plan with its native compiler target. |
+| `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Fix architecture to SM100, select native 1x MMA and the 512-column TMEM plan; admit MXFP8 E4M3, N128/CGA4 or N64/CGA2/CGA4, grouped scheduling and separate BF16 reduction. Include the architecture in the generated kernel identity. SM103 uses the same device plan with its native compiler target. Fall back to the `cutlass.utils` SMEM query on DSL 4.6/4.7, which lack `cutlass.memory`. |
 | `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | Use native K32 MMA (four instructions per K128 stage), two-dimensional Blackwell helper shapes, fixed N and static two-CTA B-row ownership. Remove Rubin helper imports and dynamic-N paths. Disable dynamic Gather for the fixed-N atom: load complete B tiles with static transaction counts. N64 uses seven disjoint accumulator stages and two gather warps at CGA4 (four at CGA2); N128 uses three stages and four gather warps. |
 | `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py` | Rename the independently owned workspace labels and architecture descriptions; preserve device computation. |
 | `kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py` | Identify the Blackwell-owned adapter; preserve scheduling/tensor-view behavior. |
 | `kernel_src/blackwell/inference/mega/tma_gather.py` | Rename the Gather4 helper and its call site to reflect Blackwell ownership; preserve the instruction implementation. |
+| `kernel_src/blackwell/inference/mega/token_comm_gen_specialized.py` | Publish each refine-stage writer's generic shared-memory stores with an async-proxy fence before the group barrier and elected bulk store. |
 
 All remaining dependency files retain the integration baseline's bytes.
 Changes under `src/` must be inventoried here; never format them for lint.

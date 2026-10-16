@@ -8442,10 +8442,7 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
+        self._validate_pack_contract(act)
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
             raise TypeError(
