@@ -22,9 +22,10 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float8E4M3FN, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
+from ..dynamic_fp8_epilogue import fake_output_scale, output_scale_arg
 from ..runtime import (
     current_cu_stream,
     make_fake_dynamic_compact_tensor,
@@ -231,7 +232,7 @@ class FinalizeAllReduceRMSNormHTKernel(_HTPath):
             )
             if norm_output_bf16 is not None
             else None,
-            to_cute(output_scale, 4) if output_scale is not None else None,
+            output_scale_arg(output_scale),
             to_cute(peers, 8),
             to_cute(state.routed_ready_counters.tensor, 4),
             to_cute(state.routed_processed_counters.flatten(), 4),
@@ -293,7 +294,7 @@ class AllReduceRMSNormHTKernel(_HTPath):
             )
             if norm_output_bf16 is not None
             else None,
-            to_cute(output_scale, 4) if output_scale is not None else None,
+            output_scale_arg(output_scale),
             to_cute(peers, 8),
             to_cute(state.all_reduce_ready_counters.tensor, 4),
             to_cute(state.all_reduce_processed_counters.flatten(), 4),
@@ -328,6 +329,7 @@ class HTProtocol:
         group: dist.ProcessGroup,
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
+        dynamic_fp8: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
@@ -351,6 +353,7 @@ class HTProtocol:
                 "apply_rms_norm=False is not supported by the "
                 "high-throughput protocol; select the LL or BT protocol"
             )
+        self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
 
         self.finalize_kernels = {
@@ -418,6 +421,7 @@ class HTProtocol:
             add_residual=self.add_residual,
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
+            dynamic_fp8=self.dynamic_fp8,
         )
         return self._compile(kernel, top_k=self.top_k)
 
@@ -445,6 +449,7 @@ class HTProtocol:
             add_residual=self.add_residual,
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
+            dynamic_fp8=self.dynamic_fp8,
         )
         return self._compile(kernel, top_k=0)
 
@@ -488,9 +493,7 @@ class HTProtocol:
             )
             if self.write_norm_output
             else None,
-            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
-            if self.output_dtype == torch.float8_e4m3fn
-            else None,
+            fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
             make_fake_compact_tensor(Uint32, (token_slots,), assumed_align=4),
             make_fake_compact_tensor(

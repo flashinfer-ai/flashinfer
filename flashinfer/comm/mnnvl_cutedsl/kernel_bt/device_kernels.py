@@ -54,6 +54,7 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
 )
+from ..dynamic_fp8_epilogue import store_dynamic_fp8_cta_row
 from ..static_fp8_epilogue import store_rmsnorm_output
 
 LAMPORT_GENERATIONS = 3
@@ -1129,10 +1130,13 @@ class _MaterializeRMSNormDeviceKernel:
         write_residual_output: bool,
         enable_pdl: bool,
         apply_rms_norm: bool = True,
+        dynamic_fp8: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.capacity_m = capacity_m
         self.threads = threads
+        # FP8 output with a per-token scale written to output_scale[token].
+        self.dynamic_fp8 = dynamic_fp8
         self.rms_epsilon = rms_epsilon
         self.weight_bias = weight_bias
         self.write_residual_output = write_residual_output
@@ -1169,7 +1173,7 @@ class _MaterializeRMSNormDeviceKernel:
         ).launch(
             grid=(m, 1, 1),
             block=(self.threads, 1, 1),
-            smem=self.warps * 4,
+            smem=self.warps * 4 * (2 if self.dynamic_fp8 else 1),
             stream=stream,
             use_pdl=self.enable_pdl,
         )
@@ -1267,7 +1271,23 @@ class _MaterializeRMSNormDeviceKernel:
                 full_sum / Float32(self.hidden_size) + Float32(self.rms_epsilon),
                 fastmath=True,
             )
-            for trip in cutlass.range_constexpr(self.trips):
+            if cutlass.const_expr(self.dynamic_fp8):
+                store_dynamic_fp8_cta_row(
+                    prenorm_fragments,
+                    gamma_fragments,
+                    inverse_rms,
+                    norm_output,
+                    norm_output_bf16,
+                    output_scale,
+                    smem.allocate_array(Float32, self.warps),
+                    tidx,
+                    token,
+                    self.hidden_size,
+                    self.threads,
+                    self.weight_bias,
+                )
+            # The dynamic FP8 epilogue above replaces this static/BF16 store.
+            for trip in cutlass.range_constexpr(0 if self.dynamic_fp8 else self.trips):
                 fragment = tidx + trip * self.threads
                 if fragment < self.fragments:
                     gamma_value = gamma_fragments[trip, None].load().to(Float32)

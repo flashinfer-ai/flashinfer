@@ -644,7 +644,11 @@ def allreduce_fusion(
         workspace's ``write_norm_output=False``; pattern 4 requires ``True``
         and a caller-provided ``norm_out``. Patterns 1 and 7 require a BF16
         workspace, so pattern 7 returns BF16 ``norm_out`` on every backend.
-        Communication and residual outputs stay BF16.
+        Dynamic per-token E4M3 output (patterns 10 and 11) needs a workspace
+        constructed with ``output_dtype=torch.float8_e4m3fn`` and
+        ``dynamic_fp8=True``; pattern 10 requires ``write_norm_output=False``,
+        pattern 11 ``True``. Both write ``scale_out`` and take no
+        ``scale_factor``. Communication and residual outputs stay BF16.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch. MNNVL CuTe DSL presets determine
         their compiled PDL mode and warn when it differs from this value.

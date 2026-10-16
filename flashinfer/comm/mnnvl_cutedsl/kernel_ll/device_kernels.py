@@ -55,6 +55,7 @@ from ..cute_dsl_primitives import (
     store_shared_cluster_f32,
     store_shared_u32x4,
 )
+from ..dynamic_fp8_epilogue import store_dynamic_fp8_cluster_row
 from ..static_fp8_epilogue import store_rmsnorm_output
 
 LAMPORT_GENERATIONS = 3
@@ -815,6 +816,7 @@ class _LamportResidualRMSNormDeviceKernel:
         write_residual_output: bool,
         apply_rms_norm: bool = True,
         enable_pdl: bool,
+        dynamic_fp8: bool = False,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -835,6 +837,8 @@ class _LamportResidualRMSNormDeviceKernel:
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
         self.apply_rms_norm = apply_rms_norm
+        # FP8 output with a per-token scale written to output_scale[token].
+        self.dynamic_fp8 = dynamic_fp8
         self.enable_pdl = enable_pdl
         self.fragments = hidden // VEC_BF16
         self.groups_per_cta = threads // rank_lanes
@@ -844,7 +848,7 @@ class _LamportResidualRMSNormDeviceKernel:
         self.rank_waves = tp // rank_lanes
 
     def smem_size_in_bytes(self) -> int:
-        return (self.warps + self.cluster_size) * 4
+        return (self.warps + self.cluster_size) * 4 * (2 if self.dynamic_fp8 else 1)
 
     @cute.jit
     def __call__(
@@ -1090,7 +1094,29 @@ class _LamportResidualRMSNormDeviceKernel:
                 full_sum / Float32(self.hidden) + Float32(self.rms_epsilon),
                 fastmath=True,
             )
-            for trip in cutlass.range_constexpr(self.trips):
+            if cutlass.const_expr(self.dynamic_fp8):
+                store_dynamic_fp8_cluster_row(
+                    prenorm_fragments,
+                    gamma_fragments,
+                    inv_rms,
+                    norm_output,
+                    norm_output_bf16,
+                    output_scale,
+                    smem.allocate_array(Float32, self.warps),
+                    smem.allocate_array(Float32, self.cluster_size),
+                    tidx,
+                    token,
+                    base_fragment,
+                    rank_lane,
+                    cluster_rank,
+                    self.hidden,
+                    self.fragment_stride,
+                    self.threads,
+                    self.cluster_size,
+                    self.weight_bias,
+                )
+            # The dynamic FP8 epilogue above replaces this static/BF16 store.
+            for trip in cutlass.range_constexpr(0 if self.dynamic_fp8 else self.trips):
                 fragment = base_fragment + trip * self.fragment_stride
                 if fragment < self.fragments and rank_lane == 0:
                     gamma_values = gamma_fragments[trip, None].load().to(Float32)

@@ -357,7 +357,10 @@ def test_static_fp8_outputs_and_replay(
                     allreduce_fusion(
                         **dict(quant_args, quant_out=torch.empty_like(residual))
                     )
-                with pytest.raises(NotImplementedError, match="Unsupported"):
+                # Dynamic FP8 needs its own workspace mode (or no MoE operands).
+                with pytest.raises(
+                    ValueError, match="dynamic_fp8=True|finalize pattern"
+                ):
                     allreduce_fusion(
                         **dict(quant_args, pattern=P.kARResidualRMSNormDynamicFP8Quant)
                     )

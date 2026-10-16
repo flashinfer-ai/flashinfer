@@ -84,23 +84,27 @@ _ALL_REDUCE_PATTERNS = (
     AllReduceFusionPattern.kARResidualRMSNorm,
     AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
     AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+    AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+    AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant,
 )
 _FINALIZE_PATTERNS = (
     AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
     AllReduceFusionPattern.kMoEFinalizeARResidualRMSNormFP8Quant,
 )
 # Patterns served by a BF16 workspace, and by an FP8 workspace for each
-# write_norm_output setting.
+# (dynamic_fp8, write_norm_output) setting.
 _BF16_PATTERNS = (
     AllReduceFusionPattern.kARResidualRMSNorm,
     AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
 )
 _FP8_PATTERNS = {
-    False: (
+    (False, False): (
         AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
         AllReduceFusionPattern.kMoEFinalizeARResidualRMSNormFP8Quant,
     ),
-    True: (AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,),
+    (False, True): (AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,),
+    (True, False): (AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,),
+    (True, True): (AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant,),
 }
 
 
@@ -115,7 +119,17 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     serve ``kARResidualRMSNormFP8Quant`` and
     ``kMoEFinalizeARResidualRMSNormFP8Quant``, or additionally
     ``write_norm_output=True`` to serve ``kARResidualRMSNormOutFP8Quant``, which
-    also writes the BF16 norm. Inputs, communication buffers, residual outputs
+    also writes the BF16 norm.
+
+    Dynamic per-token FP8 output: additionally set ``dynamic_fp8=True`` to serve
+    ``kARResidualRMSNormDynamicFP8Quant`` (or, with ``write_norm_output=True``,
+    ``kARResidualRMSNormOutDynamicFP8Quant``). Each token gets
+    ``scale_out[t] = max(amax(|norm_t|) / 448, 2**-9 / 448)`` and
+    ``quant_out[t] = E4M3(norm_t * (1 / scale_out[t]))``, computed from the FP32 norm
+    as the TRT-LLM MNNVL kernel does; ``scale_out`` is a caller-provided
+    ``[m, 1]`` FP32 tensor.
+
+    Inputs, communication buffers, residual outputs
     and norm weights stay BF16. The output mode is fixed when the kernels
     compile, so a model that needs both BF16 and FP8 outputs uses one workspace
     per mode. Existing shape profiles are reused without retuning. FP8 output
@@ -151,6 +165,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         config: MNNVLCuteDSLConfig = DEFAULT_CONFIG,
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
+        dynamic_fp8: bool = False,
     ) -> None:
         # Every validation below raises before super().__init__() can set this,
         # and __del__ reads it. Mark the object destroyed up front so a rejected
@@ -187,6 +202,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             raise ValueError("FP8 output requires apply_rms_norm=True")
         if write_norm_output and output_dtype != torch.float8_e4m3fn:
             raise ValueError("write_norm_output is only used with FP8 output")
+        if dynamic_fp8 and output_dtype != torch.float8_e4m3fn:
+            raise ValueError("dynamic_fp8 requires output_dtype=float8_e4m3fn")
         if not torch.cuda.is_available():
             raise RuntimeError("MNNVL CuTe DSL kernels require CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
@@ -220,6 +237,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.write_residual_output = write_residual_output
         self.output_dtype = output_dtype
         self.write_norm_output = write_norm_output
+        self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
         # The compiled kernels still take gamma and norm_output arguments when
         # the norm is guarded out, but never read or write them. A small owned
@@ -266,6 +284,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 write_residual_output=write_residual_output,
                 output_dtype=output_dtype,
                 write_norm_output=write_norm_output,
+                dynamic_fp8=dynamic_fp8,
                 apply_rms_norm=apply_rms_norm,
                 group=group,
             )
@@ -325,11 +344,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def _uses_pdl(self, pattern: int, m: int) -> bool:
         if pattern in _FINALIZE_PATTERNS:
             target = self.profile.finalize_routes.select(m)
-        elif pattern in (
-            AllReduceFusionPattern.kARResidualRMSNorm,
-            AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-            AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
-        ):
+        elif pattern in _ALL_REDUCE_PATTERNS:
             target = self.profile.all_reduce_routes.select(m)
         else:
             raise NotImplementedError("Unsupported MNNVL CuTe DSL fusion pattern")
@@ -434,8 +449,13 @@ def _prepare_output_tensors(
     norm_out: torch.Tensor | None,
     quant_out: torch.Tensor | None,
     scale_factor: torch.Tensor | float | None,
+    scale_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Validate the compiled output mode and select primary/companion buffers."""
+    """Validate the compiled output mode and select primary/companion buffers.
+
+    The third value is the kernel's FP32 scale operand: the static scale read
+    by every token, or the per-token ``scale_out`` written by the dynamic mode.
+    """
     if workspace.output_dtype == torch.bfloat16:
         if pattern not in _BF16_PATTERNS:
             raise ValueError(
@@ -443,27 +463,44 @@ def _prepare_output_tensors(
             )
         if quant_out is not None or scale_factor is not None:
             raise ValueError("BF16 workspace does not accept quant_out or scale_factor")
+        if scale_out is not None:
+            raise ValueError("BF16 workspace does not accept scale_out")
         return norm_out, None, None
 
-    if pattern not in _FP8_PATTERNS[workspace.write_norm_output]:
+    if (
+        pattern
+        not in _FP8_PATTERNS[(workspace.dynamic_fp8, workspace.write_norm_output)]
+    ):
         if pattern in _BF16_PATTERNS:
             raise ValueError(
                 "Patterns 1 and 7 produce BF16 output and need a BF16 workspace; "
                 "use kARResidualRMSNormFP8Quant or "
                 "kMoEFinalizeARResidualRMSNormFP8Quant for FP8 output"
             )
-        required = not workspace.write_norm_output
-        raise ValueError(
-            f"This pattern requires a workspace with write_norm_output={required}"
-        )
+        for (dynamic, write_norm), patterns in _FP8_PATTERNS.items():
+            if pattern in patterns:
+                raise ValueError(
+                    "This pattern requires a workspace with "
+                    f"dynamic_fp8={dynamic} and write_norm_output={write_norm}"
+                )
+        raise NotImplementedError("Unsupported MNNVL CuTe DSL fusion pattern")
     if workspace.write_norm_output and norm_out is None:
         raise ValueError(
-            "kARResidualRMSNormOutFP8Quant returns quant_out, so the BF16 norm "
+            "The *Out* FP8 patterns return quant_out, so the BF16 norm "
             "is only observable through a caller-provided norm_out"
         )
     if not workspace.write_norm_output and norm_out is not None:
         raise ValueError("norm_out requires write_norm_output=True")
-    device_scale = _device_scale(scale_factor, device)
+    if workspace.dynamic_fp8:
+        if scale_factor is not None:
+            raise ValueError(
+                "Dynamic FP8 computes per-token scales; scale_factor must be None"
+            )
+        device_scale = _per_token_scale(scale_out, m, device)
+    else:
+        if scale_out is not None:
+            raise ValueError("scale_out is only written by dynamic FP8 patterns")
+        device_scale = _device_scale(scale_factor, device)
     if quant_out is not None:
         _check_tensor(
             quant_out,
@@ -478,6 +515,23 @@ def _prepare_output_tensors(
             (m, workspace.hidden_dim), dtype=torch.float8_e4m3fn, device=device
         )
     return quant_out, norm_out, device_scale
+
+
+def _per_token_scale(
+    scale_out: torch.Tensor | None, m: int, device: torch.device
+) -> torch.Tensor:
+    """Validate the dynamic FP8 ``scale_out`` (``[m, 1]`` FP32, contiguous)."""
+    if scale_out is None:
+        raise ValueError("scale_out is required for dynamic FP8 patterns")
+    if scale_out.dtype != torch.float32:
+        raise ValueError("scale_out must have dtype torch.float32")
+    if tuple(scale_out.shape) != (m, 1):
+        raise ValueError(f"scale_out must have shape [{m}, 1]")
+    if not scale_out.is_contiguous():
+        raise ValueError("scale_out must be contiguous")
+    if scale_out.device != device:
+        raise ValueError(f"scale_out must be on {device}")
+    return scale_out
 
 
 def _device_scale(
@@ -544,7 +598,6 @@ def _mnnvl_cutedsl_allreduce_fusion(
         name
         for name, value in (
             ("output", output),
-            ("scale_out", scale_out),
             ("layout_code", layout_code),
             ("use_oneshot", use_oneshot),
             ("block_quant_group_size", block_quant_group_size),
@@ -645,7 +698,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 alignment=16,
             )
         primary_out, companion_out, device_scale = _prepare_output_tensors(
-            workspace, pattern, m, device, norm_out, quant_out, scale_factor
+            workspace, pattern, m, device, norm_out, quant_out, scale_factor, scale_out
         )
         # With the norm compiled out the kernel writes only residual_output.
         # Allocate that slot here when the caller omitted it, and hand the same
@@ -744,7 +797,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 alignment=16,
             )
         primary_out, companion_out, device_scale = _prepare_output_tensors(
-            workspace, pattern, m, device, norm_out, quant_out, scale_factor
+            workspace, pattern, m, device, norm_out, quant_out, scale_factor, scale_out
         )
         # With the norm compiled out the kernel writes only residual_output.
         # Allocate that slot here when the caller omitted it, and hand the same

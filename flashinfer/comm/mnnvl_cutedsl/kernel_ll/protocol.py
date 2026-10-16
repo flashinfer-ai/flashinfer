@@ -22,10 +22,11 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64
+from cutlass import BFloat16, Float8E4M3FN, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import QUAD_BF16
+from ..dynamic_fp8_epilogue import fake_output_scale, output_scale_arg
 from ..runtime import (
     current_cu_stream,
     make_fake_dynamic_compact_tensor,
@@ -363,7 +364,7 @@ class _LLPath:
             )
             if norm_output_bf16 is not None
             else None,
-            to_cute(output_scale, 4) if output_scale is not None else None,
+            output_scale_arg(output_scale),
             to_cute(state.stage_state, 4),
             Int32(m),
             current_cu_stream(),
@@ -520,7 +521,7 @@ class TwoShotAllReduceRMSNormLLKernel(_LLPath):
             )
             if norm_output_bf16 is not None
             else None,
-            to_cute(output_scale, 4) if output_scale is not None else None,
+            output_scale_arg(output_scale),
             to_cute(self._state.generations, 4),
             Int32(m),
             current_cu_stream(),
@@ -551,6 +552,7 @@ class LLProtocol:
         group: dist.ProcessGroup,
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
+        dynamic_fp8: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
@@ -565,6 +567,7 @@ class LLProtocol:
         self.write_residual_output = write_residual_output
         self.output_dtype = output_dtype
         self.write_norm_output = write_norm_output
+        self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
 
         for tuning in all_reduce_tunings:
@@ -580,6 +583,8 @@ class LLProtocol:
                 )
             if tuning.two_shot and tuning.collective.rank_lanes != 1:
                 raise ValueError("two_shot requires rank_lanes == 1")
+            if tuning.two_shot and self.dynamic_fp8:
+                raise ValueError("two_shot does not support dynamic FP8 output")
         one_shot_tunings = tuple(
             item for item in all_reduce_tunings if not item.two_shot
         )
@@ -722,6 +727,7 @@ class LLProtocol:
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
             apply_rms_norm=self.apply_rms_norm,
+            dynamic_fp8=self.dynamic_fp8,
         )
         activation = self.capacity_m * self.hidden_size
         args = (
@@ -747,9 +753,7 @@ class LLProtocol:
             )
             if self.write_norm_output
             else None,
-            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
-            if self.output_dtype == torch.float8_e4m3fn
-            else None,
+            fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -805,9 +809,7 @@ class LLProtocol:
             )
             if self.write_norm_output
             else None,
-            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
-            if self.output_dtype == torch.float8_e4m3fn
-            else None,
+            fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(
                 Int32,
                 (self.capacity_m * collective.cluster_size,),

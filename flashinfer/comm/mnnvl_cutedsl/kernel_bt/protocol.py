@@ -23,10 +23,11 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64
+from cutlass import BFloat16, Float8E4M3FN, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import VEC_BF16
+from ..dynamic_fp8_epilogue import fake_output_scale, output_scale_arg
 from ..runtime import (
     current_cu_stream,
     make_fake_dynamic_compact_tensor,
@@ -276,7 +277,7 @@ class _BTPath:
             )
             if norm_output_bf16 is not None
             else None,
-            to_cute(output_scale, 4) if output_scale is not None else None,
+            output_scale_arg(output_scale),
             to_cute(gamma, 16),
             to_cute(state.stage_state, 4),
             Int32(m),
@@ -402,6 +403,7 @@ class BTProtocol:
         group: dist.ProcessGroup,
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
+        dynamic_fp8: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
@@ -417,6 +419,7 @@ class BTProtocol:
         self.write_residual_output = write_residual_output
         self.output_dtype = output_dtype
         self.write_norm_output = write_norm_output
+        self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
 
         tail_cache = {
@@ -560,6 +563,7 @@ class BTProtocol:
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
             apply_rms_norm=self.apply_rms_norm,
+            dynamic_fp8=self.dynamic_fp8,
         )
         prenorm_elements = LAMPORT_GENERATIONS * self.capacity_m * self.hidden_size
         rms_norm = cute.compile(
@@ -578,9 +582,7 @@ class BTProtocol:
             )
             if self.write_norm_output
             else None,
-            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
-            if self.output_dtype == torch.float8_e4m3fn
-            else None,
+            fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(BFloat16, (self.hidden_size,), assumed_align=16),
             make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),
