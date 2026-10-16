@@ -117,7 +117,7 @@ def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
 
 
 # rows x columns shapes spanning the four engine families of the varlen router
-_SHAPES = [(4, 4096), (8, 32768), (96, 65536), (640, 16384)]
+_SHAPES = [(4, 4096), (8, 32768), (96, 65536), (640, 16384), (32, 262144)]
 
 
 @requires_gvr2
@@ -136,12 +136,15 @@ def test_paged_matches_transformed_local(top_k, shape):
 
 @requires_gvr2
 def test_paged_engine_families_covered():
-    """The shape grid above reaches at least three of the four engine families."""
-    fams = set()
-    for rows, ncols in _SHAPES:
-        lc = _host._varlen_launcher(rows, ncols, 512, ncols, 1, 1, True, 6)
-        fams.add(lc[0])
-    assert len(fams) >= 3, fams
+    """The shape grid above reaches all four engine families at top_k = 512:
+    the register family (either flavour), the clustered-register family, the
+    cluster family ((32, 262144) lands there) and the streaming slab."""
+    fams = {
+        _host._varlen_launcher(rows, ncols, 512, ncols, 1, 1, True, 6)[0]
+        for rows, ncols in _SHAPES
+    }
+    assert fams & {"reg", "regimg"}, fams
+    assert {"reg_clus", "clus", "main"} <= fams, fams
 
 
 @requires_gvr2
