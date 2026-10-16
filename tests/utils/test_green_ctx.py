@@ -242,3 +242,14 @@ def test_empty_per_locality_domain(part_shape):
     t.copy_(ref)
     assert torch.equal(t, ref)
     del t
+
+
+def test_locality_domain_helpers_accept_unindexed_device():
+    _need_locality_domains(torch.device("cuda:0"))
+    torch.cuda.set_device(0)
+    assert green_ctx.get_locality_domain_count(torch.device("cuda")) >= 2
+    t = green_ctx.empty_per_locality_domain(
+        (4, 1024), torch.float32, torch.device("cuda")
+    )
+    t.fill_(1.0)
+    assert t.sum().item() == t.numel()

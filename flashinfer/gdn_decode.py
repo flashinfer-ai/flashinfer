@@ -127,7 +127,7 @@ def ugpu_state_pool(
     """
     from .green_ctx import empty_per_locality_domain
 
-    device = device or torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device) if device is not None else torch.device("cuda")
     parts = empty_per_locality_domain(
         (pool_size, num_v_heads, head_size // 2, head_size), torch.bfloat16, device
     )

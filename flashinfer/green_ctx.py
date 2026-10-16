@@ -303,6 +303,14 @@ def split_device_green_ctx_by_sm_count(
 # ---------------------------------------------------------------------------
 
 
+def _indexed(dev) -> torch.device:
+    """``dev`` as a ``torch.device`` with an explicit index (``"cuda"`` -> current device)."""
+    dev = torch.device(dev)
+    if dev.index is None:
+        dev = torch.device(dev.type, torch.cuda.current_device())
+    return dev
+
+
 def get_locality_domain_count(dev: torch.device) -> int:
     r"""Number of locality domains (uGPUs, one per die) of ``dev``.
 
@@ -314,6 +322,7 @@ def get_locality_domain_count(dev: torch.device) -> int:
     )
     if attr is None:
         return 1
+    dev = _indexed(dev)
     try:
         return max(
             1,
@@ -346,6 +355,7 @@ def split_device_green_ctx_by_locality_domain(
     Raises:
         RuntimeError: if the device has fewer than two locality domains.
     """
+    dev = _indexed(dev)
     num_domains = get_locality_domain_count(dev)
     if num_domains < 2:
         raise RuntimeError(
@@ -417,15 +427,13 @@ def empty_per_locality_domain(
     Returns:
         The tensor.
     """
+    dev = _indexed(dev)
     num_domains = get_locality_domain_count(dev)
     if num_domains < 2:
         raise RuntimeError(
             f"{dev} exposes {num_domains} locality domain(s); empty_per_locality_domain "
             "needs at least two"
         )
-    dev = torch.device(
-        "cuda", dev.index if dev.index is not None else torch.cuda.current_device()
-    )
     cu_dev = get_cudevice(dev)
     elem = torch.tensor([], dtype=dtype).element_size()
     part_elems = math.prod(part_shape)
