@@ -27,7 +27,7 @@ MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test_trtllm_allreduce_fusion_pdl.py"
 
 # Tests that require torchrun instead of mpirun
-TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py"
+TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py tests/comm/test_mnnvl_cutedsl_h7168.py tests/comm/test_mnnvl_cutedsl_static_fp8.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
 _run_pytest_group() {

@@ -52,10 +52,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 1024
 
 #include <math_constants.h>
-
 extern "C" {
 
-__global__ __launch_bounds__(1024) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_rows_4_64(int* __restrict__ topk_all, int* __restrict__ counts, int* __restrict__ tokens_per_expert, int* __restrict__ num_tokens, int* __restrict__ schedule_peer_rank, int* __restrict__ schedule_peer_token_idx, int local_tokens, int top_k, int capacity, int rank)
 {
     const int tid = threadIdx.x;
@@ -78,8 +77,8 @@ kernel_cake_mok_rows_4_64(int* __restrict__ topk_all, int* __restrict__ counts, 
     const int cta_rank = 0;
 
     // Kernel setup ops
-    int* peer_counts = reinterpret_cast<int*>(smem_raw + 0);
-    const int peer_counts_addr = smem + 0;
+    int* peer_counts = reinterpret_cast<int*>(smem_raw + SMEM_PEER_COUNTS_OFF);
+    const int peer_counts_addr = smem + SMEM_PEER_COUNTS_OFF;
     int* prefix = reinterpret_cast<int*>(smem_static_raw + 0);
     const int prefix_addr = (int)(unsigned long long)__cvta_generic_to_shared(prefix);
 

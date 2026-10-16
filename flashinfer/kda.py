@@ -48,29 +48,67 @@ def _cudnn_kda_prefill_available() -> bool:
     return _linear_attention_auto_available()
 
 
-def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
-    """Measured performance policy, separate from native numerical eligibility."""
-    # PR #6187 measured this B200 region. Keep H32, ragged batches and SM103
-    # native; high-head BF16 has little margin at 8K, so admit it only at 16K.
-    return (
+def _select_kda_prefill_backend(q, initial_state, cu_seqlens, *, allow_cudnn=True):
+    """Choose a backend for single-sequence BF16 prefill on SM100/SM103.
+
+    The policy covers head dimension 128, 1K-64K tokens, and up to 96 local
+    heads. Few heads means 1-16, moderate means 17-64, and wide means 65-96.
+    K means 1024 tokens. The caller checks backend eligibility.
+
+    With FP32 state, few heads use cute-dsl below 4K and cuDNN from 4K.
+    Moderate heads use persistent below 4K and cuDNN from 4K, except that
+    SM103 keeps persistent from 8K to below 16K. Wide heads use persistent.
+    Moderate and wide FP32 cases require a head count divisible by eight.
+
+    With BF16 state, few heads use small-bh until cuDNN takes over at 4K
+    for up to eight heads, or 8K for 9-16 heads. Moderate heads use small-bh.
+    Wide heads use cuDNN.
+
+    When cuDNN is disallowed, use the corresponding native backend:
+    cute-dsl or persistent for FP32, and small-bh or Cake for BF16.
+    Return None outside this region to retain the existing policy.
+    """
+    if not (
         q.is_cuda
         and q.dtype == torch.bfloat16
+        and len(q.shape) == 4
         and q.shape[0] == 1
         and q.shape[-1] == 128
-        and 1 <= q.shape[2] <= 16
-        and 8192 <= q.shape[1] <= 16384
+        and 1 <= q.shape[2] <= 96
+        and 1024 <= q.shape[1] <= 65536
+        and cu_seqlens is not None
         and cu_seqlens.numel() == 2
         and initial_state is not None
         and initial_state.dtype in (torch.bfloat16, torch.float32)
-        and (
-            initial_state.dtype == torch.float32
-            or q.shape[2] <= 8
-            or q.shape[1] >= 16384
-        )
         and not initial_state.requires_grad
         and (not initial_state.is_inference() or torch.is_inference_mode_enabled())
-        and get_compute_capability(q.device) == (10, 0)
-    )
+    ):
+        return None
+    cc = get_compute_capability(q.device)
+    if cc not in ((10, 0), (10, 3)):
+        return None
+    tokens, heads = q.shape[1:3]
+    if initial_state.dtype == torch.float32:
+        if heads <= 16:
+            return "cudnn" if allow_cudnn and tokens >= 4096 else "cute-dsl"
+        if heads % 8:
+            return None
+        # PTX beats cuDNN by >10% in the SM103 8K bucket. Keep PTX explicit:
+        # its bounded-state contract is narrower than the native auto contract.
+        ptx_region = cc == (10, 3) and 8192 <= tokens < 16384
+        if allow_cudnn and heads <= 64 and tokens >= 4096 and not ptx_region:
+            return "cudnn"
+        return "cute-dsl-persistent"
+    if heads <= 16:
+        threshold = 4096 if heads <= 8 else 8192
+        return "cudnn" if allow_cudnn and tokens >= threshold else "small-bh"
+    if heads <= 64:
+        return "small-bh"
+    return "cudnn" if allow_cudnn else "cake"
+
+
+def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
+    return _select_kda_prefill_backend(q, initial_state, cu_seqlens) == "cudnn"
 
 
 def _try_cudnn_kda_prefill(
@@ -324,14 +362,13 @@ def recurrent_kda(
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
-            It is optional for eager execution and required for CUDA graph
-            capture. Warm it eagerly with the exact tensors on the capture
+            It is optional for eager execution and required for native CUDA
+            graph capture. Auto-selected cuDNN leaves it unused and manages
+            its own scratch buffers. Native fallback uses the supplied workspace.
+            Warm the selected backend with the exact tensors on the capture
             stream before capture. Use one workspace per captured
-            ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use non-persistent schedules, including eligible BT16,
-            M64, small-BH, and direct routes. Persistent task planning is an
-            eager-only B200/GB200 route because its bins depend on host-visible
-            sequence lengths.
+            ``recurrent_kda`` invocation. Cake's persistent task planning is
+            eager-only because its bins depend on host-visible sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
             Checkpoint output or pool ``[C, H, 128, 128]`` for prefill. CuTe DSL
             accepts BF16 or FP32 and requires it to match ``initial_state`` when
@@ -683,17 +720,14 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
-    # Reuse the native eligibility checks below to select the numerical contract.
-    # A scheduler workspace, pool or checkpoint keeps its native
-    # provider. Strided Q/K remain supported by explicit cuDNN without packing.
-    cudnn_auto = (
+    # Backend eligibility below still validates math and tensor metadata.
+    auto_prefill = (
         backend == "auto"
         and is_plain_prefill
         and cu_seqlens is not None
         and q.is_contiguous()
         and isinstance(k, torch.Tensor)
         and k.is_contiguous()
-        and prefill_workspace is None
         and ssm_state_indices is None
         and initial_state_source is None
         and initial_state_indices is None
@@ -713,6 +747,9 @@ def recurrent_kda(
         and g.shape == q.shape
         and isinstance(beta, torch.Tensor)
         and beta.shape == q.shape[:-1]
+    )
+    cudnn_auto = (
+        auto_prefill
         and _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens)
         and _cudnn_kda_prefill_available()
     )
@@ -953,28 +990,74 @@ def recurrent_kda(
                 )
                 if result is not None:
                     return result
-            return _kda_prefill_cute._run_cute_dsl_kda_prefill(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                lower_bound=lower_bound,
-                cu_seqlens=cu_seqlens,
-                seq_order=seq_order,
-                output=output,
-                prefill_workspace=prefill_workspace,
-                state_indices=ssm_state_indices,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=checkpoint_cu_starts,
-                checkpoint_state_indices=checkpoint_state_indices,
-                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            # cuDNN was skipped or declined; select a native fallback.
+            native_backend = (
+                _select_kda_prefill_backend(
+                    q, initial_state, cu_seqlens, allow_cudnn=False
+                )
+                if auto_prefill
+                and seq_order is None
+                and correction_cache is None
+                and kg_cache is None
+                else None
             )
+            if (
+                native_backend == "cute-dsl-persistent"
+                and -5.0 <= float(lower_bound) < 0.0
+                and q.shape[2]
+                <= torch.cuda.get_device_properties(q.device).multi_processor_count
+                and all(
+                    tensor.data_ptr() % 16 == 0
+                    for tensor in (q, k, v, g, beta, A_log, dt_bias)
+                )
+                and initial_state.data_ptr() % 32 == 0
+                and (output is None or output.data_ptr() % 16 == 0)
+            ):
+                # One sequence with H <= SM count cannot need inter-CTA handoffs.
+                from .kda_prefill_persistent import _run_persistent_kda
+
+                return _run_persistent_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    use_gate_in_kernel=use_gate_in_kernel,
+                    beta_is_logit=beta_is_logit,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    output=output,
+                    prefill_workspace=prefill_workspace,
+                )
+            if native_backend != "cake":
+                return _kda_prefill_cute._run_cute_dsl_kda_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    seq_order=seq_order,
+                    output=output,
+                    prefill_workspace=prefill_workspace,
+                    state_indices=ssm_state_indices,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=checkpoint_cu_starts,
+                    checkpoint_state_indices=checkpoint_state_indices,
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                )
 
     use_flash_kda_prefill = (
         not (

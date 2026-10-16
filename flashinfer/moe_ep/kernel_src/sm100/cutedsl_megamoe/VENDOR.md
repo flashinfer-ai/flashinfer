@@ -6,6 +6,11 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
+The explicit Blackwell GenPhase prototype lives in the independent
+[`../next_cutedsl_megamoe`](../next_cutedsl_megamoe/VENDOR.md) package. This
+legacy package lazily re-exports its public API; it does not import Rubin or
+replace its own device snapshot.
+
 - **Vendored commit**: not recorded — the current `src/` drop was taken
   2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
   PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
@@ -28,6 +33,25 @@ replace, what to audit) lives in `SKILL.md`.
   absorbs it.
 
 ## Pending local diffs vs upstream
+
+- Sparse decode follow-up to FlashInfer PR #6447 (2026-10-14), based on
+  FlashInfer `0a0cecb50b1250f0b609a9c51f1b25816ba073b8`:
+  `src/src/token_comm.py` gives CTA0 ownership of small shared reset prefixes,
+  retaining both peer barriers and the late local reset, while preserving the
+  grid counter phase when omitting a join. EP1, prefixes above
+  16 KiB and NCU retain distributed reset. `src/moe_nvfp4_swapab/topk_reduce.py`
+  adds optional route masking to separate BF16 reduction; the NVFP4 and MXFP8
+  `megamoe_kernel*.py` launchers pass the indices and expert count for BF16
+  combine only. Payloads and scores of invalid routes are ignored.
+  Those launchers also allocate a local extent/ready counter for capacities
+  at most 1024. `token_comm.py` uses the last valid route extent to reduce the
+  dispatch CTA count while preserving physical metadata strides and full-grid
+  high-word completion counts. Larger capacities retain the original dispatch.
+  The histogram allocation also stages the four per-warp extent maxima;
+  padding it to at least four entries fits its existing 16-byte alignment.
+  Reapply
+  these four local device-file patches until upstream absorbs them; they do
+  not introduce a GenPhase path or change quantized/in-kernel reduction.
 
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
