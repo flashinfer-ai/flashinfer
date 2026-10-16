@@ -97,6 +97,7 @@ from .helpers import (
 )
 from .sage_scales import (
     SAGE_SCORE_BLOCK_COLS,
+    SageSoftmaxMode,
     load_sage_k_tile,
     load_sage_q_scale,
     load_sage_v_channels,
@@ -104,7 +105,9 @@ from .sage_scales import (
     sage_k_block_word,
     sage_k_section_address,
     sage_k_tile_bytes,
+    sage_k_tile_words,
     sage_sequence_words,
+    sage_softmax_mode,
     sage_v_section_address,
 )
 from cutlass.experimental import primitives as prims
@@ -787,6 +790,18 @@ class FmhaConfig:
     def sage_score_blocks(self) -> int:
         """Return the 16-column score blocks of one K tile, one ``sfK`` word each."""
         return self.qk_mma_tiler[1] // SAGE_SCORE_BLOCK_COLS
+
+    @property
+    def sage_softmax_mode(self) -> SageSoftmaxMode | None:
+        """Return how the softmax applies ``sfK`` (``sage_scales.SageSoftmaxMode``)."""
+        if not self.use_sage_attention:
+            return None
+        return sage_softmax_mode(self.sage_scale_layout)
+
+    @property
+    def sage_k_tile_words(self) -> int:
+        """Return the ``sfK`` words of one K tile."""
+        return sage_k_tile_words(self.sage_scale_layout)
 
     @property
     def pv_p_scale(self) -> float:
@@ -2576,6 +2591,7 @@ class TmemSPResource(MemoryResource):
     sage_k_block_scales: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    sage_k_multipliers: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed TMEM pointers/addresses (set by auxiliary work). Avoids
     # per-iteration inttoptr + address math.
@@ -2655,6 +2671,15 @@ class TmemSPResource(MemoryResource):
             dtype=cutlass.Vector,
             default_factory=lambda: _placeholder_unit_vector(cfg.sage_score_blocks),
             docs="Sage ``sfK`` of each 16-column block of the current K tile.",
+        )
+        self.sage_k_multipliers = TaskLocalVariable(
+            dtype=cutlass.Vector,
+            default_factory=lambda: _placeholder_unit_vector(
+                cfg.sage_k_tile_words
+                if cfg.sage_softmax_mode is SageSoftmaxMode.HOISTED
+                else 1
+            ),
+            docs="Sage ``sfQ * sfK`` of each word of the current K tile.",
         )
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
@@ -3294,6 +3319,24 @@ class TmemSPResource(MemoryResource):
         words = self._load_sage_k_tile_words(stage_info, sage_k_first_atom, section)
         return self._sage_block_scales(words)
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_k_multipliers)
+    @cute.jit
+    def load_sage_k_multipliers(
+        self,
+        stage_info: StageInfo,
+        *,
+        sage_q_scale: Float32,
+        sage_k_first_atom: Int64,
+        section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
+    ) -> cutlass.Vector:
+        """Load the current K tile's ``sfQ * sfK`` per word, before the S wait.
+
+        The in-place dequantization's counterpart of
+        ``load_sage_k_block_scales`` (``SageSoftmaxMode.HOISTED``).
+        """
+        words = self._load_sage_k_tile_words(stage_info, sage_k_first_atom, section)
+        return self._sage_k_multipliers(words, sage_q_scale)
+
     @cute.jit
     def _sage_k_tile_address(
         self, stage_info: StageInfo, sage_k_first_atom: Int64, section: FmhaStage
@@ -3323,6 +3366,24 @@ class TmemSPResource(MemoryResource):
                 layout, tile_address + Int64(sage_k_tile_bytes(layout))
             )
         return words
+
+    @cute.jit
+    def _sage_k_multipliers(
+        self, sage_k_words: cutlass.Array, sage_q_scale: Float32
+    ) -> cutlass.Vector:
+        """Return ``sfQ * sfK`` of each word of the tile, in packed pairs."""
+        multipliers: tuple[Any, ...] = ()
+        for word_base in cutlass.range_constexpr(0, self.cfg.sage_k_tile_words, 2):
+            multipliers += cute.arch.mul_packed_f32x2(
+                (
+                    Float32(sage_k_words[word_base]),
+                    Float32(sage_k_words[word_base + 1]),
+                ),
+                (sage_q_scale, sage_q_scale),
+                rnd="rn",
+                ftz=False,
+            )
+        return cutlass.Vector.from_elements(multipliers, Float32)
 
     @cute.jit
     def _sage_block_scales(self, sage_k_words: cutlass.Array) -> cutlass.Vector:
@@ -3404,8 +3465,9 @@ class TmemSPResource(MemoryResource):
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Reduce per-chunk maximums into row_max, stash s_data.
 
-        With Sage attention the maximum is of the dequantized scores
-        (``_sage_dequantized_tile_max``); the stashed scores stay raw.
+        With block-scaled Sage attention the maximum is of the dequantized
+        scores (``_sage_dequantized_tile_max``) and the stashed scores stay
+        raw; a Sage plan that dequantized its scores in place passes none.
         """
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
@@ -4093,7 +4155,7 @@ class TmemSPResource(MemoryResource):
         sage_k_block_scales: cutlass.Vector,
         section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Main K-loop stage of a Sage plan: the row max of the dequantized scores.
+        """Block-scaled Sage row max (``SageSoftmaxMode.BLOCK_SCALED``).
 
         ``sage_q_scale`` is the work tile's cached ``sfQ`` (``cache_sage_scales``)
         and ``sage_k_block_scales`` the tile's per-block ``sfK``
@@ -4168,6 +4230,87 @@ class TmemSPResource(MemoryResource):
         if row_max == -Float32.inf:
             row_max_safe = Float32(0.0)
         return old_row_max, row_max_safe
+
+    @cute.jit
+    def _dequantize_s_chunks(
+        self, s_data: SoftmaxChunks, sage_k_multipliers: cutlass.Vector
+    ) -> SoftmaxChunks:
+        """Multiply the loaded scores by ``sfQ * sfK`` in place (K blocks under 16 tokens).
+
+        ``sage_k_multipliers`` holds one multiplier per ``sfK`` word of the
+        tile (``_sage_k_multipliers``); an atom's words are unpadded at these
+        block sizes, so word ``w`` scales the columns ``w * tokens_per_word``
+        onward. The scores take the multipliers in packed pairs, after which
+        the max pass, the lazy correction and the P pass run the per-tensor
+        path on dequantized scores.
+        """
+        cfg = self.cfg
+        tmem_x = cfg.tmem_x_load_s
+        num_chunks = cfg.qk_mma_tiler[1] // tmem_x
+        tokens_per_word = cfg.sage_scale_layout.k_tokens.tokens_per_word
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            scaled: tuple[Any, ...] = ()
+            for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
+                col = chunk_idx * tmem_x + elem_idx
+                scaled += cute.arch.mul_packed_f32x2(
+                    (s_data[chunk_idx][elem_idx], s_data[chunk_idx][elem_idx + 1]),
+                    (
+                        Float32(sage_k_multipliers[col // tokens_per_word]),
+                        Float32(sage_k_multipliers[(col + 1) // tokens_per_word]),
+                    ),
+                    rnd="rn",
+                    ftz=False,
+                )
+            s_data[chunk_idx] = cutlass.Vector.from_elements(scaled, cfg.qk_acc_dtype)
+        return s_data
+
+    @consumer_work(returns=(old_row_max, row_max))
+    @cute.jit
+    def sage_dequantized_row_max(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max: SoftmaxScalar,
+        sage_k_multipliers: cutlass.Vector,
+        section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
+    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
+        """Row max of scores dequantized in place with hoisted multipliers (``HOISTED``).
+
+        ``sage_k_multipliers`` is the tile's ``sfQ * sfK`` per word
+        (``load_sage_k_multipliers``). ``section=Tail`` masks the zero-filled
+        lanes of the dense tail tile.
+        """
+        s_data = self._load_s_chunks(stage_info)
+        s_data = self._dequantize_s_chunks(s_data, sage_k_multipliers)
+        if cutlass.const_expr(section == FmhaStage.Tail):
+            s_data = self._mask_fixed_dense_k_tail(stage_info, s_data, section=section)
+        return self._reduce_row_max(s_data, row_max)
+
+    @consumer_work(returns=(old_row_max, row_max))
+    @cute.jit
+    def sage_streamed_row_max(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max: SoftmaxScalar,
+        sage_q_scale: Float32,
+        sage_k_first_atom: Int64,
+        section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
+    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
+        """Row max of scores dequantized in place with streamed ``sfK`` words (``STREAMED``).
+
+        The tile's words are read inside the max pass, ahead of the S load so
+        both latencies overlap. ``section=Tail`` masks the zero-filled lanes
+        of the dense tail tile.
+        """
+        words = self._load_sage_k_tile_words(stage_info, sage_k_first_atom, section)
+        s_data = self._load_s_chunks(stage_info)
+        s_data = self._dequantize_s_chunks(
+            s_data, self._sage_k_multipliers(words, sage_q_scale)
+        )
+        if cutlass.const_expr(section == FmhaStage.Tail):
+            s_data = self._mask_fixed_dense_k_tail(stage_info, s_data, section=section)
+        return self._reduce_row_max(s_data, row_max)
 
     @cute.jit
     def _mask_fixed_dense_k_tail(
