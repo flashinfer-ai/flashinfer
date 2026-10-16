@@ -10,8 +10,10 @@ SM100 (B200 / GB200) is the acceptance architecture of the native kernels and
 SM103 (B300 / GB300) is compiled from the same sources; SM107 (Rubin R200) is
 the acceptance architecture of the packed / strided-layout extension
 (flashinfer-ai/flashinfer#5675) and is compiled from the same sources with an
-nvcc that emits `compute_107a`.  The feature is JIT-only and does not
-participate in automatic backend selection, autotuning or trace-apply.
+nvcc that emits `compute_107a`.  The feature does not participate in
+automatic backend selection, autotuning or trace-apply.  Its libraries are
+loaded prebuilt from `aot/` when the package ships them and JIT-built by
+FlashInfer from `build.json` otherwise (see "Layout of this package").
 
 ## Public entry points (`flashinfer/dsa_sparse_attention.py`)
 
@@ -286,18 +288,35 @@ pass stages serves the single pass only.
 ## Layout of this package
 
 * `cake_jit.py` -- the `MODULES` registry (one record for every architecture,
-  filled by the generated-program export), stage names and the JIT specs
-  (compiled per architecture with its exact flag set; `sm_107a` only with an
-  nvcc that lists `compute_107`).
+  filled by the generated-program export: per stage the `library` stem of its
+  `build.json` entries, the FFI entry and the launch geometry), stage names
+  and the loader glue: `library_name(stage, arch)` is the `build.json` entry
+  `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch)` loads
+  through `cake_build`; `specs_for_arch(arch)` lists the JIT specs of an
+  architecture for `flashinfer.jit.build_jit_specs`.
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  package (byte-identical copies) and this package's build manifest (schema
+  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
+  (eight stages x three architectures) with its translation units, digests,
+  nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
+  path.  `cake_build.load_library(name)` loads the prebuilt library when
+  `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
+  must agree with the library's exported `build_cuda_version()`) and otherwise
+  JIT-builds the entry through FlashInfer (`gen_jit_spec`, sources
+  digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
+  `aot/` is never tracked (`.gitignore`).
 * `cake_launch.py` -- generated positional launchers and grid functions, one
   per stage, over the kernels' own argument names.
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
+* `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
+  (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
+  shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
   eight pairs, one per stage (the main stage and its key-range-pass form each
   with a natural-layout variant), shared by `sm_100a`, `sm_103a` and `sm_107a` and
   compiled once per architecture (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+  identity-checked by the digests in `build.json`).
 
 ## Status
 

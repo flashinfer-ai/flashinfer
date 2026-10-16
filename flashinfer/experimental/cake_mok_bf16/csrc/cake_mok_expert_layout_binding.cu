@@ -14,7 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "tvm_ffi_utils.h"
+#include "cake_ffi_checks.h"
 
 #include <cstdint>
 
@@ -72,3 +72,4 @@ void Run(TensorView arg_counts, TensorView arg_schedule_rank, TensorView arg_lay
 }  // namespace cake_host_shim_7de573b5d89381d0
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_7de573b5d89381d0::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

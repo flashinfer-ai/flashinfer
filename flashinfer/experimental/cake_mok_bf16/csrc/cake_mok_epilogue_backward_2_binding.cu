@@ -14,14 +14,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "tvm_ffi_utils.h"
+#include "cake_ffi_checks.h"
 
 #include <cstdint>
 
 extern "C" __global__ void kernel_cake_mok_epilogue_backward_2(__nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ routed, float* __restrict__ scores, unsigned int* __restrict__ output, int tokens, int hidden, int ctas);
 
 
-namespace cake_host_shim_ead020536c39daee {
+namespace cake_host_shim_744cf59b9a11fcad {
 
 using tvm::ffi::TensorView;
 
@@ -82,6 +82,7 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_ead020536c39daee
+}  // namespace cake_host_shim_744cf59b9a11fcad
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_ead020536c39daee::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_744cf59b9a11fcad::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
