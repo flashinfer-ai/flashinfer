@@ -893,3 +893,47 @@ def test_decode_scratch_is_not_shared_across_streams():
     finally:
         sd._WS.clear()
         sd._WS.update(saved)
+
+
+@sm90_only
+def test_proxy_score_fp32_acc_survives_large_logits():
+    """The fp16 score accumulator saturates on unscaled fp8 dot products.
+
+    max_score holds raw Q K^T logits. Two fp8 e4m3 operands give a single
+    product of up to 448*448 = 200704, and a 128-term row runs far past the
+    65504 fp16 ceiling with nothing clamping the partial sums, so the row
+    becomes ``inf`` and outranks every real block. Ranking is what the output
+    is for, so the failure is silent: top-k picks among infinities.
+    """
+    torch.manual_seed(0)
+    total_q, hq, hkv, pages = 128, 4, 1, 32
+    mag = 64.0
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") * mag).clamp(-448, 448)
+    q = q.to(torch.float8_e4m3fn)
+    k = (torch.randn(pages, hkv, BLK_KV, HEAD_DIM, device="cuda") * mag).clamp(
+        -448, 448
+    )
+    k = k.to(torch.float8_e4m3fn)
+    page_table = torch.arange(pages, dtype=torch.int32, device="cuda").view(1, pages)
+    cu_q = torch.tensor([0, total_q], dtype=torch.int32, device="cuda")
+    seqused_k = torch.full((1,), pages * BLK_KV, dtype=torch.int32, device="cuda")
+
+    def score(use_fp32_acc):
+        return msa_proxy_score(
+            q,
+            k,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=total_q,
+            max_k_tiles=pages,
+            use_fp32_acc=use_fp32_acc,
+        ).float()
+
+    narrow = score(False)
+    wide = score(True)
+    # the fp16 accumulator loses most of the grid; fp32 keeps all of it. Only
+    # causally dead blocks may be -inf, and those are identical either way.
+    assert torch.isfinite(wide).sum() > 4 * torch.isfinite(narrow).sum()
+    dead = torch.isneginf(wide)
+    assert bool((torch.isfinite(wide) | dead).all())

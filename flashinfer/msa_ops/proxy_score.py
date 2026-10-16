@@ -285,6 +285,7 @@ def msa_proxy_score(
     output: Optional[torch.Tensor] = None,
     reduce_heads: bool = False,
     q_offset=None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
     """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
     logits.
@@ -296,6 +297,22 @@ def msa_proxy_score(
     entirely above the causal limit, yield ``-inf``.
 
     There is no softmax and no V: this is MSA pipeline stage 1.
+
+    ``use_fp32_acc`` (on by default) keeps the SM90 prefill score accumulator
+    in fp32 rather than fp16. The logits are unscaled dot products of two fp8 e4m3 operands, so a
+    single product reaches 448*448 = 200704 and a 128-term row runs far past
+    the 65504 fp16 ceiling; nothing clamps the partial sums, so a row that
+    overflows becomes ``inf`` and outranks every real block. Measured on SM90:
+    inputs of magnitude 64 leave 32 of 4096 scores finite and drop top-k
+    overlap against an fp32 reference to 0.26, which is what choosing blocks
+    at random looks like. Turning it off is faster but unsafe above
+    magnitude ~22. It costs about 1.3x (8.5 vs 6.7 us at 512 query
+    tokens, 14.9 vs 11.4 us at 4096), which is one extra scheduling wave: the
+    fp32 accumulator needs 159 registers/thread, so the launch drops to one
+    block per SM. Folding a power-of-two scale into whatever produces ``q``
+    keeps the logits in range for free -- ranking is invariant under a positive
+    scale -- but that has to happen upstream, since this path receives ``q``
+    already quantised.
 
     Single-token decode uses a dim-parallel scalar schedule that streams
     index-K straight to registers. Short multi-token decode (MTP) uses a
@@ -472,6 +489,7 @@ def msa_proxy_score(
             batch_size=batch_size,
             kv_fp8=kv_fp8,
             q_offset=sm90_q_offset,
+            use_fp32_acc=use_fp32_acc,
         )
         if not reduce_heads:
             return per_head

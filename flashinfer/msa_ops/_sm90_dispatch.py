@@ -66,6 +66,7 @@ def proxy_score_sm90(
     batch_size: int,
     kv_fp8: bool,
     q_offset: Optional[torch.Tensor] = None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
     """MSA proxy score on Hopper. Writes ``per_head`` (Hq, max_k_tiles, total_q)."""
     total_q = q.shape[0]
@@ -123,7 +124,17 @@ def proxy_score_sm90(
         if q_offset is not None
         else _prefix_lens(cu, sk)
     )
-    _prefill(q, k, cu, pt, sk, pfx, per_head, max_seqlen_q=max_seqlen_q)
+    _prefill(
+        q,
+        k,
+        cu,
+        pt,
+        sk,
+        pfx,
+        per_head,
+        max_seqlen_q=max_seqlen_q,
+        use_fp32_acc=use_fp32_acc,
+    )
     return per_head
 
 
