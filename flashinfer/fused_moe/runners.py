@@ -7219,22 +7219,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         per_token_scale = None
         if is_fp4:
+            # MXFP4xMXFP8 keeps the compact TRT-LLM UE8M0 row here;
+            # PrimsTsMxfp4Mxfp8MoERunner pads it to the GEMM's row stride.
             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
-            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
-                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
-                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
-                # Padding happens on every pack_inputs, including the hot
-                # forward path: one allocation, fill, and copy per call, so
-                # the public activation pack can stay the shared TRT-LLM layout.
-                from flashinfer.prims_ts.moe.runner import (
-                    _pad_mxfp8_linear_scale_for_prims,
-                )
-
-                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
-                    hidden_states_scale,
-                    num_tokens=num_tokens,
-                    hidden_size=hidden_size,
-                ).view(torch.float8_e4m3fn)
             if is_nvfp4:
                 if self._per_token and act.per_token_scale is None:
                     raise RuntimeError(

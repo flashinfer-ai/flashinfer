@@ -1221,6 +1221,21 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             **kwargs,
         )
 
+    def _gemm_hidden_states_scale(
+        self, moe_inputs: MoeRunnerInputs, num_tokens: int
+    ) -> torch.Tensor:
+        """MXFP8 activation scales in the layout the routed FC1 GEMM reads.
+
+        Callers pass the compact TRT-LLM row of ``hidden_size // 32`` UE8M0
+        bytes per token; the GEMM reads ``round_up(hidden_size // 32, 16)``
+        bytes per token. Already padded input is returned unchanged.
+        """
+        return _pad_mxfp8_linear_scale_for_prims(
+            moe_inputs.hidden_states_scale,
+            num_tokens=num_tokens,
+            hidden_size=self.hidden_size,
+        )
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -1360,7 +1375,9 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
                 common_io_kwargs = dict(
                     hidden_states=hidden_states,
-                    hidden_states_scale=moe_inputs.hidden_states_scale,
+                    hidden_states_scale=self._gemm_hidden_states_scale(
+                        moe_inputs, num_tokens
+                    ),
                     gemm1_weights=kwargs["gemm1_weights"],
                     gemm1_weights_scale=kwargs["gemm1_weights_scale"],
                     gemm1_bias=kwargs.get("gemm1_bias"),
@@ -1522,7 +1539,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         common_io_kwargs = dict(
             hidden_states=hidden_states,
-            hidden_states_scale=moe_inputs.hidden_states_scale,
+            hidden_states_scale=self._gemm_hidden_states_scale(moe_inputs, num_tokens),
             gemm1_weights=kwargs["gemm1_weights"],
             gemm1_weights_scale=kwargs["gemm1_weights_scale"],
             gemm1_bias=kwargs.get("gemm1_bias"),
