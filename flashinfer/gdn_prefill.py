@@ -1054,6 +1054,109 @@ def _is_cudnn_gdn_auto_eligible(
     return True
 
 
+def _select_gdn_prefill_backend(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    initial_state,
+    output_state,
+    output,
+    cu_seqlens,
+    *,
+    use_gate_in_kernel,
+    state_indices,
+    use_cp,
+    cp_chunk_len,
+    checkpoint_every_n_tokens,
+) -> Literal["cudnn", "flashinfer"]:
+    """``backend="auto"``: ``"cudnn"`` or the native ``"flashinfer"`` route.
+
+    Explicit CP and checkpoints pin the native route; everything else cuDNN
+    serves, state pools included, goes to it inside the measured region
+    (``_prefer_cudnn_gdn_prefill``, then the admission check, then the
+    runtime probe).
+    """
+    if (
+        use_cp == "auto"
+        and cp_chunk_len is None
+        and checkpoint_every_n_tokens == 0
+        and _prefer_cudnn_gdn_prefill(q, v, cu_seqlens, use_gate_in_kernel)
+        and _is_cudnn_gdn_auto_eligible(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            output_state,
+            output,
+            cu_seqlens,
+            use_gate_in_kernel=use_gate_in_kernel,
+            state_indices=state_indices,
+        )
+        and _cudnn_gdn_prefill_available()
+    ):
+        return "cudnn"
+    return "flashinfer"
+
+
+def _try_cudnn_gdn_prefill(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    *,
+    initial_state,
+    output_final_state,
+    cu_seqlens,
+    use_qk_l2norm_in_kernel,
+    output,
+    output_state,
+    state_indices,
+    gate_domain,
+    use_gate_in_kernel,
+    A_log,
+    dt_bias,
+    beta_is_logit,
+):
+    """Substitute an eligible native prefill; None after a marked build decline."""
+    from .cudnn import cudnn_chunk_gated_delta_rule
+    from .cudnn.linear_attention import _try_cudnn_auto
+
+    # Cache the value FE sees, including scalar tensors accepted by the
+    # existing adapter, rather than treating a scalar as operand layout.
+    scale = float(scale) if scale is not None else None
+    return _try_cudnn_auto(
+        cudnn_chunk_gated_delta_rule,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        output=output,
+        output_state=output_state,
+        state_indices=state_indices,
+        gate_domain=gate_domain,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        beta_is_logit=beta_is_logit,
+    )
+
+
 @flashinfer_api(trace=gdn_prefill_trace)
 def chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -1413,15 +1516,8 @@ def chunk_gated_delta_rule(
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
 
-    # Explicit CP and checkpoints pin the native route; everything else cuDNN
-    # serves, state pools included, goes to it inside the measured region.
-    cudnn_auto = (
-        backend == "auto"
-        and use_cp == "auto"
-        and _cp_chunk_len is None
-        and checkpoint_every_n_tokens == 0
-        and _prefer_cudnn_gdn_prefill(q, v, cu_seqlens, use_gate_in_kernel)
-        and _is_cudnn_gdn_auto_eligible(
+    if backend == "auto":
+        backend = _select_gdn_prefill_backend(
             q,
             k,
             v,
@@ -1435,12 +1531,36 @@ def chunk_gated_delta_rule(
             cu_seqlens,
             use_gate_in_kernel=use_gate_in_kernel,
             state_indices=state_indices,
+            use_cp=use_cp,
+            cp_chunk_len=_cp_chunk_len,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
-        and _cudnn_gdn_prefill_available()
-    )
-    if backend == "cudnn" or cudnn_auto:
+        if backend == "cudnn":
+            result = _try_cudnn_gdn_prefill(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                output=output,
+                output_state=output_state,
+                state_indices=state_indices,
+                gate_domain=gate_domain,
+                use_gate_in_kernel=use_gate_in_kernel,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                beta_is_logit=beta_is_logit,
+            )
+            if result is not None:
+                return result
+            backend = "flashinfer"
+    if backend == "cudnn":
         from .cudnn import cudnn_chunk_gated_delta_rule
-        from .cudnn.linear_attention import _try_cudnn_auto
 
         unsupported = [
             name
@@ -1455,7 +1575,13 @@ def chunk_gated_delta_rule(
                 'chunk_gated_delta_rule(backend="cudnn") does not support '
                 + ", ".join(unsupported)
             )
-        options = dict(
+        return cudnn_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
@@ -1469,17 +1595,6 @@ def chunk_gated_delta_rule(
             dt_bias=dt_bias,
             beta_is_logit=beta_is_logit,
         )
-        if cudnn_auto:
-            # Cache the value FE sees, including scalar tensors accepted by the
-            # existing adapter, rather than treating a scalar as operand layout.
-            auto_scale = float(scale) if scale is not None else None
-            result = _try_cudnn_auto(
-                cudnn_chunk_gated_delta_rule, q, k, v, g, beta, auto_scale, **options
-            )
-            if result is not None:
-                return result
-        else:
-            return cudnn_chunk_gated_delta_rule(q, k, v, g, beta, scale, **options)
 
     if gate_domain != "linear" or use_gate_in_kernel or beta_is_logit:
         from .gdn_kernels.gates import materialize_gates

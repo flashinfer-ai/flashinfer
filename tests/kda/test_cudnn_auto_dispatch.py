@@ -576,7 +576,7 @@ def test_native_fallback_selection(monkeypatch, cc, heads, tokens, state_dtype, 
     )
     offsets = SimpleNamespace(numel=lambda: 2)
     monkeypatch.setattr(kda, "get_compute_capability", lambda device: cc)
-    assert kda._select_kda_prefill_backend(q, state, offsets) == native
+    assert kda._select_native_kda_prefill_backend(q, state, offsets) == native
 
 
 @pytest.mark.parametrize("option", ["ragged", "unpacked", "sm90", "fp16", "no_state"])
@@ -599,7 +599,7 @@ def test_policy_keeps_unmeasured_contracts(monkeypatch, option):
         "get_compute_capability",
         lambda device: (9, 0) if option == "sm90" else (10, 0),
     )
-    assert kda._select_kda_prefill_backend(q, state, offsets) is None
+    assert kda._select_native_kda_prefill_backend(q, state, offsets) is None
 
 
 @pytest.mark.parametrize("backend", ["auto", "cute-dsl"])
@@ -612,7 +612,7 @@ def test_persistent_auto_preserves_native_eligibility(monkeypatch, backend, excl
     monkeypatch.setattr(kda, "_prefer_cudnn_kda_prefill", lambda *args: False)
     monkeypatch.setattr(
         kda,
-        "_select_kda_prefill_backend",
+        "_select_native_kda_prefill_backend",
         lambda *args, **kwargs: "cute-dsl-persistent",
     )
     persistent = importlib.import_module("flashinfer.kda_prefill_persistent")
@@ -696,7 +696,7 @@ def test_measured_routes_match_native_and_replay(
             values["cu_seqlens"],
             None,
         )
-        else kda._select_kda_prefill_backend(
+        else kda._select_native_kda_prefill_backend(
             values["q"], values["initial_state"], values["cu_seqlens"]
         )
     )
