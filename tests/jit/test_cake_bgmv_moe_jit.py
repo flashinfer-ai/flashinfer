@@ -348,9 +348,7 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         1 if (arch == "sm107a" and (dtype, rank) == ("bfloat16", 32)) else 0
     )
     assert metadata.body.endswith("_sm107a.cu") == bool(merge_in_expand)
-    assert (
-        f"#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND {merge_in_expand}" in binding
-    )
+    assert f"#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND {merge_in_expand}" in binding
     assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
