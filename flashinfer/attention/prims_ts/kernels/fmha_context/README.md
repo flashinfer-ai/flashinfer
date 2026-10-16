@@ -70,6 +70,7 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 | Sliding window | Positive causal left window; `window_left=-1` disables it |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state |
+| Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` Q/K/V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
 
 The established equal-dimension paths have accuracy and performance signoff
 on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
@@ -393,6 +394,10 @@ runtime tensors alive until every graph using that plan is destroyed.
 - Attention sinks and custom masks are not exposed. Q and K must share one
   dtype; the only mixed combination is `torch.bfloat16` Q/K with
   `torch.float8_e4m3fn` V.
+- Sage attention covers only the contiguous dense fixed-length
+  `head_dim=128` path with E4M3 Q/K/V and a 16-bit output; causal and
+  variable-window masks, packed or paged storage, left windows and INT8 Q/K
+  are rejected at plan time.
 - Re-plan either wrapper after changing a static capacity, head or dtype
   geometry, mask, window, or default scale; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
