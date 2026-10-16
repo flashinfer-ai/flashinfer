@@ -100,26 +100,33 @@ def vc_mean_operand_shape(head_dim: int) -> tuple[int, int]:
 class VCAttentionConfig:
     """Compile-time VC-Attention recipe of one plan.
 
-    ``k_block_size`` tokens share one restored value mean. The kernel supports
-    its 128-token K/V tile only. ``q_block_size`` Q tokens share one E4M3 Q
-    scale under VC-Attention-QK8 (plan ``q_dtype`` E4M3); the K scale covers one
-    128-token tile. Both are powers of two. A non-zero ``repair_tiles`` selects
-    V repair instead of the tile means: that many 128-row K/V tiles of
-    quantization residuals from ``vc_quantize_repair`` follow the whole tiles
-    of the sequence and only add to the output.
+    With demean on, the default, the kernel restores the tile means. Each
+    128-token K/V tile stores E4M3 residuals around its bf16 mean and the
+    kernel adds the mean back. With demean off the means are zero and the
+    kernel skips that step. This is the plan for the steps after the V-Smooth
+    window. The demean flag changes per denoising step while a plan is
+    compiled once, so a caller holds one plan of each kind.
+
+    A positive repair tile count selects V repair and needs demean off. The
+    preprocessor appends that many 128-row tiles of the largest quantization
+    residuals after the sequence and the kernel adds them to the output. Each
+    repair tile costs one extra K/V tile of attention work. Budgets of two to
+    five percent of the sequence were used so far and the count cannot exceed
+    the number of sequence tiles.
+
+    Under VC-Attention-QK8, the plan with E4M3 Q and K, every ``q_block_size``
+    Q tokens share one E4M3 Q scale and every 128-token tile one K scale.
     """
 
-    k_block_size: int = VC_K_BLOCK_SIZE
+    demean: bool = True
     q_block_size: int = VC_K_BLOCK_SIZE
     repair_tiles: int = 0
 
     def __post_init__(self) -> None:
-        if self.k_block_size != VC_K_BLOCK_SIZE:
-            raise ValueError(
-                f"k_block_size must be {VC_K_BLOCK_SIZE}, got {self.k_block_size}"
-            )
         if self.repair_tiles < 0:
             raise ValueError(f"repair_tiles must be >= 0, got {self.repair_tiles}")
+        if self.repair_tiles and self.demean:
+            raise ValueError("repair_tiles requires demean=False")
         if self.q_block_size not in _VC_Q_BLOCK_SIZES:
             raise ValueError(
                 f"q_block_size must be a power of two in [1, 256], got {self.q_block_size}"
@@ -153,17 +160,15 @@ class VCAttentionParams:
     ``tile_means`` is the packed bf16 mean operand ``[B, Hkv,
     ceil(num_kv_tiles / 16), 16, 256]`` from ``pack_vc_tile_means`` (means already divided by
     ``v_scale``). The scale must be positive and finite. The kernel does not
-    check it. ``demean`` says whether the run restores the means. It is
-    ``False`` after the V-Smooth window, when they are zero and the kernel
-    skips the mean steps, so it changes per run. VC-Attention-QK8 plans also
-    take ``q_scale`` ``[Hq, flat_scale_numel(B, Sq, q_block_size)]`` and
-    ``k_scale`` ``[Hkv, flat_scale_numel(B, Skv, 128)]``, fp32 in the flat scale
-    layout of ``flashinfer.attention.prims_ts.sage``; QK16 plans take neither.
+    check it. A plan with demean off takes no ``tile_means``. VC-Attention-QK8
+    plans also take ``q_scale`` ``[Hq, flat_scale_numel(B, Sq, q_block_size)]``
+    and ``k_scale`` ``[Hkv, flat_scale_numel(B, Skv, 128)]``, fp32 in the flat
+    scale layout of ``flashinfer.attention.prims_ts.sage``. QK16 plans take
+    neither.
     """
 
     v_scale: torch.Tensor
-    tile_means: torch.Tensor
-    demean: bool = True
+    tile_means: torch.Tensor | None
     q_scale: torch.Tensor | None = None
     k_scale: torch.Tensor | None = None
 
@@ -182,14 +187,14 @@ def vc_scale_shapes(
     """Return the shape of every ``VCAttentionParams`` tensor a plan consumes, by
     field name. ``qk_fp8`` adds the Q/K scales of VC-Attention-QK8, which need
     ``seq_len_q`` and ``num_qo_heads``."""
-    num_kv_tiles = _blocks(seq_len_kv, config.k_block_size)
+    num_kv_tiles = _blocks(seq_len_kv, VC_K_BLOCK_SIZE)
     shapes: dict[str, tuple[int, ...]] = {
         "v_scale": (batch_size, num_kv_heads, head_dim),
     }
     if config.repair_tiles:
-        # The repair tiles follow the whole tiles; no means are restored.
+        # The repair tiles follow the whole tiles.
         seq_len_kv = vc_repair_kv_len(seq_len_kv, config.repair_tiles)
-    else:
+    if config.demean:
         shapes["tile_means"] = (
             batch_size,
             num_kv_heads,
@@ -205,7 +210,7 @@ def vc_scale_shapes(
         )
         shapes["k_scale"] = (
             num_kv_heads,
-            flat_scale_numel(batch_size, seq_len_kv, config.k_block_size),
+            flat_scale_numel(batch_size, seq_len_kv, VC_K_BLOCK_SIZE),
         )
     return shapes
 
@@ -230,6 +235,8 @@ def validate_vc_params(
     """
     if not isinstance(params, VCAttentionParams):
         raise TypeError("vc must be a VCAttentionParams instance")
+    if "tile_means" not in expected_shapes and params.tile_means is not None:
+        raise ValueError("tile_means must be None on a plan with demean off")
     for name, expected_shape in expected_shapes.items():
         tensor = getattr(params, name)
         if not isinstance(tensor, torch.Tensor):
@@ -322,7 +329,6 @@ class VCAttentionOperands:
         return VCAttentionParams(
             v_scale=self.v_scale,
             tile_means=self.mu,
-            demean=self.demean,
             q_scale=self.q_scale,
             k_scale=self.k_scale,
         )
@@ -555,7 +561,7 @@ def vc_quantize(
         v=v8,
         v_scale=v_scale,
         mean=mean,
-        mu=mu,
+        mu=mu if demean else None,
         perm=perm,
         demean=demean,
     )
@@ -613,7 +619,7 @@ def vc_quantize_fp8(
         v=v8,
         v_scale=v_scale,
         mean=mean,
-        mu=mu,
+        mu=mu if demean else None,
         perm=perm,
         demean=demean,
         q=q8,

@@ -277,6 +277,9 @@ def _random_inputs(batch_size, seq_len, num_heads, *, seed=0):
     return q, k, v
 
 
+_MEAN_CONFIG = VCAttentionConfig()
+
+
 def _plan(
     wrapper,
     *,
@@ -285,8 +288,7 @@ def _plan(
     num_heads,
     sm_scale=None,
     qk_dtype=torch.bfloat16,
-    q_block_size=128,
-    repair_tiles=0,
+    vc_config=_MEAN_CONFIG,
     **overrides,
 ):
     arguments = dict(
@@ -302,9 +304,7 @@ def _plan(
         v_dtype=_FP8,
         out_dtype=torch.bfloat16,
         sm_scale=sm_scale,
-        vc_config=VCAttentionConfig(
-            q_block_size=q_block_size, repair_tiles=repair_tiles
-        ),
+        vc_config=vc_config,
     )
     wrapper.plan(**{**arguments, **overrides})
 
@@ -337,7 +337,9 @@ def _run_case(case: _VCCase):
             out_dtype=torch.bfloat16,
             vc=ops.params,
             vc_config=VCAttentionConfig(
-                q_block_size=case.q_block_size, repair_tiles=ops.repair_tiles
+                demean=ops.demean,
+                repair_tiles=ops.repair_tiles,
+                q_block_size=ops.q_block_size,
             ),
         )
     else:
@@ -349,8 +351,11 @@ def _run_case(case: _VCCase):
             num_heads=case.num_heads,
             sm_scale=sm_scale,
             qk_dtype=case.qk_dtype,
-            q_block_size=case.q_block_size,
-            repair_tiles=ops.repair_tiles,
+            vc_config=VCAttentionConfig(
+                demean=ops.demean,
+                repair_tiles=ops.repair_tiles,
+                q_block_size=ops.q_block_size,
+            ),
         )
         out = wrapper.run(q_run, ops.k, ops.v, vc=ops.params)
     reference = vca.vc_reference(q, ops, sm_scale=sm_scale)
@@ -383,9 +388,9 @@ def test_vc_attention_matches_dequantized_reference(case: _VCCase):
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.arch_blackwell
 def test_vc_mean_step():
-    """A constant tile mean shifts every output by exactly that constant. With zero
-    tile means, demean=False (mean UMMA skipped) equals demean=True bit for bit and
-    differs from a run whose means are non-zero."""
+    """A constant tile mean shifts every output by exactly that constant. A plan
+    with demean off equals the means plan fed zero tile means and differs from a
+    run whose means are non-zero."""
     q, k, v = _random_inputs(1, 1024, 2)
     ops = vca.vc_quantize(k, v)
     wrapper = BatchPrefillTSWrapper()
@@ -402,15 +407,26 @@ def test_vc_mean_step():
         atol=1.6e-2,
     )
     plain = vca.vc_quantize(k, v, perm=ops.perm, demean=False)
-    assert plain.params.demean is False
-    out_off = wrapper.run(q, plain.k, plain.v, vc=plain.params)
-    out_on = wrapper.run(q, plain.k, plain.v, vc=replace(plain.params, demean=True))
-    assert torch.equal(out_on, out_off)
-    out = wrapper.run(q, ops.k, ops.v, vc=ops.params)
-    assert not torch.equal(
-        out, wrapper.run(q, ops.k, ops.v, vc=replace(ops.params, demean=False))
+    assert plain.params.tile_means is None
+    wrapper_off = BatchPrefillTSWrapper()
+    _plan(
+        wrapper_off,
+        batch_size=1,
+        seq_len=1024,
+        num_heads=2,
+        vc_config=VCAttentionConfig(
+            demean=plain.demean,
+            repair_tiles=plain.repair_tiles,
+            q_block_size=plain.q_block_size,
+        ),
     )
-    assert _relative_error(out.float(), vca.vc_reference(q, ops)) < 6e-2
+    out_off = wrapper_off.run(q, plain.k, plain.v, vc=plain.params)
+    zero_mu = vca.pack_vc_tile_means(torch.zeros_like(ops.mean), plain.v_scale)
+    out_on = wrapper.run(
+        q, plain.k, plain.v, vc=replace(plain.params, tile_means=zero_mu)
+    )
+    torch.testing.assert_close(out_on, out_off, rtol=0, atol=0)
+    assert not torch.equal(wrapper.run(q, ops.k, ops.v, vc=ops.params), outs["zero"])
 
 
 @_REQUIRES_CONTEXT_GPU
@@ -436,16 +452,10 @@ def test_vc_mean_step():
         ),
         pytest.param({"num_qo_heads": 2}, ValueError, "equal Q and K/V head", id="gqa"),
         pytest.param(
-            {"vc_config": {"k_block_size": 128}},
+            {"vc_config": {"repair_tiles": 0}},
             TypeError,
             "VCAttentionConfig instance",
             id="dict-config",
-        ),
-        pytest.param(
-            {"vc_config": lambda: VCAttentionConfig(k_block_size=64)},
-            ValueError,
-            "k_block_size must be",
-            id="k-block-64",
         ),
         pytest.param(
             {"vc_config": lambda: VCAttentionConfig(q_block_size=96)},
@@ -486,17 +496,11 @@ def test_vc_kernel_config_rejects_invalid_profiles():
         is_clc_dynamic=False,
         two_cta_umma=True,
     )
-    FmhaTs(**arguments, vc_k_block_size=128, vc_num_q_heads=1)
-    qk8 = {**arguments, "in_qk_dtype": Float8E4M3FN}
-    FmhaTs(**qk8, vc_k_block_size=128, vc_num_q_heads=1, vc_q_block_log2=6)
-    with pytest.raises(ValueError, match="vc_q_block_log2 must be"):
-        FmhaTs(**qk8, vc_k_block_size=128, vc_num_q_heads=1, vc_q_block_log2=9)
-    with pytest.raises(ValueError, match="vc_k_block_size must equal"):
-        FmhaTs(**arguments, vc_k_block_size=64, vc_num_q_heads=1)
-    with pytest.raises(ValueError, match="requires vc_num_q_heads"):
-        FmhaTs(**arguments, vc_k_block_size=128)
-    with pytest.raises(ValueError, match="requires vc_k_block_size"):
-        FmhaTs(**arguments, vc_num_q_heads=1)
+    FmhaTs(**arguments, vc_attention="means")
+    FmhaTs(**arguments, vc_attention="outliers")
+    FmhaTs(**{**arguments, "in_qk_dtype": Float8E4M3FN}, vc_attention="means")
+    with pytest.raises(ValueError, match="unknown vc_attention mode"):
+        FmhaTs(**arguments, vc_attention="repair")
 
 
 @_REQUIRES_CONTEXT_GPU
@@ -559,7 +563,11 @@ def test_one_shot_vc_config_requires_the_operands():
             repair.k,
             repair.v,
             vc=repair.params,
-            vc_config=VCAttentionConfig(repair_tiles=repair.repair_tiles),
+            vc_config=VCAttentionConfig(
+                demean=repair.demean,
+                repair_tiles=repair.repair_tiles,
+                q_block_size=repair.q_block_size,
+            ),
         )
 
 
@@ -652,7 +660,20 @@ def test_vc_preprocessor_step_schedule():
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
-    out_late = wrapper.run(q, late.k, late.v, vc=late.params)
+    wrapper_late = BatchPrefillTSWrapper()
+    _plan(
+        wrapper_late,
+        batch_size=1,
+        seq_len=1024,
+        num_heads=2,
+        sm_scale=sm_scale,
+        vc_config=VCAttentionConfig(
+            demean=late.demean,
+            repair_tiles=late.repair_tiles,
+            q_block_size=late.q_block_size,
+        ),
+    )
+    out_late = wrapper_late.run(q, late.k, late.v, vc=late.params)
     assert _relative_error(out_late.float(), exact) < 1e-1
     # The same schedule drives the QK8 preparation, which also returns E4M3 Q.
     qk8 = VCAttentionPreprocessor().prepare(k, v, q=q, denoise_step=(0, 40))
