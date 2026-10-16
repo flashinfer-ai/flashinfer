@@ -449,7 +449,8 @@ def create_allreduce_fusion_workspace(
         Whether the finalize patterns add ``shared_expert_output``. Default
         ``True``.
     add_residual : Optional[bool]
-        Whether ``residual_in`` is added to the reduced sum. Default ``True``.
+        Whether ``residual_in`` is added to the reduced sum. ``residual_in``
+        must then be identical on every rank. Default ``True``.
     write_residual_output : Optional[bool]
         Whether the pre-norm sum is written to ``residual_out``. Default
         ``True``.
@@ -675,20 +676,30 @@ def is_mnnvl_cutedsl_supported(
     max_token_num: int,
     top_k: int = 10,
     apply_rms_norm: bool = True,
+    write_residual_output: bool = True,
+    output_dtype: torch.dtype = torch.bfloat16,
+    dynamic_fp8: bool = False,
+    write_norm_output: bool = False,
     config: Optional["MNNVLCuteDSLConfig"] = None,
     device: Optional[Union[torch.device, int, str]] = None,
 ) -> bool:
-    r"""Whether this rank can build a ``backend="mnnvl-cutedsl"`` workspace.
+    r"""Whether this rank passes the ``backend="mnnvl-cutedsl"`` workspace checks.
 
     Runs the checks of the MNNVL CuTe DSL workspace that neither allocate nor
     communicate, and returns ``False`` instead of raising: the CuTe DSL is
     importable, ``tp_size`` is 2, 4, 8 or 16, ``dtype`` is ``torch.bfloat16``,
-    ``max_token_num`` is positive, ``config`` has a static profile for
+    ``max_token_num`` is positive, the output settings are a valid
+    combination, ``config`` has a static profile for
     ``(tp_size, hidden_dim, top_k, dtype)`` on the device's compute capability
-    whose routes cover ``max_token_num`` and suit ``apply_rms_norm``, and the
-    device is a Blackwell-class GPU with PyTorch symmetric memory and NVLink
-    multicast. The workspace constructor runs the same checks, so the two
-    cannot disagree.
+    whose routes cover ``max_token_num`` and suit ``apply_rms_norm`` and
+    ``dynamic_fp8``, and the device is a Blackwell-class GPU with PyTorch
+    symmetric memory and NVLink multicast. The workspace constructor runs the
+    same checks with the same arguments.
+
+    ``True`` does not guarantee that construction succeeds: building the
+    workspace also allocates symmetric and multicast memory, which can fail
+    for lack of device memory or multicast resources, and compiles the
+    kernels.
 
     The answer describes this rank only. Workspace construction is
     collective, so combine the answers of all ranks (for example a ``MIN``
@@ -709,6 +720,14 @@ def is_mnnvl_cutedsl_supported(
         Routed experts per token; part of the profile key. Default ``10``.
     apply_rms_norm : bool
         Whether the workspace would compile the RMSNorm in. Default ``True``.
+    write_residual_output : bool
+        As the workspace argument. Default ``True``.
+    output_dtype : torch.dtype
+        As the workspace argument. Default ``torch.bfloat16``.
+    dynamic_fp8 : bool
+        As the workspace argument. Default ``False``.
+    write_norm_output : bool
+        As the workspace argument. Default ``False``.
     config : Optional[MNNVLCuteDSLConfig]
         Routing configuration. Defaults to ``DEFAULT_CONFIG`` with the norm
         and ``NO_NORM_CONFIG`` without it, as the workspace does.
@@ -731,6 +750,10 @@ def is_mnnvl_cutedsl_supported(
         max_token_num=max_token_num,
         top_k=top_k,
         apply_rms_norm=apply_rms_norm,
+        write_residual_output=write_residual_output,
+        output_dtype=output_dtype,
+        dynamic_fp8=dynamic_fp8,
+        write_norm_output=write_norm_output,
         config=config,
         device=device,
     )

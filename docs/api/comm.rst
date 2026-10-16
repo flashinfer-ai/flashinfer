@@ -159,8 +159,8 @@ MNNVL CuTe DSL backend
 
 ``create_allreduce_fusion_workspace(backend="mnnvl-cutedsl", ...)`` builds an
 :class:`~flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace`:
-CuTe DSL kernels for single-node NVLink multicast systems, compiled for one
-static problem. ``backend="auto"`` never selects it. The keyword-only
+CuTe DSL kernels for the ranks of one NVLink multicast domain, compiled for
+one static problem. ``backend="auto"`` never selects it. The keyword-only
 arguments of the factory (``top_k``, ``rms_eps``, ``weight_bias``,
 ``routed_scaling_factor``, ``include_shared_expert``, ``add_residual``,
 ``write_residual_output``, ``apply_rms_norm``, ``output_dtype``,
@@ -168,7 +168,14 @@ arguments of the factory (``top_k``, ``rms_eps``, ``weight_bias``,
 settings: every :func:`allreduce_fusion` call on the workspace must use the
 same epsilon, weight bias, residual, norm and output mode, and at most
 ``max_token_num`` tokens of ``hidden_dim`` BF16 elements. Other backends
-reject these arguments.
+reject these arguments. ``residual_in`` must be identical on every rank, as
+under tensor parallelism: most kernels add the residual once, on the rank that
+owns a token or a hidden-dimension shard.
+
+The kernels spin on data written by the other ranks and some of them occupy
+every SM. Do not run two of these collectives (for example from two
+workspaces) concurrently on different streams: a rank whose SMs are all held
+by one collective cannot start the other, which the peers may be waiting on.
 
 The workspace picks a static profile for ``(world_size, hidden_dim, top_k,
 dtype)`` and the device's compute capability, then routes each token count to

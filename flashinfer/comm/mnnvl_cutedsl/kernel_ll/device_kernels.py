@@ -586,9 +586,10 @@ class _SharedOnlyPublishDeviceKernel:
         self.release_before_store = release_before_store
         self.enable_pdl = enable_pdl
         # Store to every rank's mailbox through its unicast mapping instead of
-        # one multicast store; the local copy is an ordinary local store. Each
-        # rank walks its peers starting from rank + 1 so that the ranks' first
-        # stores land on different GPUs. The first multicast_fragments
+        # one multicast store; the local copy goes through this rank's own
+        # entry of peer_mailboxes, which maps local memory, so it does not
+        # cross NVLink. Each rank walks its peers starting from rank + 1 so
+        # that the ranks' first stores land on different GPUs. The first multicast_fragments
         # fragments of a token keep the multicast store, which splits the
         # publish between the switch's multicast replication and the unicast
         # paths.
@@ -1147,10 +1148,13 @@ class _LamportTwoShotDeviceKernel:
     the owner's reduce-scatter mailbox through the owner's unicast mapping; the
     owner keeps its own share in registers. The owner spins on the Lamport
     sentinels of the ``tp - 1`` peer copies, reduces in FP32 in rank order,
-    adds its own residual (TP replicates the residual, so every rank's copy is
-    the same), and multicast-stores the BF16 pre-norm fragment to every rank's
+    adds its own residual shard, and multicast-stores the BF16 pre-norm fragment to every rank's
     all-gather mailbox. Every rank then spins on its all-gather copy and
     finishes the optional RMSNorm the way the one-shot collective does.
+
+    Only the owner's residual enters a shard, so the residual must be the same
+    on every rank, as tensor parallelism replicates it; the one-shot
+    collective adds each rank's own residual instead.
 
     Per GPU this receives ``(tp - 1) / tp`` of an activation for the
     reduce-scatter and one activation of all-gather traffic, instead of the

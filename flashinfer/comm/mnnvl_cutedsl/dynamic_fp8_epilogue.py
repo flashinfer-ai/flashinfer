@@ -14,15 +14,22 @@
 
 """Dynamic per-token E4M3 epilogue shared by the LL, BT, and HT protocols.
 
-The semantics follow the TRT-LLM MNNVL ``kDynamicFP8`` RMSNorm epilogue:
+The recipe is the one of the TRT-LLM MNNVL ``kDynamicFP8`` RMSNorm epilogue,
+and the results match it up to FP32 rounding:
 
 * the FP32 norm (before any BF16 rounding) is the quantization input;
 * ``scale = max(amax(|norm|) / 448, 2**-9 / 448)`` per token, so all-zero and
   tiny rows keep a positive scale;
-* ``q = E4M3(clamp(norm * (1 / scale), -448, 448))`` with round-to-nearest
-  (TRT-LLM divides; see :func:`store_dynamic_fp8_output`);
+* ``q = E4M3(clamp(norm * (1 / scale), -448, 448))`` with round-to-nearest;
 * ``scale`` is written as FP32 to ``scale_out[token]``; ``q * scale``
   dequantizes.
+
+The FP32 operations differ in order: the norm here is
+``(x * inv_rms) * gamma``, TRT-LLM's ``(gamma * x) * inv_rms``, and TRT-LLM
+divides by ``scale`` where this multiplies by a reciprocal computed once per
+token (see :func:`store_dynamic_fp8_output`). A NaN stays NaN here
+(``cvt.satfinite`` keeps it), whereas TRT-LLM's ``fminf``/``fmaxf`` clamp turns
+it into ``-448``.
 
 Each protocol owns the reduction of the per-thread maxima across the threads,
 CTAs, or cluster that hold one token row; this module supplies the per-vector
@@ -133,7 +140,8 @@ def store_dynamic_fp8_output(
     scaled = values * inverse_scale
     packed_fp8 = cute.make_rmem_tensor(cute.make_layout((2,)), Uint32)
     for word in cutlass.range_constexpr(2):
-        # satfinite saturates to +-448, which equals TRT-LLM's explicit clamp.
+        # satfinite saturates finite and infinite values to +-448 like
+        # TRT-LLM's explicit clamp, but keeps NaN.
         low = cvt_f32x2_to_e4m3x2(scaled[word * 4], scaled[word * 4 + 1])
         high = cvt_f32x2_to_e4m3x2(scaled[word * 4 + 2], scaled[word * 4 + 3])
         packed_fp8[word] = low | (high << Uint32(16))

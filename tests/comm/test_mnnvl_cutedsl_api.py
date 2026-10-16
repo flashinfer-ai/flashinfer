@@ -34,9 +34,38 @@ from flashinfer.comm.mnnvl_cutedsl import (
     DEFAULT_CONFIG,
     HT_ONLY_CONFIG,
     NO_NORM_CONFIG,
+    KernelTarget,
+    MNNVLCuteDSLConfig,
+    MRangeDispatch,
+    ProtocolKind,
+    StaticProfile,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
+    LLFinalizeTuning,
 )
 
 _SHAPE = dict(world_size=4, rank=0, max_token_num=64, hidden_dim=8192)
+
+
+def _ll_route(preset) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,), targets=(KernelTarget(ProtocolKind.LL, preset),)
+    )
+
+
+_TWO_SHOT_CONFIG = MNNVLCuteDSLConfig(
+    profiles=(
+        StaticProfile(
+            tp_size=4,
+            hidden_size=8192,
+            top_k=10,
+            dtype=torch.bfloat16,
+            finalize_routes=_ll_route(LLFinalizeTuning()),
+            all_reduce_routes=_ll_route(LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT),
+        ),
+    ),
+)
 
 
 @pytest.mark.parametrize("backend", ("auto", "trtllm", "mnnvl"))
@@ -172,6 +201,17 @@ def test_probe_accepts_profiled_architectures(fake_device, capability, apply_rms
         {"apply_rms_norm": False, "config": DEFAULT_CONFIG},
         # HT cannot compile the norm out.
         {"apply_rms_norm": False, "config": HT_ONLY_CONFIG, "tp_size": 8},
+        {"apply_rms_norm": False, "write_residual_output": False},
+        {"apply_rms_norm": False, "output_dtype": torch.float8_e4m3fn},
+        {"dynamic_fp8": True},
+        {"write_norm_output": True},
+        # The LL two-shot all-reduce has no dynamic FP8 epilogue.
+        {
+            "output_dtype": torch.float8_e4m3fn,
+            "dynamic_fp8": True,
+            "config": _TWO_SHOT_CONFIG,
+            "max_token_num": 64,
+        },
     ),
     ids=(
         "tp",
@@ -182,10 +222,29 @@ def test_probe_accepts_profiled_architectures(fake_device, capability, apply_rms
         "cpu",
         "config-norm-mismatch",
         "ht-no-norm",
+        "no-output",
+        "no-norm-fp8",
+        "dynamic-bf16",
+        "norm-output-bf16",
+        "two-shot-dynamic-fp8",
     ),
 )
 def test_probe_rejects_unsupported_requests(fake_device, overrides):
     assert not _probe(**overrides)
+
+
+@pytest.mark.parametrize("capability", ((10, 3), (10, 7)))
+@pytest.mark.parametrize("dynamic_fp8", (False, True))
+@pytest.mark.parametrize("write_norm_output", (False, True))
+def test_probe_accepts_fp8_outputs(
+    fake_device, capability, dynamic_fp8, write_norm_output
+):
+    fake_device["capability"] = capability
+    assert _probe(
+        output_dtype=torch.float8_e4m3fn,
+        dynamic_fp8=dynamic_fp8,
+        write_norm_output=write_norm_output,
+    )
 
 
 @pytest.mark.parametrize(

@@ -243,6 +243,10 @@ def _probe_support(
     max_token_num: int,
     top_k: int,
     apply_rms_norm: bool,
+    write_residual_output: bool,
+    output_dtype: torch.dtype,
+    dynamic_fp8: bool,
+    write_norm_output: bool,
     config: MNNVLCuteDSLConfig | None,
     device: torch.device | int | str | None,
 ) -> bool:
@@ -254,10 +258,10 @@ def _probe_support(
             max_token_num=max_token_num,
             dtype=dtype,
             apply_rms_norm=apply_rms_norm,
-            write_residual_output=True,
-            output_dtype=torch.bfloat16,
-            write_norm_output=False,
-            dynamic_fp8=False,
+            write_residual_output=write_residual_output,
+            output_dtype=output_dtype,
+            write_norm_output=write_norm_output,
+            dynamic_fp8=dynamic_fp8,
             config=resolved_config,
         )
         if not torch.cuda.is_available():
@@ -283,7 +287,7 @@ def _probe_support(
             max_token_num=max_token_num,
             compute_capability=torch.cuda.get_device_capability(resolved_device),
             apply_rms_norm=apply_rms_norm,
-            dynamic_fp8=False,
+            dynamic_fp8=dynamic_fp8,
         )
     except (ValueError, RuntimeError, NotImplementedError):
         return False
@@ -299,8 +303,21 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     placeholders that are not read. Every setting below is fixed at
     construction: ``max_token_num``, ``hidden_dim``, ``top_k``, ``rms_eps``,
     ``weight_bias``, the residual/norm/output flags and the output dtype, so a
-    call must match them. :func:`flashinfer.comm.is_mnnvl_cutedsl_supported` checks, without
-    raising, whether this rank can build a workspace for a shape.
+    call must match them. :func:`flashinfer.comm.is_mnnvl_cutedsl_supported` runs
+    the same argument and device checks without raising; it cannot see
+    allocation or multicast failures during construction.
+
+    ``residual_in`` must be the same on every rank, as tensor parallelism
+    replicates it: the BT and HT protocols and the LL two-shot all-reduce add
+    the residual on the rank that owns a token or shard, while the LL one-shot
+    adds each rank's own copy, so differing residuals give protocol-dependent
+    results.
+
+    The kernels spin on data from the other ranks. Two such collectives that
+    fill the GPU, for example two workspaces' BT all-reduces at large token
+    counts, must not run concurrently on different streams: a rank whose SMs
+    are all held by one of them cannot start the other, which its peers may
+    be waiting on.
 
     ``config`` holds static profiles keyed by TP size, hidden size, ``top_k``,
     dtype and optionally the GPU compute capability; the profile for the
@@ -318,9 +335,12 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     ``kARResidualRMSNormDynamicFP8Quant`` (or, with ``write_norm_output=True``,
     ``kARResidualRMSNormOutDynamicFP8Quant``). Each token gets
     ``scale_out[t] = max(amax(|norm_t|) / 448, 2**-9 / 448)`` and
-    ``quant_out[t] = E4M3(norm_t * (1 / scale_out[t]))``, computed from the FP32 norm
-    as the TRT-LLM MNNVL kernel does; ``scale_out`` is a caller-provided
-    ``[m, 1]`` FP32 tensor.
+    ``quant_out[t] = E4M3(norm_t * (1 / scale_out[t]))``, computed from the FP32
+    norm with the TRT-LLM MNNVL recipe; ``scale_out`` is a caller-provided
+    ``[m, 1]`` FP32 tensor. The values match TRT-LLM up to FP32 rounding: the
+    norm is ``(x * inv_rms) * gamma`` rather than ``(gamma * x) * inv_rms``,
+    the quantizer multiplies by a per-token reciprocal rather than dividing,
+    and a NaN stays NaN where TRT-LLM's clamp makes it ``-448``.
 
     Inputs, communication buffers, residual outputs
     and norm weights stay BF16. The output mode is fixed when the kernels
