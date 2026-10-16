@@ -81,6 +81,7 @@ def build_and_load_attention_kernel(
     *,
     extra: tuple = (),
 ) -> Any:
+    """Build or load under the caller's selected CUDA device context."""
     from ...jit.cute_dsl_core import (
         build_and_load_cute_dsl_kernel,
         cute_dsl_cache_disabled,

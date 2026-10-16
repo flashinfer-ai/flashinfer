@@ -466,12 +466,13 @@ def compile_block_sparse_inspection(
 ) -> Callable[..., None]:
     """Compile one geometry specialization while keeping ``indices[nnz]`` dynamic.
 
-    Tensor ranks, dtypes, compact strides, and all attention geometry are part
-    of the specialization. Only the flat ``block_indices`` extent is symbolic;
-    tensor contents may of course vary between calls to the cached function.
+    The artifact key uses rounded Q/KV block counts: exact lengths and block
+    sizes that produce the same BSR tensor shape and index bounds share code.
+    ``block_indices[nnz]`` and tensor contents remain runtime inputs.
     """
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
+    num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
     logical_nnz = cute.sym_int()
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = _InspectBlockSparseBsr(
@@ -505,10 +506,8 @@ def compile_block_sparse_inspection(
             (
                 batch_size,
                 num_pattern_heads,
-                seq_len_q,
-                seq_len_kv,
-                q_block_size,
-                kv_block_size,
+                num_q_block_rows,
+                num_kv_blocks,
             ),
             _COMPILE_OPTIONS,
             compile_kernel,
@@ -529,7 +528,12 @@ def compile_paged_block_sparse_metadata_inspection(
     kv_block_size: int,
     page_size: int,
 ) -> Callable[..., None]:
-    """Compile one paged metadata entry that launches request then live-BSR."""
+    """Compile request and live-BSR validation keyed by its static geometry.
+
+    Exact Q lengths sharing a Q-block count reuse one artifact. Page/block
+    divisors and inclusive length limits stay in the key because they become
+    constants in the generated validation code; table widths remain symbolic.
+    """
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
     logical_nnz = cute.sym_int()
@@ -586,10 +590,9 @@ def compile_paged_block_sparse_metadata_inspection(
             (
                 batch_size,
                 num_pattern_heads,
-                seq_len_q,
+                num_q_block_rows,
                 minimum_seq_len_kv,
                 max_seq_len_kv,
-                q_block_size,
                 kv_block_size,
                 page_size,
             ),

@@ -24,11 +24,22 @@ processes, including context, paged decode, MLA, sparse/Sage preparation, and
 sparse metadata inspection. Specializations include compile options and static
 kernel configuration; device indices are excluded so ranks on equivalent GPUs
 can share artifacts. Physical GPU capability, compile target, installed DSL
-stack, and attention source changes invalidate the cache. Device-specific occupancy probes run once per
-device and cluster size in each process.
+stack, and attention source changes invalidate the cache. Device-specific
+occupancy probes run once per device and cluster size in each process.
 
-Set `FLASHINFER_WORKSPACE_BASE` to select the cache location, or
-`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile without disk persistence.
+By default, object files and `meta.json` are stored under
+`~/.cache/flashinfer/<flashinfer-version>/<cuda-archs>/cached_ops/prims_ts_<family>_<compile-arch>_cute_dsl/`.
+For example, FlashInfer 0.7.2 on a GB300 uses
+`~/.cache/flashinfer/0.7.2/103a/cached_ops/prims_ts_decode_sm103a_cute_dsl/`
+for decode. Inspect the resolved `cached_ops` directory for the current process:
+
+```bash
+python -c 'from flashinfer.jit import env; print(env.FLASHINFER_JIT_DIR)'
+```
+
+Setting `FLASHINFER_WORKSPACE_BASE=/path` places this cache under
+`/path/.cache/flashinfer/`. Set `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile
+without disk persistence.
 Warm up plans before CUDA graph capture as usual.
 
 ## Guides and public APIs

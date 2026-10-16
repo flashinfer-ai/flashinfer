@@ -836,7 +836,6 @@ def _resolve_mla_decode_launch_spec(
             reduction_mode = resolve_runtime_cluster_reduction_mode(
                 decision.config,
                 reduction_mode=None,
-                hardware_info=None,
             )
             kernel = ThroughputLatencyMlaDecodeTs(
                 batch_size=batch_size,

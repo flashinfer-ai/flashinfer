@@ -192,6 +192,85 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="PrimTS attention requires Blackwell",
 )
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_sparse_inspection_reuses_block_geometry(paged, tmp_path, monkeypatch):
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import block_sparse_inspect
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl
+
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    builds = []
+    original_build = JitSpecCuteDsl.build
+
+    def record_build(self):
+        builds.append(self.name)
+        return original_build(self)
+
+    monkeypatch.setattr(JitSpecCuteDsl, "build", record_build)
+    compile_inspection = (
+        block_sparse_inspect.compile_paged_block_sparse_metadata_inspection
+        if paged
+        else block_sparse_inspect.compile_block_sparse_inspection
+    )
+    compile_inspection.cache_clear()
+    geometry = dict(
+        device_index=torch.cuda.current_device(),
+        batch_size=1,
+        num_pattern_heads=1,
+        seq_len_q=65,
+        q_block_size=64,
+        kv_block_size=64,
+    )
+    if paged:
+        geometry.update(minimum_seq_len_kv=1, max_seq_len_kv=129, page_size=32)
+    else:
+        geometry.update(seq_len_kv=129)
+    indptr = torch.tensor([[[0, 1, 2]]], dtype=torch.int32, device="cuda")
+    indices = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    pages = torch.arange(5, dtype=torch.int32, device="cuda").view(1, 5)
+    lengths = torch.tensor([129], dtype=torch.int32, device="cuda")
+    summary = torch.zeros(2, dtype=torch.int64, device="cuda")
+
+    def inspect(compiled):
+        summary.zero_()
+        if paged:
+            compiled(indptr, indices, pages, pages.stride(0), lengths, 5, summary)
+        else:
+            compiled(indptr, indices, None, summary)
+        return tuple(summary.tolist())
+
+    try:
+        first = compile_inspection(**geometry)
+        assert inspect(first) == (0, 1)
+        assert len(builds) == 1
+        equivalent = dict(geometry, seq_len_q=128)
+        if not paged:
+            # Both lengths cover three KV blocks; the block-size divisor is
+            # unused when inspection validates a static KV-block bound.
+            equivalent.update(seq_len_kv=257, kv_block_size=128)
+        assert inspect(compile_inspection(**equivalent)) == (0, 1)
+        assert len(builds) == 1
+
+        if paged:
+            lengths.fill_(130)
+            assert inspect(first)[0] == 4  # Beyond the compiled length limit.
+            changed_bound = dict(geometry, max_seq_len_kv=130)
+            expected_error = 0
+        else:
+            changed_bound = dict(geometry, seq_len_kv=128)
+            expected_error = 2  # Block 2 is outside a two-block KV domain.
+        assert inspect(compile_inspection(**changed_bound))[0] == expected_error
+        assert len(builds) == 2
+    finally:
+        compile_inspection.cache_clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="PrimTS attention requires Blackwell",
+)
 def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
     pytest.importorskip("cutlass", minversion="4.7.0")
     # Reuse the public numerical oracles for each distinct compiler entry.
