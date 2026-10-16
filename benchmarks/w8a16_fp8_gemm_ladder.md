@@ -1054,11 +1054,20 @@ Probe tiles (ours / cuBLAS, median of 3):
   partials round trip plus a 3-6 us reduce.  PDL (`griddepcontrol`, the GEMM releases the reduce
   at its last tile) saves 1-2%, not 10%.  CUTLASS stream-K is 1.5-2.9x.
 - The cost model's split choice matched the best pinned split in every case.
+- **In-kernel reduce (fix-up), not landed.** Each split CTA stores its fp32 partial, then
+  takes a ticket on a per-tile counter; either the last CTA sums the tile or all `splits`
+  co-resident CTAs each sum 1/splits.  Correct (60 / 60 tests), but 1.25-1.29 vs 1.12-1.13
+  for the two-launch path on both cells.  ncu, 64x256 split on tp1: 19.97 us GEMM becomes
+  21.57 after waiting for the partial's TMA stores to land, 23.04 after the cross-CTA
+  arrival, 27.39 with the reduce.  One warpgroup per SM reduces with far less memory
+  parallelism than the separate 512-block kernel, and none of it overlaps.  Patch:
+  `h4-parked/step_h8_splitk_inkernel_fixup_probe.patch`.
 
 Measured reason for missing 1.02: at this size the conversion rules out cuBLAS's narrow tiles.
 The wide tiles that amortize the conversion leave too few tiles for one wave without a split, and
-the split's reduce costs more than the mainloop wins.  Closing it needs either an in-kernel
-reduction (cluster / DSMEM, or the last CTA of a tile summing the partials) or the
+the split's reduce costs more than the mainloop wins.  The last-CTA in-kernel reduction loses too
+(above).  What is left is a cluster / DSMEM reduction, where the splits of a tile form one
+cluster and sum through distributed shared memory without a global round trip, or the
 smem-sourced conversion redesign.  Patch: `h4-parked/step_h8_64x64_128x64_ca2_64splitk_pdl_probe.patch`.
 Tables: `hopper-mail/kv1024_step1_ncu.md`, `kv1024_step2_tiles.md`.
 
