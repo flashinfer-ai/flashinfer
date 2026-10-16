@@ -4434,8 +4434,13 @@ def _empty_forward(
     need_dw: bool,
     row_index: Optional[torch.Tensor] = None,
     row_valid: Optional[torch.Tensor] = None,
+    fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
 ) -> ForwardResult:
-    """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty)."""
+    """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty).
+
+    ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
+    report records the form the caller asked for, as a launched call's would."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -4449,6 +4454,8 @@ def _empty_forward(
         grad_weight_dtype=problem.grad_weight_dtype,
         return_logp=True,
         valid_rows=None if row_index is None else 0,
+        fuse_dw_cast=fuse_dw_cast,
+        dx_finalize=dx_finalize,
     )
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
@@ -4579,7 +4586,14 @@ def forward_loss(
     tuning = _resolve_gemm_tuning(gemm_tuning)
     T = problem.num_rows
     if T == 0:
-        return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw)
+        return _empty_forward(
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+        )
     fused_dx = bool(
         need_dx and _resolve_dx_finalize(dx_finalize)
     )  # resolved once per call; the backward follows it through row_valid
@@ -4610,6 +4624,8 @@ def forward_loss(
             need_dw=need_dw,
             row_index=row_index,
             row_valid=row_valid,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=fused_dx,
         )
     valid_count = None if row_index is None else int(row_index.numel())
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
