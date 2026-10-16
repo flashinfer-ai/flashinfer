@@ -34,6 +34,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from ..stage import FmhaStage
+from .sage_scales import SageSoftmaxMode
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
     schedule,
@@ -2191,8 +2192,10 @@ def create_softmax_task(
             raise ValueError("p_in_smem requires the group's SMEM P resource")
         dst.append(smem_p)
     # Sage attention reads its scales from the prepared buffer inside the
-    # softmax passes; it adds no resource to the task.
+    # softmax passes; it adds no resource to the task. The mode says how the
+    # softmax applies the K scales (``SageSoftmaxMode``).
     use_sage = tmem_sp.cfg.use_sage_attention
+    sage_mode = tmem_sp.cfg.sage_softmax_mode
     if use_sage and not p_in_smem:
         raise ValueError("Sage attention requires P in SMEM")
 
@@ -2223,9 +2226,9 @@ def create_softmax_task(
         ) -> Any:
             """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
             with the half overlap the leading half is published behind ``pr``, else P goes
-            to the TMEM S/P stage. A Sage plan passes the work tile's ``sfQ`` and the
-            tile's per-block ``sfK`` from its max pass."""
-            if use_sage:
+            to the TMEM S/P stage. A block-scaled Sage plan passes the work tile's ``sfQ``
+            and the tile's per-block ``sfK`` from its max pass."""
+            if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
                 p_chunk = sp.sage_exp2_p_smem(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
@@ -2275,17 +2278,38 @@ def create_softmax_task(
             def load_sage_k_scales(section: FmhaStage) -> Any:
                 """Issue the K tile's ``sfK`` loads before the wait for its scores.
 
-                The wait then hides their latency."""
-                return sp.load_sage_k_block_scales(
-                    sage_k_first_atom=sage_k_first_atom, section=section
-                )
+                The wait then hides their latency. The streamed mode has too
+                many words to carry across the wait and loads them in its
+                max pass instead."""
+                if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
+                    return sp.load_sage_k_block_scales(
+                        sage_k_first_atom=sage_k_first_atom, section=section
+                    )
+                if sage_mode is SageSoftmaxMode.HOISTED:
+                    return sp.load_sage_k_multipliers(
+                        sage_q_scale=sage_q_scale,
+                        sage_k_first_atom=sage_k_first_atom,
+                        section=section,
+                    )
+                return None
 
             def sage_row_max(row_max: Any, k_scales: Any, section: FmhaStage) -> Any:
-                """Row max of the dequantized scores."""
-                return sp.sage_row_max(
+                """Row max of the dequantized scores, by the plan's Sage mode."""
+                if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
+                    return sp.sage_row_max(
+                        row_max=row_max,
+                        sage_q_scale=sage_q_scale,
+                        sage_k_block_scales=k_scales,
+                        section=section,
+                    )
+                if sage_mode is SageSoftmaxMode.HOISTED:
+                    return sp.sage_dequantized_row_max(
+                        row_max=row_max, sage_k_multipliers=k_scales, section=section
+                    )
+                return sp.sage_streamed_row_max(
                     row_max=row_max,
                     sage_q_scale=sage_q_scale,
-                    sage_k_block_scales=k_scales,
+                    sage_k_first_atom=sage_k_first_atom,
                     section=section,
                 )
 
