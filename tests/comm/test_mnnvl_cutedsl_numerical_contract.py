@@ -36,7 +36,10 @@ from flashinfer.comm.mnnvl_cutedsl import (
     StaticProfile,
 )
 from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64,
+    LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192,
     LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK,
+    LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
     LLAllReduceTuning,
     LLCollectiveTuning,
     LLFinalizeTuning,
@@ -447,6 +450,12 @@ _LL_LAMPORT_VARIANTS = {
         publish_threads=192,
         publish_bulk_peer_stores=True,
     ),
+    "two-shot": LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
+    "two-shot-cluster-16": LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64,
+    "two-shot-128-threads": LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192,
+    "two-shot-two-trips": LLAllReduceTuning(
+        two_shot=True, collective=LLCollectiveTuning(cluster_size=4, threads=128)
+    ),
 }
 
 
@@ -454,7 +463,12 @@ _LL_LAMPORT_VARIANTS = {
 @pytest.mark.parametrize("variant", tuple(_LL_LAMPORT_VARIANTS))
 @torch.inference_mode()
 def test_ll_lamport_variant_graph_replay(distributed_group, variant, apply_rms_norm):
-    """Each LL all-reduce variant matches the rank-ordered reduction bit for bit."""
+    """Each LL all-reduce variant matches the rank-ordered reduction bit for bit.
+
+    The two-shot variants advance a Lamport generation per CTA, so the
+    captured sequence alternates token counts: a CTA that sits out a short call
+    must still agree with its peers on the next generation.
+    """
     group = distributed_group
     rank = dist.get_rank(group)
     hidden_size = 8192

@@ -36,6 +36,7 @@ from ..symmetric_buffer import SymmetricBuffer
 from .device_kernels import (
     LAMPORT_GENERATIONS,
     _LamportResidualRMSNormDeviceKernel,
+    _LamportTwoShotDeviceKernel,
     _QuadFinalizePublishDeviceKernel,
     _ScalarFinalizePublishDeviceKernel,
     _SharedOnlyPublishDeviceKernel,
@@ -77,6 +78,10 @@ class LLAllReduceTuning:
     peer_stores: bool = False
     publish_multicast_fragments: int = 0
     publish_bulk_peer_stores: bool = False
+    # Replace the one-shot protocol with a one-launch Lamport reduce-scatter
+    # and multicast all-gather (see _LamportTwoShotDeviceKernel). Uses the
+    # collective's cluster_size and threads; the publish knobs do not apply.
+    two_shot: bool = False
 
 
 LL_FINALIZE_GB300_TP8_H8192_K10 = LLFinalizeTuning()
@@ -103,7 +108,10 @@ LL_ALL_REDUCE_GB300_TP16_H8192 = LL_ALL_REDUCE_GB300_TP16_H8192_M_LE_10
 # TP4, hidden 8192, measured separately on GB300 and Rubin. The multicast
 # one-shot default is fastest for the fewest tokens. Once its publish is byte
 # bound, the BULK variant keeps the multicast store for the first quarter of
-# each token and sends the rest as per-CTA bulk copies to each rank.
+# each token and sends the rest as per-CTA bulk copies to each rank. Without
+# the norm, the TWO_SHOT variants move fewer bytes per GPU than the one-shot
+# and amortize their second hop; fewer tokens favour more CTAs per token
+# (a larger cluster) to spread the per-token work.
 _LL_ALL_REDUCE_H8192_BULK = LLAllReduceTuning(
     publish_threads=256,
     peer_stores=True,
@@ -111,11 +119,23 @@ _LL_ALL_REDUCE_H8192_BULK = LLAllReduceTuning(
     publish_bulk_peer_stores=True,
 )
 
+
+def _two_shot(cluster_size: int, threads: int) -> LLAllReduceTuning:
+    return LLAllReduceTuning(
+        two_shot=True,
+        collective=LLCollectiveTuning(cluster_size=cluster_size, threads=threads),
+    )
+
+
 LL_ALL_REDUCE_GB300_TP4_H8192 = LLAllReduceTuning()
 LL_ALL_REDUCE_GB300_TP4_H8192_BULK = _LL_ALL_REDUCE_H8192_BULK
+LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_25_TO_64 = _two_shot(16, 64)
+LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_65_TO_192 = _two_shot(8, 128)
+LL_ALL_REDUCE_GB300_TP4_H8192_TWO_SHOT_M_193_TO_320 = _two_shot(8, 64)
 LL_FINALIZE_GB300_TP4_H8192_K10 = LLFinalizeTuning()
 LL_ALL_REDUCE_RUBIN_TP4_H8192 = LLAllReduceTuning()
 LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK = _LL_ALL_REDUCE_H8192_BULK
+LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT = _two_shot(8, 64)
 LL_FINALIZE_RUBIN_TP4_H8192_K10 = LLFinalizeTuning()
 
 # hidden_size=5120, bf16. Tuning presets carry launch
@@ -246,6 +266,13 @@ def compile_shared_only_publish(
         Int32(capacity_m),
         current_cu_stream(),
     )
+
+
+@dataclass(slots=True)
+class _TwoShotState:
+    scatter_mailbox: SymmetricBuffer
+    gather_mailbox: SymmetricBuffer
+    generations: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +469,65 @@ class AllReduceRMSNormLLKernel(_LLPath):
         return norm_output, residual_output
 
 
+class TwoShotAllReduceRMSNormLLKernel(_LLPath):
+    def __init__(
+        self, *, compiled: Any, two_shot_state: _TwoShotState, **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self._compiled = compiled
+        self._state = two_shot_state
+
+    def __call__(
+        self,
+        local_contribution: torch.Tensor,
+        residual_source: torch.Tensor | None,
+        gamma: torch.Tensor,
+        m: int,
+        *,
+        state: LLProtocolState,
+        norm_output: torch.Tensor | None = None,
+        residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not 1 <= m <= self.capacity_m:
+            raise ValueError(f"m must be in [1, {self.capacity_m}]")
+        norm_output, residual_output = self._outputs(m, norm_output, residual_output)
+        scatter = self._state.scatter_mailbox
+        gather = self._state.gather_mailbox
+        residual_arg = residual_source if residual_source is not None else gamma
+        residual_output_arg = residual_output if residual_output is not None else gamma
+        self._compiled(
+            to_cute_dynamic(
+                local_contribution.flatten(),
+                16,
+                divisibility=self.hidden_size,
+            ),
+            to_cute(scatter.tensor.flatten(), 16),
+            to_cute(cast(torch.Tensor, scatter.peer_addresses), 8),
+            to_cute(gather.tensor.flatten(), 16),
+            Int64(cast(int, gather.multicast_address)),
+            to_cute_dynamic(residual_arg.flatten(), 16, divisibility=self.hidden_size),
+            to_cute(gamma, 16),
+            to_cute_dynamic(
+                residual_output_arg.flatten(),
+                16,
+                divisibility=self.hidden_size,
+            ),
+            to_cute_dynamic(norm_output.flatten(), 16, divisibility=self.hidden_size),
+            to_cute_dynamic(
+                norm_output_bf16.flatten(), 16, divisibility=self.hidden_size
+            )
+            if norm_output_bf16 is not None
+            else None,
+            to_cute(output_scale, 4) if output_scale is not None else None,
+            to_cute(self._state.generations, 4),
+            Int32(m),
+            current_cu_stream(),
+        )
+        return norm_output, residual_output
+
+
 class LLProtocol:
     """Own LL State and protocol-local compiled variants for both paths."""
 
@@ -492,11 +578,16 @@ class LLProtocol:
                     "publish_bulk_peer_stores requires peer_stores and a "
                     "publish_multicast_fragments multiple of publish_threads"
                 )
+            if tuning.two_shot and tuning.collective.rank_lanes != 1:
+                raise ValueError("two_shot requires rank_lanes == 1")
+        one_shot_tunings = tuple(
+            item for item in all_reduce_tunings if not item.two_shot
+        )
         collective_cache = {
             tuning: self._compile_collective(tuning)
             for tuning in {
                 *(item.collective for item in finalize_tunings),
-                *(item.collective for item in all_reduce_tunings),
+                *(item.collective for item in one_shot_tunings),
             }
         }
         self.finalize_kernels = {
@@ -509,7 +600,10 @@ class LLProtocol:
             )
             for tuning in dict.fromkeys(finalize_tunings)
         }
-        self.all_reduce_kernels = {
+        self.all_reduce_kernels: dict[
+            LLAllReduceTuning,
+            AllReduceRMSNormLLKernel | TwoShotAllReduceRMSNormLLKernel,
+        ] = {
             tuning: AllReduceRMSNormLLKernel(
                 compiled=_CompiledAllReduce(
                     publish=self._compile_all_reduce_publish(tuning),
@@ -518,7 +612,7 @@ class LLProtocol:
                 peer_stores=tuning.peer_stores,
                 **self._path_kwargs(),
             )
-            for tuning in dict.fromkeys(all_reduce_tunings)
+            for tuning in dict.fromkeys(one_shot_tunings)
         }
         self.state = create_ll_state(
             group,
@@ -527,9 +621,27 @@ class LLProtocol:
             capacity_m,
             hidden_size,
             materialize_peer_addresses=any(
-                item.peer_stores for item in all_reduce_tunings
+                item.peer_stores for item in one_shot_tunings
             ),
         )
+        # A two-shot variant derives its mailbox slots and per-CTA Lamport
+        # generations from its own CTA-to-fragment mapping, so each collective
+        # shape owns its mailboxes; variants never share a slot.
+        two_shot_cache: dict[LLCollectiveTuning, tuple[Any, _TwoShotState]] = {}
+        for tuning in dict.fromkeys(all_reduce_tunings):
+            if not tuning.two_shot:
+                continue
+            if tuning.collective not in two_shot_cache:
+                two_shot_cache[tuning.collective] = (
+                    self._compile_two_shot(tuning.collective),
+                    self._create_two_shot_state(group, tuning.collective),
+                )
+            compiled, two_shot_state = two_shot_cache[tuning.collective]
+            self.all_reduce_kernels[tuning] = TwoShotAllReduceRMSNormLLKernel(
+                compiled=compiled,
+                two_shot_state=two_shot_state,
+                **self._path_kwargs(),
+            )
 
     def _path_kwargs(self) -> _PathKwargs:
         return {
@@ -643,3 +755,100 @@ class LLProtocol:
             current_cu_stream(),
         )
         return cute.compile(device_kernel, *args)
+
+    def _compile_two_shot(self, collective: LLCollectiveTuning):
+        device_kernel = _LamportTwoShotDeviceKernel(
+            hidden=self.hidden_size,
+            tp=self.tp_size,
+            rank=self.rank,
+            capacity_m=self.capacity_m,
+            cluster_size=collective.cluster_size,
+            threads=collective.threads,
+            rms_epsilon=self.rms_epsilon,
+            weight_bias=self.weight_bias,
+            add_residual=self.add_residual,
+            write_residual_output=self.write_residual_output,
+            apply_rms_norm=self.apply_rms_norm,
+            enable_pdl=collective.enable_pdl,
+        )
+        activation = self.capacity_m * self.hidden_size
+        args = (
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            ),
+            make_fake_compact_tensor(
+                BFloat16,
+                (LAMPORT_GENERATIONS * self.tp_size * activation,),
+                assumed_align=16,
+            ),
+            make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
+            make_fake_compact_tensor(
+                BFloat16,
+                (LAMPORT_GENERATIONS * activation,),
+                assumed_align=16,
+            ),
+            Int64(0),
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            ),
+            make_fake_compact_tensor(BFloat16, (self.hidden_size,), assumed_align=16),
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            ),
+            make_fake_dynamic_compact_tensor(
+                Float8E4M3FN if self.output_dtype == torch.float8_e4m3fn else BFloat16,
+                alignment=16,
+                divisibility=self.hidden_size,
+            ),
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            )
+            if self.write_norm_output
+            else None,
+            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
+            if self.output_dtype == torch.float8_e4m3fn
+            else None,
+            make_fake_compact_tensor(
+                Int32,
+                (self.capacity_m * collective.cluster_size,),
+                assumed_align=4,
+            ),
+            Int32(self.capacity_m),
+            current_cu_stream(),
+        )
+        return cute.compile(device_kernel, *args)
+
+    def _create_two_shot_state(
+        self, group: dist.ProcessGroup, collective: LLCollectiveTuning
+    ) -> _TwoShotState:
+        device = torch.device("cuda", torch.cuda.current_device())
+        scatter = SymmetricBuffer.allocate(
+            (
+                LAMPORT_GENERATIONS,
+                self.tp_size,
+                self.capacity_m,
+                self.hidden_size,
+            ),
+            torch.bfloat16,
+            device,
+            group,
+            materialize_peer_addresses=True,
+        )
+        gather = SymmetricBuffer.allocate(
+            (LAMPORT_GENERATIONS, self.capacity_m, self.hidden_size),
+            torch.bfloat16,
+            device,
+            group,
+            require_multicast=True,
+        )
+        scatter.tensor.view(torch.int16).fill_(-32768)
+        gather.tensor.view(torch.int16).fill_(-32768)
+        return _TwoShotState(
+            scatter_mailbox=scatter,
+            gather_mailbox=gather,
+            generations=torch.zeros(
+                (self.capacity_m * collective.cluster_size,),
+                dtype=torch.int32,
+                device=device,
+            ),
+        )

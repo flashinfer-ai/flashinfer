@@ -1111,3 +1111,415 @@ class _LamportResidualRMSNormDeviceKernel:
                         output_scale,
                         norm_output_bf16,
                     )
+
+
+class _LamportTwoShotDeviceKernel:
+    """One-launch Lamport reduce-scatter plus multicast all-gather.
+
+    The hidden dimension is split into ``tp`` contiguous shards and rank ``o``
+    owns shard ``o``. Every rank stores each fragment of its contribution to
+    the owner's reduce-scatter mailbox through the owner's unicast mapping; the
+    owner keeps its own share in registers. The owner spins on the Lamport
+    sentinels of the ``tp - 1`` peer copies, reduces in FP32 in rank order,
+    adds its own residual (TP replicates the residual, so every rank's copy is
+    the same), and multicast-stores the BF16 pre-norm fragment to every rank's
+    all-gather mailbox. Every rank then spins on its all-gather copy and
+    finishes the optional RMSNorm the way the one-shot collective does.
+
+    Per GPU this receives ``(tp - 1) / tp`` of an activation for the
+    reduce-scatter and one activation of all-gather traffic, instead of the
+    ``tp`` activations a one-shot multicast publish delivers, at the price of a
+    second NVLink hop. It therefore pays off once the transfer, not the hop
+    latency, dominates.
+
+    The CTA that publishes a fragment is the CTA that reduces and gathers it on
+    every rank, so no CTA waits on another CTA of its own rank and no grid-wide
+    stage update is needed. Each CTA instead keeps its own Lamport generation
+    in ``generations[cta]``: every rank launches the same CTA sequence, so the
+    per-CTA counters agree across ranks, also when a CTA sits out a call with
+    fewer tokens. A reduce-scatter slot written in call ``n`` is rewritten in
+    call ``n + 3`` at the earliest, which needs the owner's all-gather of call
+    ``n + 2``, issued after the owner finished call ``n``; the all-gather slots
+    follow the same argument with the roles swapped.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden: int,
+        tp: int,
+        rank: int,
+        capacity_m: int,
+        cluster_size: int,
+        threads: int,
+        rms_epsilon: float,
+        weight_bias: float,
+        add_residual: bool,
+        write_residual_output: bool,
+        apply_rms_norm: bool,
+        enable_pdl: bool,
+    ) -> None:
+        if threads <= 0 or threads % WARP_SIZE:
+            raise ValueError("threads must be a positive warp multiple")
+        if hidden <= 0 or hidden % (VEC_BF16 * tp):
+            raise ValueError("hidden must split into tp shards of 8-element fragments")
+        self.hidden = hidden
+        self.tp = tp
+        self.rank = rank
+        self.capacity_m = capacity_m
+        self.cluster_size = cluster_size
+        self.threads = threads
+        self.rms_epsilon = rms_epsilon
+        self.weight_bias = weight_bias
+        self.add_residual = add_residual
+        self.write_residual_output = write_residual_output
+        self.apply_rms_norm = apply_rms_norm
+        self.enable_pdl = enable_pdl
+        self.fragments = hidden // VEC_BF16
+        self.shard_fragments = self.fragments // tp
+        self.fragment_stride = cluster_size * threads
+        self.trips = math.ceil(self.fragments / self.fragment_stride)
+        self.warps = threads // WARP_SIZE
+
+    def smem_size_in_bytes(self) -> int:
+        return (self.warps + self.cluster_size) * 4
+
+    @cute.jit
+    def __call__(
+        self,
+        local_contribution: cute.Tensor,
+        scatter_mailbox: cute.Tensor,
+        scatter_peer_mailboxes: cute.Tensor,
+        gather_mailbox: cute.Tensor,
+        gather_multicast_address: Int64,
+        residual_source: cute.Tensor,
+        gamma: cute.Tensor,
+        residual_output: cute.Tensor,
+        norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
+        generations: cute.Tensor,
+        m: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        kernel = self.kernel(
+            local_contribution,
+            scatter_mailbox,
+            scatter_peer_mailboxes,
+            gather_mailbox,
+            gather_multicast_address,
+            residual_source,
+            gamma,
+            residual_output,
+            norm_output,
+            norm_output_bf16,
+            output_scale,
+            generations,
+        )
+        if cutlass.const_expr(self.apply_rms_norm):
+            kernel.launch(
+                grid=(m, self.cluster_size, 1),
+                block=(self.threads, 1, 1),
+                cluster=(1, self.cluster_size, 1),
+                smem=self.smem_size_in_bytes(),
+                stream=stream,
+                use_pdl=self.enable_pdl,
+            )
+        else:
+            # Without the norm no CTA reads another CTA's shared memory, so the
+            # launch needs no cluster co-scheduling.
+            kernel.launch(
+                grid=(m, self.cluster_size, 1),
+                block=(self.threads, 1, 1),
+                smem=self.smem_size_in_bytes(),
+                stream=stream,
+                use_pdl=self.enable_pdl,
+            )
+
+    @cute.kernel
+    def kernel(
+        self,
+        local_contribution: cute.Tensor,
+        scatter_mailbox: cute.Tensor,
+        scatter_peer_mailboxes: cute.Tensor,
+        gather_mailbox: cute.Tensor,
+        gather_multicast_address: Int64,
+        residual_source: cute.Tensor,
+        gamma: cute.Tensor,
+        residual_output: cute.Tensor,
+        norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
+        generations: cute.Tensor,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        token, chunk, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.apply_rms_norm):
+            cluster_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        else:
+            cluster_rank = cute.arch.make_warp_uniform(chunk)
+        base_fragment = cluster_rank * self.threads + tidx
+        cta_index = Int64(token) * self.cluster_size + Int64(cluster_rank)
+
+        gamma_fragments = cute.make_rmem_tensor(
+            cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1)),
+            BFloat16,
+        )
+        gamma_fragments.fill(BFloat16(0.0))
+        if cutlass.const_expr(self.apply_rms_norm):
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments:
+                    gamma_pointer = cute.make_ptr(
+                        BFloat16,
+                        (gamma.iterator + Int64(fragment) * VEC_BF16).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    gamma_fragments[trip, None].store(
+                        packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
+                    )
+
+        # The contribution and the residual may come from the kernel this launch
+        # depends on, so unlike the static gamma they are read after the wait.
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        stage = load_volatile_u32(generations.iterator + cta_index)
+        slot_stride = Int64(self.capacity_m) * self.hidden
+        scatter_stage = Int64(stage) * self.tp
+        gather_stage = Int64(stage) * slot_stride
+
+        # Reduce-scatter publish: one unicast store to the fragment's owner.
+        own_packed = cute.make_rmem_tensor(
+            cute.make_layout((self.trips, 4), stride=(4, 1)),
+            Uint32,
+        )
+        own_packed.fill(Uint32(0))
+        for trip in cutlass.range_constexpr(self.trips):
+            fragment = base_fragment + trip * self.fragment_stride
+            if fragment < self.fragments:
+                owner = fragment // self.shard_fragments
+                token_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+                source_pointer = cute.make_ptr(
+                    BFloat16,
+                    (local_contribution.iterator + token_element).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                packed = sanitize_negative_zero_u32x4(load_global_u32x4(source_pointer))
+                for word in cutlass.range_constexpr(4):
+                    own_packed[trip, word] = packed[word]
+                if owner != Int32(self.rank):
+                    peer_base = cute.arch.load(
+                        (scatter_peer_mailboxes.iterator + owner).llvm_ptr,
+                        Int64,
+                    )
+                    own_element = (
+                        scatter_stage + self.rank
+                    ) * slot_stride + token_element
+                    store_global_u32x4(peer_base + own_element * 2, packed)
+
+        if cutlass.const_expr(self.add_residual):
+            residual_fragments = cute.make_rmem_tensor(
+                cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1)),
+                BFloat16,
+            )
+            residual_fragments.fill(BFloat16(0.0))
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments:
+                    if fragment // self.shard_fragments == Int32(self.rank):
+                        residual_pointer = cute.make_ptr(
+                            BFloat16,
+                            (
+                                residual_source.iterator
+                                + (
+                                    Int64(token) * self.hidden
+                                    + Int64(fragment) * VEC_BF16
+                                )
+                            ).llvm_ptr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        residual_fragments[trip, None].store(
+                            packed_u32x4_to_bf16x8(load_global_u32x4(residual_pointer))
+                        )
+
+        # Owner: reduce its shard in rank order and multicast the BF16 pre-norm.
+        for trip in cutlass.range_constexpr(self.trips):
+            fragment = base_fragment + trip * self.fragment_stride
+            token_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+            owned = fragment < self.fragments
+            if owned:
+                owned = fragment // self.shard_fragments == Int32(self.rank)
+            if owned:
+                peer_packed = cute.make_rmem_tensor(
+                    cute.make_layout((self.tp, 4)),
+                    Uint32,
+                )
+                peer_packed.fill(Uint32(0))
+                dirty = fragment < self.fragments
+                while dirty:
+                    dirty = False
+                    for source_rank in cutlass.range_constexpr(self.tp):
+                        if cutlass.const_expr(source_rank != self.rank):
+                            source_element = (
+                                scatter_stage + source_rank
+                            ) * slot_stride + token_element
+                            source_pointer = cute.make_ptr(
+                                BFloat16,
+                                (scatter_mailbox.iterator + source_element).llvm_ptr,
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            packed = load_global_u32x4(source_pointer, volatile=True)
+                            dirty = dirty | fragment_has_negative_zero(packed)
+                            for word in cutlass.range_constexpr(4):
+                                peer_packed[source_rank, word] = packed[word]
+                lane_sum = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+                lane_sum.fill(Float32(0.0))
+                for source_rank in cutlass.range_constexpr(self.tp):
+                    packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        if cutlass.const_expr(source_rank == self.rank):
+                            packed[word] = own_packed[trip, word]
+                        else:
+                            packed[word] = peer_packed[source_rank, word]
+                    lane_sum.store(
+                        lane_sum.load()
+                        + packed_u32x4_to_bf16x8(packed.load()).to(Float32)
+                    )
+                prenorm = lane_sum.load()
+                if cutlass.const_expr(self.add_residual):
+                    prenorm = prenorm + residual_fragments[trip, None].load().to(
+                        Float32
+                    )
+                # A -0.0 result would read as an unwritten sentinel on every rank.
+                reduced = sanitize_negative_zero_u32x4(
+                    bf16x8_to_packed_u32x4(prenorm.to(BFloat16))
+                )
+                stmc_bf16x8(
+                    gather_multicast_address + (gather_stage + token_element) * 2,
+                    reduced,
+                )
+                for source_rank in cutlass.range_constexpr(self.tp):
+                    if cutlass.const_expr(source_rank != self.rank):
+                        source_element = (
+                            scatter_stage + source_rank
+                        ) * slot_stride + token_element
+                        store_lamport_sentinel_u32x4(
+                            Int64((scatter_mailbox.iterator + source_element).toint())
+                        )
+
+        # Every rank, the owner included: wait for the gathered pre-norm.
+        prenorm_fragments = cute.make_rmem_tensor(
+            cute.make_layout((self.trips, VEC_BF16), stride=(VEC_BF16, 1)),
+            BFloat16,
+        )
+        prenorm_fragments.fill(BFloat16(0.0))
+        for trip in cutlass.range_constexpr(self.trips):
+            fragment = base_fragment + trip * self.fragment_stride
+            token_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+            if fragment < self.fragments:
+                gather_pointer = cute.make_ptr(
+                    BFloat16,
+                    (gather_mailbox.iterator + gather_stage + token_element).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                gathered = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+                gathered.fill(Uint32(0))
+                dirty = fragment < self.fragments
+                while dirty:
+                    packed = load_global_u32x4(gather_pointer, volatile=True)
+                    dirty = fragment_has_negative_zero(packed)
+                    for word in cutlass.range_constexpr(4):
+                        gathered[word] = packed[word]
+                prenorm_fragments[trip, None].store(
+                    packed_u32x4_to_bf16x8(gathered.load())
+                )
+                if cutlass.const_expr(self.write_residual_output):
+                    store_global_u32x4(
+                        Int64((residual_output.iterator + token_element).toint()),
+                        gathered.load(),
+                    )
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+        for trip in cutlass.range_constexpr(self.trips):
+            fragment = base_fragment + trip * self.fragment_stride
+            token_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+            if fragment < self.fragments:
+                store_lamport_sentinel_u32x4(
+                    Int64(
+                        (gather_mailbox.iterator + gather_stage + token_element).toint()
+                    )
+                )
+
+        smem = cutlass.utils.SmemAllocator()
+        warp_sums = smem.allocate_array(Float32, self.warps)
+        cluster_sums = smem.allocate_array(Float32, self.cluster_size)
+        if cutlass.const_expr(self.apply_rms_norm):
+            thread_sum = Float32(0.0)
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments:
+                    values = prenorm_fragments[trip, None].load().to(Float32)
+                    thread_sum = thread_sum + (values * values).reduce(
+                        cute.ReductionOp.ADD,
+                        init_val=Float32(0.0),
+                        reduction_profile=0,
+                    )
+            cta_sum = _group_leader_block_sum(thread_sum, warp_sums, self.warps, 1)
+            # Peer CTAs must exist before accessing their distributed shared memory.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            if tidx < self.cluster_size:
+                local_slot = cluster_sums + cluster_rank
+                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                store_shared_cluster_f32(remote_slot, cta_sum)
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+
+            full_sum = Float32(0.0)
+            for peer in cutlass.range_constexpr(self.cluster_size):
+                full_sum = full_sum + cute.arch.load(
+                    (cluster_sums + peer).llvm_ptr,
+                    Float32,
+                )
+            inv_rms = cute.math.rsqrt(
+                full_sum / Float32(self.hidden) + Float32(self.rms_epsilon),
+                fastmath=True,
+            )
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments:
+                    gamma_values = gamma_fragments[trip, None].load().to(Float32)
+                    if cutlass.const_expr(self.weight_bias != 0.0):
+                        gamma_values = gamma_values + Float32(self.weight_bias)
+                    result = (
+                        prenorm_fragments[trip, None].load().to(Float32)
+                        * inv_rms
+                        * gamma_values
+                    ).to(BFloat16)
+                    output_element = (
+                        Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+                    )
+                    store_rmsnorm_output(
+                        bf16x8_to_packed_u32x4(result),
+                        norm_output,
+                        Int64(output_element),
+                        output_scale,
+                        norm_output_bf16,
+                    )
+        else:
+            # Every thread must have read this CTA's generation before it advances.
+            cute.arch.barrier()
+
+        if tidx == 0:
+            store_global_u32(
+                generations.iterator + cta_index,
+                (stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
+            )
