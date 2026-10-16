@@ -119,6 +119,74 @@ def device_facts(index: int) -> DeviceFacts:
         )
 
 
+def _sm120_block_scale_stages(value, smem_bytes, swap_ab):
+    """AB ring depth of cuDNN Frost's SM120 block-scale MoE renderer.
+
+    A stage holds every operand's packed K-tile and scale-factor box (+16 B).
+    The transposed-STG epilogue staging (4 B x 528 per compute warp) and the
+    template's 2 KB reserve come off the budget first; GATHER adds 32 B of
+    linear-scale scratch per routed token row (the token is B after swap-AB).
+    Multi-GEMM (gated) kernels then drop stages until the aligned buffer
+    layout fits.
+    """
+    m, n, _ = value("cta_tile_mnk")
+    na, nb = value("num_a_operands"), value("num_b_operands")
+    sfa, sfb = value("sfa_smem_bytes"), value("sfb_smem_bytes")
+    gemms = value("num_gemms", 1)
+    if gemms > 1:
+        warps = 8
+        per_stage = (
+            na * (value("sA_packed_elems") + (0 if value("fake_dequant_a") else sfa))
+            + nb * (value("sB_packed_elems") + (0 if value("fake_dequant_b") else sfb))
+            + 16
+        )
+    else:
+        warps = (m // (16 * value("mma_size_m"))) * (n // (16 * value("mma_size_n")))
+        per_stage = (
+            value("sA_packed_elems")
+            + value("sB_packed_elems")
+            + value("num_sfa_operands") * sfa
+            + value("num_sfb_operands") * sfb
+            + 16
+        )
+    staging = 4 * 528 * warps
+    rows, tokens = (n, nb) if swap_ab else (m, na)
+    gather = value("moe_gather", False)
+    if gather and gemms > 1:
+        if not value("fake_dequant_b" if swap_ab else "fake_dequant_a"):
+            staging += rows * 32 * tokens
+    elif gather:
+        scaled = value("num_sfb_operands" if swap_ab else "num_sfa_operands")
+        staging += rows * 32 * scaled
+    available = smem_bytes - 2048 - staging
+    stages = min(available // per_stage, 16) if available >= per_stage else 0
+    if gemms > 1:
+        kb = max(value("a_packed_per_row"), value("b_packed_per_row"))
+
+        def up(offset, align):
+            return -(-offset // align) * align
+
+        def footprint(count):
+            offset = 1024
+            for operands, tile in ((na, m * kb), (nb, n * kb)):
+                for _ in range(operands):
+                    offset = up(offset, 1024) + count * tile
+            for operands, tile in ((na, sfa), (nb, sfb)):
+                for _ in range(operands):
+                    offset = up(offset, 512) + count * tile
+            offset = up(offset, 1024) + 4 * 528 * warps
+            if gather:
+                for _ in range(tokens):
+                    offset = up(offset, 128) + rows * 32
+                for _ in range(tokens):
+                    offset = up(offset, 8) + 8
+            return offset
+
+        while stages > 0 and footprint(stages) > smem_bytes:
+            stages -= 1
+    return stages
+
+
 def specialize_parameters(parameters, facts: DeviceFacts):
     """Resolve device-derived constants before source generation and JIT."""
     from copy import deepcopy
@@ -147,7 +215,9 @@ def specialize_parameters(parameters, facts: DeviceFacts):
             * value("epi_slot_widen", 1)
             + 16
         )
-    if facts.arch == "sm_120a":
+    if facts.arch == "sm_120a" and "sfa_smem_bytes" in constants:
+        stages = _sm120_block_scale_stages(value, facts.smem_bytes, result["swap_ab"])
+    elif facts.arch == "sm_120a":
         reserve = 2048
         per_stage = (na * m + nb * n) * k * 2 + 16
         if value("num_gemms") > 1:

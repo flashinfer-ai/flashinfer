@@ -2566,7 +2566,7 @@ class CudnnFrostBf16Config:
 
 @dataclass(frozen=True)
 class CudnnFrostMxfp8Config:
-    """Frost MXFP8 MoE on SM107, with packed precomputed routing.
+    """Frost MXFP8 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
     ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
@@ -2575,7 +2575,7 @@ class CudnnFrostMxfp8Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
@@ -2583,7 +2583,7 @@ class CudnnFrostMxfp8Config:
 
 @dataclass(frozen=True)
 class CudnnFrostNvfp4Config:
-    """Frost NVFP4 MoE on SM107, with packed precomputed routing.
+    """Frost NVFP4 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
     ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
@@ -2592,7 +2592,7 @@ class CudnnFrostNvfp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
@@ -2600,7 +2600,7 @@ class CudnnFrostNvfp4Config:
 
 @dataclass(frozen=True)
 class CudnnFrostMxfp8Mxfp4Config:
-    """Frost MXFP8-activation / MXFP4-weight MoE on SM107.
+    """Frost MXFP8-activation / MXFP4-weight MoE on SM107 and SM120.
 
     Requires packed precomputed routing and H/I divisible by 128. Register
     prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
@@ -2610,7 +2610,7 @@ class CudnnFrostMxfp8Mxfp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
