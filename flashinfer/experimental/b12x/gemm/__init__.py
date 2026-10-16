@@ -18,6 +18,7 @@ import importlib
 from typing import Any
 
 _OP_MODULES = (
+    "hyperconnection_gate",
     "bf16_vocab_projection",
     "blockscaled",
     "block_fp8_linear",
