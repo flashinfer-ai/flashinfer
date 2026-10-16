@@ -231,13 +231,16 @@ class _SageKSection:
     scale of the atom's token ``w * tokens_per_word``, padded with zeros to
     whole float4s. Scales come from the flat source tensor of one scale per
     ``source_block_size`` tokens; a coarser source repeats its value, and a
-    token past ``length`` takes the last scale.
+    token past ``length`` takes the last scale. The atoms are padded to whole
+    groups of ``tile_atoms``, so a reader that addresses whole K tiles never
+    runs past the section; a pad atom repeats the last scale.
     """
 
     length: int
     block_size: int
     source_block_size: int
     word_offset: int
+    tile_atoms: int = 1
 
     @property
     def words_per_atom(self) -> int:
@@ -265,9 +268,9 @@ class _SageKSection:
 
     @property
     def atoms(self) -> int:
-        """Return the section's 64-token atoms, the last one possibly partial."""
+        """Return the section's 64-token atoms, padded to whole ``tile_atoms`` groups."""
 
-        return ceil_div(self.length, _SAGE_ATOM_TOKENS)
+        return round_up(ceil_div(self.length, _SAGE_ATOM_TOKENS), self.tile_atoms)
 
     @property
     def words(self) -> int:
@@ -280,29 +283,34 @@ class _SageKSection:
 class _SageQSection:
     """The ``sfQ`` words of a sequence's Q tiles: one word per tile row.
 
-    Tile ``t`` holds ``tile_size_q`` words from word ``word_offset + t *
-    tile_size_q``, in the order the softmax lanes read them: row ``r`` is
-    token ``t * tokens_per_tile + r // heads_q_per_kv`` of local Q head ``r %
-    heads_q_per_kv``, and its word is that head's scale of the token's
-    ``q_block_size`` block. Rows past the sequence's last token repeat the
-    last valid word, so a masked row keeps a finite positive scale.
+    A tile holds ``tokens_per_tile`` tokens of the sequence for each of the
+    ``heads_q_per_kv`` Q heads of its KV head, ``rows_per_tile`` words from
+    word ``word_offset + t * rows_per_tile``, in the order the softmax lanes
+    read them. With ``heads_interleaved`` (the decode kernel's grouped Q
+    tile) row ``r`` is token ``r // heads_q_per_kv`` of local head ``r %
+    heads_q_per_kv``; otherwise (the context kernel's tile, one head per 128
+    rows) row ``r`` is token ``r % tokens_per_tile`` of local head ``r //
+    tokens_per_tile``. The word is that head's scale of the token's
+    ``q_block_size`` block; a row whose token lies past the sequence's end
+    takes the last token's, so a masked row keeps a finite positive scale.
     """
 
     seq_len_q: int
     q_block_size: int
     heads_q_per_kv: int
-    tile_size_q: int
+    tokens_per_tile: int
     word_offset: int
+    heads_interleaved: bool
 
     def __post_init__(self) -> None:
-        if self.tile_size_q % _FLOAT4_WORDS or self.heads_q_per_kv > self.tile_size_q:
+        if self.tokens_per_tile < 1 or self.rows_per_tile % _FLOAT4_WORDS:
             raise ValueError("sfQ tiles hold whole float4s of at least one token")
 
     @property
-    def tokens_per_tile(self) -> int:
-        """Return the complete Q tokens of one tile."""
+    def rows_per_tile(self) -> int:
+        """Return the words of one tile: every head's row of every token."""
 
-        return self.tile_size_q // self.heads_q_per_kv
+        return self.tokens_per_tile * self.heads_q_per_kv
 
     @property
     def tiles(self) -> int:
@@ -310,17 +318,11 @@ class _SageQSection:
 
         return ceil_div(self.seq_len_q, self.tokens_per_tile)
 
-    def valid_rows(self, tile_idx: int) -> int:
-        """Return the rows of tile ``tile_idx`` that hold a token of the sequence."""
-
-        remaining = self.seq_len_q - tile_idx * self.tokens_per_tile
-        return min(remaining, self.tokens_per_tile) * self.heads_q_per_kv
-
     @property
     def words(self) -> int:
-        """Return the words of the section: ``tile_size_q`` per tile."""
+        """Return the words of the section: ``rows_per_tile`` per tile."""
 
-        return self.tiles * self.tile_size_q
+        return self.tiles * self.rows_per_tile
 
 
 @dataclass(frozen=True)
@@ -392,9 +394,14 @@ class _SageScaleLayout:
     seq_len_q: int
     q_block_size: int
     heads_q_per_kv: int
-    tile_size_q: int
+    # Q tokens per Q tile and the tile's row order (``_SageQSection``).
+    q_tokens_per_tile: int
+    q_heads_interleaved: bool
     headdim: int
     v_mean: bool
+    # Atoms per K tile of the reader; the K-token atoms are padded to whole
+    # tiles (``_SageKSection.tile_atoms``).
+    k_tile_atoms: int = 1
 
     @property
     def k_tokens(self) -> _SageKSection:
@@ -405,6 +412,7 @@ class _SageScaleLayout:
             block_size=self.k_tokens_block_size,
             source_block_size=self.k_block_size,
             word_offset=0,
+            tile_atoms=self.k_tile_atoms,
         )
 
     @property
@@ -435,8 +443,9 @@ class _SageScaleLayout:
             seq_len_q=self.seq_len_q,
             q_block_size=self.q_block_size,
             heads_q_per_kv=self.heads_q_per_kv,
-            tile_size_q=self.tile_size_q,
+            tokens_per_tile=self.q_tokens_per_tile,
             word_offset=sum(section.words for section in self.k_sections),
+            heads_interleaved=self.q_heads_interleaved,
         )
 
     @property

@@ -145,14 +145,14 @@ def load_q_scale(
 
     ``sequence_words`` is the first word of the row's sequence
     (``sage_sequence_words``). The word already holds the scale of the row's
-    token and Q head, the last valid row's for a row past the tile's valid
-    rows (``_SageQSection``).
+    token and Q head, the last token's for a row past the sequence's end
+    (``_SageQSection``).
     """
     q_rows = cfg.sage_scale_layout(cfg.static_seq_len_kv).q_rows
     word = (
         sequence_words
         + Int32(q_rows.word_offset)
-        + q_group_idx * Int32(q_rows.tile_size_q)
+        + q_group_idx * Int32(q_rows.rows_per_tile)
         + row_idx
     )
     return _load_scale(scales_ptr.toint(), word)
