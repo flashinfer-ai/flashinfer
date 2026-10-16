@@ -41,12 +41,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_LIMC_STAGE_BYTES 128
 #define SMEM_LIMC_STRIDE 128
 #define SMEM_CBUF_OFF 35216
-#define SMEM_CBUF_STAGE_BYTES 4096
-#define SMEM_CBUF_STRIDE 4096
+#define SMEM_CBUF_STAGE_BYTES 2048
+#define SMEM_CBUF_STRIDE 2048
 #define SMEM_PUB_OFF 144
 #define SMEM_PUB_STAGE_BYTES 34816
 #define SMEM_PUB_STRIDE 34816
-#define SMEM_TOTAL 39424
+#define SMEM_TOTAL 37376
 #define THREADS 512
 
 
@@ -68,7 +68,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
+kernel_cake_hopper_msa_4866d848f815226b6c99(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1907,19 +1907,14 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                 float _min_199 = fminf(sc_1, 1.7014118346046923e+38f);
                 sc_1 = _min_199;
                 sc_1 = sc_1;
-                float sc3 = sc_1;
-                unsigned int u3 = __as_u32(sc3);
-                unsigned int cls3 = u3 & 4294965248u;
-                unsigned int key3 = 0;
-                unsigned int img_1 = cls3 ^ (unsigned int)((int)cls3 >> 31) & 2147483647;
-                if (thr2 < (int)img_1) {
-                    key3 = 1073741824 | (unsigned int)t4_4_4;
+                float sc8 = sc_1;
+                unsigned int u8 = __as_u32(sc8);
+                unsigned int key8 = 0;
+                if ((u8 & 4294965248u) == qf7) {
+                    unsigned int lowb8 = (u8 ^ (unsigned int)((int)u8 >> 31) & 2047) & 2047;
+                    key8 = 536870912 | lowb8 << 11 | (unsigned int)t4_4_4;
                 }
-                if (cls3 == qf7) {
-                    unsigned int lowb3 = (u3 ^ (unsigned int)((int)u3 >> 31) & 2047) & 2047;
-                    key3 = 536870912 | lowb3 << 11 | (unsigned int)t4_4_4;
-                }
-                kk2[0] = key3;
+                kk2[0] = key8;
             }
             kk2[1] = 0;
             int s5_32 = lane_1 + 32;
@@ -1945,19 +1940,14 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                 float _min_200 = fminf(sc_2, 1.7014118346046923e+38f);
                 sc_2 = _min_200;
                 sc_2 = sc_2;
-                float sc3_1 = sc_2;
-                unsigned int u3_1 = __as_u32(sc3_1);
-                unsigned int cls3_1 = u3_1 & 4294965248u;
-                unsigned int key3_1 = 0;
-                unsigned int img_2 = cls3_1 ^ (unsigned int)((int)cls3_1 >> 31) & 2147483647;
-                if (thr2 < (int)img_2) {
-                    key3_1 = 1073741824 | (unsigned int)t4_4_5;
+                float sc8_1 = sc_2;
+                unsigned int u8_1 = __as_u32(sc8_1);
+                unsigned int key8_1 = 0;
+                if ((u8_1 & 4294965248u) == qf7) {
+                    unsigned int lowb8_1 = (u8_1 ^ (unsigned int)((int)u8_1 >> 31) & 2047) & 2047;
+                    key8_1 = 536870912 | lowb8_1 << 11 | (unsigned int)t4_4_5;
                 }
-                if (cls3_1 == qf7) {
-                    unsigned int lowb3_1 = (u3_1 ^ (unsigned int)((int)u3_1 >> 31) & 2047) & 2047;
-                    key3_1 = 536870912 | lowb3_1 << 11 | (unsigned int)t4_4_5;
-                }
-                kk2[1] = key3_1;
+                kk2[1] = key8_1;
             }
             kk2[2] = 0;
             int s5_40 = lane_1 + 64;
@@ -1983,19 +1973,14 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                 float _min_201 = fminf(sc_3, 1.7014118346046923e+38f);
                 sc_3 = _min_201;
                 sc_3 = sc_3;
-                float sc3_2 = sc_3;
-                unsigned int u3_2 = __as_u32(sc3_2);
-                unsigned int cls3_2 = u3_2 & 4294965248u;
-                unsigned int key3_2 = 0;
-                unsigned int img_3 = cls3_2 ^ (unsigned int)((int)cls3_2 >> 31) & 2147483647;
-                if (thr2 < (int)img_3) {
-                    key3_2 = 1073741824 | (unsigned int)t4_4_6;
+                float sc8_2 = sc_3;
+                unsigned int u8_2 = __as_u32(sc8_2);
+                unsigned int key8_2 = 0;
+                if ((u8_2 & 4294965248u) == qf7) {
+                    unsigned int lowb8_2 = (u8_2 ^ (unsigned int)((int)u8_2 >> 31) & 2047) & 2047;
+                    key8_2 = 536870912 | lowb8_2 << 11 | (unsigned int)t4_4_6;
                 }
-                if (cls3_2 == qf7) {
-                    unsigned int lowb3_2 = (u3_2 ^ (unsigned int)((int)u3_2 >> 31) & 2047) & 2047;
-                    key3_2 = 536870912 | lowb3_2 << 11 | (unsigned int)t4_4_6;
-                }
-                kk2[2] = key3_2;
+                kk2[2] = key8_2;
             }
             kk2[3] = 0;
             int s5_48 = lane_1 + 96;
@@ -2021,19 +2006,14 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                 float _min_202 = fminf(sc_4, 1.7014118346046923e+38f);
                 sc_4 = _min_202;
                 sc_4 = sc_4;
-                float sc3_3 = sc_4;
-                unsigned int u3_3 = __as_u32(sc3_3);
-                unsigned int cls3_3 = u3_3 & 4294965248u;
-                unsigned int key3_3 = 0;
-                unsigned int img_4 = cls3_3 ^ (unsigned int)((int)cls3_3 >> 31) & 2147483647;
-                if (thr2 < (int)img_4) {
-                    key3_3 = 1073741824 | (unsigned int)t4_4_7;
+                float sc8_3 = sc_4;
+                unsigned int u8_3 = __as_u32(sc8_3);
+                unsigned int key8_3 = 0;
+                if ((u8_3 & 4294965248u) == qf7) {
+                    unsigned int lowb8_3 = (u8_3 ^ (unsigned int)((int)u8_3 >> 31) & 2047) & 2047;
+                    key8_3 = 536870912 | lowb8_3 << 11 | (unsigned int)t4_4_7;
                 }
-                if (cls3_3 == qf7) {
-                    unsigned int lowb3_3 = (u3_3 ^ (unsigned int)((int)u3_3 >> 31) & 2047) & 2047;
-                    key3_3 = 536870912 | lowb3_3 << 11 | (unsigned int)t4_4_7;
-                }
-                kk2[3] = key3_3;
+                kk2[3] = key8_3;
             }
             int n3 = 0;
             if (kk2[0] != 0) {
@@ -2051,10 +2031,10 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
             if (n3 > 0) {
                 unsigned int _atomic_old_0 = atomicAdd(&ccnt[fc7], (unsigned int)n3);
                 unsigned int base3 = _atomic_old_0;
-                if (base3 + (unsigned int)n3 > 32) {
+                if (base3 + (unsigned int)n3 > 16) {
                     flagw[1] = 1;
                 } else {
-                    int pos3 = fc7 * 32 + (int)base3;
+                    int pos3 = fc7 * 16 + (int)base3;
                     if (kk2[0] != 0) {
                         cbuf[pos3] = kk2[0];
                         pos3 = pos3 + 1;
@@ -2075,35 +2055,35 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
             }
         }
         asm volatile("barrier.sync 8, 512;" ::: "memory");
-        unsigned int need_full = flagw[1];
-        unsigned int cntc = ccnt[c];
-        int ovf = 0;
-        if (flagged != 0 && cntc > 32) {
-            ovf = 1;
+        unsigned int need_fullx = flagw[1];
+        unsigned int cntx = ccnt[c];
+        int ovfx = 0;
+        if (flagged != 0 && cntx > 16) {
+            ovfx = 1;
         }
-        if (need_full != 0) {
-            int lim2f = 0;
-            if (ovf != 0) {
-                lim2f = lim;
+        if (need_fullx != 0) {
+            int lim2x = 0;
+            if (ovfx != 0) {
+                lim2x = lim;
             }
-            float a2f[16];
-            a2f[0] = 0.0f;
-            a2f[1] = 0.0f;
-            a2f[2] = 0.0f;
-            a2f[3] = 0.0f;
-            a2f[4] = 0.0f;
-            a2f[5] = 0.0f;
-            a2f[6] = 0.0f;
-            a2f[7] = 0.0f;
-            a2f[8] = 0.0f;
-            a2f[9] = 0.0f;
-            a2f[10] = 0.0f;
-            a2f[11] = 0.0f;
-            a2f[12] = 0.0f;
-            a2f[13] = 0.0f;
-            a2f[14] = 0.0f;
-            a2f[15] = 0.0f;
-            int _vote_1 = __any_sync(0xFFFFFFFF, ovf != 0);
+            float a2x[16];
+            a2x[0] = 0.0f;
+            a2x[1] = 0.0f;
+            a2x[2] = 0.0f;
+            a2x[3] = 0.0f;
+            a2x[4] = 0.0f;
+            a2x[5] = 0.0f;
+            a2x[6] = 0.0f;
+            a2x[7] = 0.0f;
+            a2x[8] = 0.0f;
+            a2x[9] = 0.0f;
+            a2x[10] = 0.0f;
+            a2x[11] = 0.0f;
+            a2x[12] = 0.0f;
+            a2x[13] = 0.0f;
+            a2x[14] = 0.0f;
+            a2x[15] = 0.0f;
+            int _vote_1 = __any_sync(0xFFFFFFFF, ovfx != 0);
             if (_vote_1 != 0) {
                 unsigned int cb2[16];
                 unsigned int nb2[16];
@@ -2112,67 +2092,67 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                 int t0_2_1 = t0_1_1;
                 long long p_3_1 = cbase + (long long)t0_2_1 * nq64;
                 cb2[0] = 4286578688;
-                if (lim2f > t0_2_1) {
+                if (lim2x > t0_2_1) {
                     cb2[0] = S[p_3_1];
                 }
                 cb2[1] = 4286578688;
-                if (lim2f > t0_2_1 + 1) {
+                if (lim2x > t0_2_1 + 1) {
                     cb2[1] = S[p_3_1 + nq64];
                 }
                 cb2[2] = 4286578688;
-                if (lim2f > t0_2_1 + 2) {
+                if (lim2x > t0_2_1 + 2) {
                     cb2[2] = S[p_3_1 + 2 * nq64];
                 }
                 cb2[3] = 4286578688;
-                if (lim2f > t0_2_1 + 3) {
+                if (lim2x > t0_2_1 + 3) {
                     cb2[3] = S[p_3_1 + 3 * nq64];
                 }
                 cb2[4] = 4286578688;
-                if (lim2f > t0_2_1 + 4) {
+                if (lim2x > t0_2_1 + 4) {
                     cb2[4] = S[p_3_1 + 4 * nq64];
                 }
                 cb2[5] = 4286578688;
-                if (lim2f > t0_2_1 + 5) {
+                if (lim2x > t0_2_1 + 5) {
                     cb2[5] = S[p_3_1 + 5 * nq64];
                 }
                 cb2[6] = 4286578688;
-                if (lim2f > t0_2_1 + 6) {
+                if (lim2x > t0_2_1 + 6) {
                     cb2[6] = S[p_3_1 + 6 * nq64];
                 }
                 cb2[7] = 4286578688;
-                if (lim2f > t0_2_1 + 7) {
+                if (lim2x > t0_2_1 + 7) {
                     cb2[7] = S[p_3_1 + 7 * nq64];
                 }
                 cb2[8] = 4286578688;
-                if (lim2f > t0_2_1 + 8) {
+                if (lim2x > t0_2_1 + 8) {
                     cb2[8] = S[p_3_1 + 8 * nq64];
                 }
                 cb2[9] = 4286578688;
-                if (lim2f > t0_2_1 + 9) {
+                if (lim2x > t0_2_1 + 9) {
                     cb2[9] = S[p_3_1 + 9 * nq64];
                 }
                 cb2[10] = 4286578688;
-                if (lim2f > t0_2_1 + 10) {
+                if (lim2x > t0_2_1 + 10) {
                     cb2[10] = S[p_3_1 + 10 * nq64];
                 }
                 cb2[11] = 4286578688;
-                if (lim2f > t0_2_1 + 11) {
+                if (lim2x > t0_2_1 + 11) {
                     cb2[11] = S[p_3_1 + 11 * nq64];
                 }
                 cb2[12] = 4286578688;
-                if (lim2f > t0_2_1 + 12) {
+                if (lim2x > t0_2_1 + 12) {
                     cb2[12] = S[p_3_1 + 12 * nq64];
                 }
                 cb2[13] = 4286578688;
-                if (lim2f > t0_2_1 + 13) {
+                if (lim2x > t0_2_1 + 13) {
                     cb2[13] = S[p_3_1 + 13 * nq64];
                 }
                 cb2[14] = 4286578688;
-                if (lim2f > t0_2_1 + 14) {
+                if (lim2x > t0_2_1 + 14) {
                     cb2[14] = S[p_3_1 + 14 * nq64];
                 }
                 cb2[15] = 4286578688;
-                if (lim2f > t0_2_1 + 15) {
+                if (lim2x > t0_2_1 + 15) {
                     cb2[15] = S[p_3_1 + 15 * nq64];
                 }
                 asm volatile("" ::: "memory");
@@ -2182,67 +2162,67 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                     int t0_4_1 = t0_3;
                     long long p_5 = cbase + (long long)t0_4_1 * nq64;
                     nb2[0] = 4286578688;
-                    if (lim2f > t0_4_1) {
+                    if (lim2x > t0_4_1) {
                         nb2[0] = S[p_5];
                     }
                     nb2[1] = 4286578688;
-                    if (lim2f > t0_4_1 + 1) {
+                    if (lim2x > t0_4_1 + 1) {
                         nb2[1] = S[p_5 + nq64];
                     }
                     nb2[2] = 4286578688;
-                    if (lim2f > t0_4_1 + 2) {
+                    if (lim2x > t0_4_1 + 2) {
                         nb2[2] = S[p_5 + 2 * nq64];
                     }
                     nb2[3] = 4286578688;
-                    if (lim2f > t0_4_1 + 3) {
+                    if (lim2x > t0_4_1 + 3) {
                         nb2[3] = S[p_5 + 3 * nq64];
                     }
                     nb2[4] = 4286578688;
-                    if (lim2f > t0_4_1 + 4) {
+                    if (lim2x > t0_4_1 + 4) {
                         nb2[4] = S[p_5 + 4 * nq64];
                     }
                     nb2[5] = 4286578688;
-                    if (lim2f > t0_4_1 + 5) {
+                    if (lim2x > t0_4_1 + 5) {
                         nb2[5] = S[p_5 + 5 * nq64];
                     }
                     nb2[6] = 4286578688;
-                    if (lim2f > t0_4_1 + 6) {
+                    if (lim2x > t0_4_1 + 6) {
                         nb2[6] = S[p_5 + 6 * nq64];
                     }
                     nb2[7] = 4286578688;
-                    if (lim2f > t0_4_1 + 7) {
+                    if (lim2x > t0_4_1 + 7) {
                         nb2[7] = S[p_5 + 7 * nq64];
                     }
                     nb2[8] = 4286578688;
-                    if (lim2f > t0_4_1 + 8) {
+                    if (lim2x > t0_4_1 + 8) {
                         nb2[8] = S[p_5 + 8 * nq64];
                     }
                     nb2[9] = 4286578688;
-                    if (lim2f > t0_4_1 + 9) {
+                    if (lim2x > t0_4_1 + 9) {
                         nb2[9] = S[p_5 + 9 * nq64];
                     }
                     nb2[10] = 4286578688;
-                    if (lim2f > t0_4_1 + 10) {
+                    if (lim2x > t0_4_1 + 10) {
                         nb2[10] = S[p_5 + 10 * nq64];
                     }
                     nb2[11] = 4286578688;
-                    if (lim2f > t0_4_1 + 11) {
+                    if (lim2x > t0_4_1 + 11) {
                         nb2[11] = S[p_5 + 11 * nq64];
                     }
                     nb2[12] = 4286578688;
-                    if (lim2f > t0_4_1 + 12) {
+                    if (lim2x > t0_4_1 + 12) {
                         nb2[12] = S[p_5 + 12 * nq64];
                     }
                     nb2[13] = 4286578688;
-                    if (lim2f > t0_4_1 + 13) {
+                    if (lim2x > t0_4_1 + 13) {
                         nb2[13] = S[p_5 + 13 * nq64];
                     }
                     nb2[14] = 4286578688;
-                    if (lim2f > t0_4_1 + 14) {
+                    if (lim2x > t0_4_1 + 14) {
                         nb2[14] = S[p_5 + 14 * nq64];
                     }
                     nb2[15] = 4286578688;
-                    if (lim2f > t0_4_1 + 15) {
+                    if (lim2x > t0_4_1 + 15) {
                         nb2[15] = S[p_5 + 15 * nq64];
                     }
                     asm volatile("" ::: "memory");
@@ -2250,8 +2230,8 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                     int t0_7 = t0_6;
                     int thr_1 = 2147483647;
                     if (qc != 4294967295u) {
-                        unsigned int img_5 = qc ^ (unsigned int)((int)qc >> 31) & 2147483647;
-                        thr_1 = (int)img_5;
+                        unsigned int img_1 = qc ^ (unsigned int)((int)qc >> 31) & 2147483647;
+                        thr_1 = (int)img_1;
                     }
                     int thr_8 = thr_1;
                     float sc_5 = __uint_as_float(cb2[0]);
@@ -2264,8 +2244,8 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                     unsigned int u = __as_u32(sc_9);
                     unsigned int cls = u & 4294965248u;
                     unsigned int key_1 = 0;
-                    unsigned int img_6 = cls ^ (unsigned int)((int)cls >> 31) & 2147483647;
-                    if (thr_8 < (int)img_6) {
+                    unsigned int img_2 = cls ^ (unsigned int)((int)cls >> 31) & 2147483647;
+                    if (thr_8 < (int)img_2) {
                         key_1 = 1073741824 | (unsigned int)t0_7;
                     }
                     if (cls == qc) {
@@ -2937,246 +2917,246 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                         float lo_143_1 = _min_278;
                         kb2[8] = hi_142_1;
                         kb2[9] = lo_143_1;
-                        float _fmax_311 = fmaxf(a2f[0], kb2[15]);
+                        float _fmax_311 = fmaxf(a2x[0], kb2[15]);
                         float hi_144_1 = _fmax_311;
-                        a2f[0] = hi_144_1;
-                        float _fmax_312 = fmaxf(a2f[1], kb2[14]);
+                        a2x[0] = hi_144_1;
+                        float _fmax_312 = fmaxf(a2x[1], kb2[14]);
                         float hi_146_1 = _fmax_312;
-                        a2f[1] = hi_146_1;
-                        float _fmax_313 = fmaxf(a2f[2], kb2[13]);
+                        a2x[1] = hi_146_1;
+                        float _fmax_313 = fmaxf(a2x[2], kb2[13]);
                         float hi_147 = _fmax_313;
-                        a2f[2] = hi_147;
-                        float _fmax_314 = fmaxf(a2f[3], kb2[12]);
+                        a2x[2] = hi_147;
+                        float _fmax_314 = fmaxf(a2x[3], kb2[12]);
                         float hi_149 = _fmax_314;
-                        a2f[3] = hi_149;
-                        float _fmax_315 = fmaxf(a2f[4], kb2[11]);
+                        a2x[3] = hi_149;
+                        float _fmax_315 = fmaxf(a2x[4], kb2[11]);
                         float hi_150_1 = _fmax_315;
-                        a2f[4] = hi_150_1;
-                        float _fmax_316 = fmaxf(a2f[5], kb2[10]);
+                        a2x[4] = hi_150_1;
+                        float _fmax_316 = fmaxf(a2x[5], kb2[10]);
                         float hi_152_1 = _fmax_316;
-                        a2f[5] = hi_152_1;
-                        float _fmax_317 = fmaxf(a2f[6], kb2[9]);
+                        a2x[5] = hi_152_1;
+                        float _fmax_317 = fmaxf(a2x[6], kb2[9]);
                         float hi_153 = _fmax_317;
-                        a2f[6] = hi_153;
-                        float _fmax_318 = fmaxf(a2f[7], kb2[8]);
+                        a2x[6] = hi_153;
+                        float _fmax_318 = fmaxf(a2x[7], kb2[8]);
                         float hi_155 = _fmax_318;
-                        a2f[7] = hi_155;
-                        float _fmax_319 = fmaxf(a2f[8], kb2[7]);
+                        a2x[7] = hi_155;
+                        float _fmax_319 = fmaxf(a2x[8], kb2[7]);
                         float hi_156_1 = _fmax_319;
-                        a2f[8] = hi_156_1;
-                        float _fmax_320 = fmaxf(a2f[9], kb2[6]);
+                        a2x[8] = hi_156_1;
+                        float _fmax_320 = fmaxf(a2x[9], kb2[6]);
                         float hi_157 = _fmax_320;
-                        a2f[9] = hi_157;
-                        float _fmax_321 = fmaxf(a2f[10], kb2[5]);
+                        a2x[9] = hi_157;
+                        float _fmax_321 = fmaxf(a2x[10], kb2[5]);
                         float hi_158_1 = _fmax_321;
-                        a2f[10] = hi_158_1;
-                        float _fmax_322 = fmaxf(a2f[11], kb2[4]);
+                        a2x[10] = hi_158_1;
+                        float _fmax_322 = fmaxf(a2x[11], kb2[4]);
                         float hi_159 = _fmax_322;
-                        a2f[11] = hi_159;
-                        float _fmax_323 = fmaxf(a2f[12], kb2[3]);
+                        a2x[11] = hi_159;
+                        float _fmax_323 = fmaxf(a2x[12], kb2[3]);
                         float hi_160_1 = _fmax_323;
-                        a2f[12] = hi_160_1;
-                        float _fmax_324 = fmaxf(a2f[13], kb2[2]);
+                        a2x[12] = hi_160_1;
+                        float _fmax_324 = fmaxf(a2x[13], kb2[2]);
                         float hi_162_1 = _fmax_324;
-                        a2f[13] = hi_162_1;
-                        float _fmax_325 = fmaxf(a2f[14], kb2[1]);
+                        a2x[13] = hi_162_1;
+                        float _fmax_325 = fmaxf(a2x[14], kb2[1]);
                         float hi_163 = _fmax_325;
-                        a2f[14] = hi_163;
-                        float _fmax_326 = fmaxf(a2f[15], kb2[0]);
+                        a2x[14] = hi_163;
+                        float _fmax_326 = fmaxf(a2x[15], kb2[0]);
                         float hi_165 = _fmax_326;
-                        a2f[15] = hi_165;
-                        float _fmax_327 = fmaxf(a2f[0], a2f[8]);
+                        a2x[15] = hi_165;
+                        float _fmax_327 = fmaxf(a2x[0], a2x[8]);
                         float hi_166_1 = _fmax_327;
-                        float _min_279 = fminf(a2f[0], a2f[8]);
+                        float _min_279 = fminf(a2x[0], a2x[8]);
                         float lo_167_1 = _min_279;
-                        a2f[0] = hi_166_1;
-                        a2f[8] = lo_167_1;
-                        float _fmax_328 = fmaxf(a2f[1], a2f[9]);
+                        a2x[0] = hi_166_1;
+                        a2x[8] = lo_167_1;
+                        float _fmax_328 = fmaxf(a2x[1], a2x[9]);
                         float hi_168_1 = _fmax_328;
-                        float _min_280 = fminf(a2f[1], a2f[9]);
+                        float _min_280 = fminf(a2x[1], a2x[9]);
                         float lo_169_1 = _min_280;
-                        a2f[1] = hi_168_1;
-                        a2f[9] = lo_169_1;
-                        float _fmax_329 = fmaxf(a2f[2], a2f[10]);
+                        a2x[1] = hi_168_1;
+                        a2x[9] = lo_169_1;
+                        float _fmax_329 = fmaxf(a2x[2], a2x[10]);
                         float hi_171 = _fmax_329;
-                        float _min_281 = fminf(a2f[2], a2f[10]);
+                        float _min_281 = fminf(a2x[2], a2x[10]);
                         float lo_172 = _min_281;
-                        a2f[2] = hi_171;
-                        a2f[10] = lo_172;
-                        float _fmax_330 = fmaxf(a2f[3], a2f[11]);
+                        a2x[2] = hi_171;
+                        a2x[10] = lo_172;
+                        float _fmax_330 = fmaxf(a2x[3], a2x[11]);
                         float hi_173 = _fmax_330;
-                        float _min_282 = fminf(a2f[3], a2f[11]);
+                        float _min_282 = fminf(a2x[3], a2x[11]);
                         float lo_174 = _min_282;
-                        a2f[3] = hi_173;
-                        a2f[11] = lo_174;
-                        float _fmax_331 = fmaxf(a2f[4], a2f[12]);
+                        a2x[3] = hi_173;
+                        a2x[11] = lo_174;
+                        float _fmax_331 = fmaxf(a2x[4], a2x[12]);
                         float hi_175 = _fmax_331;
-                        float _min_283 = fminf(a2f[4], a2f[12]);
+                        float _min_283 = fminf(a2x[4], a2x[12]);
                         float lo_176 = _min_283;
-                        a2f[4] = hi_175;
-                        a2f[12] = lo_176;
-                        float _fmax_332 = fmaxf(a2f[5], a2f[13]);
+                        a2x[4] = hi_175;
+                        a2x[12] = lo_176;
+                        float _fmax_332 = fmaxf(a2x[5], a2x[13]);
                         float hi_178_1 = _fmax_332;
-                        float _min_284 = fminf(a2f[5], a2f[13]);
+                        float _min_284 = fminf(a2x[5], a2x[13]);
                         float lo_179_1 = _min_284;
-                        a2f[5] = hi_178_1;
-                        a2f[13] = lo_179_1;
-                        float _fmax_333 = fmaxf(a2f[6], a2f[14]);
+                        a2x[5] = hi_178_1;
+                        a2x[13] = lo_179_1;
+                        float _fmax_333 = fmaxf(a2x[6], a2x[14]);
                         float hi_181 = _fmax_333;
-                        float _min_285 = fminf(a2f[6], a2f[14]);
+                        float _min_285 = fminf(a2x[6], a2x[14]);
                         float lo_182 = _min_285;
-                        a2f[6] = hi_181;
-                        a2f[14] = lo_182;
-                        float _fmax_334 = fmaxf(a2f[7], a2f[15]);
+                        a2x[6] = hi_181;
+                        a2x[14] = lo_182;
+                        float _fmax_334 = fmaxf(a2x[7], a2x[15]);
                         float hi_184_1 = _fmax_334;
-                        float _min_286 = fminf(a2f[7], a2f[15]);
+                        float _min_286 = fminf(a2x[7], a2x[15]);
                         float lo_185_1 = _min_286;
-                        a2f[7] = hi_184_1;
-                        a2f[15] = lo_185_1;
-                        float _fmax_335 = fmaxf(a2f[0], a2f[4]);
+                        a2x[7] = hi_184_1;
+                        a2x[15] = lo_185_1;
+                        float _fmax_335 = fmaxf(a2x[0], a2x[4]);
                         float hi_187 = _fmax_335;
-                        float _min_287 = fminf(a2f[0], a2f[4]);
+                        float _min_287 = fminf(a2x[0], a2x[4]);
                         float lo_188 = _min_287;
-                        a2f[0] = hi_187;
-                        a2f[4] = lo_188;
-                        float _fmax_336 = fmaxf(a2f[1], a2f[5]);
+                        a2x[0] = hi_187;
+                        a2x[4] = lo_188;
+                        float _fmax_336 = fmaxf(a2x[1], a2x[5]);
                         float hi_189 = _fmax_336;
-                        float _min_288 = fminf(a2f[1], a2f[5]);
+                        float _min_288 = fminf(a2x[1], a2x[5]);
                         float lo_190 = _min_288;
-                        a2f[1] = hi_189;
-                        a2f[5] = lo_190;
-                        float _fmax_337 = fmaxf(a2f[2], a2f[6]);
+                        a2x[1] = hi_189;
+                        a2x[5] = lo_190;
+                        float _fmax_337 = fmaxf(a2x[2], a2x[6]);
                         float hi_191 = _fmax_337;
-                        float _min_289 = fminf(a2f[2], a2f[6]);
+                        float _min_289 = fminf(a2x[2], a2x[6]);
                         float lo_192 = _min_289;
-                        a2f[2] = hi_191;
-                        a2f[6] = lo_192;
-                        float _fmax_338 = fmaxf(a2f[3], a2f[7]);
+                        a2x[2] = hi_191;
+                        a2x[6] = lo_192;
+                        float _fmax_338 = fmaxf(a2x[3], a2x[7]);
                         float hi_194_1 = _fmax_338;
-                        float _min_290 = fminf(a2f[3], a2f[7]);
+                        float _min_290 = fminf(a2x[3], a2x[7]);
                         float lo_195_1 = _min_290;
-                        a2f[3] = hi_194_1;
-                        a2f[7] = lo_195_1;
-                        float _fmax_339 = fmaxf(a2f[8], a2f[12]);
+                        a2x[3] = hi_194_1;
+                        a2x[7] = lo_195_1;
+                        float _fmax_339 = fmaxf(a2x[8], a2x[12]);
                         float hi_197 = _fmax_339;
-                        float _min_291 = fminf(a2f[8], a2f[12]);
+                        float _min_291 = fminf(a2x[8], a2x[12]);
                         float lo_198 = _min_291;
-                        a2f[8] = hi_197;
-                        a2f[12] = lo_198;
-                        float _fmax_340 = fmaxf(a2f[9], a2f[13]);
+                        a2x[8] = hi_197;
+                        a2x[12] = lo_198;
+                        float _fmax_340 = fmaxf(a2x[9], a2x[13]);
                         float hi_200_1 = _fmax_340;
-                        float _min_292 = fminf(a2f[9], a2f[13]);
+                        float _min_292 = fminf(a2x[9], a2x[13]);
                         float lo_201_1 = _min_292;
-                        a2f[9] = hi_200_1;
-                        a2f[13] = lo_201_1;
-                        float _fmax_341 = fmaxf(a2f[10], a2f[14]);
+                        a2x[9] = hi_200_1;
+                        a2x[13] = lo_201_1;
+                        float _fmax_341 = fmaxf(a2x[10], a2x[14]);
                         float hi_203 = _fmax_341;
-                        float _min_293 = fminf(a2f[10], a2f[14]);
+                        float _min_293 = fminf(a2x[10], a2x[14]);
                         float lo_204 = _min_293;
-                        a2f[10] = hi_203;
-                        a2f[14] = lo_204;
-                        float _fmax_342 = fmaxf(a2f[11], a2f[15]);
+                        a2x[10] = hi_203;
+                        a2x[14] = lo_204;
+                        float _fmax_342 = fmaxf(a2x[11], a2x[15]);
                         float hi_205 = _fmax_342;
-                        float _min_294 = fminf(a2f[11], a2f[15]);
+                        float _min_294 = fminf(a2x[11], a2x[15]);
                         float lo_206 = _min_294;
-                        a2f[11] = hi_205;
-                        a2f[15] = lo_206;
-                        float _fmax_343 = fmaxf(a2f[0], a2f[2]);
+                        a2x[11] = hi_205;
+                        a2x[15] = lo_206;
+                        float _fmax_343 = fmaxf(a2x[0], a2x[2]);
                         float hi_207 = _fmax_343;
-                        float _min_295 = fminf(a2f[0], a2f[2]);
+                        float _min_295 = fminf(a2x[0], a2x[2]);
                         float lo_208 = _min_295;
-                        a2f[0] = hi_207;
-                        a2f[2] = lo_208;
-                        float _fmax_344 = fmaxf(a2f[1], a2f[3]);
+                        a2x[0] = hi_207;
+                        a2x[2] = lo_208;
+                        float _fmax_344 = fmaxf(a2x[1], a2x[3]);
                         float hi_210_1 = _fmax_344;
-                        float _min_296 = fminf(a2f[1], a2f[3]);
+                        float _min_296 = fminf(a2x[1], a2x[3]);
                         float lo_211_1 = _min_296;
-                        a2f[1] = hi_210_1;
-                        a2f[3] = lo_211_1;
-                        float _fmax_345 = fmaxf(a2f[4], a2f[6]);
+                        a2x[1] = hi_210_1;
+                        a2x[3] = lo_211_1;
+                        float _fmax_345 = fmaxf(a2x[4], a2x[6]);
                         float hi_213 = _fmax_345;
-                        float _min_297 = fminf(a2f[4], a2f[6]);
+                        float _min_297 = fminf(a2x[4], a2x[6]);
                         float lo_214 = _min_297;
-                        a2f[4] = hi_213;
-                        a2f[6] = lo_214;
-                        float _fmax_346 = fmaxf(a2f[5], a2f[7]);
+                        a2x[4] = hi_213;
+                        a2x[6] = lo_214;
+                        float _fmax_346 = fmaxf(a2x[5], a2x[7]);
                         float hi_216_1 = _fmax_346;
-                        float _min_298 = fminf(a2f[5], a2f[7]);
+                        float _min_298 = fminf(a2x[5], a2x[7]);
                         float lo_217_1 = _min_298;
-                        a2f[5] = hi_216_1;
-                        a2f[7] = lo_217_1;
-                        float _fmax_347 = fmaxf(a2f[8], a2f[10]);
+                        a2x[5] = hi_216_1;
+                        a2x[7] = lo_217_1;
+                        float _fmax_347 = fmaxf(a2x[8], a2x[10]);
                         float hi_219 = _fmax_347;
-                        float _min_299 = fminf(a2f[8], a2f[10]);
+                        float _min_299 = fminf(a2x[8], a2x[10]);
                         float lo_220 = _min_299;
-                        a2f[8] = hi_219;
-                        a2f[10] = lo_220;
-                        float _fmax_348 = fmaxf(a2f[9], a2f[11]);
+                        a2x[8] = hi_219;
+                        a2x[10] = lo_220;
+                        float _fmax_348 = fmaxf(a2x[9], a2x[11]);
                         float hi_221 = _fmax_348;
-                        float _min_300 = fminf(a2f[9], a2f[11]);
+                        float _min_300 = fminf(a2x[9], a2x[11]);
                         float lo_222 = _min_300;
-                        a2f[9] = hi_221;
-                        a2f[11] = lo_222;
-                        float _fmax_349 = fmaxf(a2f[12], a2f[14]);
+                        a2x[9] = hi_221;
+                        a2x[11] = lo_222;
+                        float _fmax_349 = fmaxf(a2x[12], a2x[14]);
                         float hi_223 = _fmax_349;
-                        float _min_301 = fminf(a2f[12], a2f[14]);
+                        float _min_301 = fminf(a2x[12], a2x[14]);
                         float lo_224 = _min_301;
-                        a2f[12] = hi_223;
-                        a2f[14] = lo_224;
-                        float _fmax_350 = fmaxf(a2f[13], a2f[15]);
+                        a2x[12] = hi_223;
+                        a2x[14] = lo_224;
+                        float _fmax_350 = fmaxf(a2x[13], a2x[15]);
                         float hi_226_1 = _fmax_350;
-                        float _min_302 = fminf(a2f[13], a2f[15]);
+                        float _min_302 = fminf(a2x[13], a2x[15]);
                         float lo_227_1 = _min_302;
-                        a2f[13] = hi_226_1;
-                        a2f[15] = lo_227_1;
-                        float _fmax_351 = fmaxf(a2f[0], a2f[1]);
+                        a2x[13] = hi_226_1;
+                        a2x[15] = lo_227_1;
+                        float _fmax_351 = fmaxf(a2x[0], a2x[1]);
                         float hi_229 = _fmax_351;
-                        float _min_303 = fminf(a2f[0], a2f[1]);
+                        float _min_303 = fminf(a2x[0], a2x[1]);
                         float lo_230 = _min_303;
-                        a2f[0] = hi_229;
-                        a2f[1] = lo_230;
-                        float _fmax_352 = fmaxf(a2f[2], a2f[3]);
+                        a2x[0] = hi_229;
+                        a2x[1] = lo_230;
+                        float _fmax_352 = fmaxf(a2x[2], a2x[3]);
                         float hi_232_1 = _fmax_352;
-                        float _min_304 = fminf(a2f[2], a2f[3]);
+                        float _min_304 = fminf(a2x[2], a2x[3]);
                         float lo_233_1 = _min_304;
-                        a2f[2] = hi_232_1;
-                        a2f[3] = lo_233_1;
-                        float _fmax_353 = fmaxf(a2f[4], a2f[5]);
+                        a2x[2] = hi_232_1;
+                        a2x[3] = lo_233_1;
+                        float _fmax_353 = fmaxf(a2x[4], a2x[5]);
                         float hi_235 = _fmax_353;
-                        float _min_305 = fminf(a2f[4], a2f[5]);
+                        float _min_305 = fminf(a2x[4], a2x[5]);
                         float lo_236 = _min_305;
-                        a2f[4] = hi_235;
-                        a2f[5] = lo_236;
-                        float _fmax_354 = fmaxf(a2f[6], a2f[7]);
+                        a2x[4] = hi_235;
+                        a2x[5] = lo_236;
+                        float _fmax_354 = fmaxf(a2x[6], a2x[7]);
                         float hi_237 = _fmax_354;
-                        float _min_306 = fminf(a2f[6], a2f[7]);
+                        float _min_306 = fminf(a2x[6], a2x[7]);
                         float lo_238 = _min_306;
-                        a2f[6] = hi_237;
-                        a2f[7] = lo_238;
-                        float _fmax_355 = fmaxf(a2f[8], a2f[9]);
+                        a2x[6] = hi_237;
+                        a2x[7] = lo_238;
+                        float _fmax_355 = fmaxf(a2x[8], a2x[9]);
                         float hi_239 = _fmax_355;
-                        float _min_307 = fminf(a2f[8], a2f[9]);
+                        float _min_307 = fminf(a2x[8], a2x[9]);
                         float lo_240 = _min_307;
-                        a2f[8] = hi_239;
-                        a2f[9] = lo_240;
-                        float _fmax_356 = fmaxf(a2f[10], a2f[11]);
+                        a2x[8] = hi_239;
+                        a2x[9] = lo_240;
+                        float _fmax_356 = fmaxf(a2x[10], a2x[11]);
                         float hi_241 = _fmax_356;
-                        float _min_308 = fminf(a2f[10], a2f[11]);
+                        float _min_308 = fminf(a2x[10], a2x[11]);
                         float lo_242 = _min_308;
-                        a2f[10] = hi_241;
-                        a2f[11] = lo_242;
-                        float _fmax_357 = fmaxf(a2f[12], a2f[13]);
+                        a2x[10] = hi_241;
+                        a2x[11] = lo_242;
+                        float _fmax_357 = fmaxf(a2x[12], a2x[13]);
                         float hi_243 = _fmax_357;
-                        float _min_309 = fminf(a2f[12], a2f[13]);
+                        float _min_309 = fminf(a2x[12], a2x[13]);
                         float lo_244 = _min_309;
-                        a2f[12] = hi_243;
-                        a2f[13] = lo_244;
-                        float _fmax_358 = fmaxf(a2f[14], a2f[15]);
+                        a2x[12] = hi_243;
+                        a2x[13] = lo_244;
+                        float _fmax_358 = fmaxf(a2x[14], a2x[15]);
                         float hi_245 = _fmax_358;
-                        float _min_310 = fminf(a2f[14], a2f[15]);
+                        float _min_310 = fminf(a2x[14], a2x[15]);
                         float lo_246 = _min_310;
-                        a2f[14] = hi_245;
-                        a2f[15] = lo_246;
+                        a2x[14] = hi_245;
+                        a2x[15] = lo_246;
                     }
                     cb2[0] = nb2[0];
                     cb2[1] = nb2[1];
@@ -3196,24 +3176,24 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
                     cb2[15] = nb2[15];
                 }
             }
-            float rr2f[1];
+            float rr2x[1];
             int pb_0 = tid_1 * 17;
-            pub[pb_0] = a2f[0];
-            pub[pb_0 + 1] = a2f[1];
-            pub[pb_0 + 2] = a2f[2];
-            pub[pb_0 + 3] = a2f[3];
-            pub[pb_0 + 4] = a2f[4];
-            pub[pb_0 + 5] = a2f[5];
-            pub[pb_0 + 6] = a2f[6];
-            pub[pb_0 + 7] = a2f[7];
-            pub[pb_0 + 8] = a2f[8];
-            pub[pb_0 + 9] = a2f[9];
-            pub[pb_0 + 10] = a2f[10];
-            pub[pb_0 + 11] = a2f[11];
-            pub[pb_0 + 12] = a2f[12];
-            pub[pb_0 + 13] = a2f[13];
-            pub[pb_0 + 14] = a2f[14];
-            pub[pb_0 + 15] = a2f[15];
+            pub[pb_0] = a2x[0];
+            pub[pb_0 + 1] = a2x[1];
+            pub[pb_0 + 2] = a2x[2];
+            pub[pb_0 + 3] = a2x[3];
+            pub[pb_0 + 4] = a2x[4];
+            pub[pb_0 + 5] = a2x[5];
+            pub[pb_0 + 6] = a2x[6];
+            pub[pb_0 + 7] = a2x[7];
+            pub[pb_0 + 8] = a2x[8];
+            pub[pb_0 + 9] = a2x[9];
+            pub[pb_0 + 10] = a2x[10];
+            pub[pb_0 + 11] = a2x[11];
+            pub[pb_0 + 12] = a2x[12];
+            pub[pb_0 + 13] = a2x[13];
+            pub[pb_0 + 14] = a2x[14];
+            pub[pb_0 + 15] = a2x[15];
             pub[pb_0 + 16] = neg_inf;
             asm volatile("barrier.sync 8, 512;" ::: "memory");
             float r_1_1 = neg_inf;
@@ -3779,2066 +3759,499 @@ kernel_cake_hopper_msa_4ac46be7cfb44763e180(unsigned int* __restrict__ S, int* _
             float hil_255 = _fmax_445;
             V_2[0] = hil_255;
             float K_256 = V_2[0];
-            rr2f[0] = r_1_1;
+            rr2x[0] = r_1_1;
             K2 = K_256;
         }
         if (tid_1 < 512) {
-            unsigned int cgc = ccnt[cg];
-            if (gflag != 0 && cgc <= 32) {
-                float xg[16];
-                xg[0] = 0.0f;
-                if (cgc > 0) {
-                    xg[0] = __uint_as_float(cbuf[cg * 32]);
-                }
-                xg[1] = 0.0f;
-                if (cgc > 1) {
-                    xg[1] = __uint_as_float(cbuf[cg * 32 + 1]);
-                }
-                xg[2] = 0.0f;
-                if (cgc > 2) {
-                    xg[2] = __uint_as_float(cbuf[cg * 32 + 2]);
-                }
-                xg[3] = 0.0f;
-                if (cgc > 3) {
-                    xg[3] = __uint_as_float(cbuf[cg * 32 + 3]);
-                }
-                xg[4] = 0.0f;
-                if (cgc > 4) {
-                    xg[4] = __uint_as_float(cbuf[cg * 32 + 4]);
-                }
-                xg[5] = 0.0f;
-                if (cgc > 5) {
-                    xg[5] = __uint_as_float(cbuf[cg * 32 + 5]);
-                }
-                xg[6] = 0.0f;
-                if (cgc > 6) {
-                    xg[6] = __uint_as_float(cbuf[cg * 32 + 6]);
-                }
-                xg[7] = 0.0f;
-                if (cgc > 7) {
-                    xg[7] = __uint_as_float(cbuf[cg * 32 + 7]);
-                }
-                xg[8] = 0.0f;
-                if (cgc > 8) {
-                    xg[8] = __uint_as_float(cbuf[cg * 32 + 8]);
-                }
-                xg[9] = 0.0f;
-                if (cgc > 9) {
-                    xg[9] = __uint_as_float(cbuf[cg * 32 + 9]);
-                }
-                xg[10] = 0.0f;
-                if (cgc > 10) {
-                    xg[10] = __uint_as_float(cbuf[cg * 32 + 10]);
-                }
-                xg[11] = 0.0f;
-                if (cgc > 11) {
-                    xg[11] = __uint_as_float(cbuf[cg * 32 + 11]);
-                }
-                xg[12] = 0.0f;
-                if (cgc > 12) {
-                    xg[12] = __uint_as_float(cbuf[cg * 32 + 12]);
-                }
-                xg[13] = 0.0f;
-                if (cgc > 13) {
-                    xg[13] = __uint_as_float(cbuf[cg * 32 + 13]);
-                }
-                xg[14] = 0.0f;
-                if (cgc > 14) {
-                    xg[14] = __uint_as_float(cbuf[cg * 32 + 14]);
-                }
-                xg[15] = 0.0f;
-                if (cgc > 15) {
-                    xg[15] = __uint_as_float(cbuf[cg * 32 + 15]);
-                }
-                float _fmax_446 = fmaxf(xg[0], xg[13]);
-                float hi_0_1 = _fmax_446;
-                float _min_382 = fminf(xg[0], xg[13]);
-                float lo_1_2 = _min_382;
-                xg[0] = hi_0_1;
-                xg[13] = lo_1_2;
-                float _fmax_447 = fmaxf(xg[1], xg[12]);
-                float hi_3_1 = _fmax_447;
-                float _min_383 = fminf(xg[1], xg[12]);
-                float lo_4_1 = _min_383;
-                xg[1] = hi_3_1;
-                xg[12] = lo_4_1;
-                float _fmax_448 = fmaxf(xg[2], xg[15]);
-                float hi_6_1 = _fmax_448;
-                float _min_384 = fminf(xg[2], xg[15]);
-                float lo_7_1 = _min_384;
-                xg[2] = hi_6_1;
-                xg[15] = lo_7_1;
-                float _fmax_449 = fmaxf(xg[3], xg[14]);
-                float hi_9_1 = _fmax_449;
-                float _min_385 = fminf(xg[3], xg[14]);
-                float lo_10_1 = _min_385;
-                xg[3] = hi_9_1;
-                xg[14] = lo_10_1;
-                float _fmax_450 = fmaxf(xg[4], xg[8]);
-                float hi_11_2 = _fmax_450;
-                float _min_386 = fminf(xg[4], xg[8]);
-                float lo_12_2 = _min_386;
-                xg[4] = hi_11_2;
-                xg[8] = lo_12_2;
-                float _fmax_451 = fmaxf(xg[5], xg[6]);
-                float hi_13_1 = _fmax_451;
-                float _min_387 = fminf(xg[5], xg[6]);
-                float lo_14_1 = _min_387;
-                xg[5] = hi_13_1;
-                xg[6] = lo_14_1;
-                float _fmax_452 = fmaxf(xg[7], xg[11]);
-                float hi_15_1 = _fmax_452;
-                float _min_388 = fminf(xg[7], xg[11]);
-                float lo_16_1 = _min_388;
-                xg[7] = hi_15_1;
-                xg[11] = lo_16_1;
-                float _fmax_453 = fmaxf(xg[9], xg[10]);
-                float hi_17_2 = _fmax_453;
-                float _min_389 = fminf(xg[9], xg[10]);
-                float lo_18_2 = _min_389;
-                xg[9] = hi_17_2;
-                xg[10] = lo_18_2;
-                float _fmax_454 = fmaxf(xg[0], xg[5]);
-                float hi_19_1 = _fmax_454;
-                float _min_390 = fminf(xg[0], xg[5]);
-                float lo_20_1 = _min_390;
-                xg[0] = hi_19_1;
-                xg[5] = lo_20_1;
-                float _fmax_455 = fmaxf(xg[1], xg[7]);
-                float hi_22_1 = _fmax_455;
-                float _min_391 = fminf(xg[1], xg[7]);
-                float lo_23_1 = _min_391;
-                xg[1] = hi_22_1;
-                xg[7] = lo_23_1;
-                float _fmax_456 = fmaxf(xg[2], xg[9]);
-                float hi_25_1 = _fmax_456;
-                float _min_392 = fminf(xg[2], xg[9]);
-                float lo_26_1 = _min_392;
-                xg[2] = hi_25_1;
-                xg[9] = lo_26_1;
-                float _fmax_457 = fmaxf(xg[3], xg[4]);
-                float hi_28_1 = _fmax_457;
-                float _min_393 = fminf(xg[3], xg[4]);
-                float lo_29_1 = _min_393;
-                xg[3] = hi_28_1;
-                xg[4] = lo_29_1;
-                float _fmax_458 = fmaxf(xg[6], xg[13]);
-                float hi_30_2 = _fmax_458;
-                float _min_394 = fminf(xg[6], xg[13]);
-                float lo_31_2 = _min_394;
-                xg[6] = hi_30_2;
-                xg[13] = lo_31_2;
-                float _fmax_459 = fmaxf(xg[8], xg[14]);
-                float hi_32_1 = _fmax_459;
-                float _min_395 = fminf(xg[8], xg[14]);
-                float lo_33_1 = _min_395;
-                xg[8] = hi_32_1;
-                xg[14] = lo_33_1;
-                float _fmax_460 = fmaxf(xg[10], xg[15]);
-                float hi_34_1 = _fmax_460;
-                float _min_396 = fminf(xg[10], xg[15]);
-                float lo_35_1 = _min_396;
-                xg[10] = hi_34_1;
-                xg[15] = lo_35_1;
-                float _fmax_461 = fmaxf(xg[11], xg[12]);
-                float hi_36_2 = _fmax_461;
-                float _min_397 = fminf(xg[11], xg[12]);
-                float lo_37_2 = _min_397;
-                xg[11] = hi_36_2;
-                xg[12] = lo_37_2;
-                float _fmax_462 = fmaxf(xg[0], xg[1]);
-                float hi_38_1 = _fmax_462;
-                float _min_398 = fminf(xg[0], xg[1]);
-                float lo_39_1 = _min_398;
-                xg[0] = hi_38_1;
-                xg[1] = lo_39_1;
-                float _fmax_463 = fmaxf(xg[2], xg[3]);
-                float hi_41_1 = _fmax_463;
-                float _min_399 = fminf(xg[2], xg[3]);
-                float lo_42_1 = _min_399;
-                xg[2] = hi_41_1;
-                xg[3] = lo_42_1;
-                float _fmax_464 = fmaxf(xg[4], xg[5]);
-                float hi_44_1 = _fmax_464;
-                float _min_400 = fminf(xg[4], xg[5]);
-                float lo_45_1 = _min_400;
-                xg[4] = hi_44_1;
-                xg[5] = lo_45_1;
-                float _fmax_465 = fmaxf(xg[6], xg[8]);
-                float hi_47_1 = _fmax_465;
-                float _min_401 = fminf(xg[6], xg[8]);
-                float lo_48_1 = _min_401;
-                xg[6] = hi_47_1;
-                xg[8] = lo_48_1;
-                float _fmax_466 = fmaxf(xg[7], xg[9]);
-                float hi_49_2 = _fmax_466;
-                float _min_402 = fminf(xg[7], xg[9]);
-                float lo_50_2 = _min_402;
-                xg[7] = hi_49_2;
-                xg[9] = lo_50_2;
-                float _fmax_467 = fmaxf(xg[10], xg[11]);
-                float hi_51_1 = _fmax_467;
-                float _min_403 = fminf(xg[10], xg[11]);
-                float lo_52_1 = _min_403;
-                xg[10] = hi_51_1;
-                xg[11] = lo_52_1;
-                float _fmax_468 = fmaxf(xg[12], xg[13]);
-                float hi_53_1 = _fmax_468;
-                float _min_404 = fminf(xg[12], xg[13]);
-                float lo_54_1 = _min_404;
-                xg[12] = hi_53_1;
-                xg[13] = lo_54_1;
-                float _fmax_469 = fmaxf(xg[14], xg[15]);
-                float hi_55_2 = _fmax_469;
-                float _min_405 = fminf(xg[14], xg[15]);
-                float lo_56_2 = _min_405;
-                xg[14] = hi_55_2;
-                xg[15] = lo_56_2;
-                float _fmax_470 = fmaxf(xg[0], xg[2]);
-                float hi_57_1 = _fmax_470;
-                float _min_406 = fminf(xg[0], xg[2]);
-                float lo_58_1 = _min_406;
-                xg[0] = hi_57_1;
-                xg[2] = lo_58_1;
-                float _fmax_471 = fmaxf(xg[1], xg[3]);
-                float hi_60_2 = _fmax_471;
-                float _min_407 = fminf(xg[1], xg[3]);
-                float lo_61_2 = _min_407;
-                xg[1] = hi_60_2;
-                xg[3] = lo_61_2;
-                float _fmax_472 = fmaxf(xg[4], xg[10]);
-                float hi_63_1 = _fmax_472;
-                float _min_408 = fminf(xg[4], xg[10]);
-                float lo_64_1 = _min_408;
-                xg[4] = hi_63_1;
-                xg[10] = lo_64_1;
-                float _fmax_473 = fmaxf(xg[5], xg[11]);
-                float hi_66_2 = _fmax_473;
-                float _min_409 = fminf(xg[5], xg[11]);
-                float lo_67_2 = _min_409;
-                xg[5] = hi_66_2;
-                xg[11] = lo_67_2;
-                float _fmax_474 = fmaxf(xg[6], xg[7]);
-                float hi_68_3 = _fmax_474;
-                float _min_410 = fminf(xg[6], xg[7]);
-                float lo_69_3 = _min_410;
-                xg[6] = hi_68_3;
-                xg[7] = lo_69_3;
-                float _fmax_475 = fmaxf(xg[8], xg[9]);
-                float hi_70_2 = _fmax_475;
-                float _min_411 = fminf(xg[8], xg[9]);
-                float lo_71_2 = _min_411;
-                xg[8] = hi_70_2;
-                xg[9] = lo_71_2;
-                float _fmax_476 = fmaxf(xg[12], xg[14]);
-                float hi_72_2 = _fmax_476;
-                float _min_412 = fminf(xg[12], xg[14]);
-                float lo_73_2 = _min_412;
-                xg[12] = hi_72_2;
-                xg[14] = lo_73_2;
-                float _fmax_477 = fmaxf(xg[13], xg[15]);
-                float hi_74_3 = _fmax_477;
-                float _min_413 = fminf(xg[13], xg[15]);
-                float lo_75_3 = _min_413;
-                xg[13] = hi_74_3;
-                xg[15] = lo_75_3;
-                float _fmax_478 = fmaxf(xg[1], xg[2]);
-                float hi_76_2 = _fmax_478;
-                float _min_414 = fminf(xg[1], xg[2]);
-                float lo_77_2 = _min_414;
-                xg[1] = hi_76_2;
-                xg[2] = lo_77_2;
-                float _fmax_479 = fmaxf(xg[3], xg[12]);
-                float hi_79_1 = _fmax_479;
-                float _min_415 = fminf(xg[3], xg[12]);
-                float lo_80_1 = _min_415;
-                xg[3] = hi_79_1;
-                xg[12] = lo_80_1;
-                float _fmax_480 = fmaxf(xg[4], xg[6]);
-                float hi_82_2 = _fmax_480;
-                float _min_416 = fminf(xg[4], xg[6]);
-                float lo_83_2 = _min_416;
-                xg[4] = hi_82_2;
-                xg[6] = lo_83_2;
-                float _fmax_481 = fmaxf(xg[5], xg[7]);
-                float hi_85_1 = _fmax_481;
-                float _min_417 = fminf(xg[5], xg[7]);
-                float lo_86_1 = _min_417;
-                xg[5] = hi_85_1;
-                xg[7] = lo_86_1;
-                float _fmax_482 = fmaxf(xg[8], xg[10]);
-                float hi_87_2 = _fmax_482;
-                float _min_418 = fminf(xg[8], xg[10]);
-                float lo_88_2 = _min_418;
-                xg[8] = hi_87_2;
-                xg[10] = lo_88_2;
-                float _fmax_483 = fmaxf(xg[9], xg[11]);
-                float hi_89_1 = _fmax_483;
-                float _min_419 = fminf(xg[9], xg[11]);
-                float lo_90_1 = _min_419;
-                xg[9] = hi_89_1;
-                xg[11] = lo_90_1;
-                float _fmax_484 = fmaxf(xg[13], xg[14]);
-                float hi_91_1 = _fmax_484;
-                float _min_420 = fminf(xg[13], xg[14]);
-                float lo_92_1 = _min_420;
-                xg[13] = hi_91_1;
-                xg[14] = lo_92_1;
-                float _fmax_485 = fmaxf(xg[1], xg[4]);
-                float hi_93_2 = _fmax_485;
-                float _min_421 = fminf(xg[1], xg[4]);
-                float lo_94_2 = _min_421;
-                xg[1] = hi_93_2;
-                xg[4] = lo_94_2;
-                float _fmax_486 = fmaxf(xg[2], xg[6]);
-                float hi_95_1 = _fmax_486;
-                float _min_422 = fminf(xg[2], xg[6]);
-                float lo_96_1 = _min_422;
-                xg[2] = hi_95_1;
-                xg[6] = lo_96_1;
-                float _fmax_487 = fmaxf(xg[5], xg[8]);
-                float hi_98_2 = _fmax_487;
-                float _min_423 = fminf(xg[5], xg[8]);
-                float lo_99_2 = _min_423;
-                xg[5] = hi_98_2;
-                xg[8] = lo_99_2;
-                float _fmax_488 = fmaxf(xg[7], xg[10]);
-                float hi_101_1 = _fmax_488;
-                float _min_424 = fminf(xg[7], xg[10]);
-                float lo_102_1 = _min_424;
-                xg[7] = hi_101_1;
-                xg[10] = lo_102_1;
-                float _fmax_489 = fmaxf(xg[9], xg[13]);
-                float hi_104_2 = _fmax_489;
-                float _min_425 = fminf(xg[9], xg[13]);
-                float lo_105_2 = _min_425;
-                xg[9] = hi_104_2;
-                xg[13] = lo_105_2;
-                float _fmax_490 = fmaxf(xg[11], xg[14]);
-                float hi_106_3 = _fmax_490;
-                float _min_426 = fminf(xg[11], xg[14]);
-                float lo_107_3 = _min_426;
-                xg[11] = hi_106_3;
-                xg[14] = lo_107_3;
-                float _fmax_491 = fmaxf(xg[2], xg[4]);
-                float hi_108_2 = _fmax_491;
-                float _min_427 = fminf(xg[2], xg[4]);
-                float lo_109_2 = _min_427;
-                xg[2] = hi_108_2;
-                xg[4] = lo_109_2;
-                float _fmax_492 = fmaxf(xg[3], xg[6]);
-                float hi_110_2 = _fmax_492;
-                float _min_428 = fminf(xg[3], xg[6]);
-                float lo_111_2 = _min_428;
-                xg[3] = hi_110_2;
-                xg[6] = lo_111_2;
-                float _fmax_493 = fmaxf(xg[9], xg[12]);
-                float hi_112_3 = _fmax_493;
-                float _min_429 = fminf(xg[9], xg[12]);
-                float lo_113_3 = _min_429;
-                xg[9] = hi_112_3;
-                xg[12] = lo_113_3;
-                float _fmax_494 = fmaxf(xg[11], xg[13]);
-                float hi_114_2 = _fmax_494;
-                float _min_430 = fminf(xg[11], xg[13]);
-                float lo_115_2 = _min_430;
-                xg[11] = hi_114_2;
-                xg[13] = lo_115_2;
-                float _fmax_495 = fmaxf(xg[3], xg[5]);
-                float hi_117_1 = _fmax_495;
-                float _min_431 = fminf(xg[3], xg[5]);
-                float lo_118_1 = _min_431;
-                xg[3] = hi_117_1;
-                xg[5] = lo_118_1;
-                float _fmax_496 = fmaxf(xg[6], xg[8]);
-                float hi_120_2 = _fmax_496;
-                float _min_432 = fminf(xg[6], xg[8]);
-                float lo_121_2 = _min_432;
-                xg[6] = hi_120_2;
-                xg[8] = lo_121_2;
-                float _fmax_497 = fmaxf(xg[7], xg[9]);
-                float hi_123_1 = _fmax_497;
-                float _min_433 = fminf(xg[7], xg[9]);
-                float lo_124_1 = _min_433;
-                xg[7] = hi_123_1;
-                xg[9] = lo_124_1;
-                float _fmax_498 = fmaxf(xg[10], xg[12]);
-                float hi_125_2 = _fmax_498;
-                float _min_434 = fminf(xg[10], xg[12]);
-                float lo_126_2 = _min_434;
-                xg[10] = hi_125_2;
-                xg[12] = lo_126_2;
-                float _fmax_499 = fmaxf(xg[3], xg[4]);
-                float hi_127_1 = _fmax_499;
-                float _min_435 = fminf(xg[3], xg[4]);
-                float lo_128_1 = _min_435;
-                xg[3] = hi_127_1;
-                xg[4] = lo_128_1;
-                float _fmax_500 = fmaxf(xg[5], xg[6]);
-                float hi_129_1 = _fmax_500;
-                float _min_436 = fminf(xg[5], xg[6]);
-                float lo_130_1 = _min_436;
-                xg[5] = hi_129_1;
-                xg[6] = lo_130_1;
-                float _fmax_501 = fmaxf(xg[7], xg[8]);
-                float hi_131_2 = _fmax_501;
-                float _min_437 = fminf(xg[7], xg[8]);
-                float lo_132_2 = _min_437;
-                xg[7] = hi_131_2;
-                xg[8] = lo_132_2;
-                float _fmax_502 = fmaxf(xg[9], xg[10]);
-                float hi_133_1 = _fmax_502;
-                float _min_438 = fminf(xg[9], xg[10]);
-                float lo_134_1 = _min_438;
-                xg[9] = hi_133_1;
-                xg[10] = lo_134_1;
-                float _fmax_503 = fmaxf(xg[11], xg[12]);
-                float hi_136_2 = _fmax_503;
-                float _min_439 = fminf(xg[11], xg[12]);
-                float lo_137_2 = _min_439;
-                xg[11] = hi_136_2;
-                xg[12] = lo_137_2;
-                float _fmax_504 = fmaxf(xg[6], xg[7]);
-                float hi_139_1 = _fmax_504;
-                float _min_440 = fminf(xg[6], xg[7]);
-                float lo_140_1 = _min_440;
-                xg[6] = hi_139_1;
-                xg[7] = lo_140_1;
-                float _fmax_505 = fmaxf(xg[8], xg[9]);
-                float hi_142_2 = _fmax_505;
-                float _min_441 = fminf(xg[8], xg[9]);
-                float lo_143_2 = _min_441;
-                xg[8] = hi_142_2;
-                xg[9] = lo_143_2;
-                if (cgc > 16) {
-                    float v6 = __uint_as_float(cbuf[cg * 32 + 16]);
-                    float _fmax_506 = fmaxf(xg[0], v6);
-                    float hi6 = _fmax_506;
-                    float _min_442 = fminf(xg[0], v6);
-                    float lo6 = _min_442;
-                    xg[0] = hi6;
-                    v6 = lo6;
-                    float _fmax_507 = fmaxf(xg[1], v6);
-                    float hi6_0 = _fmax_507;
-                    float _min_443 = fminf(xg[1], v6);
-                    float lo6_1 = _min_443;
-                    xg[1] = hi6_0;
-                    v6 = lo6_1;
-                    float _fmax_508 = fmaxf(xg[2], v6);
-                    float hi6_2 = _fmax_508;
-                    float _min_444 = fminf(xg[2], v6);
-                    float lo6_3 = _min_444;
-                    xg[2] = hi6_2;
-                    v6 = lo6_3;
-                    float _fmax_509 = fmaxf(xg[3], v6);
-                    float hi6_4 = _fmax_509;
-                    float _min_445 = fminf(xg[3], v6);
-                    float lo6_5 = _min_445;
-                    xg[3] = hi6_4;
-                    v6 = lo6_5;
-                    float _fmax_510 = fmaxf(xg[4], v6);
-                    float hi6_6 = _fmax_510;
-                    float _min_446 = fminf(xg[4], v6);
-                    float lo6_7 = _min_446;
-                    xg[4] = hi6_6;
-                    v6 = lo6_7;
-                    float _fmax_511 = fmaxf(xg[5], v6);
-                    float hi6_8 = _fmax_511;
-                    float _min_447 = fminf(xg[5], v6);
-                    float lo6_9 = _min_447;
-                    xg[5] = hi6_8;
-                    v6 = lo6_9;
-                    float _fmax_512 = fmaxf(xg[6], v6);
-                    float hi6_10 = _fmax_512;
-                    float _min_448 = fminf(xg[6], v6);
-                    float lo6_11 = _min_448;
-                    xg[6] = hi6_10;
-                    v6 = lo6_11;
-                    float _fmax_513 = fmaxf(xg[7], v6);
-                    float hi6_12 = _fmax_513;
-                    float _min_449 = fminf(xg[7], v6);
-                    float lo6_13 = _min_449;
-                    xg[7] = hi6_12;
-                    v6 = lo6_13;
-                    float _fmax_514 = fmaxf(xg[8], v6);
-                    float hi6_14 = _fmax_514;
-                    float _min_450 = fminf(xg[8], v6);
-                    float lo6_15 = _min_450;
-                    xg[8] = hi6_14;
-                    v6 = lo6_15;
-                    float _fmax_515 = fmaxf(xg[9], v6);
-                    float hi6_16 = _fmax_515;
-                    float _min_451 = fminf(xg[9], v6);
-                    float lo6_17 = _min_451;
-                    xg[9] = hi6_16;
-                    v6 = lo6_17;
-                    float _fmax_516 = fmaxf(xg[10], v6);
-                    float hi6_18 = _fmax_516;
-                    float _min_452 = fminf(xg[10], v6);
-                    float lo6_19 = _min_452;
-                    xg[10] = hi6_18;
-                    v6 = lo6_19;
-                    float _fmax_517 = fmaxf(xg[11], v6);
-                    float hi6_20 = _fmax_517;
-                    float _min_453 = fminf(xg[11], v6);
-                    float lo6_21 = _min_453;
-                    xg[11] = hi6_20;
-                    v6 = lo6_21;
-                    float _fmax_518 = fmaxf(xg[12], v6);
-                    float hi6_22 = _fmax_518;
-                    float _min_454 = fminf(xg[12], v6);
-                    float lo6_23 = _min_454;
-                    xg[12] = hi6_22;
-                    v6 = lo6_23;
-                    float _fmax_519 = fmaxf(xg[13], v6);
-                    float hi6_24 = _fmax_519;
-                    float _min_455 = fminf(xg[13], v6);
-                    float lo6_25 = _min_455;
-                    xg[13] = hi6_24;
-                    v6 = lo6_25;
-                    float _fmax_520 = fmaxf(xg[14], v6);
-                    float hi6_26 = _fmax_520;
-                    float _min_456 = fminf(xg[14], v6);
-                    float lo6_27 = _min_456;
-                    xg[14] = hi6_26;
-                    v6 = lo6_27;
-                    float _fmax_521 = fmaxf(xg[15], v6);
-                    float hi6_28 = _fmax_521;
-                    float _min_457 = fminf(xg[15], v6);
-                    float lo6_29 = _min_457;
-                    xg[15] = hi6_28;
-                    v6 = lo6_29;
-                }
-                if (cgc > 17) {
-                    float v6_1 = __uint_as_float(cbuf[cg * 32 + 17]);
-                    float _fmax_522 = fmaxf(xg[0], v6_1);
-                    float hi6_1 = _fmax_522;
-                    float _min_458 = fminf(xg[0], v6_1);
-                    float lo6_2 = _min_458;
-                    xg[0] = hi6_1;
-                    v6_1 = lo6_2;
-                    float _fmax_523 = fmaxf(xg[1], v6_1);
-                    float hi6_0_1 = _fmax_523;
-                    float _min_459 = fminf(xg[1], v6_1);
-                    float lo6_1_1 = _min_459;
-                    xg[1] = hi6_0_1;
-                    v6_1 = lo6_1_1;
-                    float _fmax_524 = fmaxf(xg[2], v6_1);
-                    float hi6_2_1 = _fmax_524;
-                    float _min_460 = fminf(xg[2], v6_1);
-                    float lo6_3_1 = _min_460;
-                    xg[2] = hi6_2_1;
-                    v6_1 = lo6_3_1;
-                    float _fmax_525 = fmaxf(xg[3], v6_1);
-                    float hi6_4_1 = _fmax_525;
-                    float _min_461 = fminf(xg[3], v6_1);
-                    float lo6_5_1 = _min_461;
-                    xg[3] = hi6_4_1;
-                    v6_1 = lo6_5_1;
-                    float _fmax_526 = fmaxf(xg[4], v6_1);
-                    float hi6_6_1 = _fmax_526;
-                    float _min_462 = fminf(xg[4], v6_1);
-                    float lo6_7_1 = _min_462;
-                    xg[4] = hi6_6_1;
-                    v6_1 = lo6_7_1;
-                    float _fmax_527 = fmaxf(xg[5], v6_1);
-                    float hi6_8_1 = _fmax_527;
-                    float _min_463 = fminf(xg[5], v6_1);
-                    float lo6_9_1 = _min_463;
-                    xg[5] = hi6_8_1;
-                    v6_1 = lo6_9_1;
-                    float _fmax_528 = fmaxf(xg[6], v6_1);
-                    float hi6_10_1 = _fmax_528;
-                    float _min_464 = fminf(xg[6], v6_1);
-                    float lo6_11_1 = _min_464;
-                    xg[6] = hi6_10_1;
-                    v6_1 = lo6_11_1;
-                    float _fmax_529 = fmaxf(xg[7], v6_1);
-                    float hi6_12_1 = _fmax_529;
-                    float _min_465 = fminf(xg[7], v6_1);
-                    float lo6_13_1 = _min_465;
-                    xg[7] = hi6_12_1;
-                    v6_1 = lo6_13_1;
-                    float _fmax_530 = fmaxf(xg[8], v6_1);
-                    float hi6_14_1 = _fmax_530;
-                    float _min_466 = fminf(xg[8], v6_1);
-                    float lo6_15_1 = _min_466;
-                    xg[8] = hi6_14_1;
-                    v6_1 = lo6_15_1;
-                    float _fmax_531 = fmaxf(xg[9], v6_1);
-                    float hi6_16_1 = _fmax_531;
-                    float _min_467 = fminf(xg[9], v6_1);
-                    float lo6_17_1 = _min_467;
-                    xg[9] = hi6_16_1;
-                    v6_1 = lo6_17_1;
-                    float _fmax_532 = fmaxf(xg[10], v6_1);
-                    float hi6_18_1 = _fmax_532;
-                    float _min_468 = fminf(xg[10], v6_1);
-                    float lo6_19_1 = _min_468;
-                    xg[10] = hi6_18_1;
-                    v6_1 = lo6_19_1;
-                    float _fmax_533 = fmaxf(xg[11], v6_1);
-                    float hi6_20_1 = _fmax_533;
-                    float _min_469 = fminf(xg[11], v6_1);
-                    float lo6_21_1 = _min_469;
-                    xg[11] = hi6_20_1;
-                    v6_1 = lo6_21_1;
-                    float _fmax_534 = fmaxf(xg[12], v6_1);
-                    float hi6_22_1 = _fmax_534;
-                    float _min_470 = fminf(xg[12], v6_1);
-                    float lo6_23_1 = _min_470;
-                    xg[12] = hi6_22_1;
-                    v6_1 = lo6_23_1;
-                    float _fmax_535 = fmaxf(xg[13], v6_1);
-                    float hi6_24_1 = _fmax_535;
-                    float _min_471 = fminf(xg[13], v6_1);
-                    float lo6_25_1 = _min_471;
-                    xg[13] = hi6_24_1;
-                    v6_1 = lo6_25_1;
-                    float _fmax_536 = fmaxf(xg[14], v6_1);
-                    float hi6_26_1 = _fmax_536;
-                    float _min_472 = fminf(xg[14], v6_1);
-                    float lo6_27_1 = _min_472;
-                    xg[14] = hi6_26_1;
-                    v6_1 = lo6_27_1;
-                    float _fmax_537 = fmaxf(xg[15], v6_1);
-                    float hi6_28_1 = _fmax_537;
-                    float _min_473 = fminf(xg[15], v6_1);
-                    float lo6_29_1 = _min_473;
-                    xg[15] = hi6_28_1;
-                    v6_1 = lo6_29_1;
-                }
-                if (cgc > 18) {
-                    float v6_2 = __uint_as_float(cbuf[cg * 32 + 18]);
-                    float _fmax_538 = fmaxf(xg[0], v6_2);
-                    float hi6_3 = _fmax_538;
-                    float _min_474 = fminf(xg[0], v6_2);
-                    float lo6_4 = _min_474;
-                    xg[0] = hi6_3;
-                    v6_2 = lo6_4;
-                    float _fmax_539 = fmaxf(xg[1], v6_2);
-                    float hi6_0_2 = _fmax_539;
-                    float _min_475 = fminf(xg[1], v6_2);
-                    float lo6_1_2 = _min_475;
-                    xg[1] = hi6_0_2;
-                    v6_2 = lo6_1_2;
-                    float _fmax_540 = fmaxf(xg[2], v6_2);
-                    float hi6_2_2 = _fmax_540;
-                    float _min_476 = fminf(xg[2], v6_2);
-                    float lo6_3_2 = _min_476;
-                    xg[2] = hi6_2_2;
-                    v6_2 = lo6_3_2;
-                    float _fmax_541 = fmaxf(xg[3], v6_2);
-                    float hi6_4_2 = _fmax_541;
-                    float _min_477 = fminf(xg[3], v6_2);
-                    float lo6_5_2 = _min_477;
-                    xg[3] = hi6_4_2;
-                    v6_2 = lo6_5_2;
-                    float _fmax_542 = fmaxf(xg[4], v6_2);
-                    float hi6_6_2 = _fmax_542;
-                    float _min_478 = fminf(xg[4], v6_2);
-                    float lo6_7_2 = _min_478;
-                    xg[4] = hi6_6_2;
-                    v6_2 = lo6_7_2;
-                    float _fmax_543 = fmaxf(xg[5], v6_2);
-                    float hi6_8_2 = _fmax_543;
-                    float _min_479 = fminf(xg[5], v6_2);
-                    float lo6_9_2 = _min_479;
-                    xg[5] = hi6_8_2;
-                    v6_2 = lo6_9_2;
-                    float _fmax_544 = fmaxf(xg[6], v6_2);
-                    float hi6_10_2 = _fmax_544;
-                    float _min_480 = fminf(xg[6], v6_2);
-                    float lo6_11_2 = _min_480;
-                    xg[6] = hi6_10_2;
-                    v6_2 = lo6_11_2;
-                    float _fmax_545 = fmaxf(xg[7], v6_2);
-                    float hi6_12_2 = _fmax_545;
-                    float _min_481 = fminf(xg[7], v6_2);
-                    float lo6_13_2 = _min_481;
-                    xg[7] = hi6_12_2;
-                    v6_2 = lo6_13_2;
-                    float _fmax_546 = fmaxf(xg[8], v6_2);
-                    float hi6_14_2 = _fmax_546;
-                    float _min_482 = fminf(xg[8], v6_2);
-                    float lo6_15_2 = _min_482;
-                    xg[8] = hi6_14_2;
-                    v6_2 = lo6_15_2;
-                    float _fmax_547 = fmaxf(xg[9], v6_2);
-                    float hi6_16_2 = _fmax_547;
-                    float _min_483 = fminf(xg[9], v6_2);
-                    float lo6_17_2 = _min_483;
-                    xg[9] = hi6_16_2;
-                    v6_2 = lo6_17_2;
-                    float _fmax_548 = fmaxf(xg[10], v6_2);
-                    float hi6_18_2 = _fmax_548;
-                    float _min_484 = fminf(xg[10], v6_2);
-                    float lo6_19_2 = _min_484;
-                    xg[10] = hi6_18_2;
-                    v6_2 = lo6_19_2;
-                    float _fmax_549 = fmaxf(xg[11], v6_2);
-                    float hi6_20_2 = _fmax_549;
-                    float _min_485 = fminf(xg[11], v6_2);
-                    float lo6_21_2 = _min_485;
-                    xg[11] = hi6_20_2;
-                    v6_2 = lo6_21_2;
-                    float _fmax_550 = fmaxf(xg[12], v6_2);
-                    float hi6_22_2 = _fmax_550;
-                    float _min_486 = fminf(xg[12], v6_2);
-                    float lo6_23_2 = _min_486;
-                    xg[12] = hi6_22_2;
-                    v6_2 = lo6_23_2;
-                    float _fmax_551 = fmaxf(xg[13], v6_2);
-                    float hi6_24_2 = _fmax_551;
-                    float _min_487 = fminf(xg[13], v6_2);
-                    float lo6_25_2 = _min_487;
-                    xg[13] = hi6_24_2;
-                    v6_2 = lo6_25_2;
-                    float _fmax_552 = fmaxf(xg[14], v6_2);
-                    float hi6_26_2 = _fmax_552;
-                    float _min_488 = fminf(xg[14], v6_2);
-                    float lo6_27_2 = _min_488;
-                    xg[14] = hi6_26_2;
-                    v6_2 = lo6_27_2;
-                    float _fmax_553 = fmaxf(xg[15], v6_2);
-                    float hi6_28_2 = _fmax_553;
-                    float _min_489 = fminf(xg[15], v6_2);
-                    float lo6_29_2 = _min_489;
-                    xg[15] = hi6_28_2;
-                    v6_2 = lo6_29_2;
-                }
-                if (cgc > 19) {
-                    float v6_3 = __uint_as_float(cbuf[cg * 32 + 19]);
-                    float _fmax_554 = fmaxf(xg[0], v6_3);
-                    float hi6_5 = _fmax_554;
-                    float _min_490 = fminf(xg[0], v6_3);
-                    float lo6_6 = _min_490;
-                    xg[0] = hi6_5;
-                    v6_3 = lo6_6;
-                    float _fmax_555 = fmaxf(xg[1], v6_3);
-                    float hi6_0_3 = _fmax_555;
-                    float _min_491 = fminf(xg[1], v6_3);
-                    float lo6_1_3 = _min_491;
-                    xg[1] = hi6_0_3;
-                    v6_3 = lo6_1_3;
-                    float _fmax_556 = fmaxf(xg[2], v6_3);
-                    float hi6_2_3 = _fmax_556;
-                    float _min_492 = fminf(xg[2], v6_3);
-                    float lo6_3_3 = _min_492;
-                    xg[2] = hi6_2_3;
-                    v6_3 = lo6_3_3;
-                    float _fmax_557 = fmaxf(xg[3], v6_3);
-                    float hi6_4_3 = _fmax_557;
-                    float _min_493 = fminf(xg[3], v6_3);
-                    float lo6_5_3 = _min_493;
-                    xg[3] = hi6_4_3;
-                    v6_3 = lo6_5_3;
-                    float _fmax_558 = fmaxf(xg[4], v6_3);
-                    float hi6_6_3 = _fmax_558;
-                    float _min_494 = fminf(xg[4], v6_3);
-                    float lo6_7_3 = _min_494;
-                    xg[4] = hi6_6_3;
-                    v6_3 = lo6_7_3;
-                    float _fmax_559 = fmaxf(xg[5], v6_3);
-                    float hi6_8_3 = _fmax_559;
-                    float _min_495 = fminf(xg[5], v6_3);
-                    float lo6_9_3 = _min_495;
-                    xg[5] = hi6_8_3;
-                    v6_3 = lo6_9_3;
-                    float _fmax_560 = fmaxf(xg[6], v6_3);
-                    float hi6_10_3 = _fmax_560;
-                    float _min_496 = fminf(xg[6], v6_3);
-                    float lo6_11_3 = _min_496;
-                    xg[6] = hi6_10_3;
-                    v6_3 = lo6_11_3;
-                    float _fmax_561 = fmaxf(xg[7], v6_3);
-                    float hi6_12_3 = _fmax_561;
-                    float _min_497 = fminf(xg[7], v6_3);
-                    float lo6_13_3 = _min_497;
-                    xg[7] = hi6_12_3;
-                    v6_3 = lo6_13_3;
-                    float _fmax_562 = fmaxf(xg[8], v6_3);
-                    float hi6_14_3 = _fmax_562;
-                    float _min_498 = fminf(xg[8], v6_3);
-                    float lo6_15_3 = _min_498;
-                    xg[8] = hi6_14_3;
-                    v6_3 = lo6_15_3;
-                    float _fmax_563 = fmaxf(xg[9], v6_3);
-                    float hi6_16_3 = _fmax_563;
-                    float _min_499 = fminf(xg[9], v6_3);
-                    float lo6_17_3 = _min_499;
-                    xg[9] = hi6_16_3;
-                    v6_3 = lo6_17_3;
-                    float _fmax_564 = fmaxf(xg[10], v6_3);
-                    float hi6_18_3 = _fmax_564;
-                    float _min_500 = fminf(xg[10], v6_3);
-                    float lo6_19_3 = _min_500;
-                    xg[10] = hi6_18_3;
-                    v6_3 = lo6_19_3;
-                    float _fmax_565 = fmaxf(xg[11], v6_3);
-                    float hi6_20_3 = _fmax_565;
-                    float _min_501 = fminf(xg[11], v6_3);
-                    float lo6_21_3 = _min_501;
-                    xg[11] = hi6_20_3;
-                    v6_3 = lo6_21_3;
-                    float _fmax_566 = fmaxf(xg[12], v6_3);
-                    float hi6_22_3 = _fmax_566;
-                    float _min_502 = fminf(xg[12], v6_3);
-                    float lo6_23_3 = _min_502;
-                    xg[12] = hi6_22_3;
-                    v6_3 = lo6_23_3;
-                    float _fmax_567 = fmaxf(xg[13], v6_3);
-                    float hi6_24_3 = _fmax_567;
-                    float _min_503 = fminf(xg[13], v6_3);
-                    float lo6_25_3 = _min_503;
-                    xg[13] = hi6_24_3;
-                    v6_3 = lo6_25_3;
-                    float _fmax_568 = fmaxf(xg[14], v6_3);
-                    float hi6_26_3 = _fmax_568;
-                    float _min_504 = fminf(xg[14], v6_3);
-                    float lo6_27_3 = _min_504;
-                    xg[14] = hi6_26_3;
-                    v6_3 = lo6_27_3;
-                    float _fmax_569 = fmaxf(xg[15], v6_3);
-                    float hi6_28_3 = _fmax_569;
-                    float _min_505 = fminf(xg[15], v6_3);
-                    float lo6_29_3 = _min_505;
-                    xg[15] = hi6_28_3;
-                    v6_3 = lo6_29_3;
-                }
-                if (cgc > 20) {
-                    float v6_4 = __uint_as_float(cbuf[cg * 32 + 20]);
-                    float _fmax_570 = fmaxf(xg[0], v6_4);
-                    float hi6_7 = _fmax_570;
-                    float _min_506 = fminf(xg[0], v6_4);
-                    float lo6_8 = _min_506;
-                    xg[0] = hi6_7;
-                    v6_4 = lo6_8;
-                    float _fmax_571 = fmaxf(xg[1], v6_4);
-                    float hi6_0_4 = _fmax_571;
-                    float _min_507 = fminf(xg[1], v6_4);
-                    float lo6_1_4 = _min_507;
-                    xg[1] = hi6_0_4;
-                    v6_4 = lo6_1_4;
-                    float _fmax_572 = fmaxf(xg[2], v6_4);
-                    float hi6_2_4 = _fmax_572;
-                    float _min_508 = fminf(xg[2], v6_4);
-                    float lo6_3_4 = _min_508;
-                    xg[2] = hi6_2_4;
-                    v6_4 = lo6_3_4;
-                    float _fmax_573 = fmaxf(xg[3], v6_4);
-                    float hi6_4_4 = _fmax_573;
-                    float _min_509 = fminf(xg[3], v6_4);
-                    float lo6_5_4 = _min_509;
-                    xg[3] = hi6_4_4;
-                    v6_4 = lo6_5_4;
-                    float _fmax_574 = fmaxf(xg[4], v6_4);
-                    float hi6_6_4 = _fmax_574;
-                    float _min_510 = fminf(xg[4], v6_4);
-                    float lo6_7_4 = _min_510;
-                    xg[4] = hi6_6_4;
-                    v6_4 = lo6_7_4;
-                    float _fmax_575 = fmaxf(xg[5], v6_4);
-                    float hi6_8_4 = _fmax_575;
-                    float _min_511 = fminf(xg[5], v6_4);
-                    float lo6_9_4 = _min_511;
-                    xg[5] = hi6_8_4;
-                    v6_4 = lo6_9_4;
-                    float _fmax_576 = fmaxf(xg[6], v6_4);
-                    float hi6_10_4 = _fmax_576;
-                    float _min_512 = fminf(xg[6], v6_4);
-                    float lo6_11_4 = _min_512;
-                    xg[6] = hi6_10_4;
-                    v6_4 = lo6_11_4;
-                    float _fmax_577 = fmaxf(xg[7], v6_4);
-                    float hi6_12_4 = _fmax_577;
-                    float _min_513 = fminf(xg[7], v6_4);
-                    float lo6_13_4 = _min_513;
-                    xg[7] = hi6_12_4;
-                    v6_4 = lo6_13_4;
-                    float _fmax_578 = fmaxf(xg[8], v6_4);
-                    float hi6_14_4 = _fmax_578;
-                    float _min_514 = fminf(xg[8], v6_4);
-                    float lo6_15_4 = _min_514;
-                    xg[8] = hi6_14_4;
-                    v6_4 = lo6_15_4;
-                    float _fmax_579 = fmaxf(xg[9], v6_4);
-                    float hi6_16_4 = _fmax_579;
-                    float _min_515 = fminf(xg[9], v6_4);
-                    float lo6_17_4 = _min_515;
-                    xg[9] = hi6_16_4;
-                    v6_4 = lo6_17_4;
-                    float _fmax_580 = fmaxf(xg[10], v6_4);
-                    float hi6_18_4 = _fmax_580;
-                    float _min_516 = fminf(xg[10], v6_4);
-                    float lo6_19_4 = _min_516;
-                    xg[10] = hi6_18_4;
-                    v6_4 = lo6_19_4;
-                    float _fmax_581 = fmaxf(xg[11], v6_4);
-                    float hi6_20_4 = _fmax_581;
-                    float _min_517 = fminf(xg[11], v6_4);
-                    float lo6_21_4 = _min_517;
-                    xg[11] = hi6_20_4;
-                    v6_4 = lo6_21_4;
-                    float _fmax_582 = fmaxf(xg[12], v6_4);
-                    float hi6_22_4 = _fmax_582;
-                    float _min_518 = fminf(xg[12], v6_4);
-                    float lo6_23_4 = _min_518;
-                    xg[12] = hi6_22_4;
-                    v6_4 = lo6_23_4;
-                    float _fmax_583 = fmaxf(xg[13], v6_4);
-                    float hi6_24_4 = _fmax_583;
-                    float _min_519 = fminf(xg[13], v6_4);
-                    float lo6_25_4 = _min_519;
-                    xg[13] = hi6_24_4;
-                    v6_4 = lo6_25_4;
-                    float _fmax_584 = fmaxf(xg[14], v6_4);
-                    float hi6_26_4 = _fmax_584;
-                    float _min_520 = fminf(xg[14], v6_4);
-                    float lo6_27_4 = _min_520;
-                    xg[14] = hi6_26_4;
-                    v6_4 = lo6_27_4;
-                    float _fmax_585 = fmaxf(xg[15], v6_4);
-                    float hi6_28_4 = _fmax_585;
-                    float _min_521 = fminf(xg[15], v6_4);
-                    float lo6_29_4 = _min_521;
-                    xg[15] = hi6_28_4;
-                    v6_4 = lo6_29_4;
-                }
-                if (cgc > 21) {
-                    float v6_5 = __uint_as_float(cbuf[cg * 32 + 21]);
-                    float _fmax_586 = fmaxf(xg[0], v6_5);
-                    float hi6_9 = _fmax_586;
-                    float _min_522 = fminf(xg[0], v6_5);
-                    float lo6_10 = _min_522;
-                    xg[0] = hi6_9;
-                    v6_5 = lo6_10;
-                    float _fmax_587 = fmaxf(xg[1], v6_5);
-                    float hi6_0_5 = _fmax_587;
-                    float _min_523 = fminf(xg[1], v6_5);
-                    float lo6_1_5 = _min_523;
-                    xg[1] = hi6_0_5;
-                    v6_5 = lo6_1_5;
-                    float _fmax_588 = fmaxf(xg[2], v6_5);
-                    float hi6_2_5 = _fmax_588;
-                    float _min_524 = fminf(xg[2], v6_5);
-                    float lo6_3_5 = _min_524;
-                    xg[2] = hi6_2_5;
-                    v6_5 = lo6_3_5;
-                    float _fmax_589 = fmaxf(xg[3], v6_5);
-                    float hi6_4_5 = _fmax_589;
-                    float _min_525 = fminf(xg[3], v6_5);
-                    float lo6_5_5 = _min_525;
-                    xg[3] = hi6_4_5;
-                    v6_5 = lo6_5_5;
-                    float _fmax_590 = fmaxf(xg[4], v6_5);
-                    float hi6_6_5 = _fmax_590;
-                    float _min_526 = fminf(xg[4], v6_5);
-                    float lo6_7_5 = _min_526;
-                    xg[4] = hi6_6_5;
-                    v6_5 = lo6_7_5;
-                    float _fmax_591 = fmaxf(xg[5], v6_5);
-                    float hi6_8_5 = _fmax_591;
-                    float _min_527 = fminf(xg[5], v6_5);
-                    float lo6_9_5 = _min_527;
-                    xg[5] = hi6_8_5;
-                    v6_5 = lo6_9_5;
-                    float _fmax_592 = fmaxf(xg[6], v6_5);
-                    float hi6_10_5 = _fmax_592;
-                    float _min_528 = fminf(xg[6], v6_5);
-                    float lo6_11_5 = _min_528;
-                    xg[6] = hi6_10_5;
-                    v6_5 = lo6_11_5;
-                    float _fmax_593 = fmaxf(xg[7], v6_5);
-                    float hi6_12_5 = _fmax_593;
-                    float _min_529 = fminf(xg[7], v6_5);
-                    float lo6_13_5 = _min_529;
-                    xg[7] = hi6_12_5;
-                    v6_5 = lo6_13_5;
-                    float _fmax_594 = fmaxf(xg[8], v6_5);
-                    float hi6_14_5 = _fmax_594;
-                    float _min_530 = fminf(xg[8], v6_5);
-                    float lo6_15_5 = _min_530;
-                    xg[8] = hi6_14_5;
-                    v6_5 = lo6_15_5;
-                    float _fmax_595 = fmaxf(xg[9], v6_5);
-                    float hi6_16_5 = _fmax_595;
-                    float _min_531 = fminf(xg[9], v6_5);
-                    float lo6_17_5 = _min_531;
-                    xg[9] = hi6_16_5;
-                    v6_5 = lo6_17_5;
-                    float _fmax_596 = fmaxf(xg[10], v6_5);
-                    float hi6_18_5 = _fmax_596;
-                    float _min_532 = fminf(xg[10], v6_5);
-                    float lo6_19_5 = _min_532;
-                    xg[10] = hi6_18_5;
-                    v6_5 = lo6_19_5;
-                    float _fmax_597 = fmaxf(xg[11], v6_5);
-                    float hi6_20_5 = _fmax_597;
-                    float _min_533 = fminf(xg[11], v6_5);
-                    float lo6_21_5 = _min_533;
-                    xg[11] = hi6_20_5;
-                    v6_5 = lo6_21_5;
-                    float _fmax_598 = fmaxf(xg[12], v6_5);
-                    float hi6_22_5 = _fmax_598;
-                    float _min_534 = fminf(xg[12], v6_5);
-                    float lo6_23_5 = _min_534;
-                    xg[12] = hi6_22_5;
-                    v6_5 = lo6_23_5;
-                    float _fmax_599 = fmaxf(xg[13], v6_5);
-                    float hi6_24_5 = _fmax_599;
-                    float _min_535 = fminf(xg[13], v6_5);
-                    float lo6_25_5 = _min_535;
-                    xg[13] = hi6_24_5;
-                    v6_5 = lo6_25_5;
-                    float _fmax_600 = fmaxf(xg[14], v6_5);
-                    float hi6_26_5 = _fmax_600;
-                    float _min_536 = fminf(xg[14], v6_5);
-                    float lo6_27_5 = _min_536;
-                    xg[14] = hi6_26_5;
-                    v6_5 = lo6_27_5;
-                    float _fmax_601 = fmaxf(xg[15], v6_5);
-                    float hi6_28_5 = _fmax_601;
-                    float _min_537 = fminf(xg[15], v6_5);
-                    float lo6_29_5 = _min_537;
-                    xg[15] = hi6_28_5;
-                    v6_5 = lo6_29_5;
-                }
-                if (cgc > 22) {
-                    float v6_6 = __uint_as_float(cbuf[cg * 32 + 22]);
-                    float _fmax_602 = fmaxf(xg[0], v6_6);
-                    float hi6_11 = _fmax_602;
-                    float _min_538 = fminf(xg[0], v6_6);
-                    float lo6_12 = _min_538;
-                    xg[0] = hi6_11;
-                    v6_6 = lo6_12;
-                    float _fmax_603 = fmaxf(xg[1], v6_6);
-                    float hi6_0_6 = _fmax_603;
-                    float _min_539 = fminf(xg[1], v6_6);
-                    float lo6_1_6 = _min_539;
-                    xg[1] = hi6_0_6;
-                    v6_6 = lo6_1_6;
-                    float _fmax_604 = fmaxf(xg[2], v6_6);
-                    float hi6_2_6 = _fmax_604;
-                    float _min_540 = fminf(xg[2], v6_6);
-                    float lo6_3_6 = _min_540;
-                    xg[2] = hi6_2_6;
-                    v6_6 = lo6_3_6;
-                    float _fmax_605 = fmaxf(xg[3], v6_6);
-                    float hi6_4_6 = _fmax_605;
-                    float _min_541 = fminf(xg[3], v6_6);
-                    float lo6_5_6 = _min_541;
-                    xg[3] = hi6_4_6;
-                    v6_6 = lo6_5_6;
-                    float _fmax_606 = fmaxf(xg[4], v6_6);
-                    float hi6_6_6 = _fmax_606;
-                    float _min_542 = fminf(xg[4], v6_6);
-                    float lo6_7_6 = _min_542;
-                    xg[4] = hi6_6_6;
-                    v6_6 = lo6_7_6;
-                    float _fmax_607 = fmaxf(xg[5], v6_6);
-                    float hi6_8_6 = _fmax_607;
-                    float _min_543 = fminf(xg[5], v6_6);
-                    float lo6_9_6 = _min_543;
-                    xg[5] = hi6_8_6;
-                    v6_6 = lo6_9_6;
-                    float _fmax_608 = fmaxf(xg[6], v6_6);
-                    float hi6_10_6 = _fmax_608;
-                    float _min_544 = fminf(xg[6], v6_6);
-                    float lo6_11_6 = _min_544;
-                    xg[6] = hi6_10_6;
-                    v6_6 = lo6_11_6;
-                    float _fmax_609 = fmaxf(xg[7], v6_6);
-                    float hi6_12_6 = _fmax_609;
-                    float _min_545 = fminf(xg[7], v6_6);
-                    float lo6_13_6 = _min_545;
-                    xg[7] = hi6_12_6;
-                    v6_6 = lo6_13_6;
-                    float _fmax_610 = fmaxf(xg[8], v6_6);
-                    float hi6_14_6 = _fmax_610;
-                    float _min_546 = fminf(xg[8], v6_6);
-                    float lo6_15_6 = _min_546;
-                    xg[8] = hi6_14_6;
-                    v6_6 = lo6_15_6;
-                    float _fmax_611 = fmaxf(xg[9], v6_6);
-                    float hi6_16_6 = _fmax_611;
-                    float _min_547 = fminf(xg[9], v6_6);
-                    float lo6_17_6 = _min_547;
-                    xg[9] = hi6_16_6;
-                    v6_6 = lo6_17_6;
-                    float _fmax_612 = fmaxf(xg[10], v6_6);
-                    float hi6_18_6 = _fmax_612;
-                    float _min_548 = fminf(xg[10], v6_6);
-                    float lo6_19_6 = _min_548;
-                    xg[10] = hi6_18_6;
-                    v6_6 = lo6_19_6;
-                    float _fmax_613 = fmaxf(xg[11], v6_6);
-                    float hi6_20_6 = _fmax_613;
-                    float _min_549 = fminf(xg[11], v6_6);
-                    float lo6_21_6 = _min_549;
-                    xg[11] = hi6_20_6;
-                    v6_6 = lo6_21_6;
-                    float _fmax_614 = fmaxf(xg[12], v6_6);
-                    float hi6_22_6 = _fmax_614;
-                    float _min_550 = fminf(xg[12], v6_6);
-                    float lo6_23_6 = _min_550;
-                    xg[12] = hi6_22_6;
-                    v6_6 = lo6_23_6;
-                    float _fmax_615 = fmaxf(xg[13], v6_6);
-                    float hi6_24_6 = _fmax_615;
-                    float _min_551 = fminf(xg[13], v6_6);
-                    float lo6_25_6 = _min_551;
-                    xg[13] = hi6_24_6;
-                    v6_6 = lo6_25_6;
-                    float _fmax_616 = fmaxf(xg[14], v6_6);
-                    float hi6_26_6 = _fmax_616;
-                    float _min_552 = fminf(xg[14], v6_6);
-                    float lo6_27_6 = _min_552;
-                    xg[14] = hi6_26_6;
-                    v6_6 = lo6_27_6;
-                    float _fmax_617 = fmaxf(xg[15], v6_6);
-                    float hi6_28_6 = _fmax_617;
-                    float _min_553 = fminf(xg[15], v6_6);
-                    float lo6_29_6 = _min_553;
-                    xg[15] = hi6_28_6;
-                    v6_6 = lo6_29_6;
-                }
-                if (cgc > 23) {
-                    float v6_7 = __uint_as_float(cbuf[cg * 32 + 23]);
-                    float _fmax_618 = fmaxf(xg[0], v6_7);
-                    float hi6_13 = _fmax_618;
-                    float _min_554 = fminf(xg[0], v6_7);
-                    float lo6_14 = _min_554;
-                    xg[0] = hi6_13;
-                    v6_7 = lo6_14;
-                    float _fmax_619 = fmaxf(xg[1], v6_7);
-                    float hi6_0_7 = _fmax_619;
-                    float _min_555 = fminf(xg[1], v6_7);
-                    float lo6_1_7 = _min_555;
-                    xg[1] = hi6_0_7;
-                    v6_7 = lo6_1_7;
-                    float _fmax_620 = fmaxf(xg[2], v6_7);
-                    float hi6_2_7 = _fmax_620;
-                    float _min_556 = fminf(xg[2], v6_7);
-                    float lo6_3_7 = _min_556;
-                    xg[2] = hi6_2_7;
-                    v6_7 = lo6_3_7;
-                    float _fmax_621 = fmaxf(xg[3], v6_7);
-                    float hi6_4_7 = _fmax_621;
-                    float _min_557 = fminf(xg[3], v6_7);
-                    float lo6_5_7 = _min_557;
-                    xg[3] = hi6_4_7;
-                    v6_7 = lo6_5_7;
-                    float _fmax_622 = fmaxf(xg[4], v6_7);
-                    float hi6_6_7 = _fmax_622;
-                    float _min_558 = fminf(xg[4], v6_7);
-                    float lo6_7_7 = _min_558;
-                    xg[4] = hi6_6_7;
-                    v6_7 = lo6_7_7;
-                    float _fmax_623 = fmaxf(xg[5], v6_7);
-                    float hi6_8_7 = _fmax_623;
-                    float _min_559 = fminf(xg[5], v6_7);
-                    float lo6_9_7 = _min_559;
-                    xg[5] = hi6_8_7;
-                    v6_7 = lo6_9_7;
-                    float _fmax_624 = fmaxf(xg[6], v6_7);
-                    float hi6_10_7 = _fmax_624;
-                    float _min_560 = fminf(xg[6], v6_7);
-                    float lo6_11_7 = _min_560;
-                    xg[6] = hi6_10_7;
-                    v6_7 = lo6_11_7;
-                    float _fmax_625 = fmaxf(xg[7], v6_7);
-                    float hi6_12_7 = _fmax_625;
-                    float _min_561 = fminf(xg[7], v6_7);
-                    float lo6_13_7 = _min_561;
-                    xg[7] = hi6_12_7;
-                    v6_7 = lo6_13_7;
-                    float _fmax_626 = fmaxf(xg[8], v6_7);
-                    float hi6_14_7 = _fmax_626;
-                    float _min_562 = fminf(xg[8], v6_7);
-                    float lo6_15_7 = _min_562;
-                    xg[8] = hi6_14_7;
-                    v6_7 = lo6_15_7;
-                    float _fmax_627 = fmaxf(xg[9], v6_7);
-                    float hi6_16_7 = _fmax_627;
-                    float _min_563 = fminf(xg[9], v6_7);
-                    float lo6_17_7 = _min_563;
-                    xg[9] = hi6_16_7;
-                    v6_7 = lo6_17_7;
-                    float _fmax_628 = fmaxf(xg[10], v6_7);
-                    float hi6_18_7 = _fmax_628;
-                    float _min_564 = fminf(xg[10], v6_7);
-                    float lo6_19_7 = _min_564;
-                    xg[10] = hi6_18_7;
-                    v6_7 = lo6_19_7;
-                    float _fmax_629 = fmaxf(xg[11], v6_7);
-                    float hi6_20_7 = _fmax_629;
-                    float _min_565 = fminf(xg[11], v6_7);
-                    float lo6_21_7 = _min_565;
-                    xg[11] = hi6_20_7;
-                    v6_7 = lo6_21_7;
-                    float _fmax_630 = fmaxf(xg[12], v6_7);
-                    float hi6_22_7 = _fmax_630;
-                    float _min_566 = fminf(xg[12], v6_7);
-                    float lo6_23_7 = _min_566;
-                    xg[12] = hi6_22_7;
-                    v6_7 = lo6_23_7;
-                    float _fmax_631 = fmaxf(xg[13], v6_7);
-                    float hi6_24_7 = _fmax_631;
-                    float _min_567 = fminf(xg[13], v6_7);
-                    float lo6_25_7 = _min_567;
-                    xg[13] = hi6_24_7;
-                    v6_7 = lo6_25_7;
-                    float _fmax_632 = fmaxf(xg[14], v6_7);
-                    float hi6_26_7 = _fmax_632;
-                    float _min_568 = fminf(xg[14], v6_7);
-                    float lo6_27_7 = _min_568;
-                    xg[14] = hi6_26_7;
-                    v6_7 = lo6_27_7;
-                    float _fmax_633 = fmaxf(xg[15], v6_7);
-                    float hi6_28_7 = _fmax_633;
-                    float _min_569 = fminf(xg[15], v6_7);
-                    float lo6_29_7 = _min_569;
-                    xg[15] = hi6_28_7;
-                    v6_7 = lo6_29_7;
-                }
-                if (cgc > 24) {
-                    float v6_8 = __uint_as_float(cbuf[cg * 32 + 24]);
-                    float _fmax_634 = fmaxf(xg[0], v6_8);
-                    float hi6_15 = _fmax_634;
-                    float _min_570 = fminf(xg[0], v6_8);
-                    float lo6_16 = _min_570;
-                    xg[0] = hi6_15;
-                    v6_8 = lo6_16;
-                    float _fmax_635 = fmaxf(xg[1], v6_8);
-                    float hi6_0_8 = _fmax_635;
-                    float _min_571 = fminf(xg[1], v6_8);
-                    float lo6_1_8 = _min_571;
-                    xg[1] = hi6_0_8;
-                    v6_8 = lo6_1_8;
-                    float _fmax_636 = fmaxf(xg[2], v6_8);
-                    float hi6_2_8 = _fmax_636;
-                    float _min_572 = fminf(xg[2], v6_8);
-                    float lo6_3_8 = _min_572;
-                    xg[2] = hi6_2_8;
-                    v6_8 = lo6_3_8;
-                    float _fmax_637 = fmaxf(xg[3], v6_8);
-                    float hi6_4_8 = _fmax_637;
-                    float _min_573 = fminf(xg[3], v6_8);
-                    float lo6_5_8 = _min_573;
-                    xg[3] = hi6_4_8;
-                    v6_8 = lo6_5_8;
-                    float _fmax_638 = fmaxf(xg[4], v6_8);
-                    float hi6_6_8 = _fmax_638;
-                    float _min_574 = fminf(xg[4], v6_8);
-                    float lo6_7_8 = _min_574;
-                    xg[4] = hi6_6_8;
-                    v6_8 = lo6_7_8;
-                    float _fmax_639 = fmaxf(xg[5], v6_8);
-                    float hi6_8_8 = _fmax_639;
-                    float _min_575 = fminf(xg[5], v6_8);
-                    float lo6_9_8 = _min_575;
-                    xg[5] = hi6_8_8;
-                    v6_8 = lo6_9_8;
-                    float _fmax_640 = fmaxf(xg[6], v6_8);
-                    float hi6_10_8 = _fmax_640;
-                    float _min_576 = fminf(xg[6], v6_8);
-                    float lo6_11_8 = _min_576;
-                    xg[6] = hi6_10_8;
-                    v6_8 = lo6_11_8;
-                    float _fmax_641 = fmaxf(xg[7], v6_8);
-                    float hi6_12_8 = _fmax_641;
-                    float _min_577 = fminf(xg[7], v6_8);
-                    float lo6_13_8 = _min_577;
-                    xg[7] = hi6_12_8;
-                    v6_8 = lo6_13_8;
-                    float _fmax_642 = fmaxf(xg[8], v6_8);
-                    float hi6_14_8 = _fmax_642;
-                    float _min_578 = fminf(xg[8], v6_8);
-                    float lo6_15_8 = _min_578;
-                    xg[8] = hi6_14_8;
-                    v6_8 = lo6_15_8;
-                    float _fmax_643 = fmaxf(xg[9], v6_8);
-                    float hi6_16_8 = _fmax_643;
-                    float _min_579 = fminf(xg[9], v6_8);
-                    float lo6_17_8 = _min_579;
-                    xg[9] = hi6_16_8;
-                    v6_8 = lo6_17_8;
-                    float _fmax_644 = fmaxf(xg[10], v6_8);
-                    float hi6_18_8 = _fmax_644;
-                    float _min_580 = fminf(xg[10], v6_8);
-                    float lo6_19_8 = _min_580;
-                    xg[10] = hi6_18_8;
-                    v6_8 = lo6_19_8;
-                    float _fmax_645 = fmaxf(xg[11], v6_8);
-                    float hi6_20_8 = _fmax_645;
-                    float _min_581 = fminf(xg[11], v6_8);
-                    float lo6_21_8 = _min_581;
-                    xg[11] = hi6_20_8;
-                    v6_8 = lo6_21_8;
-                    float _fmax_646 = fmaxf(xg[12], v6_8);
-                    float hi6_22_8 = _fmax_646;
-                    float _min_582 = fminf(xg[12], v6_8);
-                    float lo6_23_8 = _min_582;
-                    xg[12] = hi6_22_8;
-                    v6_8 = lo6_23_8;
-                    float _fmax_647 = fmaxf(xg[13], v6_8);
-                    float hi6_24_8 = _fmax_647;
-                    float _min_583 = fminf(xg[13], v6_8);
-                    float lo6_25_8 = _min_583;
-                    xg[13] = hi6_24_8;
-                    v6_8 = lo6_25_8;
-                    float _fmax_648 = fmaxf(xg[14], v6_8);
-                    float hi6_26_8 = _fmax_648;
-                    float _min_584 = fminf(xg[14], v6_8);
-                    float lo6_27_8 = _min_584;
-                    xg[14] = hi6_26_8;
-                    v6_8 = lo6_27_8;
-                    float _fmax_649 = fmaxf(xg[15], v6_8);
-                    float hi6_28_8 = _fmax_649;
-                    float _min_585 = fminf(xg[15], v6_8);
-                    float lo6_29_8 = _min_585;
-                    xg[15] = hi6_28_8;
-                    v6_8 = lo6_29_8;
-                }
-                if (cgc > 25) {
-                    float v6_9 = __uint_as_float(cbuf[cg * 32 + 25]);
-                    float _fmax_650 = fmaxf(xg[0], v6_9);
-                    float hi6_17 = _fmax_650;
-                    float _min_586 = fminf(xg[0], v6_9);
-                    float lo6_18 = _min_586;
-                    xg[0] = hi6_17;
-                    v6_9 = lo6_18;
-                    float _fmax_651 = fmaxf(xg[1], v6_9);
-                    float hi6_0_9 = _fmax_651;
-                    float _min_587 = fminf(xg[1], v6_9);
-                    float lo6_1_9 = _min_587;
-                    xg[1] = hi6_0_9;
-                    v6_9 = lo6_1_9;
-                    float _fmax_652 = fmaxf(xg[2], v6_9);
-                    float hi6_2_9 = _fmax_652;
-                    float _min_588 = fminf(xg[2], v6_9);
-                    float lo6_3_9 = _min_588;
-                    xg[2] = hi6_2_9;
-                    v6_9 = lo6_3_9;
-                    float _fmax_653 = fmaxf(xg[3], v6_9);
-                    float hi6_4_9 = _fmax_653;
-                    float _min_589 = fminf(xg[3], v6_9);
-                    float lo6_5_9 = _min_589;
-                    xg[3] = hi6_4_9;
-                    v6_9 = lo6_5_9;
-                    float _fmax_654 = fmaxf(xg[4], v6_9);
-                    float hi6_6_9 = _fmax_654;
-                    float _min_590 = fminf(xg[4], v6_9);
-                    float lo6_7_9 = _min_590;
-                    xg[4] = hi6_6_9;
-                    v6_9 = lo6_7_9;
-                    float _fmax_655 = fmaxf(xg[5], v6_9);
-                    float hi6_8_9 = _fmax_655;
-                    float _min_591 = fminf(xg[5], v6_9);
-                    float lo6_9_9 = _min_591;
-                    xg[5] = hi6_8_9;
-                    v6_9 = lo6_9_9;
-                    float _fmax_656 = fmaxf(xg[6], v6_9);
-                    float hi6_10_9 = _fmax_656;
-                    float _min_592 = fminf(xg[6], v6_9);
-                    float lo6_11_9 = _min_592;
-                    xg[6] = hi6_10_9;
-                    v6_9 = lo6_11_9;
-                    float _fmax_657 = fmaxf(xg[7], v6_9);
-                    float hi6_12_9 = _fmax_657;
-                    float _min_593 = fminf(xg[7], v6_9);
-                    float lo6_13_9 = _min_593;
-                    xg[7] = hi6_12_9;
-                    v6_9 = lo6_13_9;
-                    float _fmax_658 = fmaxf(xg[8], v6_9);
-                    float hi6_14_9 = _fmax_658;
-                    float _min_594 = fminf(xg[8], v6_9);
-                    float lo6_15_9 = _min_594;
-                    xg[8] = hi6_14_9;
-                    v6_9 = lo6_15_9;
-                    float _fmax_659 = fmaxf(xg[9], v6_9);
-                    float hi6_16_9 = _fmax_659;
-                    float _min_595 = fminf(xg[9], v6_9);
-                    float lo6_17_9 = _min_595;
-                    xg[9] = hi6_16_9;
-                    v6_9 = lo6_17_9;
-                    float _fmax_660 = fmaxf(xg[10], v6_9);
-                    float hi6_18_9 = _fmax_660;
-                    float _min_596 = fminf(xg[10], v6_9);
-                    float lo6_19_9 = _min_596;
-                    xg[10] = hi6_18_9;
-                    v6_9 = lo6_19_9;
-                    float _fmax_661 = fmaxf(xg[11], v6_9);
-                    float hi6_20_9 = _fmax_661;
-                    float _min_597 = fminf(xg[11], v6_9);
-                    float lo6_21_9 = _min_597;
-                    xg[11] = hi6_20_9;
-                    v6_9 = lo6_21_9;
-                    float _fmax_662 = fmaxf(xg[12], v6_9);
-                    float hi6_22_9 = _fmax_662;
-                    float _min_598 = fminf(xg[12], v6_9);
-                    float lo6_23_9 = _min_598;
-                    xg[12] = hi6_22_9;
-                    v6_9 = lo6_23_9;
-                    float _fmax_663 = fmaxf(xg[13], v6_9);
-                    float hi6_24_9 = _fmax_663;
-                    float _min_599 = fminf(xg[13], v6_9);
-                    float lo6_25_9 = _min_599;
-                    xg[13] = hi6_24_9;
-                    v6_9 = lo6_25_9;
-                    float _fmax_664 = fmaxf(xg[14], v6_9);
-                    float hi6_26_9 = _fmax_664;
-                    float _min_600 = fminf(xg[14], v6_9);
-                    float lo6_27_9 = _min_600;
-                    xg[14] = hi6_26_9;
-                    v6_9 = lo6_27_9;
-                    float _fmax_665 = fmaxf(xg[15], v6_9);
-                    float hi6_28_9 = _fmax_665;
-                    float _min_601 = fminf(xg[15], v6_9);
-                    float lo6_29_9 = _min_601;
-                    xg[15] = hi6_28_9;
-                    v6_9 = lo6_29_9;
-                }
-                if (cgc > 26) {
-                    float v6_10 = __uint_as_float(cbuf[cg * 32 + 26]);
-                    float _fmax_666 = fmaxf(xg[0], v6_10);
-                    float hi6_19 = _fmax_666;
-                    float _min_602 = fminf(xg[0], v6_10);
-                    float lo6_20 = _min_602;
-                    xg[0] = hi6_19;
-                    v6_10 = lo6_20;
-                    float _fmax_667 = fmaxf(xg[1], v6_10);
-                    float hi6_0_10 = _fmax_667;
-                    float _min_603 = fminf(xg[1], v6_10);
-                    float lo6_1_10 = _min_603;
-                    xg[1] = hi6_0_10;
-                    v6_10 = lo6_1_10;
-                    float _fmax_668 = fmaxf(xg[2], v6_10);
-                    float hi6_2_10 = _fmax_668;
-                    float _min_604 = fminf(xg[2], v6_10);
-                    float lo6_3_10 = _min_604;
-                    xg[2] = hi6_2_10;
-                    v6_10 = lo6_3_10;
-                    float _fmax_669 = fmaxf(xg[3], v6_10);
-                    float hi6_4_10 = _fmax_669;
-                    float _min_605 = fminf(xg[3], v6_10);
-                    float lo6_5_10 = _min_605;
-                    xg[3] = hi6_4_10;
-                    v6_10 = lo6_5_10;
-                    float _fmax_670 = fmaxf(xg[4], v6_10);
-                    float hi6_6_10 = _fmax_670;
-                    float _min_606 = fminf(xg[4], v6_10);
-                    float lo6_7_10 = _min_606;
-                    xg[4] = hi6_6_10;
-                    v6_10 = lo6_7_10;
-                    float _fmax_671 = fmaxf(xg[5], v6_10);
-                    float hi6_8_10 = _fmax_671;
-                    float _min_607 = fminf(xg[5], v6_10);
-                    float lo6_9_10 = _min_607;
-                    xg[5] = hi6_8_10;
-                    v6_10 = lo6_9_10;
-                    float _fmax_672 = fmaxf(xg[6], v6_10);
-                    float hi6_10_10 = _fmax_672;
-                    float _min_608 = fminf(xg[6], v6_10);
-                    float lo6_11_10 = _min_608;
-                    xg[6] = hi6_10_10;
-                    v6_10 = lo6_11_10;
-                    float _fmax_673 = fmaxf(xg[7], v6_10);
-                    float hi6_12_10 = _fmax_673;
-                    float _min_609 = fminf(xg[7], v6_10);
-                    float lo6_13_10 = _min_609;
-                    xg[7] = hi6_12_10;
-                    v6_10 = lo6_13_10;
-                    float _fmax_674 = fmaxf(xg[8], v6_10);
-                    float hi6_14_10 = _fmax_674;
-                    float _min_610 = fminf(xg[8], v6_10);
-                    float lo6_15_10 = _min_610;
-                    xg[8] = hi6_14_10;
-                    v6_10 = lo6_15_10;
-                    float _fmax_675 = fmaxf(xg[9], v6_10);
-                    float hi6_16_10 = _fmax_675;
-                    float _min_611 = fminf(xg[9], v6_10);
-                    float lo6_17_10 = _min_611;
-                    xg[9] = hi6_16_10;
-                    v6_10 = lo6_17_10;
-                    float _fmax_676 = fmaxf(xg[10], v6_10);
-                    float hi6_18_10 = _fmax_676;
-                    float _min_612 = fminf(xg[10], v6_10);
-                    float lo6_19_10 = _min_612;
-                    xg[10] = hi6_18_10;
-                    v6_10 = lo6_19_10;
-                    float _fmax_677 = fmaxf(xg[11], v6_10);
-                    float hi6_20_10 = _fmax_677;
-                    float _min_613 = fminf(xg[11], v6_10);
-                    float lo6_21_10 = _min_613;
-                    xg[11] = hi6_20_10;
-                    v6_10 = lo6_21_10;
-                    float _fmax_678 = fmaxf(xg[12], v6_10);
-                    float hi6_22_10 = _fmax_678;
-                    float _min_614 = fminf(xg[12], v6_10);
-                    float lo6_23_10 = _min_614;
-                    xg[12] = hi6_22_10;
-                    v6_10 = lo6_23_10;
-                    float _fmax_679 = fmaxf(xg[13], v6_10);
-                    float hi6_24_10 = _fmax_679;
-                    float _min_615 = fminf(xg[13], v6_10);
-                    float lo6_25_10 = _min_615;
-                    xg[13] = hi6_24_10;
-                    v6_10 = lo6_25_10;
-                    float _fmax_680 = fmaxf(xg[14], v6_10);
-                    float hi6_26_10 = _fmax_680;
-                    float _min_616 = fminf(xg[14], v6_10);
-                    float lo6_27_10 = _min_616;
-                    xg[14] = hi6_26_10;
-                    v6_10 = lo6_27_10;
-                    float _fmax_681 = fmaxf(xg[15], v6_10);
-                    float hi6_28_10 = _fmax_681;
-                    float _min_617 = fminf(xg[15], v6_10);
-                    float lo6_29_10 = _min_617;
-                    xg[15] = hi6_28_10;
-                    v6_10 = lo6_29_10;
-                }
-                if (cgc > 27) {
-                    float v6_11 = __uint_as_float(cbuf[cg * 32 + 27]);
-                    float _fmax_682 = fmaxf(xg[0], v6_11);
-                    float hi6_21 = _fmax_682;
-                    float _min_618 = fminf(xg[0], v6_11);
-                    float lo6_22 = _min_618;
-                    xg[0] = hi6_21;
-                    v6_11 = lo6_22;
-                    float _fmax_683 = fmaxf(xg[1], v6_11);
-                    float hi6_0_11 = _fmax_683;
-                    float _min_619 = fminf(xg[1], v6_11);
-                    float lo6_1_11 = _min_619;
-                    xg[1] = hi6_0_11;
-                    v6_11 = lo6_1_11;
-                    float _fmax_684 = fmaxf(xg[2], v6_11);
-                    float hi6_2_11 = _fmax_684;
-                    float _min_620 = fminf(xg[2], v6_11);
-                    float lo6_3_11 = _min_620;
-                    xg[2] = hi6_2_11;
-                    v6_11 = lo6_3_11;
-                    float _fmax_685 = fmaxf(xg[3], v6_11);
-                    float hi6_4_11 = _fmax_685;
-                    float _min_621 = fminf(xg[3], v6_11);
-                    float lo6_5_11 = _min_621;
-                    xg[3] = hi6_4_11;
-                    v6_11 = lo6_5_11;
-                    float _fmax_686 = fmaxf(xg[4], v6_11);
-                    float hi6_6_11 = _fmax_686;
-                    float _min_622 = fminf(xg[4], v6_11);
-                    float lo6_7_11 = _min_622;
-                    xg[4] = hi6_6_11;
-                    v6_11 = lo6_7_11;
-                    float _fmax_687 = fmaxf(xg[5], v6_11);
-                    float hi6_8_11 = _fmax_687;
-                    float _min_623 = fminf(xg[5], v6_11);
-                    float lo6_9_11 = _min_623;
-                    xg[5] = hi6_8_11;
-                    v6_11 = lo6_9_11;
-                    float _fmax_688 = fmaxf(xg[6], v6_11);
-                    float hi6_10_11 = _fmax_688;
-                    float _min_624 = fminf(xg[6], v6_11);
-                    float lo6_11_11 = _min_624;
-                    xg[6] = hi6_10_11;
-                    v6_11 = lo6_11_11;
-                    float _fmax_689 = fmaxf(xg[7], v6_11);
-                    float hi6_12_11 = _fmax_689;
-                    float _min_625 = fminf(xg[7], v6_11);
-                    float lo6_13_11 = _min_625;
-                    xg[7] = hi6_12_11;
-                    v6_11 = lo6_13_11;
-                    float _fmax_690 = fmaxf(xg[8], v6_11);
-                    float hi6_14_11 = _fmax_690;
-                    float _min_626 = fminf(xg[8], v6_11);
-                    float lo6_15_11 = _min_626;
-                    xg[8] = hi6_14_11;
-                    v6_11 = lo6_15_11;
-                    float _fmax_691 = fmaxf(xg[9], v6_11);
-                    float hi6_16_11 = _fmax_691;
-                    float _min_627 = fminf(xg[9], v6_11);
-                    float lo6_17_11 = _min_627;
-                    xg[9] = hi6_16_11;
-                    v6_11 = lo6_17_11;
-                    float _fmax_692 = fmaxf(xg[10], v6_11);
-                    float hi6_18_11 = _fmax_692;
-                    float _min_628 = fminf(xg[10], v6_11);
-                    float lo6_19_11 = _min_628;
-                    xg[10] = hi6_18_11;
-                    v6_11 = lo6_19_11;
-                    float _fmax_693 = fmaxf(xg[11], v6_11);
-                    float hi6_20_11 = _fmax_693;
-                    float _min_629 = fminf(xg[11], v6_11);
-                    float lo6_21_11 = _min_629;
-                    xg[11] = hi6_20_11;
-                    v6_11 = lo6_21_11;
-                    float _fmax_694 = fmaxf(xg[12], v6_11);
-                    float hi6_22_11 = _fmax_694;
-                    float _min_630 = fminf(xg[12], v6_11);
-                    float lo6_23_11 = _min_630;
-                    xg[12] = hi6_22_11;
-                    v6_11 = lo6_23_11;
-                    float _fmax_695 = fmaxf(xg[13], v6_11);
-                    float hi6_24_11 = _fmax_695;
-                    float _min_631 = fminf(xg[13], v6_11);
-                    float lo6_25_11 = _min_631;
-                    xg[13] = hi6_24_11;
-                    v6_11 = lo6_25_11;
-                    float _fmax_696 = fmaxf(xg[14], v6_11);
-                    float hi6_26_11 = _fmax_696;
-                    float _min_632 = fminf(xg[14], v6_11);
-                    float lo6_27_11 = _min_632;
-                    xg[14] = hi6_26_11;
-                    v6_11 = lo6_27_11;
-                    float _fmax_697 = fmaxf(xg[15], v6_11);
-                    float hi6_28_11 = _fmax_697;
-                    float _min_633 = fminf(xg[15], v6_11);
-                    float lo6_29_11 = _min_633;
-                    xg[15] = hi6_28_11;
-                    v6_11 = lo6_29_11;
-                }
-                if (cgc > 28) {
-                    float v6_12 = __uint_as_float(cbuf[cg * 32 + 28]);
-                    float _fmax_698 = fmaxf(xg[0], v6_12);
-                    float hi6_23 = _fmax_698;
-                    float _min_634 = fminf(xg[0], v6_12);
-                    float lo6_24 = _min_634;
-                    xg[0] = hi6_23;
-                    v6_12 = lo6_24;
-                    float _fmax_699 = fmaxf(xg[1], v6_12);
-                    float hi6_0_12 = _fmax_699;
-                    float _min_635 = fminf(xg[1], v6_12);
-                    float lo6_1_12 = _min_635;
-                    xg[1] = hi6_0_12;
-                    v6_12 = lo6_1_12;
-                    float _fmax_700 = fmaxf(xg[2], v6_12);
-                    float hi6_2_12 = _fmax_700;
-                    float _min_636 = fminf(xg[2], v6_12);
-                    float lo6_3_12 = _min_636;
-                    xg[2] = hi6_2_12;
-                    v6_12 = lo6_3_12;
-                    float _fmax_701 = fmaxf(xg[3], v6_12);
-                    float hi6_4_12 = _fmax_701;
-                    float _min_637 = fminf(xg[3], v6_12);
-                    float lo6_5_12 = _min_637;
-                    xg[3] = hi6_4_12;
-                    v6_12 = lo6_5_12;
-                    float _fmax_702 = fmaxf(xg[4], v6_12);
-                    float hi6_6_12 = _fmax_702;
-                    float _min_638 = fminf(xg[4], v6_12);
-                    float lo6_7_12 = _min_638;
-                    xg[4] = hi6_6_12;
-                    v6_12 = lo6_7_12;
-                    float _fmax_703 = fmaxf(xg[5], v6_12);
-                    float hi6_8_12 = _fmax_703;
-                    float _min_639 = fminf(xg[5], v6_12);
-                    float lo6_9_12 = _min_639;
-                    xg[5] = hi6_8_12;
-                    v6_12 = lo6_9_12;
-                    float _fmax_704 = fmaxf(xg[6], v6_12);
-                    float hi6_10_12 = _fmax_704;
-                    float _min_640 = fminf(xg[6], v6_12);
-                    float lo6_11_12 = _min_640;
-                    xg[6] = hi6_10_12;
-                    v6_12 = lo6_11_12;
-                    float _fmax_705 = fmaxf(xg[7], v6_12);
-                    float hi6_12_12 = _fmax_705;
-                    float _min_641 = fminf(xg[7], v6_12);
-                    float lo6_13_12 = _min_641;
-                    xg[7] = hi6_12_12;
-                    v6_12 = lo6_13_12;
-                    float _fmax_706 = fmaxf(xg[8], v6_12);
-                    float hi6_14_12 = _fmax_706;
-                    float _min_642 = fminf(xg[8], v6_12);
-                    float lo6_15_12 = _min_642;
-                    xg[8] = hi6_14_12;
-                    v6_12 = lo6_15_12;
-                    float _fmax_707 = fmaxf(xg[9], v6_12);
-                    float hi6_16_12 = _fmax_707;
-                    float _min_643 = fminf(xg[9], v6_12);
-                    float lo6_17_12 = _min_643;
-                    xg[9] = hi6_16_12;
-                    v6_12 = lo6_17_12;
-                    float _fmax_708 = fmaxf(xg[10], v6_12);
-                    float hi6_18_12 = _fmax_708;
-                    float _min_644 = fminf(xg[10], v6_12);
-                    float lo6_19_12 = _min_644;
-                    xg[10] = hi6_18_12;
-                    v6_12 = lo6_19_12;
-                    float _fmax_709 = fmaxf(xg[11], v6_12);
-                    float hi6_20_12 = _fmax_709;
-                    float _min_645 = fminf(xg[11], v6_12);
-                    float lo6_21_12 = _min_645;
-                    xg[11] = hi6_20_12;
-                    v6_12 = lo6_21_12;
-                    float _fmax_710 = fmaxf(xg[12], v6_12);
-                    float hi6_22_12 = _fmax_710;
-                    float _min_646 = fminf(xg[12], v6_12);
-                    float lo6_23_12 = _min_646;
-                    xg[12] = hi6_22_12;
-                    v6_12 = lo6_23_12;
-                    float _fmax_711 = fmaxf(xg[13], v6_12);
-                    float hi6_24_12 = _fmax_711;
-                    float _min_647 = fminf(xg[13], v6_12);
-                    float lo6_25_12 = _min_647;
-                    xg[13] = hi6_24_12;
-                    v6_12 = lo6_25_12;
-                    float _fmax_712 = fmaxf(xg[14], v6_12);
-                    float hi6_26_12 = _fmax_712;
-                    float _min_648 = fminf(xg[14], v6_12);
-                    float lo6_27_12 = _min_648;
-                    xg[14] = hi6_26_12;
-                    v6_12 = lo6_27_12;
-                    float _fmax_713 = fmaxf(xg[15], v6_12);
-                    float hi6_28_12 = _fmax_713;
-                    float _min_649 = fminf(xg[15], v6_12);
-                    float lo6_29_12 = _min_649;
-                    xg[15] = hi6_28_12;
-                    v6_12 = lo6_29_12;
-                }
-                if (cgc > 29) {
-                    float v6_13 = __uint_as_float(cbuf[cg * 32 + 29]);
-                    float _fmax_714 = fmaxf(xg[0], v6_13);
-                    float hi6_25 = _fmax_714;
-                    float _min_650 = fminf(xg[0], v6_13);
-                    float lo6_26 = _min_650;
-                    xg[0] = hi6_25;
-                    v6_13 = lo6_26;
-                    float _fmax_715 = fmaxf(xg[1], v6_13);
-                    float hi6_0_13 = _fmax_715;
-                    float _min_651 = fminf(xg[1], v6_13);
-                    float lo6_1_13 = _min_651;
-                    xg[1] = hi6_0_13;
-                    v6_13 = lo6_1_13;
-                    float _fmax_716 = fmaxf(xg[2], v6_13);
-                    float hi6_2_13 = _fmax_716;
-                    float _min_652 = fminf(xg[2], v6_13);
-                    float lo6_3_13 = _min_652;
-                    xg[2] = hi6_2_13;
-                    v6_13 = lo6_3_13;
-                    float _fmax_717 = fmaxf(xg[3], v6_13);
-                    float hi6_4_13 = _fmax_717;
-                    float _min_653 = fminf(xg[3], v6_13);
-                    float lo6_5_13 = _min_653;
-                    xg[3] = hi6_4_13;
-                    v6_13 = lo6_5_13;
-                    float _fmax_718 = fmaxf(xg[4], v6_13);
-                    float hi6_6_13 = _fmax_718;
-                    float _min_654 = fminf(xg[4], v6_13);
-                    float lo6_7_13 = _min_654;
-                    xg[4] = hi6_6_13;
-                    v6_13 = lo6_7_13;
-                    float _fmax_719 = fmaxf(xg[5], v6_13);
-                    float hi6_8_13 = _fmax_719;
-                    float _min_655 = fminf(xg[5], v6_13);
-                    float lo6_9_13 = _min_655;
-                    xg[5] = hi6_8_13;
-                    v6_13 = lo6_9_13;
-                    float _fmax_720 = fmaxf(xg[6], v6_13);
-                    float hi6_10_13 = _fmax_720;
-                    float _min_656 = fminf(xg[6], v6_13);
-                    float lo6_11_13 = _min_656;
-                    xg[6] = hi6_10_13;
-                    v6_13 = lo6_11_13;
-                    float _fmax_721 = fmaxf(xg[7], v6_13);
-                    float hi6_12_13 = _fmax_721;
-                    float _min_657 = fminf(xg[7], v6_13);
-                    float lo6_13_13 = _min_657;
-                    xg[7] = hi6_12_13;
-                    v6_13 = lo6_13_13;
-                    float _fmax_722 = fmaxf(xg[8], v6_13);
-                    float hi6_14_13 = _fmax_722;
-                    float _min_658 = fminf(xg[8], v6_13);
-                    float lo6_15_13 = _min_658;
-                    xg[8] = hi6_14_13;
-                    v6_13 = lo6_15_13;
-                    float _fmax_723 = fmaxf(xg[9], v6_13);
-                    float hi6_16_13 = _fmax_723;
-                    float _min_659 = fminf(xg[9], v6_13);
-                    float lo6_17_13 = _min_659;
-                    xg[9] = hi6_16_13;
-                    v6_13 = lo6_17_13;
-                    float _fmax_724 = fmaxf(xg[10], v6_13);
-                    float hi6_18_13 = _fmax_724;
-                    float _min_660 = fminf(xg[10], v6_13);
-                    float lo6_19_13 = _min_660;
-                    xg[10] = hi6_18_13;
-                    v6_13 = lo6_19_13;
-                    float _fmax_725 = fmaxf(xg[11], v6_13);
-                    float hi6_20_13 = _fmax_725;
-                    float _min_661 = fminf(xg[11], v6_13);
-                    float lo6_21_13 = _min_661;
-                    xg[11] = hi6_20_13;
-                    v6_13 = lo6_21_13;
-                    float _fmax_726 = fmaxf(xg[12], v6_13);
-                    float hi6_22_13 = _fmax_726;
-                    float _min_662 = fminf(xg[12], v6_13);
-                    float lo6_23_13 = _min_662;
-                    xg[12] = hi6_22_13;
-                    v6_13 = lo6_23_13;
-                    float _fmax_727 = fmaxf(xg[13], v6_13);
-                    float hi6_24_13 = _fmax_727;
-                    float _min_663 = fminf(xg[13], v6_13);
-                    float lo6_25_13 = _min_663;
-                    xg[13] = hi6_24_13;
-                    v6_13 = lo6_25_13;
-                    float _fmax_728 = fmaxf(xg[14], v6_13);
-                    float hi6_26_13 = _fmax_728;
-                    float _min_664 = fminf(xg[14], v6_13);
-                    float lo6_27_13 = _min_664;
-                    xg[14] = hi6_26_13;
-                    v6_13 = lo6_27_13;
-                    float _fmax_729 = fmaxf(xg[15], v6_13);
-                    float hi6_28_13 = _fmax_729;
-                    float _min_665 = fminf(xg[15], v6_13);
-                    float lo6_29_13 = _min_665;
-                    xg[15] = hi6_28_13;
-                    v6_13 = lo6_29_13;
-                }
-                if (cgc > 30) {
-                    float v6_14 = __uint_as_float(cbuf[cg * 32 + 30]);
-                    float _fmax_730 = fmaxf(xg[0], v6_14);
-                    float hi6_27 = _fmax_730;
-                    float _min_666 = fminf(xg[0], v6_14);
-                    float lo6_28 = _min_666;
-                    xg[0] = hi6_27;
-                    v6_14 = lo6_28;
-                    float _fmax_731 = fmaxf(xg[1], v6_14);
-                    float hi6_0_14 = _fmax_731;
-                    float _min_667 = fminf(xg[1], v6_14);
-                    float lo6_1_14 = _min_667;
-                    xg[1] = hi6_0_14;
-                    v6_14 = lo6_1_14;
-                    float _fmax_732 = fmaxf(xg[2], v6_14);
-                    float hi6_2_14 = _fmax_732;
-                    float _min_668 = fminf(xg[2], v6_14);
-                    float lo6_3_14 = _min_668;
-                    xg[2] = hi6_2_14;
-                    v6_14 = lo6_3_14;
-                    float _fmax_733 = fmaxf(xg[3], v6_14);
-                    float hi6_4_14 = _fmax_733;
-                    float _min_669 = fminf(xg[3], v6_14);
-                    float lo6_5_14 = _min_669;
-                    xg[3] = hi6_4_14;
-                    v6_14 = lo6_5_14;
-                    float _fmax_734 = fmaxf(xg[4], v6_14);
-                    float hi6_6_14 = _fmax_734;
-                    float _min_670 = fminf(xg[4], v6_14);
-                    float lo6_7_14 = _min_670;
-                    xg[4] = hi6_6_14;
-                    v6_14 = lo6_7_14;
-                    float _fmax_735 = fmaxf(xg[5], v6_14);
-                    float hi6_8_14 = _fmax_735;
-                    float _min_671 = fminf(xg[5], v6_14);
-                    float lo6_9_14 = _min_671;
-                    xg[5] = hi6_8_14;
-                    v6_14 = lo6_9_14;
-                    float _fmax_736 = fmaxf(xg[6], v6_14);
-                    float hi6_10_14 = _fmax_736;
-                    float _min_672 = fminf(xg[6], v6_14);
-                    float lo6_11_14 = _min_672;
-                    xg[6] = hi6_10_14;
-                    v6_14 = lo6_11_14;
-                    float _fmax_737 = fmaxf(xg[7], v6_14);
-                    float hi6_12_14 = _fmax_737;
-                    float _min_673 = fminf(xg[7], v6_14);
-                    float lo6_13_14 = _min_673;
-                    xg[7] = hi6_12_14;
-                    v6_14 = lo6_13_14;
-                    float _fmax_738 = fmaxf(xg[8], v6_14);
-                    float hi6_14_14 = _fmax_738;
-                    float _min_674 = fminf(xg[8], v6_14);
-                    float lo6_15_14 = _min_674;
-                    xg[8] = hi6_14_14;
-                    v6_14 = lo6_15_14;
-                    float _fmax_739 = fmaxf(xg[9], v6_14);
-                    float hi6_16_14 = _fmax_739;
-                    float _min_675 = fminf(xg[9], v6_14);
-                    float lo6_17_14 = _min_675;
-                    xg[9] = hi6_16_14;
-                    v6_14 = lo6_17_14;
-                    float _fmax_740 = fmaxf(xg[10], v6_14);
-                    float hi6_18_14 = _fmax_740;
-                    float _min_676 = fminf(xg[10], v6_14);
-                    float lo6_19_14 = _min_676;
-                    xg[10] = hi6_18_14;
-                    v6_14 = lo6_19_14;
-                    float _fmax_741 = fmaxf(xg[11], v6_14);
-                    float hi6_20_14 = _fmax_741;
-                    float _min_677 = fminf(xg[11], v6_14);
-                    float lo6_21_14 = _min_677;
-                    xg[11] = hi6_20_14;
-                    v6_14 = lo6_21_14;
-                    float _fmax_742 = fmaxf(xg[12], v6_14);
-                    float hi6_22_14 = _fmax_742;
-                    float _min_678 = fminf(xg[12], v6_14);
-                    float lo6_23_14 = _min_678;
-                    xg[12] = hi6_22_14;
-                    v6_14 = lo6_23_14;
-                    float _fmax_743 = fmaxf(xg[13], v6_14);
-                    float hi6_24_14 = _fmax_743;
-                    float _min_679 = fminf(xg[13], v6_14);
-                    float lo6_25_14 = _min_679;
-                    xg[13] = hi6_24_14;
-                    v6_14 = lo6_25_14;
-                    float _fmax_744 = fmaxf(xg[14], v6_14);
-                    float hi6_26_14 = _fmax_744;
-                    float _min_680 = fminf(xg[14], v6_14);
-                    float lo6_27_14 = _min_680;
-                    xg[14] = hi6_26_14;
-                    v6_14 = lo6_27_14;
-                    float _fmax_745 = fmaxf(xg[15], v6_14);
-                    float hi6_28_14 = _fmax_745;
-                    float _min_681 = fminf(xg[15], v6_14);
-                    float lo6_29_14 = _min_681;
-                    xg[15] = hi6_28_14;
-                    v6_14 = lo6_29_14;
-                }
-                if (cgc > 31) {
-                    float v6_15 = __uint_as_float(cbuf[cg * 32 + 31]);
-                    float _fmax_746 = fmaxf(xg[0], v6_15);
-                    float hi6_29 = _fmax_746;
-                    float _min_682 = fminf(xg[0], v6_15);
-                    float lo6_30 = _min_682;
-                    xg[0] = hi6_29;
-                    v6_15 = lo6_30;
-                    float _fmax_747 = fmaxf(xg[1], v6_15);
-                    float hi6_0_15 = _fmax_747;
-                    float _min_683 = fminf(xg[1], v6_15);
-                    float lo6_1_15 = _min_683;
-                    xg[1] = hi6_0_15;
-                    v6_15 = lo6_1_15;
-                    float _fmax_748 = fmaxf(xg[2], v6_15);
-                    float hi6_2_15 = _fmax_748;
-                    float _min_684 = fminf(xg[2], v6_15);
-                    float lo6_3_15 = _min_684;
-                    xg[2] = hi6_2_15;
-                    v6_15 = lo6_3_15;
-                    float _fmax_749 = fmaxf(xg[3], v6_15);
-                    float hi6_4_15 = _fmax_749;
-                    float _min_685 = fminf(xg[3], v6_15);
-                    float lo6_5_15 = _min_685;
-                    xg[3] = hi6_4_15;
-                    v6_15 = lo6_5_15;
-                    float _fmax_750 = fmaxf(xg[4], v6_15);
-                    float hi6_6_15 = _fmax_750;
-                    float _min_686 = fminf(xg[4], v6_15);
-                    float lo6_7_15 = _min_686;
-                    xg[4] = hi6_6_15;
-                    v6_15 = lo6_7_15;
-                    float _fmax_751 = fmaxf(xg[5], v6_15);
-                    float hi6_8_15 = _fmax_751;
-                    float _min_687 = fminf(xg[5], v6_15);
-                    float lo6_9_15 = _min_687;
-                    xg[5] = hi6_8_15;
-                    v6_15 = lo6_9_15;
-                    float _fmax_752 = fmaxf(xg[6], v6_15);
-                    float hi6_10_15 = _fmax_752;
-                    float _min_688 = fminf(xg[6], v6_15);
-                    float lo6_11_15 = _min_688;
-                    xg[6] = hi6_10_15;
-                    v6_15 = lo6_11_15;
-                    float _fmax_753 = fmaxf(xg[7], v6_15);
-                    float hi6_12_15 = _fmax_753;
-                    float _min_689 = fminf(xg[7], v6_15);
-                    float lo6_13_15 = _min_689;
-                    xg[7] = hi6_12_15;
-                    v6_15 = lo6_13_15;
-                    float _fmax_754 = fmaxf(xg[8], v6_15);
-                    float hi6_14_15 = _fmax_754;
-                    float _min_690 = fminf(xg[8], v6_15);
-                    float lo6_15_15 = _min_690;
-                    xg[8] = hi6_14_15;
-                    v6_15 = lo6_15_15;
-                    float _fmax_755 = fmaxf(xg[9], v6_15);
-                    float hi6_16_15 = _fmax_755;
-                    float _min_691 = fminf(xg[9], v6_15);
-                    float lo6_17_15 = _min_691;
-                    xg[9] = hi6_16_15;
-                    v6_15 = lo6_17_15;
-                    float _fmax_756 = fmaxf(xg[10], v6_15);
-                    float hi6_18_15 = _fmax_756;
-                    float _min_692 = fminf(xg[10], v6_15);
-                    float lo6_19_15 = _min_692;
-                    xg[10] = hi6_18_15;
-                    v6_15 = lo6_19_15;
-                    float _fmax_757 = fmaxf(xg[11], v6_15);
-                    float hi6_20_15 = _fmax_757;
-                    float _min_693 = fminf(xg[11], v6_15);
-                    float lo6_21_15 = _min_693;
-                    xg[11] = hi6_20_15;
-                    v6_15 = lo6_21_15;
-                    float _fmax_758 = fmaxf(xg[12], v6_15);
-                    float hi6_22_15 = _fmax_758;
-                    float _min_694 = fminf(xg[12], v6_15);
-                    float lo6_23_15 = _min_694;
-                    xg[12] = hi6_22_15;
-                    v6_15 = lo6_23_15;
-                    float _fmax_759 = fmaxf(xg[13], v6_15);
-                    float hi6_24_15 = _fmax_759;
-                    float _min_695 = fminf(xg[13], v6_15);
-                    float lo6_25_15 = _min_695;
-                    xg[13] = hi6_24_15;
-                    v6_15 = lo6_25_15;
-                    float _fmax_760 = fmaxf(xg[14], v6_15);
-                    float hi6_26_15 = _fmax_760;
-                    float _min_696 = fminf(xg[14], v6_15);
-                    float lo6_27_15 = _min_696;
-                    xg[14] = hi6_26_15;
-                    v6_15 = lo6_27_15;
-                    float _fmax_761 = fmaxf(xg[15], v6_15);
-                    float hi6_28_15 = _fmax_761;
-                    float _min_697 = fminf(xg[15], v6_15);
-                    float lo6_29_15 = _min_697;
-                    xg[15] = hi6_28_15;
-                    v6_15 = lo6_29_15;
-                }
-                K2 = xg[0];
-                if (ln == 1) {
-                    K2 = xg[1];
-                }
-                if (ln == 2) {
-                    K2 = xg[2];
-                }
-                if (ln == 3) {
-                    K2 = xg[3];
-                }
-                if (ln == 4) {
-                    K2 = xg[4];
-                }
-                if (ln == 5) {
-                    K2 = xg[5];
-                }
-                if (ln == 6) {
-                    K2 = xg[6];
-                }
-                if (ln == 7) {
-                    K2 = xg[7];
-                }
-                if (ln == 8) {
-                    K2 = xg[8];
-                }
-                if (ln == 9) {
-                    K2 = xg[9];
-                }
-                if (ln == 10) {
-                    K2 = xg[10];
-                }
-                if (ln == 11) {
-                    K2 = xg[11];
-                }
-                if (ln == 12) {
-                    K2 = xg[12];
-                }
-                if (ln == 13) {
-                    K2 = xg[13];
-                }
-                if (ln == 14) {
-                    K2 = xg[14];
-                }
-                if (ln == 15) {
-                    K2 = xg[15];
+            unsigned int cgx = ccnt[cg];
+            unsigned int k1x = __as_u32(K);
+            int isq = 0;
+            if (gflag != 0 && (k1x & 4294965248u) == qg) {
+                isq = 1;
+            }
+            unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, isq != 0);
+            unsigned int mqx = _vote_3;
+            unsigned int gmx = mqx & 65535;
+            if ((tid_1 & 16) != 0) {
+                gmx = mqx >> 16 & 65535;
+            }
+            unsigned int lowx = (unsigned int)((1 << ln) - 1);
+            int _popc_1 = __popc(gmx & lowx);
+            int rx = _popc_1;
+            if (gflag != 0 && cgx <= 16) {
+                K2 = __uint_as_float(1073741824 | k1x & 2047);
+                if (isq != 0) {
+                    float xs[16];
+                    xs[0] = 0.0f;
+                    if (cgx > 0) {
+                        xs[0] = __uint_as_float(cbuf[cg * 16]);
+                    }
+                    xs[1] = 0.0f;
+                    if (cgx > 1) {
+                        xs[1] = __uint_as_float(cbuf[cg * 16 + 1]);
+                    }
+                    xs[2] = 0.0f;
+                    if (cgx > 2) {
+                        xs[2] = __uint_as_float(cbuf[cg * 16 + 2]);
+                    }
+                    xs[3] = 0.0f;
+                    if (cgx > 3) {
+                        xs[3] = __uint_as_float(cbuf[cg * 16 + 3]);
+                    }
+                    xs[4] = 0.0f;
+                    if (cgx > 4) {
+                        xs[4] = __uint_as_float(cbuf[cg * 16 + 4]);
+                    }
+                    xs[5] = 0.0f;
+                    if (cgx > 5) {
+                        xs[5] = __uint_as_float(cbuf[cg * 16 + 5]);
+                    }
+                    xs[6] = 0.0f;
+                    if (cgx > 6) {
+                        xs[6] = __uint_as_float(cbuf[cg * 16 + 6]);
+                    }
+                    xs[7] = 0.0f;
+                    if (cgx > 7) {
+                        xs[7] = __uint_as_float(cbuf[cg * 16 + 7]);
+                    }
+                    xs[8] = 0.0f;
+                    if (cgx > 8) {
+                        xs[8] = __uint_as_float(cbuf[cg * 16 + 8]);
+                    }
+                    xs[9] = 0.0f;
+                    if (cgx > 9) {
+                        xs[9] = __uint_as_float(cbuf[cg * 16 + 9]);
+                    }
+                    xs[10] = 0.0f;
+                    if (cgx > 10) {
+                        xs[10] = __uint_as_float(cbuf[cg * 16 + 10]);
+                    }
+                    xs[11] = 0.0f;
+                    if (cgx > 11) {
+                        xs[11] = __uint_as_float(cbuf[cg * 16 + 11]);
+                    }
+                    xs[12] = 0.0f;
+                    if (cgx > 12) {
+                        xs[12] = __uint_as_float(cbuf[cg * 16 + 12]);
+                    }
+                    xs[13] = 0.0f;
+                    if (cgx > 13) {
+                        xs[13] = __uint_as_float(cbuf[cg * 16 + 13]);
+                    }
+                    xs[14] = 0.0f;
+                    if (cgx > 14) {
+                        xs[14] = __uint_as_float(cbuf[cg * 16 + 14]);
+                    }
+                    xs[15] = 0.0f;
+                    if (cgx > 15) {
+                        xs[15] = __uint_as_float(cbuf[cg * 16 + 15]);
+                    }
+                    float _fmax_446 = fmaxf(xs[0], xs[13]);
+                    float hi_0_1 = _fmax_446;
+                    float _min_382 = fminf(xs[0], xs[13]);
+                    float lo_1_2 = _min_382;
+                    xs[0] = hi_0_1;
+                    xs[13] = lo_1_2;
+                    float _fmax_447 = fmaxf(xs[1], xs[12]);
+                    float hi_3_1 = _fmax_447;
+                    float _min_383 = fminf(xs[1], xs[12]);
+                    float lo_4_1 = _min_383;
+                    xs[1] = hi_3_1;
+                    xs[12] = lo_4_1;
+                    float _fmax_448 = fmaxf(xs[2], xs[15]);
+                    float hi_6_1 = _fmax_448;
+                    float _min_384 = fminf(xs[2], xs[15]);
+                    float lo_7_1 = _min_384;
+                    xs[2] = hi_6_1;
+                    xs[15] = lo_7_1;
+                    float _fmax_449 = fmaxf(xs[3], xs[14]);
+                    float hi_9_1 = _fmax_449;
+                    float _min_385 = fminf(xs[3], xs[14]);
+                    float lo_10_1 = _min_385;
+                    xs[3] = hi_9_1;
+                    xs[14] = lo_10_1;
+                    float _fmax_450 = fmaxf(xs[4], xs[8]);
+                    float hi_11_2 = _fmax_450;
+                    float _min_386 = fminf(xs[4], xs[8]);
+                    float lo_12_2 = _min_386;
+                    xs[4] = hi_11_2;
+                    xs[8] = lo_12_2;
+                    float _fmax_451 = fmaxf(xs[5], xs[6]);
+                    float hi_13_1 = _fmax_451;
+                    float _min_387 = fminf(xs[5], xs[6]);
+                    float lo_14_1 = _min_387;
+                    xs[5] = hi_13_1;
+                    xs[6] = lo_14_1;
+                    float _fmax_452 = fmaxf(xs[7], xs[11]);
+                    float hi_15_1 = _fmax_452;
+                    float _min_388 = fminf(xs[7], xs[11]);
+                    float lo_16_1 = _min_388;
+                    xs[7] = hi_15_1;
+                    xs[11] = lo_16_1;
+                    float _fmax_453 = fmaxf(xs[9], xs[10]);
+                    float hi_17_2 = _fmax_453;
+                    float _min_389 = fminf(xs[9], xs[10]);
+                    float lo_18_2 = _min_389;
+                    xs[9] = hi_17_2;
+                    xs[10] = lo_18_2;
+                    float _fmax_454 = fmaxf(xs[0], xs[5]);
+                    float hi_19_1 = _fmax_454;
+                    float _min_390 = fminf(xs[0], xs[5]);
+                    float lo_20_1 = _min_390;
+                    xs[0] = hi_19_1;
+                    xs[5] = lo_20_1;
+                    float _fmax_455 = fmaxf(xs[1], xs[7]);
+                    float hi_22_1 = _fmax_455;
+                    float _min_391 = fminf(xs[1], xs[7]);
+                    float lo_23_1 = _min_391;
+                    xs[1] = hi_22_1;
+                    xs[7] = lo_23_1;
+                    float _fmax_456 = fmaxf(xs[2], xs[9]);
+                    float hi_25_1 = _fmax_456;
+                    float _min_392 = fminf(xs[2], xs[9]);
+                    float lo_26_1 = _min_392;
+                    xs[2] = hi_25_1;
+                    xs[9] = lo_26_1;
+                    float _fmax_457 = fmaxf(xs[3], xs[4]);
+                    float hi_28_1 = _fmax_457;
+                    float _min_393 = fminf(xs[3], xs[4]);
+                    float lo_29_1 = _min_393;
+                    xs[3] = hi_28_1;
+                    xs[4] = lo_29_1;
+                    float _fmax_458 = fmaxf(xs[6], xs[13]);
+                    float hi_30_2 = _fmax_458;
+                    float _min_394 = fminf(xs[6], xs[13]);
+                    float lo_31_2 = _min_394;
+                    xs[6] = hi_30_2;
+                    xs[13] = lo_31_2;
+                    float _fmax_459 = fmaxf(xs[8], xs[14]);
+                    float hi_32_1 = _fmax_459;
+                    float _min_395 = fminf(xs[8], xs[14]);
+                    float lo_33_1 = _min_395;
+                    xs[8] = hi_32_1;
+                    xs[14] = lo_33_1;
+                    float _fmax_460 = fmaxf(xs[10], xs[15]);
+                    float hi_34_1 = _fmax_460;
+                    float _min_396 = fminf(xs[10], xs[15]);
+                    float lo_35_1 = _min_396;
+                    xs[10] = hi_34_1;
+                    xs[15] = lo_35_1;
+                    float _fmax_461 = fmaxf(xs[11], xs[12]);
+                    float hi_36_2 = _fmax_461;
+                    float _min_397 = fminf(xs[11], xs[12]);
+                    float lo_37_2 = _min_397;
+                    xs[11] = hi_36_2;
+                    xs[12] = lo_37_2;
+                    float _fmax_462 = fmaxf(xs[0], xs[1]);
+                    float hi_38_1 = _fmax_462;
+                    float _min_398 = fminf(xs[0], xs[1]);
+                    float lo_39_1 = _min_398;
+                    xs[0] = hi_38_1;
+                    xs[1] = lo_39_1;
+                    float _fmax_463 = fmaxf(xs[2], xs[3]);
+                    float hi_41_1 = _fmax_463;
+                    float _min_399 = fminf(xs[2], xs[3]);
+                    float lo_42_1 = _min_399;
+                    xs[2] = hi_41_1;
+                    xs[3] = lo_42_1;
+                    float _fmax_464 = fmaxf(xs[4], xs[5]);
+                    float hi_44_1 = _fmax_464;
+                    float _min_400 = fminf(xs[4], xs[5]);
+                    float lo_45_1 = _min_400;
+                    xs[4] = hi_44_1;
+                    xs[5] = lo_45_1;
+                    float _fmax_465 = fmaxf(xs[6], xs[8]);
+                    float hi_47_1 = _fmax_465;
+                    float _min_401 = fminf(xs[6], xs[8]);
+                    float lo_48_1 = _min_401;
+                    xs[6] = hi_47_1;
+                    xs[8] = lo_48_1;
+                    float _fmax_466 = fmaxf(xs[7], xs[9]);
+                    float hi_49_2 = _fmax_466;
+                    float _min_402 = fminf(xs[7], xs[9]);
+                    float lo_50_2 = _min_402;
+                    xs[7] = hi_49_2;
+                    xs[9] = lo_50_2;
+                    float _fmax_467 = fmaxf(xs[10], xs[11]);
+                    float hi_51_1 = _fmax_467;
+                    float _min_403 = fminf(xs[10], xs[11]);
+                    float lo_52_1 = _min_403;
+                    xs[10] = hi_51_1;
+                    xs[11] = lo_52_1;
+                    float _fmax_468 = fmaxf(xs[12], xs[13]);
+                    float hi_53_1 = _fmax_468;
+                    float _min_404 = fminf(xs[12], xs[13]);
+                    float lo_54_1 = _min_404;
+                    xs[12] = hi_53_1;
+                    xs[13] = lo_54_1;
+                    float _fmax_469 = fmaxf(xs[14], xs[15]);
+                    float hi_55_2 = _fmax_469;
+                    float _min_405 = fminf(xs[14], xs[15]);
+                    float lo_56_2 = _min_405;
+                    xs[14] = hi_55_2;
+                    xs[15] = lo_56_2;
+                    float _fmax_470 = fmaxf(xs[0], xs[2]);
+                    float hi_57_1 = _fmax_470;
+                    float _min_406 = fminf(xs[0], xs[2]);
+                    float lo_58_1 = _min_406;
+                    xs[0] = hi_57_1;
+                    xs[2] = lo_58_1;
+                    float _fmax_471 = fmaxf(xs[1], xs[3]);
+                    float hi_60_2 = _fmax_471;
+                    float _min_407 = fminf(xs[1], xs[3]);
+                    float lo_61_2 = _min_407;
+                    xs[1] = hi_60_2;
+                    xs[3] = lo_61_2;
+                    float _fmax_472 = fmaxf(xs[4], xs[10]);
+                    float hi_63_1 = _fmax_472;
+                    float _min_408 = fminf(xs[4], xs[10]);
+                    float lo_64_1 = _min_408;
+                    xs[4] = hi_63_1;
+                    xs[10] = lo_64_1;
+                    float _fmax_473 = fmaxf(xs[5], xs[11]);
+                    float hi_66_2 = _fmax_473;
+                    float _min_409 = fminf(xs[5], xs[11]);
+                    float lo_67_2 = _min_409;
+                    xs[5] = hi_66_2;
+                    xs[11] = lo_67_2;
+                    float _fmax_474 = fmaxf(xs[6], xs[7]);
+                    float hi_68_3 = _fmax_474;
+                    float _min_410 = fminf(xs[6], xs[7]);
+                    float lo_69_3 = _min_410;
+                    xs[6] = hi_68_3;
+                    xs[7] = lo_69_3;
+                    float _fmax_475 = fmaxf(xs[8], xs[9]);
+                    float hi_70_2 = _fmax_475;
+                    float _min_411 = fminf(xs[8], xs[9]);
+                    float lo_71_2 = _min_411;
+                    xs[8] = hi_70_2;
+                    xs[9] = lo_71_2;
+                    float _fmax_476 = fmaxf(xs[12], xs[14]);
+                    float hi_72_2 = _fmax_476;
+                    float _min_412 = fminf(xs[12], xs[14]);
+                    float lo_73_2 = _min_412;
+                    xs[12] = hi_72_2;
+                    xs[14] = lo_73_2;
+                    float _fmax_477 = fmaxf(xs[13], xs[15]);
+                    float hi_74_3 = _fmax_477;
+                    float _min_413 = fminf(xs[13], xs[15]);
+                    float lo_75_3 = _min_413;
+                    xs[13] = hi_74_3;
+                    xs[15] = lo_75_3;
+                    float _fmax_478 = fmaxf(xs[1], xs[2]);
+                    float hi_76_2 = _fmax_478;
+                    float _min_414 = fminf(xs[1], xs[2]);
+                    float lo_77_2 = _min_414;
+                    xs[1] = hi_76_2;
+                    xs[2] = lo_77_2;
+                    float _fmax_479 = fmaxf(xs[3], xs[12]);
+                    float hi_79_1 = _fmax_479;
+                    float _min_415 = fminf(xs[3], xs[12]);
+                    float lo_80_1 = _min_415;
+                    xs[3] = hi_79_1;
+                    xs[12] = lo_80_1;
+                    float _fmax_480 = fmaxf(xs[4], xs[6]);
+                    float hi_82_2 = _fmax_480;
+                    float _min_416 = fminf(xs[4], xs[6]);
+                    float lo_83_2 = _min_416;
+                    xs[4] = hi_82_2;
+                    xs[6] = lo_83_2;
+                    float _fmax_481 = fmaxf(xs[5], xs[7]);
+                    float hi_85_1 = _fmax_481;
+                    float _min_417 = fminf(xs[5], xs[7]);
+                    float lo_86_1 = _min_417;
+                    xs[5] = hi_85_1;
+                    xs[7] = lo_86_1;
+                    float _fmax_482 = fmaxf(xs[8], xs[10]);
+                    float hi_87_2 = _fmax_482;
+                    float _min_418 = fminf(xs[8], xs[10]);
+                    float lo_88_2 = _min_418;
+                    xs[8] = hi_87_2;
+                    xs[10] = lo_88_2;
+                    float _fmax_483 = fmaxf(xs[9], xs[11]);
+                    float hi_89_1 = _fmax_483;
+                    float _min_419 = fminf(xs[9], xs[11]);
+                    float lo_90_1 = _min_419;
+                    xs[9] = hi_89_1;
+                    xs[11] = lo_90_1;
+                    float _fmax_484 = fmaxf(xs[13], xs[14]);
+                    float hi_91_1 = _fmax_484;
+                    float _min_420 = fminf(xs[13], xs[14]);
+                    float lo_92_1 = _min_420;
+                    xs[13] = hi_91_1;
+                    xs[14] = lo_92_1;
+                    float _fmax_485 = fmaxf(xs[1], xs[4]);
+                    float hi_93_2 = _fmax_485;
+                    float _min_421 = fminf(xs[1], xs[4]);
+                    float lo_94_2 = _min_421;
+                    xs[1] = hi_93_2;
+                    xs[4] = lo_94_2;
+                    float _fmax_486 = fmaxf(xs[2], xs[6]);
+                    float hi_95_1 = _fmax_486;
+                    float _min_422 = fminf(xs[2], xs[6]);
+                    float lo_96_1 = _min_422;
+                    xs[2] = hi_95_1;
+                    xs[6] = lo_96_1;
+                    float _fmax_487 = fmaxf(xs[5], xs[8]);
+                    float hi_98_2 = _fmax_487;
+                    float _min_423 = fminf(xs[5], xs[8]);
+                    float lo_99_2 = _min_423;
+                    xs[5] = hi_98_2;
+                    xs[8] = lo_99_2;
+                    float _fmax_488 = fmaxf(xs[7], xs[10]);
+                    float hi_101_1 = _fmax_488;
+                    float _min_424 = fminf(xs[7], xs[10]);
+                    float lo_102_1 = _min_424;
+                    xs[7] = hi_101_1;
+                    xs[10] = lo_102_1;
+                    float _fmax_489 = fmaxf(xs[9], xs[13]);
+                    float hi_104_2 = _fmax_489;
+                    float _min_425 = fminf(xs[9], xs[13]);
+                    float lo_105_2 = _min_425;
+                    xs[9] = hi_104_2;
+                    xs[13] = lo_105_2;
+                    float _fmax_490 = fmaxf(xs[11], xs[14]);
+                    float hi_106_3 = _fmax_490;
+                    float _min_426 = fminf(xs[11], xs[14]);
+                    float lo_107_3 = _min_426;
+                    xs[11] = hi_106_3;
+                    xs[14] = lo_107_3;
+                    float _fmax_491 = fmaxf(xs[2], xs[4]);
+                    float hi_108_2 = _fmax_491;
+                    float _min_427 = fminf(xs[2], xs[4]);
+                    float lo_109_2 = _min_427;
+                    xs[2] = hi_108_2;
+                    xs[4] = lo_109_2;
+                    float _fmax_492 = fmaxf(xs[3], xs[6]);
+                    float hi_110_2 = _fmax_492;
+                    float _min_428 = fminf(xs[3], xs[6]);
+                    float lo_111_2 = _min_428;
+                    xs[3] = hi_110_2;
+                    xs[6] = lo_111_2;
+                    float _fmax_493 = fmaxf(xs[9], xs[12]);
+                    float hi_112_3 = _fmax_493;
+                    float _min_429 = fminf(xs[9], xs[12]);
+                    float lo_113_3 = _min_429;
+                    xs[9] = hi_112_3;
+                    xs[12] = lo_113_3;
+                    float _fmax_494 = fmaxf(xs[11], xs[13]);
+                    float hi_114_2 = _fmax_494;
+                    float _min_430 = fminf(xs[11], xs[13]);
+                    float lo_115_2 = _min_430;
+                    xs[11] = hi_114_2;
+                    xs[13] = lo_115_2;
+                    float _fmax_495 = fmaxf(xs[3], xs[5]);
+                    float hi_117_1 = _fmax_495;
+                    float _min_431 = fminf(xs[3], xs[5]);
+                    float lo_118_1 = _min_431;
+                    xs[3] = hi_117_1;
+                    xs[5] = lo_118_1;
+                    float _fmax_496 = fmaxf(xs[6], xs[8]);
+                    float hi_120_2 = _fmax_496;
+                    float _min_432 = fminf(xs[6], xs[8]);
+                    float lo_121_2 = _min_432;
+                    xs[6] = hi_120_2;
+                    xs[8] = lo_121_2;
+                    float _fmax_497 = fmaxf(xs[7], xs[9]);
+                    float hi_123_1 = _fmax_497;
+                    float _min_433 = fminf(xs[7], xs[9]);
+                    float lo_124_1 = _min_433;
+                    xs[7] = hi_123_1;
+                    xs[9] = lo_124_1;
+                    float _fmax_498 = fmaxf(xs[10], xs[12]);
+                    float hi_125_2 = _fmax_498;
+                    float _min_434 = fminf(xs[10], xs[12]);
+                    float lo_126_2 = _min_434;
+                    xs[10] = hi_125_2;
+                    xs[12] = lo_126_2;
+                    float _fmax_499 = fmaxf(xs[3], xs[4]);
+                    float hi_127_1 = _fmax_499;
+                    float _min_435 = fminf(xs[3], xs[4]);
+                    float lo_128_1 = _min_435;
+                    xs[3] = hi_127_1;
+                    xs[4] = lo_128_1;
+                    float _fmax_500 = fmaxf(xs[5], xs[6]);
+                    float hi_129_1 = _fmax_500;
+                    float _min_436 = fminf(xs[5], xs[6]);
+                    float lo_130_1 = _min_436;
+                    xs[5] = hi_129_1;
+                    xs[6] = lo_130_1;
+                    float _fmax_501 = fmaxf(xs[7], xs[8]);
+                    float hi_131_2 = _fmax_501;
+                    float _min_437 = fminf(xs[7], xs[8]);
+                    float lo_132_2 = _min_437;
+                    xs[7] = hi_131_2;
+                    xs[8] = lo_132_2;
+                    float _fmax_502 = fmaxf(xs[9], xs[10]);
+                    float hi_133_1 = _fmax_502;
+                    float _min_438 = fminf(xs[9], xs[10]);
+                    float lo_134_1 = _min_438;
+                    xs[9] = hi_133_1;
+                    xs[10] = lo_134_1;
+                    float _fmax_503 = fmaxf(xs[11], xs[12]);
+                    float hi_136_2 = _fmax_503;
+                    float _min_439 = fminf(xs[11], xs[12]);
+                    float lo_137_2 = _min_439;
+                    xs[11] = hi_136_2;
+                    xs[12] = lo_137_2;
+                    float _fmax_504 = fmaxf(xs[6], xs[7]);
+                    float hi_139_1 = _fmax_504;
+                    float _min_440 = fminf(xs[6], xs[7]);
+                    float lo_140_1 = _min_440;
+                    xs[6] = hi_139_1;
+                    xs[7] = lo_140_1;
+                    float _fmax_505 = fmaxf(xs[8], xs[9]);
+                    float hi_142_2 = _fmax_505;
+                    float _min_441 = fminf(xs[8], xs[9]);
+                    float lo_143_2 = _min_441;
+                    xs[8] = hi_142_2;
+                    xs[9] = lo_143_2;
+                    K2 = xs[0];
+                    if (rx == 1) {
+                        K2 = xs[1];
+                    }
+                    if (rx == 2) {
+                        K2 = xs[2];
+                    }
+                    if (rx == 3) {
+                        K2 = xs[3];
+                    }
+                    if (rx == 4) {
+                        K2 = xs[4];
+                    }
+                    if (rx == 5) {
+                        K2 = xs[5];
+                    }
+                    if (rx == 6) {
+                        K2 = xs[6];
+                    }
+                    if (rx == 7) {
+                        K2 = xs[7];
+                    }
+                    if (rx == 8) {
+                        K2 = xs[8];
+                    }
+                    if (rx == 9) {
+                        K2 = xs[9];
+                    }
+                    if (rx == 10) {
+                        K2 = xs[10];
+                    }
+                    if (rx == 11) {
+                        K2 = xs[11];
+                    }
+                    if (rx == 12) {
+                        K2 = xs[12];
+                    }
+                    if (rx == 13) {
+                        K2 = xs[13];
+                    }
+                    if (rx == 14) {
+                        K2 = xs[14];
+                    }
+                    if (rx == 15) {
+                        K2 = xs[15];
+                    }
                 }
             }
         }
