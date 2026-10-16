@@ -968,6 +968,25 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
   int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
   bool const active = vecIdx < numVecs;
 
+  // The permutation and the expert weights come from routing, which completed before the GEMMs
+  // this kernel depends on could start, so they are read before waiting on the primary kernel
+  // (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
+  int permutedIdx[SMALL_BATCH_FINALIZE_MAX_LOADS];
+  float scale[SMALL_BATCH_FINALIZE_MAX_LOADS];
+#pragma unroll
+  for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+    int const k = threadIdx.y + j * kSplit;
+    permutedIdx[j] = -1;
+    scale[j] = 0.f;
+    if (active && k < params.topK) {
+      int64_t const expandedIdx = tokenIdx * params.topK + k;
+      permutedIdx[j] = params.expandedIdxToPermutedIdx[expandedIdx];
+      scale[j] = params.expertWeightsPtr != nullptr
+                     ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
+                     : 1.f;
+    }
+  }
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   // wait on primary kernel when using PDL
   if constexpr (KernelParams::UsePdl) {
@@ -978,21 +997,6 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
   ComputeElem acc;
   acc.fill(0.f);
   if (active) {
-    int permutedIdx[SMALL_BATCH_FINALIZE_MAX_LOADS];
-    float scale[SMALL_BATCH_FINALIZE_MAX_LOADS];
-#pragma unroll
-    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
-      int const k = threadIdx.y + j * kSplit;
-      permutedIdx[j] = -1;
-      scale[j] = 0.f;
-      if (k < params.topK) {
-        int64_t const expandedIdx = tokenIdx * params.topK + k;
-        permutedIdx[j] = params.expandedIdxToPermutedIdx[expandedIdx];
-        scale[j] = params.expertWeightsPtr != nullptr
-                       ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
-                       : 1.f;
-      }
-    }
     VecElem in[SMALL_BATCH_FINALIZE_MAX_LOADS];
 #pragma unroll
     for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
