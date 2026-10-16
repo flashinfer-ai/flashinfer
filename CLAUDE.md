@@ -35,6 +35,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| GDN ReplaySSM u-cache flush kernel with an fp16 state pool (on SM100 served by the UMMA backend; `gated_delta_rule_mtp_ucache_flush(backend=...)`) | `export GDN_UCACHE_STATE_DTYPE=fp16` |
 | Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override ragged-prefill `auto` backend order (Blackwell) | `export FLASHINFER_RAGGED_AUTO_BACKEND_ORDER=cutlass,cudnn` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
@@ -124,8 +125,10 @@ Caveats:
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
 `1e-6` without an epsilon argument. Auto selection also requires CuTe DSL 4.7+.
-The bounded SM100 policies live in `kda.py` and `gdn_prefill.py`. Validate both
-output and final state before changing a policy. Explicit state-pool calls
+The bounded KDA SM100/SM103 and GDN SM100 policies live in `kda.py` and
+`gdn_prefill.py`. KDA's head/length regions are documented in `docs/api/kda.rst`.
+Auto-selected cuDNN ignores the native KDA workspace; native fallback uses it.
+Validate output and final state before changing a policy. Explicit state-pool calls
 require unique, in-range slots; auto keeps pools on their native route.
 
 Use `benchmarks/bench_cudnn_linear_attention.py` for public-call comparisons.

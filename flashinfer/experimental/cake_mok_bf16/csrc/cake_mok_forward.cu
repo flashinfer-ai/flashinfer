@@ -22,6 +22,9 @@ typedef short int          int16_t;
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_right; };
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -88,6 +91,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 232448
 #define THREADS 256
 #define CAKE_TMEM_HOLD_OFFSET 336
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -129,13 +133,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
 
 
 
@@ -157,6 +154,14 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 
 
 
+
+__device__ __forceinline__ void tma_store_5d(
+    const void *tmap, int x, int y, int z, int w, int v, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2, %3, %4, %5}], [%6];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(v), "r"(smem_addr) : "memory");
+}
 
 
 __device__ __forceinline__ void cp_async_bulk_gmem2smem(
@@ -205,8 +210,8 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit, CakeFastDivmod mini_tasks_div, CakeFastDivmod minis_per_macro_div, CakeFastDivmod fused_col_blocks_div, CakeFastDivmod down_col_blocks_div)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -259,28 +264,28 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int a_smem_addr = smem + 1024;
-    __nv_bfloat16* b_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int b_smem_addr = smem + 66560;
-    __nv_bfloat16* b_hi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int b_hi_addr = smem + 132096;
-    __nv_bfloat16* d_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
-    const int d_smem_addr = smem + 206848;
-    __nv_bfloat16* dispatch_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int dispatch_smem_addr = smem + 1024;
-    unsigned int* dispatch_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
-    const int dispatch_words_addr = smem + 1024;
-    float* range_weights = reinterpret_cast<float*>(smem_raw + 197632);
-    const int range_weights_addr = smem + 197632;
-    int* range_flags = reinterpret_cast<int*>(smem_raw + 199168);
-    const int range_flags_addr = smem + 199168;
-    int* combine_schedule = reinterpret_cast<int*>(smem_raw + 197632);
-    const int combine_schedule_addr = smem + 197632;
-    float* dispatch_weights = reinterpret_cast<float*>(smem_raw + 199680);
-    const int dispatch_weights_addr = smem + 199680;
-    __nv_bfloat16* combine_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int combine_smem_addr = smem + 1024;
+    __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_A_SMEM_OFF);
+    const int a_smem_addr = smem + SMEM_A_SMEM_OFF;
+    __nv_bfloat16* b_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_B_SMEM_OFF);
+    const int b_smem_addr = smem + SMEM_B_SMEM_OFF;
+    __nv_bfloat16* b_hi = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_B_HI_OFF);
+    const int b_hi_addr = smem + SMEM_B_HI_OFF;
+    __nv_bfloat16* d_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_D_SMEM_OFF);
+    const int d_smem_addr = smem + SMEM_D_SMEM_OFF;
+    __nv_bfloat16* dispatch_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_DISPATCH_SMEM_OFF);
+    const int dispatch_smem_addr = smem + SMEM_DISPATCH_SMEM_OFF;
+    unsigned int* dispatch_words = reinterpret_cast<unsigned int*>(smem_raw + SMEM_DISPATCH_WORDS_OFF);
+    const int dispatch_words_addr = smem + SMEM_DISPATCH_WORDS_OFF;
+    float* range_weights = reinterpret_cast<float*>(smem_raw + SMEM_RANGE_WEIGHTS_OFF);
+    const int range_weights_addr = smem + SMEM_RANGE_WEIGHTS_OFF;
+    int* range_flags = reinterpret_cast<int*>(smem_raw + SMEM_RANGE_FLAGS_OFF);
+    const int range_flags_addr = smem + SMEM_RANGE_FLAGS_OFF;
+    int* combine_schedule = reinterpret_cast<int*>(smem_raw + SMEM_COMBINE_SCHEDULE_OFF);
+    const int combine_schedule_addr = smem + SMEM_COMBINE_SCHEDULE_OFF;
+    float* dispatch_weights = reinterpret_cast<float*>(smem_raw + SMEM_DISPATCH_WEIGHTS_OFF);
+    const int dispatch_weights_addr = smem + SMEM_DISPATCH_WEIGHTS_OFF;
+    __nv_bfloat16* combine_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_COMBINE_SMEM_OFF);
+    const int combine_smem_addr = smem + SMEM_COMBINE_SMEM_OFF;
     int tokens = num_tokens[0];
     int shared_rows = local_tokens / 256;
     int shared_fused = shared_rows * (intermediate / 256);
@@ -4652,13 +4657,23 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                 }
                 gemm_bits = phase_bits_3;
             } else {
-                int ordered_mini = (compute - shared_tasks) / mini_tasks;
-                int task_1 = (compute - shared_tasks) % mini_tasks;
-                int macro_1 = macros - 1;
-                int mini_3 = ordered_mini;
-                if (ordered_mini >= last_minis) {
-                    macro_1 = macros - 2 - (ordered_mini - last_minis) / minis_per_macro;
-                    mini_3 = (ordered_mini - last_minis) % minis_per_macro;
+                int task_1 = 0;
+                int macro_1 = 0;
+                int mini_3 = 0;
+                int swiglu = 0;
+                if (compute >= shared_tasks) {
+                    uint32_t _fast_div_q_0 = (mini_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(compute - shared_tasks)), mini_tasks_div.multiplier) >> mini_tasks_div.shift_right) : (uint32_t)((unsigned int)(compute - shared_tasks));
+                    uint32_t _fast_div_r_0 = (uint32_t)((unsigned int)(compute - shared_tasks)) - _fast_div_q_0 * (uint32_t)(mini_tasks_div.divisor);
+                    int ordered_mini = (int)_fast_div_q_0;
+                    task_1 = (int)_fast_div_r_0;
+                    macro_1 = macros - 1;
+                    mini_3 = ordered_mini;
+                    if (ordered_mini >= last_minis) {
+                        uint32_t _fast_div_q_1 = (minis_per_macro_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(ordered_mini - last_minis)), minis_per_macro_div.multiplier) >> minis_per_macro_div.shift_right) : (uint32_t)((unsigned int)(ordered_mini - last_minis));
+                        uint32_t _fast_div_r_1 = (uint32_t)((unsigned int)(ordered_mini - last_minis)) - _fast_div_q_1 * (uint32_t)(minis_per_macro_div.divisor);
+                        macro_1 = macros - 2 - (int)_fast_div_q_1;
+                        mini_3 = (int)_fast_div_r_1;
+                    }
                 }
                 if (task_1 < mini_fused) {
                     int col_blocks_3 = (intermediate + 256 - 1) / 256;
@@ -4671,7 +4686,10 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                     int first_block = (macro_1 * (macro_size / mini_size) + mini_3) * (mini_size / 256);
                     int _min_32 = ((first_block + mini_size / 256) < (tokens / 256) ? (first_block + mini_size / 256) : (tokens / 256));
                     int end_block = _min_32;
-                    int block_5 = first_block + task_1 / col_blocks_3;
+                    int block_5 = first_block;
+                    uint32_t _fast_div_q_2 = (fused_col_blocks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)task_1), fused_col_blocks_div.multiplier) >> fused_col_blocks_div.shift_right) : (uint32_t)((unsigned int)task_1);
+                    uint32_t _fast_div_r_2 = (uint32_t)((unsigned int)task_1) - _fast_div_q_2 * (uint32_t)(fused_col_blocks_div.divisor);
+                    block_5 = first_block + (int)_fast_div_q_2;
                     if (block_5 < end_block) {
                         int index = counts[3 * experts + block_5];
                         int offset_26 = counts[experts + index] / 256;
@@ -8126,7 +8144,10 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                     int first_block_1 = (macro_1 * (macro_size / mini_size) + mini_3) * (mini_size / 256);
                     int _min_35 = ((first_block_1 + mini_size / 256) < (tokens / 256) ? (first_block_1 + mini_size / 256) : (tokens / 256));
                     int end_block_1 = _min_35;
-                    int block_6 = first_block_1 + (task_1 - mini_fused) / col_blocks_4;
+                    int block_6 = first_block_1;
+                    uint32_t _fast_div_q_3 = (down_col_blocks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(task_1 - mini_fused)), down_col_blocks_div.multiplier) >> down_col_blocks_div.shift_right) : (uint32_t)((unsigned int)(task_1 - mini_fused));
+                    uint32_t _fast_div_r_3 = (uint32_t)((unsigned int)(task_1 - mini_fused)) - _fast_div_q_3 * (uint32_t)(down_col_blocks_div.divisor);
+                    block_6 = first_block_1 + (int)_fast_div_q_3;
                     if (block_6 < end_block_1) {
                         int index_1 = counts[3 * experts + block_6];
                         int offset_51 = counts[experts + index_1] / 256;
@@ -8377,10 +8398,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                                 if (tid == 0) {
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                        " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                        :: "l"((&y_routed)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"(y_3 * 2 * 8 + chunk_5), "r"(0), "r"(0), "r"(d_smem_addr + (unsigned int)(chunk_5 % 3 * 8192)), "l"(0x12F0000000000000ULL) : "memory");
+                                    tma_store_5d((&y_routed), 0, x_3 * 256 + cta_rank_0 * 128, y_3 * 2 * 8 + chunk_5, 0, 0, d_smem_addr + (unsigned int)(chunk_5 % 3 * 8192));
                                     asm volatile("cp.async.bulk.commit_group;");
                                 }
                             }
@@ -8440,10 +8458,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        asm volatile(
-                                            "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-                                            " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                            :: "l"((&y_routed)), "r"(0), "r"(x_3 * 256 + cta_rank_0 * 128), "r"((y_3 * 2 + 1) * 8 + chunk_7), "r"(0), "r"(0), "r"(d_smem_addr + (unsigned int)((8 + chunk_7) % 3 * 8192)), "l"(0x12F0000000000000ULL) : "memory");
+                                        tma_store_5d((&y_routed), 0, x_3 * 256 + cta_rank_0 * 128, (y_3 * 2 + 1) * 8 + chunk_7, 0, 0, d_smem_addr + (unsigned int)((8 + chunk_7) % 3 * 8192));
                                         asm volatile("cp.async.bulk.commit_group;");
                                     }
                                 }

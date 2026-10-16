@@ -967,7 +967,9 @@ def gen_all_modules(
             if not has_sm100:
                 jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         if has_sm120:
-            jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
+            jit_specs.extend(
+                gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
+            )
             jit_specs.append(gen_fp4_quantization_sm120_module())
             # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
             # the binding and the default DeepSeek-V4-Flash device instances.  Both need

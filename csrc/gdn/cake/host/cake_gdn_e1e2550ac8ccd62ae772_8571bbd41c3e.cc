@@ -187,7 +187,7 @@ inline CUtensorMap EncodeTma_O(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O, TensorView arg_gate, TensorView arg_beta, TensorView arg_cu_seqlens, TensorView arg_state_indices, TensorView arg_initial_state, TensorView arg_output_state, TensorView arg_checkpoint_state, TensorView arg_cu_checkpoints, TensorView arg_tensormap_workspace, int64_t arg_initial_state_stride_slot, int64_t arg_output_state_stride_slot, int64_t arg_checkpoint_every_n_tokens, double arg_scale, int64_t arg_num_seqs, int64_t arg_num_q_heads, int64_t arg_num_v_heads, int64_t arg_total_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O, TensorView arg_gate, TensorView arg_beta, TensorView arg_cu_seqlens, TensorView arg_state_indices, TensorView arg_initial_state, TensorView arg_output_state, TensorView arg_checkpoint_state, TensorView arg_cu_checkpoints, TensorView arg_tensormap_workspace, int64_t arg_initial_state_stride_slot, int64_t arg_output_state_stride_slot, int64_t arg_checkpoint_every_n_tokens, double arg_scale, int64_t arg_num_seqs, int64_t arg_total_tokens, int64_t arg_num_q_heads, int64_t arg_num_v_heads, int64_t arg_total_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_Q.device();
   ScopedCudaDevice device_guard(dev.device_id);
   CheckCudaTensor(arg_Q, "Q");
@@ -229,6 +229,11 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   TVM_FFI_CHECK(arg_num_seqs >= -2147483648LL && arg_num_seqs <= 2147483647LL, ValueError)
       << "scalar 'num_seqs' value " << arg_num_seqs
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_total_tokens >= -2147483648LL && arg_total_tokens <= 2147483647LL, ValueError)
+      << "scalar 'total_tokens' value " << arg_total_tokens
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_total_tokens == arg_Q.size(0), ValueError)
+      << "scalar 'total_tokens' must equal the token count q.shape(0), got " << arg_total_tokens;
   TVM_FFI_CHECK(arg_num_q_heads >= -2147483648LL && arg_num_q_heads <= 2147483647LL, ValueError)
       << "scalar 'num_q_heads' value " << arg_num_q_heads
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -310,19 +315,20 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   int32_t v_checkpoint_every_n_tokens = (int32_t)arg_checkpoint_every_n_tokens;
   float v_scale = (float)arg_scale;
   int32_t v_num_seqs = (int32_t)arg_num_seqs;
+  int32_t v_total_tokens = (int32_t)arg_total_tokens;
   int32_t v_num_q_heads = (int32_t)arg_num_q_heads;
   int32_t v_num_v_heads = (int32_t)arg_num_v_heads;
   int32_t v_total_tiles = (int32_t)arg_total_tiles;
-  void* kargs[] = {&p_Q, &p_K, &p_V, &p_O, &p_gate, &p_beta, &p_cu_seqlens, &p_state_indices, &p_initial_state, &p_output_state, &p_checkpoint_state, &p_cu_checkpoints, &p_tensormap_workspace, &v_initial_state_stride_slot, &v_output_state_stride_slot, &v_checkpoint_every_n_tokens, &v_scale, &v_num_seqs, &v_num_q_heads, &v_num_v_heads, &v_total_tiles};
+  void* kargs[] = {&p_Q, &p_K, &p_V, &p_O, &p_gate, &p_beta, &p_cu_seqlens, &p_state_indices, &p_initial_state, &p_output_state, &p_checkpoint_state, &p_cu_checkpoints, &p_tensormap_workspace, &v_initial_state_stride_slot, &v_output_state_stride_slot, &v_checkpoint_every_n_tokens, &v_scale, &v_num_seqs, &v_total_tokens, &v_num_q_heads, &v_num_v_heads, &v_total_tiles};
 
   static auto kernel = EmbedCubinModule_cake_gdn_e1e2550ac8ccd62ae772_9c82a3504b::Global()->mod.GetKernel("kernel_cake_gdn_e1e2550ac8ccd62ae772");
   static signed char cake_gdn_smem_cache[64] = {0};
-  CakeGDNSetMaxDynamicSmem(kernel, (int)arg_Q.device().device_id, 226048,
+  CakeGDNSetMaxDynamicSmem(kernel, (int)arg_Q.device().device_id, 226176,
                            cake_gdn_smem_cache, 64);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(384u, 1u, 1u);
 
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 226048u));
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 226176u));
 }
 
 }  // namespace cake_gdn_host_shim_1d7f24a30d3ba2ec

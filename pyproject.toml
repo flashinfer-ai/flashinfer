@@ -78,6 +78,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 [tool.setuptools.package-data]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
+"flashinfer.cake_rmsnorm_train_backend" = ["csrc/**"]
+"flashinfer.experimental.cake_dsa_train" = ["csrc/**"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "sources.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
