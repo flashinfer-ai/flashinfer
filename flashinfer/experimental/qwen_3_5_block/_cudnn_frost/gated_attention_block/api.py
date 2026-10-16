@@ -248,7 +248,7 @@ the argument list with a ``None`` default), so nothing below needs a placeholder
 field today.
 
 Design record (fusion analysis, backward graph, multi-GPU/CP, measurement
-protocol): ``frost_dev/plans/qwen_gated_attention_block_plan.md``.
+protocol): an internal design record (not part of this tree).
 Backward: :mod:`cudnn.gated_attention_block.api_bwd` — read this file first, the
 backward is defined against the :class:`SavedForBackward` contract below.
 PyTorch oracle and perf baseline:
@@ -3432,7 +3432,7 @@ class _FusedQkvProjection(_Stage):
         same bytes ``[B, S, H, d]``).
 
         The positional order is the runner's leading order on purpose --
-        ``frost_dev/probe_fp8_fused_gemm_ab.py`` captures these arguments and
+        an internal probe script captures these arguments and
         replays them through ``run_fused_proj_gemm_fp8(plan, *args, qscal, **kw)``.
         ``a`` is the e4m3 ``[M, K]`` view of ``h`` (the runner binds it rank-3
         ``[1, M, K]`` exactly as the bf16 runner does), ``w`` the e4m3
@@ -3541,7 +3541,7 @@ class _QkNormRope(_Stage):
     **Quote no fraction for this stage that was not L2-FLUSHED.** The earlier
     "58%" was hot-cache and against another node's ceiling; re-measured cold on
     2026-09-10 it is 36.7%. The kernel docstring carries the full table and the
-    register-pressure diagnosis; ``frost_dev/probe_norm_rope_bw.py`` reproduces
+    register-pressure diagnosis; an internal probe script reproduces
     it with hot and cold columns side by side.
 
     Q/K may be updated IN PLACE (``q_out is q``): every lane reads its whole row

@@ -1571,7 +1571,7 @@ def _sm107_spec() -> EngineSpec:
     (``sm107/prefill_d192_d128_f16.py`` — the d128 body with ``make_cfg_d192``);
     the QUANTIZED Rubin rows are the ones that ship a strict subset.
 
-    Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
+    Every capability below was MEASURED on a Rubin dev node against an
     explicit fp32 reference, not inherited from the SM100 row:
 
     - causal / bottom-right / right-band / SWA: validated on all three flavors,
@@ -2186,7 +2186,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # F8_128x4 descale POOLS that page with them through the block tables (page id = TMA batch coordinate of
             # the K/V and SF descriptors, tile-in-page = SF tile coordinate, page -1 past a sequence's live pages =
             # TMA-OOB zero fill), page_size % 128 (mismatch() gates it), the sink composed (epilogue fold vs. loader;
-            # validated on w2u1g-lc-0614 incl. keyless rows), softmax_precision=HALF composed, the pre-folded scale
+            # validated on a Rubin dev node incl. keyless rows), softmax_precision=HALF composed, the pre-folded scale
             # declined over paged KV like every row.  Dense queries on the d128 / d256 siblings only: THD queries over
             # pools (the THD arm is a separate leg of the d256 body) and the d192x128 / d512 pools stay declined
             # until their loaders are ported.

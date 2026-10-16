@@ -53,7 +53,7 @@ whole perf story (``NORM_SOURCE``):
   ``const``      the diagnostic floor: same arithmetic, every load deleted.
   ``off``        the arm is not traced: the fork IS the shipped GEMM (control).
 
-Measured on the Rubin perf node (vr-nvl72-ts3-l11-062-c06, 212 SMs, 2026-09-11,
+Measured on a Rubin perf node (212 SMs, 2026-09-11,
 397B geometry, 40 iters x 5 interleaved rounds; read the interleaved columns
 only -- the SM clock power-capped from 2376 to ~1.7 GHz during later arms):
 
@@ -76,7 +76,7 @@ per-lane global loads (cos/sin/w) and the optional rstd store.
 KEEP IN SYNC WITH ``gemm/frost/kernel_templates/sm100_matmul.py``
 -----------------------------------------------------------------
 This file is the rendered dense-bf16 expansion of that template for the config
-above (``frost_dev/render_proj_gemm.py`` regenerates it) plus the epilogue arm
+above (an internal rendering script regenerates it) plus the epilogue arm
 between the ``NORM+ROPE FUSION`` markers, the six appended kernel/host
 parameters and their fakes in ``compile()``.  Diff against a fresh rendering to
 review a change (``frost-tile-dsl.md`` S5: diff the RENDERINGS, not the edit).

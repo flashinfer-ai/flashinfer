@@ -173,9 +173,9 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 #
 # All four qualify as of 2026-09-09.  d192xd128 came free -- it IS the shipped
 # d128 body, only the config factory differs -- and d256 / d512 were moved onto
-# the contract (frost_dev/port_thd_contract.py); they previously called the
+# the contract (an internal porting script); they previously called the
 # setup kernel with the pre-upstream 7-arg signature and allocated 3B+2 where
-# the shared decode reads 4B+4.  Confirmed on w2u1g-lc-0030: 43 passed / 0
+# the shared decode reads 4B+4.  Confirmed on a Rubin dev node: 43 passed / 0
 # failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
