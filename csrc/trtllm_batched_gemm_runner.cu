@@ -15,7 +15,12 @@
  */
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -36,6 +41,125 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+// Serialises the cubin probes, the pre-loads and their inserts into the module cache above.
+static std::mutex globalTrtllmGenBatchedGemmModuleMutex;
+
+namespace {
+
+// Key prefix of the current CUDA context: the raw context id bytes, exactly as
+// BatchedGemmInterface::run() builds its module-cache key. Modules and probe results are
+// per context, so a result from one device never applies to another.
+CUresult currentContextKey(std::string* key, std::string* failedCall) {
+  CUcontext ctx = nullptr;
+  CUresult res = cuCtxGetCurrent(&ctx);
+  if (res == CUDA_SUCCESS && ctx == nullptr) {
+    cudaFree(nullptr);
+    res = cuCtxGetCurrent(&ctx);
+  }
+  if (res != CUDA_SUCCESS || ctx == nullptr) {
+    *failedCall = "cuCtxGetCurrent";
+    return res == CUDA_SUCCESS ? CUDA_ERROR_INVALID_CONTEXT : res;
+  }
+  unsigned long long ctxId = 0;
+  res = cuCtxGetId(ctx, &ctxId);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuCtxGetId";
+    return res;
+  }
+  *key = std::string(reinterpret_cast<char*>(&ctxId), sizeof(ctxId));
+  return CUDA_SUCCESS;
+}
+
+// Loads the cubin of `config` into `cache` with checked CUresults, so that
+// BatchedGemmInterface::run() finds the module in the cache and never reaches its own
+// unchecked cuModuleLoadData / cuModuleGetFunction (GitHub #5322). The caller holds
+// globalTrtllmGenBatchedGemmModuleMutex.
+CUresult preloadModule(BatchedGemmConfig const& config, BatchedGemmInterface::ModuleCache& cache,
+                       std::string* failedCall) {
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, failedCall);
+  if (res != CUDA_SUCCESS) {
+    return res;
+  }
+  std::string const key = ctxKey + std::string(config.mFunctionName);
+  if (cache.find(key) != cache.end()) {
+    return CUDA_SUCCESS;
+  }
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+  res = loadCubinData(&module, config);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuModuleLoadData";
+    return res;
+  }
+  res = cuModuleGetFunction(&function, module, config.mFunctionName);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuModuleGetFunction";
+    cuModuleUnload(module);
+    return res;
+  }
+  cache.emplace(key, std::make_tuple(module, function));
+  return CUDA_SUCCESS;
+}
+
+// Some drivers cannot load a subset of the shipped cubins (Windows arm64 drivers fail on the
+// single-CTA sm100f kernels, GitHub #5322). When enabled, configs whose
+// cubin does not load are treated as unavailable, so default-tactic selection and autotuning
+// use the remaining ones. Default: on for Windows, off elsewhere; override with
+// FLASHINFER_TRTLLM_GEN_SKIP_UNLOADABLE_CUBINS=0 or 1.
+bool skipUnloadableCubins() {
+  static bool const enabled = [] {
+    char const* env = std::getenv("FLASHINFER_TRTLLM_GEN_SKIP_UNLOADABLE_CUBINS");
+    if (env != nullptr && env[0] != '\0') {
+      return env[0] != '0';
+    }
+#if defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+  }();
+  return enabled;
+}
+
+// Probe results are keyed per CUDA context like the module cache. A load is tried twice before
+// a cubin counts as unloadable: on the affected drivers some two-CTA kernels fail once and load
+// on the second attempt.
+bool cubinLoads(BatchedGemmConfig const& config) {
+  if (!skipUnloadableCubins()) {
+    return true;
+  }
+  static std::unordered_map<std::string, bool> probed;
+  std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+  std::string failedCall;
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, &failedCall);
+  if (res != CUDA_SUCCESS) {
+    std::fprintf(stderr, "[FlashInfer] %s returned CUresult %d while probing trtllm-gen cubin %s\n",
+                 failedCall.c_str(), static_cast<int>(res), config.mFunctionName);
+    return false;
+  }
+  std::string const name = ctxKey + std::string(config.mFunctionName);
+  auto const it = probed.find(name);
+  if (it != probed.end()) {
+    return it->second;
+  }
+  res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  if (res != CUDA_SUCCESS) {
+    res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  }
+  bool const ok = res == CUDA_SUCCESS;
+  if (!ok) {
+    std::fprintf(stderr,
+                 "[FlashInfer] trtllm-gen cubin %s does not load on this driver (%s returned "
+                 "CUresult %d); skipping it (GitHub #5322)\n",
+                 config.mFunctionName, failedCall.c_str(), static_cast<int>(res));
+  }
+  probed.emplace(name, ok);
+  return ok;
+}
+
+}  // namespace
 
 namespace {
 
@@ -414,6 +538,16 @@ void TrtllmGenBatchedGemmRunner::run(
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
+  std::string failedCall;
+  CUresult loadRes = CUDA_SUCCESS;
+  {
+    std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+    loadRes = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  }
+  FLASHINFER_CHECK(loadRes == CUDA_SUCCESS, failedCall, " returned CUresult ",
+                   static_cast<int>(loadRes), " for trtllm-gen cubin ", config.mFunctionName,
+                   " (numBatches: ", numBatches, ", GemmMNK: ", m, " ", n, " ", k, ")");
+
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
               enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
@@ -564,17 +698,23 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   std::vector<int64_t> prioritizedIndices =
       prioritizePredefinedConfigs(m, n, k, sortedIndices, configs);
 
-  // Filter out invalid configs.
+  // Filter out invalid configs, then the configs whose cubin does not load on this driver.
   std::vector<int64_t> validConfigIndices;
+  int numShapeValid = 0;
   for (auto const& configIndex : prioritizedIndices) {
-    auto isValidConfig = bmm.isValidConfig(configs[configIndex], gemmData);
-    if (isValidConfig) {
+    if (!bmm.isValidConfig(configs[configIndex], gemmData)) {
+      continue;
+    }
+    ++numShapeValid;
+    if (cubinLoads(configs[configIndex])) {
       validConfigIndices.push_back(configIndex);
     }
   }
 
-  FLASHINFER_CHECK(!validConfigIndices.empty(),
-                   "No valid config found for the given problem shape");
+  FLASHINFER_CHECK(numShapeValid > 0, "No valid config found for the given problem shape");
+  FLASHINFER_CHECK(!validConfigIndices.empty(), "All ", numShapeValid,
+                   " configs valid for this problem shape have cubins that do not load on this "
+                   "driver (GitHub #5322); no usable kernel for this tile_N");
 
   return validConfigIndices;
 }
@@ -620,7 +760,7 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
 
   auto const& config = configs[configIndex];
 
-  return bmm.isValidConfig(config, gemmData);
+  return bmm.isValidConfig(config, gemmData) && cubinLoads(config);
 }
 
 }  // namespace kernels

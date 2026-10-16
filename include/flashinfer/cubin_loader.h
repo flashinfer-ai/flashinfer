@@ -53,6 +53,13 @@ std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");
   }
+  current_cubin.clear();
   callbackGetCubin(name.c_str(), sha256.c_str());
+  if (current_cubin.empty()) {
+    throw std::runtime_error("FlashInfer cubin loader returned no data for " + name +
+                             " (expected sha256 " + sha256 +
+                             "); see the preceding Python log line for the download or checksum "
+                             "error");
+  }
   return current_cubin;
 }
