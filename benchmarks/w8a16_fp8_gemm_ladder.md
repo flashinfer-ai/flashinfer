@@ -1071,6 +1071,28 @@ cluster and sum through distributed shared memory without a global round trip, o
 smem-sourced conversion redesign.  Patch: `h4-parked/step_h8_64x64_128x64_ca2_64splitk_pdl_probe.patch`.
 Tables: `hopper-mail/kv1024_step1_ncu.md`, `kv1024_step2_tiles.md`.
 
+### Version H9 probe: pre-shuffled weight, 64-bit fragment loads (Thu 15 Oct 2026), not landed
+
+SASS of the shipped RS mainloop (64x128 ping-pong, 128x128 cooperative, bf16): each thread
+loads its A fragment of a k16 block as four `LDS.U16` (k-pairs of rows m and m + 8): 16 per
+64-deep k-tile, plus 24 PRMT to re-pack them.  CUTLASS's own fix applies as is: give the
+weight a cute Layout "stride" built from `compute_memory_reordering_atom<bf16>()` (16 x 16
+atoms, the fragment's bytes contiguous per lane) and the collective's AutoVectorizingCopy
+turns them into 4 `LDS.64`; the k-tile loop goes 141 -> 115 instructions, conversion
+unchanged.  The host shuffle is one reshape + permute; results are bitwise equal to the
+plain layout (60 / 60 cases).
+
+| cell (50 x 3, ipp2-0061) | plain / cuBLAS | shuffled / cuBLAS |
+|---|---|---|
+| und.kv tp1 M = 1024, 64x128 | 1.090 | 1.014 |
+| und.kv tp2 M = 1024, 128x128 split-K | 1.164 | 1.088 |
+| mlp.down tp2 M = 8192, 128x128 | 1.356 | 1.109 |
+| gen.qkv tp8 M = 8192, 128x128 | 1.241 | 1.081 |
+
+Shipping it needs a checkpoint-time weight transform (the layout is not the torch Linear layout),
+so it is parked pending that decision: `h4-parked/step_h9_shuffled_weight_lds64_probe.patch`,
+table in `hopper-mail/h9_shuffle_probe.md`.
+
 ## Why not the Hopper design
 
 tcgen05.mma takes both operands from shared memory (or A from TMEM), so the fp8 -> bf16
