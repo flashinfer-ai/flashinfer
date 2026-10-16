@@ -80,6 +80,8 @@ HT_FINALIZE_GB300_TP16_H8192_K10 = HTFinalizeTuning(
 )
 HT_ALL_REDUCE_GB300_TP8_H8192 = HTAllReduceTuning()
 HT_ALL_REDUCE_GB300_TP16_H8192 = HTAllReduceTuning()
+HT_FINALIZE_GB300_TP4_H8192_K10 = HTFinalizeTuning()
+HT_FINALIZE_RUBIN_TP4_H8192_K10 = HTFinalizeTuning()
 
 # K3's TP4/8/16 reduction shards contain 112/56/28 bf16x8 packs.
 # Consumer tiles cover a whole token; partial reduction warps are masked.

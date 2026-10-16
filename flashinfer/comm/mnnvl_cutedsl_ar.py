@@ -256,6 +256,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             top_k=top_k,
             dtype=dtype,
             capacity_m=max_token_num,
+            compute_capability=torch.cuda.get_device_capability(device),
         )
 
         for protocol in (ProtocolKind.LL, ProtocolKind.BT, ProtocolKind.HT):
