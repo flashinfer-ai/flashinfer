@@ -14,6 +14,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "named_barrier.cuh"
 #include "utils.cuh"
+#include "variant_helper.cuh"
 
 namespace flashinfer {
 
@@ -61,6 +62,55 @@ __forceinline__ __device__ void write_O(ElemO* O, const TiledCopyO& tiled_copy_O
                                         int write_warp_idx) {
   write_tiled<NUM_COPY_THREADS>(O, tiled_copy_O, layout_O, tile_shape_O, sO, thread_idx,
                                 qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
+}
+
+// Applies the variant's OutputTransform to the accumulator fragment. tOrO and its coordinate
+// tensor tOcO are viewed as (row, col) through convert_layout_acc_rowcol, like rescale_o does,
+// so row mi matches lse(mi). Rows at or beyond qo_len are skipped, as in write_O.
+template <int CTA_Q, typename AttentionVariant, typename MainloopParams, typename FrgTensorO,
+          typename FrgTensorCoord, typename FrgTensorLSE>
+__forceinline__ __device__ void transform_output_fragment(
+    AttentionVariant& variant, const MainloopParams& mainloop_params, FrgTensorO& tOrO,
+    FrgTensorCoord const& tOcO, FrgTensorLSE const& lse, int qo_tile_idx, int qo_len,
+    int qo_head_idx, int batch_idx) {
+  Tensor tOrO_rowcol = make_tensor(tOrO.data(), convert_layout_acc_rowcol(tOrO.layout()));
+  Tensor tOcO_rowcol = make_tensor(tOcO.data(), convert_layout_acc_rowcol(tOcO.layout()));
+  CUTE_STATIC_ASSERT_V(size<0>(tOrO_rowcol) == size(lse));
+  CUTE_STATIC_ASSERT_V(size<0>(tOrO_rowcol) == size<0>(tOcO_rowcol));
+  CUTE_STATIC_ASSERT_V(size<1>(tOrO_rowcol) == size<1>(tOcO_rowcol));
+  const int valid_rows = qo_len - qo_tile_idx * CTA_Q;
+#pragma unroll
+  for (int mi = 0; mi < size<0>(tOrO_rowcol); ++mi) {
+    const int row = get<0>(tOcO_rowcol(mi, _0{}));
+    if (row < valid_rows) {
+      const uint32_t qo_idx = qo_tile_idx * CTA_Q + row;
+#pragma unroll
+      for (int ni = 0; ni < size<1>(tOrO_rowcol); ++ni) {
+        tOrO_rowcol(mi, ni) = variant.OutputTransform(
+            mainloop_params, tOrO_rowcol(mi, ni), uint32_t(batch_idx), qo_idx,
+            uint32_t(qo_head_idx), uint32_t(get<1>(tOcO_rowcol(mi, ni))), lse(mi));
+      }
+    }
+  }
+}
+
+// Same for the cleared fragment of a query tile that attends to no keys: output 0, lse -inf.
+template <typename AttentionVariant, typename MainloopParams, typename FrgTensorO,
+          typename FrgTensorCoord>
+__forceinline__ __device__ void transform_zero_fragment(
+    AttentionVariant& variant, const MainloopParams& mainloop_params, FrgTensorO& tOrO,
+    FrgTensorCoord const& tOcO, int qo_tile_base, int valid_rows, int qo_head_idx, int batch_idx) {
+  using DTypeO = typename FrgTensorO::value_type;
+  CUTE_STATIC_ASSERT_V(size(tOrO) == size(tOcO));
+#pragma unroll
+  for (int i = 0; i < size(tOrO); ++i) {
+    const int row = get<0>(tOcO(i));
+    if (row < valid_rows) {
+      tOrO(i) = DTypeO(variant.OutputTransform(mainloop_params, 0.f, uint32_t(batch_idx),
+                                               uint32_t(qo_tile_base + row), uint32_t(qo_head_idx),
+                                               uint32_t(get<1>(tOcO(i))), -math::inf));
+    }
+  }
 }
 
 template <typename Ktraits>
@@ -149,15 +199,23 @@ struct CollectiveEpilogue {
   static void prefetch_tma_descriptors(Params const& epilogue_params) {}
 
   template <typename BlockCoord, typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE,
-            typename TiledMma>
-  CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO const& tOrO,
+            typename TiledMma, typename AttentionVariant, typename MainloopParams>
+  CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
+                            AttentionVariant& variant, MainloopParams const& mainloop_params) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
+
+    if constexpr (has_output_transform_v<AttentionVariant, MainloopParams>) {
+      Tensor cO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
+      Tensor tOcO = tiled_mma.get_thread_slice(thread_idx).partition_C(cO);  // (MMA,MMA_M,MMA_K)
+      transform_output_fragment<CTA_Q>(variant, mainloop_params, tOrO, tOcO, lse, qo_tile_idx,
+                                       qo_len, qo_head_idx, batch_idx);
+    }
 
     Tensor tOrO_out = convert_type<DTypeO>(tOrO);
     Tensor tOrO_retile = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
@@ -208,10 +266,12 @@ struct CollectiveEpilogue {
     // tma_store_wait<0>();
   }
 
-  // Write 0 to output and -inf to LSE
-  template <typename BlockCoord, typename SharedStorage>
+  // Write 0 to output and -inf to LSE, through the variant's output transform when it has one.
+  template <typename BlockCoord, typename SharedStorage, typename AttentionVariant,
+            typename MainloopParams>
   CUTLASS_DEVICE void store_zero(Params const& epilogue_params, SharedStorage& shared_storage,
-                                 int thread_idx, BlockCoord const& block_coord) {
+                                 int thread_idx, BlockCoord const& block_coord,
+                                 AttentionVariant& variant, MainloopParams const& mainloop_params) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.O_ptr), epilogue_params.layout_O);
@@ -228,9 +288,15 @@ struct CollectiveEpilogue {
     Tensor tOrO = make_fragment_like(tOgO);    // (CPY, CPY_O, CPY_D)
     clear(tOrO);
     Tensor tOcO = thr_copy_O.partition_D(cO);  // (CPY, CPY_O, CPY_D)
-    Tensor tOgOGroup = flatten_1(tOgO);        // (CPY, (CPY_O, CPY_D))
-    Tensor tOrOGroup = flatten_1(tOrO);        // (CPY, (CPY_O, CPY_D))
-    Tensor tOcOGroup = flatten_1(tOcO);        // (CPY, (CPY_O, CPY_D))
+    if constexpr (has_output_transform_v<AttentionVariant, MainloopParams>) {
+      // Before the flattened views below copy the fragment.
+      const int qo_tile_base = qo_tile_idx * get<0>(TileShape_PDV{});
+      transform_zero_fragment(variant, mainloop_params, tOrO, tOcO, qo_tile_base,
+                              qo_len - qo_tile_base, qo_head_idx, batch_idx);
+    }
+    Tensor tOgOGroup = flatten_1(tOgO);  // (CPY, (CPY_O, CPY_D))
+    Tensor tOrOGroup = flatten_1(tOrO);  // (CPY, (CPY_O, CPY_D))
+    Tensor tOcOGroup = flatten_1(tOcO);  // (CPY, (CPY_O, CPY_D))
 
     const int qo_tile_size = get<0>(TileShape_PDV{});
     int valid_qo_tile_size = std::min<int>(qo_len - qo_tile_idx * qo_tile_size, qo_tile_size);
