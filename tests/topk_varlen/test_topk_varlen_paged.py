@@ -253,16 +253,19 @@ def test_paged_warmup_and_cuda_graph_replay():
 
 
 @requires_gvr2
-def test_paged_capacity_buffer_graph_replay():
+@pytest.mark.parametrize("bound", [None, 16384], ids=["capacity", "bound16k"])
+def test_paged_capacity_buffer_graph_replay(bound):
     """V4.1 c1 shape: a 1M-column buffer (page 128) whose rows stay at or below
-    16K, captured once with the capacity envelope; replays rewrite lengths,
-    scores and the page table."""
+    16K, captured once with the capacity envelope or with the 16K-token graph
+    variant's bound; replays rewrite lengths, scores and the page table."""
     rows, ncols, top_k, page_size, live = 32, 1048576, 512, 128, 16384
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     lens = _mixed_lens(rows, live, top_k, 1, seed=43)
     pt = _page_table(rows, ncols, page_size, seed=47)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     kw = dict(out_indices=out, backend="gvr_2", page_table=pt, page_size=page_size)
+    if bound is not None:
+        kw["max_window_len"] = bound
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):

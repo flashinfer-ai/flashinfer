@@ -618,9 +618,11 @@ def test_prefill_max_window_len_validation():
         for bad in (0, -1, "8", 2.5, True):
             with pytest.raises(ValueError, match="max_window_len"):
                 flashinfer.top_k_varlen(lg, le, k, row_starts=rs, max_window_len=bad)
-    # refused without row_starts (decode mode), any backend
-    with pytest.raises(ValueError, match="max_window_len requires row_starts"):
-        flashinfer.top_k_varlen(lg, le, k, max_window_len=5)
+    # decode mode takes the bound too (on seq_lens, in tokens) and refuses a
+    # bad value the same way, any backend
+    for bad in (0, "8", True):
+        with pytest.raises(ValueError, match="max_window_len"):
+            flashinfer.top_k_varlen(lg, le, k, max_window_len=bad)
 
 
 def test_prefill_api_validation_and_admission():

@@ -1136,11 +1136,13 @@ def _run_gvr2(
     """Self-sampling GVR V2: one launch for the whole batch via the per-row
     in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
     selects the windowed (prefill) engines (TRT-LLM #18702 port);
-    ``max_window_len`` (windowed only) is the caller's bound on the window
-    lengths, which lets the host pick a register-resident engine for the
-    launch; without it the streaming engine serves every row.
+    ``max_window_len`` is the caller's bound on the ``seq_lens`` entries. In
+    windowed mode it lets the host pick a register-resident engine for the
+    launch; without it the streaming engine serves every row. In decode it
+    replaces the logits width as the launch envelope, so a buffer allocated
+    at serving capacity launches the engine of its live rows.
 
-    ``max_window_len`` is derived from the logits row width (in uncompressed
+    The decode envelope defaults to the logits row width (in uncompressed
     token space, hence ``* compress_ratio``), which is capture-stable — the
     call performs NO host reads of device data and is CUDA-graph safe once
     the launcher for this shape has been compiled (warm up before capture).
@@ -1153,6 +1155,15 @@ def _run_gvr2(
     """
     from .kernels import gvr2_topk_host
 
+    # The bound on seq_lens, clamped to what the logits width holds in its units
+    # (decode: KV tokens, hence * compress_ratio). Without a caller bound,
+    # windowed calls pass None (unbounded: the streaming engine) and decode
+    # calls the width itself.
+    windowed = row_starts is not None
+    width = logits.shape[1] if windowed else logits.shape[1] * compress_ratio
+    bound = None if windowed else width
+    if max_window_len is not None:
+        bound = min(int(max_window_len), width)
     gvr2_topk_host.run_varlen(
         logits,
         pre_idx,
@@ -1161,18 +1172,7 @@ def _run_gvr2(
         next_n=next_n,
         compress_ratio=compress_ratio,
         values=out_values if return_output_values else None,
-        # windowed: None = unhinted (streaming engine), else the caller's
-        # window-length bound (clamped to the width); decode: the logits
-        # width in uncompressed token space
-        max_seq_len=(
-            (
-                min(int(max_window_len), logits.shape[1])
-                if max_window_len is not None
-                else None
-            )
-            if row_starts is not None
-            else logits.shape[1] * compress_ratio
-        ),
+        max_seq_len=bound,
         workspace=workspace.get("gvr2_workspace") if workspace else None,
         top_k=top_k,
         row_starts=row_starts,
@@ -1633,11 +1633,11 @@ def top_k_varlen(
     Windowed (prefill) mode
     -----------------------
     ``row_starts`` switches a call into windowed (prefill) mode.
-    ``max_window_len`` and ``absolute_indices`` apply only there (a decode
-    call refuses ``max_window_len`` and ``absolute_indices=True`` with
-    ``ValueError``); ``next_n``, ``compress_ratio`` and ``pre_idx`` belong to
-    decode mode (a windowed call refuses any value but ``None``, ``next_n=1``
-    and ``compress_ratio=1`` included, with ``ValueError``).
+    ``absolute_indices`` applies only there (a decode call refuses
+    ``absolute_indices=True`` with ``ValueError``); ``next_n``,
+    ``compress_ratio`` and ``pre_idx`` belong to decode mode (a windowed call
+    refuses any value but ``None``, ``next_n=1`` and ``compress_ratio=1``
+    included, with ``ValueError``).
 
     The mode exists for the DSA indexer's prefill layout, where two things
     move a row's keys away from column 0: several requests share one packed
@@ -1725,14 +1725,21 @@ def top_k_varlen(
         Starts must lie within the row; they are device data and are not
         validated on the host. Default ``None``.
     max_window_len : int, optional
-        Windowed (prefill) mode only: an upper bound on every window length
-        ``seq_lens[r]``, in columns; defaults to ``num_cols``. The bound is
-        consumed before the launch and fixed for a captured graph, so it must
-        hold at every replay. Pass the batch's longest window
-        (``seq_lens.max()``) when it is smaller than ``num_cols``; the tighter
-        the bound, the more the backend can specialize. A positive ``int``; a
-        value above ``num_cols`` counts as ``num_cols``. Refused with
-        ``ValueError`` without ``row_starts``.
+        An upper bound on every entry of ``seq_lens``, in its units: window
+        columns in windowed (prefill) mode, KV tokens in decode mode. It
+        defaults to what the buffer holds, ``num_cols`` (decode: ``num_cols *
+        compress_ratio``), and a larger value counts as that default. The
+        bound is consumed before the launch and fixed for a captured graph,
+        so it must hold at every call and every replay. Pass it when the rows
+        are known to be shorter than the buffer: the batch's longest entry
+        (``seq_lens.max()``), or in decode the length bucket a CUDA graph is
+        captured for while ``logits`` is allocated at the serving capacity;
+        the tighter the bound, the more the backend can specialize. Only
+        ``gvr_2`` uses it; the other backends rank every row in full. In
+        decode, ``gvr_2`` ranks a request whose ``seq_lens`` entry exceeds
+        the bound over the first ``max_window_len // compress_ratio`` columns
+        only, as it ranks a row wider than the buffer over ``num_cols``. A
+        positive ``int``.
     absolute_indices : bool, optional
         Windowed (prefill) mode only: write each hit as its column of
         ``logits`` (``window-local index + row_starts[r]``) instead of the
@@ -1840,7 +1847,8 @@ def top_k_varlen(
                               graphs: a geometry must be compiled before it is
                               captured. Warm up each decode geometry (row
                               count, ``num_cols`` and row stride, ``top_k``,
-                              ``next_n``, ``compress_ratio``, hinted or not)
+                              ``next_n``, ``compress_ratio``, hinted or not,
+                              and ``max_window_len`` when given)
                               with one eager call on the stream that will
                               capture, and each windowed geometry (row count,
                               ``top_k``, ``absolute_indices`` and the bound:
@@ -1932,7 +1940,7 @@ def top_k_varlen(
         If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
         grouping contract; if an argument is used outside its mode
         (``next_n``, ``compress_ratio`` or ``pre_idx`` with ``row_starts``;
-        ``max_window_len`` or ``absolute_indices=True`` without it); if
+        ``absolute_indices=True`` without it); if
         ``row_starts`` is not a contiguous 1-D ``int32`` tensor with one entry
         per row, ``max_window_len`` not a positive ``int`` or
         ``absolute_indices`` not a ``bool``; if ``page_table`` comes with
@@ -2095,14 +2103,6 @@ def top_k_varlen(
                 f"row_starts has {row_starts.shape[0]} entries, expected one per "
                 f"logits row ({num_rows})"
             )
-        if max_window_len is not None and (
-            isinstance(max_window_len, bool)
-            or not isinstance(max_window_len, int)
-            or max_window_len < 1
-        ):
-            raise ValueError(
-                f"max_window_len must be a positive int (window-length bound), got {max_window_len!r}"
-            )
         if not isinstance(absolute_indices, bool):
             raise ValueError(
                 f"absolute_indices must be a bool, got {absolute_indices!r}"
@@ -2113,11 +2113,13 @@ def top_k_varlen(
             "frame of windowed (prefill) mode, and decode indices are already "
             "columns of logits"
         )
-    elif max_window_len is not None:
+    if max_window_len is not None and (
+        isinstance(max_window_len, bool)
+        or not isinstance(max_window_len, int)
+        or max_window_len < 1
+    ):
         raise ValueError(
-            "max_window_len requires row_starts: it bounds the windows of "
-            "windowed (prefill) mode, and in decode every row starts at column "
-            "0 and num_cols already bounds it"
+            f"max_window_len must be a positive int (bound on every seq_lens entry), got {max_window_len!r}"
         )
     if page_table is None and page_size is not None:
         raise ValueError(

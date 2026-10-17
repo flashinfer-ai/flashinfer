@@ -519,13 +519,15 @@ def test_gvr2_workspace_override():
 # ---------------------------------------------------------------------------
 
 
-def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
-    """The varlen launcher must admit the same family the free route picks."""
+def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=None):
+    """The varlen launcher must admit the same family the free route picks.
+    ``n_env`` is the launch envelope in columns (default: the buffer width
+    ``msl_c``; a decode ``max_window_len`` bound sets it below that)."""
     key = (
         rows,
         msl_c,
         top_k,
-        msl_c,
+        msl_c if n_env is None else n_env,
         next_n,
         cr,
         hint_free,
@@ -804,6 +806,139 @@ def test_gvr2_graph_replay_lengths_change_after_capture(
         g.replay()
         torch.cuda.synchronize()
         _check_varlen_rows(logits, out, cols, top_k)
+
+
+# ---------------------------------------------------------------------------
+# decode-mode length bound (max_window_len without row_starts)
+# ---------------------------------------------------------------------------
+
+_BOUND_CASES = [
+    # rows, capacity (columns), bound (tokens), top_k, cr, family at the
+    # capacity, family at the bound
+    (64, 1048576, 16384, 512, 1, "clus", "reg"),  # V4.1 c1, <= 16K-token graphs
+    (148, 524288, 8192, 512, 1, "main", "reg"),  # V4.1 c2 as compressed lengths
+    (4, 262144, 65536, 1024, 4, "main", "reg"),  # c4 1M-token buffer, SPLIT plan
+    (8, 262144, 131072, 512, 4, "main", "reg_clus"),
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,cap_c,bound,top_k,cr,fam_cap,fam_bound", _BOUND_CASES)
+def test_gvr2_decode_bound_launches_the_bound_plan(
+    rows, cap_c, bound, top_k, cr, fam_cap, fam_bound
+):
+    """In decode, a bound below what the buffer holds replaces the logits
+    width as the launch envelope: the capacity-sized buffer launches the plan
+    of the bound. Both launches rank every row exactly."""
+    n_b = bound // cr
+    hgen = torch.Generator().manual_seed(rows + bound)
+    cols = [n_b, n_b - 1, top_k + 1, top_k, 0, 2 * top_k + 1][:rows]
+    while len(cols) < rows:
+        cols.append(int(torch.randint(1, n_b + 1, (1,), generator=hgen)))
+    kv = [c * cr for c in cols]
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(
+        kv, 1, cr, top_k, seed=rows, msl_c=cap_c
+    )
+    for kw, n_env, family in (
+        ({}, cap_c, fam_cap),
+        ({"max_window_len": bound}, n_b, fam_bound),
+    ):
+        indices, _ = _run_gvr2(logits, seq_lens, top_k, None, compress_ratio=cr, **kw)
+        _assert_family(rows, cap_c, top_k, 1, cr, family, hint_free=True, n_env=n_env)
+        _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+def test_gvr2_decode_bound_graph_replay(hinted):
+    """The bound is fixed at capture: replays may rewrite lengths and scores in
+    place while every seq_lens entry stays within it."""
+    rows, cap_c, bound, top_k = 64, 1048576, 16384, 512
+    gen = torch.Generator(device=_DEV).manual_seed(41)
+    hgen = torch.Generator().manual_seed(41)
+
+    def draw():
+        return [
+            int(torch.randint(0, bound + 1, (1,), generator=hgen)) for _ in range(rows)
+        ]
+
+    cols = draw()
+    logits = torch.empty(rows, cap_c, device=_DEV)
+    _refill(logits, cols, gen)
+    seq_lens = torch.tensor(cols, dtype=torch.int32, device=_DEV)
+    pre_idx = None
+    if hinted:
+        pre_idx = torch.randint(
+            0, 1000, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+        )
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out, max_window_len=bound)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
+    torch.cuda.synchronize()
+    _assert_family(rows, cap_c, top_k, 1, 1, "reg", hint_free=not hinted, n_env=bound)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    tiny = [(r * 37) % (top_k + 1) for r in range(rows)]
+    for cols in (draw(), [bound] * rows, tiny, draw()):
+        seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
+        _refill(logits, cols, gen)
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, out, cols, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,cap_c,bound_c,family",
+    [(8, 65536, 4096, "reg"), (100, 262144, 131072, "main")],
+)
+def test_gvr2_decode_bound_violation_truncates(rows, cap_c, bound_c, family):
+    """Outside the contract, as documented: gvr_2 ranks a request longer than
+    the bound over its first max_window_len // compress_ratio columns; the
+    other backends ignore the bound and rank the whole row."""
+    top_k, cr = 512, 4
+    hgen = torch.Generator().manual_seed(rows)
+    cols = [2 * bound_c, bound_c, bound_c + 1, 100, cap_c]
+    while len(cols) < rows:
+        cols.append(int(torch.randint(1, cap_c + 1, (1,), generator=hgen)))
+    kv = [c * cr for c in cols]
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(
+        kv, 1, cr, top_k, seed=rows, msl_c=cap_c
+    )
+    indices, _ = _run_gvr2(
+        logits, seq_lens, top_k, None, compress_ratio=cr, max_window_len=bound_c * cr
+    )
+    _assert_family(rows, cap_c, top_k, 1, cr, family, hint_free=True, n_env=bound_c)
+    _check_varlen_rows(logits, indices, [min(n, bound_c) for n in n_r], top_k)
+    full, _ = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        compress_ratio=cr,
+        max_window_len=bound_c * cr,
+        backend="radix_cutlass",
+    )
+    _check_varlen_rows(logits, full, n_r, top_k)
+
+
+@requires_gvr2
+def test_gvr2_decode_bound_validation():
+    logits = torch.randn(4, 4096, device=_DEV)
+    seq_lens = torch.full((4,), 4096, dtype=torch.int32, device=_DEV)
+    for bad in (0, -1, "8", 2.5, True):
+        with pytest.raises(ValueError, match="max_window_len"):
+            _run_gvr2(logits, seq_lens, 512, None, max_window_len=bad)
+    # a bound at or above what the buffer holds is the default envelope
+    for bound in (4096, 1 << 30):
+        indices, _ = _run_gvr2(logits, seq_lens, 512, None, max_window_len=bound)
+        _assert_family(4, 4096, 512, 1, 1, "reg", hint_free=True)
+        _check_varlen_rows(logits, indices, [4096] * 4, 512)
 
 
 # ---------------------------------------------------------------------------
