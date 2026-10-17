@@ -271,14 +271,17 @@ def _read_text(path: Path, label: str) -> str:
 def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
     """Load the generated physical-module table, keyed by ``arch:module_ident``.
 
-    The table is lazy: importing FlashInfer or using the checkpoint fallback does
-    not read it. Source files are read only when a module's JIT spec is created.
+    One table row describes one generated body and lists every exact
+    architecture that compiles it under ``archs``; the registry holds one entry
+    per (architecture, module) pair. The table is lazy: importing FlashInfer or
+    using the checkpoint fallback does not read it. Source files are read only
+    when a module's JIT spec is created.
     """
 
     csrc_dir = _get_flash_kda_csrc_dir()
     metadata_path = csrc_dir / _FLASH_KDA_GENERATED_METADATA_NAME
     metadata = json.loads(_read_text(metadata_path, "generated FlashKDA module table"))
-    if not isinstance(metadata, dict) or metadata.get("schema_version") != 2:
+    if not isinstance(metadata, dict) or metadata.get("schema_version") != 3:
         raise ValueError("unsupported generated FlashKDA module table schema")
     rows = metadata.get("modules")
     if not isinstance(rows, list) or not rows:
@@ -289,18 +292,19 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         label = f"generated FlashKDA module {index}"
         if not isinstance(row, dict):
             raise ValueError(f"{label} is not an object")
-        arch = row.get("arch")
-        if arch not in _FLASH_KDA_GENERATED_ARCH_TARGETS:
-            raise ValueError(f"{label} has unsupported exact architecture: {arch!r}")
+        archs = row.get("archs")
+        if (
+            not isinstance(archs, list)
+            or not archs
+            or any(arch not in _FLASH_KDA_GENERATED_ARCH_TARGETS for arch in archs)
+        ):
+            raise ValueError(f"{label} has unsupported exact architectures: {archs!r}")
         module_ident = row.get("module_ident")
         if (
             not isinstance(module_ident, str)
             or _FLASH_KDA_C_IDENTIFIER_RE.fullmatch(module_ident) is None
         ):
             raise ValueError(f"{label} module_ident is not a C identifier")
-        variant_id = f"{arch}:{module_ident}"
-        if variant_id in modules:
-            raise ValueError(f"duplicate generated FlashKDA module: {variant_id}")
         state_mode = row.get("state_mode")
         if state_mode not in _FLASH_KDA_GENERATED_STATE_MODES:
             raise ValueError(f"{label} has unsupported state mode {state_mode!r}")
@@ -352,26 +356,30 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
                     ),
                 )
             )
-        modules[variant_id] = GeneratedFlashKDAModule(
-            variant_id=variant_id,
-            arch=arch,
-            target=_FLASH_KDA_GENERATED_ARCH_TARGETS[arch],
-            module_ident=module_ident,
-            body=row["body"],
-            kernel=row["kernel"],
-            threads=row["threads"],
-            smem_bytes=row["smem_bytes"],
-            use_pdl=row["use_pdl"],
-            state_mode=state_mode,
-            abi_family=abi_family,
-            abi_variant=abi_variant,
-            tma_tile_tokens=row["tma_tile_tokens"],
-            value_rows=row["value_rows"],
-            value_tma_rank=row["value_tma_rank"],
-            pair_packed_beta=row["pair_packed_beta"],
-            affine_dependency=row["affine_dependency"],
-            selectors=tuple(selectors),
-        )
+        for arch in archs:
+            variant_id = f"{arch}:{module_ident}"
+            if variant_id in modules:
+                raise ValueError(f"duplicate generated FlashKDA module: {variant_id}")
+            modules[variant_id] = GeneratedFlashKDAModule(
+                variant_id=variant_id,
+                arch=arch,
+                target=_FLASH_KDA_GENERATED_ARCH_TARGETS[arch],
+                module_ident=module_ident,
+                body=row["body"],
+                kernel=row["kernel"],
+                threads=row["threads"],
+                smem_bytes=row["smem_bytes"],
+                use_pdl=row["use_pdl"],
+                state_mode=state_mode,
+                abi_family=abi_family,
+                abi_variant=abi_variant,
+                tma_tile_tokens=row["tma_tile_tokens"],
+                value_rows=row["value_rows"],
+                value_tma_rank=row["value_tma_rank"],
+                pair_packed_beta=row["pair_packed_beta"],
+                affine_dependency=row["affine_dependency"],
+                selectors=tuple(selectors),
+            )
     return MappingProxyType(modules)
 
 
