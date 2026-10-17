@@ -860,10 +860,10 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_nvfp4` | `CudnnFrostNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
-| `cudnn_grouped_gemm_bf16` | `CudnnGroupedGemmBf16Config` | `BF16×BF16` | `SwiGLU` |
-| `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU` |
-| `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU` |
-| `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU` |
+| `cudnn_grouped_gemm_bf16` | `CudnnGroupedGemmBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
@@ -895,6 +895,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
+| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `ReLU2` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |

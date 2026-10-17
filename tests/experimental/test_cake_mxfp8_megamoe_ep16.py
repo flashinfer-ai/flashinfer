@@ -580,7 +580,6 @@ def test_sparse_reference_routing_exercises_mixed_width_tail() -> None:
         _validate_gathered_routing_capacity(routing)
 
 
-@pytest.mark.solo
 @pytest.mark.parametrize(
     "backend", (None, "cute_dsl"), ids=("default_cuda", "cute_dsl")
 )

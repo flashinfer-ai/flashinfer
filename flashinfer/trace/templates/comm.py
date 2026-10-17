@@ -20,6 +20,83 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
+def _tp_moe_finalize_rmsnorm_reference(
+    gemm2_permuted,
+    expert_weights,
+    expanded_idx_to_permuted_idx,
+    norm_weight,
+    eps,
+    gain_center,
+    weight_before_norm,
+    **_unused,
+):
+    """Single-rank reference treating gathered GEMM2 rows as already reduced."""
+    num_tokens, num_experts = expanded_idx_to_permuted_idx.shape
+    hidden_size = norm_weight.shape[0]
+    indices = expanded_idx_to_permuted_idx.reshape(-1).to(torch.int64)
+    valid = (indices >= 0) & (indices < gemm2_permuted.shape[0])
+    if gemm2_permuted.shape[0] == 0:
+        rows = gemm2_permuted.new_zeros((num_tokens, num_experts, hidden_size))
+    else:
+        rows = gemm2_permuted.index_select(
+            0, indices.clamp(0, gemm2_permuted.shape[0] - 1)
+        )[:, :hidden_size]
+        rows = rows.reshape(num_tokens, num_experts, hidden_size)
+        rows = rows.masked_fill(~valid.reshape(num_tokens, num_experts, 1), 0)
+    rows = rows.to(torch.float32)
+    if weight_before_norm:
+        rows = rows * (norm_weight.to(torch.float32) + float(gain_center))
+    inv_rms = torch.rsqrt(rows.square().mean(dim=-1, keepdim=True) + float(eps))
+    normalized = rows * inv_rms
+    if not weight_before_norm:
+        normalized = normalized * (norm_weight.to(torch.float32) + float(gain_center))
+    return (
+        normalized.mul(expert_weights.to(torch.float32).unsqueeze(-1))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+
+
+tp_moe_finalize_rmsnorm_trace = TraceTemplate(
+    op_type="tp_moe_finalize_rmsnorm",
+    name_prefix="tp_moe_finalize_rmsnorm",
+    description=(
+        "Gather raw permuted GEMM2 rows, reduce them across TP ranks, apply "
+        "per-expert RMSNorm, and perform the BF16- or FP32-routing-weighted "
+        "finalize. The trace reference treats the gathered rows as already "
+        "TP-reduced."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_permuted_rows": Var(),
+        "num_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+        "hidden_size_padded": Const(abbrev="hp"),
+    },
+    inputs={
+        "gemm2_permuted": Tensor(["num_permuted_rows", "hidden_size_padded"]),
+        "expert_weights": Tensor(["num_tokens", "num_experts"]),
+        "expanded_idx_to_permuted_idx": Tensor(
+            ["num_tokens", "num_experts"], dtype="int32"
+        ),
+        "norm_weight": Tensor(["hidden_size"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "weight_before_norm": Scalar("int32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype_from="gemm2_permuted",
+            param="output",
+        )
+    },
+    tags=["status:verified", "stage:comm", "fused", "tp4"],
+    reference=_tp_moe_finalize_rmsnorm_reference,
+)
+
+
+@torch.no_grad()
 def _allreduce_fusion_reference(
     input: torch.Tensor,
     workspace,
@@ -536,4 +613,89 @@ decode_cp_a2a_lse_reduce_trace = TraceTemplate(
     tags=["status:experimental", "stage:comm"],
     reference=_decode_cp_a2a_lse_reduce_reference,
     init=_decode_cp_a2a_lse_reduce_init,
+)
+
+
+all_gather_gated_residual_next_rmsnorm_trace = TraceTemplate(
+    op_type="all_gather_gated_residual_next_rmsnorm",
+    name_prefix="all_gather_gated_residual_next_rmsnorm",
+    description="Gather TP column shards, combine the gated residual, and normalize it.",
+    axes={
+        "num_tokens": Var(),
+        "shard_hidden": Const(abbrev="sh"),
+        "hidden": Const(abbrev="h"),
+    },
+    inputs={
+        "branch_shard": Tensor(["num_tokens", "shard_hidden"]),
+        "residual": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "alpha": Tensor(["hidden"], dtype="float32"),
+        "beta": Tensor(["hidden"], dtype="float32"),
+        "next_weight": Tensor(["hidden"]),
+        "post_weight": Tensor(["hidden"], optional=True),
+        "post_eps": Scalar("float32"),
+        "next_eps": Scalar("float32"),
+        "next_gain_center": Scalar("float32"),
+        "post_gain_center": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "residual_out": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "ffn_input": Tensor(["num_tokens", "hidden"], dtype="bfloat16"),
+    },
+    tags=["stage:comm", "fused"],
+)
+
+all_gather_rmsnorm_fp4_quantize_trace = TraceTemplate(
+    op_type="all_gather_rmsnorm_fp4_quantize",
+    name_prefix="all_gather_rmsnorm_fp4_quantize",
+    description="Gather TP column shards, normalize, and quantize to NVFP4.",
+    axes={
+        "num_tokens": Var(),
+        "shard_hidden": Const(abbrev="sh"),
+        "hidden": Const(abbrev="h"),
+        "packed_hidden": Var(),
+        "scale_hidden": Var(),
+        "one": Const(value=1),
+    },
+    inputs={
+        "shard": Tensor(["num_tokens", "shard_hidden"]),
+        "weight": Tensor(["hidden"]),
+        "global_scale": Tensor(["one"], dtype="float32"),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "packed": Tensor(["num_tokens", "packed_hidden"], dtype="uint8"),
+        "scales": Tensor(["num_tokens", "scale_hidden"], dtype="uint8"),
+    },
+    constraints=["packed_hidden == hidden // 2", "scale_hidden == hidden // 16"],
+    tags=["stage:comm", "fused"],
+)
+
+moe_finalize_rmsnorm_allreduce_trace = TraceTemplate(
+    op_type="moe_finalize_rmsnorm_allreduce",
+    name_prefix="moe_finalize_rmsnorm_allreduce",
+    description="Normalize and weight local expert rows, then all-reduce their BF16 partial sums.",
+    axes={
+        "num_tokens": Var(),
+        "num_rows": Var(),
+        "hidden_padded": Const(abbrev="hp"),
+        "hidden": Const(abbrev="h"),
+        "top_k": Const(abbrev="k"),
+    },
+    inputs={
+        "routed_rows": Tensor(["num_rows", "hidden_padded"]),
+        "route_weights": Tensor(["num_tokens", "top_k"]),
+        "permuted_idx": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "norm_weight": Tensor(["hidden"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "weight_before_norm": Scalar("int32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "hidden"], dtype="bfloat16", param="output")
+    },
+    tags=["stage:comm", "fused"],
 )

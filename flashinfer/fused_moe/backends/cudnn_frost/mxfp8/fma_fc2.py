@@ -18,6 +18,7 @@ def _kernel(
     mid_sf: cute.Tensor,
     weights: cute.Tensor,
     weight_sf: cute.Tensor,
+    alpha: cute.Tensor,
     ids: cute.Tensor,
     scores: cute.Tensor,
     out: cute.Tensor,
@@ -67,6 +68,7 @@ def _kernel(
         if lane == 0:
             weighted = cutlass.Float32(0.0)
             if expert >= 0 and expert < cute.size(weights, mode=[0]):
+                value = _mul(value, alpha[expert])
                 value = value.to(cutlass.BFloat16).to(cutlass.Float32)
                 weighted = _mul(value, scores[token, slot])
             shared[o, slot] = weighted
@@ -79,8 +81,8 @@ def _kernel(
 
 
 @cute.jit
-def _launch(mid, mid_sf, weights, weight_sf, ids, scores, out, stream):
-    _kernel(mid, mid_sf, weights, weight_sf, ids, scores, out).launch(
+def _launch(mid, mid_sf, weights, weight_sf, alpha, ids, scores, out, stream):
+    _kernel(mid, mid_sf, weights, weight_sf, alpha, ids, scores, out).launch(
         grid=(cute.size(out) // 4, 1, 1),
         block=(32 * cute.size(ids, mode=[1]), 1, 1),
         stream=stream,
