@@ -209,6 +209,8 @@ def _dense_offset_case(q_len_per_req=1, packed=False, with_end=True):
 @pytest.mark.parametrize("q_len_per_req", [1, 3])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cudnn_decode_without_block_tables(q_len_per_req, dtype):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("cuDNN SDPA requires SM80 or later")
     torch.manual_seed(61)
     b, h, hk, d, sk = 2, 8, 2, 128, 32
     q = torch.randn(b * q_len_per_req, h, d, device="cuda", dtype=dtype)
