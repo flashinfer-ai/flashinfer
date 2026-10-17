@@ -240,7 +240,8 @@ When `auto` changes providers, an older captured call can still hold the previou
 provider's metadata pointers. Keep wrapper-owned tables and length buffers alive
 and refresh them in `plan()` whenever replay can still use them; `run()` must not
 rebuild or repack metadata. Validate transitions with changed page IDs as well as
-changed lengths. Shortening a KV prefix without changing page IDs can accidentally
+changed lengths, including replacing an owned table with a caller-supplied table
+of a different width. Shortening a KV prefix without changing page IDs can accidentally
 pass while the captured table is stale. A reserved page table can be wider than
 one graph's declared KV range: declare only that range while preserving the
 storage row stride and pointer. Include a backend-only provider control in
@@ -250,6 +251,11 @@ indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
 Replay an old capture only with lengths inside its declared bounds and compatible
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
+
+Auto dispatch must preserve run-time calibration scales for half-precision as
+well as FP8 inputs. Test non-unit Q/K scales with nontrivial logits, V scales
+against O and unchanged LSE, and GPU scalar changes before replay. A plan-time
+predicate cannot exclude arguments supplied only to `run()`.
 
 ## Benchmarking
 

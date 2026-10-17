@@ -791,10 +791,10 @@ def test_graph_query_capacity_replan_and_capture(
     monkeypatch, lse_layout, shape_override, dtype, num_kv_heads
 ):
     """Graph capacities are cache keys and survive shorter live replans."""
-    if not cudnn_prefill._cudnn_supports_bounded_ragged():
-        pytest.skip("packed capacity declarations require FE 1.31 native support")
-    if shape_override and not cudnn_prefill._cudnn_supports_bounded_ragged(d128=True):
-        pytest.skip("bounded D128 requires matching native support")
+    if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=True):
+        pytest.skip("packed D128 capacity requires matching native support")
+    if shape_override and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded D128 override is enabled on SM100/SM107")
     monkeypatch.setenv(
         "FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE", str(int(shape_override))
     )

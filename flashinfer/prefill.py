@@ -2420,6 +2420,7 @@ def _blackwell_paged_auto_cudnn(
     max_q,
     max_kv,
     page_size,
+    total_q,
 ):
     """Measured D128 prefix domain; feature compatibility is checked by plan."""
     return (
@@ -2435,6 +2436,9 @@ def _blackwell_paged_auto_cudnn(
         and 64 <= max_q <= 1024
         and 2048 <= max_kv <= 32768
         and max_kv >= 4 * max_q
+        # Amortize paged setup and split/combine cost. Count live query rows
+        # rather than B * max_q, which overestimates uneven batches.
+        and total_q * hq * max_kv >= 8 * 1024 * 1024
         and get_compute_capability(device) == (10, 0)
         and _cudnn_supports_paged_auto()
     )
@@ -3629,6 +3633,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._max_q_len,
                     self._max_kv_len,
                     page_size,
+                    total_num_rows,
                 )
             ):
                 self._backend = "cudnn"
@@ -4119,6 +4124,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self.device,
                     out=self._cudnn_block_tables,
                 )
+            elif self.is_cuda_graph_enabled and self._cudnn_block_tables is not None:
+                # Earlier captures retain the owned table's pointer and row
+                # stride even when this plan binds a caller-owned table.
+                retained = self._cudnn_block_tables
+                width = min(retained.shape[1], block_tables.shape[1])
+                retained[:, :width].copy_(
+                    block_tables[:, :width], non_blocking=non_blocking
+                )
+                retained[:, width:].zero_()
             if self._backend == "cudnn":
                 previous_cudnn_plan = self._cudnn_plan
                 self._cudnn_plan = None

@@ -283,6 +283,7 @@ class UIDs(Enum):
     S_SCALE_UID = 153  # Scale tensor
     S_DESCALE_UID = 154  # Descale tensor
     O_SCALE_UID = 155  # Output scale tensor
+    ATTN_SCALE_UID = 156  # Runtime half-precision Q/K calibration
 
     S_AMAX_UID = 160  # Scale amax tensor
     O_AMAX_UID = 161  # Output amax tensor
@@ -425,7 +426,13 @@ def _sdpa_prefill_key_fn(
     **metadata,
 ):
     return (
-        _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type),
+        _prefill_runtime_key(
+            q,
+            k_cache,
+            v_cache,
+            "device_scalar" if isinstance(scale, torch.Tensor) else scale,
+            o_data_type,
+        ),
         _prefill_descriptor_key(**metadata),
         bool(stats_head_stride)
         if metadata.get("override_cache") is not None and _CUDNN_NATIVE_HN_SUPPORTED
@@ -808,6 +815,13 @@ if CUDNN_AVAILABLE:
                 cudnn_q_data_type == cudnn.data_type.BFLOAT16
                 or cudnn_q_data_type == cudnn.data_type.HALF
             ):
+                if isinstance(scale, torch.Tensor):
+                    scale = g.tensor(
+                        name="attn_scale",
+                        dim=(1, 1, 1, 1),
+                        stride=(1, 1, 1, 1),
+                        data_type=cudnn.data_type.FLOAT,
+                    ).set_uid(UIDs.ATTN_SCALE_UID.value)
                 O, Stats = g.sdpa(
                     name="sdpa",
                     q=cudnn_q,
@@ -1051,7 +1065,7 @@ class _PrefillMetadata:
     Cumulative lengths and ragged offsets already have the units expected by
     the graph. One explicit mapping supplies both build and match, including
     every descriptor argument even if today's cache key ignores some of them.
-    FP8 scales are runtime bindings, and outputs stay call-local.
+    Device scales are runtime bindings, and outputs stay call-local.
     """
 
     max_token_per_sequence: int
@@ -1072,6 +1086,7 @@ class _PrefillMetadata:
     q_scale: Optional[torch.Tensor] = None
     k_scale: Optional[torch.Tensor] = None
     v_scale: Optional[torch.Tensor] = None
+    attn_scale: Optional[torch.Tensor] = None
 
     # Only a wrapper-enforced lifetime capacity is safe here. A live total is
     # insufficient: captured graphs can outlive later plan() calls.
@@ -1319,6 +1334,8 @@ class _PrefillMetadata:
 def _prefill_plan_bindings(metadata, dtype, device):
     """Bindings whose layout and ownership are fixed by a plan."""
     var_map = {}
+    if metadata.attn_scale is not None:
+        var_map[UIDs.ATTN_SCALE_UID.value] = metadata.attn_scale
     # The cumulative seq lens feed the padding mask via the seq-lens UID
     # slots (on the ragged path these are the same buffers as the
     # token-unit ragged offsets below).
@@ -1995,11 +2012,14 @@ def cudnn_batch_prefill_with_kv_cache(
         Whether to return the log-sum-exp tensor (currently must be ``True`` in the
         cubin backend).
     q_scale : Optional[torch.Tensor]
-        FP8 dequantization scale for the query, shape ``(1, 1, 1, 1)`` on GPU.
+        Query calibration scale. The graph path accepts a Python scalar or a
+        scalar float32 tensor on GPU. For FP16/BF16 it multiplies ``scale``;
+        for FP8 it supplies the query descale.
     k_scale : Optional[torch.Tensor]
-        FP8 dequantization scale for the key, shape ``(1, 1, 1, 1)`` on GPU.
+        Key calibration scale, with the same contract as ``q_scale``.
     v_scale : Optional[torch.Tensor]
-        FP8 dequantization scale for the value, shape ``(1, 1, 1, 1)`` on GPU.
+        Value calibration scale, with the same scalar forms as ``q_scale``.
+        On the graph path it scales O without changing LSE.
     batch_offsets_q : Optional[torch.Tensor]
         Cumulative per-request start offsets into the packed query tensor,
         shape ``(batch_size + 1,)``, int32, on GPU, in the units given by
@@ -2186,6 +2206,24 @@ def cudnn_batch_prefill_with_kv_cache(
             batch_offsets_v = batch_offsets_k
 
     if use_cudnn_graph:
+        half_scales = q.dtype in (torch.float16, torch.bfloat16)
+        if half_scales:
+            # sdpa has no FP8 descale inputs. Fold Q/K calibration into the
+            # score scale; device scalars stay on device and change on replay.
+            for calibration in (scale, q_scale, k_scale, v_scale):
+                if isinstance(calibration, torch.Tensor) and (
+                    calibration.dtype != torch.float32
+                    or calibration.numel() != 1
+                    or not calibration.is_contiguous()
+                    or calibration.device != q.device
+                ):
+                    raise ValueError(
+                        "cuDNN scales must be scalar float32 tensors on q's device"
+                    )
+            if q_scale is not None:
+                scale = scale * q_scale
+            if k_scale is not None:
+                scale = scale * k_scale
         # The cuDNN graph declares packed q/out with THD nominal strides
         # (batch stride == one token), which is only addressable through ragged
         # offsets. Without them the graph is well-formed but reads/writes batch
@@ -2233,6 +2271,7 @@ def cudnn_batch_prefill_with_kv_cache(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            attn_scale=scale if isinstance(scale, torch.Tensor) else None,
             o_data_type=o_data_type,
             batch_offsets_q=batch_offsets_q,
             batch_offsets_o=batch_offsets_o,
@@ -2258,7 +2297,7 @@ def cudnn_batch_prefill_with_kv_cache(
             metadata=metadata,
             lse_base=lse_base,
         )
-        return prepared.run(
+        result = prepared.run(
             q,
             k_cache,
             v_cache,
@@ -2268,6 +2307,16 @@ def cudnn_batch_prefill_with_kv_cache(
             metadata=metadata,
             lse_base=lse_base,
         )
+        if (
+            half_scales
+            and v_scale is not None
+            and not (isinstance(v_scale, (float, int)) and v_scale == 1)
+        ):
+            # Match the wrapper's FA2 contract: scale O, leaving Stats intact.
+            out.mul_(
+                v_scale.reshape(()) if isinstance(v_scale, torch.Tensor) else v_scale
+            )
+        return result
     else:
         if actual_seq_lens_q is None or actual_seq_lens_kv is None:
             raise ValueError(
