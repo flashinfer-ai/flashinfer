@@ -4909,6 +4909,305 @@ def test_cake_decode_balanced_fp8_family_matches_reference_and_replays(
     )
 
 
+_FP8_FULL_BLOCK_SM103_REASON = (
+    "decode_quant_fp8 attends to the wrong tokens on sm_103a: inside every "
+    "128-token block the kernel reads the K pages in a head-dependent XOR order "
+    "(page slot p is read as p ^ 5, p ^ 7 or p ^ 3 depending on the head row); "
+    "the V path, the page table and the output scaling are correct. "
+    "Pre-existing on main, which has no GPU test for this route."
+)
+_FP8_FULL_BLOCK_SM100_REASON = (
+    "decode_quant_fp8 faults on sm_100a with cudaErrorIllegalInstruction: the "
+    "JIT adapter encodes a 5-D KV tensor map while the sm_100a kernel issues "
+    "4-D TMA loads; the error is sticky and fails every later test in the "
+    "process, so the test is not run there. "
+    "Pre-existing on main, which has no GPU test for this route."
+)
+_FP8_FULL_BLOCK_ODD_REASON = (
+    " The odd-block-count cases also exercise the padding block that the "
+    "FULL_BLOCKS=1 kernel walks without masking while the selector admits "
+    "lengths that are not multiples of 256."
+)
+
+
+def _fp8_full_block_xfail(extra_reason=""):
+    """Capability-specific xfail marks for the fp8 full-block decode tests."""
+
+    marks = []
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability == (10, 0):
+            marks.append(
+                pytest.mark.xfail(
+                    run=False, reason=_FP8_FULL_BLOCK_SM100_REASON + extra_reason
+                )
+            )
+        elif capability == (10, 3):
+            marks.append(
+                pytest.mark.xfail(
+                    strict=True, reason=_FP8_FULL_BLOCK_SM103_REASON + extra_reason
+                )
+            )
+
+    def apply(fn):
+        for mark in marks:
+            fn = mark(fn)
+        return fn
+
+    return apply
+
+
+_FP8_FULL_BLOCK_SEQ_LENS = [
+    # The smallest admitted shape: four 128-token blocks, one split.
+    pytest.param([512, 512, 512, 512], id="512x4"),
+    # Eight blocks, every length a multiple of 256: the binding splits each
+    # (request, KV head) tile in two and ``decode_quant_fp8_reduce`` combines
+    # the partials.
+    pytest.param([1024, 1024, 1024, 1024], id="1024x4-split2"),
+    # Sixteen blocks: four partials per tile.
+    pytest.param([2048, 2048, 2048, 2048], id="2048x4-split4"),
+]
+
+
+def _fp8_full_block_decode_case(device, *, seq_lens, page_size, seed):
+    """E4M3 decode inputs for the optimized full-block FP8 route.
+
+    One BF16 draw is quantized per tensor with amax scales (``_e4m3_quantize``).
+    The FP32 reference reads the stored E4M3 query / K / V values with
+    ``bmm1_scale = q_scale * k_scale / sqrt(128)`` and multiplies by
+    ``v_scale``, so only the kernel arithmetic is under test.  The output is
+    E4M3 too: ``o_scale = amax(expected) / 448`` maps the largest reference
+    value to the E4M3 maximum and ``bmm2_scale = v_scale / o_scale`` is the
+    kernel's output scale.  ``query_bf16`` / ``kv_cache_bf16`` hold the
+    dequantized tensors for FlashInfer's BF16 decode reference.
+    """
+
+    query, kv_cache, block_tables, seq_lens_t = _balanced_case(
+        device,
+        q_len=1,
+        num_kv_heads=2,
+        seq_lens=seq_lens,
+        seed=seed,
+        dtype=torch.bfloat16,
+        page_size=page_size,
+    )
+    query_q, q_scale = _e4m3_quantize(query)
+    key_q, k_scale = _e4m3_quantize(kv_cache[:, 0])
+    value_q, v_scale = _e4m3_quantize(kv_cache[:, 1])
+    kv_cache_q = torch.empty(kv_cache.shape, dtype=torch.float8_e4m3fn, device=device)
+    kv_cache_q[:, 0] = key_q
+    kv_cache_q[:, 1] = value_q
+    kv_cache_bf16 = torch.empty_like(kv_cache)
+    kv_cache_bf16[:, 0] = key_q.float() * k_scale
+    kv_cache_bf16[:, 1] = value_q.float() * v_scale
+    bmm1_scale = q_scale * k_scale / 128**0.5
+    expected = (
+        _balanced_reference_decode(
+            query_q,
+            kv_cache_q.float(),
+            block_tables,
+            seq_lens_t,
+            q_len=1,
+            scale=bmm1_scale,
+            page_size=page_size,
+        )
+        * v_scale
+    )
+    amax = float(expected.abs().amax())
+    o_scale = amax / 448.0
+    return SimpleNamespace(
+        query=query_q,
+        kv_cache=kv_cache_q,
+        block_tables=block_tables,
+        seq_lens=list(seq_lens),
+        seq_lens_t=seq_lens_t,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=v_scale / o_scale,
+        o_scale=o_scale,
+        expected=expected,
+        # Output E4M3 rounding is at most 1/16 of each value (three mantissa
+        # bits) and 16/448 of ``amax`` in the top binade; the E4M3 P tile of
+        # the PV MMA adds a few percent of the output scale.  ``rtol=0.1`` is
+        # the balanced E4M3 family's bound; the absolute term follows the
+        # output quantization grid instead of that test's fixed 0.1.
+        atol=0.1 * amax,
+        query_bf16=(query_q.float() * q_scale).to(torch.bfloat16),
+        kv_cache_bf16=kv_cache_bf16,
+    )
+
+
+def _paged_decode_wrapper_reference(
+    query, kv_cache, block_tables, seq_lens, *, page_size, scale
+):
+    """FlashInfer's BF16 tensor-core paged decode over the same page tables."""
+
+    device = query.device
+    pages_per_req = [(length + page_size - 1) // page_size for length in seq_lens]
+    indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(torch.tensor(pages_per_req, dtype=torch.int32), dim=0)
+    indices = torch.cat(
+        [block_tables[b, :pages] for b, pages in enumerate(pages_per_req)]
+    )
+    last_page_len = torch.tensor(
+        [
+            seq_lens[b] - (pages_per_req[b] - 1) * page_size
+            for b in range(len(seq_lens))
+        ],
+        dtype=torch.int32,
+    )
+    wrapper = decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        "HND",
+        use_tensor_cores=True,
+    )
+    wrapper.plan(
+        indptr.to(device),
+        indices,
+        last_page_len.to(device),
+        query.shape[1],
+        kv_cache.shape[2],
+        query.shape[2],
+        page_size,
+        pos_encoding_mode="NONE",
+        kv_data_type=torch.bfloat16,
+        q_data_type=torch.bfloat16,
+        sm_scale=scale,
+    )
+    return wrapper.run(query, kv_cache)
+
+
+def _check_fp8_full_block_decode(device, *, seq_lens, page_size, device_scale):
+    case = _fp8_full_block_decode_case(
+        device, seq_lens=seq_lens, page_size=page_size, seed=685_300 + page_size
+    )
+    max_seq_len = max(seq_lens)
+    if device_scale:
+        bmm1_scale = torch.tensor([case.bmm1_scale], dtype=torch.float32, device=device)
+        bmm2_scale = torch.tensor([case.bmm2_scale], dtype=torch.float32, device=device)
+    else:
+        bmm1_scale, bmm2_scale = case.bmm1_scale, case.bmm2_scale
+    # Below the balanced E4M3 route's workspace bound (about ten MiB), so the
+    # page-16 host-scale shape also reaches the quantized route; the quantized
+    # route's split-KV partials need a few hundred KiB at these shapes.
+    workspace = torch.empty(4 * 1024 * 1024, dtype=torch.uint8, device=device)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    assert workspace.numel() < cake_api.cake_fmha_balanced_workspace_bytes(sm_count, 1)
+    out = torch.empty_like(case.query)
+    route = _select_balanced_route(
+        device,
+        query=case.query,
+        kv_cache=case.kv_cache,
+        out=out,
+        workspace=workspace,
+        block_tables=case.block_tables,
+        seq_lens_t=case.seq_lens_t,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+    )
+    assert route is not None and route.component == "decode_quant_fp8"
+    assert (route.page_size, route.use_scale_ptr) == (page_size, device_scale)
+    assert (route.batch_size, route.num_q_heads, route.num_kv_heads) == (4, 16, 2)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert cake_api._route_components(route) == (
+        "decode_quant_fp8",
+        "decode_quant_fp8_reduce",
+    )
+    _, optimized_loaded = cake_api._resolve_cake_fmha_decode_module(device, route)
+    assert optimized_loaded
+
+    actual = cake_api.cake_batch_decode_with_kv_cache(
+        case.query,
+        case.kv_cache,
+        workspace,
+        case.block_tables,
+        case.seq_lens_t,
+        max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        window_left=-1,
+        kv_layout="HND",
+        q_len_per_req=1,
+        out=out,
+    )
+    assert actual.dtype == torch.float8_e4m3fn and actual.data_ptr() == out.data_ptr()
+    dequant = actual.float() * case.o_scale
+    torch.testing.assert_close(dequant, case.expected, atol=case.atol, rtol=0.1)
+
+    # FlashInfer's BF16 decode over the dequantized cache agrees with the FP32
+    # definition (BF16 inputs and output) and brackets the E4M3 result.
+    reference = _paged_decode_wrapper_reference(
+        case.query_bf16,
+        case.kv_cache_bf16,
+        case.block_tables,
+        seq_lens,
+        page_size=page_size,
+        scale=128**-0.5,
+    ).float()
+    torch.testing.assert_close(reference, case.expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dequant, reference, atol=case.atol, rtol=0.1)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize("seq_lens", _FP8_FULL_BLOCK_SEQ_LENS)
+@pytest.mark.parametrize("page_size", [16, 32], ids=["page16", "page32"])
+@pytest.mark.parametrize(
+    "device_scale", [False, True], ids=["host-scale", "device-scale"]
+)
+@_fp8_full_block_xfail()
+def test_cake_decode_fp8_full_block_route_matches_reference(
+    seq_lens, page_size, device_scale
+) -> None:
+    """E4M3 query, KV cache and output on the optimized full-block FP8 route.
+
+    The route (``decode_quant_fp8`` plus ``decode_quant_fp8_reduce``) owns
+    HND E4M3 decode with a shared page table, eight query heads per KV head,
+    16- or 32-token pages and KV lengths that are whole 128-token blocks, at
+    least 512 tokens and in one evened block bucket.  Host scalar and device
+    tensor scales are both admitted; the balanced E4M3 route takes the
+    page-16 host-scale shape only when its larger workspace is available.
+    """
+
+    _check_fp8_full_block_decode(
+        torch.device("cuda"),
+        seq_lens=seq_lens,
+        page_size=page_size,
+        device_scale=device_scale,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize("page_size", [16, 32], ids=["page16", "page32"])
+@_fp8_full_block_xfail(_FP8_FULL_BLOCK_ODD_REASON)
+def test_cake_decode_fp8_full_block_route_odd_block_count_matches_reference(
+    page_size,
+) -> None:
+    """Five- and six-block requests share the evened six-block bucket.
+
+    ``_decode_quant_fp8_seq_lens_supported`` admits ``[640, 768, 768, 640]``
+    (whole blocks, at least 512 tokens, one evened bucket) and the binding
+    keeps one split because 640 is not a multiple of 256.  The kernel walks
+    the evened block count of each request, so the five-block requests must
+    not attend to their sixth, padding block.
+    """
+
+    _check_fp8_full_block_decode(
+        torch.device("cuda"),
+        seq_lens=[640, 768, 768, 640],
+        page_size=page_size,
+        device_scale=False,
+    )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
