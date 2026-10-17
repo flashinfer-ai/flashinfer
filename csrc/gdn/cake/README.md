@@ -20,7 +20,12 @@ with per-variant SASS equivalence checks against the generated originals.
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
   target other than exact SM100a; the eight `fullgrid_vhold` prefill variants
-  stay SM100a-only) or, when one architecture's lowering of a shared body
+  stay SM100a-only; a prefill body shared by all three architectures masks
+  its shared-memory descriptor addresses per architecture inside the one
+  file -- the per-file `CAKE_GDN_SMEM_DESC_MASK`, `0x7FFF` under
+  `#if __CUDA_ARCH__ == 1070` and `0x3FFF` otherwise, or an exact
+  `#if __CUDA_ARCH__ == 1030` guard -- so every prefill record carries one
+  output) or, when one architecture's lowering of a shared body
   differs from the shipped text, in that architecture's own output: the
   SM107a decode bodies scale q through `cake_f32_mul_f64const_rn` (an exact,
   FP64-free emulation of `(float)((double)x * SCALE)` defined in
