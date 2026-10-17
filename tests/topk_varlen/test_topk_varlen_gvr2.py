@@ -29,6 +29,7 @@ The route-dispatch fuzz tests are CPU-only (pure-Python host dispatch).
 """
 
 import math
+import threading
 
 import pytest
 import torch
@@ -1659,8 +1660,9 @@ def test_gvr2_graph_replay_both_directions(
 
 # (rows, msl_c, top_k, next_n, cr). The decode launch is planned for msl_c (the
 # CUDA-graph capacity) and lands on a main engine, while the rows are much
-# shorter: SPLIT (1024 threads, R CTAs per row: R = 33 / 16 / 9 / 4 here) or one
-# CTA per row (1024 threads at 128 and 64 rows, 512 threads at 160 rows).
+# shorter: SPLIT (1024 threads, R CTAs per row in clusters of 8 or 4: R = 32 / 12
+# / 8 / 4 here) or one CTA per row (1024 threads at 128 and 64 rows, 512 threads
+# at 160 rows).
 # Register rows are <= 16384 columns at 1024 threads and <= 8192 at 512; rows
 # up to half that take the VPT 2 body.
 _MAIN_REG_SHAPES = [
@@ -1886,10 +1888,10 @@ def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
 # (rows, width, top_k, next_n, cr, family): launches planned for `width` columns
 # (a CUDA-graph capacity) on each engine family the decode launcher builds: the
 # register kernel (256 and 512 threads, several output positions per thread), the
-# clustered register kernel (8 and 2 ranks), clus (4 and 2 ranks), SPLIT main (18
-# and 37 CTAs per row; K = 2048: two positions per thread), and main with one CTA
-# per row at 1024 threads (with the register path compiled in, and below its
-# envelope gate), 512 and 256 threads.
+# clustered register kernel (8 and 2 ranks), clus (4 and 2 ranks), SPLIT main (16
+# and 32 CTAs per row in clusters of 4; K = 2048: two positions per thread), and
+# main with one CTA per row at 1024 threads (with the register path compiled in,
+# and below its envelope gate), 512 and 256 threads.
 _SHORT_SHAPES = [
     (4, 1024, 1024, 1, 1, "reg"),
     (4, 2048, 2048, 2, 1, "reg"),
@@ -2134,6 +2136,274 @@ def test_gvr2_short_rows_graph_replay(rows, width, top_k, next_n, cr, family, pa
             col = inv[req, (o64 >> 6).clamp_min(0)] * 64 + (o64 & 63)
             got = torch.where(out >= 0, col, o64).to(torch.int32)
         _check_varlen_rows(logits, got, n_r, top_k)
+
+
+# ---------------------------------------------------------------------------
+# main engines: cluster register path for rows between the register path and the
+# cluster's registers
+# ---------------------------------------------------------------------------
+
+# (rows, msl_c, top_k, next_n, cr). SPLIT launches at capacity-sized envelopes;
+# their parts run in clusters, R = 64 / 32 / 8 / 16 / 4 parts per row here.
+_MAIN_CLUS_SHAPES = [
+    (1, 262208, 1024, 1, 4),
+    (4, 524416, 512, 1, 1),
+    (16, 262208, 512, 1, 4),  # two clusters per row
+    (8, 131136, 1024, 2, 4),
+    (32, 1048640, 2048, 1, 1),  # K = 2048 keeps SPLIT up to 32 rows: one cluster
+]
+
+
+def _main_clus_caps(rows, msl_c, top_k):
+    """(register-path cap, cluster size, cluster-path cap) in columns of the
+    SPLIT engine the launcher builds for this envelope."""
+    tpl, r, clus, _ = _host._main_engine(
+        rows, max(msl_c, top_k + 1), msl_c, top_k, False
+    )
+    cs = clus.get("clus_cs", 0)
+    assert tpl[5] and r % max(cs, 1) == 0
+    return tpl[0] * _host._main_reg_vpt(tpl[0], tpl[5], msl_c) * 4, cs, cs * tpl[0] * 16
+
+
+def _clus_band_lengths(n, top_k, reg_cap, cs, cap, msl_c, gen):
+    """n compressed row lengths cycling through the cluster band (reg_cap, cap]:
+    its edges, both sides of every slots-per-thread step (cs * 4096 columns),
+    n % 4 != 0 tails, and register, short, empty and streaming rows; none is
+    pinned to the envelope msl_c."""
+
+    def rnd(lo, hi):
+        return int(torch.randint(lo, hi + 1, (1,), generator=gen))
+
+    step = cs * 4096
+    kinds = [lambda: rnd(reg_cap + 1, cap), lambda: reg_cap + 1, lambda: reg_cap + 4]
+    for m in range(2, cap // step + 1):
+        kinds += [
+            lambda m=m: m * step,
+            lambda m=m: m * step - 3,
+            lambda m=m: m * step + 2,
+        ]
+    kinds += [
+        lambda: cap - 1,
+        lambda: cap + 1,
+        lambda: rnd(cap + 2, msl_c),
+        lambda: rnd(top_k + 1, reg_cap),
+        lambda: top_k,
+        lambda: 0,
+    ]
+    return [min(kinds[i % len(kinds)](), msl_c) for i in range(n)]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,msl_c,top_k,next_n,cr", _MAIN_CLUS_SHAPES)
+def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
+    """Rows far shorter than the launch envelope on clustered SPLIT launches,
+    hinted and hint-free: rows of the cluster band take the clustered register
+    body on their first cluster, the others the register path, the slab or the
+    short path. Every row is exact; small batches cycle through several sets of
+    lengths."""
+    reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
+    assert cs >= 2 and cap > reg_cap
+    gen = torch.Generator().manual_seed(rows * 7 + top_k)
+    for t in range(max(1, 24 // rows)):
+        targets = _clus_band_lengths(
+            rows // next_n, top_k, reg_cap, cs, cap, msl_c, gen
+        )
+        targets = targets[t % len(targets) :] + targets[: t % len(targets)]
+        kv = [x * cr + next_n - 1 for x in targets]
+        logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+            kv, next_n, cr, top_k, seed=rows + top_k + t, msl_c=msl_c
+        )
+        for hint_free in (False, True):
+            indices, _ = _run_gvr2(
+                logits,
+                seq_lens,
+                top_k,
+                None if hint_free else pre_idx,
+                next_n=next_n,
+                compress_ratio=cr,
+            )
+            _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+            _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(16, 262208, 1024), (32, 1048640, 2048)],
+    ids=["cs4_k1024", "cs4_k2048"],
+)
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "constant",
+        "two_values",
+        "quantized4",
+        "huge_flood_gt_k",
+        "huge_flood_lt_k",
+        "ramp_up",
+        "ramp_down",
+        "posinf",
+        "neginf_tail",
+    ],
+)
+def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, pattern):
+    """Tie floods, monotone ramps, +inf (in and out of the bracket window, more
+    than K) and -inf tails (fewer than K finite values) in cluster-band rows of a
+    clustered SPLIT launch, hinted and hint-free: the clustered body's sentinel
+    bracket, crossing refinement and whole-row fallback. Lengths: just above the
+    register path, a slot step, and the cluster cap - 3 (n % 4 == 1)."""
+    reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
+    band = [reg_cap + 1, cs * 4096 * 2 + 5, cap - 3]
+    lens = [band[r % len(band)] for r in range(rows)]
+    n = max(lens)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + len(pattern))
+    if pattern == "posinf":
+        x = torch.randn(rows, n, generator=gen, device=_DEV) * 2.0
+        x[0::3, 700] = float("inf")  # inside the bracket window
+        for r in range(rows):
+            x[r, lens[r] - 2] = float("inf")  # outside it
+        x[1::2, 0 : 4 * (top_k + 5) : 4] = float("inf")  # more +inf than K
+    elif pattern == "neginf_tail":
+        x = torch.randn(rows, n, generator=gen, device=_DEV)
+        for r in range(rows):
+            x[r, lens[r] - 1] = float("-inf")  # the tail column
+        x[1::2, 900:] = float("-inf")  # odd rows: fewer than K finite values
+    else:
+        x = _adversarial_logits(pattern, rows, n, top_k, gen)
+    logits = torch.full((rows, msl_c), 3e38, device=_DEV)
+    for r in range(rows):
+        logits[r, : lens[r]] = x[r, : lens[r]]
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=_DEV)
+    hint = torch.stack(
+        [torch.randint(0, n_, (top_k,), generator=gen, device=_DEV) for n_ in lens]
+    ).to(torch.int32)
+    for pre_idx in (None, hint):
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        torch.cuda.synchronize()
+        _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
+        _check_varlen_rows(logits, out, lens, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(4, 524416, 512), (16, 262208, 1024)],
+    ids=["r32", "r8"],
+)
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+def test_gvr2_main_cluster_path_graph_replay(rows, msl_c, top_k, paged):
+    """Capture a clustered SPLIT launch with every row in the cluster band, then
+    replay after rewriting the lengths in place so rows move between the cluster,
+    register, streaming and short paths in both directions. The path is chosen
+    per row on device; a cluster step never touches the slab, so the streaming
+    step after it must find the slab clean (its counters are zero after every
+    replay)."""
+    reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
+    gen = torch.Generator().manual_seed(rows + top_k)
+    gdev = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    logits = torch.randn(rows, msl_c, generator=gdev, device=_DEV)
+    seq_lens = torch.full((rows,), cap, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ws = torch.zeros(_host.workspace_bytes(), dtype=torch.uint8, device=_DEV)
+    kw = dict(workspace={"gvr2_workspace": ws})
+    pages = (msl_c + 63) // 64
+    if paged:
+        # injective per row, reversed page order, a distinct page range per row
+        r_ = torch.arange(rows, device=_DEV).unsqueeze(1)
+        p_ = torch.arange(pages, device=_DEV).unsqueeze(0)
+        pt = ((pages - 1 - p_) + r_ * pages).to(torch.int32).contiguous()
+        kw.update(page_table=pt, page_size=64)
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, out_indices=out, backend="gvr_2", **kw
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()  # compile outside capture
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        call()
+    torch.cuda.synchronize()
+
+    def rnd(lo, hi, m):
+        return [int(v) for v in torch.randint(lo, hi + 1, (m,), generator=gen)]
+
+    steps = [
+        rnd(reg_cap + 1, cap, rows),  # cluster band
+        rnd(cap + 1, msl_c, rows),  # streaming (the SPLIT slab)
+        _clus_band_lengths(rows, top_k, reg_cap, cs, cap, msl_c, gen),  # mixed
+        rnd(0, top_k, rows),  # short
+        rnd(top_k + 1, reg_cap, rows),  # register path
+        rnd(reg_cap + 1, cap, rows),  # cluster band again
+        rnd(cap + 1, msl_c, rows),  # streaming after a cluster step
+    ]
+    for lens in steps:
+        seq_lens.copy_(torch.tensor(lens, dtype=torch.int32, device=_DEV))
+        logits.normal_(generator=gdev)
+        for r, n in enumerate(lens):
+            logits[r, n:] = 3e38  # poison past each row
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = out
+        if paged:
+            # invert the page map back to row-local columns (pads stay -1)
+            q = (out.to(torch.int64) >> 6) - torch.arange(rows, device=_DEV).unsqueeze(
+                1
+            ) * pages
+            col = (pages - 1 - q) * 64 + (out.to(torch.int64) & 63)
+            got = torch.where(out >= 0, col, out.to(torch.int64)).to(torch.int32)
+        _check_varlen_rows(logits, got, lens, top_k)
+        # the slab's arrival words and offsets (its first 2048 bytes) are zero again
+        assert int(ws[:2048].sum()) == 0, "slab counters not restored"
+
+
+@requires_gvr2
+def test_gvr2_main_cluster_plan():
+    """SPLIT launches group their parts into clusters that fit one wave (R a
+    multiple of the cluster size, R * rows within the device's co-resident
+    clusters); the other main engines keep route()'s plan."""
+    for rows, msl_c, top_k in [
+        (1, 1048832, 512),
+        (2, 262208, 1024),
+        (4, 1048832, 512),
+        (8, 524416, 512),
+        (16, 262208, 1024),
+        (32, 1048640, 2048),
+    ]:
+        plan = _host.route_streaming(rows, msl_c, msl_c, top_k, force_main=True)
+        tpl, r, clus, _ = _host._main_engine(rows, msl_c, msl_c, top_k, False)
+        cs = clus["clus_cs"]
+        assert r % cs == 0 and cs <= r <= plan["rt"]["R"]
+        assert (r // cs) * rows <= _host._max_clusters(cs)
+        assert tpl[:1] + tpl[2:] == tuple(plan["tpl"][:1] + plan["tpl"][2:])
+    for rows, msl_c, top_k in [(64, 262208, 2048), (160, 262208, 512)]:
+        tpl, r, clus, _ = _host._main_engine(rows, msl_c, msl_c, top_k, False)
+        assert not tpl[5] and r == 1 and clus == {}
+
+
+@requires_gvr2
+def test_gvr2_max_clusters_without_current_context(monkeypatch):
+    """The cluster occupancy query loads a probe kernel into the calling
+    thread's CUDA context. A thread that has made no CUDA call yet (a warmup
+    thread; a process planning before its first allocation) has none: the
+    query must still return the device's counts, not cache 0 for the process
+    (every later SPLIT launch would then plan without clusters)."""
+    monkeypatch.setattr(_host, "_MAX_CLUSTERS", {})
+    got = {}
+    t = threading.Thread(
+        target=lambda: got.update({cs: _host._max_clusters(cs) for cs in (2, 4, 8)})
+    )
+    t.start()
+    t.join()
+    monkeypatch.setattr(_host, "_MAX_CLUSTERS", {})
+    want = {cs: _host._max_clusters(cs) for cs in (2, 4, 8)}
+    assert got == want and min(want.values()) > 0, (got, want)
 
 
 # ---------------------------------------------------------------------------
@@ -2536,6 +2806,9 @@ _INF_SHAPES = [
     # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns)
     pytest.param(1, 131104, 4101, 2048, "main", id="main_split"),
     pytest.param(1, 131104, 32773, 2048, "main", id="main_split_stream"),
+    # clustered SPLIT: rows of the cluster band take the clustered register body
+    pytest.param(1, 262208, 32773, 1024, "main", id="main_split_cluster"),
+    pytest.param(16, 1048640, 60001, 2048, "main", id="main_split_cluster_k2048"),
     pytest.param(1, 131104, 2045, 512, "main", id="main_split_narrow"),
     pytest.param(64, 131072, 32773, 2048, "main", id="main_big"),
     pytest.param(64, 131104, 4101, 2048, "main", id="main_big_reg"),
