@@ -20,6 +20,12 @@
 
 using namespace flashinfer;
 
+// 16-byte base-address check (TMA descriptors, 16-byte vector loads / stores); CHECK_INPUT
+// covers device and contiguity only.
+#define W8A16_CHECK_ALIGNED(x)                                          \
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>((x).data_ptr()) % 16 == 0) \
+      << #x " must start at a 16-byte aligned address (storage offset of a view)"
+
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 // `algo` is the Hopper variant code (0 = the launcher's cost model, 2.. = one CUTLASS
 // mixed-input variant; 1 is the retired hand-written kernel and is rejected; see
@@ -57,8 +63,18 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
       << "this w8a16_fp8_gemm module was built for another activation dtype";
   TVM_FFI_ICHECK(out.dtype() == act.dtype()) << "out must have the activation dtype";
   TVM_FFI_ICHECK(M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX);
+  // M = 0 is handled by the Python caller (empty output, no launch); here the tile
+  // schedulers divide by the tile counts, so every dimension must be positive.
+  TVM_FFI_ICHECK(M > 0 && N > 0 && K > 0)
+      << "M, N, K must be positive, got " << M << " " << N << " " << K;
   TVM_FFI_ICHECK(K % 16 == 0) << "K must be a multiple of 16 (16-byte TMA rows of fp8), got " << K;
   TVM_FFI_ICHECK(N % 8 == 0) << "N must be a multiple of 8 (16-byte output rows), got " << N;
+  // TMA descriptors and the 16-byte vector loads / stores (epilogue, split-K reduce)
+  // need 16-byte aligned base addresses; a contiguous view at an odd storage offset
+  // is not, and a misaligned pointer faults the CUDA context instead of this call.
+  W8A16_CHECK_ALIGNED(act);
+  W8A16_CHECK_ALIGNED(weight);
+  W8A16_CHECK_ALIGNED(out);
 
   const void* bias_ptr = nullptr;
   if (bias.has_value()) {
@@ -68,6 +84,7 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
     CHECK_DIM(1, b);
     TVM_FFI_ICHECK_EQ(b.size(0), N) << "bias must be [N]";
     TVM_FFI_ICHECK(b.dtype() == act.dtype()) << "bias must have the activation dtype";
+    W8A16_CHECK_ALIGNED(b);
     bias_ptr = b.data_ptr();
   }
 
@@ -78,6 +95,7 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
     CHECK_INPUT(wsv);
     CHECK_DEVICE(act, wsv);
     TVM_FFI_ICHECK(encode_dlpack_dtype(wsv.dtype()) == float32_code) << "workspace must be float32";
+    W8A16_CHECK_ALIGNED(wsv);
     ws_ptr = static_cast<float*>(wsv.data_ptr());
     ws_bytes = wsv.numel() * 4;
   }
@@ -108,6 +126,8 @@ int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t 
                                        int64_t algo) {
   TVM_FFI_ICHECK(algo == 0 || (algo >= 2 && algo <= gemm::kW8A16Sm90MaxAlgoCode))
       << "algo must be 0 (auto) or a variant code 2.." << gemm::kW8A16Sm90MaxAlgoCode;
+  TVM_FFI_ICHECK(M > 0 && N > 0 && K > 0 && M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX)
+      << "M, N, K must be positive 32-bit values, got " << M << " " << N << " " << K;
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
   const gemm::W8A16Sm90Algo variant =

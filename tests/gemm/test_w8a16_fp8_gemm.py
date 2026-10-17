@@ -196,6 +196,122 @@ def test_w8a16_fp8_gemm_rejects_misaligned(n, k):
         w8a16_fp8_gemm(act, w_fp8, scale)
 
 
+def test_w8a16_fp8_gemm_rejects_misaligned_storage():
+    """A contiguous view at an odd storage offset is rejected (a misaligned pointer
+    would otherwise fault the CUDA context from the TMA / vector-store paths)."""
+    dev = torch.device("cuda")
+    major = get_compute_capability(dev)[0]
+    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    m, n, k = 7, 8, 1024
+    act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8 = torch.ones(n, k, device=dev).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.5], device=dev)
+    out = torch.full((m * n + 1,), -1.0, device=dev, dtype=torch.bfloat16)[1:].view(
+        m, n
+    )
+    assert out.is_contiguous()
+    with pytest.raises(ValueError, match="aligned"):
+        w8a16_fp8_gemm(act, w_fp8, scale, out=out, algo=algo)
+    need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    ws = torch.empty(need // 4 + 1, device=dev, dtype=torch.float32)[1:]
+    with pytest.raises(ValueError, match="aligned"):
+        w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, workspace=ws)
+    act_off = torch.ones(m * k + 1, device=dev, dtype=torch.bfloat16)[1:].view(m, k)
+    with pytest.raises(ValueError, match="aligned"):
+        w8a16_fp8_gemm(act_off, w_fp8, scale, algo=algo)
+    bias_off = torch.ones(n + 1, device=dev, dtype=torch.bfloat16)[1:]
+    with pytest.raises(ValueError, match="aligned"):
+        w8a16_fp8_gemm(act, w_fp8, scale, bias=bias_off, algo=algo)
+    # A view at a 16-byte-aligned offset is fine (and the context is still alive).
+    out_ok = torch.full((m * n + 8,), -1.0, device=dev, dtype=torch.bfloat16)[8:].view(
+        m, n
+    )
+    w8a16_fp8_gemm(act, w_fp8, scale, out=out_ok, algo=algo)
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out_ok, torch.full((m, n), 512.0, device=dev, dtype=torch.bfloat16)
+    )
+
+
+def test_w8a16_fp8_gemm_empty_m():
+    """M = 0 returns the empty output without launching (the tile schedulers divide
+    by the tile count); N = 0 and K = 0 are rejected upfront."""
+    dev = torch.device("cuda")
+    w_fp8, scale = _quantize(torch.randn(64, 256, device=dev))
+    out = w8a16_fp8_gemm(
+        torch.empty(0, 256, device=dev, dtype=torch.bfloat16), w_fp8, scale
+    )
+    assert out.shape == (0, 64) and out.dtype == torch.bfloat16
+    out3 = w8a16_fp8_gemm(
+        torch.empty(2, 0, 256, device=dev, dtype=torch.float16), w_fp8, scale
+    )
+    assert out3.shape == (2, 0, 64) and out3.dtype == torch.float16
+    given = torch.empty(0, 64, device=dev, dtype=torch.bfloat16)
+    assert (
+        w8a16_fp8_gemm(
+            torch.empty(0, 256, device=dev, dtype=torch.bfloat16),
+            w_fp8,
+            scale,
+            out=given,
+            algo="128x128" if get_compute_capability(dev)[0] == 9 else "1sm128x128",
+        )
+        is given
+    )
+    assert w8a16_fp8_gemm_workspace_bytes(0, 64, 256, dev) == 0
+    act = torch.empty(4, 0, device=dev, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="K > 0"):
+        w8a16_fp8_gemm(
+            act, torch.empty(64, 0, device=dev).to(torch.float8_e4m3fn), scale
+        )
+    with pytest.raises(ValueError, match="N > 0"):
+        w8a16_fp8_gemm(
+            torch.empty(4, 256, device=dev, dtype=torch.bfloat16),
+            torch.empty(0, 256, device=dev).to(torch.float8_e4m3fn),
+            scale,
+        )
+    with pytest.raises(ValueError, match="N > 0"):
+        w8a16_fp8_gemm_workspace_bytes(4, 0, 256, dev)
+    with pytest.raises(ValueError, match="K > 0"):
+        w8a16_fp8_gemm_workspace_bytes(4, 64, 0, dev)
+
+
+def test_w8a16_fp8_gemm_strided_act():
+    """A non-contiguous activation is copied, as documented: row slices (strides
+    (2K, 1) survive reshape as a view), transposed last dims, permuted 3D."""
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    k, n = 1024, 64
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    base = torch.randn(14, k, device=dev, dtype=torch.bfloat16)
+    rows = base[::2]
+    assert not rows.is_contiguous()
+    ref = w8a16_fp8_gemm(rows.contiguous(), w_fp8, scale)
+    assert torch.equal(w8a16_fp8_gemm(rows, w_fp8, scale), ref)
+    t = torch.randn(k, 7, device=dev, dtype=torch.bfloat16).T
+    assert torch.equal(
+        w8a16_fp8_gemm(t, w_fp8, scale), w8a16_fp8_gemm(t.contiguous(), w_fp8, scale)
+    )
+    x3 = torch.randn(3, 5, k, device=dev, dtype=torch.bfloat16).permute(1, 0, 2)
+    out3 = w8a16_fp8_gemm(x3, w_fp8, scale)
+    assert out3.shape == (5, 3, n)
+    assert torch.equal(out3, w8a16_fp8_gemm(x3.contiguous(), w_fp8, scale))
+
+
+def test_w8a16_fp8_gemm_device_resolution():
+    """``torch.device("cuda")`` without an index means the current device, same as
+    omitting it; a CPU device is rejected."""
+    dev = torch.device("cuda")
+    cur = torch.device("cuda", torch.cuda.current_device())
+    assert w8a16_fp8_gemm_workspace_bytes(
+        256, 1024, 5120, dev
+    ) == w8a16_fp8_gemm_workspace_bytes(256, 1024, 5120, cur)
+    assert w8a16_fp8_gemm_workspace_bytes(
+        256, 1024, 5120
+    ) == w8a16_fp8_gemm_workspace_bytes(256, 1024, 5120, cur)
+    with pytest.raises(ValueError, match="CUDA"):
+        w8a16_fp8_gemm_workspace_bytes(256, 1024, 5120, torch.device("cpu"))
+
+
 def test_w8a16_fp8_gemm_rejects_retired_hand_algo():
     """The hand-written Hopper kernel was retired in version H7; its name is gone."""
     dev = torch.device("cuda")
