@@ -860,8 +860,9 @@ shape (`tactic=-1` selects the planner's centre tile). Routing reads logits
 (`RoutingInputMode.FromLogits`) or unpacked pre-computed top-k ids + bf16 / fp32
 weights (`RoutingInputMode.UnpackedPrecomputed`); fused shared experts, LoRA
 deltas and routing biases are rejected. `FLASHINFER_CAKE_STEPFUN_FULL_PATH` is read
-only by the `flashinfer.fused_moe` entry (`auto` / `1`); the former FC1-only
-hybrid module no longer exists, so `0` raises. The host contract lives in
+only by the `flashinfer.fused_moe` entry (`auto` / `1`); the FC1-only hybrid of
+#6046 was removed by the cake-build/1 migration, so `0` raises
+`NotImplementedError`. The host contract lives in
 `flashinfer/experimental/cake_stepfun_moe/README.md`.
 
 The class-level matrix below is generated from the registered runner classes.

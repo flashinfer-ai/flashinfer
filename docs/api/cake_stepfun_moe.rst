@@ -31,7 +31,8 @@ The weight view must come from ``CakeStepFunConfig.prepare_weights`` (view
 logits (``RoutingInputMode.FromLogits``) or unpacked pre-computed top-k ids and weights
 (``RoutingInputMode.UnpackedPrecomputed``); fused shared experts and LoRA deltas are not
 supported.  ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` is read by this entry only (``auto`` /
-``1``; the former FC1-only hybrid no longer exists, so ``0`` raises).
+``1``; the FC1-only hybrid of #6046 was removed by the cake-build/1 migration, so ``0``
+raises ``NotImplementedError``).
 
 One-shot functions
 ------------------

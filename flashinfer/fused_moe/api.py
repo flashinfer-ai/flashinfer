@@ -825,8 +825,9 @@ class CakeStepFunConfig:
     read.
 
     ``full_path`` and ``reserved_sms`` are the backend knobs; ``None`` reads
-    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (``auto`` / ``1``; the former FC1-only
-    hybrid no longer exists, so ``0`` raises) and
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (``auto`` / ``1``; the FC1-only hybrid of
+    flashinfer-ai/flashinfer#6046 was removed by the cake-build/1 migration, so
+    ``0`` raises ``NotImplementedError``) and
     ``FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS`` (default 8, the SMs the
     cooperative router leaves free) once in ``check_support``. An explicit value
     wins over the environment. The package itself reads no environment variable.
@@ -1050,9 +1051,9 @@ def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
 
     Returns ``{"full_path": True, "reserved_sms": int, "global_scale_inv": float}``.
     ``full_path`` resolves through :func:`_resolve_cake_stepfun_full_path`; ``False``
-    raises ``NotImplementedError`` because the FC1-only hybrid module was removed
-    with the cake-build/1 migration (owner item O1: keep the variable, raise on
-    ``0``). ``reserved_sms`` sizes the cooperative routing grid. The NVFP4 4over6
+    raises ``NotImplementedError``: the FC1-only hybrid of flashinfer-ai/flashinfer#6046
+    was removed by the cake-build/1 migration, not migrated (the variable stays and
+    ``0`` raises). ``reserved_sms`` sizes the cooperative routing grid. The NVFP4 4over6
     recipe of ``config.quant`` (explicit or from ``FLASHINFER_NVFP4_4OVER6*``)
     must resolve to ``None``: only the ``e4m3_max = 448`` requantization unit is
     exported, so ``global_scale_inv`` is always ``1 / (448 * 6)``.
@@ -1064,11 +1065,12 @@ def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
             f"{backend!r}."
         )
     full_path = _resolve_cake_stepfun_full_path(backend.full_path)
-    if not full_path:  # O1 default: keep FLASHINFER_CAKE_STEPFUN_FULL_PATH, raise on 0
+    if not full_path:  # the variable stays; 0 names the removed hybrid and raises
         raise NotImplementedError(
             "The Cake StepFun FC1-only hybrid (FLASHINFER_CAKE_STEPFUN_FULL_PATH=0 / "
-            "CakeStepFunConfig(full_path=False)) was removed with the cake-build/1 "
-            "migration; every stage runs on the exported Cake kernels (full_path=True)."
+            "CakeStepFunConfig(full_path=False)) of flashinfer-ai/flashinfer#6046 was "
+            "removed by the cake-build/1 migration, not migrated; every stage runs on "
+            "the exported Cake kernels (full_path=True)."
         )
     reserved_sms = _resolve_cake_stepfun_reserved_sms(backend.reserved_sms)
     if config.quant.activation is QuantFormat.NVFP4:

@@ -7,7 +7,8 @@ calling one of the package helpers is the explicit opt-in and emits
 FlashInfer's experimental API warning once. There is no automatic backend
 selection. Tracking: history in flashinfer-ai/flashinfer#6046 (the C++
 stage-runner form this package supersedes); the tracking issue of the
-experimental package is pending.
+experimental package is pending (none is opened yet; the PR checklist slot
+stays unchecked until review decides).
 
 The backend runs the StepFun fused MoE -- `SwiGLUStep(limit)` with a
 per-expert `gemm1_clamp_limit`, `clamp(up, -L, L) * min(silu(gate), L)` -- on
@@ -131,11 +132,27 @@ orchestration in `cake_backend.py`) and
 `tests/experimental/test_cake_stepfun_moe{,_api}.py`. `CakeStepFunConfig` /
 `CakeStepFunRunner` keep their names and import paths in `flashinfer.fused_moe`.
 `FLASHINFER_CAKE_STEPFUN_FULL_PATH` is read only by the `flashinfer.fused_moe`
-entry; the FC1-only hybrid module no longer exists, so `0` raises. The
-FI-global `csrc/cake_device_helpers/` root is unchanged except for the four
-files only StepFun used. `CakeStepFunRunner.native_fc2_twin` and the
-`CAKE_STEPFUN_FC1` / `CAKE_STEPFUN_FULL` hooks of the trtllm-gen host sources
-are removed.
+entry; the FC1-only hybrid of #6046 is removed, not migrated, so `0` raises
+`NotImplementedError`. The FI-global `csrc/cake_device_helpers/` root is
+unchanged except for the four files only StepFun used.
+`CakeStepFunRunner.native_fc2_twin` and the `CAKE_STEPFUN_FC1` /
+`CAKE_STEPFUN_FULL` hooks of the trtllm-gen host sources are removed.
+
+### Limitations
+
+* No FC1-only hybrid. The `FLASHINFER_CAKE_STEPFUN_FULL_PATH=0` path of #6046
+  (the Cake FC1 inside the native trtllm-gen pipeline) is removed: `0` and
+  `CakeStepFunConfig(full_path=False)` raise `NotImplementedError`. The
+  per-family error table therefore has no Cake-vs-native `fc1` rows (`n/a`);
+  the Cake FC1 stage is compared directly against the fp32 reference by the
+  backend suite and covered indirectly through the FC2 inputs and the
+  whole-forward comparison of the API suite.
+* `CakeStepFunRunner.native_fc2_twin` is removed; the Cake FC2 stage is
+  compared against the native FC2 kernel on the same permuted input by the
+  API suite instead.
+* LoRA deltas, fused shared experts, routing biases, packed pre-computed ids,
+  routing methods other than Renormalize and NVFP4 4over6 recipes are
+  rejected (see "Host contract").
 
 ## Tests
 
@@ -143,5 +160,8 @@ are removed.
 package only through `tests/test_helpers/cake_package.py`);
 `tests/experimental/test_cake_stepfun_moe_api.py` tests the
 `flashinfer.fused_moe` route against the native trtllm-gen kernels and writes
-the per-family error table. Both are delivered by the export together with
-the generated programs and skip without an SM100 / SM103 device.
+the per-family error table; its `fc1` Cake-vs-native rows are `n/a` (no
+FC1-only native output exists without the hybrid), so the FC1 stage is gated
+by the backend suite against the fp32 reference. Both are delivered by the
+export together with the generated programs and skip without an SM100 / SM103
+device.

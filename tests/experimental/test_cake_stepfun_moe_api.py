@@ -19,7 +19,10 @@ The suite is delivered byte-for-byte from ``exports/stepfun_moe/test_api_templat
 of the Cake repository together with the generated programs: it drives
 ``flashinfer.fused_moe`` with ``CakeStepFunConfig(backend="cake_stepfun")``,
 compares every family against the native trtllm-gen kernels and writes the
-per-family error table.  Until that delivery lands this module skips.
+per-family error table.  The table's ``fc1`` Cake-vs-native rows are ``n/a``:
+the FC1-only hybrid of flashinfer-ai/flashinfer#6046 is removed, so no FC1-only
+native output exists and the FC1 stage is gated by the backend suite against
+the fp32 reference.  Until that delivery lands this module skips.
 """
 
 import pytest
