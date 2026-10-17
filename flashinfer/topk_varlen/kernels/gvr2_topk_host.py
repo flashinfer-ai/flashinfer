@@ -68,6 +68,7 @@ CUDA-graph capture.
 import math
 import operator
 import threading
+import warnings
 from collections.abc import Sequence
 
 import torch
@@ -976,6 +977,82 @@ def _main_reg_vpt(blk: int, split: bool, n_env: int) -> int:
 # rows <= 8192; both bodies together made ptxas spill the streaming loops.
 _CLUS_REG_VPT = 2
 
+_MAX_CLUSTERS = {}
+
+
+def _max_clusters(cs: int) -> int:
+    """Clusters of ``cs`` CTAs of one CTA per SM (the 1024-thread decode engines)
+    that the CURRENT device runs at once: CUDA's occupancy query, cached per
+    device; 0 (no cluster path, with a warning) where it is unavailable. B200:
+    74, 33 and 15 for 2, 4 and 8, since its GPCs hold 16 to 20 SMs.
+
+    The query loads a probe kernel into the calling thread's current context. A
+    thread that has made no CUDA call yet has none (a warmup thread, or a process
+    before its first allocation), so the device's primary context is made current
+    first, as the CUDA runtime does on such a thread's first call."""
+    d = torch.cuda.current_device()
+    v = _MAX_CLUSTERS.get((d, cs))
+    if v is None:
+        try:
+            from cuda.bindings import driver
+            from cutlass import utils as _cutlass_utils
+
+            err, ctx = driver.cuCtxGetCurrent()
+            if err or not int(ctx):
+                _, dev = driver.cuDeviceGet(d)
+                _, ctx = driver.cuDevicePrimaryCtxRetain(dev)
+                driver.cuCtxSetCurrent(ctx)
+            v = int(_cutlass_utils.HardwareInfo(d).get_max_active_clusters(cs))
+        except Exception as e:  # noqa: BLE001 — no occupancy query: launch without clusters
+            warnings.warn(
+                f"gvr_2: cluster occupancy query failed ({type(e).__name__}: {e}); "
+                "SPLIT launches run without clusters",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            v = 0
+        _MAX_CLUSTERS[(d, cs)] = v
+    return v
+
+
+def _split_clusters(num_rows: int, r: int) -> tuple[int, int]:
+    """(cluster size, parts per row) of a decode SPLIT launch, FlashInfer-local;
+    (0, r) launches without clusters.
+
+    A launch planned for the capacity gets rows of 16K-131K columns that one
+    CTA's registers cannot hold (the register path, ``_main_reg_vpt``) but a
+    cluster's can: route() ranks them with the clustered register family at a
+    launch sized to them (5-7 us on B200), the SPLIT slab streams them (8-11 us).
+    With clusters of ``cs`` parts, such a row runs that family's body on its first
+    cluster (``GvrMainKernel`` ``clus_cs``). The parts per row must be a multiple
+    of ``cs`` and every cluster must fit one wave, so R drops to ``cs * min(r //
+    cs, clusters per row that fit)``; the widest of 8, 4 and 2 that keeps at least
+    3/4 of route()'s ``r`` is taken (B200: 8 at 1-3 rows, then 8, 4 or 2 as the
+    remainders fall; rows of up to 131072, 65536 or 32768 columns). Fewer parts
+    cost the slab's long rows more than they gain."""
+    for cs in (8, 4, 2):
+        parts = cs * min(r // cs, _max_clusters(cs) // num_rows)
+        if 4 * parts >= 3 * r:
+            return cs, parts
+    return 0, r
+
+
+def _main_engine(num_rows, n_route, npad, k, paged):
+    """The decode ``main`` engine of a varlen launch: (tpl, R, ``get_compiled``
+    cluster kwargs, route_streaming()'s rt). SPLIT launches take the cluster plan
+    of ``_split_clusters``; U stays route()'s."""
+    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
+    tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
+    r_const = plan["rt"]["R"]
+    clus = {}
+    if tpl[5] and _main_reg_vpt(tpl[0], tpl[5], n_route):
+        cs, r_const = _split_clusters(num_rows, r_const)
+        if cs:
+            # staged emit as the clustered register kernel's, and always on unpaged
+            # launches: there the scattered emit makes ptxas spill the slab loops
+            clus = dict(clus_cs=cs, clus_stage=(not paged) or _regclus_stage_out(num_rows, k, paged))
+    return tpl, r_const, clus, plan["rt"]
+
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
@@ -1129,10 +1206,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
-    tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
-    rt = plan["rt"]
-    r_const = rt["R"]
+    tpl, r_const, clus, rt = _main_engine(num_rows, n_route, npad, k, paged)
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
@@ -1143,6 +1217,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
             reg_vpt=_main_reg_vpt(tpl[0], tpl[5], n_kernel),
+            **clus,
             **pg,
         )
     )
@@ -2878,14 +2953,14 @@ def warmup_varlen(
         elif plan_free["kernel"] in ("reg", "regimg"):
             ekey = ("reg", tuple(plan_free["tpl"]), _reg_stage_out(r, sms))
         else:
-            p = route_streaming(
+            tpl, r_const, clus, _ = _main_engine(
                 r,
                 max(min(n_env_c, npad_c), int(top_k) + 1),
                 npad_c,
                 int(top_k),
-                force_main=True,
+                page_shift is not None,
             )
-            ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
+            ekey = ("main", tpl[:6], r_const, tuple(sorted(clus.items())))
         if ekey not in seen_keys:
             seen_keys.add(ekey)
             rows_list.append(r)
