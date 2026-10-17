@@ -24,12 +24,12 @@
 #include <numeric>
 #include <vector>
 
+#include "cake_moe_alltoall_dispatch.cuh"
+#include "cake_moe_alltoall_meta.h"
 #include "flashinfer/utils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
-#include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;

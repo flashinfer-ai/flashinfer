@@ -100,14 +100,14 @@ def test_fused_module_keeps_the_public_python_contract():
     }
     expected_module_defaults = {
         "moe_a2a_active_rank_mask": {},
-        "moe_a2a_initialize": {"eplb_stats_num_experts": 0, "backend": "trtllm"},
+        "moe_a2a_initialize": {"eplb_stats_num_experts": 0, "backend": "cake"},
         "moe_a2a_wrap_payload_tensor_in_workspace": {},
         "moe_a2a_dispatch": {
             "enable_pdl": None,
             "eplb_local_stats": None,
             "enable_rank_mask": False,
             "active_rank_mask": None,
-            "backend": "trtllm",
+            "backend": "cake",
             "recv_view_cache": None,
         },
         "moe_a2a_combine": {
@@ -121,12 +121,12 @@ def test_fused_module_keeps_the_public_python_contract():
             "enable_pdl": None,
             "enable_rank_mask": False,
             "active_rank_mask": None,
-            "backend": "trtllm",
+            "backend": "cake",
         },
-        "moe_a2a_sanitize_expert_ids": {"enable_pdl": None, "backend": "trtllm"},
+        "moe_a2a_sanitize_expert_ids": {"enable_pdl": None, "backend": "cake"},
         "moe_a2a_get_workspace_size_per_rank": {
             "eplb_stats_num_experts": 0,
-            "backend": "trtllm",
+            "backend": "cake",
         },
     }
     assert set(api.__all__) == set(expected_module_parameters)
@@ -156,13 +156,6 @@ def test_active_rank_mask_preserves_upper_u64_bits_in_dispatch():
     assert mask.dtype is torch.uint64
     assert mask.device.type == "cpu"
     assert mask.tolist() == [0x8000000180000001]
-
-    dispatch_source = (
-        Path(__file__).resolve().parents[2]
-        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllDispatch.cu"
-    ).read_text()
-    assert "1 << (unsigned long long)" not in dispatch_source
-    assert dispatch_source.count("1ULL << (unsigned long long)") == 5
 
 
 def test_backends_register_distinct_custom_ops(monkeypatch):
@@ -195,11 +188,11 @@ def test_backends_register_distinct_custom_ops(monkeypatch):
     }
     try:
         expected_registrations = set()
-        for target in ("legacy", "sm100a", "sm103a"):
+        for target in ("sm100a", "sm103a"):
             module = api._get_moe_alltoall_module_for_target(target)
             assert api._get_moe_alltoall_module_for_target(target) is module
             assert set(vars(module)) == operation_names
-            suffix = "" if target == "legacy" else f"_{target}"
+            suffix = f"_{target}"
             expected_registrations.update(
                 f"flashinfer::{name}{suffix}" for name in operation_names
             )
@@ -248,46 +241,13 @@ def test_fused_jit_inventory_is_exact_arch_and_self_contained(
     names = {path.name for path in captured["sources"]}
     assert captured["name"] == module_name
     assert generated_name in names
+    assert {"cake_moe_alltoall.cu", "cake_moe_alltoall_dispatch.cu"} <= names
     assert {
-        "trtllm_moe_alltoall.cu",
-        "moeAlltoAllFusedKernels.cu",
-    } <= names
-    assert (
-        not {
-            "moeAlltoAllKernels.cu",
-            "moeAlltoAllPrepareDispatch.cu",
-            "moeAlltoAllDispatch.cu",
-            "moeAlltoAllStageCombine.cu",
-            "moeAlltoAllPublishCombine.cu",
-            "moeAlltoAllCombine.cu",
-            "moeAlltoAllQuantizeCombine.cu",
-            "moeAlltoAllSanitize.cu",
-        }
-        & names
-    )
-    assert {
-        path.name for path in captured["sources"] if path.parent.name == "generated"
+        path.name
+        for path in captured["sources"]
+        if path.parent.name == "moe_alltoall" and path.parent.parent.name == "generated"
     } == {generated_name}
     assert any(arch_flag in flag for flag in captured["kwargs"]["extra_cuda_cflags"])
-
-
-def test_legacy_jit_inventory_remains_available(monkeypatch):
-    import flashinfer.jit.comm as jit_comm
-
-    captured = {}
-
-    def capture(name, sources, **kwargs):
-        captured.update(name=name, sources=tuple(sources), kwargs=kwargs)
-        return object()
-
-    monkeypatch.setattr(jit_comm, "gen_jit_spec", capture)
-    jit_comm.gen_moe_alltoall_module()
-    names = {path.name for path in captured["sources"]}
-    assert captured["name"] == "mnnvl_moe_alltoall"
-    assert "moeAlltoAllKernels.cu" in names
-    assert "moeAlltoAllFusedKernels.cu" not in names
-    assert not {name for name in names if name.startswith("mnnvl_moe_alltoall_sm")}
-    assert captured["kwargs"]["extra_cuda_cflags"] == ["-DENABLE_BF16"]
 
 
 @pytest.mark.parametrize(
@@ -302,7 +262,7 @@ def test_legacy_jit_inventory_remains_available(monkeypatch):
         ((12, 1), None),
     ],
 )
-def test_runtime_module_selection_requires_explicit_cake_opt_in(
+def test_runtime_module_selection_follows_the_device(
     monkeypatch, capability, cake_target
 ):
     import flashinfer.comm.trtllm_moe_alltoall as api
@@ -325,22 +285,23 @@ def test_runtime_module_selection_requires_explicit_cake_opt_in(
 
     try:
         api.get_moe_alltoall_module.cache_clear()
-        assert api.get_moe_alltoall_module() == "legacy"
-        assert api.get_moe_alltoall_module(backend="trtllm") == "legacy"
+        with pytest.raises(ValueError, match="NVLinkOneSidedAlltoAll"):
+            api.get_moe_alltoall_module(backend="trtllm")
         assert capability_queries == []
         if cake_target is None:
-            with pytest.raises(ValueError, match="cake"):
-                api.get_moe_alltoall_module(backend="cake")
-            assert selected == ["legacy", "legacy"]
+            with pytest.raises(ValueError, match="compute capability"):
+                api.get_moe_alltoall_module()
+            assert selected == []
         else:
+            assert api.get_moe_alltoall_module() == cake_target
             assert api.get_moe_alltoall_module(backend="cake") == cake_target
-            assert selected == ["legacy", "legacy", cake_target]
+            assert selected == [cake_target, cake_target]
         assert capability_queries == [7]
     finally:
         api.get_moe_alltoall_module.cache_clear()
 
 
-@pytest.mark.parametrize("backend", ["auto", "legacy", "sm100a", "", None])
+@pytest.mark.parametrize("backend", ["auto", "trtllm", "legacy", "sm100a", "", None])
 def test_runtime_module_selection_rejects_invalid_backends(backend):
     import flashinfer.comm.trtllm_moe_alltoall as api
 
@@ -393,11 +354,8 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
 
 def test_quantized_combine_preserves_the_physical_accumulator_dtype():
     repo_root = Path(__file__).resolve().parents[2]
-    adapter_source = (repo_root / "csrc/trtllm_moe_alltoall.cu").read_text()
-    launcher_source = (
-        repo_root
-        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
-    ).read_text()
+    adapter_source = (repo_root / "csrc/cake_moe_alltoall.cu").read_text()
+    launcher_source = (repo_root / "csrc/cake_moe_alltoall_dispatch.cu").read_text()
 
     assert (
         "alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device())"
@@ -409,26 +367,20 @@ def test_quantized_combine_preserves_the_physical_accumulator_dtype():
 
 
 def test_combine_inventory_is_specialized_and_fail_closed():
-    source_root = (
-        Path(__file__).resolve().parents[2]
-        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels"
-    )
-    combine_source = (source_root / "moeAlltoAllCombine.cu").read_text()
-    launcher_source = (source_root / "moeAlltoAllFusedKernels.cu").read_text()
+    launcher_source = (
+        Path(__file__).resolve().parents[2] / "csrc/cake_moe_alltoall_dispatch.cu"
+    ).read_text()
     supported_top_k = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 22)
 
     for top_k in supported_top_k:
-        assert f"DEFINE_COMBINE_TOP_K({top_k})" in combine_source
         assert f"PRELOAD_COMBINE_TOP_K({top_k})" in launcher_source
         assert f"LAUNCH_COMBINE_TOP_K({top_k})" in launcher_source
     assert "unsupported top_k for moe_a2a_combine" in launcher_source
-    assert "int ep_rank, int top_k" not in combine_source
 
 
 def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
     launcher_source = (
-        Path(__file__).resolve().parents[2]
-        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
+        Path(__file__).resolve().parents[2] / "csrc/cake_moe_alltoall_dispatch.cu"
     ).read_text()
 
     for top_k in (1, 2, 4):
@@ -494,7 +446,7 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         "        params.enable_rank_mask, params.active_rank_mask[0]" in launcher_source
     )
 
-    generated_root = Path(__file__).resolve().parents[2] / "csrc/generated"
+    generated_root = Path(__file__).resolve().parents[2] / "csrc/generated/moe_alltoall"
     for generated_name in (
         "mnnvl_moe_alltoall_sm100.cu",
         "mnnvl_moe_alltoall_sm103.cu",
@@ -605,14 +557,12 @@ def _normalized_cxx(source: str) -> str:
 
 def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
     repo_root = Path(__file__).resolve().parents[2]
-    kernel_root = (
-        repo_root / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels"
-    )
-    launcher_source = (kernel_root / "moeAlltoAllFusedKernels.cu").read_text()
+    launcher_source = (repo_root / "csrc/cake_moe_alltoall_dispatch.cu").read_text()
     launcher = _normalized_cxx(launcher_source)
-    header = _normalized_cxx((kernel_root / "moeAlltoAllKernels.h").read_text())
-    legacy = _normalized_cxx((kernel_root / "moeAlltoAllKernels.cu").read_text())
-    adapter = _normalized_cxx((repo_root / "csrc/trtllm_moe_alltoall.cu").read_text())
+    header = _normalized_cxx(
+        (repo_root / "csrc/cake_moe_alltoall_dispatch.cuh").read_text()
+    )
+    adapter = _normalized_cxx((repo_root / "csrc/cake_moe_alltoall.cu").read_text())
 
     # one extern declaration, preload slot and launch case per exported TOP_K
     for top_k in _FUSED_QUANTIZED_COMBINE_TOP_K:
@@ -678,8 +628,7 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
     assert "int const grid = std::max(params.local_num_tokens, 1);" in launcher_source
     # both quantized routes take the scale geometry from one helper
     assert launcher_source.count("quantizedCombineLayout(params);") == 2
-    # the host boundary skips the BF16/FP16 intermediate on the fused route; the trtllm
-    # backend never fuses, so backend="trtllm" keeps its allocation
+    # the host boundary skips the BF16/FP16 intermediate on the fused route
     assert (
         "bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params);"
         in header
@@ -689,17 +638,13 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
         "return useFusedQuantizedCombine(params); }" in launcher
     )
     assert (
-        "bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const&) "
-        "{ return false; }" in legacy
-    )
-    assert (
         "if (!tl_throughput::moe_a2a_combine_fuses_quantization(params)) { "
         "accumulationStorage = alloc_tensor({localNumTokens, elementsPerToken}, "
         "payload.dtype(), payload.device()); "
         "params.accumulation_data = accumulationStorage.data_ptr(); }" in adapter
     )
 
-    generated_root = repo_root / "csrc/generated"
+    generated_root = repo_root / "csrc/generated/moe_alltoall"
     for generated_name in (
         "mnnvl_moe_alltoall_sm100.cu",
         "mnnvl_moe_alltoall_sm103.cu",
@@ -743,8 +688,7 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
 
 def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
     launcher_source = (
-        Path(__file__).resolve().parents[2]
-        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
+        Path(__file__).resolve().parents[2] / "csrc/cake_moe_alltoall_dispatch.cu"
     ).read_text()
 
     assert "template <PreloadKernelSlot Slot, typename KernelFn>" in launcher_source
@@ -1065,7 +1009,7 @@ def _run_public_combine_round(
     )
 
 
-def _run_public_mpi2_cycle(backend):
+def _run_public_mpi2_cycle():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     if comm.Get_size() != 2:
@@ -1085,11 +1029,7 @@ def _run_public_mpi2_cycle(backend):
 
     from flashinfer.comm.trtllm_moe_alltoall import get_moe_alltoall_module
 
-    # Keep both implementations loaded before exercising either collective.
-    legacy_module = get_moe_alltoall_module()
-    cake_module = get_moe_alltoall_module(backend="cake")
-    assert get_moe_alltoall_module(backend="trtllm") is legacy_module
-    assert cake_module is not legacy_module
+    assert get_moe_alltoall_module() is get_moe_alltoall_module(backend="cake")
 
     routes = torch.tensor(_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda")
     payloads = _payloads(rank, routes)
@@ -1103,7 +1043,7 @@ def _run_public_mpi2_cycle(backend):
         _HIDDEN_SIZE,
         extra_payload_bytes_per_token=extra_payload_bytes,
         eplb_stats_num_experts=5,
-        backend=backend,
+        backend="cake",
     )
     mapping = Mapping(rank=rank, moe_ep_size=2, tp_size=2, world_size=2)
     collective = MoeA2ADriver(
@@ -1114,7 +1054,7 @@ def _run_public_mpi2_cycle(backend):
         workspace_size_per_rank=workspace_size,
         eplb_stats_num_experts=5,
         enable_rank_mask=True,
-        backend=backend,
+        backend="cake",
     )
     active_mask = moe_a2a_active_rank_mask((0, 1), 2)
     _run_public_combine_round(
@@ -1149,7 +1089,7 @@ def _run_public_mpi2_cycle(backend):
         max_tokens,
         _HIDDEN_SIZE,
         extra_payload_bytes_per_token=extra_payload_bytes,
-        backend=backend,
+        backend="cake",
     )
     topk8_collective = MoeA2ADriver(
         mapping,
@@ -1158,7 +1098,7 @@ def _run_public_mpi2_cycle(backend):
         num_experts=16,
         workspace_size_per_rank=topk8_workspace_size,
         enable_rank_mask=True,
-        backend=backend,
+        backend="cake",
     )
     _run_public_combine_round(
         topk8_collective,
@@ -1207,15 +1147,14 @@ def _run_public_mpi2_cycle(backend):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_public_mpi2_nondivisible_six_payload_eplb_and_external_output():
-    """Exercise both backends in one process through public APIs only."""
-    legacy = _run_public_mpi2_cycle(backend="trtllm")
-    cake = _run_public_mpi2_cycle(backend="cake")
-    for legacy_collective, cake_collective in zip(legacy, cake, strict=True):
+    """Run the public-API cycle twice; the second reuses the first's workspaces."""
+    first = _run_public_mpi2_cycle()
+    second = _run_public_mpi2_cycle()
+    for first_collective, second_collective in zip(first, second, strict=True):
         assert (
-            legacy_collective.workspace.data_ptr()
-            != cake_collective.workspace.data_ptr()
+            first_collective.workspace.data_ptr()
+            == second_collective.workspace.data_ptr()
         )
-    _run_public_mpi2_cycle(backend="trtllm")
 
     # Check a dropped peer only after all full-rank reuse checks. A peer that
     # misses collective epochs cannot rejoin without coordinated reinitialization.
@@ -1226,7 +1165,7 @@ def test_public_mpi2_nondivisible_six_payload_eplb_and_external_output():
         routes = torch.tensor(_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda")
         payloads = _payloads(rank, routes)
         rank_zero_mask = moe_a2a_active_rank_mask((0,), 2)
-        for collective in (legacy[0], cake[0]):
+        for collective in (first[0],):
             _run_public_combine_round(
                 collective,
                 rank,
