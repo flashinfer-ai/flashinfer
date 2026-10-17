@@ -61,6 +61,20 @@ rung 37, pinned 96.0% tensor pipe on 12800x5120 M=8192, all instantiations spill
 
 ## Knobs
 
+**Versions H10 / B18 (Fri 16 Oct 2026) removed every `FLASHINFER_W8A16_*` environment
+variable.**  The only override left is the Python op's `algo=` string, which pins one kernel
+variant per call (`W8A16_FP8_GEMM_ALGOS_SM90` / `_SM100` in `flashinfer/gemm/w8a16_fp8.py`).
+The tile-order, stream-K, swizzle, L2-group, raster, cache-hint and split-count knobs
+mentioned below all had their winning value made the compiled-in default (see
+`include/flashinfer/gemm/w8a16_sm90/tile_order.hpp` and `w8a16_sm100/tile_order.hpp` for the
+values and the measurements behind them); the bench's `--algo auto@g<n>` column syntax went
+with them.  The tables that used those knobs stay as measured.  The two headers were also
+split into `w8a16_sm90/{convert,scheduler,tile_order,gemm,dispatch}.hpp` and
+`w8a16_sm100/{convert,tile_order,gemm,dispatch}.hpp` (next to the forked CUTLASS files);
+`w8a16_fp8_gemm_sm90.cuh` / `_sm100.cuh` are now one-include umbrellas.  Kernel code unchanged.
+
+Historical knob table (version 37, the retired hand kernel):
+
 | Variable | Effect |
 |---|---|
 | `FLASHINFER_W8A16_FP8_TILE` | `128x256`, `128x128`, `256x128` or `64x256`: pins the tile instead of the cost model (auto only ever picks the first two). Read once per process. |

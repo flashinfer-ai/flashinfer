@@ -22,6 +22,13 @@ from flashinfer.gemm import w8a16_fp8_gemm, w8a16_fp8_gemm_workspace_bytes
 from flashinfer.utils import get_compute_capability
 
 
+@pytest.fixture(autouse=True)
+def _needs_hopper_or_blackwell():
+    """The op has Hopper (sm_90a) and Blackwell (sm_100a) builds only."""
+    if get_compute_capability(torch.device("cuda"))[0] not in (9, 10):
+        pytest.skip("w8a16_fp8_gemm needs Hopper or Blackwell")
+
+
 def _quantize(w32: torch.Tensor):
     scale = (w32.abs().amax() / 448.0).to(torch.float32).reshape(1)
     return (w32 / scale).to(torch.float8_e4m3fn), scale

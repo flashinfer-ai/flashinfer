@@ -140,7 +140,7 @@ w8a16_sm100_compute_stage_count_or_override_mixed_input(StageCountAutoCarveout<c
   constexpr int TmemAWordsPerDP = CtaK / 2;
 
   // TMEM-A path: upstream only handles CtaN <= 128 (2 accumulator stages at 128 columns
-  // leave 4 A stages; 3 stages below that).  Rung B8 generalises: keep 2 accumulator
+  // leave 4 A stages; 3 stages below that).  Version B8 generalises: keep 2 accumulator
   // stages and give the rest to A, so CtaN = 192 fits as 2 x 192 + 2 x 64 = 512.
   constexpr int AccumulatorStageCount = (IsAComputeinTmem)
       ? ((TmemAccWordsPerDP < 128) ? 3 : 2)

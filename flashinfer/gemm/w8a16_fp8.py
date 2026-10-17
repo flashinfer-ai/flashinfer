@@ -106,7 +106,7 @@ def w8a16_fp8_gemm_workspace_bytes(
 
 
 # Blackwell kernel variants selectable through ``algo``.  The codes are the
-# W8A16Sm100Tile enum values in include/flashinfer/gemm/w8a16_fp8_gemm_sm100.cuh.
+# W8A16Sm100Tile enum values in include/flashinfer/gemm/w8a16_sm100/dispatch.hpp.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "auto": 0,
     "2sm256x128": 1,
@@ -122,7 +122,7 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 # Hopper kernel variants selectable through ``algo``: the variants on CUTLASS's mixed-input
 # mainloop (weight rows x activation rows per CTA tile, plus the stream-K and split-K
 # decompositions).  The codes are the W8A16Sm90Algo enum values in
-# include/flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh; code 1 was the retired
+# include/flashinfer/gemm/w8a16_sm90/dispatch.hpp; code 1 was the retired
 # hand-written kernel and stays reserved.
 W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "auto": 0,
@@ -176,10 +176,21 @@ def w8a16_fp8_gemm(
 
     ``out = act @ (weight.float() * weight_scale).T + bias``, computed with the
     weight dequantized inside the kernel; no 16-bit copy of the weight is
-    materialised.  This is the fused form of TRT-LLM's
-    ``W8A16FP8LinearMethod`` (``weight.to(dtype).mul_(scale)`` then
-    ``F.linear``) and consumes the same checkpoint tensors: an FP8QDQ weight
-    with one per-tensor scale.
+    materialised.  It consumes the same checkpoint tensors as TRT-LLM's
+    ``W8A16FP8LinearMethod`` (an FP8QDQ weight with one per-tensor scale) and
+    replaces its ``weight.to(dtype).mul_(scale)`` followed by ``F.linear``.
+
+    Numerics.  Each e4m3 weight value is converted to ``act``'s dtype exactly
+    (every finite e4m3 value is representable in both bf16 and fp16, denormals
+    included), the tensor cores accumulate the unscaled products in fp32, and
+    ``weight_scale`` (fp32) and ``bias`` are applied to the fp32 accumulator
+    before the single rounding to the output dtype.  The TRT-LLM path instead
+    rounds ``weight * scale`` to the activation dtype first, so the two are
+    the same mathematical operation but not bitwise equal; this one carries
+    one rounding fewer.  The weight must be finite: the two e4m3fn NaN
+    encodings (``0x7F``, ``0xFF``) are not checked for (that would cost a
+    device synchronisation per call) and produce an unspecified finite value
+    or NaN depending on the architecture and dtype.
 
     Parameters
     ----------
@@ -205,24 +216,28 @@ def w8a16_fp8_gemm(
         allocator, so the cost is a few microseconds of host time).  A caller
         that wants a fixed memory budget sizes one buffer once and passes it to
         every call.
+    algo: Optional[str]
+        Pins one kernel variant instead of the launcher's choice: a key of
+        ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
+        ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
+        (``<weight rows>x<activation rows>[_streamk|_splitk]``).
+        ``None`` / ``"auto"`` = the launcher decides.  This is the only
+        override; there are no environment variables.
 
     Notes
     -----
     Hopper (``sm_90a``: wgmma + TMA) and Blackwell (``sm_100a``: tcgen05 + TMA,
-    a FlashInfer fork of CUTLASS's mixed-input mainloop).  ``K`` must be a
-    multiple of 16 and ``N`` a multiple of 8 (16-byte TMA rows), and ``act`` /
-    ``weight`` / ``out`` 16-byte aligned; anything else is rejected with a
-    ValueError before launch.  On Hopper the launcher picks a CUTLASS tile and
+    a FlashInfer fork of CUTLASS's mixed-input mainloop); JIT-compiled on
+    first use, not part of the AOT packages.  ``K`` must be a multiple of 16
+    and ``N`` a multiple of 8 (16-byte TMA rows), and ``act`` / ``weight`` /
+    ``out`` 16-byte aligned; anything else is rejected with a ValueError
+    before launch.  A non-contiguous ``act`` is copied to a contiguous buffer
+    first; a non-contiguous ``out`` is rejected (it could not receive the
+    result in place).  On Hopper the launcher picks a CUTLASS tile and
     decomposition (plain, stream-K or split-K) from a cost model; split-K runs
     go through an fp32 workspace (``workspace``, or one this function
-    allocates).  On Blackwell it
-    picks one of the 2SM tiles from the same kind of model.
-    algo: Optional[str]
-        Pins one kernel variant instead of the launcher's choice (benchmarking):
-        a key of ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
-        ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
-        (``<weight rows>x<activation rows>[_streamk|_splitk]``).
-        ``None`` / ``"auto"`` = the launcher decides.
+    allocates).  On Blackwell it picks one of the 2SM tiles from the same kind
+    of model.
 
     Returns
     -------

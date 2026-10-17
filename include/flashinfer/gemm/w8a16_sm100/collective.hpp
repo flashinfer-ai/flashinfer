@@ -303,7 +303,7 @@ public:
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must evenly divide tile k shape.");
 
   // Thread Counts
-  // Rung B3/B5: transform warpgroups (two, then four).  All map onto the same 128 TMEM lanes (rows);
+  // Version B3/B5: transform warpgroups (two, then four).  All map onto the same 128 TMEM lanes (rows);
   // warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
   static constexpr uint32_t NumTransformationGroups = 2;
   static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
@@ -1217,7 +1217,7 @@ public:
     // Partition of thread -> shared and thread -> RF for the scale / zero tensors.
     // Only meaningful (and only compilable, it builds a TMEM copy) when scales exist;
     // the no-scale path hands partition_extra_transform_info a copy it ignores, which
-    // is what lets the smem-A (SS) MMA atoms through (rung B4).
+    // is what lets the smem-A (SS) MMA atoms through (version B4).
     auto partitioned_extra_info = [&] () {
       if constexpr (ModeHasScales) {
         auto fragment_compute = TiledMma::make_fragment_A(sS);

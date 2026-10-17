@@ -367,33 +367,11 @@ def make_kernel(
         out = torch.empty(
             act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
         )
-    w_use = w_fp8
-    # "<algo>@g<n>": Hopper L2 group size n for this column (FLASHINFER_W8A16_FP8_SM90_GROUP,
-    # read per call; the graph capture bakes it in).
-    # The launcher caches the variable as absent if it is unset at its first read, so it is
-    # set ("0" = launcher's choice) before any GEMM runs whenever a group column is used.
-    group = None
-    if algo is not None and "@g" in algo:
-        algo, g = algo.split("@g")
-        group = g
-        algo = None if algo == "auto" else algo
-        os.environ.setdefault("FLASHINFER_W8A16_FP8_SM90_GROUP", "0")
+    if algo == "auto":
+        algo = None
 
     def run() -> torch.Tensor:
-        if group is not None:
-            os.environ["FLASHINFER_W8A16_FP8_SM90_GROUP"] = group
-        try:
-            return w8a16_fp8_gemm(
-                act,
-                w_use,
-                scale,
-                bias=bias,
-                out=out,
-                algo=algo,
-            )
-        finally:
-            if group is not None:
-                os.environ["FLASHINFER_W8A16_FP8_SM90_GROUP"] = "0"
+        return w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, out=out, algo=algo)
 
     return run
 
