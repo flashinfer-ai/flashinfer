@@ -41,7 +41,7 @@
 #ifndef T_STEPS
 #error "T_STEPS is a downstream specialization of this program; define it on the compile line"
 #endif
-#define TILE_V_WIDE 64
+#define TILE_V_WIDE 32
 #ifndef UPDATE_STATE
 #error "UPDATE_STATE is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -67,7 +67,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2)
+kernel_cake_gdn_03f4a5e14b198c8dfe25(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -106,6 +106,7 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
     int h = state_head - n * HV;
     int group_idx = tid / 16;
     int lane_in_group = tid - group_idx * 16;
+    int lane_hi8 = ((lane_in_group >= 8) ? 1 : 0);
     int lane_local = lane;
     int warp_local = warp;
     int qk_h = h / (HV / H);
@@ -199,10 +200,9 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             t_pre = ((t_pre_raw < T_STEPS) ? t_pre_raw : 0);
         }
         {
-            long long q_base = (long long)n * q_stride_p0 + (long long)t_pre * q_stride_p1 + (long long)qk_h * q_stride_p2;
-            long long k_base = (long long)n * k_stride_p0 + (long long)t_pre * k_stride_p1 + (long long)qk_h * k_stride_p2;
+            int qk_base = ((n * T_STEPS + t_pre) * H + qk_h) * 128;
             {
-                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(q + q_base + (long long)k_start);
+                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(q + qk_base + k_start);
                 uint4 _vld_4[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -216,7 +216,7 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                 }
             }
             {
-                const uint4* _vptr_5 = reinterpret_cast<const uint4*>(k + k_base + (long long)k_start);
+                const uint4* _vptr_5 = reinterpret_cast<const uint4*>(k + qk_base + k_start);
                 uint4 _vld_5[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -327,12 +327,11 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         float x = 0.0f;
         beta_scalar = 0.0f;
         {
-            long long a_index = (long long)n * a_stride_p0 + (long long)t_pre * a_stride_p1 + (long long)h * a_stride_p2;
-            long long b_index = (long long)n * b_stride_p0 + (long long)t_pre * b_stride_p1 + (long long)h * b_stride_p2;
-            x = (float)a[a_index] + dt_bias[h];
-            float _expf_0 = __expf(-(float)b[b_index]);
-            float _rcp_0 = approx_rcp(1.0f + _expf_0);
-            beta_scalar = _rcp_0;
+            int gate_index = (n * T_STEPS + t_pre) * HV + h;
+            x = (float)a[gate_index] + dt_bias[h];
+            float _expf_1 = __expf(-(float)b[gate_index]);
+            float _rcp_1 = approx_rcp(1.0f + _expf_1);
+            beta_scalar = _rcp_1;
         }
         float _expf_2 = __expf(x);
         float _log2_0;
@@ -354,10 +353,10 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         #pragma unroll
         for (int pre_iter = 0; pre_iter < iters_per_group; pre_iter++) {
             {
-                long long v_pre_base = (long long)n * v_stride_p0 + (long long)v_tok * v_stride_p1 + (long long)h * v_stride_p2;
+                int vh_pre_base = ((n * T_STEPS + v_tok) * HV + h) * 128;
                 {
                     uint2 _vld_6;
-                    _vld_6 = *reinterpret_cast<const uint2*>(v + v_pre_base + (long long)v_row_pre + (long long)(pre_iter * 4));
+                    _vld_6 = *reinterpret_cast<const uint2*>(v + vh_pre_base + v_row_pre + pre_iter * 4);
                     uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
                     #pragma unroll
                     for (int _pair = 0; _pair < 2; _pair++) {
@@ -651,38 +650,34 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             float sum_hk_b = sum_hk_b_pair.x + sum_hk_b_pair.y;
             float sum_hk_c = sum_hk_c_pair.x + sum_hk_c_pair.y;
             float sum_hk_d = sum_hk_d_pair.x + sum_hk_d_pair.y;
-            float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_a, 8);
-            sum_hk_a = sum_hk_a + _shfl_xor_8;
-            float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_b, 8);
-            sum_hk_b = sum_hk_b + _shfl_xor_9;
-            float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_c, 8);
-            sum_hk_c = sum_hk_c + _shfl_xor_10;
-            float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_d, 8);
-            sum_hk_d = sum_hk_d + _shfl_xor_11;
-            float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_a, 4);
-            sum_hk_a = sum_hk_a + _shfl_xor_12;
-            float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_b, 4);
-            sum_hk_b = sum_hk_b + _shfl_xor_13;
-            float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_c, 4);
-            sum_hk_c = sum_hk_c + _shfl_xor_14;
-            float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_d, 4);
-            sum_hk_d = sum_hk_d + _shfl_xor_15;
-            float _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_a, 2);
-            sum_hk_a = sum_hk_a + _shfl_xor_16;
-            float _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_b, 2);
-            sum_hk_b = sum_hk_b + _shfl_xor_17;
-            float _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_c, 2);
-            sum_hk_c = sum_hk_c + _shfl_xor_18;
-            float _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_d, 2);
-            sum_hk_d = sum_hk_d + _shfl_xor_19;
-            float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_a, 1);
-            sum_hk_a = sum_hk_a + _shfl_xor_20;
-            float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_b, 1);
-            sum_hk_b = sum_hk_b + _shfl_xor_21;
-            float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_c, 1);
-            sum_hk_c = sum_hk_c + _shfl_xor_22;
-            float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, sum_hk_d, 1);
-            sum_hk_d = sum_hk_d + _shfl_xor_23;
+            float xk_send0 = ((lane_hi8 == 0) ? sum_hk_c : sum_hk_a);
+            float xk_send1 = ((lane_hi8 == 0) ? sum_hk_d : sum_hk_b);
+            float xk_keep0 = ((lane_hi8 == 0) ? sum_hk_a : sum_hk_c);
+            float xk_keep1 = ((lane_hi8 == 0) ? sum_hk_b : sum_hk_d);
+            float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, xk_send0, 8);
+            xk_keep0 = xk_keep0 + _shfl_xor_8;
+            float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, xk_send1, 8);
+            xk_keep1 = xk_keep1 + _shfl_xor_9;
+            float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, xk_keep0, 4);
+            xk_keep0 = xk_keep0 + _shfl_xor_10;
+            float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, xk_keep1, 4);
+            xk_keep1 = xk_keep1 + _shfl_xor_11;
+            float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, xk_keep0, 2);
+            xk_keep0 = xk_keep0 + _shfl_xor_12;
+            float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, xk_keep1, 2);
+            xk_keep1 = xk_keep1 + _shfl_xor_13;
+            float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, xk_keep0, 1);
+            xk_keep0 = xk_keep0 + _shfl_xor_14;
+            float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, xk_keep1, 1);
+            xk_keep1 = xk_keep1 + _shfl_xor_15;
+            float _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, xk_keep0, 8);
+            float xk_other0 = _shfl_xor_16;
+            float _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, xk_keep1, 8);
+            float xk_other1 = _shfl_xor_17;
+            sum_hk_a = ((lane_hi8 == 0) ? xk_keep0 : xk_other0);
+            sum_hk_b = ((lane_hi8 == 0) ? xk_keep1 : xk_other1);
+            sum_hk_c = ((lane_hi8 == 0) ? xk_other0 : xk_keep0);
+            sum_hk_d = ((lane_hi8 == 0) ? xk_other1 : xk_keep1);
             float beta_val = beta_scalar;
             {
                 beta_val = sScalar[t * 2 + 1];
@@ -826,38 +821,34 @@ kernel_cake_gdn_23b1dd923d28be021748(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             float sum_hq_b = sum_hq_b_pair.x + sum_hq_b_pair.y;
             float sum_hq_c = sum_hq_c_pair.x + sum_hq_c_pair.y;
             float sum_hq_d = sum_hq_d_pair.x + sum_hq_d_pair.y;
-            float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 8);
-            sum_hq_a = sum_hq_a + _shfl_xor_24;
-            float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_b, 8);
-            sum_hq_b = sum_hq_b + _shfl_xor_25;
-            float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_c, 8);
-            sum_hq_c = sum_hq_c + _shfl_xor_26;
-            float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_d, 8);
-            sum_hq_d = sum_hq_d + _shfl_xor_27;
-            float _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 4);
-            sum_hq_a = sum_hq_a + _shfl_xor_28;
-            float _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_b, 4);
-            sum_hq_b = sum_hq_b + _shfl_xor_29;
-            float _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_c, 4);
-            sum_hq_c = sum_hq_c + _shfl_xor_30;
-            float _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_d, 4);
-            sum_hq_d = sum_hq_d + _shfl_xor_31;
-            float _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 2);
-            sum_hq_a = sum_hq_a + _shfl_xor_32;
-            float _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_b, 2);
-            sum_hq_b = sum_hq_b + _shfl_xor_33;
-            float _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_c, 2);
-            sum_hq_c = sum_hq_c + _shfl_xor_34;
-            float _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_d, 2);
-            sum_hq_d = sum_hq_d + _shfl_xor_35;
-            float _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_a, 1);
-            sum_hq_a = sum_hq_a + _shfl_xor_36;
-            float _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_b, 1);
-            sum_hq_b = sum_hq_b + _shfl_xor_37;
-            float _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_c, 1);
-            sum_hq_c = sum_hq_c + _shfl_xor_38;
-            float _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, sum_hq_d, 1);
-            sum_hq_d = sum_hq_d + _shfl_xor_39;
+            float xq_send0 = ((lane_hi8 == 0) ? sum_hq_c : sum_hq_a);
+            float xq_send1 = ((lane_hi8 == 0) ? sum_hq_d : sum_hq_b);
+            float xq_keep0 = ((lane_hi8 == 0) ? sum_hq_a : sum_hq_c);
+            float xq_keep1 = ((lane_hi8 == 0) ? sum_hq_b : sum_hq_d);
+            float _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, xq_send0, 8);
+            xq_keep0 = xq_keep0 + _shfl_xor_18;
+            float _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, xq_send1, 8);
+            xq_keep1 = xq_keep1 + _shfl_xor_19;
+            float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, xq_keep0, 4);
+            xq_keep0 = xq_keep0 + _shfl_xor_20;
+            float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, xq_keep1, 4);
+            xq_keep1 = xq_keep1 + _shfl_xor_21;
+            float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, xq_keep0, 2);
+            xq_keep0 = xq_keep0 + _shfl_xor_22;
+            float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, xq_keep1, 2);
+            xq_keep1 = xq_keep1 + _shfl_xor_23;
+            float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, xq_keep0, 1);
+            xq_keep0 = xq_keep0 + _shfl_xor_24;
+            float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, xq_keep1, 1);
+            xq_keep1 = xq_keep1 + _shfl_xor_25;
+            float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, xq_keep0, 8);
+            float xq_other0 = _shfl_xor_26;
+            float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, xq_keep1, 8);
+            float xq_other1 = _shfl_xor_27;
+            sum_hq_a = ((lane_hi8 == 0) ? xq_keep0 : xq_other0);
+            sum_hq_b = ((lane_hi8 == 0) ? xq_keep1 : xq_other1);
+            sum_hq_c = ((lane_hi8 == 0) ? xq_other0 : xq_keep0);
+            sum_hq_d = ((lane_hi8 == 0) ? xq_other1 : xq_keep1);
             if (lane_in_group == 0) {
                 if (read_state_slot_valid != 0) {
                     r_o[0] = sum_hq_a;

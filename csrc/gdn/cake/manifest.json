@@ -8968,422 +8968,6 @@
       "compile_options": [
         "--use_fast_math"
       ],
-      "cuda_symbol": "kernel_cake_gdn_23b1dd923d28be021748",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "64",
-        "INTERMEDIATE_BATCH_STRIDE": "4194304",
-        "INTERMEDIATE_TOKEN_STRIDE": "1048576",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "4",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_1469b1424be3",
-        "module_ident": "cake_gdn_23b1dd923d28be021748_7e1da1a600",
-        "path": "host/cake_gdn_23b1dd923d28be021748_1469b1424be3.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_1469b1424be3",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_23b1dd923d28be021748_99d46896cfe6.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_23b1dd923d28be021748",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 16,
-        "HV": 64,
-        "INTERMEDIATE_BATCH_STRIDE": 4194304,
-        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 64,
-        "T_STEPS": 4,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_23b1dd923d28be021748",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "64",
-        "INTERMEDIATE_BATCH_STRIDE": "5242880",
-        "INTERMEDIATE_TOKEN_STRIDE": "1048576",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "4",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_1ec0aab2106e",
-        "module_ident": "cake_gdn_23b1dd923d28be021748_fd0a795b72",
-        "path": "host/cake_gdn_23b1dd923d28be021748_1ec0aab2106e.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_1ec0aab2106e",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_23b1dd923d28be021748_99d46896cfe6.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_23b1dd923d28be021748",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 16,
-        "HV": 64,
-        "INTERMEDIATE_BATCH_STRIDE": 5242880,
-        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 64,
-        "T_STEPS": 4,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_eaf1e8b244cd4ba498be",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "8",
-        "HV": "16",
-        "INTERMEDIATE_BATCH_STRIDE": "1835008",
-        "INTERMEDIATE_TOKEN_STRIDE": "262144",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "7",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_27bf58e25b2f",
-        "module_ident": "cake_gdn_eaf1e8b244cd4ba498be_edae3957af",
-        "path": "host/cake_gdn_eaf1e8b244cd4ba498be_27bf58e25b2f.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_27bf58e25b2f",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_eaf1e8b244cd4ba498be_7f3845a33c38.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_eaf1e8b244cd4ba498be",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 8,
-        "HV": 16,
-        "INTERMEDIATE_BATCH_STRIDE": 1835008,
-        "INTERMEDIATE_TOKEN_STRIDE": 262144,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 32,
-        "T_STEPS": 7,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_7fdc14dcdd658bc71978",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "32",
-        "INTERMEDIATE_BATCH_STRIDE": "2097152",
-        "INTERMEDIATE_TOKEN_STRIDE": "524288",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "0",
-        "T_STEPS": "2",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_4f9f4a683714",
-        "module_ident": "cake_gdn_7fdc14dcdd658bc71978_e9b2676256",
-        "path": "host/cake_gdn_7fdc14dcdd658bc71978_4f9f4a683714.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_4f9f4a683714",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_7fdc14dcdd658bc71978_5246a50345f9.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_7fdc14dcdd658bc71978",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 16,
-        "HV": 32,
-        "INTERMEDIATE_BATCH_STRIDE": 2097152,
-        "INTERMEDIATE_TOKEN_STRIDE": 524288,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 0,
-        "TILE_V_WIDE": 32,
-        "T_STEPS": 2,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_eaf1e8b244cd4ba498be",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "32",
-        "INTERMEDIATE_BATCH_STRIDE": "3670016",
-        "INTERMEDIATE_TOKEN_STRIDE": "524288",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "7",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_52924c7c7c42",
-        "module_ident": "cake_gdn_eaf1e8b244cd4ba498be_b55790ffff",
-        "path": "host/cake_gdn_eaf1e8b244cd4ba498be_52924c7c7c42.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_52924c7c7c42",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_eaf1e8b244cd4ba498be_7f3845a33c38.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_eaf1e8b244cd4ba498be",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 16,
-        "HV": 32,
-        "INTERMEDIATE_BATCH_STRIDE": 3670016,
-        "INTERMEDIATE_TOKEN_STRIDE": 524288,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 32,
-        "T_STEPS": 7,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_5c39d6c8b1006cf953de",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "0",
-        "H": "16",
-        "HV": "64",
-        "INTERMEDIATE_BATCH_STRIDE": "16384",
-        "INTERMEDIATE_TOKEN_STRIDE": "16384",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "2",
-        "UPDATE_STATE": "1"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_9442581848a4",
-        "module_ident": "cake_gdn_5c39d6c8b1006cf953de_829073155a",
-        "path": "host/cake_gdn_5c39d6c8b1006cf953de_9442581848a4.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_9442581848a4",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_5c39d6c8b1006cf953de_eee3d97640f8.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_5c39d6c8b1006cf953de",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 0,
-        "H": 16,
-        "HV": 64,
-        "INTERMEDIATE_BATCH_STRIDE": 16384,
-        "INTERMEDIATE_TOKEN_STRIDE": 16384,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 64,
-        "T_STEPS": 2,
-        "UPDATE_STATE": 1
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_23b1dd923d28be021748",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "64",
-        "INTERMEDIATE_BATCH_STRIDE": "3145728",
-        "INTERMEDIATE_TOKEN_STRIDE": "1048576",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "3",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_a37c0d3ee78c",
-        "module_ident": "cake_gdn_23b1dd923d28be021748_b2bf2da625",
-        "path": "host/cake_gdn_23b1dd923d28be021748_a37c0d3ee78c.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_a37c0d3ee78c",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_23b1dd923d28be021748_99d46896cfe6.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_23b1dd923d28be021748",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 16,
-        "HV": 64,
-        "INTERMEDIATE_BATCH_STRIDE": 3145728,
-        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 64,
-        "T_STEPS": 3,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_eaf1e8b244cd4ba498be",
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "32",
-        "INTERMEDIATE_BATCH_STRIDE": "2097152",
-        "INTERMEDIATE_TOKEN_STRIDE": "524288",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "4",
-        "UPDATE_STATE": "0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 16512,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_e89bf87a3d2d",
-        "module_ident": "cake_gdn_eaf1e8b244cd4ba498be_e3cf1563f3",
-        "path": "host/cake_gdn_eaf1e8b244cd4ba498be_e89bf87a3d2d.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_e89bf87a3d2d",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_eaf1e8b244cd4ba498be_7f3845a33c38.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
-      "source_symbol": "cake_gdn_eaf1e8b244cd4ba498be",
-      "specializations": {
-        "CACHE_INTERMEDIATE_STATES": 1,
-        "H": 16,
-        "HV": 32,
-        "INTERMEDIATE_BATCH_STRIDE": 2097152,
-        "INTERMEDIATE_TOKEN_STRIDE": 524288,
-        "SCALE": 0.08838834764831845,
-        "STRIDED_INPUTS": 1,
-        "TILE_V_WIDE": 32,
-        "T_STEPS": 4,
-        "UPDATE_STATE": 0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
       "cuda_symbol": "kernel_cake_gdn_0581947bd7b00d694574",
       "defines": {
         "CACHE_INTERMEDIATE_STATES": "1",
@@ -9803,84 +9387,6 @@
         "INTERMEDIATE_TOKEN_STRIDE": 131072,
         "SCALE": 0.08838834764831845,
         "STRIDED_INPUTS": 1
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_76dbd9616fc3d0d426f4",
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "1.0"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 0,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_splitv8_reg_17e98bf1653e",
-        "module_ident": "cake_gdn_76dbd9616fc3d0d426f4_50b8350219",
-        "path": "host/cake_gdn_76dbd9616fc3d0d426f4_17e98bf1653e.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_splitv8_reg_17e98bf1653e",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_76dbd9616fc3d0d426f4_96be6ea3c235.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_splitv8_reg",
-      "source_symbol": "cake_gdn_76dbd9616fc3d0d426f4",
-      "specializations": {
-        "H": 16,
-        "HV": 32,
-        "SCALE": 1.0
-      },
-      "threads": 128,
-      "tma_abi": "pointer"
-    },
-    {
-      "architectures": [
-        "sm_107a"
-      ],
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "cuda_symbol": "kernel_cake_gdn_76dbd9616fc3d0d426f4",
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845"
-      },
-      "domain": "decode",
-      "dynamic_smem_bytes": 0,
-      "host_binding": {
-        "entry": "run_decode_gdn_decode_pretranspose_splitv8_reg_6a998fe39ebf",
-        "module_ident": "cake_gdn_76dbd9616fc3d0d426f4_7da5dee8cb",
-        "path": "host/cake_gdn_76dbd9616fc3d0d426f4_6a998fe39ebf.cc"
-      },
-      "name": "decode_gdn_decode_pretranspose_splitv8_reg_6a998fe39ebf",
-      "outputs": [
-        {
-          "architectures": [
-            "sm_107a"
-          ],
-          "path": "cuda/cake_gdn_76dbd9616fc3d0d426f4_96be6ea3c235.cu"
-        }
-      ],
-      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_splitv8_reg",
-      "source_symbol": "cake_gdn_76dbd9616fc3d0d426f4",
-      "specializations": {
-        "H": 16,
-        "HV": 32,
-        "SCALE": 0.08838834764831845
       },
       "threads": 128,
       "tma_abi": "pointer"
@@ -15129,6 +14635,500 @@
       },
       "threads": 384,
       "tma_abi": "grid_constant"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_43649da2f302334631f0",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "16",
+        "HV": "64",
+        "INTERMEDIATE_BATCH_STRIDE": "4194304",
+        "INTERMEDIATE_TOKEN_STRIDE": "1048576",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "4",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_0b1660ed7075",
+        "module_ident": "cake_gdn_43649da2f302334631f0_1a36a93dee",
+        "path": "host/cake_gdn_43649da2f302334631f0_0b1660ed7075.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_0b1660ed7075",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_43649da2f302334631f0_2650abefc422.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_43649da2f302334631f0",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 4194304,
+        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 4,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_4101613bda764e9048fb",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "0",
+        "H": "16",
+        "HV": "64",
+        "INTERMEDIATE_BATCH_STRIDE": "16384",
+        "INTERMEDIATE_TOKEN_STRIDE": "16384",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "2",
+        "UPDATE_STATE": "1"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_441c7bc63697",
+        "module_ident": "cake_gdn_4101613bda764e9048fb_891f99448d",
+        "path": "host/cake_gdn_4101613bda764e9048fb_441c7bc63697.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_441c7bc63697",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_4101613bda764e9048fb_b856b58ff4aa.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_4101613bda764e9048fb",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 0,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 16384,
+        "INTERMEDIATE_TOKEN_STRIDE": 16384,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 2,
+        "UPDATE_STATE": 1
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_43649da2f302334631f0",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "16",
+        "HV": "64",
+        "INTERMEDIATE_BATCH_STRIDE": "5242880",
+        "INTERMEDIATE_TOKEN_STRIDE": "1048576",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "4",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_5fdf4c788d37",
+        "module_ident": "cake_gdn_43649da2f302334631f0_e140f5010b",
+        "path": "host/cake_gdn_43649da2f302334631f0_5fdf4c788d37.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_5fdf4c788d37",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_43649da2f302334631f0_2650abefc422.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_43649da2f302334631f0",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 5242880,
+        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 4,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_cabf75bb4286b737d70f",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "16",
+        "HV": "32",
+        "INTERMEDIATE_BATCH_STRIDE": "2097152",
+        "INTERMEDIATE_TOKEN_STRIDE": "524288",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "4",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_89cee53ed8a8",
+        "module_ident": "cake_gdn_cabf75bb4286b737d70f_74241b5975",
+        "path": "host/cake_gdn_cabf75bb4286b737d70f_89cee53ed8a8.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_89cee53ed8a8",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_cabf75bb4286b737d70f_b63412c7a9f7.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_cabf75bb4286b737d70f",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 4,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_cabf75bb4286b737d70f",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "16",
+        "HV": "32",
+        "INTERMEDIATE_BATCH_STRIDE": "3670016",
+        "INTERMEDIATE_TOKEN_STRIDE": "524288",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "7",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_9dbec173b733",
+        "module_ident": "cake_gdn_cabf75bb4286b737d70f_d50698fd64",
+        "path": "host/cake_gdn_cabf75bb4286b737d70f_9dbec173b733.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_9dbec173b733",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_cabf75bb4286b737d70f_b63412c7a9f7.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_cabf75bb4286b737d70f",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 3670016,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_43649da2f302334631f0",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "16",
+        "HV": "64",
+        "INTERMEDIATE_BATCH_STRIDE": "3145728",
+        "INTERMEDIATE_TOKEN_STRIDE": "1048576",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "3",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_aeac0ecc9275",
+        "module_ident": "cake_gdn_43649da2f302334631f0_2b2e7ff352",
+        "path": "host/cake_gdn_43649da2f302334631f0_aeac0ecc9275.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_aeac0ecc9275",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_43649da2f302334631f0_2650abefc422.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_43649da2f302334631f0",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 3145728,
+        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 3,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_03f4a5e14b198c8dfe25",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "16",
+        "HV": "32",
+        "INTERMEDIATE_BATCH_STRIDE": "2097152",
+        "INTERMEDIATE_TOKEN_STRIDE": "524288",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "0",
+        "T_STEPS": "2",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_cb22081d65d5",
+        "module_ident": "cake_gdn_03f4a5e14b198c8dfe25_5cd424e1ba",
+        "path": "host/cake_gdn_03f4a5e14b198c8dfe25_cb22081d65d5.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_cb22081d65d5",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_03f4a5e14b198c8dfe25_b0621c3442d2.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_03f4a5e14b198c8dfe25",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 0,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 2,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_cabf75bb4286b737d70f",
+      "defines": {
+        "CACHE_INTERMEDIATE_STATES": "1",
+        "H": "8",
+        "HV": "16",
+        "INTERMEDIATE_BATCH_STRIDE": "1835008",
+        "INTERMEDIATE_TOKEN_STRIDE": "262144",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "7",
+        "UPDATE_STATE": "0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 16512,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_fb222fa9f3bc",
+        "module_ident": "cake_gdn_cabf75bb4286b737d70f_8a96834585",
+        "path": "host/cake_gdn_cabf75bb4286b737d70f_fb222fa9f3bc.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_fb222fa9f3bc",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_cabf75bb4286b737d70f_b63412c7a9f7.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg",
+      "source_symbol": "cake_gdn_cabf75bb4286b737d70f",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_1bafa8b7e24368183c90",
+      "defines": {
+        "H": "16",
+        "HV": "32",
+        "SCALE": "0.08838834764831845"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 0,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_splitv8_reg_ost_4bd2cdca0786",
+        "module_ident": "cake_gdn_1bafa8b7e24368183c90_9c2679c997",
+        "path": "host/cake_gdn_1bafa8b7e24368183c90_4bd2cdca0786.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_splitv8_reg_ost_4bd2cdca0786",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_1bafa8b7e24368183c90_b078ef018373.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_splitv8_reg_ost",
+      "source_symbol": "cake_gdn_1bafa8b7e24368183c90",
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "architectures": [
+        "sm_107a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_cake_gdn_1bafa8b7e24368183c90",
+      "defines": {
+        "H": "16",
+        "HV": "32",
+        "SCALE": "1.0"
+      },
+      "domain": "decode",
+      "dynamic_smem_bytes": 0,
+      "host_binding": {
+        "entry": "run_decode_gdn_decode_pretranspose_splitv8_reg_ost_7d3a948841d0",
+        "module_ident": "cake_gdn_1bafa8b7e24368183c90_2ab6a85afc",
+        "path": "host/cake_gdn_1bafa8b7e24368183c90_7d3a948841d0.cc"
+      },
+      "name": "decode_gdn_decode_pretranspose_splitv8_reg_ost_7d3a948841d0",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_1bafa8b7e24368183c90_b078ef018373.cu"
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_splitv8_reg_ost",
+      "source_symbol": "cake_gdn_1bafa8b7e24368183c90",
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
     }
   ]
 }

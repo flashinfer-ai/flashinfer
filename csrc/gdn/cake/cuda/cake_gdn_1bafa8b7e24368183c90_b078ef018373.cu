@@ -32,7 +32,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_gdn_76dbd9616fc3d0d426f4(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0)
+kernel_cake_gdn_1bafa8b7e24368183c90(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -66,9 +66,11 @@ kernel_cake_gdn_76dbd9616fc3d0d426f4(__nv_bfloat16* __restrict__ q, __nv_bfloat1
     long long write_state_head_base = ((long long)safe_write_state_slot * (long long)HV + (long long)h) * 16384;
     int split_v_base = split * 16;
     int k_start = lane_local * 4;
+    int warp_row_base = split_v_base + warp_local * 4;
     float r_q[4];
     float r_k[4];
     float r_h[4];
+    float r_o[4];
     float r_hs[16];
     float r_vrow[4];
     float2 r_q_pair0;
@@ -86,7 +88,7 @@ kernel_cake_gdn_76dbd9616fc3d0d426f4(__nv_bfloat16* __restrict__ q, __nv_bfloat1
     if (read_state_slot_valid != 0) {
         #pragma unroll
         for (int rg = 0; rg < 4; rg++) {
-            int load_v_row = split_v_base + rg * 4 + warp_local;
+            int load_v_row = warp_row_base + rg;
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(state + read_state_head_base + (long long)load_v_row * 128 + (long long)k_start);
                 r_hs[rg * 4 + 0] = _v4.x;
@@ -98,7 +100,7 @@ kernel_cake_gdn_76dbd9616fc3d0d426f4(__nv_bfloat16* __restrict__ q, __nv_bfloat1
     }
     #pragma unroll
     for (int rg_1 = 0; rg_1 < 4; rg_1++) {
-        r_vrow[rg_1] = (float)v[vh_base + split_v_base + rg_1 * 4 + warp_local];
+        r_vrow[rg_1] = (float)v[vh_base + warp_row_base + rg_1];
     }
     {
         uint2 _vld_1;
@@ -193,7 +195,7 @@ kernel_cake_gdn_76dbd9616fc3d0d426f4(__nv_bfloat16* __restrict__ q, __nv_bfloat1
     float2 decay_pair = _f2_8;
     #pragma unroll
     for (int rg_2 = 0; rg_2 < 4; rg_2++) {
-        int v_row = split_v_base + rg_2 * 4 + warp_local;
+        int v_row = warp_row_base + rg_2;
         float2 _f2_9 = make_float2(r_hs[rg_2 * 4], r_hs[rg_2 * 4 + 1]);
         float2 h_src_pair0 = _f2_9;
         float2 _f2_10 = make_float2(r_hs[rg_2 * 4 + 2], r_hs[rg_2 * 4 + 3]);
@@ -240,8 +242,16 @@ kernel_cake_gdn_76dbd9616fc3d0d426f4(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         for (int offset = 16; offset > 0; offset >>= 1)
             _warp_reduce_3 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_3, offset);
         sum_hq = _warp_reduce_3;
-        if (lane_local == 0) {
-            out[vh_base + v_row] = ((read_state_slot_valid != 0) ? sum_hq : 0.0f);
+        float out_val = ((read_state_slot_valid != 0) ? sum_hq : 0.0f);
+        r_o[rg_2] = out_val;
+    }
+    if (lane_local == 0) {
+        {
+            uint2 _pk2;
+            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+            _pk[0] = __floats2bfloat162_rn(r_o[0 + 0], r_o[0 + 1]);
+            _pk[1] = __floats2bfloat162_rn(r_o[0 + 2], r_o[0 + 3]);
+            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[vh_base + warp_row_base]) = _pk2;
         }
     }
 }
