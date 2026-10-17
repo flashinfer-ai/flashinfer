@@ -156,6 +156,51 @@ def test_paged_page_sizes(page_size):
 
 
 @requires_gvr2
+@pytest.mark.parametrize(
+    "rows,ncols,top_k",
+    [(9, 131136, 512), (9, 131136, 2048), (16, 131136, 512), (32, 131136, 2048)],
+    ids=["split9-k512", "split9-k2048", "split16-k512", "split32-k2048"],
+)
+@pytest.mark.parametrize("page_size", [1, 64, 128], ids=lambda p: f"ps{p}")
+def test_paged_main_register_rows(rows, ncols, top_k, page_size):
+    """SPLIT main-engine launches (capacity-wide logits) whose rows mostly fit
+    the in-kernel register path: that path stages its own page-table slice,
+    sized from the register capacity (none at page size 1), and must map
+    through the request's row like the streaming path."""
+    plan = _host.route_streaming(rows, ncols, ncols, top_k, force_main=True)
+    cap = plan["tpl"][0] * _host._main_reg_vpt(plan["tpl"][0], plan["tpl"][5]) * 4
+    assert cap > 0
+    lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + page_size)
+    lens = torch.randint(top_k + 1, cap + 1, (rows,), generator=gen, device=_DEV)
+    # band edges, the VPT 2 / VPT 4 boundary, a short row, a streaming row, and
+    # short register rows (k + 1, 2048, 2049)
+    lens[0], lens[1], lens[2], lens[3] = cap, cap + 1, top_k, ncols
+    lens[4], lens[5] = cap // 2, cap // 2 + 1
+    lens[6], lens[7], lens[8] = top_k + 1, 2048, 2049
+    lens = lens.to(torch.int32)
+    pt = _page_table(rows, ncols, page_size, seed=41)
+    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    page_shift = page_size.bit_length() - 1
+    assert (
+        _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, page_shift)[0]
+        == "main"
+    )
+    for r in range(rows):  # the local output itself is the exact top-k
+        n = int(lens[r])
+        if n > top_k:
+            idx = loc[r].to(torch.int64)
+            assert (
+                int(idx.min()) >= 0
+                and int(idx.max()) < n
+                and idx.unique().numel() == top_k
+            )
+            ref = torch.topk(lg[r, :n], top_k).values.sort().values
+            assert torch.equal(lg[r, idx].sort().values, ref), f"row {r} inexact"
+    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+
+
+@requires_gvr2
 def test_paged_next_n_shares_the_request_table():
     """next_n rows per request all map through the request's page-table row."""
     batch, next_n, ncols, top_k = 12, 3, 8192, 1024
