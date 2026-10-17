@@ -43,9 +43,6 @@
 #define SMEM_FLAGS_OFF 75456
 #define SMEM_FLAGS_STAGE_BYTES 64
 #define SMEM_FLAGS_STRIDE 64
-#define SMEM_KEQ_OFF 67072
-#define SMEM_KEQ_STAGE_BYTES 2048
-#define SMEM_KEQ_STRIDE 2048
 #define SMEM_TOTAL 75520
 #define THREADS 256
 
@@ -68,7 +65,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, int* __restrict__ output, unsigned long long* __restrict__ partials, unsigned int* __restrict__ counters, unsigned int* __restrict__ block_max, int num_heads, int max_k_tiles, int total_q, int num_valid_pages, int force_begin_blocks, int force_end_blocks, int num_qtiles, int num_slices, int slice_len, int index_bits)
+kernel_cake_blackwell_msa_c14b5fe5d3aa9f47ab07(float* __restrict__ max_score, int* __restrict__ output, unsigned long long* __restrict__ partials, unsigned int* __restrict__ counters, unsigned int* __restrict__ block_max, int num_heads, int max_k_tiles, int total_q, int num_valid_pages, int force_begin_blocks, int force_end_blocks, int num_qtiles, int num_slices, int slice_len, int index_bits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -105,8 +102,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
     const int cand_cnt_addr = smem + SMEM_CAND_CNT_OFF;
     unsigned int* flags = reinterpret_cast<unsigned int*>(smem_raw + SMEM_FLAGS_OFF);
     const int flags_addr = smem + SMEM_FLAGS_OFF;
-    unsigned int* keq = reinterpret_cast<unsigned int*>(smem_raw + SMEM_KEQ_OFF);
-    const int keq_addr = smem + SMEM_KEQ_OFF;
 
     // === Task calls (dependency order) ===
     int tid_0 = tid;
@@ -183,8 +178,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
     unsigned int pre[2];
     unsigned int res[3];
     int nres[1];
-    unsigned int kacc[1];
-    unsigned int kref[1];
     for (int p = 0; p < 11; p++) {
         if (any_open != 0) {
             int n_hist = 0;
@@ -239,7 +232,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
             }
             unsigned long long cthr_me = klo << 32 | (unsigned long long)ilo;
             if (n_stage == 0 && p == 0) {
-                kacc[0] = 0;
                 #pragma unroll 1
                 for (int i0 = 0; i0 < iters; i0 += 16) {
                     int i1 = i0 + 8;
@@ -385,12 +377,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_30 = _min_6;
                     int neg = (int)(bits >> 31);
                     int h10 = ((neg != 0) ? 511 - raw_30 : 512 + raw_30);
-                    if (i0 == 0) {
-                        kref[0] = bits;
-                    }
-                    if (nan == 0) {
-                        kacc[0] = kacc[0] | bits ^ kref[0];
-                    }
                     int hb = ((nan != 0) ? 1024 : h10);
                     atomicAdd(&hist_ext[hb * 16 + q_local], 1);
                     m[0] = ((nan != 0) ? 0 : h10);
@@ -404,9 +390,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_36 = _min_7;
                     int neg_37 = (int)(bits_34 >> 31);
                     int h10_38 = ((neg_37 != 0) ? 511 - raw_36 : 512 + raw_36);
-                    if (nan_33 == 0) {
-                        kacc[0] = kacc[0] | bits_34 ^ kref[0];
-                    }
                     int hb_39 = ((nan_33 != 0) ? 1024 : h10_38);
                     atomicAdd(&hist_ext[hb_39 * 16 + q_local], 1);
                     m[1] = ((nan_33 != 0) ? 0 : h10_38);
@@ -420,9 +403,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_45 = _min_8;
                     int neg_46 = (int)(bits_43 >> 31);
                     int h10_47 = ((neg_46 != 0) ? 511 - raw_45 : 512 + raw_45);
-                    if (nan_42 == 0) {
-                        kacc[0] = kacc[0] | bits_43 ^ kref[0];
-                    }
                     int hb_48 = ((nan_42 != 0) ? 1024 : h10_47);
                     atomicAdd(&hist_ext[hb_48 * 16 + q_local], 1);
                     m[2] = ((nan_42 != 0) ? 0 : h10_47);
@@ -436,9 +416,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_54 = _min_9;
                     int neg_55 = (int)(bits_52 >> 31);
                     int h10_56 = ((neg_55 != 0) ? 511 - raw_54 : 512 + raw_54);
-                    if (nan_51 == 0) {
-                        kacc[0] = kacc[0] | bits_52 ^ kref[0];
-                    }
                     int hb_57 = ((nan_51 != 0) ? 1024 : h10_56);
                     atomicAdd(&hist_ext[hb_57 * 16 + q_local], 1);
                     m[3] = ((nan_51 != 0) ? 0 : h10_56);
@@ -452,9 +429,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_63 = _min_10;
                     int neg_64 = (int)(bits_61 >> 31);
                     int h10_65 = ((neg_64 != 0) ? 511 - raw_63 : 512 + raw_63);
-                    if (nan_60 == 0) {
-                        kacc[0] = kacc[0] | bits_61 ^ kref[0];
-                    }
                     int hb_66 = ((nan_60 != 0) ? 1024 : h10_65);
                     atomicAdd(&hist_ext[hb_66 * 16 + q_local], 1);
                     m[4] = ((nan_60 != 0) ? 0 : h10_65);
@@ -468,9 +442,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_72 = _min_11;
                     int neg_73 = (int)(bits_70 >> 31);
                     int h10_74 = ((neg_73 != 0) ? 511 - raw_72 : 512 + raw_72);
-                    if (nan_69 == 0) {
-                        kacc[0] = kacc[0] | bits_70 ^ kref[0];
-                    }
                     int hb_75 = ((nan_69 != 0) ? 1024 : h10_74);
                     atomicAdd(&hist_ext[hb_75 * 16 + q_local], 1);
                     m[5] = ((nan_69 != 0) ? 0 : h10_74);
@@ -484,9 +455,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_81 = _min_12;
                     int neg_82 = (int)(bits_79 >> 31);
                     int h10_83 = ((neg_82 != 0) ? 511 - raw_81 : 512 + raw_81);
-                    if (nan_78 == 0) {
-                        kacc[0] = kacc[0] | bits_79 ^ kref[0];
-                    }
                     int hb_84 = ((nan_78 != 0) ? 1024 : h10_83);
                     atomicAdd(&hist_ext[hb_84 * 16 + q_local], 1);
                     m[6] = ((nan_78 != 0) ? 0 : h10_83);
@@ -500,9 +468,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     int raw_90 = _min_13;
                     int neg_91 = (int)(bits_88 >> 31);
                     int h10_92 = ((neg_91 != 0) ? 511 - raw_90 : 512 + raw_90);
-                    if (nan_87 == 0) {
-                        kacc[0] = kacc[0] | bits_88 ^ kref[0];
-                    }
                     int hb_93 = ((nan_87 != 0) ? 1024 : h10_92);
                     atomicAdd(&hist_ext[hb_93 * 16 + q_local], 1);
                     m[7] = ((nan_87 != 0) ? 0 : h10_92);
@@ -575,9 +540,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_6 = _min_14;
                         int neg_7 = (int)(bits_4 >> 31);
                         int h10_8 = ((neg_7 != 0) ? 511 - raw_6 : 512 + raw_6);
-                        if (nan_3 == 0) {
-                            kacc[0] = kacc[0] | bits_4 ^ kref[0];
-                        }
                         int hb_9 = ((nan_3 != 0) ? 1024 : h10_8);
                         atomicAdd(&hist_ext[hb_9 * 16 + q_local], 1);
                         m_0[0] = ((nan_3 != 0) ? 0 : h10_8);
@@ -591,9 +553,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_15 = _min_15;
                         int neg_16 = (int)(bits_13 >> 31);
                         int h10_17 = ((neg_16 != 0) ? 511 - raw_15 : 512 + raw_15);
-                        if (nan_12 == 0) {
-                            kacc[0] = kacc[0] | bits_13 ^ kref[0];
-                        }
                         int hb_18 = ((nan_12 != 0) ? 1024 : h10_17);
                         atomicAdd(&hist_ext[hb_18 * 16 + q_local], 1);
                         m_0[1] = ((nan_12 != 0) ? 0 : h10_17);
@@ -607,9 +566,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_24 = _min_16;
                         int neg_25 = (int)(bits_22 >> 31);
                         int h10_26 = ((neg_25 != 0) ? 511 - raw_24 : 512 + raw_24);
-                        if (nan_21 == 0) {
-                            kacc[0] = kacc[0] | bits_22 ^ kref[0];
-                        }
                         int hb_27 = ((nan_21 != 0) ? 1024 : h10_26);
                         atomicAdd(&hist_ext[hb_27 * 16 + q_local], 1);
                         m_0[2] = ((nan_21 != 0) ? 0 : h10_26);
@@ -623,9 +579,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_33 = _min_17;
                         int neg_34 = (int)(bits_31 >> 31);
                         int h10_35 = ((neg_34 != 0) ? 511 - raw_33 : 512 + raw_33);
-                        if (nan_30 == 0) {
-                            kacc[0] = kacc[0] | bits_31 ^ kref[0];
-                        }
                         int hb_36 = ((nan_30 != 0) ? 1024 : h10_35);
                         atomicAdd(&hist_ext[hb_36 * 16 + q_local], 1);
                         m_0[3] = ((nan_30 != 0) ? 0 : h10_35);
@@ -639,9 +592,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_42 = _min_18;
                         int neg_43 = (int)(bits_40 >> 31);
                         int h10_44 = ((neg_43 != 0) ? 511 - raw_42 : 512 + raw_42);
-                        if (nan_39 == 0) {
-                            kacc[0] = kacc[0] | bits_40 ^ kref[0];
-                        }
                         int hb_45 = ((nan_39 != 0) ? 1024 : h10_44);
                         atomicAdd(&hist_ext[hb_45 * 16 + q_local], 1);
                         m_0[4] = ((nan_39 != 0) ? 0 : h10_44);
@@ -655,9 +605,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_51 = _min_19;
                         int neg_52 = (int)(bits_49 >> 31);
                         int h10_53 = ((neg_52 != 0) ? 511 - raw_51 : 512 + raw_51);
-                        if (nan_48 == 0) {
-                            kacc[0] = kacc[0] | bits_49 ^ kref[0];
-                        }
                         int hb_54 = ((nan_48 != 0) ? 1024 : h10_53);
                         atomicAdd(&hist_ext[hb_54 * 16 + q_local], 1);
                         m_0[5] = ((nan_48 != 0) ? 0 : h10_53);
@@ -671,9 +618,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_60 = _min_20;
                         int neg_61 = (int)(bits_58 >> 31);
                         int h10_62 = ((neg_61 != 0) ? 511 - raw_60 : 512 + raw_60);
-                        if (nan_57 == 0) {
-                            kacc[0] = kacc[0] | bits_58 ^ kref[0];
-                        }
                         int hb_63 = ((nan_57 != 0) ? 1024 : h10_62);
                         atomicAdd(&hist_ext[hb_63 * 16 + q_local], 1);
                         m_0[6] = ((nan_57 != 0) ? 0 : h10_62);
@@ -687,9 +631,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         int raw_69 = _min_21;
                         int neg_70 = (int)(bits_67 >> 31);
                         int h10_71 = ((neg_70 != 0) ? 511 - raw_69 : 512 + raw_69);
-                        if (nan_66 == 0) {
-                            kacc[0] = kacc[0] | bits_67 ^ kref[0];
-                        }
                         int hb_72 = ((nan_66 != 0) ? 1024 : h10_71);
                         atomicAdd(&hist_ext[hb_72 * 16 + q_local], 1);
                         m_0[7] = ((nan_66 != 0) ? 0 : h10_71);
@@ -752,9 +693,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         }
                     }
                 }
-                int kslot = (r_sub * 16 + q_local) * 2;
-                keq[kslot] = kref[0] & ~kacc[0];
-                keq[kslot + 1] = kref[0] | kacc[0];
             } else if (n_hist == 0) {
                 if (p > 0 && slen > 224) {
                     int nchunks = iters + 8 - 1 >> 3;
@@ -2539,138 +2477,141 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
             __syncthreads();
             if (is_hist != 0) {
                 int base_1 = seg * 1024 + q_local;
+                int swap = (seg & 1) * 16;
+                int b0 = base_1 + swap;
+                int b1_2 = base_1 + 16 - swap;
                 subs[0] = 0;
                 subs[1] = 0;
                 subs[2] = 0;
                 subs[3] = 0;
-                unsigned int c_3 = hist[base_1];
-                subs[0] = subs[0] + c_3;
-                unsigned int c_0 = hist[base_1 + 16];
-                subs[0] = subs[0] + c_0;
-                unsigned int c_1_1 = hist[base_1 + 32];
-                subs[0] = subs[0] + c_1_1;
-                unsigned int c_2_2 = hist[base_1 + 48];
-                subs[0] = subs[0] + c_2_2;
-                unsigned int c_3_1 = hist[base_1 + 64];
-                subs[0] = subs[0] + c_3_1;
-                unsigned int c_4 = hist[base_1 + 80];
-                subs[0] = subs[0] + c_4;
-                unsigned int c_5_1 = hist[base_1 + 96];
-                subs[0] = subs[0] + c_5_1;
-                unsigned int c_6 = hist[base_1 + 112];
-                subs[0] = subs[0] + c_6;
-                unsigned int c_7 = hist[base_1 + 128];
-                subs[0] = subs[0] + c_7;
-                unsigned int c_8_1 = hist[base_1 + 144];
-                subs[0] = subs[0] + c_8_1;
-                unsigned int c_9 = hist[base_1 + 160];
-                subs[0] = subs[0] + c_9;
-                unsigned int c_10 = hist[base_1 + 176];
-                subs[0] = subs[0] + c_10;
-                unsigned int c_11 = hist[base_1 + 192];
-                subs[0] = subs[0] + c_11;
-                unsigned int c_12 = hist[base_1 + 208];
-                subs[0] = subs[0] + c_12;
-                unsigned int c_13 = hist[base_1 + 224];
-                subs[0] = subs[0] + c_13;
-                unsigned int c_14 = hist[base_1 + 240];
-                subs[0] = subs[0] + c_14;
-                unsigned int c_15 = hist[base_1 + 256];
-                subs[1] = subs[1] + c_15;
-                unsigned int c_16 = hist[base_1 + 272];
-                subs[1] = subs[1] + c_16;
-                unsigned int c_17 = hist[base_1 + 288];
-                subs[1] = subs[1] + c_17;
-                unsigned int c_18 = hist[base_1 + 304];
-                subs[1] = subs[1] + c_18;
-                unsigned int c_19 = hist[base_1 + 320];
-                subs[1] = subs[1] + c_19;
-                unsigned int c_20 = hist[base_1 + 336];
-                subs[1] = subs[1] + c_20;
-                unsigned int c_21 = hist[base_1 + 352];
-                subs[1] = subs[1] + c_21;
-                unsigned int c_22 = hist[base_1 + 368];
-                subs[1] = subs[1] + c_22;
-                unsigned int c_23 = hist[base_1 + 384];
-                subs[1] = subs[1] + c_23;
-                unsigned int c_24 = hist[base_1 + 400];
-                subs[1] = subs[1] + c_24;
-                unsigned int c_25 = hist[base_1 + 416];
-                subs[1] = subs[1] + c_25;
-                unsigned int c_26 = hist[base_1 + 432];
-                subs[1] = subs[1] + c_26;
-                unsigned int c_27 = hist[base_1 + 448];
-                subs[1] = subs[1] + c_27;
-                unsigned int c_28 = hist[base_1 + 464];
-                subs[1] = subs[1] + c_28;
-                unsigned int c_29 = hist[base_1 + 480];
-                subs[1] = subs[1] + c_29;
-                unsigned int c_30 = hist[base_1 + 496];
-                subs[1] = subs[1] + c_30;
-                unsigned int c_31 = hist[base_1 + 512];
-                subs[2] = subs[2] + c_31;
-                unsigned int c_32 = hist[base_1 + 528];
-                subs[2] = subs[2] + c_32;
-                unsigned int c_33 = hist[base_1 + 544];
-                subs[2] = subs[2] + c_33;
-                unsigned int c_34 = hist[base_1 + 560];
-                subs[2] = subs[2] + c_34;
-                unsigned int c_35 = hist[base_1 + 576];
-                subs[2] = subs[2] + c_35;
-                unsigned int c_36 = hist[base_1 + 592];
-                subs[2] = subs[2] + c_36;
-                unsigned int c_37 = hist[base_1 + 608];
-                subs[2] = subs[2] + c_37;
-                unsigned int c_38 = hist[base_1 + 624];
-                subs[2] = subs[2] + c_38;
-                unsigned int c_39 = hist[base_1 + 640];
-                subs[2] = subs[2] + c_39;
-                unsigned int c_40 = hist[base_1 + 656];
-                subs[2] = subs[2] + c_40;
-                unsigned int c_41 = hist[base_1 + 672];
-                subs[2] = subs[2] + c_41;
-                unsigned int c_42 = hist[base_1 + 688];
-                subs[2] = subs[2] + c_42;
-                unsigned int c_43 = hist[base_1 + 704];
-                subs[2] = subs[2] + c_43;
-                unsigned int c_44 = hist[base_1 + 720];
-                subs[2] = subs[2] + c_44;
-                unsigned int c_45 = hist[base_1 + 736];
-                subs[2] = subs[2] + c_45;
-                unsigned int c_46 = hist[base_1 + 752];
-                subs[2] = subs[2] + c_46;
-                unsigned int c_47 = hist[base_1 + 768];
-                subs[3] = subs[3] + c_47;
-                unsigned int c_48 = hist[base_1 + 784];
-                subs[3] = subs[3] + c_48;
-                unsigned int c_49 = hist[base_1 + 800];
-                subs[3] = subs[3] + c_49;
-                unsigned int c_50 = hist[base_1 + 816];
-                subs[3] = subs[3] + c_50;
-                unsigned int c_51 = hist[base_1 + 832];
-                subs[3] = subs[3] + c_51;
-                unsigned int c_52 = hist[base_1 + 848];
-                subs[3] = subs[3] + c_52;
-                unsigned int c_53 = hist[base_1 + 864];
-                subs[3] = subs[3] + c_53;
-                unsigned int c_54 = hist[base_1 + 880];
-                subs[3] = subs[3] + c_54;
-                unsigned int c_55 = hist[base_1 + 896];
-                subs[3] = subs[3] + c_55;
-                unsigned int c_56 = hist[base_1 + 912];
-                subs[3] = subs[3] + c_56;
-                unsigned int c_57 = hist[base_1 + 928];
-                subs[3] = subs[3] + c_57;
-                unsigned int c_58 = hist[base_1 + 944];
-                subs[3] = subs[3] + c_58;
-                unsigned int c_59 = hist[base_1 + 960];
-                subs[3] = subs[3] + c_59;
-                unsigned int c_60 = hist[base_1 + 976];
-                subs[3] = subs[3] + c_60;
-                unsigned int c_61 = hist[base_1 + 992];
-                subs[3] = subs[3] + c_61;
-                unsigned int c_62 = hist[base_1 + 1008];
-                subs[3] = subs[3] + c_62;
+                unsigned int c0 = hist[b0];
+                unsigned int c1 = hist[b1_2];
+                subs[0] = subs[0] + c0;
+                subs[0] = subs[0] + c1;
+                unsigned int c0_0 = hist[b0 + 32];
+                unsigned int c1_1 = hist[b1_2 + 32];
+                subs[0] = subs[0] + c0_0;
+                subs[0] = subs[0] + c1_1;
+                unsigned int c0_2 = hist[b0 + 64];
+                unsigned int c1_3 = hist[b1_2 + 64];
+                subs[0] = subs[0] + c0_2;
+                subs[0] = subs[0] + c1_3;
+                unsigned int c0_4 = hist[b0 + 96];
+                unsigned int c1_5 = hist[b1_2 + 96];
+                subs[0] = subs[0] + c0_4;
+                subs[0] = subs[0] + c1_5;
+                unsigned int c0_6 = hist[b0 + 128];
+                unsigned int c1_7 = hist[b1_2 + 128];
+                subs[0] = subs[0] + c0_6;
+                subs[0] = subs[0] + c1_7;
+                unsigned int c0_8 = hist[b0 + 160];
+                unsigned int c1_9 = hist[b1_2 + 160];
+                subs[0] = subs[0] + c0_8;
+                subs[0] = subs[0] + c1_9;
+                unsigned int c0_10 = hist[b0 + 192];
+                unsigned int c1_11 = hist[b1_2 + 192];
+                subs[0] = subs[0] + c0_10;
+                subs[0] = subs[0] + c1_11;
+                unsigned int c0_12 = hist[b0 + 224];
+                unsigned int c1_13 = hist[b1_2 + 224];
+                subs[0] = subs[0] + c0_12;
+                subs[0] = subs[0] + c1_13;
+                unsigned int c0_14 = hist[b0 + 256];
+                unsigned int c1_15 = hist[b1_2 + 256];
+                subs[1] = subs[1] + c0_14;
+                subs[1] = subs[1] + c1_15;
+                unsigned int c0_16 = hist[b0 + 288];
+                unsigned int c1_17 = hist[b1_2 + 288];
+                subs[1] = subs[1] + c0_16;
+                subs[1] = subs[1] + c1_17;
+                unsigned int c0_18 = hist[b0 + 320];
+                unsigned int c1_19 = hist[b1_2 + 320];
+                subs[1] = subs[1] + c0_18;
+                subs[1] = subs[1] + c1_19;
+                unsigned int c0_20 = hist[b0 + 352];
+                unsigned int c1_21 = hist[b1_2 + 352];
+                subs[1] = subs[1] + c0_20;
+                subs[1] = subs[1] + c1_21;
+                unsigned int c0_22 = hist[b0 + 384];
+                unsigned int c1_23 = hist[b1_2 + 384];
+                subs[1] = subs[1] + c0_22;
+                subs[1] = subs[1] + c1_23;
+                unsigned int c0_24 = hist[b0 + 416];
+                unsigned int c1_25 = hist[b1_2 + 416];
+                subs[1] = subs[1] + c0_24;
+                subs[1] = subs[1] + c1_25;
+                unsigned int c0_26 = hist[b0 + 448];
+                unsigned int c1_27 = hist[b1_2 + 448];
+                subs[1] = subs[1] + c0_26;
+                subs[1] = subs[1] + c1_27;
+                unsigned int c0_28 = hist[b0 + 480];
+                unsigned int c1_29 = hist[b1_2 + 480];
+                subs[1] = subs[1] + c0_28;
+                subs[1] = subs[1] + c1_29;
+                unsigned int c0_30 = hist[b0 + 512];
+                unsigned int c1_31 = hist[b1_2 + 512];
+                subs[2] = subs[2] + c0_30;
+                subs[2] = subs[2] + c1_31;
+                unsigned int c0_32 = hist[b0 + 544];
+                unsigned int c1_33 = hist[b1_2 + 544];
+                subs[2] = subs[2] + c0_32;
+                subs[2] = subs[2] + c1_33;
+                unsigned int c0_34 = hist[b0 + 576];
+                unsigned int c1_35 = hist[b1_2 + 576];
+                subs[2] = subs[2] + c0_34;
+                subs[2] = subs[2] + c1_35;
+                unsigned int c0_36 = hist[b0 + 608];
+                unsigned int c1_37 = hist[b1_2 + 608];
+                subs[2] = subs[2] + c0_36;
+                subs[2] = subs[2] + c1_37;
+                unsigned int c0_38 = hist[b0 + 640];
+                unsigned int c1_39 = hist[b1_2 + 640];
+                subs[2] = subs[2] + c0_38;
+                subs[2] = subs[2] + c1_39;
+                unsigned int c0_40 = hist[b0 + 672];
+                unsigned int c1_41 = hist[b1_2 + 672];
+                subs[2] = subs[2] + c0_40;
+                subs[2] = subs[2] + c1_41;
+                unsigned int c0_42 = hist[b0 + 704];
+                unsigned int c1_43 = hist[b1_2 + 704];
+                subs[2] = subs[2] + c0_42;
+                subs[2] = subs[2] + c1_43;
+                unsigned int c0_44 = hist[b0 + 736];
+                unsigned int c1_45 = hist[b1_2 + 736];
+                subs[2] = subs[2] + c0_44;
+                subs[2] = subs[2] + c1_45;
+                unsigned int c0_46 = hist[b0 + 768];
+                unsigned int c1_47 = hist[b1_2 + 768];
+                subs[3] = subs[3] + c0_46;
+                subs[3] = subs[3] + c1_47;
+                unsigned int c0_48 = hist[b0 + 800];
+                unsigned int c1_49 = hist[b1_2 + 800];
+                subs[3] = subs[3] + c0_48;
+                subs[3] = subs[3] + c1_49;
+                unsigned int c0_50 = hist[b0 + 832];
+                unsigned int c1_51 = hist[b1_2 + 832];
+                subs[3] = subs[3] + c0_50;
+                subs[3] = subs[3] + c1_51;
+                unsigned int c0_52 = hist[b0 + 864];
+                unsigned int c1_53 = hist[b1_2 + 864];
+                subs[3] = subs[3] + c0_52;
+                subs[3] = subs[3] + c1_53;
+                unsigned int c0_54 = hist[b0 + 896];
+                unsigned int c1_55 = hist[b1_2 + 896];
+                subs[3] = subs[3] + c0_54;
+                subs[3] = subs[3] + c1_55;
+                unsigned int c0_56 = hist[b0 + 928];
+                unsigned int c1_57 = hist[b1_2 + 928];
+                subs[3] = subs[3] + c0_56;
+                subs[3] = subs[3] + c1_57;
+                unsigned int c0_58 = hist[b0 + 960];
+                unsigned int c1_59 = hist[b1_2 + 960];
+                subs[3] = subs[3] + c0_58;
+                subs[3] = subs[3] + c1_59;
+                unsigned int c0_60 = hist[b0 + 992];
+                unsigned int c1_61 = hist[b1_2 + 992];
+                subs[3] = subs[3] + c0_60;
+                subs[3] = subs[3] + c1_61;
                 seg_sum[seg * 16 + q_local] = subs[0] + subs[1] + subs[2] + subs[3];
             }
             __syncthreads();
@@ -2741,10 +2682,10 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     if (crossing != 0) {
                         unsigned int c3 = above_15;
                         unsigned int c2 = c3 + subs[3];
-                        unsigned int c1 = c2 + subs[2];
-                        unsigned int c0 = c1 + subs[1];
+                        unsigned int c1_2 = c2 + subs[2];
+                        unsigned int c0_1 = c1_2 + subs[1];
                         int k = 0;
-                        unsigned int cum = c0;
+                        unsigned int cum = c0_1;
                         if (r_rem <= c3 + subs[3]) {
                             k = 3;
                             cum = c3;
@@ -2752,9 +2693,9 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                             k = 2;
                             cum = c2;
                         } else {
-                            if (r_rem <= c1 + subs[1]) {
+                            if (r_rem <= c1_2 + subs[1]) {
                                 k = 1;
-                                cum = c1;
+                                cum = c1_2;
                             }
                         }
                         int bin0 = seg * 64 + k * 16;
@@ -2763,118 +2704,118 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                         unsigned int tsel_0 = 0;
                         unsigned int ct_1 = 0;
                         unsigned int nadd_2 = 0;
-                        unsigned int c_63 = hist[base_2 + 240];
-                        unsigned int take = (unsigned int)(found == 0 && r_rem <= cum + c_63);
+                        unsigned int c_3 = hist[base_2 + 240];
+                        unsigned int take = (unsigned int)(found == 0 && r_rem <= cum + c_3);
                         tsel_0 = ((take != 0) ? (unsigned int)(bin0 + 15) : tsel_0);
-                        ct_1 = ((take != 0) ? c_63 : ct_1);
+                        ct_1 = ((take != 0) ? c_3 : ct_1);
                         nadd_2 = ((take != 0) ? cum : nadd_2);
                         found = found | take;
-                        cum = cum + c_63;
-                        unsigned int c_3_2 = hist[base_2 + 224];
-                        unsigned int take_4 = (unsigned int)(found == 0 && r_rem <= cum + c_3_2);
+                        cum = cum + c_3;
+                        unsigned int c_3_1 = hist[base_2 + 224];
+                        unsigned int take_4 = (unsigned int)(found == 0 && r_rem <= cum + c_3_1);
                         tsel_0 = ((take_4 != 0) ? (unsigned int)(bin0 + 14) : tsel_0);
-                        ct_1 = ((take_4 != 0) ? c_3_2 : ct_1);
+                        ct_1 = ((take_4 != 0) ? c_3_1 : ct_1);
                         nadd_2 = ((take_4 != 0) ? cum : nadd_2);
                         found = found | take_4;
-                        cum = cum + c_3_2;
-                        unsigned int c_5_2 = hist[base_2 + 208];
-                        unsigned int take_6 = (unsigned int)(found == 0 && r_rem <= cum + c_5_2);
+                        cum = cum + c_3_1;
+                        unsigned int c_5_1 = hist[base_2 + 208];
+                        unsigned int take_6 = (unsigned int)(found == 0 && r_rem <= cum + c_5_1);
                         tsel_0 = ((take_6 != 0) ? (unsigned int)(bin0 + 13) : tsel_0);
-                        ct_1 = ((take_6 != 0) ? c_5_2 : ct_1);
+                        ct_1 = ((take_6 != 0) ? c_5_1 : ct_1);
                         nadd_2 = ((take_6 != 0) ? cum : nadd_2);
                         found = found | take_6;
-                        cum = cum + c_5_2;
-                        unsigned int c_7_1 = hist[base_2 + 192];
-                        unsigned int take_8 = (unsigned int)(found == 0 && r_rem <= cum + c_7_1);
+                        cum = cum + c_5_1;
+                        unsigned int c_7 = hist[base_2 + 192];
+                        unsigned int take_8 = (unsigned int)(found == 0 && r_rem <= cum + c_7);
                         tsel_0 = ((take_8 != 0) ? (unsigned int)(bin0 + 12) : tsel_0);
-                        ct_1 = ((take_8 != 0) ? c_7_1 : ct_1);
+                        ct_1 = ((take_8 != 0) ? c_7 : ct_1);
                         nadd_2 = ((take_8 != 0) ? cum : nadd_2);
                         found = found | take_8;
-                        cum = cum + c_7_1;
-                        unsigned int c_9_1 = hist[base_2 + 176];
-                        unsigned int take_10 = (unsigned int)(found == 0 && r_rem <= cum + c_9_1);
+                        cum = cum + c_7;
+                        unsigned int c_9 = hist[base_2 + 176];
+                        unsigned int take_10 = (unsigned int)(found == 0 && r_rem <= cum + c_9);
                         tsel_0 = ((take_10 != 0) ? (unsigned int)(bin0 + 11) : tsel_0);
-                        ct_1 = ((take_10 != 0) ? c_9_1 : ct_1);
+                        ct_1 = ((take_10 != 0) ? c_9 : ct_1);
                         nadd_2 = ((take_10 != 0) ? cum : nadd_2);
                         found = found | take_10;
-                        cum = cum + c_9_1;
-                        unsigned int c_11_1 = hist[base_2 + 160];
-                        unsigned int take_12 = (unsigned int)(found == 0 && r_rem <= cum + c_11_1);
+                        cum = cum + c_9;
+                        unsigned int c_11 = hist[base_2 + 160];
+                        unsigned int take_12 = (unsigned int)(found == 0 && r_rem <= cum + c_11);
                         tsel_0 = ((take_12 != 0) ? (unsigned int)(bin0 + 10) : tsel_0);
-                        ct_1 = ((take_12 != 0) ? c_11_1 : ct_1);
+                        ct_1 = ((take_12 != 0) ? c_11 : ct_1);
                         nadd_2 = ((take_12 != 0) ? cum : nadd_2);
                         found = found | take_12;
-                        cum = cum + c_11_1;
-                        unsigned int c_13_1 = hist[base_2 + 144];
-                        unsigned int take_14 = (unsigned int)(found == 0 && r_rem <= cum + c_13_1);
+                        cum = cum + c_11;
+                        unsigned int c_13 = hist[base_2 + 144];
+                        unsigned int take_14 = (unsigned int)(found == 0 && r_rem <= cum + c_13);
                         tsel_0 = ((take_14 != 0) ? (unsigned int)(bin0 + 9) : tsel_0);
-                        ct_1 = ((take_14 != 0) ? c_13_1 : ct_1);
+                        ct_1 = ((take_14 != 0) ? c_13 : ct_1);
                         nadd_2 = ((take_14 != 0) ? cum : nadd_2);
                         found = found | take_14;
-                        cum = cum + c_13_1;
-                        unsigned int c_15_1 = hist[base_2 + 128];
-                        unsigned int take_16 = (unsigned int)(found == 0 && r_rem <= cum + c_15_1);
+                        cum = cum + c_13;
+                        unsigned int c_15 = hist[base_2 + 128];
+                        unsigned int take_16 = (unsigned int)(found == 0 && r_rem <= cum + c_15);
                         tsel_0 = ((take_16 != 0) ? (unsigned int)(bin0 + 8) : tsel_0);
-                        ct_1 = ((take_16 != 0) ? c_15_1 : ct_1);
+                        ct_1 = ((take_16 != 0) ? c_15 : ct_1);
                         nadd_2 = ((take_16 != 0) ? cum : nadd_2);
                         found = found | take_16;
-                        cum = cum + c_15_1;
-                        unsigned int c_17_1 = hist[base_2 + 112];
-                        unsigned int take_18 = (unsigned int)(found == 0 && r_rem <= cum + c_17_1);
+                        cum = cum + c_15;
+                        unsigned int c_17 = hist[base_2 + 112];
+                        unsigned int take_18 = (unsigned int)(found == 0 && r_rem <= cum + c_17);
                         tsel_0 = ((take_18 != 0) ? (unsigned int)(bin0 + 7) : tsel_0);
-                        ct_1 = ((take_18 != 0) ? c_17_1 : ct_1);
+                        ct_1 = ((take_18 != 0) ? c_17 : ct_1);
                         nadd_2 = ((take_18 != 0) ? cum : nadd_2);
                         found = found | take_18;
-                        cum = cum + c_17_1;
-                        unsigned int c_19_1 = hist[base_2 + 96];
-                        unsigned int take_20 = (unsigned int)(found == 0 && r_rem <= cum + c_19_1);
+                        cum = cum + c_17;
+                        unsigned int c_19 = hist[base_2 + 96];
+                        unsigned int take_20 = (unsigned int)(found == 0 && r_rem <= cum + c_19);
                         tsel_0 = ((take_20 != 0) ? (unsigned int)(bin0 + 6) : tsel_0);
-                        ct_1 = ((take_20 != 0) ? c_19_1 : ct_1);
+                        ct_1 = ((take_20 != 0) ? c_19 : ct_1);
                         nadd_2 = ((take_20 != 0) ? cum : nadd_2);
                         found = found | take_20;
-                        cum = cum + c_19_1;
-                        unsigned int c_21_1 = hist[base_2 + 80];
-                        unsigned int take_22 = (unsigned int)(found == 0 && r_rem <= cum + c_21_1);
+                        cum = cum + c_19;
+                        unsigned int c_21 = hist[base_2 + 80];
+                        unsigned int take_22 = (unsigned int)(found == 0 && r_rem <= cum + c_21);
                         tsel_0 = ((take_22 != 0) ? (unsigned int)(bin0 + 5) : tsel_0);
-                        ct_1 = ((take_22 != 0) ? c_21_1 : ct_1);
+                        ct_1 = ((take_22 != 0) ? c_21 : ct_1);
                         nadd_2 = ((take_22 != 0) ? cum : nadd_2);
                         found = found | take_22;
-                        cum = cum + c_21_1;
-                        unsigned int c_23_1 = hist[base_2 + 64];
-                        unsigned int take_24 = (unsigned int)(found == 0 && r_rem <= cum + c_23_1);
+                        cum = cum + c_21;
+                        unsigned int c_23 = hist[base_2 + 64];
+                        unsigned int take_24 = (unsigned int)(found == 0 && r_rem <= cum + c_23);
                         tsel_0 = ((take_24 != 0) ? (unsigned int)(bin0 + 4) : tsel_0);
-                        ct_1 = ((take_24 != 0) ? c_23_1 : ct_1);
+                        ct_1 = ((take_24 != 0) ? c_23 : ct_1);
                         nadd_2 = ((take_24 != 0) ? cum : nadd_2);
                         found = found | take_24;
-                        cum = cum + c_23_1;
-                        unsigned int c_25_1 = hist[base_2 + 48];
-                        unsigned int take_26 = (unsigned int)(found == 0 && r_rem <= cum + c_25_1);
+                        cum = cum + c_23;
+                        unsigned int c_25 = hist[base_2 + 48];
+                        unsigned int take_26 = (unsigned int)(found == 0 && r_rem <= cum + c_25);
                         tsel_0 = ((take_26 != 0) ? (unsigned int)(bin0 + 3) : tsel_0);
-                        ct_1 = ((take_26 != 0) ? c_25_1 : ct_1);
+                        ct_1 = ((take_26 != 0) ? c_25 : ct_1);
                         nadd_2 = ((take_26 != 0) ? cum : nadd_2);
                         found = found | take_26;
-                        cum = cum + c_25_1;
-                        unsigned int c_27_1 = hist[base_2 + 32];
-                        unsigned int take_28 = (unsigned int)(found == 0 && r_rem <= cum + c_27_1);
+                        cum = cum + c_25;
+                        unsigned int c_27 = hist[base_2 + 32];
+                        unsigned int take_28 = (unsigned int)(found == 0 && r_rem <= cum + c_27);
                         tsel_0 = ((take_28 != 0) ? (unsigned int)(bin0 + 2) : tsel_0);
-                        ct_1 = ((take_28 != 0) ? c_27_1 : ct_1);
+                        ct_1 = ((take_28 != 0) ? c_27 : ct_1);
                         nadd_2 = ((take_28 != 0) ? cum : nadd_2);
                         found = found | take_28;
-                        cum = cum + c_27_1;
-                        unsigned int c_29_1 = hist[base_2 + 16];
-                        unsigned int take_30 = (unsigned int)(found == 0 && r_rem <= cum + c_29_1);
+                        cum = cum + c_27;
+                        unsigned int c_29 = hist[base_2 + 16];
+                        unsigned int take_30 = (unsigned int)(found == 0 && r_rem <= cum + c_29);
                         tsel_0 = ((take_30 != 0) ? (unsigned int)(bin0 + 1) : tsel_0);
-                        ct_1 = ((take_30 != 0) ? c_29_1 : ct_1);
+                        ct_1 = ((take_30 != 0) ? c_29 : ct_1);
                         nadd_2 = ((take_30 != 0) ? cum : nadd_2);
                         found = found | take_30;
-                        cum = cum + c_29_1;
-                        unsigned int c_31_1 = hist[base_2];
-                        unsigned int take_32 = (unsigned int)(found == 0 && r_rem <= cum + c_31_1);
+                        cum = cum + c_29;
+                        unsigned int c_31 = hist[base_2];
+                        unsigned int take_32 = (unsigned int)(found == 0 && r_rem <= cum + c_31);
                         tsel_0 = ((take_32 != 0) ? (unsigned int)bin0 : tsel_0);
-                        ct_1 = ((take_32 != 0) ? c_31_1 : ct_1);
+                        ct_1 = ((take_32 != 0) ? c_31 : ct_1);
                         nadd_2 = ((take_32 != 0) ? cum : nadd_2);
                         found = found | take_32;
-                        cum = cum + c_31_1;
+                        cum = cum + c_31;
                         res[0] = tsel_0;
                         res[1] = ct_1;
                         res[2] = nadd_2;
@@ -2887,20 +2828,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     }
                     unsigned int ngt_new = ngt_me + nadd;
                     int over = (int)(ngt_new + ct > 64);
-                    int t9 = 0;
-                    unsigned int kor = 0;
-                    if (is_pass0 != 0) {
-                        unsigned int kand = 4294967295u;
-                        #pragma unroll 1
-                        for (int hw = 0; hw < 16; hw++) {
-                            kand = kand & keq[(hw * 16 + q_local) * 2];
-                            kor = kor | keq[(hw * 16 + q_local) * 2 + 1];
-                        }
-                        t9 = (int)(kand == kor && ct == (unsigned int)slen);
-                    }
-                    if (t9 != 0) {
-                        over = 0;
-                    }
                     unsigned int rsh_new = 0;
                     unsigned long long rp_new = 0;
                     if (is_pass0 != 0) {
@@ -2914,14 +2841,6 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                             rp_new = (unsigned long long)tsel << 13 | (unsigned long long)p13;
                         }
                         state[q_local * 8 + 5] = tsel;
-                        if (t9 != 0) {
-                            rsh_new = 0;
-                            unsigned int neg_mask_3 = -(kor >> 31);
-                            unsigned int key_3 = kor ^ (neg_mask_3 | 2147483648u);
-                            unsigned int invm_1 = ~(unsigned int)(lo_s + r - 1) & idx_mask;
-                            unsigned long long rk_1 = (unsigned long long)(int)tsel << 54 | (unsigned long long)key_3 << 22 | (unsigned long long)invm_1;
-                            rp_new = rk_1;
-                        }
                     } else {
                         rp_new = rprefix_me << (unsigned long long)w_me | (unsigned long long)tsel;
                         rsh_new = rshift_me - w_me;
@@ -2939,70 +2858,73 @@ kernel_cake_blackwell_msa_0301f8d49b7d96d6139e(float* __restrict__ max_score, in
                     contrib = 1;
                 }
                 int base_3 = seg * 1024 + q_local;
-                hist[base_3] = 0;
-                hist[base_3 + 16] = 0;
-                hist[base_3 + 32] = 0;
-                hist[base_3 + 48] = 0;
-                hist[base_3 + 64] = 0;
-                hist[base_3 + 80] = 0;
-                hist[base_3 + 96] = 0;
-                hist[base_3 + 112] = 0;
-                hist[base_3 + 128] = 0;
-                hist[base_3 + 144] = 0;
-                hist[base_3 + 160] = 0;
-                hist[base_3 + 176] = 0;
-                hist[base_3 + 192] = 0;
-                hist[base_3 + 208] = 0;
-                hist[base_3 + 224] = 0;
-                hist[base_3 + 240] = 0;
-                hist[base_3 + 256] = 0;
-                hist[base_3 + 272] = 0;
-                hist[base_3 + 288] = 0;
-                hist[base_3 + 304] = 0;
-                hist[base_3 + 320] = 0;
-                hist[base_3 + 336] = 0;
-                hist[base_3 + 352] = 0;
-                hist[base_3 + 368] = 0;
-                hist[base_3 + 384] = 0;
-                hist[base_3 + 400] = 0;
-                hist[base_3 + 416] = 0;
-                hist[base_3 + 432] = 0;
-                hist[base_3 + 448] = 0;
-                hist[base_3 + 464] = 0;
-                hist[base_3 + 480] = 0;
-                hist[base_3 + 496] = 0;
-                hist[base_3 + 512] = 0;
-                hist[base_3 + 528] = 0;
-                hist[base_3 + 544] = 0;
-                hist[base_3 + 560] = 0;
-                hist[base_3 + 576] = 0;
-                hist[base_3 + 592] = 0;
-                hist[base_3 + 608] = 0;
-                hist[base_3 + 624] = 0;
-                hist[base_3 + 640] = 0;
-                hist[base_3 + 656] = 0;
-                hist[base_3 + 672] = 0;
-                hist[base_3 + 688] = 0;
-                hist[base_3 + 704] = 0;
-                hist[base_3 + 720] = 0;
-                hist[base_3 + 736] = 0;
-                hist[base_3 + 752] = 0;
-                hist[base_3 + 768] = 0;
-                hist[base_3 + 784] = 0;
-                hist[base_3 + 800] = 0;
-                hist[base_3 + 816] = 0;
-                hist[base_3 + 832] = 0;
-                hist[base_3 + 848] = 0;
-                hist[base_3 + 864] = 0;
-                hist[base_3 + 880] = 0;
-                hist[base_3 + 896] = 0;
-                hist[base_3 + 912] = 0;
-                hist[base_3 + 928] = 0;
-                hist[base_3 + 944] = 0;
-                hist[base_3 + 960] = 0;
-                hist[base_3 + 976] = 0;
-                hist[base_3 + 992] = 0;
-                hist[base_3 + 1008] = 0;
+                int swap_1 = (seg & 1) * 16;
+                int b0_1 = base_3 + swap_1;
+                int b1_3 = base_3 + 16 - swap_1;
+                hist[b0_1] = 0;
+                hist[b1_3] = 0;
+                hist[b0_1 + 32] = 0;
+                hist[b1_3 + 32] = 0;
+                hist[b0_1 + 64] = 0;
+                hist[b1_3 + 64] = 0;
+                hist[b0_1 + 96] = 0;
+                hist[b1_3 + 96] = 0;
+                hist[b0_1 + 128] = 0;
+                hist[b1_3 + 128] = 0;
+                hist[b0_1 + 160] = 0;
+                hist[b1_3 + 160] = 0;
+                hist[b0_1 + 192] = 0;
+                hist[b1_3 + 192] = 0;
+                hist[b0_1 + 224] = 0;
+                hist[b1_3 + 224] = 0;
+                hist[b0_1 + 256] = 0;
+                hist[b1_3 + 256] = 0;
+                hist[b0_1 + 288] = 0;
+                hist[b1_3 + 288] = 0;
+                hist[b0_1 + 320] = 0;
+                hist[b1_3 + 320] = 0;
+                hist[b0_1 + 352] = 0;
+                hist[b1_3 + 352] = 0;
+                hist[b0_1 + 384] = 0;
+                hist[b1_3 + 384] = 0;
+                hist[b0_1 + 416] = 0;
+                hist[b1_3 + 416] = 0;
+                hist[b0_1 + 448] = 0;
+                hist[b1_3 + 448] = 0;
+                hist[b0_1 + 480] = 0;
+                hist[b1_3 + 480] = 0;
+                hist[b0_1 + 512] = 0;
+                hist[b1_3 + 512] = 0;
+                hist[b0_1 + 544] = 0;
+                hist[b1_3 + 544] = 0;
+                hist[b0_1 + 576] = 0;
+                hist[b1_3 + 576] = 0;
+                hist[b0_1 + 608] = 0;
+                hist[b1_3 + 608] = 0;
+                hist[b0_1 + 640] = 0;
+                hist[b1_3 + 640] = 0;
+                hist[b0_1 + 672] = 0;
+                hist[b1_3 + 672] = 0;
+                hist[b0_1 + 704] = 0;
+                hist[b1_3 + 704] = 0;
+                hist[b0_1 + 736] = 0;
+                hist[b1_3 + 736] = 0;
+                hist[b0_1 + 768] = 0;
+                hist[b1_3 + 768] = 0;
+                hist[b0_1 + 800] = 0;
+                hist[b1_3 + 800] = 0;
+                hist[b0_1 + 832] = 0;
+                hist[b1_3 + 832] = 0;
+                hist[b0_1 + 864] = 0;
+                hist[b1_3 + 864] = 0;
+                hist[b0_1 + 896] = 0;
+                hist[b1_3 + 896] = 0;
+                hist[b0_1 + 928] = 0;
+                hist[b1_3 + 928] = 0;
+                hist[b0_1 + 960] = 0;
+                hist[b1_3 + 960] = 0;
+                hist[b0_1 + 992] = 0;
+                hist[b1_3 + 992] = 0;
             } else if (is_stage != 0) {
                 if (seg == 0) {
                     state[q_local * 8] = 2;
