@@ -151,6 +151,73 @@ def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     return wrapper
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("placement", ["pageable", "pinned", "cuda"])
+def test_fa_metadata_staging_avoids_pageable_async_copies(graph, placement):
+    """CPU metadata must be safe for async H2D, including immediate caller reuse."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from flashinfer.mla._batch_mla._backends._fa_common import (
+        _BatchMLAGeneratedFaMechanics,
+    )
+
+    class RejectPageableH2D(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func == torch.ops.aten.copy_.default:
+                target, source = args[:2]
+                device = target.device
+                non_blocking = args[2] if len(args) > 2 else False
+            elif func == torch.ops.aten._to_copy.default:
+                source = args[0]
+                device = kwargs.get("device", source.device)
+                non_blocking = kwargs.get("non_blocking", False)
+            else:
+                return func(*args, **kwargs)
+            if (
+                non_blocking
+                and device.type == "cuda"
+                and source.device.type == "cpu"
+                and not source.is_pinned()
+            ):
+                raise RuntimeError("pageable async H2D metadata copy")
+            return func(*args, **kwargs)
+
+    names = ("qo_indptr", "kv_indptr", "kv_indices", "kv_len_arr")
+    values = ([0, 1, 2], [0, 2, 4], [3, 5, 7, 9], [2, 2])
+    sources = {
+        name: torch.tensor(value, dtype=torch.int32)
+        for name, value in zip(names, values, strict=True)
+    }
+    if placement == "pinned":
+        sources = {name: value.pin_memory() for name, value in sources.items()}
+    elif placement == "cuda":
+        sources = {name: value.cuda() for name, value in sources.items()}
+    backend = _BatchMLAGeneratedFaMechanics(
+        float_workspace_buffer=torch.empty(1, device="cuda", dtype=torch.uint8),
+        int_workspace_buffer=torch.empty(1, device="cuda", dtype=torch.uint8),
+        pin_memory_int_workspace_buffer=torch.empty(1, dtype=torch.uint8),
+        use_cuda_graph=graph,
+        **{
+            name + "_buf": torch.empty_like(value, device="cuda") if graph else None
+            for name, value in sources.items()
+        },
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(5_000_000)
+        with RejectPageableH2D():
+            backend._stage_metadata(**sources)
+        if placement == "pageable":
+            for source in sources.values():
+                source.fill_(-1)
+    stream.synchronize()
+    for name, expected in zip(names, values, strict=True):
+        assert getattr(backend, "_" + name + "_buf").cpu().tolist() == expected
+
+
 def _patch_fake_fa_module(monkeypatch, fake_module):
     import flashinfer.mla._batch_mla._backends.fa2_backend as fa2_backend
     import flashinfer.mla._batch_mla._backends.fa3_backend as fa3_backend
