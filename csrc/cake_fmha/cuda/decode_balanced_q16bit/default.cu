@@ -324,7 +324,11 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+kernel_cake_fmha_decode_balanced_fp16q(unsigned int* __restrict__ Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __half* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, float output_scale, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+#else
 kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, float output_scale, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1575,17 +1579,31 @@ kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __gr
                             int o_idx_m = (row_tile_c * num_q_heads + kv_head_idx * group_ratio + m_head) * HEAD_DIM + m_d0;
                             {
                                 uint2 _pk2;
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+                                __half2* _pk = reinterpret_cast<__half2*>(&_pk2);
+                                _pk[0] = __floats2half2_rn(acc_lo[0 + 0], acc_lo[0 + 1]);
+                                _pk[1] = __floats2half2_rn(acc_lo[0 + 2], acc_lo[0 + 3]);
+                                *reinterpret_cast<uint2*>(&((__half*)(O_ptr + o_idx_m))[0]) = _pk2;
+#else
                                 __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                                 _pk[0] = __floats2bfloat162_rn(acc_lo[0 + 0], acc_lo[0 + 1]);
                                 _pk[1] = __floats2bfloat162_rn(acc_lo[0 + 2], acc_lo[0 + 3]);
                                 *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + o_idx_m))[0]) = _pk2;
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
                             }
                             {
                                 uint2 _pk2;
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+                                __half2* _pk = reinterpret_cast<__half2*>(&_pk2);
+                                _pk[0] = __floats2half2_rn(acc_hi[0 + 0], acc_hi[0 + 1]);
+                                _pk[1] = __floats2half2_rn(acc_hi[0 + 2], acc_hi[0 + 3]);
+                                *reinterpret_cast<uint2*>(&((__half*)(O_ptr + (o_idx_m + 4)))[0]) = _pk2;
+#else
                                 __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                                 _pk[0] = __floats2bfloat162_rn(acc_hi[0 + 0], acc_hi[0 + 1]);
                                 _pk[1] = __floats2bfloat162_rn(acc_hi[0 + 2], acc_hi[0 + 3]);
                                 *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_m + 4)))[0]) = _pk2;
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
                             }
                         }
                         if (corr_tid == 0) {
@@ -1604,12 +1622,20 @@ kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __gr
                         if (o_q0 < group_ratio) {
                             int q_head0 = kv_head_idx * group_ratio + o_q0;
                             int out_idx0 = (row_tile_c * num_q_heads + q_head0) * HEAD_DIM + o_dim;
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+                            *(reinterpret_cast<__half*>(O_ptr + out_idx0) + (0)) = __float2half_rn(out_vals[o_pair * 2]);
+#else
                             *(reinterpret_cast<__nv_bfloat16*>(O_ptr + out_idx0) + (0)) = __float2bfloat16_rn(out_vals[o_pair * 2]);
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
                         }
                         if (o_q1 < group_ratio) {
                             int q_head1 = kv_head_idx * group_ratio + o_q1;
                             int out_idx1 = (row_tile_c * num_q_heads + q_head1) * HEAD_DIM + o_dim;
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+                            *(reinterpret_cast<__half*>(O_ptr + out_idx1) + (0)) = __float2half_rn(out_vals[o_pair * 2 + 1]);
+#else
                             *(reinterpret_cast<__nv_bfloat16*>(O_ptr + out_idx1) + (0)) = __float2bfloat16_rn(out_vals[o_pair * 2 + 1]);
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
                         }
                     }
                 }
@@ -2771,6 +2797,24 @@ kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __gr
                         #pragma unroll
                         for (int qw_s = 0; qw_s < 8; qw_s++) {
                             unsigned int q_w_s = q_words_s[qw_s];
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+                            unsigned int q_lo_bits_d = q_w_s & 65535;
+                            unsigned int q_hi_bits_d = q_w_s >> 16 & 65535;
+                            unsigned int q_lo_tb_d = q_lo_bits_d & 65408;
+                            unsigned int q_hi_tb_d = q_hi_bits_d & 65408;
+                            float _cvt_f32_f16_0;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_0) : "h"((uint16_t)(q_lo_bits_d)));
+                            float q_lo_d = _cvt_f32_f16_0;
+                            float _cvt_f32_f16_1;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_1) : "h"((uint16_t)(q_lo_tb_d)));
+                            float q_lo_t_d = _cvt_f32_f16_1;
+                            float _cvt_f32_f16_2;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_2) : "h"((uint16_t)(q_hi_bits_d)));
+                            float q_hi_d = _cvt_f32_f16_2;
+                            float _cvt_f32_f16_3;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_3) : "h"((uint16_t)(q_hi_tb_d)));
+                            float q_hi_t_d = _cvt_f32_f16_3;
+#else
                             unsigned int q_wbits_d = q_w_s << 16;
                             float q_lo_d = 0.0f;
                             float q_lo_t_d = 0.0f;
@@ -2783,6 +2827,7 @@ kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __gr
                             q_hi_d = reinterpret_cast<float*>(&q_wbits_d)[0];
                             q_wbits_d = (q_w_s >> 16 & 65520) << 16;
                             q_hi_t_d = reinterpret_cast<float*>(&q_wbits_d)[0];
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
                             q_f32_s[2 * qw_s] = q_lo_t_d;
                             q_res_s[2 * qw_s] = q_lo_d - q_lo_t_d;
                             q_f32_s[2 * qw_s + 1] = q_hi_t_d;
@@ -3059,6 +3104,24 @@ kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __gr
                         #pragma unroll
                         for (int qw_s_1 = 0; qw_s_1 < 8; qw_s_1++) {
                             unsigned int q_w_s_1 = q_words_s_1[qw_s_1];
+#if CAKE_FMHA_BALANCED_Q_DTYPE == 2
+                            unsigned int q_lo_bits_d_1 = q_w_s_1 & 65535;
+                            unsigned int q_hi_bits_d_1 = q_w_s_1 >> 16 & 65535;
+                            unsigned int q_lo_tb_d_1 = q_lo_bits_d_1 & 65408;
+                            unsigned int q_hi_tb_d_1 = q_hi_bits_d_1 & 65408;
+                            float _cvt_f32_f16_4;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_4) : "h"((uint16_t)(q_lo_bits_d_1)));
+                            float q_lo_d_1 = _cvt_f32_f16_4;
+                            float _cvt_f32_f16_5;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_5) : "h"((uint16_t)(q_lo_tb_d_1)));
+                            float q_lo_t_d_1 = _cvt_f32_f16_5;
+                            float _cvt_f32_f16_6;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_6) : "h"((uint16_t)(q_hi_bits_d_1)));
+                            float q_hi_d_1 = _cvt_f32_f16_6;
+                            float _cvt_f32_f16_7;
+                            asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_7) : "h"((uint16_t)(q_hi_tb_d_1)));
+                            float q_hi_t_d_1 = _cvt_f32_f16_7;
+#else
                             unsigned int q_wbits_d_1 = q_w_s_1 << 16;
                             float q_lo_d_1 = 0.0f;
                             float q_lo_t_d_1 = 0.0f;
@@ -3071,6 +3134,7 @@ kernel_cake_fmha_decode_balanced_bf16q(unsigned int* __restrict__ Qt, const __gr
                             q_hi_d_1 = reinterpret_cast<float*>(&q_wbits_d_1)[0];
                             q_wbits_d_1 = (q_w_s_1 >> 16 & 65520) << 16;
                             q_hi_t_d_1 = reinterpret_cast<float*>(&q_wbits_d_1)[0];
+#endif  // CAKE_FMHA_BALANCED_Q_DTYPE
                             q_f32_s_1[2 * qw_s_1] = q_lo_t_d_1;
                             q_res_s_1[2 * qw_s_1] = q_lo_d_1 - q_lo_t_d_1;
                             q_f32_s_1[2 * qw_s_1 + 1] = q_hi_t_d_1;

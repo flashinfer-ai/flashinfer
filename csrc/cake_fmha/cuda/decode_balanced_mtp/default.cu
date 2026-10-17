@@ -285,7 +285,19 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
+#if CAKE_FMHA_BALANCED_FP16
 kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __half* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, unsigned int max_items)
+#else
+kernel_cake_fmha_decode_balanced_bf16_mtp_n64(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, unsigned int max_items)
+#endif  // CAKE_FMHA_BALANCED_FP16
+#else
+#if CAKE_FMHA_BALANCED_FP16
+kernel_cake_fmha_decode_balanced_fp16_mtp_n32(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __half* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, unsigned int max_items)
+#else
+kernel_cake_fmha_decode_balanced_bf16_mtp_n32(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, unsigned int max_items)
+#endif  // CAKE_FMHA_BALANCED_FP16
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -340,11 +352,23 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
     const int work_token_words_addr = smem + SMEM_WORK_TOKEN_WORDS_OFF;
     int* sched_seq_lens = reinterpret_cast<int*>(smem_raw + SMEM_SCHED_SEQ_LENS_OFF);
     const int sched_seq_lens_addr = smem + SMEM_SCHED_SEQ_LENS_OFF;
+#if CAKE_FMHA_BALANCED_FP16
     __half* smem_qt = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_QT_OFF);
+#else
+    __nv_bfloat16* smem_qt = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QT_OFF);
+#endif  // CAKE_FMHA_BALANCED_FP16
     const int smem_qt_addr = smem + SMEM_SMEM_QT_OFF;
+#if CAKE_FMHA_BALANCED_FP16
     __half* smem_k = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_K_OFF);
+#else
+    __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_K_OFF);
+#endif  // CAKE_FMHA_BALANCED_FP16
     const int smem_k_addr = smem + SMEM_SMEM_K_OFF;
+#if CAKE_FMHA_BALANCED_FP16
     __half* smem_v = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_V_OFF);
+#else
+    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_V_OFF);
+#endif  // CAKE_FMHA_BALANCED_FP16
     const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
@@ -433,7 +457,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
             int half = lane / 16;
             int tok_base = half * 64;
             int my_s_base = taddr + (unsigned int)(s_warp * 32 << 16);
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
             int rows_live = ((s_warp * 16 < 64) ? 1 : 0);
+#else
+            int rows_live = ((s_warp * 16 < 32) ? 1 : 0);
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
             int row_j = my_row / 8;
             int _min_1 = ((row_j) < (q_len - 1) ? (row_j) : (q_len - 1));
             int vis_j = _min_1;
@@ -506,7 +534,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 : "r"((unsigned int)my_s_base + sm_stage * (unsigned int)BLOCK_N));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             int n_vis = vis_col - blk_pos;
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                             if (my_row >= 64) {
+#else
+                            if (my_row >= 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                                 n_vis = 0;
                             }
                             if (n_vis < 32) {
@@ -685,8 +717,13 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                             unsigned int regs_p[16];
                             #pragma unroll
                             for (int _lp = 0; _lp < 16; _lp++) {
+#if CAKE_FMHA_BALANCED_FP16
                                 __half2 _h2 = __float22half2_rn(make_float2(sv[_lp*2 + 0], sv[_lp*2+1 + 0]));
                                 regs_p[_lp] = *(uint32_t*)&_h2;
+#else
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sv[_lp*2 + 0], sv[_lp*2+1 + 0]));
+                                regs_p[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_FMHA_BALANCED_FP16
                             }
                             asm volatile(
                                 "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
@@ -796,10 +833,17 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 }
                                 {
                                     uint2 _pk2;
+#if CAKE_FMHA_BALANCED_FP16
                                     __half2* _pk = reinterpret_cast<__half2*>(&_pk2);
                                     _pk[0] = __floats2half2_rn(out4[0 + 0], out4[0 + 1]);
                                     _pk[1] = __floats2half2_rn(out4[0 + 2], out4[0 + 3]);
                                     *reinterpret_cast<uint2*>(&((__half*)(O_ptr + (o_idx_r + g_r * 4)))[0]) = _pk2;
+#else
+                                    __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                    _pk[0] = __floats2bfloat162_rn(out4[0 + 0], out4[0 + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(out4[0 + 2], out4[0 + 3]);
+                                    *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r + g_r * 4)))[0]) = _pk2;
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                             }
                         }
@@ -846,7 +890,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
             int o_row_base = taddr + 256 + (unsigned int)corr_row;
             int my_s_base_c = taddr + (unsigned int)corr_row;
             int tok_base_c = half_c * 64 + 32;
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
             int rows_live_c = ((warp_in_wg_c * 16 < 64) ? 1 : 0);
+#else
+            int rows_live_c = ((warp_in_wg_c * 16 < 32) ? 1 : 0);
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
             int row_j_c = my_row_c / 8;
             int _min_3 = ((row_j_c) < (q_len - 1) ? (row_j_c) : (q_len - 1));
             int vis_j_c = _min_3;
@@ -954,7 +1002,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 : "r"((unsigned int)my_s_base_c + sm_stage_c * (unsigned int)BLOCK_N + 32));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             int n_vis_c = vis_col_c - blk_pos_c;
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                             if (my_row_c >= 64) {
+#else
+                            if (my_row_c >= 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                                 n_vis_c = 0;
                             }
                             if (n_vis_c < 32) {
@@ -1127,8 +1179,13 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                             unsigned int regs_pc[16];
                             #pragma unroll
                             for (int _lp = 0; _lp < 16; _lp++) {
+#if CAKE_FMHA_BALANCED_FP16
                                 __half2 _h2 = __float22half2_rn(make_float2(sv_c[_lp*2 + 0], sv_c[_lp*2+1 + 0]));
                                 regs_pc[_lp] = *(uint32_t*)&_h2;
+#else
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sv_c[_lp*2 + 0], sv_c[_lp*2+1 + 0]));
+                                regs_pc[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_FMHA_BALANCED_FP16
                             }
                             asm volatile(
                                 "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
@@ -1242,7 +1299,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                     int publish_split = ((n_chunks_c > 1) ? 1 : 0);
                     if (publish_split == 0) {
                         float row_sum_c = 1.0f;
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                         if (my_row_c < 64) {
+#else
+                        if (my_row_c < 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                             row_sum_c = smem_sum[st_off + my_row_c];
                         }
                         float _rcp_16 = approx_rcp(row_sum_c);
@@ -1265,12 +1326,21 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                     for (int _ps = 0; _ps < 8; _ps++)
                                         _tmem_load_1[off + _ps] *= inv_c;
                                     #endif
+#if CAKE_FMHA_BALANCED_FP16
                                     __half2 _pk[4];
                                     _pk[0] = __floats2half2_rn(_tmem_load_1[off + 0], _tmem_load_1[off + 1]);
                                     _pk[1] = __floats2half2_rn(_tmem_load_1[off + 2], _tmem_load_1[off + 3]);
                                     _pk[2] = __floats2half2_rn(_tmem_load_1[off + 4], _tmem_load_1[off + 5]);
                                     _pk[3] = __floats2half2_rn(_tmem_load_1[off + 6], _tmem_load_1[off + 7]);
                                     *reinterpret_cast<uint4*>(&((__half*)(O_ptr + (o_idx + off)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
+                                    __nv_bfloat162 _pk[4];
+                                    _pk[0] = __floats2bfloat162_rn(_tmem_load_1[off + 0], _tmem_load_1[off + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(_tmem_load_1[off + 2], _tmem_load_1[off + 3]);
+                                    _pk[2] = __floats2bfloat162_rn(_tmem_load_1[off + 4], _tmem_load_1[off + 5]);
+                                    _pk[3] = __floats2bfloat162_rn(_tmem_load_1[off + 6], _tmem_load_1[off + 7]);
+                                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + (o_idx + off)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                             }
                         }
@@ -1279,7 +1349,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                             mbarrier_arrive(stats_empty_addr + (st_stage_c) * 8);
                         }
                     } else if (n_chunks_c == 2) {
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                         if (my_row_c < 64) {
+#else
+                        if (my_row_c < 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                             int p_base = my_slot * 8192 + my_row_c * 4 + half_c * 256;
                             #pragma unroll
                             for (int off_1 = 0; off_1 < 64; off_1 += 4) {
@@ -1289,7 +1363,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 }
                             }
                         }
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                         if (wg_tid_c < 64) {
+#else
+                        if (wg_tid_c < 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                             *(reinterpret_cast<float*>(partial_stats + (my_slot * 128 + wg_tid_c)) + (0)) = smem_max[st_off + wg_tid_c];
                             *(reinterpret_cast<float*>(partial_stats + (my_slot * 128 + 64 + wg_tid_c)) + (0)) = smem_sum[st_off + wg_tid_c];
                         }
@@ -1608,12 +1686,21 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 #pragma unroll
                                 for (int off_2 = 0; off_2 < 64; off_2 += 8) {
                                     {
+#if CAKE_FMHA_BALANCED_FP16
                                         __half2 _pk[4];
                                         _pk[0] = __floats2half2_rn(_tmem_load_1[off_2 + 0], _tmem_load_1[off_2 + 1]);
                                         _pk[1] = __floats2half2_rn(_tmem_load_1[off_2 + 2], _tmem_load_1[off_2 + 3]);
                                         _pk[2] = __floats2half2_rn(_tmem_load_1[off_2 + 4], _tmem_load_1[off_2 + 5]);
                                         _pk[3] = __floats2half2_rn(_tmem_load_1[off_2 + 6], _tmem_load_1[off_2 + 7]);
                                         *reinterpret_cast<uint4*>(&((__half*)(O_ptr + (o_idx_f + off_2)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
+                                        __nv_bfloat162 _pk[4];
+                                        _pk[0] = __floats2bfloat162_rn(_tmem_load_1[off_2 + 0], _tmem_load_1[off_2 + 1]);
+                                        _pk[1] = __floats2bfloat162_rn(_tmem_load_1[off_2 + 2], _tmem_load_1[off_2 + 3]);
+                                        _pk[2] = __floats2bfloat162_rn(_tmem_load_1[off_2 + 4], _tmem_load_1[off_2 + 5]);
+                                        _pk[3] = __floats2bfloat162_rn(_tmem_load_1[off_2 + 6], _tmem_load_1[off_2 + 7]);
+                                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + (o_idx_f + off_2)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                     }
                                 }
                             }
@@ -1632,7 +1719,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                             }
                         }
                     } else {
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                         if (my_row_c < 64) {
+#else
+                        if (my_row_c < 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                             int p_base_1 = my_slot * 8192 + my_row_c * 4 + half_c * 256;
                             #pragma unroll
                             for (int off_3 = 0; off_3 < 64; off_3 += 4) {
@@ -1642,7 +1733,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 }
                             }
                         }
+#if CAKE_FMHA_BALANCED_N_ROWS == 64
                         if (wg_tid_c < 64) {
+#else
+                        if (wg_tid_c < 32) {
+#endif  // CAKE_FMHA_BALANCED_N_ROWS
                             *(reinterpret_cast<float*>(partial_stats + (my_slot * 128 + wg_tid_c)) + (0)) = smem_max[st_off + wg_tid_c];
                             *(reinterpret_cast<float*>(partial_stats + (my_slot * 128 + 64 + wg_tid_c)) + (0)) = smem_sum[st_off + wg_tid_c];
                         }
@@ -1738,10 +1833,17 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 }
                                 {
                                     uint2 _pk2;
+#if CAKE_FMHA_BALANCED_FP16
                                     __half2* _pk = reinterpret_cast<__half2*>(&_pk2);
                                     _pk[0] = __floats2half2_rn(out4_1[0 + 0], out4_1[0 + 1]);
                                     _pk[1] = __floats2half2_rn(out4_1[0 + 2], out4_1[0 + 3]);
                                     *reinterpret_cast<uint2*>(&((__half*)(O_ptr + (o_idx_r_1 + g_r_1 * 4)))[0]) = _pk2;
+#else
+                                    __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                    _pk[0] = __floats2bfloat162_rn(out4_1[0 + 0], out4_1[0 + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(out4_1[0 + 2], out4_1[0 + 3]);
+                                    *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r_1 + g_r_1 * 4)))[0]) = _pk2;
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                             }
                         }
@@ -1839,42 +1941,74 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                         uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                         uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 0);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 0);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 506U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 1018U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                             tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69206032, 1);
+#else
+                            tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                         }
                     }
                     elect_commit(s_full_addr + (s_buf) * 8);
@@ -1909,42 +2043,74 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                                 uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
                                 uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 0);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 0);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 506U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 1018U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                                 incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                                 if (elect_sync()) {
+#if CAKE_FMHA_BALANCED_FP16
                                     tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69206032, 1);
+#else
+                                    tcgen05_mma_f16((tmem_tmem_s + (s_buf * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 69207184, 1);
+#endif  // CAKE_FMHA_BALANCED_FP16
                                 }
                             }
                             elect_commit(s_full_addr + (s_buf) * 8);
@@ -1977,7 +2143,11 @@ kernel_cake_fmha_decode_balanced_fp16_mtp_n64(const __grid_constant__ CUtensorMa
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
+#if CAKE_FMHA_BALANCED_FP16
                     "mov.b32 id, 69271568;\n\t"
+#else
+                    "mov.b32 id, 69272720;\n\t"
+#endif  // CAKE_FMHA_BALANCED_FP16
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"

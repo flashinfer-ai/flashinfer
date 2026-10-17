@@ -292,7 +292,15 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+kernel_cake_fmha_decode_balanced_bf16_hd256_p64(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
 kernel_cake_fmha_decode_balanced_bf16_hd256_p32(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+#else
+kernel_cake_fmha_decode_balanced_bf16_hd256_p16(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1187,23 +1195,90 @@ kernel_cake_fmha_decode_balanced_bf16_hd256_p32(const __grid_constant__ CUtensor
                 }
                 int num_n_blocks_p = block_end_p - block_begin_p;
                 int cta_n_blocks_p = num_n_blocks_p + num_n_blocks_p % 2;
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                int max_pg_p = (seqlen_kv_p + 64 - 1) / 64 - 1;
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                 int max_pg_p = (seqlen_kv_p + 32 - 1) / 32 - 1;
+#else
+                int max_pg_p = (seqlen_kv_p + 16 - 1) / 16 - 1;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                 int pt_base_p = batch_idx_p * max_pages_per_seq;
                 #pragma unroll 1
                 for (int ni_p = 0; ni_p < cta_n_blocks_p; ni_p++) {
                     int n_block_p = block_begin_p + cta_n_blocks_p - 1 - ni_p;
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                    int logical_page_base_p = n_block_p * 2;
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                     int logical_page_base_p = n_block_p * 4;
+#else
+                    int logical_page_base_p = n_block_p * 8;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                     mbarrier_wait(page_offsets_empty_addr + (page_prod_stage) * 8, page_prod_phase);
                     if (elect_sync()) {
                         int smem_page_base_p = page_prod_stage * 8;
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
                         {
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
+                        {
+#else
+                        if (max_pg_p >= logical_page_base_p + 7 && pt_base_p % 4 == 0) {
+                            int _vec_load_0[4];
+                            {
+                                const int4* _ivptr_0 = reinterpret_cast<const int4*>(page_table + pt_base_p + logical_page_base_p);
+                                int4 _ivld_0;
+                                _ivld_0 = *_ivptr_0;
+                                _vec_load_0[0 + 0] = _ivld_0.x;
+                                _vec_load_0[0 + 1] = _ivld_0.y;
+                                _vec_load_0[0 + 2] = _ivld_0.z;
+                                _vec_load_0[0 + 3] = _ivld_0.w;
+                            }
+                            int _vec_load_1[4];
+                            {
+                                const int4* _ivptr_1 = reinterpret_cast<const int4*>(page_table + pt_base_p + logical_page_base_p + 4);
+                                int4 _ivld_1;
+                                _ivld_1 = *_ivptr_1;
+                                _vec_load_1[0 + 0] = _ivld_1.x;
+                                _vec_load_1[0 + 1] = _ivld_1.y;
+                                _vec_load_1[0 + 2] = _ivld_1.z;
+                                _vec_load_1[0 + 3] = _ivld_1.w;
+                            }
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                             #pragma unroll
-                            for (int pg_i_p = 0; pg_i_p < 4; pg_i_p++) {
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                            for (int pg_i_p = 0; pg_i_p < 2; pg_i_p++) {
                                 int safe_page_idx_p = logical_page_base_p + pg_i_p;
+#else
+                            for (int pg_i_p = 0; pg_i_p < 4; pg_i_p++) {
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
+                                int safe_page_idx_p = logical_page_base_p + pg_i_p;
+#else
+                                smem_page_offsets[smem_page_base_p + pg_i_p] = _vec_load_0[pg_i_p];
+                                smem_page_offsets[smem_page_base_p + pg_i_p + 4] = _vec_load_1[pg_i_p];
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int pg_i_p_1 = 0; pg_i_p_1 < 8; pg_i_p_1++) {
+                                int safe_page_idx_p = logical_page_base_p + pg_i_p_1;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                                 if (safe_page_idx_p > max_pg_p) {
                                     safe_page_idx_p = max_pg_p;
                                 }
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
                                 smem_page_offsets[smem_page_base_p + pg_i_p] = page_table[pt_base_p + safe_page_idx_p];
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
+                                smem_page_offsets[smem_page_base_p + pg_i_p] = page_table[pt_base_p + safe_page_idx_p];
+#else
+                                smem_page_offsets[smem_page_base_p + pg_i_p_1] = page_table[pt_base_p + safe_page_idx_p];
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                             }
                         }
                         mbarrier_arrive(page_offsets_full_addr + (page_prod_stage) * 8);
@@ -1867,7 +1942,15 @@ kernel_cake_fmha_decode_balanced_bf16_hd256_p32(const __grid_constant__ CUtensor
                         int spec_row = spec_row_tile - spec_batch * q_len;
                         int spec_seqlen = seq_lens_kv[spec_batch] - (q_len - 1 - spec_row);
                         int spec_blocks = (spec_seqlen + BLOCK_N - 1) / BLOCK_N;
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                        int spec_max_pg = (spec_seqlen + 64 - 1) / 64 - 1;
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                         int spec_max_pg = (spec_seqlen + 32 - 1) / 32 - 1;
+#else
+                        int spec_max_pg = (spec_seqlen + 16 - 1) / 16 - 1;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                         int spec_pt_base = spec_batch * max_pages_per_seq;
                         int spec_off_qt = (spec_row_tile * num_kv_heads + spec_head) * group_ratio;
                         asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&Qt))), "r"((int)(0)), "r"((int)(spec_off_qt)), "r"((int)(0)) : "memory");
@@ -1877,14 +1960,32 @@ kernel_cake_fmha_decode_balanced_bf16_hd256_p32(const __grid_constant__ CUtensor
                             int spec_block = spec_blocks - 1 - spec_nb;
                             if (spec_block >= 0) {
                                 #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                                for (int spec_pg = 0; spec_pg < 2; spec_pg++) {
+                                    int spec_page_idx = spec_block * 2 + spec_pg;
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                                 for (int spec_pg = 0; spec_pg < 4; spec_pg++) {
                                     int spec_page_idx = spec_block * 4 + spec_pg;
+#else
+                                for (int spec_pg = 0; spec_pg < 8; spec_pg++) {
+                                    int spec_page_idx = spec_block * 8 + spec_pg;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                                     if (spec_page_idx > spec_max_pg) {
                                         spec_page_idx = spec_max_pg;
                                     }
                                     int spec_page = page_table[spec_pt_base + spec_page_idx];
                                     #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                                    for (int spec_sub = 0; spec_sub < 4; spec_sub++) {
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                                     for (int spec_sub = 0; spec_sub < 2; spec_sub++) {
+#else
+                                    for (int spec_sub = 0; spec_sub < 1; spec_sub++) {
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                                         #pragma unroll
                                         for (int spec_hg = 0; spec_hg < 4; spec_hg++) {
                                             asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&K))), "r"((int)(0)), "r"((int)(spec_sub * 16)), "r"((int)(spec_hg)), "r"((int)(spec_head)), "r"((int)(spec_page)) : "memory");
@@ -1946,14 +2047,40 @@ kernel_cake_fmha_decode_balanced_bf16_hd256_p32(const __grid_constant__ CUtensor
                         int lo_dst = smem_kv_lo_addr + (unsigned int)(kv_slot * 32768);
                         int pg_ids[8];
                         #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                        for (int pg_i = 0; pg_i < 2; pg_i++) {
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                         for (int pg_i = 0; pg_i < 4; pg_i++) {
+#else
+                        for (int pg_i = 0; pg_i < 8; pg_i++) {
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                             pg_ids[pg_i] = smem_page_offsets[page_cons_stage * 8 + (unsigned int)pg_i];
                         }
                         #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                        for (int pg_i_1 = 0; pg_i_1 < 2; pg_i_1++) {
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                         for (int pg_i_1 = 0; pg_i_1 < 4; pg_i_1++) {
+#else
+                        for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                             #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                            for (int sub = 0; sub < 4; sub++) {
+                                int box_off = (pg_i_1 * 4 + sub) * 2048;
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                             for (int sub = 0; sub < 2; sub++) {
                                 int box_off = (pg_i_1 * 2 + sub) * 2048;
+#else
+                            for (int sub = 0; sub < 1; sub++) {
+                                int box_off = (pg_i_1 + sub) * 2048;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                                 #pragma unroll
                                 for (int hg = 0; hg < 2; hg++) {
                                     tma_5d_gmem2smem(hi_dst + hg * 16384 + box_off, (&K), 0, sub * 16, hg, kv_head_idx_1, pg_ids[pg_i_1], kv_full_addr + (kv_slot) * 8);
@@ -1972,14 +2099,40 @@ kernel_cake_fmha_decode_balanced_bf16_hd256_p32(const __grid_constant__ CUtensor
                         int lo_dst_1 = smem_kv_lo_addr + (unsigned int)(kv_slot * 32768);
                         int pg_ids_2[8];
                         #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                        for (int pg_i_2 = 0; pg_i_2 < 2; pg_i_2++) {
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                         for (int pg_i_2 = 0; pg_i_2 < 4; pg_i_2++) {
+#else
+                        for (int pg_i_2 = 0; pg_i_2 < 8; pg_i_2++) {
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                             pg_ids_2[pg_i_2] = smem_page_offsets[page_cons_stage * 8 + (unsigned int)pg_i_2];
                         }
                         #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                        for (int pg_i_3 = 0; pg_i_3 < 2; pg_i_3++) {
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                         for (int pg_i_3 = 0; pg_i_3 < 4; pg_i_3++) {
+#else
+                        for (int pg_i_3 = 0; pg_i_3 < 8; pg_i_3++) {
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                             #pragma unroll
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 64
+                            for (int sub_1 = 0; sub_1 < 4; sub_1++) {
+                                int box_off_1 = (pg_i_3 * 4 + sub_1) * 2048;
+#else
+#if CAKE_FMHA_BALANCED_PAGE_SIZE == 32
                             for (int sub_1 = 0; sub_1 < 2; sub_1++) {
                                 int box_off_1 = (pg_i_3 * 2 + sub_1) * 2048;
+#else
+                            for (int sub_1 = 0; sub_1 < 1; sub_1++) {
+                                int box_off_1 = (pg_i_3 + sub_1) * 2048;
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
+#endif  // CAKE_FMHA_BALANCED_PAGE_SIZE
                                 #pragma unroll
                                 for (int hg_2 = 0; hg_2 < 2; hg_2++) {
                                     tma_5d_gmem2smem(hi_dst_0 + hg_2 * 16384 + box_off_1, (&V), 0, sub_1 * 16, hg_2, kv_head_idx_1, pg_ids_2[pg_i_3], kv_full_addr + (kv_slot) * 8);

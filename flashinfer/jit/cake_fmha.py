@@ -1443,7 +1443,8 @@ def gen_cake_fmha_decode_balanced_hd64_module(
     One body (Q16Kv128 ForGen, page 16, ``q_len == 1``) in two structural
     instances: ``max_group`` 8 (eight softmax columns, 1..8 query heads per KV
     head -- the kernel of record) and 16 (sixteen columns, 9..16); batch, heads
-    and KV lengths are runtime kernel arguments.
+    and KV lengths are runtime kernel arguments.  One source serves both
+    instances (``CAKE_FMHA_BALANCED_MAX_GROUPS``).
     """
 
     component = cake_fmha_balanced_hd64_component_name(max_group)
@@ -1457,6 +1458,7 @@ def gen_cake_fmha_decode_balanced_hd64_module(
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
             "-use_fast_math",
+            f"-DCAKE_FMHA_BALANCED_MAX_GROUPS={max_group}",
             f"-DCAKE_FMHA_BALANCED_LAUNCH={manifest_component['launch_binding']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],

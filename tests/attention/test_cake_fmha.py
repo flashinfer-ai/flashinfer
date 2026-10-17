@@ -312,6 +312,72 @@ def test_cake_fmha_generic_members_share_one_folded_source(
     assert all(set(member["selector"]) == set(macros) for member in generic_members)
 
 
+@pytest.mark.parametrize(
+    ("components", "knobs", "source"),
+    (
+        (
+            ("decode_balanced_bf16", "decode_balanced_fp16"),
+            {"CAKE_FMHA_BALANCED_FP16": ()},
+            "cuda/decode_balanced_16bit/default.cu",
+        ),
+        (
+            (
+                "decode_balanced_bf16_mtp_n32",
+                "decode_balanced_bf16_mtp_n64",
+                "decode_balanced_fp16_mtp_n32",
+                "decode_balanced_fp16_mtp_n64",
+            ),
+            {"CAKE_FMHA_BALANCED_N_ROWS": (64,), "CAKE_FMHA_BALANCED_FP16": ()},
+            "cuda/decode_balanced_mtp/default.cu",
+        ),
+        (
+            (
+                "decode_balanced_bf16_hd256_p16",
+                "decode_balanced_bf16_hd256_p32",
+                "decode_balanced_bf16_hd256_p64",
+            ),
+            {"CAKE_FMHA_BALANCED_PAGE_SIZE": (32, 64)},
+            "cuda/decode_balanced_hd256/default.cu",
+        ),
+        (
+            ("decode_balanced_bf16q", "decode_balanced_fp16q"),
+            {"CAKE_FMHA_BALANCED_Q_DTYPE": (2,)},
+            "cuda/decode_balanced_q16bit/default.cu",
+        ),
+        (
+            ("decode_balanced_bf16_hd64", "decode_balanced_bf16_hd64_g16"),
+            {"CAKE_FMHA_BALANCED_MAX_GROUPS": (16,)},
+            "cuda/decode_balanced_hd64/default.cu",
+        ),
+    ),
+)
+def test_cake_fmha_balanced_decode_components_share_one_folded_source(
+    components, knobs, source
+) -> None:
+    """One folded source per balanced decode family, selected by the loader defines."""
+
+    manifest_components = get_cake_fmha_manifest()["components"]
+    text = (get_cake_fmha_csrc_dir() / source).read_text(encoding="utf-8")
+    for component in components:
+        (member,) = manifest_components[component]["source_family"]
+        assert member["selector"] == {}
+        assert member["sources"] == {"sm_100a": source, "sm_103a": source}
+        assert f"{manifest_components[component]['public_symbol']}(" in text
+    for knob, values in knobs.items():
+        assert f"#define {knob}" not in text
+        opens = [
+            line
+            for line in text.splitlines()
+            if line == f"#if {knob}"
+            or line == f"#if !{knob}"
+            or line.startswith((f"#if {knob} == ", f"#if {knob} != "))
+        ]
+        assert text.count(f"#if {knob}") == len(opens)
+        assert text.count(f"#endif  // {knob}\n") == len(opens) > 0
+        tested = {int(line.rsplit(" ", 1)[1]) for line in opens if " " in line[4:]}
+        assert tested <= set(values)
+
+
 def test_cake_fmha_context_bf16_generic_members_share_one_arch_source() -> None:
     """Both arches compile one context_bf16 source split only by __CUDA_ARCH__."""
 
@@ -4200,8 +4266,9 @@ def test_cake_fmha_decode_balanced_jit_selects_the_q_len_component(
             f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
             in spec.extra_cuda_cflags
         )
+        folded = "decode_balanced_16bit" if n_rows == 0 else "decode_balanced_mtp"
         assert any(
-            f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+            f"/cuda/{folded}/default.cu" in str(source) for source in spec.sources
         )
 
 
@@ -4225,9 +4292,8 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_fp8_jit_binding.cu",
     }
-    assert any(
-        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
-    )
+    folded = "decode_balanced_fp8" if q_dtype == "fp8" else "decode_balanced_q16bit"
+    assert any(f"/cuda/{folded}/default.cu" in str(source) for source in spec.sources)
     assert f"-DCAKE_FMHA_BALANCED_Q_DTYPE={q_dtype_flag}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
@@ -4259,8 +4325,10 @@ def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(
         "cake_fmha_decode_balanced_hd64_jit_binding.cu",
     }
     assert any(
-        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+        "/cuda/decode_balanced_hd64/default.cu" in str(source)
+        for source in spec.sources
     )
+    assert f"-DCAKE_FMHA_BALANCED_MAX_GROUPS={max_group}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
         in spec.extra_cuda_cflags
@@ -4286,7 +4354,8 @@ def test_cake_fmha_decode_balanced_hd256_jit_selects_the_page_size_component(
         "cake_fmha_decode_balanced_hd256_jit_binding.cu",
     }
     assert any(
-        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+        "/cuda/decode_balanced_hd256/default.cu" in str(source)
+        for source in spec.sources
     )
     assert f"-DCAKE_FMHA_BALANCED_PAGE_SIZE={page_size}" in spec.extra_cuda_cflags
     assert (

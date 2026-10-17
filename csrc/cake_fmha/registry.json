@@ -1328,8 +1328,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16/default.cu"
+            "sm_100a": "cuda/decode_balanced_16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_16bit/default.cu"
           }
         }
       ],
@@ -1437,8 +1437,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p16/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p16/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd256/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd256/default.cu"
           }
         }
       ],
@@ -1546,8 +1546,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p32/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p32/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd256/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd256/default.cu"
           }
         }
       ],
@@ -1655,8 +1655,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p64/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p64/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd256/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd256/default.cu"
           }
         }
       ],
@@ -1764,8 +1764,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd64/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd64/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd64/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd64/default.cu"
           }
         }
       ],
@@ -1873,8 +1873,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd64_g16/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd64_g16/default.cu"
+            "sm_100a": "cuda/decode_balanced_hd64/default.cu",
+            "sm_103a": "cuda/decode_balanced_hd64/default.cu"
           }
         }
       ],
@@ -1977,8 +1977,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n32/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -2081,8 +2081,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n64/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -2195,8 +2195,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16q/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16q/default.cu"
+            "sm_100a": "cuda/decode_balanced_q16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_q16bit/default.cu"
           }
         }
       ],
@@ -2304,8 +2304,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16/default.cu"
+            "sm_100a": "cuda/decode_balanced_16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_16bit/default.cu"
           }
         }
       ],
@@ -2408,8 +2408,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16_mtp_n32/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16_mtp_n32/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -2512,8 +2512,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16_mtp_n64/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16_mtp_n64/default.cu"
+            "sm_100a": "cuda/decode_balanced_mtp/default.cu",
+            "sm_103a": "cuda/decode_balanced_mtp/default.cu"
           }
         }
       ],
@@ -2626,8 +2626,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16q/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16q/default.cu"
+            "sm_100a": "cuda/decode_balanced_q16bit/default.cu",
+            "sm_103a": "cuda/decode_balanced_q16bit/default.cu"
           }
         }
       ],
