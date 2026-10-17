@@ -16,6 +16,7 @@
 #include <flashinfer/gemm/w8a16_fp8_gemm_sm90.cuh>
 
 #include "tvm_ffi_utils.h"
+#include "w8a16_fp8_gemm_config.inc"
 
 using namespace flashinfer;
 
@@ -23,6 +24,8 @@ using namespace flashinfer;
 // `algo` is the Hopper variant code (0 = the launcher's cost model, 2.. = one CUTLASS
 // mixed-input variant; 1 is the retired hand-written kernel and is rejected; see
 // W8A16Sm90Algo and flashinfer.gemm.w8a16_fp8_gemm's `algo` argument).
+// The activation dtype is fixed per module (W8A16ActType, rendered from the Jinja config);
+// the Python side loads the module matching act.dtype.
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
                     ffi::Optional<TensorView> bias, ffi::Optional<TensorView> workspace,
                     int64_t algo) {
@@ -50,6 +53,8 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
       << "weight must be float8_e4m3fn";
   TVM_FFI_ICHECK(encode_dlpack_dtype(scale.dtype()) == float32_code) << "scale must be float32";
   TVM_FFI_ICHECK_EQ(scale.numel(), 1) << "scale is one per-tensor value";
+  TVM_FFI_ICHECK(encode_dlpack_dtype(act.dtype()) == W8A16_ACT_DTYPE_CODE)
+      << "this w8a16_fp8_gemm module was built for another activation dtype";
   TVM_FFI_ICHECK(out.dtype() == act.dtype()) << "out must have the activation dtype";
   TVM_FFI_ICHECK(M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX);
   TVM_FFI_ICHECK(K % 16 == 0) << "K must be a multiple of 16 (16-byte TMA rows of fp8), got " << K;
@@ -87,17 +92,14 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
       gemm::W8A16Sm90PickAlgo(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                               num_sms, static_cast<int>(algo));
 
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(act.dtype(), c_type, [&] {
-    const cudaError_t status = gemm::W8A16Fp8GemmSm90<c_type>(
-        variant, static_cast<const c_type*>(act.data_ptr()),
-        static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
-        static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
-        static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), ws_ptr, static_cast<size_t>(ws_bytes), device_id, num_sms, stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "w8a16_fp8_gemm failed with error code " << cudaGetErrorString(status);
-    return true;
-  });
+  const cudaError_t status = gemm::W8A16Fp8GemmSm90<W8A16ActType>(
+      variant, static_cast<const W8A16ActType*>(act.data_ptr()),
+      static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
+      static_cast<const float*>(scale.data_ptr()), static_cast<const W8A16ActType*>(bias_ptr),
+      static_cast<W8A16ActType*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
+      static_cast<int>(K), ws_ptr, static_cast<size_t>(ws_bytes), device_id, num_sms, stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "w8a16_fp8_gemm failed with error code " << cudaGetErrorString(status);
 }
 
 // Workspace (bytes) the chosen variant needs for this problem: the split-K fp32 partials
@@ -111,8 +113,9 @@ int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t 
   const gemm::W8A16Sm90Algo variant =
       gemm::W8A16Sm90PickAlgo(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                               num_sms, static_cast<int>(algo));
-  // Both activation dtypes share the mainloop / epilogue layout; bf16 sizes the workspace.
-  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm90WorkspaceBytes<__nv_bfloat16>(
+  // Both activation dtypes share the mainloop / epilogue layout, so the answer is the same
+  // from either dtype's module.
+  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm90WorkspaceBytes<W8A16ActType>(
       variant, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
       static_cast<int>(device_id), num_sms));
 }

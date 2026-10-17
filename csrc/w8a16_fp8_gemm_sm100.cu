@@ -16,13 +16,16 @@
 #include <flashinfer/gemm/w8a16_fp8_gemm_sm100.cuh>
 
 #include "tvm_ffi_utils.h"
+#include "w8a16_fp8_gemm_config.inc"
 
 using namespace flashinfer;
 
 // Blackwell (sm_100a) launcher: same contract as w8a16_fp8_gemm (csrc/w8a16_fp8_gemm.cu).
 // out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
-// `algo` is the tile code (0 = cost model, 1..4 = W8A16Sm100Tile); see
+// `algo` is the tile code (0 = cost model, 1.. = W8A16Sm100Tile); see
 // flashinfer.gemm.w8a16_fp8_gemm's `algo` argument.
+// The activation dtype is fixed per module (W8A16ActType, rendered from the Jinja config);
+// the Python side loads the module matching act.dtype.
 void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorView scale,
                     ffi::Optional<TensorView> bias, ffi::Optional<TensorView> workspace,
                     int64_t algo) {
@@ -49,6 +52,8 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
       << "weight must be float8_e4m3fn";
   TVM_FFI_ICHECK(encode_dlpack_dtype(scale.dtype()) == float32_code) << "scale must be float32";
   TVM_FFI_ICHECK_EQ(scale.numel(), 1) << "scale is one per-tensor value";
+  TVM_FFI_ICHECK(encode_dlpack_dtype(act.dtype()) == W8A16_ACT_DTYPE_CODE)
+      << "this w8a16_fp8_gemm module was built for another activation dtype";
   TVM_FFI_ICHECK(out.dtype() == act.dtype()) << "out must have the activation dtype";
   TVM_FFI_ICHECK(M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX);
   TVM_FFI_ICHECK(K % 16 == 0) << "K must be a multiple of 16 (16-byte TMA rows of fp8)";
@@ -81,17 +86,14 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
   ffi::CUDADeviceGuard device_guard(device_id);
   const cudaStream_t stream = get_stream(act.device());
 
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(act.dtype(), c_type, [&] {
-    cudaError_t status = gemm::W8A16Fp8GemmSm100<c_type>(
-        static_cast<const c_type*>(act.data_ptr()),
-        static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
-        static_cast<const float*>(scale.data_ptr()), static_cast<const c_type*>(bias_ptr),
-        static_cast<c_type*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
-        static_cast<int>(K), ws_ptr, ws_bytes, device_id, num_sms, stream, static_cast<int>(algo));
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "w8a16_fp8_gemm (sm100) failed with error code " << cudaGetErrorString(status);
-    return true;
-  });
+  const cudaError_t status = gemm::W8A16Fp8GemmSm100<W8A16ActType>(
+      static_cast<const W8A16ActType*>(act.data_ptr()),
+      static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
+      static_cast<const float*>(scale.data_ptr()), static_cast<const W8A16ActType*>(bias_ptr),
+      static_cast<W8A16ActType*>(out.data_ptr()), static_cast<int>(M), static_cast<int>(N),
+      static_cast<int>(K), ws_ptr, ws_bytes, device_id, num_sms, stream, static_cast<int>(algo));
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "w8a16_fp8_gemm (sm100) failed with error code " << cudaGetErrorString(status);
 }
 
 // Workspace (bytes) the CUTLASS kernel needs for this problem; 0 for the persistent scheduler.
@@ -99,8 +101,9 @@ int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t 
                                        int64_t algo) {
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
-  // Both activation dtypes share the mainloop/epilogue layout; bf16 sizes the workspace.
-  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm100WorkspaceBytes<__nv_bfloat16>(
+  // Both activation dtypes share the mainloop/epilogue layout, so the answer is the same
+  // from either dtype's module.
+  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm100WorkspaceBytes<W8A16ActType>(
       static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), static_cast<int>(device_id),
       num_sms, static_cast<int>(algo)));
 }

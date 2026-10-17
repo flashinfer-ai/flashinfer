@@ -145,6 +145,11 @@ def test_w8a16_fp8_gemm_caller_workspace():
     assert (
         w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) == need
     )  # pure in its inputs
+    # Same answer from the fp16 module: the size does not depend on the activation dtype.
+    assert (
+        w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo, act_dtype=torch.float16)
+        == need
+    )
     ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
     ws = torch.full(
         (need + 1000,), 0x7F, dtype=torch.uint8, device=dev

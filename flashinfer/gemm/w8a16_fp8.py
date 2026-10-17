@@ -28,21 +28,27 @@ from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
-def _get_module_for_major(major: int):
+def _get_module(major: int, act_dtype: torch.dtype):
     if major == 9:
-        return gen_w8a16_fp8_gemm_module().build_and_load()
+        return gen_w8a16_fp8_gemm_module(act_dtype).build_and_load()
     if major == 10:
-        return gen_w8a16_fp8_gemm_sm100_module().build_and_load()
+        return gen_w8a16_fp8_gemm_sm100_module(act_dtype).build_and_load()
     raise RuntimeError(
         f"w8a16_fp8_gemm needs Hopper (sm_90a) or Blackwell (sm_100a), got SM {major}x"
     )
 
 
-def get_w8a16_fp8_gemm_module(device: Optional[torch.device] = None):
-    """Kernel module for ``device`` (current device when omitted): Hopper or Blackwell build."""
+def get_w8a16_fp8_gemm_module(
+    device: Optional[torch.device] = None, act_dtype: torch.dtype = torch.bfloat16
+):
+    """Kernel module for ``device`` (current device when omitted) and activation dtype.
+
+    One JIT module per (architecture, activation dtype): Hopper or Blackwell build,
+    fp16 or bf16.  The first call for a pair compiles it; the other dtype is never
+    compiled unless used."""
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    return _get_module_for_major(get_compute_capability(device)[0])
+    return _get_module(get_compute_capability(device)[0], act_dtype)
 
 
 @register_custom_op("flashinfer::w8a16_fp8_gemm", mutates_args=("out",))
@@ -55,7 +61,7 @@ def _w8a16_fp8_gemm_impl(
     workspace: Optional[torch.Tensor],
     algo: int,
 ) -> None:
-    get_w8a16_fp8_gemm_module(act.device).w8a16_fp8_gemm(
+    get_w8a16_fp8_gemm_module(act.device, act.dtype).w8a16_fp8_gemm(
         out, act, weight, weight_scale, bias, workspace, algo
     )
 
@@ -74,11 +80,16 @@ def _w8a16_fp8_gemm_impl_fake(
 
 
 @functools.cache
-def _workspace_bytes(m: int, n: int, k: int, device_index: int, algo: int) -> int:
-    """Bytes of workspace this problem needs on this device (0 = none)."""
+def _workspace_bytes(
+    m: int, n: int, k: int, device_index: int, algo: int, act_dtype: torch.dtype
+) -> int:
+    """Bytes of workspace this problem needs on this device (0 = none).
+
+    The size does not depend on the activation dtype; ``act_dtype`` only picks
+    which module answers, so the GEMM call never loads a second one."""
     return int(
         get_w8a16_fp8_gemm_module(
-            torch.device("cuda", device_index)
+            torch.device("cuda", device_index), act_dtype
         ).w8a16_fp8_gemm_workspace_bytes(m, n, k, device_index, algo)
     )
 
@@ -89,6 +100,7 @@ def w8a16_fp8_gemm_workspace_bytes(
     k: int,
     device: Optional[torch.device] = None,
     algo: Optional[str] = None,
+    act_dtype: torch.dtype = torch.bfloat16,
 ) -> int:
     """Workspace bytes :func:`w8a16_fp8_gemm` needs for an ``[M, K] x [N, K]`` problem.
 
@@ -98,11 +110,15 @@ def w8a16_fp8_gemm_workspace_bytes(
     (the product of ``act``'s leading dimensions).  The answer depends on the
     device (SM count) and on ``algo`` exactly as the launch does, so size the
     buffer with the arguments you will call with; a caller serving several
-    shapes from one buffer takes the maximum over them.
+    shapes from one buffer takes the maximum over them.  The size is the same
+    for fp16 and bf16; ``act_dtype`` only selects which JIT module answers
+    (pass the dtype you will call with to avoid compiling the other one).
     """
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    return _workspace_bytes(m, n, k, device.index or 0, _algo_code(algo, device))
+    return _workspace_bytes(
+        m, n, k, device.index or 0, _algo_code(algo, device), act_dtype
+    )
 
 
 # Blackwell kernel variants selectable through ``algo``.  The codes are the
@@ -228,7 +244,10 @@ def w8a16_fp8_gemm(
     -----
     Hopper (``sm_90a``: wgmma + TMA) and Blackwell (``sm_100a``: tcgen05 + TMA,
     a FlashInfer fork of CUTLASS's mixed-input mainloop); JIT-compiled on
-    first use, not part of the AOT packages.  ``K`` must be a multiple of 16
+    first use, not part of the AOT packages.  One module per architecture and
+    activation dtype (the dtype is rendered through a Jinja config header), so
+    the first bf16 call compiles only the bf16 variants and the first fp16 call
+    only the fp16 ones.  ``K`` must be a multiple of 16
     and ``N`` a multiple of 8 (16-byte TMA rows), and ``act`` / ``weight`` /
     ``out`` 16-byte aligned; anything else is rejected with a ValueError
     before launch.  A non-contiguous ``act`` is copied to a contiguous buffer
@@ -283,7 +302,9 @@ def w8a16_fp8_gemm(
     out2d = out.view(-1, n)
     # Under-filled grids run split-K through an fp32 workspace; the kernel
     # decides, this only sizes the buffer (0 bytes = single pass).
-    ws_bytes = _workspace_bytes(act2d.shape[0], n, k, act.device.index or 0, algo_code)
+    ws_bytes = _workspace_bytes(
+        act2d.shape[0], n, k, act.device.index or 0, algo_code, act.dtype
+    )
     if ws_bytes == 0:
         ws = None
     elif workspace is None:

@@ -73,6 +73,24 @@ split into `w8a16_sm90/{convert,scheduler,tile_order,gemm,dispatch}.hpp` and
 `w8a16_sm100/{convert,tile_order,gemm,dispatch}.hpp` (next to the forked CUTLASS files);
 `w8a16_fp8_gemm_sm90.cuh` / `_sm100.cuh` are now one-include umbrellas.  Kernel code unchanged.
 
+**Versions H11 / B19 (Sat 17 Oct 2026): one JIT module per activation dtype.**  The launcher's
+activation type comes from a Jinja-rendered `w8a16_fp8_gemm_config.inc`
+(`csrc/w8a16_fp8_gemm_config.jinja`), so the module `w8a16_fp8_gemm_{bf16,f16}` (Hopper) /
+`w8a16_fp8_gemm_sm100_{bf16,f16}` (Blackwell) instantiates only its own dtype's kernel variants;
+the runtime dtype switch in the launcher is gone and a module rejects the other dtype.
+`w8a16_fp8_gemm_workspace_bytes` takes `act_dtype=` so a caller never loads a second module just
+to size a buffer.  Cold first-call compile (cache wiped, `--threads=1`, one `.cu` per module):
+
+| node | old module, both dtypes | new module, one dtype |
+|---|---|---|
+| B200 (umb-b200-263) | 85 s | 69.0 s (bf16), 68.4 s (fp16) |
+| H100 (viking-prod-233) | 105-123 s | 88.6 s (bf16), 88.6 s (fp16) |
+
+About 20% off, not the 50% the instantiation count suggests: most of the time is the fixed
+cost of parsing the CUTLASS headers once per translation unit, which the dtype split does not
+touch.  The remaining lever is one translation unit per kernel variant (10 on Hopper, 7 on
+Blackwell) so ninja compiles them in parallel; not done.
+
 Historical knob table (version 37, the retired hand kernel):
 
 | Variable | Effect |
