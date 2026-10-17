@@ -2926,3 +2926,115 @@ def test_attention_ts_mla_decode_runtime_k_pruning_product(
         case,
         expected_b200={"kernel": expected_kernel},
     )
+
+
+# Triggers its dependents first, spins, and only then copies the real query into
+# the buffer MLA decode reads, so a decode kernel that reads Q before the
+# preceding grid has completed sees the NaN left in the buffer.
+_PDL_EARLY_TRIGGER_PRIMARY_CUDA = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+__global__ void trigger_then_copy_kernel(uint8_t* dst, const uint8_t* src, int64_t n,
+                                         int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += stride) {
+    dst[i] = src[i];
+  }
+}
+
+void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, int64_t spin_cycles) {
+  TORCH_CHECK(dst.numel() * dst.element_size() == src.numel() * src.element_size());
+  trigger_then_copy_kernel<<<132, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      static_cast<uint8_t*>(dst.data_ptr()), static_cast<const uint8_t*>(src.data_ptr()),
+      dst.numel() * dst.element_size(), spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+@pytest.mark.parametrize(
+    ("num_qo_heads", "expected_kernel"),
+    (
+        pytest.param(16, "throughput_latency_1cta", id="1cta"),
+        pytest.param(128, "throughput_2cta", id="2cta"),
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_split_kv_waits_for_early_triggering_predecessor(
+    num_qo_heads: int,
+    expected_kernel: str,
+):
+    """A split-KV call must not read Q before the preceding grid has completed,
+    even when that grid executes griddepcontrol.launch_dependents early."""
+
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = torch.cuda.get_device_capability()
+    primary = load_inline(
+        name="test_attention_ts_mla_pdl_early_trigger_primary",
+        cpp_sources=[
+            "void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, "
+            "int64_t spin_cycles);"
+        ],
+        cuda_sources=[_PDL_EARLY_TRIGGER_PRIMARY_CUDA],
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        ],
+        functions=["pdl_early_trigger_copy"],
+        verbose=False,
+    )
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=32768,
+        qkv_dtype=torch.bfloat16,
+        page_size=64,
+        device="cuda",
+        seed=41000 + num_qo_heads,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {"kernel": expected_kernel},
+        device=case.query.device,
+    )
+    assert int(policy["split_kv"]) > 1
+
+    real_query = case.query
+    query_buffer = torch.empty_like(real_query)
+    staged = replace(case, query=query_buffer)
+    output = torch.empty(
+        (*real_query.shape[:3], _LATENT_DIM),
+        dtype=case.output_dtype,
+        device=real_query.device,
+    )
+    # Warm up so compilation does not run between the primary and the decode.
+    query_buffer.copy_(real_query)
+    _run_case(wrapper, staged, out=output, validate=False)
+    torch.cuda.synchronize()
+    _assert_case_correct(output, case, policy)
+
+    for _ in range(5):
+        query_buffer.fill_(float("nan"))
+        output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        primary.pdl_early_trigger_copy(query_buffer, real_query, 20_000_000)
+        _run_case(wrapper, staged, out=output, validate=False)
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all(), (
+            "MLA decode read Q before the preceding kernel wrote it"
+        )
+        _assert_case_correct(output, case, policy)
