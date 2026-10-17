@@ -39,6 +39,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from ..api_logging import flashinfer_api
 from ..jit.fp4_allreduce import (
     CAPACITY,
     FAMILIES,
@@ -465,6 +466,7 @@ def _output(
     return out
 
 
+@flashinfer_api
 def fp4_allreduce(
     x: torch.Tensor,
     workspace: Fp4AllReduceWorkspace,
@@ -515,6 +517,7 @@ def fp4_allreduce(
     return out
 
 
+@flashinfer_api
 def fp4_allreduce_nvfp4(
     records: torch.Tensor,
     global_scales: torch.Tensor,
@@ -793,6 +796,7 @@ def _launch_fused(
     )
 
 
+@flashinfer_api
 def fp4_allreduce_rmsnorm(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -858,6 +862,7 @@ def fp4_allreduce_rmsnorm(
     )
 
 
+@flashinfer_api
 def fp4_allreduce_rmsnorm_nvfp4(
     records: torch.Tensor,
     global_scales: torch.Tensor,
@@ -871,10 +876,41 @@ def fp4_allreduce_rmsnorm_nvfp4(
 ) -> Fp4AllReduceFusedNormResult:
     """Sum pre-quantised NVFP4 records, add ``residual`` and apply the RMSNorm of ``spec`` (bfloat16 output).
 
-    ``records`` and ``global_scales`` are as in :func:`fp4_allreduce_nvfp4`; the
-    delivered programs produce the bfloat16 output for this input, so
-    ``spec.output`` must be ``Fp4AllReduceFusedNormOutput.BF16``.  The other
-    parameters and the result are those of :func:`fp4_allreduce_rmsnorm`.
+    The sum is the rank-order sum of the decoded records (as
+    :func:`fp4_allreduce_nvfp4`), kept in float32: ``z = sum + residual``,
+    ``residual_out = bf16(z)``, ``y = z * rsqrt(mean(z^2) + eps) * (1 + weight)``.
+    The delivered programs produce the bfloat16 output for this input, so
+    ``spec.output`` must be ``Fp4AllReduceFusedNormOutput.BF16``.
+
+    Parameters
+    ----------
+    records : torch.Tensor
+        Contiguous uint8 ``[rows, 3456]`` records of this rank, encoded as for
+        :func:`fp4_allreduce_nvfp4`; ``rows`` is a multiple of 4, at most the
+        workspace capacity and the same on every rank.
+    global_scales : torch.Tensor
+        Contiguous float32 ``[world_size]`` tensor holding the static scale of
+        every rank's records; identical on every rank.
+    residual : torch.Tensor
+        Contiguous bfloat16 ``[rows, 6144]`` residual stream of this rank (the
+        same tensor on every rank gives rank-identical outputs).
+    spec : Fp4AllReduceFusedNormSpec
+        Weight, eps and output precision (``BF16`` for this input).
+    workspace : Fp4AllReduceWorkspace
+        The collective workspace of the group (family ``"rmsnorm"``).
+    out : torch.Tensor, optional
+        Bfloat16 output buffer ``[rows, 6144]``.
+    residual_out : torch.Tensor, optional
+        Bfloat16 ``[rows, 6144]`` buffer for the summed residual; must not alias
+        ``residual``.
+    launch_with_pdl : bool
+        Launch with the programmatic-stream-serialization attribute.
+
+    Returns
+    -------
+    Fp4AllReduceFusedNormResult
+        The output tensors (``residual_out`` and the bfloat16 ``out``: the given
+        buffers, or freshly allocated ones), as for :func:`fp4_allreduce_rmsnorm`.
     """
     _check_workspace(workspace, "rmsnorm")
     _check_records(records, global_scales, workspace)
