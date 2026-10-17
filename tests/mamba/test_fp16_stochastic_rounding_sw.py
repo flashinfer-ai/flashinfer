@@ -1,4 +1,4 @@
-"""FP16 software stochastic rounding, including values missed by normal sampling."""
+"""FP16 software rounding and hardware-wrapper parity on supported GPUs."""
 
 import pathlib
 
@@ -6,11 +6,20 @@ import pytest
 import torch
 from torch.utils.cpp_extension import load_inline
 
+from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
+
 
 @pytest.fixture(scope="module")
 def fp16_sr_sw():
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA")
+    cuda_flags = ["--expt-relaxed-constexpr"]
+    if is_cvt_rs_supported(torch.device("cuda")):
+        major, minor = get_compute_capability(torch.device("cuda"))
+        # The architecture-specific target enables the native wrapper paths.
+        cuda_flags.append(
+            f"-gencode=arch=compute_{major}{minor}a,code=sm_{major}{minor}a"
+        )
     return load_inline(
         name="test_fp16_sr_sw_subnormals",
         cpp_sources="torch::Tensor convert(torch::Tensor x, torch::Tensor noise, int mode);",
@@ -49,15 +58,13 @@ torch::Tensor convert(torch::Tensor x, torch::Tensor noise, int mode) {
         extra_include_paths=[
             str(pathlib.Path(__file__).resolve().parents[2] / "include")
         ],
-        extra_cuda_cflags=["--expt-relaxed-constexpr"],
+        extra_cuda_cflags=cuda_flags,
         verbose=False,
     )
 
 
 @pytest.fixture(params=[0, 1, 2], ids=["software", "scalar", "packed"])
 def conversion_mode(request):
-    if request.param and torch.cuda.get_device_capability()[0] == 10:
-        pytest.skip("Wrapper may use hardware cvt.rs on SM10x")
     return request.param
 
 
