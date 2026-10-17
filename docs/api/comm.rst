@@ -559,8 +559,8 @@ Fused QKV Projection + Norm + RoPE + Head Exchange
 sequence-parallel (Ulysses) layer into one prepared session: the BF16 QKV
 projection, per-head RMSNorm of Q and K (one ``[D]`` scale each), interleaved
 RoPE from a per-token ``[rows, D]`` cos/sin table, and the head exchange.  The
-Cake backend (``backend="nvlink"``; SM90, SM100 and SM103, single-node NVLink
-groups of 2, 4 or 8 ranks, ``head_dim=128``, BF16) stores every destination's
+Cake backend (``backend="nvlink"``; SM90, SM100, SM103 and SM107, single-node NVLink
+groups of 2, 4 or 8 ranks (2 or 4 on SM107), ``head_dim=128``, BF16) stores every destination's
 head band straight from the GEMM epilogue into that rank's symmetric receive
 slot and publishes per-chunk readiness words, so the exchange overlaps the
 projection instead of following it; a one-CTA wait kernel on a consumer stream
@@ -587,7 +587,7 @@ The producer build is selected per architecture and world size
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
 operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
 build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; groups of 2 ranks and SM90 run the baseline build.  Every build
+``ow256``; groups of 2 ranks, SM90 and SM107 run the baseline build.  Every build
 stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
 and norm-weight tensors (a misaligned view raises and names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
@@ -599,7 +599,7 @@ delivered ones.  The host plan's group scaling follows the same keying
 groups of 4 and 2 ranks and on SM103 every group size double the token-tile
 group of a grouped row whose hidden size is at least 6144 (the tile order
 changes, every destination element is still written once); SM100 groups of 8
-ranks and SM90 keep the baseline plan.  ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE``
+ranks, SM90 and SM107 keep the baseline plan.  ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE``
 (``auto`` / ``1`` / ``2`` / ``4``) overrides it per session, rank-uniformly.
 
 Per-architecture row-count gates shape each call's host plan: on SM100 and
@@ -608,7 +608,7 @@ destination, and a call with at least 16384 rows per rank launches the producer
 once per destination run of its tile table (the first launch carrying the
 folded rendezvous); on SM90 a call with at least 16384 rows per rank runs the
 persistent producer grid over every SM (no reserved SMs) and the other two gates
-are off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
+are off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
 (``auto`` / ``off`` /
 ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``)
 overrides them per session, rank-uniformly; ``describe()`` reports the resolved
