@@ -44,11 +44,12 @@
 #define SMEM_SMEM_SFB_STRIDE 512
 #define SMEM_TOTAL 213376
 #define THREADS 256
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles, CakeFastDivmod SCHED_DIV, CakeFastDivmod TAIL_DIV)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_deepgemm_mixed_gemm_b50e49418a858200ba74(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles, CakeFastDivmod SCHED_DIV, CakeFastDivmod TAIL_DIV)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -81,16 +82,16 @@ kernel_cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d(const __grid_constant__ CUt
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
-    const int epi_addr = smem + 0;
-    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 8192);
-    const int smem_a_addr = smem + 8192;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 38912);
-    const int smem_b_addr = smem + 38912;
-    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 202752);
-    const int smem_sfa_addr = smem + 202752;
-    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 207872);
-    const int smem_sfb_addr = smem + 207872;
+    __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_OFF);
+    const int epi_addr = smem + SMEM_EPI_OFF;
+    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
+    const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
+    const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFA_OFF);
+    const int smem_sfa_addr = smem + SMEM_SMEM_SFA_OFF;
+    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFB_OFF);
+    const int smem_sfb_addr = smem + SMEM_SMEM_SFB_OFF;
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
@@ -103,47 +104,22 @@ kernel_cake_deepgemm_mixed_gemm_ac5a27628d43b5aec93d(const __grid_constant__ CUt
     // Mbarriers at smem_raw[212992..213280)
 
     if (warp == 1) {
-        uint32_t leader = elect_sync();
-        if (leader) {
-            // Stage-major initialization across barrier declarations.
-            mbarrier_init(smem + 212992, 66);
-            mbarrier_init(smem + 213072, 1);
-            mbarrier_init(smem + 213152, 1);
-            mbarrier_init(smem + 213232, 1);
-            mbarrier_init(smem + 213248, 256);
-            mbarrier_init(smem + 213264, 256);
-            mbarrier_init(smem + 213000, 66);
-            mbarrier_init(smem + 213080, 1);
-            mbarrier_init(smem + 213160, 1);
-            mbarrier_init(smem + 213240, 1);
-            mbarrier_init(smem + 213256, 256);
-            mbarrier_init(smem + 213272, 256);
-            mbarrier_init(smem + 213008, 66);
-            mbarrier_init(smem + 213088, 1);
-            mbarrier_init(smem + 213168, 1);
-            mbarrier_init(smem + 213016, 66);
-            mbarrier_init(smem + 213096, 1);
-            mbarrier_init(smem + 213176, 1);
-            mbarrier_init(smem + 213024, 66);
-            mbarrier_init(smem + 213104, 1);
-            mbarrier_init(smem + 213184, 1);
-            mbarrier_init(smem + 213032, 66);
-            mbarrier_init(smem + 213112, 1);
-            mbarrier_init(smem + 213192, 1);
-            mbarrier_init(smem + 213040, 66);
-            mbarrier_init(smem + 213120, 1);
-            mbarrier_init(smem + 213200, 1);
-            mbarrier_init(smem + 213048, 66);
-            mbarrier_init(smem + 213128, 1);
-            mbarrier_init(smem + 213208, 1);
-            mbarrier_init(smem + 213056, 66);
-            mbarrier_init(smem + 213136, 1);
-            mbarrier_init(smem + 213216, 1);
-            mbarrier_init(smem + 213064, 66);
-            mbarrier_init(smem + 213144, 1);
-            mbarrier_init(smem + 213224, 1);
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        // --- pipeline 'pipe' ---
+        // full: 10 barriers, init_count=66
+        // sf_full: 10 barriers, init_count=1
+        // empty: 10 barriers, init_count=1
+        // --- pipeline 'epi_pipe' ---
+        // tmem_full: 2 barriers, init_count=1
+        // tmem_empty: 2 barriers, init_count=256
+        // tmem_overlap: 2 barriers, init_count=256
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_1_0 = 1;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(10), "r"((uint32_t)(66)));
+        mbarrier_init(smem + 212992 + lane * 8, _mbarrier_init_count_1_0);
+        if (lane < 4) {
+            mbarrier_init(smem + 213248 + lane * 8, 256);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");

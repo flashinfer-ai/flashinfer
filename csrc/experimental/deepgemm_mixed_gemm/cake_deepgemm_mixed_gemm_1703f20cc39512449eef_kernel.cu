@@ -47,8 +47,8 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(256) __cluster_dims__(2,1,1) void
-kernel_cake_deepgemm_mixed_gemm_215099de8776807fb433(const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles)
+__global__ __launch_bounds__(THREADS) __cluster_dims__(2,1,1) void
+kernel_cake_deepgemm_mixed_gemm_1703f20cc39512449eef(const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -80,16 +80,16 @@ kernel_cake_deepgemm_mixed_gemm_215099de8776807fb433(const __grid_constant__ CUt
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_a_addr = smem + 1024;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 17408);
-    const int smem_b_addr = smem + 17408;
-    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 31744);
-    const int smem_sfa_addr = smem + 31744;
-    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 32256);
-    const int smem_sfb_addr = smem + 32256;
-    __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 194560);
-    const int epi_staging_addr = smem + 194560;
+    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
+    const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
+    const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFA_OFF);
+    const int smem_sfa_addr = smem + SMEM_SMEM_SFA_OFF;
+    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFB_OFF);
+    const int smem_sfb_addr = smem + SMEM_SMEM_SFB_OFF;
+    __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_STAGING_OFF);
+    const int epi_staging_addr = smem + SMEM_EPI_STAGING_OFF;
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 

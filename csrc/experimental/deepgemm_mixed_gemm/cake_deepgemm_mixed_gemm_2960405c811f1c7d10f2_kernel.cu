@@ -44,11 +44,12 @@
 #define SMEM_SMEM_SFB_STRIDE 512
 #define SMEM_TOTAL 212224
 #define THREADS 256
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles, CakeFastDivmod SCHED_DIV, CakeFastDivmod TAIL_DIV)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles, CakeFastDivmod SCHED_DIV, CakeFastDivmod TAIL_DIV)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -81,16 +82,16 @@ kernel_cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e(const __grid_constant__ CUt
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
-    const int epi_addr = smem + 0;
-    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 32768);
-    const int smem_a_addr = smem + 32768;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 147456);
-    const int smem_b_addr = smem + 147456;
-    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 204800);
-    const int smem_sfa_addr = smem + 204800;
-    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 208384);
-    const int smem_sfb_addr = smem + 208384;
+    __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_OFF);
+    const int epi_addr = smem + SMEM_EPI_OFF;
+    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
+    const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
+    const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFA_OFF);
+    const int smem_sfa_addr = smem + SMEM_SMEM_SFA_OFF;
+    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFB_OFF);
+    const int smem_sfb_addr = smem + SMEM_SMEM_SFB_OFF;
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
@@ -137,7 +138,8 @@ kernel_cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e(const __grid_constant__ CUt
         }
     }
 
-    __syncwarp();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 264 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 212184);
@@ -147,12 +149,13 @@ kernel_cake_deepgemm_mixed_gemm_7c41f9e1650b40806f5e(const __grid_constant__ CUt
         __syncwarp();
     }
 
-    __syncthreads();
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    // Partial post-allocation TMEM rendezvous (224 threads on named barrier 9)
+    if (warp >= 1 && warp <= 7) {
+        asm volatile("barrier.sync.aligned %0, %1;" :: "r"(9), "r"(224) : "memory");
+        asm volatile("tcgen05.fence::after_thread_sync;");
+    }
 
-    const int taddr = tmem_addr_storage[0];
+    const int taddr = (warp >= 1 && warp <= 7) ? tmem_addr_storage[0] : 0;
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
