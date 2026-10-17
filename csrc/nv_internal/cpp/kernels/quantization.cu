@@ -340,7 +340,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
       encode_func(&tensor_map, data_type, rank, global_address, gmem_dim, stride_in_bytes, smem_dim,
                   elem_strides, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
                   CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Failed to encode TMA tensor map");
   return tensor_map;
 }
@@ -429,6 +429,16 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
+
+// Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
+// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). The
+// grid spans row tiles only, so wide inputs with few rows stay on the vectorized kernel.
+template <typename T>
+bool useTmaQuantization(int b, int m, int n) {
+  constexpr int64_t kMinTmaInputBytes = 32ll << 20;
+  return m >= 1024 && n % TmaKernelTraits<T>::TMA_COL_CHUNK == 0 &&
+         static_cast<int64_t>(b) * m * n * sizeof(T) >= kMinTmaInputBytes;
+}
 
 // Helper function to launch TMA quantization kernel
 template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_SIZE>
@@ -525,11 +535,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   // recipe was always silently ignored there. Python rejects an explicit one.
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-    // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (useTmaQuantization<T>(b, m, n)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE,
@@ -537,7 +545,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
-    // Original non-TMA path for small m or SF_VEC_SIZE != 16
+    // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 16 values.
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
@@ -563,11 +571,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   } else
 #endif
   {
-    // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (useTmaQuantization<T>(b, m, n)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, recipe.use4Over6, inverse_scale,
@@ -576,7 +582,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
-    // Original non-TMA path for small m or SF_VEC_SIZE != 16
+    // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 8 values.
     dim3 block(std::min(int(n / CVT_FP16_TO_FP4_ELTS_PER_THREAD), 512));
