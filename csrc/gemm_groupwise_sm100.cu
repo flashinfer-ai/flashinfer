@@ -115,8 +115,24 @@ void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorVi
               const int k = static_cast<int>(A.size(1));
 
               cudaError_t status;
+              // The small-batch (low-latency) kernel computes D^T = B^T @ A^T so it can use a
+              // 16-wide N tile instead of wasting a 128-wide M tile on m <= 32 rows. That swap
+              // also mirrors the blockwise scale granularities: the per-token (granularity-1)
+              // scale of A becomes a granularity-1 scale along N, i.e. the CUTLASS collective
+              // runs with ScaleMsPerTile == 1 and ScaleNsPerTile == 16 instead of the usual
+              // ScaleMsPerTile == 128 / ScaleNsPerTile == 1.
+              //
+              // That mirrored configuration races in the CUTLASS SM100 blockwise-scaling
+              // mainloop's cp.async scale-factor pipeline: roughly 0.3% of launches consume one
+              // scale-factor column before its cp.async has landed, which corrupts exactly one
+              // output row of one N tile (see flashinfer-ai/flashinfer#4396 - reproduced on
+              // SM103/GB300 for m in [24, 32], never reproduced through the general kernel on
+              // identical inputs). Take the general kernel until CUTLASS is fixed; re-enabling is
+              // a one-line change here once it is.
+              constexpr bool kEnableLowLatencySmallBatch = false;
               // Small-batch-size kernel is not compatible with (scale_granularity_m=128).
-              constexpr bool can_use_small_batch = (SCALE_GRANULARITY_M == 1);
+              constexpr bool can_use_small_batch =
+                  kEnableLowLatencySmallBatch && (SCALE_GRANULARITY_M == 1);
               if (can_use_small_batch && m <= 32) {
                 status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100LowLatency<
                     SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
