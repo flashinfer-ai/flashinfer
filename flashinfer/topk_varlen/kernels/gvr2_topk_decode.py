@@ -1561,13 +1561,13 @@ class GvrMainKernel:
         assert self.ck_off % 16 == 0, "ck64 must stay 16B aligned (ulonglong2)"
         self.dyn_bytes = self.ck_off + (self.cmpb + 1) * 8
         self.lb = self.nbs.bit_length() - 1  # log2(NBS)=8
-        # In-kernel register path (FlashInfer-local, decode, 1024 threads). Under
+        # In-kernel register path (FlashInfer-local, decode, 512/1024 threads). Under
         # a CUDA graph the launch is planned for the capacity, so this streaming
         # kernel gets rows far shorter than that, which the register family ranks
         # ~2x faster. With reg_vpt > 0, a row of at most BLK * reg_vpt * 4 columns
         # (short rows included) runs that family's body (GvrTopkRegKernel.row_topk)
         # on its own CTA instead of streaming: the narrowest of VPT 2 and VPT 4
-        # that holds it (the rungs route() picks for this CTA shape, NBH 2048), as
+        # that holds it (the rungs route() picks for this CTA shape, NBH 2 * BLK), as
         # SGLang's topk_v2 picks Register2 / Register4 per row. The kernel takes
         # that branch as soon as it knows the row's length and then exits, so the
         # smem window can start at the smem base and the streaming body never sees
@@ -1575,8 +1575,8 @@ class GvrMainKernel:
         self.reg_vpt = int(reg_vpt)
         self.regs = []  # (row capacity, embedded body, smem window bytes), narrowest first
         if self.reg_vpt:
-            assert self.varlen and not self.prefill and blk == 1024 and self.reg_vpt in (2, 4)
-            nbh = 2 * NB__reg
+            assert self.varlen and not self.prefill and blk in (512, 1024) and self.reg_vpt in (2, 4)
+            nbh = 2 * blk
             for vpt in (2, 4)[: self.reg_vpt // 2]:
                 cap = blk * vpt * 4
                 # page-table entries a register row can span (the reg family's rule)
@@ -1602,8 +1602,9 @@ class GvrMainKernel:
                     page_shift=self.page_shift,
                     pt_smem=reg_pt,
                     # staged emit for one-wave launches (_reg_stage_out): 1024-thread
-                    # main is one wave by construction (rows * R <= 148)
-                    stage_out=True,
+                    # main is one wave by construction (rows * R <= 148); 512-thread
+                    # main serves more rows than SMs
+                    stage_out=blk == 1024,
                     embedded=True,
                 )
                 win = STATIC_BYTES + (nbh + 2 * REG_CMP) * 4 + 4 * reg_pt
@@ -1731,7 +1732,7 @@ class GvrMainKernel:
             smem_bytes = smem_bytes + k * cutlass.Int32(4)
         # n = the row's own length: the body's prologue clamps to it and its
         # envelope-bounded early load reads exactly the row. QC: the O(mc^2)
-        # rank gate route() gives these rungs while one wave.
+        # rank gate route() gives these rungs (QUADC while one wave, 1024 above).
         body.row_topk(
             logits,
             pre_idx,
@@ -1739,7 +1740,7 @@ class GvrMainKernel:
             out,
             n_row,
             cutlass.Int32(REG_CMP),
-            cutlass.Int32(QUADC),
+            cutlass.Int32(QUADC if self.blk == 1024 else 1024),
             smem_bytes,
             row,
             sbase,
