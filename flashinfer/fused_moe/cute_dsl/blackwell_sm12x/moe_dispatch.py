@@ -1112,15 +1112,17 @@ def _get_weight_views(
             f"for the SM120 MoE block-scale branches and padded operands."
         )
 
+    # The alphas stay out of the key and the cached value: the functional
+    # path folds input_global_scale into a fresh w1_alpha on every call, and
+    # a cached reference to it would pin the tensor whose finalizer evicts
+    # the entry, so every call would add an entry that is never removed.
     key = (
         activation_precision,
         quant_mode,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
-        w1_alphas.data_ptr(),
         w2_fp4.data_ptr(),
         w2_blockscale.data_ptr(),
-        w2_alphas.data_ptr(),
         bool(source_scales),
     )
     n_true = n if intermediate_size is None else int(intermediate_size)
@@ -1137,7 +1139,7 @@ def _get_weight_views(
     cached = _WEIGHT_CACHE.get(key)
     if cached is None:
         _refuse_during_capture("the converted block-scale views")
-        # Cache the fresh buffers (scale factors + fp32 alphas).
+        # Cache the converted scale factors.
         # Rows / reduction extent the scale layout describes: the padded n (2*n
         # gated, n otherwise), or the true extent when the static kernel reads
         # the source layout (the 6D MMA view is a permutation of the caller's
@@ -1159,21 +1161,15 @@ def _get_weight_views(
                 num_groups=w2_fp4.shape[0],
                 sf_vec_size=sf_vec_size,
             ).contiguous(),
-            w1_alphas.contiguous().to(torch.float32),
-            w2_alphas.contiguous().to(torch.float32),
         )
         _WEIGHT_CACHE[key] = cached
         _register_cache_eviction(
-            _WEIGHT_CACHE,
-            key,
-            w1_fp4,
-            w1_blockscale,
-            w1_alphas,
-            w2_fp4,
-            w2_blockscale,
-            w2_alphas,
+            _WEIGHT_CACHE, key, w1_fp4, w1_blockscale, w2_fp4, w2_blockscale
         )
-    w13_sf_contiguous, down_sf_contiguous, w1_alpha, w2_alpha = cached
+    w13_sf_contiguous, down_sf_contiguous = cached
+    # No-op (same tensor) for the usual fp32 contiguous alphas.
+    w1_alpha = w1_alphas.contiguous().to(torch.float32)
+    w2_alpha = w2_alphas.contiguous().to(torch.float32)
 
     # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy).
     if padded_fp4_present:
@@ -4358,7 +4354,9 @@ def launch_sm120_moe(
 
     input_global_scale overrides w1_alpha as the FC1 input-quant scale and
     is folded into the multiplier internally.  With _weight_views supplied,
-    w1_alpha must already contain the fold.
+    w1_alpha must already contain the fold.  For nvfp4, fc2_input_scale is
+    not folded into w2_alpha here: w2_alpha must already carry it
+    (weight_scale_2 * fc2 input scale).
 
     Optional _workspace and _weight_views can be pre-allocated and reused
     across calls to avoid per-call allocation overhead (wrapper path).
