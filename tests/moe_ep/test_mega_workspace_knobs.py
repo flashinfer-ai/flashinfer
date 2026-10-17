@@ -115,6 +115,7 @@ def test_blackwell_mxfp8_legacy_config_and_dispatch(monkeypatch, dist_not_initia
 def test_blackwell_genphase_backend_selects_own_workspace(
     tile, cluster, monkeypatch, dist_not_initialized
 ):
+    """GenPhase allocation and pool identity stay separate from legacy inference."""
     from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -164,6 +165,7 @@ def test_blackwell_genphase_backend_selects_own_workspace(
     ],
 )
 def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch):
+    """Explicit geometry constrains schedule estimation and workspace pooling."""
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -181,6 +183,7 @@ def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch)
     )
 
     def make(**overrides):
+        """Bind a GenPhase backend with selected geometry and optional overrides."""
         params = dict(
             intermediate_size=1024,
             top_k=8,
@@ -600,6 +603,7 @@ def test_blackwell_genphase_admission(override):
 
 
 def _genphase_tuning_config(**overrides):
+    """Build a valid EP2 tuning workload with per-test field overrides."""
     values = dict(
         num_total_experts=256,
         max_tokens_per_rank=1024,
@@ -626,6 +630,7 @@ def _genphase_tuning_config(**overrides):
 def test_blackwell_genphase_tuning_estimate_spans_latency_regimes(
     tokens, n, cluster, hint
 ):
+    """Host estimates cover empty, sparse and dense workloads at fixed capacity."""
     cfg = _genphase_tuning_config()
     knobs = default_sm100_genphase_knobs(cfg, sm_count=148, live_tokens=tokens)
     assert knobs == dict(
@@ -644,6 +649,7 @@ def test_blackwell_genphase_tuning_estimate_spans_latency_regimes(
 def test_blackwell_genphase_tuning_candidate_domain_and_original_fallback(
     sms, world, hidden, intermediate, experts, topk
 ):
+    """All ranks enumerate twelve valid candidates including the original config."""
     cfg = _genphase_tuning_config(
         world_size=world,
         hidden=hidden,
@@ -672,6 +678,7 @@ def test_blackwell_genphase_tuning_candidate_domain_and_original_fallback(
 
 
 def test_blackwell_genphase_tuning_constraints_and_resource_budget():
+    """Candidate filtering respects explicit geometry, hints and limited SMs."""
     cfg = _genphase_tuning_config()
     rows = sm100_genphase_candidates(
         cfg,
@@ -703,6 +710,7 @@ def test_blackwell_genphase_tuning_constraints_and_resource_budget():
 
 @pytest.mark.parametrize("tokens", [-1, 1025, 1.5, True])
 def test_blackwell_genphase_tuning_invalid_live_count(tokens):
+    """Reject noninteger and out-of-capacity workload counts before tuning."""
     with pytest.raises(ValueError):
         sm100_genphase_candidates(
             _genphase_tuning_config(), sm_count=148, live_tokens=tokens
@@ -711,6 +719,7 @@ def test_blackwell_genphase_tuning_invalid_live_count(tokens):
 
 @pytest.mark.parametrize("sms", [0, 1, 1.5, True])
 def test_blackwell_genphase_tuning_invalid_hardware_count(sms):
+    """Reject noninteger SM counts and devices too small for an admitted cluster."""
     with pytest.raises(ValueError):
         sm100_genphase_candidates(_genphase_tuning_config(), sm_count=sms)
 
@@ -718,6 +727,7 @@ def test_blackwell_genphase_tuning_invalid_hardware_count(sms):
 def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_record(
     tmp_path, monkeypatch
 ):
+    """Cache reuse requires exact profiles and preserves unrelated or invalid data."""
     import json
     from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
         knob_cache as cache,
@@ -812,6 +822,7 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
 def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
     monkeypatch,
 ):
+    """Auto tuning retunes an unpooled workspace once and blocks early capture."""
     from unittest import mock
     import torch
     from flashinfer.moe_ep import (
@@ -856,6 +867,7 @@ def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
 
 
 def test_blackwell_genphase_tuning_offline_cli_dispatch_and_admission(monkeypatch):
+    """The offline CLI dispatches GenPhase and rejects unsupported reduction modes."""
     from unittest import mock
     from flashinfer.moe_ep import tune
 
@@ -894,6 +906,7 @@ def test_blackwell_genphase_tuning_offline_cli_dispatch_and_admission(monkeypatc
 def test_blackwell_genphase_tuning_backend_selection_memo_separates_devices(
     monkeypatch,
 ):
+    """Memoized knob resolution never crosses device identities."""
     from types import SimpleNamespace
     from unittest import mock
     import torch
@@ -937,6 +950,7 @@ def test_blackwell_genphase_tuning_backend_selection_memo_separates_devices(
 def test_blackwell_genphase_tuning_device_identity_separates_compiler_stacks_and_options(
     monkeypatch,
 ):
+    """Compiler library versions and options isolate tuning cache identities."""
     from types import SimpleNamespace
     import torch
     from flashinfer.jit import cute_dsl_core
@@ -962,3 +976,49 @@ def test_blackwell_genphase_tuning_device_identity_separates_compiler_stacks_and
     assert updated != original
     monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "iket")
     assert knob_cache.device_identity() not in (original, updated)
+
+
+@pytest.mark.parametrize("minor", [0, 3])
+@pytest.mark.parametrize("initial_arch", ["unset", "bare", "native"])
+def test_blackwell_genphase_tuning_cache_hit_before_dsl_arch_configuration(
+    tmp_path, monkeypatch, minor, initial_arch
+):
+    """Native target aliases reuse cached winners before DSL initialization."""
+    from types import SimpleNamespace
+    import json
+    import torch
+    from flashinfer.jit import cute_dsl_core
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        knob_cache as cache,
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            name="Blackwell", major=10, minor=minor, multi_processor_count=148
+        ),
+    )
+    monkeypatch.setattr(
+        cute_dsl_core, "_get_cute_dsl_version", lambda: "test-dsl-stack"
+    )
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "preserve-options")
+    native = f"sm_10{minor}a"
+    cfg = _genphase_tuning_config()
+    winner = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[-1]
+    # A previous workspace configured the native compiler target before tuning.
+    monkeypatch.setenv("CUTE_DSL_ARCH", native)
+    assert cache.record_knobs(winner, cfg, live_tokens=16, p50_us=200)
+    # A fresh caller resolves the cache before creating its first workspace.
+    if initial_arch == "unset":
+        monkeypatch.delenv("CUTE_DSL_ARCH")
+    elif initial_arch == "bare":
+        monkeypatch.setenv("CUTE_DSL_ARCH", native.removesuffix("a"))
+    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16) == (winner, "cache")
+    identity = json.loads(cache.device_identity())
+    assert identity["compile_arch"] == native
+    assert identity["compiler_options"] == "preserve-options"
+    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "different-options")
+    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16)[1] == "heuristic"

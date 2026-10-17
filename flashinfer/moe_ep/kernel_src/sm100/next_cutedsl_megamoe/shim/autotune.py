@@ -98,6 +98,7 @@ def autotune_sm100_genphase_mega_moe(
         raise ValueError("autotune needs at least one candidate")
 
     def barrier():
+        """Keep candidate lifetimes and cache publication ordered across EP ranks."""
         if collective:
             dist.barrier(group=process_group)
 
@@ -110,6 +111,7 @@ def autotune_sm100_genphase_mega_moe(
     )
 
     def error(trial):
+        """Return the maximum sampled output error across the EP group."""
         value = torch.tensor(
             output_error(trial.output_activation[:num_tokens], indices, expected),
             dtype=torch.float64,

@@ -33,6 +33,7 @@ SOURCE_ROOT = Path(__file__).resolve().parents[6]
 
 
 def collective_action(action, gather):
+    """Propagate rank-local action failures so every EP rank exits the phase."""
     error = None
     try:
         action()
@@ -44,6 +45,7 @@ def collective_action(action, gather):
 
 
 def atomic_json(path, data):
+    """Publish a complete report by replacing its temporary file atomically."""
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, indent=2) + "\n")
     temporary.replace(path)
@@ -78,6 +80,12 @@ p.add_argument(
 )
 p.add_argument("--weight-placement", choices=("early", "late", "both"), default="both")
 args = p.parse_args()
+try:
+    active_counts = tuple(int(value) for value in args.active.split(","))
+except ValueError:
+    p.error("--active must be a comma-separated list of integers")
+if any(value < 0 or value > args.capacity for value in active_counts):
+    p.error("--active values must be between zero and --capacity")
 if args.policy == "heuristic":
     os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"] = "off"
 if args.policy == "auto":
@@ -137,29 +145,34 @@ torch.cuda.set_stream(stream)
 
 
 def gather_errors(error):
+    """Collect each EP rank's error before deciding whether to continue."""
     errors = [None] * world
     dist.all_gather_object(errors, error)
     return errors
 
 
 def barrier():
+    """Drain the benchmark stream before synchronizing EP ranks."""
     stream.synchronize()
     dist.barrier()
 
 
 def assert_all(condition, context):
+    """Fail on every EP rank if any rank's local correctness check fails."""
     failed = torch.tensor(not condition, device="cuda", dtype=torch.int32)
     dist.all_reduce(failed, op=dist.ReduceOp.MAX)
     assert failed.item() == 0, context
 
 
 def digest(tensor):
+    """Hash contiguous tensor bytes for exact output comparisons between runs."""
     return hashlib.sha256(
         tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
     ).hexdigest()
 
 
 def save_report():
+    """Write per-rank progress reports and propagate filesystem failures."""
     collective_action(
         lambda: atomic_json(args.output / f"rank-{rank}.json", report), gather_errors
     )
@@ -308,8 +321,7 @@ try:
             status == cuda.CUresult.CUDA_SUCCESS and count == 3 * args.calls,
             ("graph nodes", status, count),
         )
-        for active in map(int, args.active.split(",")):
-            assert 0 <= active <= args.capacity
+        for active in active_counts:
             for holes in (False, True):
                 keep = torch.zeros(args.capacity, device="cuda", dtype=torch.bool)
                 keep[

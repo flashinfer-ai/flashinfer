@@ -21,12 +21,14 @@ _GEOMETRIES = (
 
 
 def _effective_sms(config: Any, sm_count: int) -> int:
+    """Validate the device SM count and apply the optional workspace SM limit."""
     if type(sm_count) is not int or sm_count < 2:
         raise ValueError("GenPhase tuning requires at least two SMs")
     return min(sm_count, config.max_sm_count or sm_count)
 
 
 def _live_tokens(config: Any, live_tokens: int | None) -> int:
+    """Validate the host workload count, defaulting to workspace capacity."""
     count = config.max_tokens_per_rank if live_tokens is None else live_tokens
     if type(count) is not int or not 0 <= count <= config.max_tokens_per_rank:
         raise ValueError("live_tokens must be an integer between zero and capacity")

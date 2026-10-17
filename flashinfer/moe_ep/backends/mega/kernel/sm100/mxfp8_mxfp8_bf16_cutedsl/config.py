@@ -17,6 +17,13 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     Expert weights must be MXFP8 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized
     fp8 weights with ``w13_scale`` / ``w2_scale``.
+
+    ``kernel_variant="genphase"`` opts into the Blackwell decoding pipeline.
+    Its ``knobs=None`` selects an exact cached profile or a host heuristic;
+    dictionaries and explicit tile/cluster/schedule fields constrain selection.
+    ``knobs="auto"`` tunes collectively during warmup before graph capture.
+    Auto layers own a single capacity and cannot call ``create_workspace()``;
+    use fixed or offline-tuned knobs for additional capacity profiles.
     """
 
     intermediate_size: int

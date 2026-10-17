@@ -57,6 +57,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        """Validate pipeline options and initialize deferred tuning state."""
         super().__init__(config)
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
         if config.kernel_variant not in ("inference", "genphase"):
@@ -126,6 +127,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         return mxfp8_cutedsl_runtime_requirements(bootstrap)
 
     def _genphase_constraints(self):
+        """Merge explicit fields and knob overrides, rejecting conflicting values."""
         k = self._kernel_config
         names = ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
         knobs = dict(k.knobs) if isinstance(k.knobs, dict) else {}
@@ -143,6 +145,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         return knobs
 
     def _genphase_base_config(self, fleet_params):
+        """Describe the EP workload before selecting performance knobs."""
         from ......kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
 
         k = self._kernel_config
@@ -159,6 +162,12 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _genphase_config(self, fleet_params: FleetParams):
+        """Memoize cache or heuristic selection for one workload and device.
+
+        Auto tuning bypasses the disk cache here and retunes its default
+        workspace during warmup. Public auto layers cannot create additional
+        capacity profiles through ``create_workspace()``.
+        """
         from ......kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
 
         try:
@@ -188,6 +197,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(str(exc)) from exc
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
+        """List cached GenPhase profiles when no explicit knob constraints apply."""
         if self._kernel_config.kernel_variant != "genphase":
             return super().live_token_buckets(fleet_params)
         if (
@@ -203,6 +213,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
 
     def _check_genphase_selection(self, config):
+        """Require identical configuration selection across EP ranks at allocation."""
         # Selection is construction-time work; never inspect live routing on forward.
         if self.ep_world_size > 1:
             import torch.distributed as dist
@@ -217,6 +228,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 )
 
     def _workspace_pool_request(self, fleet_params):
+        """Return a pool key and allocator; mutable auto workspaces stay unpooled."""
         if self._kernel_config.kernel_variant != "genphase":
             return super()._workspace_pool_request(fleet_params)
         if self._kernel_config.knobs == "auto":
@@ -328,6 +340,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
+        """Allocate the selected pipeline's workspace collectively on the EP group."""
         if self._kernel_config.kernel_variant == "genphase":
             from ......kernel_src.sm100.next_cutedsl_megamoe import (
                 Sm100GenphaseSymmBuffer,
@@ -358,6 +371,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def validate_capture_ready(self, workspace, transformed_weights):
+        """Reject GenPhase capture until collective auto warmup has completed."""
         if self._kernel_config.kernel_variant == "genphase" and self._autotune_pending:
             raise MoEEpConfigError(
                 "GenPhase knobs='auto' requires collective warmup before CUDA graph capture"
@@ -451,6 +465,11 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Launch staged inputs, tuning once first when explicitly requested.
+
+        All EP ranks must enter the initial auto sweep together outside graph
+        capture. With ``output=None``, the result borrows workspace storage.
+        """
         if self._kernel_config.kernel_variant == "genphase":
             from ......kernel_src.sm100.next_cutedsl_megamoe import (
                 sm100_genphase_mega_moe,
@@ -537,6 +556,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        """Key immutable workspace configurations; return None for auto tuning."""
         k = self._kernel_config
         if k.kernel_variant == "genphase":
             if k.knobs == "auto":

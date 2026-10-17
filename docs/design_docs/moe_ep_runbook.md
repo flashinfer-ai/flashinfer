@@ -665,6 +665,10 @@ preparation are outside it. Tuning creates temporary workspaces and compiles
 candidates; subsequent forward calls reuse the chosen configuration. Tuning
 preserves input/output pointers, and auto workspaces are excluded from pooling.
 
+An auto layer supports only its default capacity: `create_workspace()` rejects
+`knobs="auto"` even after warmup. For additional capacity or live-token profiles,
+construct a layer with fixed or offline-tuned knobs before creating handles.
+
 For serving, tune offline and use `knobs=None` when constructing layers:
 
 ```bash
@@ -691,6 +695,9 @@ a live-token profile from the incoming batch automatically.
 Entries require matching GPU/SM count, CUDA/Torch/DSL compiler stack, compiler
 options, implementation
 revision, operation attributes, EP geometry, capacity and live-token bucket.
+The native compiler target has the same cache identity before and after the
+first workspace configures CuTe DSL, including its bare architecture alias.
+Collective tuning waits for rank 0 to finish the cache write before returning.
 Distribute the same cache to every EP rank. Construction checks that ranks
 agree on the selected configuration before allocating collective storage.
 A warmup result is also available through `layer.get_tuned_knobs()`.

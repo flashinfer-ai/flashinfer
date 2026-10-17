@@ -12,6 +12,11 @@ from ...tuning import finish_sweep
 
 
 def tune_one(args, rank, world_size, max_tokens):
+    """Stage synthetic inputs and tune one capacity on every EP rank.
+
+    ``args.live_tokens`` selects the workload bucket without shrinking the
+    workspace. Schedule-only sweeps preserve the selected tile and cluster.
+    """
     import torch
 
     from ......kernel_src.sm100 import next_cutedsl_megamoe as pkg
@@ -123,6 +128,11 @@ def tune_one(args, rank, world_size, max_tokens):
 
 
 def run_tuning(args):
+    """Bootstrap an EP job, tune requested GenPhase capacities, and return zero.
+
+    Requires MXFP8 E4M3, BF16 combine and deterministic reduction. A failed GPU
+    worker relies on job teardown rather than entering collective cleanup.
+    """
     import torch
 
     from ......config import BootstrapConfig

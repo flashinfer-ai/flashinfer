@@ -47,6 +47,7 @@ from .sm90_routing import (
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse offline workload, pipeline and sweep options without starting CUDA."""
     parser = argparse.ArgumentParser(
         prog="python -m flashinfer.moe_ep.tune",
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
@@ -307,6 +308,11 @@ def _resolve_arch(arch: str) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Validate CLI options and run the architecture-specific offline tuner.
+
+    Invalid argument combinations return 2 before importing a backend tuner;
+    valid requests return the selected tuner's exit code.
+    """
     args = _parse_args(argv)
     error = _argument_error(args)
     if error is not None:

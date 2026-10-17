@@ -24,6 +24,7 @@ _REVISION = "sm100-genphase-3c1d1c2f-auto-v3"
 
 
 def knob_cache_path() -> str | None:
+    """Resolve the shared knob-cache path, or None when disabled by environment."""
     value = os.environ.get("FLASHINFER_MOE_EP_KNOB_CACHE", "")
     if value.strip().lower() in ("0", "off", "none", "disable", "disabled"):
         return None
@@ -31,10 +32,19 @@ def knob_cache_path() -> str | None:
 
 
 def device_identity() -> str:
+    """Identify the current GPU and compiler stack for exact cache matching.
+
+    Native target aliases normalize before DSL initialization so a fresh
+    process can reuse prior tuning. Compiler options remain part of the key.
+    """
     import torch
     from flashinfer.jit.cute_dsl_core import _get_cute_dsl_version
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    native_arch = f"sm_{props.major}{props.minor}a"
+    compile_arch = os.environ.get("CUTE_DSL_ARCH", native_arch)
+    if compile_arch == native_arch.removesuffix("a"):
+        compile_arch = native_arch
     return json.dumps(
         dict(
             name=props.name,
@@ -43,7 +53,7 @@ def device_identity() -> str:
             cuda=torch.version.cuda,
             torch=torch.__version__,
             dsl_stack=_get_cute_dsl_version(),
-            compile_arch=os.environ.get("CUTE_DSL_ARCH", ""),
+            compile_arch=compile_arch,
             compiler_options=os.environ.get("CUTE_DSL_COMPILER_OPT", ""),
             instrumentation=os.environ.get("DKG_IKET_INSTRUMENTATION_METHOD", ""),
         ),
@@ -52,6 +62,7 @@ def device_identity() -> str:
 
 
 def _key(config, device: str | None = None) -> dict:
+    """Key operation attributes and capacity independently of rank and knobs."""
     spec = dataclasses.asdict(config)
     for name in ("rank", *KNOB_KEYS):
         spec.pop(name)
@@ -63,6 +74,7 @@ def _key(config, device: str | None = None) -> dict:
 
 
 def _read(path: str) -> dict:
+    """Read a supported cache document, treating a missing file as an empty cache."""
     try:
         data = json.loads(Path(path).read_text())
     except FileNotFoundError:
@@ -77,6 +89,7 @@ def _read(path: str) -> dict:
 
 
 def _entries(config, device=None) -> list[dict]:
+    """Find exact workload entries; warn and ignore unreadable cache files."""
     path = knob_cache_path()
     if path is None:
         return []
@@ -98,6 +111,7 @@ def _entries(config, device=None) -> list[dict]:
 
 
 def _decode(entry, config):
+    """Restore knob tuples and reject malformed or inadmissible cached values."""
     raw = entry.get("knobs")
     if not isinstance(raw, dict) or set(raw) != set(KNOB_KEYS):
         return None
@@ -109,6 +123,7 @@ def _decode(entry, config):
 
 
 def live_token_buckets(config, *, device=None) -> list[int]:
+    """List valid cached live-token counts for this capacity and device identity."""
     return sorted(
         {
             e["live_tokens"]
@@ -129,6 +144,11 @@ def resolve_knobs(
     device=None,
     use_cache=True,
 ) -> tuple[dict[str, Any], str]:
+    """Return exact cached knobs or a heuristic, together with their source.
+
+    Cache hits must match the live-token count and explicit constraints.
+    ``use_cache=False`` starts from the heuristic for a fresh tuning sweep.
+    """
     candidates = sm100_genphase_candidates(
         config, sm_count=sm_count, live_tokens=live_tokens, constraints=constraints
     )

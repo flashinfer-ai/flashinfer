@@ -449,6 +449,7 @@ class BlockScaledSymmBuffer:
         )
 
     def __init__(self, config: BlockScaledMoeConfig) -> None:
+        """Allocate staging, output and kernel storage collectively before capture."""
         comm.ensure_not_capturing("block-scaled mega workspace allocation")
         self._require_device()
         self._configure_dsl()

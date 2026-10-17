@@ -1257,6 +1257,7 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
     try:
 
         def create(knobs):
+            """Build a public layer sharing test weights with the requested knobs."""
             layer = MoEEpLayer(
                 BootstrapConfig(rank=rank, world_size=world),
                 fleet,
@@ -1281,6 +1282,45 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
             getattr(ws, n).data_ptr()
             for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
         ]
+        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+            knob_cache,
+        )
+        import time
+
+        record_knobs = knob_cache.record_knobs
+        tune = pkg.autotune_sm100_genphase_mega_moe
+
+        def delayed_record(*args, **kwargs):
+            """Delay rank zero's cache write to expose premature peer returns."""
+            # Expose peers returning before a slow shared-cache write completes.
+            if world > 1:
+                time.sleep(0.25)
+            return record_knobs(*args, **kwargs)
+
+        def tune_and_check_publication(*args, **kwargs):
+            """Require all ranks to observe the cached winner when tuning returns."""
+            winner = tune(*args, **kwargs)
+            resolved = knob_cache.resolve_knobs(
+                ws.config,
+                sm_count=torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count,
+                live_tokens=tokens,
+            )
+            observed = [resolved]
+            if world > 1:
+                observed = [None] * world
+                dist.all_gather_object(observed, resolved)
+            assert all(value == (winner, "cache") for value in observed), (
+                "cache publication incomplete at autotune return",
+                observed,
+            )
+            return winner
+
+        monkeypatch.setattr(knob_cache, "record_knobs", delayed_record)
+        monkeypatch.setattr(
+            pkg, "autotune_sm100_genphase_mega_moe", tune_and_check_publication
+        )
         layer.warmup(inputs)
         winner = {
             k: getattr(ws.config, k)
