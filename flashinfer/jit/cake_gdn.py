@@ -1011,12 +1011,15 @@ CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
 # straight into registers) in the band 64 < state heads < 256; `splitv8` up to 64 heads,
 # the `splitv8_tilev32` twin from 256 on.  Bitwise-identical output, only the state load
 # path changes.  Mirrors `FP32_T1_SPLITV8_REG_MIN_STATE_HEADS`.
+# CAKE-1096 R26 (lane P2, P2-W6-OUT): the band takes the `splitv8_reg_ost` twin of `splitv8_reg`
+# (same loads, FMA and reduction order; the warp's four output rows are remapped contiguous so
+# lane 0 issues one 64-bit store instead of four scalar bf16 stores).  Bitwise-identical output.
 CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS = 64
 # (largest state-head count of the band or None for the open last band, body)
 CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_107a": (
         (CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS, "splitv8"),
-        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8_reg"),
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8_reg_ost"),
         (None, "splitv8_tilev32"),
     ),
 }
@@ -1027,6 +1030,7 @@ CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_pretranspose_splitv8": 8,
     "gdn_decode_pretranspose_splitv8_tilev32": 4,
     "gdn_decode_pretranspose_splitv8_reg": 8,
+    "gdn_decode_pretranspose_splitv8_reg_ost": 8,
 }
 
 

@@ -817,20 +817,21 @@ def test_decode_resolver_routes_the_fp32_mtp_bodies_per_architecture(arch) -> No
 
 def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
     # Two thresholds, one table (sm_107a only): the shipped `splitv8` body up to 64 state
-    # heads, the register-direct `splitv8_reg` body below 256, the `splitv8_tilev32` twin
+    # heads, the register-direct `splitv8_reg_ost` body (R26: the out-store twin of `splitv8_reg`) below 256, the `splitv8_tilev32` twin
     # from 256 on; B200 / B300 keep `splitv8`.
     assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS == 256
     assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS == 64
     assert set(cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS) == {"sm_107a"}
     assert cake_gdn.CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS["sm_107a"] == (
         (64, "splitv8"),
-        (255, "splitv8_reg"),
+        (255, "splitv8_reg_ost"),
         (None, "splitv8_tilev32"),
     )
     assert cake_gdn.CAKE_GDN_FP32_T1_CTAS_PER_STATE == {
         "gdn_decode_pretranspose_splitv8": 8,
         "gdn_decode_pretranspose_splitv8_tilev32": 4,
         "gdn_decode_pretranspose_splitv8_reg": 8,
+        "gdn_decode_pretranspose_splitv8_reg_ost": 8,
     }
     rule = cake_gdn.cake_gdn_fp32_t1_route
     for arch in ("sm_100a", "sm_103a"):
@@ -845,13 +846,14 @@ def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
         ):
             assert rule(batch_size, num_v_heads, arch) == "splitv8"
     # the public bench_pretranspose_b* rows (HV=32): b1 and the 64-head edge keep splitv8,
-    # 64 < heads < 256 (b4 .. b7) take splitv8_reg, b8 .. b512 splitv8_tilev32
+    # 64 < heads < 256 (b4 .. b7) take splitv8_reg_ost (R26), b8 .. b512 splitv8_tilev32
     assert rule(1, 32, "sm_107a") == "splitv8"
     assert rule(2, 32, "sm_107a") == "splitv8"
-    assert rule(4, 32, "sm_107a") == "splitv8_reg"
-    assert rule(6, 32, "sm_107a") == "splitv8_reg"
-    assert rule(7, 32, "sm_107a") == "splitv8_reg"
-    assert rule(15, 16, "sm_107a") == "splitv8_reg"
+    assert rule(3, 32, "sm_107a") == "splitv8_reg_ost"
+    assert rule(4, 32, "sm_107a") == "splitv8_reg_ost"
+    assert rule(6, 32, "sm_107a") == "splitv8_reg_ost"
+    assert rule(7, 32, "sm_107a") == "splitv8_reg_ost"
+    assert rule(15, 16, "sm_107a") == "splitv8_reg_ost"
     assert rule(8, 32, "sm_107a") == "splitv8_tilev32"
     assert rule(16, 16, "sm_107a") == "splitv8_tilev32"
     assert rule(16, 32, "sm_107a") == "splitv8_tilev32"
@@ -875,7 +877,7 @@ def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_ban
         if arch != "sm_107a" or heads <= 64:
             expected = "splitv8"
         elif heads < 256:
-            expected = "splitv8_reg"
+            expected = "splitv8_reg_ost"
         else:
             expected = "splitv8_tilev32"
         assert body == expected, (arch, batch_size, body)
