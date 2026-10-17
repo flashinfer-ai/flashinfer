@@ -853,3 +853,39 @@ def test_nvfp4_split_kv_gate_arch_scope(monkeypatch):
         torch.float8_e5m2,
     ):
         assert not prefill._nvfp4_kv_requires_disabled_split_kv(dtype, device)
+
+
+def test_nvfp4_split_kv_gate_shape_scope(monkeypatch):
+    """On SM120/121 the gate must fire only for the VO-split plan shape.
+
+    The corruption behind the gate was observed on Gemma-4's asymmetric plan
+    (head_dim_qk 512 / head_dim_vo 256). Symmetric plans at head_dim <= 256
+    were validated clean with split-KV enabled on both sm120 and sm121
+    (vllm-project/vllm#46329), and for them the gate only costs: spec-decode
+    verify batches (qo_len 2..9) run through the prefill wrapper and lose
+    flash-decoding parallelism. The compute capability is faked, so this runs
+    without a GPU.
+    """
+    from flashinfer import prefill
+
+    device = torch.device("cuda:0")
+    monkeypatch.setattr(prefill, "get_compute_capability", lambda _device: (12, 0))
+    gate = prefill._nvfp4_kv_requires_disabled_split_kv
+
+    # Symmetric heads up to 256 wide keep split-KV.
+    for head_dim in (64, 128, 256):
+        assert not gate(torch.uint8, device, head_dim, head_dim)
+        assert not gate(torch.uint8, device, head_dim)  # vo defaults to qk
+
+    # The asymmetric VO-split plan stays gated, as does any head wider than 256.
+    assert gate(torch.uint8, device, 512, 256)
+    assert gate(torch.uint8, device, 512, 512)
+    assert gate(torch.uint8, device, 256, 128)
+
+    # Callers that know only dtype and device keep the arch-level gate.
+    assert gate(torch.uint8, device)
+
+    # Shape never overrides the dtype or arch tests.
+    assert not gate(torch.bfloat16, device, 512, 256)
+    monkeypatch.setattr(prefill, "get_compute_capability", lambda _device: (9, 0))
+    assert not gate(torch.uint8, device, 512, 256)
