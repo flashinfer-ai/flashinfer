@@ -226,47 +226,84 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
 
 
 @pytest.mark.parametrize(
-    ("component", "macros", "generic_count"),
+    ("component", "macros", "generic_count", "exact_key", "prefix", "sources"),
     (
         (
             "decode_native_bf16",
             ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"),
             11,
+            "BATCH_SIZE",
+            "CAKE_FMHA_",
+            {
+                "sm_100a": "cuda/decode_native_bf16/default.cu",
+                "sm_103a": "cuda/decode_native_bf16/default.cu",
+            },
         ),
         (
             "decode_native_fp16_nhd",
             ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"),
             16,
+            "BATCH_SIZE",
+            "CAKE_FMHA_",
+            {
+                "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+                "sm_103a": "cuda/decode_native_fp16_nhd/default.cu",
+            },
         ),
         (
             "decode_native_fp16_hd512",
             ("HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"),
             8,
+            "BATCH_SIZE",
+            "CAKE_FMHA_",
+            {
+                "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+                "sm_103a": "cuda/decode_native_fp16_hd512/default.cu",
+            },
+        ),
+        (
+            "context_fp8",
+            ("ENABLE_SINK", "IS_CAUSAL", "RETURN_LSE"),
+            6,
+            "NUM_M_BLOCKS",
+            "CAKE_FMHA_CONTEXT_",
+            {
+                "sm_100a": "cuda/context_fp8/default.cu",
+                "sm_103a": "cuda/context_fp8/default.cu",
+            },
+        ),
+        (
+            "context_bf16",
+            ("ENABLE_SINK", "IS_CAUSAL", "RETURN_LSE"),
+            6,
+            "NUM_M_BLOCKS",
+            "CAKE_FMHA_CONTEXT_",
+            {
+                "sm_100a": "cuda/context_bf16/sm_100a/default.cu",
+                "sm_103a": "cuda/context_bf16/sm_103a/default.cu",
+            },
         ),
     ),
 )
-def test_cake_fmha_decode_generic_members_share_one_folded_source(
-    component, macros, generic_count
+def test_cake_fmha_generic_members_share_one_folded_source(
+    component, macros, generic_count, exact_key, prefix, sources
 ) -> None:
     """The generic members compile one source whose flags come from the loader defines."""
 
     members = get_cake_fmha_manifest()["components"][component]["source_family"]
-    generic_members = [m for m in members if "BATCH_SIZE" not in m["selector"]]
+    generic_members = [m for m in members if exact_key not in m["selector"]]
     assert len(generic_members) == generic_count
-    sources = {
-        member["sources"][arch]
-        for member in generic_members
-        for arch in ("sm_100a", "sm_103a")
-    }
-    assert sources == {f"cuda/{component}/default.cu"}
-    text = (get_cake_fmha_csrc_dir() / f"cuda/{component}/default.cu").read_text(
-        encoding="utf-8"
-    )
-    for macro in macros:
-        assert f"#define {macro} CAKE_FMHA_{macro}\n" in text
-        assert f"#define {macro} 0\n" not in text
-        assert f"#define {macro} 1\n" not in text
-        assert text.count(f"#if {macro}\n") == text.count(f"#endif  // {macro}\n") > 0
+    for arch, source in sources.items():
+        assert {member["sources"][arch] for member in generic_members} == {source}
+    for source in sorted(set(sources.values())):
+        text = (get_cake_fmha_csrc_dir() / source).read_text(encoding="utf-8")
+        for macro in macros:
+            assert f"#define {macro} {prefix}{macro}\n" in text
+            assert f"#define {macro} 0\n" not in text
+            assert f"#define {macro} 1\n" not in text
+            assert (
+                text.count(f"#if {macro}\n") == text.count(f"#endif  // {macro}\n") > 0
+            )
     flag_sets = {
         tuple(member["selector"][macro] for macro in macros)
         for member in generic_members
@@ -769,7 +806,7 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
         enable_sink=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "enable_sink0_is_causal1_return_lse1.cu",
+        "default.cu",
         "cake_fmha_context_bf16_binding.cu",
         "cake_fmha_context_bf16_jit_binding.cu",
     }
@@ -871,7 +908,7 @@ def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> N
         enable_sink=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "enable_sink0_is_causal1_return_lse0.cu",
+        "default.cu",
         "cake_fmha_context_fp8_binding.cu",
         "cake_fmha_context_fp8_jit_binding.cu",
     }
