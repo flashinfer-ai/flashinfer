@@ -29,7 +29,7 @@ import inspect
 import logging
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import flashinfer.experimental.qwen_3_5_block._cudnn_frost as cudnn
 
@@ -39,6 +39,7 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa import graph_analy
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     SM100_THD_PACK_GQA_SHAPES,
+    d256_wide_decode_launch,
     decode_d256_q_tile,
     pack_gqa_supported,
     supports_paged_prefill_cga1,
@@ -506,13 +507,13 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     clamped descriptors), ragged Stats when Stats are requested (a per-batch
     padded Stats has no ragged base to place rows at), int32 offsets whose
     multiplier divides the row, per-batch ``seq_len_kv`` (the dense kernel's
-    SEQ_KV read; the cu form is not plumbed), no sink (sink + split is declined
-    everywhere) and no fused epilogue gate (unsplittable). Twin of
+    SEQ_KV read; the cu form is not plumbed) and no fused epilogue gate
+    (unsplittable); a sink rides it (the combine folds it once). Twin of
     ``SdpaFwdDslSm100.thd_decode_leg``; keep in lockstep.
     """
     if not (facts.thd and facts.has_paged_kv and facts.s_q == 1):
         return False
-    if facts.is_fp8 or facts.is_mxfp8 or facts.has_sink or getattr(facts, "has_epilogue_gate", False):
+    if facts.is_fp8 or facts.is_mxfp8 or getattr(facts, "has_epilogue_gate", False):
         return False
     if capabilities.sm_lo != 100 or capabilities.sm_hi >= 107:
         return False
@@ -529,17 +530,44 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
-def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int) -> int:
+def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int, wide_launch: bool = False, paged: bool = False, masked: bool = True) -> int:
     """The d256 decode tile's N extent (the Q rows of one token unit) a ROW routes ``s_q``
     tokens packed ``pack_g`` heads per token onto, or 0 for the prefill tile: the Rubin
-    row's rule (``config_sm107.decode_d256_q_tile``: the 32-column tile routed, two token
-    units for a packed MTP step) on cc 10.7, the Blackwell line's
-    (``config_sm100.decode_d256_q_tile``: 16 rows, one unit) otherwise.  The facts-level
-    twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch dispatch; the heuristics' decode
-    geometry reads it too -- keep the three in lockstep."""
+    row's rule (``config_sm107.decode_d256_q_tile``, table-driven: the 32- and 64-column
+    tiles routed in one unit, then two token units of the widest admitted width for a packed
+    MTP step) on cc 10.7, the Blackwell line's (``config_sm100.decode_d256_q_tile``: the
+    16-column tile in one unit, and the 32-column one too for a ``wide_launch`` --
+    :func:`config_sm100.d256_wide_decode_launch`) otherwise.  ``wide_launch`` (appended) is
+    the Blackwell line's launch-size reading (:func:`d256_wide_decode_launch_for_facts`);
+    ``paged`` / ``masked`` (appended) are the graph's cache kind and causal / window mask --
+    the Rubin 64-column width's form predicate (``config_sm107.decode_d256_wide_tile_admits``)
+    declines a mask-free PAGED step, which keeps the (16, 32) table.  Each line reads its own
+    arguments only.  The facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch
+    dispatch; the heuristics' decode geometry reads it too -- keep the three in lockstep
+    (:func:`_facts_decode_form` reads the two Rubin facts off ``SdpaGraphFacts``)."""
     if capabilities.sm_lo == 107:
-        return _config_sm107.decode_d256_q_tile(s_q, pack_g)
-    return decode_d256_q_tile(s_q, pack_g)
+        return _config_sm107.decode_d256_q_tile(s_q, pack_g, paged=bool(paged), masked=bool(masked))
+    return decode_d256_q_tile(s_q, pack_g, wide_launch=wide_launch)
+
+
+def d256_wide_decode_launch_for_facts(facts: "ga.SdpaGraphFacts", pack_g: int) -> bool:
+    """:func:`config_sm100.d256_wide_decode_launch` on a graph's declared shape: batch x
+    (heads / ``pack_g``) units over ``s_kv`` keys, never for a windowed graph.  The
+    facts-level twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s launch argument."""
+    return d256_wide_decode_launch(facts.b, facts.h_q // max(1, pack_g), facts.s_kv, facts.window_left is not None)
+
+
+def _facts_decode_form(facts: "ga.SdpaGraphFacts") -> Tuple[bool, bool]:
+    """``(paged, masked)`` of a graph for :func:`decode_d256_q_tile_for_row`: the paged KV cache, and the causal /
+    window mask exactly as the kernels' MASK_CAUSAL / MASK_SWA bits derive (``config_sm100._mask_flags_from``: a right
+    band resolved -- ``right_bound`` 0 = causal, ``causal`` its effective reading -- or a left window)."""
+    return bool(facts.has_paged_kv), bool(facts.causal) or facts.right_bound is not None or facts.window_left is not None
+
+
+def _facts_decode_form_kw(facts: "ga.SdpaGraphFacts") -> dict:
+    """:func:`_facts_decode_form` as the ``paged`` / ``masked`` keywords of :func:`decode_d256_q_tile_for_row`."""
+    paged, masked = _facts_decode_form(facts)
+    return dict(paged=paged, masked=masked)
 
 
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
@@ -550,8 +578,9 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
     half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
     (not wired on the decode tile), and ``S_q x pack_g`` packed Q rows within the
     row's routed envelope (``decode_d256_q_tile_for_row``: 16 rows in one unit on the
-    Blackwell line; on cc 10.7 also the 32-column tile, in up to two token units for a
-    packed MTP step; ``pack_g`` is the decode tile's WHOLE-group packing when the plan
+    Blackwell line, which also routes the 32-column tile for a launch big enough to be
+    HBM-bound; on cc 10.7 the 32-column tile for every launch, in up to two token units
+    for a packed MTP step; ``pack_g`` is the decode tile's WHOLE-group packing when the plan
     packs, else 1).
 
     The fused epilogue gate: the tile has no gate seams, so a GATED graph rides it only
@@ -576,13 +605,37 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
         and gate_ok
         and not facts.attn_scale_prefolded
         and _selected_d_shape(capabilities, facts) == (256, 256)
-        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g) > 0
+        and decode_d256_q_tile_for_row(
+            capabilities, facts.s_q, pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, pack_g), **_facts_decode_form_kw(facts)
+        )
+        > 0
     )
 
 
 def _decode_tile_pack_g(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> int:
     """The decode tile's packing for a knob set: the whole GQA ratio when it packs, else 1."""
     return (facts.h_q // facts.h_kv) if (knobs is not None and knobs.pack_gqa and facts.h_kv) else 1
+
+
+def _decode_tile_pack_g_choices(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> Tuple[int, ...]:
+    """The packings a decode-tile question may assume: a knob set's own (:func:`_decode_tile_pack_g`); with NO knob set -- the
+    facts-only question the heuristics' ``_eligible`` asks before any set is built -- every packing SOME plan may carry: unpacked,
+    and the whole group where there is one.  A graph only the packed form serves (4 / 2 at ``S_q`` 33 over pages under the causal
+    mask: 66 packed rows = two 64-column units, while 33 unpacked rows are past the 32-column tile) therefore keeps its row on the
+    ranked list, where the heuristics propose the packed set (``_pack_gqa_eligible`` reads the same group) and ``mismatch`` declines
+    the unpacked one.  Until 2026-10-15 the facts-only reading asked the unpacked question alone and dropped the row, so the ranked
+    list offered nothing where the adapter and the facts twins routed the packed form -- the gate behind the graph-level pin of the
+    Rubin decode suite (``test_decode_routing_boundary``), which the host twin test there now pins over a grid."""
+    if knobs is not None:
+        return (_decode_tile_pack_g(facts, knobs),)
+    group = (facts.h_q // facts.h_kv) if facts.h_kv else 0
+    return (1, group) if (group > 1 and facts.h_q % facts.h_kv == 0) else (1,)
+
+
+def d256_decode_tile_served(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs], split_kv: Optional[int] = None) -> bool:
+    """:func:`d256_decode_tile_selected` for a knob set's own packing, or -- with no knob set -- for SOME plan: any packing of
+    :func:`_decode_tile_pack_g_choices` the row routes onto the tile."""
+    return any(d256_decode_tile_selected(capabilities, facts, pack_g, split_kv) for pack_g in _decode_tile_pack_g_choices(facts, knobs))
 
 
 def _decode_tile_split_kv(knobs: Optional[SdpaFwdKnobs]) -> Optional[int]:
@@ -864,6 +917,22 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     return domain
 
 
+_amax_s_warned = False
+
+
+def _warn_amax_s_declared_once() -> None:
+    """Reached only past the device-arch check, so it fires where a FROST FP8 row would otherwise consider the graph."""
+    global _amax_s_warned
+    if _amax_s_warned:
+        return
+    _amax_s_warned = True
+    logging.getLogger(__name__).warning(
+        "sdpa_fp8: the graph declares the deprecated Amax_S output, which the FROST engines do not produce, so it runs on "
+        "cuDNN backend engines only (up to ~2x slower on some shapes). Leave Amax_S virtual and set scale_s from the bounds in "
+        "docs/operations/Attention.md, 'Amax S' (448 for E4M3 without dropout)."
+    )
+
+
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
     """First reason this engine is not a candidate for these facts and tuning
     knobs, or ``None`` when lowering should perform the final feasibility check.
@@ -1023,11 +1092,26 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                or (facts.has_sink and not packed_split)
+                # The SM100 half flavors write sink-free partials and fold the sink
+                # once in the combine; the FP8 epilogues and the Rubin kernels still
+                # fold it per tile, a gated split's combine carries no sink, and the
+                # packed THD split carries one only where thd_split_domain admits it
+                # (supports_paged_split_sink).
+                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo != 100))
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
+                # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
+                # row must stay O := 0 / LSE := -inf): an older extension declines it here rather than at the spec build.
+                or (
+                    facts.has_sink
+                    and not packed_split
+                    and not facts.thd
+                    and facts.padded
+                    and facts.seq_q_t is not None
+                    and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
+                )
             ):
-                return "split_kv > 1 serves sink-free dense graphs, the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
                 (facts.d_qk, facts.d_v),
                 device_cc=facts.device_cc,
@@ -1269,7 +1353,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         _gate_split = _decode_tile_split_kv(knobs)
         if _gate_split is None and facts.has_sink:
             _gate_split = 1
-        if facts.has_paged_kv and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _gate_split):
+        if facts.has_paged_kv and not d256_decode_tile_served(capabilities, facts, knobs, _gate_split):
             return "the fused epilogue gate is not wired on the paged-KV flavor (only the d256 decode tile's split applies the gate in its combine; a sink never splits)"
         if not facts.epilogue_gate_shape_ok:
             return "the gate G must have exactly O's shape (B, H_q, S_q, D_v); a broadcast G is not fused"
@@ -1313,12 +1397,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries are
         # otherwise not wired on cc 10.7; the MXFP8 row answers through its own flags above.
         # api_dsl.check_support mirrors this (rule 8b).
-        if (
-            capabilities.sm_lo == 107
-            and not capabilities.is_mxfp8
-            and not facts.thd
-            and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs))
-        ):
+        if capabilities.sm_lo == 107 and not capabilities.is_mxfp8 and not facts.thd and not d256_decode_tile_served(capabilities, facts, knobs):
+            # knobs None = the facts-only question: SOME packing rides the tile (the packed form alone past 32 unpacked rows)
             return "Rubin paged KV requires THD queries or a decode-shaped half D256 graph (the decode tile); dense paged queries are not wired on cc 10.7 otherwise"
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
         # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
@@ -1398,6 +1478,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # The FROST FP8 kernels no longer compute Amax_S (dropped: nothing
         # consumed it and the atomicMax serialized the epilogue); a graph that
         # DECLARES the output must go to an engine that writes it.
+        _warn_amax_s_declared_once()
         return "graph requests the Amax_S output, which the FROST engines do not produce"
 
     if facts.bottom_right:
@@ -2053,14 +2134,20 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             cgas=frozenset({2}),
             # (64, 64): cga1 only -- at cga2 the halved V slab would need a 32-byte
             # swizzle the FP8 P.V descriptors do not model (api_dsl.supported_cgas_for).
-            # (128, 128): the per-tensor FP8 d128 kernel builds at both widths; the
-            # heuristic runs its dense unsplit leg at cga1 (heuristics._auto_sched_cga).
+            # (128, 128): the per-tensor FP8 d128 kernel builds at both widths on
+            # BOTH legs; the heuristic runs a dense graph at cga1 (heuristics.
+            # _auto_sched_cga).  The split leg used to be held at cga2: on a
+            # decode shape that doubles the MMA work per KV tile (each CTA of the
+            # pair runs the full 256-row tile against the same keys) and the
+            # kernel is MMA-bound there, so the split could never pay (B300,
+            # llama 64/8 e4m3, 128k keys, b=1: 134 us at cga2 x split 8, flat to
+            # split 32; b=8 stayed unsplit at 895 us).
             cgas_by_d_shape=(
                 (((256, 256), frozenset({1})),)
                 if rubin_row
                 else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
-            split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((128, 128), frozenset({2})), ((192, 128), frozenset({2})))),
+            split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((192, 128), frozenset({2})))),
             # f16x2-softmax arm: only the cc 10.7 sibling kernels carry the
             # path, in every per-tensor FP8 flavor (MUFU EX2.F16x2 exists below
             # cc10.7 but no other file wires it). FLOAT is the f32 pipeline

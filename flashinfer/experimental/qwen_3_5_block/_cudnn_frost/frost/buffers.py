@@ -532,6 +532,7 @@ CUTEDSL_MIN_VERSION = (4, 7, 0)
 _RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
 
 _DSL_STATE = None
+_DSL_PRIMITIVES = None
 
 
 def cutedsl_state():
@@ -623,6 +624,42 @@ def cutedsl_arch_requirement_error(device_cc):
     return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
 
 
+def cutedsl_primitives_error(what):
+    """Message when the DSL is new enough but exports no ``cutlass.primitives``.
+
+    Clearing the version floor does not imply the primitive layer is reachable
+    under that name: public wheels have shipped it as
+    ``cutlass.experimental.primitives``, and where ``cutlass.primitives`` does
+    work it can be an alias with no directory of its own -- so neither the
+    version nor the filesystem answers this. Only an import does.
+
+    That import executes the cutlass package (~1 s), which is why this is NOT
+    folded into :func:`cutedsl_requirement_error`: callers run it last, once an
+    engine would otherwise accept, where lowering is about to import the DSL
+    anyway. Declining here still beats the alternative, which is an ImportError
+    raised from inside the lowering with the plan already in the ranked list.
+    """
+    global _DSL_PRIMITIVES
+    if _DSL_PRIMITIVES is None:
+        import importlib
+
+        try:
+            importlib.import_module("cutlass.primitives")
+            _DSL_PRIMITIVES = False
+        except Exception:  # noqa: BLE001 - any failure to reach it is the same answer
+            _DSL_PRIMITIVES = True
+    if not _DSL_PRIMITIVES:
+        return None
+    _, version = cutedsl_state()
+    found = version[1] if version else "unknown"
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return (
+        f"{what} lowers through the CuTe DSL primitive layer (cutlass.primitives), "
+        f"which the installed nvidia-cutlass-dsl ({found}) does not export. "
+        f"Install a build that provides it (>= {floor})."
+    )
+
+
 def cutedsl_requirement_error(what):
     """Message naming the installed DSL version when it is below the floor, else None.
 
@@ -631,10 +668,12 @@ def cutedsl_requirement_error(what):
     downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
     """
     installed, version = cutedsl_state()
-    if not installed or not cutedsl_too_old(version):
+    if not installed:
         return None
     floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
-    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
+    if cutedsl_too_old(version):
+        return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
+    return None
 
 
 def current_device_id():

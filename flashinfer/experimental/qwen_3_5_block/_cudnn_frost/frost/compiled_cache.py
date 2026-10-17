@@ -541,7 +541,7 @@ def _try_load(entry: Path, key: str, symbol: str):
             return None
         wrapper._compiled_cache_module = module  # keep the engine alive as long as the callable
         wrapper._compiled_cache_entry = str(entry)
-        wrapper._compiled_cache_raw = raw  # positional-only tvm_ffi.Function, for a prepared lane
+        wrapper._compiled_cache_raw = raw  # positional-only tvm_ffi.Function, for a prepared launch
         return wrapper
     except Exception as exc:  # noqa: BLE001 -- a stale or foreign artifact is a miss
         _count("invalid")

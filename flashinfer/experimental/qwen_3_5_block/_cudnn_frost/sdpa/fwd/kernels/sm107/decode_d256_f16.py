@@ -20,15 +20,16 @@ This tile transposes the problem instead (the "swap-AB" decode form):
     O^T[d_v, N_Q]     += V^T[d_v, 128 keys] . P^T[128 keys, N_Q]  (BMM2, M = d_v)
 
 The KV tokens are the MMA M axis (M = 128, the standard TMEM lane == row
-layout) and the packed Q rows are the N axis (N_Q = 16 or 32, a multiple of
+layout) and the packed Q rows are the N axis (N_Q = 16, 32 or 64, a multiple of
 the f16 UMMA N granule), so the tensor-core and exp work scale with the live
 rows: 8x less MMA and 8x fewer exponentials per key than the prefill tile at
 N_Q = 16.  The online softmax reduces over LANES (a column of S^T is one Q
 row's scores for the tile's 128 keys): a 5-step butterfly inside each warp
-and a 4-way exchange through shared memory across a 4-warp group, once per KV
-tile.  A group owns 16 columns; N_Q = 32 runs two groups (8 softmax warps)
+and, once per KV tile, a shared-memory max across the 4-warp group (red.shared.max
+on order-preserving int32 keys into one 16-word slot per group).  A group owns
+16 columns; N_Q = 32 runs two groups (8 softmax warps) and N_Q = 64 four (16)
 over the same 128 TMEM lanes, so the per-thread exp / shuffle / register load
-is the same at either tile width (one 4-warp group over 32 columns was
+is the same at every tile width (one 4-warp group over 32 columns was
 issue-bound and lost to the prefill tile on the S_q = 2 MTP shape).  On B200
 the 32-column tile streams a KV tile 1.6x slower per CTA than the 16-column
 one (2.8 vs 1.75 us; 90 us unsplit at b=32 x 2 KV heads x 4096 keys where the
@@ -44,7 +45,7 @@ MN-major: the N_Q values of one key are contiguous), V is consumed in place
 as an MN-major A operand (d_v contiguous), and O^T accumulates in TMEM with
 lane = d_v (two 128-lane blocks for d_v = 256).
 
-Roles (6 warps at N_Q = 16, 10 at N_Q = 32; cta_group::1, one CTA per
+Roles (6 warps at N_Q = 16, 10 at N_Q = 32, 18 at N_Q = 64; cta_group::1, one CTA per
 (KV-head group, batch, split, TOKEN UNIT) unit -- a token unit is one Q box of
 Q_BOX_TOKENS = N_Q // HEADS_PER_TILE consecutive tokens, and a graph with more
 tokens than one box holds launches ceil(S_q / Q_BOX_TOKENS) units per head
@@ -58,9 +59,10 @@ derives the count from the runtime S_q); W = 4 * N_Q / 16 softmax warps):
   * warp W+1      TMA loads: Q^T once, then K/V through a 3-slot 64 KiB ring
                   (K(t), V(t), K(t+1), ...), block-table indirection under PAGED_KV.
 
-SMEM: Q^T N_Q x 512 B (8 / 16 KiB) + 3 x 64 KiB ring + 2 x P^T (4 / 8 KiB) =
-208 / 224 KiB at N_Q = 16 / 32.  TMEM: 2 S^T slots + 2 O^T blocks = 4 * N_Q
-columns.  The KV loop, per-batch lengths, masks (padding / bottom-right causal
+SMEM: Q^T N_Q x 512 B (8 / 16 / 32 KiB) + 3 x 64 KiB ring + 2 x P^T (4 / 8 /
+16 KiB) = 208 / 224 / 256 KiB at N_Q = 16 / 32 / 64 (plus the max-key slots, the
+sum scratch and the barriers).  TMEM: 2 S^T slots + 2 O^T blocks = 4 * N_Q
+columns (64 / 128 / 256).  The KV loop, per-batch lengths, masks (padding / bottom-right causal
 / SWA / right band), sink, Stats (natural or base-2), dense padded-Q trim and
 split-KV partials follow the prefill tile's contract exactly: a split writes
 fp32 O / natural-log LSE partials into the split-major workspace that
@@ -72,13 +74,30 @@ explicit pointer ABI: extents and Int64 strides are runtime arguments, while
 head dimensions, Stats presence and the paged in-page layout specialize compile().
 
 Rubin (SM107) sibling of sm100/decode_d256_f16.py: the SAME body (cta_group::1,
-6 / 10 warps, f16 TILE_K_HW = 16 on both arch lines, 64 TMEM columns) under
-config_sm107.make_cfg_d256_decode, which re-validates the shared CfgD256Decode
-record against the Rubin facts -- the 320 KiB usable carveout (the tile's 209 /
-226 KiB at N_Q = 16 / 32 fit the STANDARD 227 KiB carveout, so no oversized-SMEM
-launch and no L1 shrink) and the 256 KiB version-0 tcgen05 descriptor window
-(every MMA-operand slab starts below it; DESC_VERSION is DERIVED from the layout,
-never assumed).  SPIN_RING_WAITS is this kernel's own measured constant (the
+6 / 10 / 18 warps, f16 TILE_K_HW = 16 on both arch lines, 4 x N_Q TMEM columns)
+under config_sm107.make_cfg_d256_decode, which builds the shared CfgD256Decode
+record over the Rubin width set (config_sm107._D256_DECODE_Q_TILES_SM107: the SM100
+pair plus the 64-column tile the Blackwell carveout cannot hold) and re-validates it
+against the Rubin facts -- the 320 KiB usable carveout (209 / 226 KiB at N_Q = 16 /
+32 fit the STANDARD 227 KiB carveout: no oversized-SMEM launch, no L1 shrink; the
+64-column tile's 259 KiB take the oversized carveout, L1 -> 8 kB, which costs this
+TMA-fed tile nothing it uses) and the 256 KiB version-0 tcgen05 descriptor window
+(every MMA-operand slab starts AND ends inside it -- P^T at N_Q = 64 ends exactly at
+the line; DESC_VERSION is DERIVED from the layout, never assumed).
+
+The 64-column tile (four softmax groups, 576 threads) is ONE unit of up to 64
+packed rows: an MTP step of four tokens x 12 / 16 heads (48 / 64 rows) streams the
+KV range once where the 32-column tile cuts it into two token units.  Its register
+budget is what shapes this body: ptxas caps an 18-warp CTA at 96 registers per
+thread (16,384 per SM sub-partition over 5 warps x 32 lanes, 8-granular -- the
+`.reqntid` the DSL emits, no `.maxnreg`), and the per-thread work is the same 16
+columns at every width, so the keyed max exchange, the ftz max intrinsics, the x8
+O^T readbacks and the two-half epilogue below exist to keep the sm_107a rendering
+spill-free at that cap (MEASURED: REG 93-96, STACK 0, STL + LDL 0 on the admitted
+forms; the SM100 twin runs the same source at its roomier caps).  The admitted
+forms are a config fact (config_sm107._validate_cfg_d256_decode_sm107: a packed
+group of at least two heads, and over a paged cache the causal / window mask); which
+steps the route sends to the width is config_sm107.decode_d256_q_tile's decision.  SPIN_RING_WAITS is this kernel's own measured constant (the
 sleeping form until its A/B on an exclusive Rubin GPU).  Kept line-for-line with
 the SM100 body apart from those declarations (pinned by the twin-diff test in
 test_sdpa_fwd_decode_d256_sm107.py): a fix to the tile lands in BOTH files.
@@ -87,7 +106,8 @@ Not served here (the adapter keeps these on the prefill tile): THD queries,
 graphs past the Rubin route (config_sm107.decode_d256_q_tile: more than two
 token units of the 32-column tile for a packed step, an unpacked / MHA step above
 32 tokens, a head group wider than the tile), FP8/MXFP8, the fused epilogue gate
-and the pre-folded softmax scale (the Rubin d256 prefill kernel carries both).
+and the pre-folded softmax scale (the Rubin d256 prefill kernel carries both);
+the 64-column width declines the unpacked and the mask-free paged forms (above).
 """
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -135,7 +155,7 @@ DESC_VERSION: int = d256_decode_desc_version(CFG)
 # constant IS the whole experiment (test_sm107_decode_ring_waits_take_the_module_spin_constant).
 SPIN_RING_WAITS: bool = False
 
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, launch_dependent_grids, wait_on_dependent_grids
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.mma import mma_ss
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import tma_load_tile
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
@@ -245,10 +265,17 @@ TMALDG_WARP_ID = CFG.TMALDG_WARP_ID
 # softmax warps' own cross-warp reductions (all groups, they run in lockstep).
 _BAR_TMEM = 1
 _BAR_SOFTMAX = 2
-# Cross-warp reduction scratch: [2 tile parities + 1 epilogue][softmax warp][COLS];
-# a group reads the 4 entries of its own warps.
-RED_SLOTS = 3
-RED_WORDS = RED_SLOTS * SOFTMAX_WARPS * COLS
+# Cross-warp reduction scratch.  The per-KV-tile column MAXIMA meet in ONE 16-word Int32 slot per group: each of the
+# group's four warps publishes its 16 butterfly maxima with red.shared.max on order-preserving keys (_max_key), and
+# after the tile's named barrier every lane reads the 16 group maxima back -- no fold, nothing retained across the
+# exchange.  MAX_RED_SLOTS slots rotate per tile and the group's first warp re-arms the slot two tiles ahead, so the
+# one barrier per tile also orders every reuse.  The epilogue's column SUMS keep the per-warp fp32 form ([softmax
+# warp][COLS], each warp's partial read back by its group).  (Holding the 16 maxima in registers and folding 64
+# loaded values was what put the 18-warp N_Q = 64 tile over ptxas's 96-register cap.)
+MAX_RED_SLOTS = 3
+MAX_RED_WORDS = MAX_RED_SLOTS * COL_GROUPS * COLS  # <= SOFTMAX_LANES by construction (48 per group against 128 lanes), so one lane arms one word
+RED_WORDS = SOFTMAX_WARPS * COLS
+INT32_MIN = -2147483648  # below every max key: the slot's armed value
 
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
@@ -289,6 +316,21 @@ def _select_i32(cond, a, b):
 @cute.jit
 def _select_f32(cond, a, b):
     return cutlass.Float32(arith.select(cond.ir_value(), a.ir_value(), b.ir_value()))
+
+
+@cute.jit
+def _max_key(x):
+    """Order-preserving Int32 key of a non-NaN fp32 (the softmax maxima: finite or -inf): the bit pattern, with the
+    magnitude bits inverted for a negative value, so signed-integer order is the float order (-inf -> 0x807FFFFF, the
+    smallest key a column can hold, above INT32_MIN).  Its own inverse on the keys it produces (_key_max)."""
+    b = x.bitcast(cutlass.Int32)
+    return _select_i32(b < cutlass.Int32(0), b ^ cutlass.Int32(0x7FFFFFFF), b)
+
+
+@cute.jit
+def _key_max(k):
+    """The fp32 a _max_key key encodes."""
+    return _select_i32(k < cutlass.Int32(0), k ^ cutlass.Int32(0x7FFFFFFF), k).bitcast(cutlass.Float32)
 
 
 @cute.jit
@@ -408,6 +450,7 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     tma_q = GmemTileTma(tma_q_desc)
     if cutlass.const_expr(PAGED_KV and paged_hnd):
@@ -419,6 +462,15 @@ def _tmaldg_warp_group(
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
+
+    if cutlass.const_expr(use_pdl):
+        # Programmatic dependent launch: every global read of this role -- the lengths and the table (a serving stack's own
+        # earlier kernels write them), the Q box (the slab a projection / norm-RoPE launch wrote), the K / V pages (the
+        # write-through filled them) -- sits BELOW this wait; the descriptor prefetches above it are the prologue it overlaps.
+        wait_on_dependent_grids()
+        # The prologue is behind this CTA: release the dependent grid so it stages its own while the mainloop runs (its wait
+        # still blocks on this grid's completion and memory flush, wherever this trigger sits).
+        launch_dependent_grids()
 
     lo, hi, eff_seqlen_kv, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
@@ -479,6 +531,7 @@ def _mma_warp_group(
     batch_idx,
     split_idx,
     tok0,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     tmem_alloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(_BAR_TMEM, 32 * (SOFTMAX_WARPS + 1))
@@ -533,6 +586,9 @@ def _mma_warp_group(
         kind=MMA_KIND,
     )
 
+    if cutlass.const_expr(use_pdl):
+        # PDL: the TMEM allocation and the descriptor builds above are this role's prologue; its first global read (the lengths) is below.
+        wait_on_dependent_grids()
     lo, hi, _ek, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
 
@@ -601,8 +657,13 @@ def _mma_warp_group(
 
 @cute.jit
 def _warp_reduce_max(x):
+    # ftz=True (the FMNMX intrinsic, as tile_dsl's row_max_reduction and the sparse sibling spell it): the bare
+    # cute.math.max lowers to compare + select -- FSETP.NAN + FSETP.GTU + two FSEL per max, every predicate register busy
+    # -- which tipped the 18-warp (N_Q = 64) tile's KV loop over ptxas's 96-register cap; the inline-asm max.f32 form
+    # pins its operands around each asm block and spilled more.  Softmax maxima are finite or -inf, so only a score below
+    # the fp32 normal range (|s| < 2^-126) could read differently (flushed to 0).
     for off in cutlass.range_constexpr(5):
-        x = cute.math.max(x, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, x, 16 >> off, 31, kind=nvvm.Shfl.BFLY)))
+        x = cute.math.max(x, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, x, 16 >> off, 31, kind=nvvm.Shfl.BFLY)), ftz=True)
     return x
 
 
@@ -618,6 +679,7 @@ def _softmax_warp_group(
     tmem_ptr_i32,
     bars,
     red_smem,
+    mred_smem,
     sP_raw,
     o_tensor,
     lse_tensor: Optional[cute.Tensor],
@@ -632,6 +694,7 @@ def _softmax_warp_group(
     split_idx,
     tok0,
     scale_log2: cutlass.Float32,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
     tidx = cute.arch.thread_idx()[0]
@@ -646,6 +709,9 @@ def _softmax_warp_group(
     G = cutlass.Int32(HEADS_PER_TILE)
     tmem_base = tmem_ptr_i32.load()
 
+    if cutlass.const_expr(use_pdl):
+        # PDL: the TMEM handshake above is this role's prologue; its first global read (the lengths) is below.
+        wait_on_dependent_grids()
     lo, hi, eff_seqlen_kv, eff_seqlen_q, q_len_b = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
     causal_diag = cutlass.Int32(0)
@@ -661,6 +727,12 @@ def _softmax_warp_group(
     l_vec = cutlass.Vector.from_elements(tuple(ZERO for _ in range(COLS)), cutlass.Float32)
 
     red_ptr = Pointer(red_smem.data_ptr(), dtype=cutlass.Float32)
+    mred_ptr = Pointer(mred_smem.data_ptr(), dtype=cutlass.Int32)
+    # The column each thread publishes into its group's max slot (lanes 16..31 repeat 0..15: a duplicate max is idempotent),
+    # the group's slot index, and the group's first warp (it re-arms the slot two tiles ahead).
+    key_col = (tidx % cutlass.Int32(32)) % cutlass.Int32(COLS)
+    grp = col0 // cutlass.Int32(COLS)
+    group_lead = (sm_warp % cutlass.Int32(4)) == cutlass.Int32(0)
 
     for i in cutlass.range(0, n_tiles, 1, unroll=1):
         kv_tile = lo + i
@@ -695,23 +767,23 @@ def _softmax_warp_group(
                 v = _select_f32(masked, NEG_INF, v)
             s_cols.append(v)
 
-        # Column max over the tile's 128 keys: butterfly inside the warp, then
-        # the group's four warps exchange through SMEM (slot = tile parity, so
-        # the single barrier per tile also orders the next reuse of the slot).
-        red_base = par * cutlass.Int32(SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
-        col_max = []
+        # Column max over the tile's 128 keys: butterfly inside the warp, then the group's four warps meet in the
+        # tile's 16-word slot through red.shared.max on order-preserving keys; after the barrier every lane reads the
+        # 16 group maxima back (no fold, nothing retained across the exchange).  The slot rotates per tile and the
+        # group's first warp re-arms the slot two tiles ahead: its last readers passed this tile's barrier, its next
+        # writers wait the next one, so the one barrier per tile orders every reuse.
+        mbase = ((i % cutlass.Int32(MAX_RED_SLOTS)) * cutlass.Int32(COL_GROUPS) + grp) * cutlass.Int32(COLS)
+        my_key = cutlass.Int32(INT32_MIN)
         for j in cutlass.range_constexpr(COLS):
-            cm = _warp_reduce_max(s_cols[j])
-            (red_ptr + (red_base + cutlass.Int32(j))).store(cm)
-            col_max.append(cm)
+            my_key = _select_i32(key_col == cutlass.Int32(j), _max_key(_warp_reduce_max(s_cols[j])), my_key)
+        nvvm.inline_ptx("red.shared.max.s32 [{$r0}], {$r1};", read_only_args=[mred_smem.subview(mbase + key_col), my_key])
         nvvm.barrier_cta_sync(barrier_id=_BAR_SOFTMAX, thread_count=SOFTMAX_LANES)
-        red_read = par * cutlass.Int32(SOFTMAX_WARPS * COLS) + (sm_warp - (sm_warp % cutlass.Int32(4))) * cutlass.Int32(COLS)
         tile_max = []
         for j in cutlass.range_constexpr(COLS):
-            tm = col_max[j]
-            for w in cutlass.range_constexpr(4):
-                tm = cute.math.max(tm, cutlass.Float32((red_ptr + (red_read + cutlass.Int32(w * COLS + j))).load()))
-            tile_max.append(tm)
+            tile_max.append(_key_max(cutlass.Int32((mred_ptr + (mbase + cutlass.Int32(j))).load())))
+        if group_lead:
+            rbase = (((i + cutlass.Int32(2)) % cutlass.Int32(MAX_RED_SLOTS)) * cutlass.Int32(COL_GROUPS) + grp) * cutlass.Int32(COLS)
+            (mred_ptr + (rbase + key_col)).store(cutlass.Int32(INT32_MIN))
 
         # Online update per column (identical in every lane: the max is the
         # tile-wide column max, so alpha is uniform and O^T's rescale is exact).
@@ -722,7 +794,7 @@ def _softmax_warp_group(
         p_cols = []
         for j in cutlass.range_constexpr(COLS):
             m_old_j = cutlass.Float32(m_vec[j])
-            m_new_j = cute.math.max(m_old_j, tile_max[j])
+            m_new_j = cute.math.max(m_old_j, tile_max[j], ftz=True)
             ms_old = row_max_for_exp2(m_old_j)
             ms_new = row_max_for_exp2(m_new_j)
             alpha_j = cute.math.exp2(cute.math.min(ms_old - ms_new, ZERO), fastmath=True)
@@ -757,12 +829,17 @@ def _softmax_warp_group(
             bars.mb_bmm2_done[t_prev & cutlass.Int32(1)].wait((t_prev // cutlass.Int32(2)) & cutlass.Int32(1), spin=SPIN_RING_WAITS)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
             if ~all_one:
+                # Two x8 halves per d block (the register peak of the loop is here: alpha, the running max / sum and the
+                # O^T values together; the x16 readback tipped the 18-warp N_Q = 64 tile over ptxas's 96-register cap).
                 for blk in cutlass.range_constexpr(O_BLOCKS):
-                    o_ptr = nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk]) + col0, cutlass.Float32)
-                    o_vals = nvvm.tcgen05_ld("32x32b", o_ptr, num=COLS)
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    o_scaled = cutlass.Vector.from_elements(tuple(cutlass.Float32(o_vals[j]) * alpha[j] for j in range(COLS)), cutlass.Float32)
-                    nvvm.tcgen05_st("32x32b", o_ptr, o_scaled)
+                    for h in cutlass.range_constexpr(2):
+                        o_ptr = nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk] + h * (COLS // 2)) + col0, cutlass.Float32)
+                        o_vals = nvvm.tcgen05_ld("32x32b", o_ptr, num=COLS // 2)
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        o_scaled = cutlass.Vector.from_elements(
+                            tuple(cutlass.Float32(o_vals[jj]) * alpha[h * (COLS // 2) + jj] for jj in range(COLS // 2)), cutlass.Float32
+                        )
+                        nvvm.tcgen05_st("32x32b", o_ptr, o_scaled)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         # Publish P^T(t) (and the rescaled O^T) to the MMA warp: the tcgen05 stores
         # are ordered before the arrive, and the MMA fences after its wait.
@@ -777,106 +854,116 @@ def _softmax_warp_group(
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
 
     # Column sums over the 128 lanes (once per unit), via the epilogue slot.
-    red_epi = cutlass.Int32(2 * SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
+    red_epi = sm_warp * cutlass.Int32(COLS)
     for j in cutlass.range_constexpr(COLS):
         (red_ptr + (red_epi + cutlass.Int32(j))).store(_warp_reduce_sum(cutlass.Float32(l_vec[j])))
     nvvm.barrier_cta_sync(barrier_id=_BAR_SOFTMAX, thread_count=SOFTMAX_LANES)
-    red_epi_read = cutlass.Int32(2 * SOFTMAX_WARPS * COLS) + (sm_warp - (sm_warp % cutlass.Int32(4))) * cutlass.Int32(COLS)
+    red_epi_read = (sm_warp - (sm_warp % cutlass.Int32(4))) * cutlass.Int32(COLS)
 
-    lse_cols = []
-    inv_cols = []
-    dead_cols = []
-    live_cols = []
     LN2_F = cutlass.Float32(LN2)
     TINY = cutlass.Float32(1e-30)
-    if cutlass.const_expr(CFG.HAS_SINK):
+    # Under a KV split the fold moves to the combine pass (split_combine), which adds the sink column exactly once; the partials stay sink-free.
+    if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
         sinks_arr = cutlass.make_array_view(sinks_tensor)
-    tok_cols = []
-    head_cols = []
-    for j in cutlass.range_constexpr(COLS):
-        jg = col0 + cutlass.Int32(j)  # the packed Q row this column is
-        tok_j = tok0 + jg // G
-        head_j = head_idx * G + (jg % G)
-        tok_cols.append(tok_j)
-        head_cols.append(head_j)
-        # Every warp's partial comes back from SMEM (this warp's included), so
-        # the group's four warps see the same total.
-        l_tot = ZERO
-        for w in cutlass.range_constexpr(4):
-            l_tot = l_tot + cutlass.Float32((red_ptr + (red_epi_read + cutlass.Int32(w * COLS + j))).load())
-        m_raw = cutlass.Float32(m_vec[j])  # -inf while the row has no live key
-        m_nat = row_max_for_exp2(m_raw) * LN2_F
-        row_dead = l_tot <= ZERO
-        if cutlass.const_expr(CFG.HAS_SINK):
-            # The sink folds against the row's ACTUAL max (what the prefill tile
-            # does with its published max), -inf on a keyless row: new_max is
-            # then the sink logit itself, scale = exp(-inf) = 0 and new_sum = 1,
-            # so LSE is the sink logit exactly and O := 0 through inv = 0.  The
-            # 0-substitute above is for exp2 arguments only: anchoring the fold
-            # on it charged a phantom logit 0 against the sink, and a finite sink
-            # far below it (-100) underflowed exp() to 0 -> LSE = -inf.
-            m_fold = m_raw * LN2_F
-            sink_logit = cutlass.Float32(sinks_arr[head_j])
-            new_max = cute.math.max(m_fold, sink_logit)
-            scale = cute.math.exp(m_fold - new_max, fastmath=True)
-            new_sum = l_tot * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
-            lse_j = new_max + cute.math.log(new_sum, fastmath=True)
-            inv_j = scale / new_sum
-        else:
-            lse_j = m_nat + cute.math.log(cute.math.max(l_tot, TINY), fastmath=True)
-            inv_j = ONE / cute.math.max(l_tot, TINY)
-            lse_j = _select_f32(row_dead, NEG_INF, lse_j)
-            inv_j = _select_f32(row_dead, ZERO, inv_j)
-        live_j = tok_j < seqlen_q
-        if cutlass.const_expr(Q_BOX_ROWS < N_Q):
-            # The zero-filled tail rows past the Q box (a head group that does not divide N_Q) decode
-            # to the NEXT unit's first token (jg // G == Q_BOX_TOKENS), a live token whenever another
-            # unit follows: they are never stored -- without this guard a non-last unit's tail
-            # overwrote the next unit's first token (a CTA-order race: 5-14 % of that token's O
-            # elements wrong, which unit's store landed last).
-            live_j = live_j & (jg < cutlass.Int32(Q_BOX_ROWS))
-        if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
-            # Dense padded-Q trim: rows past seq_len_q[b] write O := 0 / LSE := -inf,
-            # applied AFTER the sink fold (a trimmed row is dead even with a sink).
-            row_trim = tok_j >= q_len_b
-            lse_j = _select_f32(row_trim, NEG_INF, lse_j)
-            inv_j = _select_f32(row_trim, ZERO, inv_j)
-            row_dead = row_dead | row_trim
-        if cutlass.const_expr(CFG.STATS_LOG2):
-            lse_j = lse_j * cutlass.Float32(LOG2E)
-        lse_cols.append(lse_j)
-        inv_cols.append(inv_j)
-        dead_cols.append(row_dead)
-        live_cols.append(live_j)
-
     # Split partials stack split-major on the workspace batch axis (b + s*B).
     o_batch = batch_idx + split_idx * n_batch
-
-    if cutlass.const_expr(lse_tensor is not None):
-        lse_arr = cutlass.make_array_view(lse_tensor)
-        for j in cutlass.range_constexpr(COLS):
-            if (lane == cutlass.Int32(j)) & live_cols[j]:
-                lse_arr[o_batch, head_cols[j], tok_cols[j]] = lse_cols[j]
-
     # O[q, d] = O^T[d, q] / l[q]: this lane is d (and d + 128); the store
     # writes the graph's actual d_v columns only (the tile is an envelope).
     oo = cutlass.make_array_view(o_tensor)
     D_V = cutlass.const_expr(o_tensor.shape[3])
-    for blk in cutlass.range_constexpr(O_BLOCKS):
-        if cutlass.const_expr(blk * 128 < D_V):
-            d_idx = lane + cutlass.Int32(blk * 128)
-            o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(COLS)), cutlass.Float32)
-            if n_tiles > cutlass.Int32(0):
-                # Empty range: O^T TMEM was never written, so the load is skipped
-                # rather than multiplied by 0 (NaN * 0 is NaN).
-                o_vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk]) + col0, cutlass.Float32), num=COLS)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            if d_idx < cutlass.Int32(D_V):
-                for j in cutlass.range_constexpr(COLS):
-                    val = _select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])
-                    if live_cols[j]:
-                        o_row = oo[o_batch, tok_cols[j], head_cols[j], :]
-                        o_row[d_idx] = val.to(o_tensor.element_type)
+    # The epilogue runs in two 8-column halves: each half derives its columns' inverse sum / dead / live facts, then
+    # reads that half of O^T back (the x8 tcgen05.ld shape) and stores it.  The 16-wide per-column lists and the x16
+    # O^T readback together were what the 18-warp N_Q = 64 tile spilled at ptxas's 96-register cap; the halves keep
+    # the same arithmetic and the same stores (bitwise).  Each thread stores ONE LSE (the column its key lane names, lane == j), kept
+    # as a per-lane scalar with a liveness bit; the column's token / head are two integer ops on a warp-uniform row
+    # index, recomputed at each store site rather than carried in lists.
+    O_HALF = COLS // 2
+    my_lse = ZERO
+    my_lse_live = lane < cutlass.Int32(0)  # False
+    for h in cutlass.range_constexpr(2):
+        inv_cols = []
+        dead_cols = []
+        live_cols = []
+        for jj in cutlass.range_constexpr(O_HALF):
+            j = h * O_HALF + jj
+            jg = col0 + cutlass.Int32(j)  # the packed Q row this column is
+            tok_j = tok0 + jg // G
+            head_j = head_idx * G + (jg % G)
+            # Every warp's partial comes back from SMEM (this warp's included), so
+            # the group's four warps see the same total.
+            l_tot = ZERO
+            for w in cutlass.range_constexpr(4):
+                l_tot = l_tot + cutlass.Float32((red_ptr + (red_epi_read + cutlass.Int32(w * COLS + j))).load())
+            m_raw = cutlass.Float32(m_vec[j])  # -inf while the row has no live key
+            m_nat = row_max_for_exp2(m_raw) * LN2_F
+            row_dead = l_tot <= ZERO
+            if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
+                # The sink folds against the row's ACTUAL max (what the prefill tile
+                # does with its published max), -inf on a keyless row: new_max is
+                # then the sink logit itself, scale = exp(-inf) = 0 and new_sum = 1,
+                # so LSE is the sink logit exactly and O := 0 through inv = 0.  The
+                # 0-substitute above is for exp2 arguments only: anchoring the fold
+                # on it charged a phantom logit 0 against the sink, and a finite sink
+                # far below it (-100) underflowed exp() to 0 -> LSE = -inf.
+                m_fold = m_raw * LN2_F
+                sink_logit = cutlass.Float32(sinks_arr[head_j])
+                new_max = cute.math.max(m_fold, sink_logit)
+                scale = cute.math.exp(m_fold - new_max, fastmath=True)
+                new_sum = l_tot * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
+                lse_j = new_max + cute.math.log(new_sum, fastmath=True)
+                inv_j = scale / new_sum
+            else:
+                lse_j = m_nat + cute.math.log(cute.math.max(l_tot, TINY), fastmath=True)
+                inv_j = ONE / cute.math.max(l_tot, TINY)
+                lse_j = _select_f32(row_dead, NEG_INF, lse_j)
+                inv_j = _select_f32(row_dead, ZERO, inv_j)
+            live_j = tok_j < seqlen_q
+            if cutlass.const_expr(Q_BOX_ROWS < N_Q):
+                # The zero-filled tail rows past the Q box (a head group that does not divide N_Q) decode
+                # to the NEXT unit's first token (jg // G == Q_BOX_TOKENS), a live token whenever another
+                # unit follows: they are never stored -- without this guard a non-last unit's tail
+                # overwrote the next unit's first token (a CTA-order race: 5-14 % of that token's O
+                # elements wrong, which unit's store landed last).
+                live_j = live_j & (jg < cutlass.Int32(Q_BOX_ROWS))
+            if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
+                # Dense padded-Q trim: rows past seq_len_q[b] write O := 0 / LSE := -inf,
+                # applied AFTER the sink fold (a trimmed row is dead even with a sink).
+                row_trim = tok_j >= q_len_b
+                lse_j = _select_f32(row_trim, NEG_INF, lse_j)
+                inv_j = _select_f32(row_trim, ZERO, inv_j)
+                row_dead = row_dead | row_trim
+            if cutlass.const_expr(CFG.STATS_LOG2):
+                lse_j = lse_j * cutlass.Float32(LOG2E)
+            is_mine = lane == cutlass.Int32(j)
+            my_lse = _select_f32(is_mine, lse_j, my_lse)
+            my_lse_live = my_lse_live | (is_mine & live_j)
+            inv_cols.append(inv_j)
+            dead_cols.append(row_dead)
+            live_cols.append(live_j)
+        for blk in cutlass.range_constexpr(O_BLOCKS):
+            if cutlass.const_expr(blk * 128 < D_V):
+                d_idx = lane + cutlass.Int32(blk * 128)
+                o_vals = cutlass.Vector.from_elements(tuple(ZERO for _ in range(O_HALF)), cutlass.Float32)
+                if n_tiles > cutlass.Int32(0):
+                    # Empty range: O^T TMEM was never written, so the load is skipped
+                    # rather than multiplied by 0 (NaN * 0 is NaN).
+                    o_vals = nvvm.tcgen05_ld(
+                        "32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk] + h * O_HALF) + col0, cutlass.Float32), num=O_HALF
+                    )
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                if d_idx < cutlass.Int32(D_V):
+                    for jj in cutlass.range_constexpr(O_HALF):
+                        jg = col0 + cutlass.Int32(h * O_HALF + jj)
+                        val = _select_f32(dead_cols[jj], ZERO, cutlass.Float32(o_vals[jj]) * inv_cols[jj])
+                        if live_cols[jj]:
+                            o_row = oo[o_batch, tok0 + jg // G, head_idx * G + (jg % G), :]
+                            o_row[d_idx] = val.to(o_tensor.element_type)
+
+    if cutlass.const_expr(lse_tensor is not None):
+        lse_arr = cutlass.make_array_view(lse_tensor)
+        if my_lse_live:
+            jg = col0 + lane  # lanes 0 .. COLS-1 own one column each (my_lse_live is False past them)
+            lse_arr[o_batch, head_idx * G + (jg % G), tok0 + jg // G] = my_lse
 
     bars.mb_tmem_dealloc.arrive()
 
@@ -903,6 +990,9 @@ def _kernel(
     block_table_tensor: Optional[cute.Tensor] = None,
     block_table_v_tensor: Optional[cute.Tensor] = None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag): each role waits on the
+    # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -916,6 +1006,7 @@ def _kernel(
     sQ_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sKV_raw = cutlass.Array(STORAGE_DTYPE, STAGES * kvBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sP_raw = cutlass.Array(cutlass.Int32, 2 * pBufferWords, alignment=1024, space=cutlass.AddressSpace.smem)
+    mred_smem = cutlass.Array(cutlass.Int32, MAX_RED_WORDS, alignment=16, space=cutlass.AddressSpace.smem)
     red_smem = cutlass.Array(cutlass.Float32, RED_WORDS, alignment=16, space=cutlass.AddressSpace.smem)
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -1001,6 +1092,11 @@ def _kernel(
                     Pointer(sQ_raw.subview(elem_off).data_ptr(), dtype=cutlass.Int32).store(zero4, alignment=16)
             nvvm.fence_proxy("async.shared", space="cta")
 
+    if warp_idx < SOFTMAX_WARPS:
+        # Arm every max-key slot (one word per lane): the first MAX_RED_SLOTS tiles find them at the smallest key.
+        if tidx < cutlass.Int32(MAX_RED_WORDS):
+            (Pointer(mred_smem.data_ptr(), dtype=cutlass.Int32) + tidx).store(cutlass.Int32(INT32_MIN))
+
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
@@ -1009,6 +1105,7 @@ def _kernel(
             tmem_ptr_i32=tmem_ptr_i32,
             bars=bars,
             red_smem=red_smem,
+            mred_smem=mred_smem,
             sP_raw=sP_raw,
             o_tensor=o_tensor,
             lse_tensor=lse_tensor,
@@ -1023,6 +1120,7 @@ def _kernel(
             split_idx=split_idx,
             tok0=tok0,
             scale_log2=scale_softmax_log2,
+            use_pdl=use_pdl,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1039,6 +1137,7 @@ def _kernel(
             batch_idx=batch_idx,
             split_idx=split_idx,
             tok0=tok0,
+            use_pdl=use_pdl,
         )
     elif warp_idx == TMALDG_WARP_ID:
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
@@ -1062,6 +1161,7 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            use_pdl=use_pdl,
         )
 
 
@@ -1100,6 +1200,7 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    use_pdl: cutlass.Constexpr[bool] = False,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
@@ -1203,23 +1304,26 @@ def _host(
         n_tok_units,
     )
 
-    def launch(args, k_table, v_table, hnd, grid, current_stream):
-        _kernel(*args, k_table, v_table, hnd).launch(
+    # `pdl` is an explicit argument of both helpers (like `hnd`): the DSL refuses a closure capture inside a staged `if`.
+    def launch(args, k_table, v_table, hnd, pdl, grid, current_stream):
+        # pdl: the programmatic-stream-serialization launch attribute, paired with the kernel's griddepcontrol sites.
+        _kernel(*args, k_table, v_table, hnd, pdl).launch(
             grid=grid,
             block=[CFG.THREADS_PER_CTA, 1, 1],
             stream=current_stream,
+            use_pdl=pdl,
         )
 
-    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, grid, current_stream):
+    def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, pdl, grid, current_stream):
         if cutlass.const_expr(PAGED_KV):
             # Keep the common unit page-column stride static in the device code.
             if strides[1] == cutlass.Int64(1):
                 layout = cute.make_layout((batch, kv_extent // cutlass.Int32(PAGE_SIZE)), stride=(strides[0], 1))
-                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, grid, current_stream)
+                launch(args, cute.make_tensor(kp, layout), cute.make_tensor(vp, layout), hnd, pdl, grid, current_stream)
             else:
-                launch(args, kt, vt, hnd, grid, current_stream)
+                launch(args, kt, vt, hnd, pdl, grid, current_stream)
         else:
-            launch(args, kt, vt, hnd, grid, current_stream)
+            launch(args, kt, vt, hnd, pdl, grid, current_stream)
 
     compact_inner = o_strides[2] == cutlass.Int64(d_v)
     if cutlass.const_expr(lse_ptr is not None):
@@ -1230,10 +1334,23 @@ def _host(
         if cutlass.const_expr(lse_ptr is not None):
             stats = cute.make_tensor(lse_ptr, cute.make_layout((B * SPLIT_KV, QH, SQ), stride=(lse_strides[0], lse_strides[1], 1)))
         args = kernel_args[:3] + (output, stats) + kernel_args[5:]
-        launch_tables(args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, grid_shape, stream)
+        launch_tables(
+            args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, use_pdl, grid_shape, stream
+        )
     else:
         launch_tables(
-            kernel_args, block_table_tensor, block_table_v_tensor, block_table_ptr, block_table_v_ptr, table_strides, B, SKV, paged_hnd, grid_shape, stream
+            kernel_args,
+            block_table_tensor,
+            block_table_v_tensor,
+            block_table_ptr,
+            block_table_v_ptr,
+            table_strides,
+            B,
+            SKV,
+            paged_hnd,
+            use_pdl,
+            grid_shape,
+            stream,
         )
 
 
@@ -1248,10 +1365,13 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    use_pdl: bool = False,
 ) -> Callable:
     """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
     are runtime arguments; head-dim envelopes, Stats presence and pool layout
-    are specializations. All stride fakes, including page tables, are Int64."""
+    are specializations. All stride fakes, including page tables, are Int64.
+    ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
+    ``griddepcontrol`` wait before the first global read and the release after the prologue -- the same math, bitwise."""
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d256 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
@@ -1302,6 +1422,7 @@ def compile(  # noqa: A001
         d_v,
         lse_kind,
         paged_hnd,
+        bool(use_pdl),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

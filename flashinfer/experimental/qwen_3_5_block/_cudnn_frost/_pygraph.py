@@ -2995,7 +2995,7 @@ def _linear_attention_final_state_dims(node):
     state0 = node.inputs.get("initial_state")
     if node.inputs.get("state_indices") is not None and state0 is not None and state0.dim:
         rows = state0.dim[0]
-    return [rows, max(q[1], v[1]), v[2], q[2]]
+    return [rows, max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_summary_final_dims(node):
@@ -3004,7 +3004,7 @@ def _linear_attention_summary_final_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], v[2], k[2]]
+    return [cu.dim[0] - 1, g[1], v[-1], k[-1]]
 
 
 def _linear_attention_transition_dims(node):
@@ -3013,7 +3013,7 @@ def _linear_attention_transition_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], k[2], k[2]]
+    return [cu.dim[0] - 1, g[1], k[-1], k[-1]]
 
 
 def linear_attention_summary_bwd_dims(node):
@@ -3022,7 +3022,7 @@ def linear_attention_summary_bwd_dims(node):
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, g[1], do[2], k[2]]
+    return [cu.dim[0] - 1, g[1], do[-1], k[-1]]
 
 
 def _linear_attention_state_checkpoints_dims(node):
@@ -3031,19 +3031,19 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max(v[0] // n + (cu[0] - 1), 1), max(q[1], v[1]), v[2], q[2]]
+    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_o_dims(node):
     # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    return [v[0], max(q[1], v[1]), v[2]]
+    return [v[0] * v[1] if len(v) == 4 else v[0], max(q[-2], v[-2]), v[-1]]
 
 
 def _gdp_o_dims(node):
-    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion
+    # [total_T, HO, V]: O follows q's rows; k/v carry the num_householder expansion (expanded rows or token-major)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    return [q[0], max(q[1], v[1]), v[2]]
+    return [q[0], max(q[-2], v[-2]), v[-1]]
 
 
 def _mamba2_transition_dims(node):

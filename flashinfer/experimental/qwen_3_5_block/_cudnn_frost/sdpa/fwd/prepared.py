@@ -649,6 +649,10 @@ class DenseLaunchSpec:
         "split",
         "fp32_partial",
         "combine",
+        # The split sink combine takes the per-batch Q lengths (int32 (B,)) after the sink pointer: a plan with a split sink AND the dense padded-Q
+        # trim (``seq_q_present``).  The combine cannot tell a padded query row from a valid keyless one without them (the native binder appends the
+        # bound Q-length address to the combine frame).
+        "combine_q_lens",
         "tile_n",
         "kv_tail_native",
         "causal",
@@ -668,6 +672,43 @@ class DenseLaunchSpec:
         "ragged_lse_head_major",
         "total_q",
     )
+
+
+def _plan_device_cc(api) -> Tuple[int, int]:
+    """The compute capability a plan lowers for, as its adapter recorded it at ``check_support``: the SM100 and SM90
+    adapters keep ``_device_cc``, the SM120 adapter ``compute_capability``; a plan that recorded neither reads its Q
+    tensor's device once more (the read the adapters make).  Never None: the split combine's form pin keys on it."""
+    cc = getattr(api, "_device_cc", None) or getattr(api, "compute_capability", None)
+    if cc is None:
+        import torch
+
+        cc = torch.cuda.get_device_capability(api.q_desc.device)
+    return (int(cc[0]), int(cc[1]))
+
+
+def _split_combine_decode_grid(api, b: int, qh: int, s_q_max: int, split: int) -> int:
+    """The split combine entry's kernel FORM for a plan (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
+    ``DECODE_GRID_LEAN_WALK``): a plan-time specialization on the declared B / H_q / S_q, the split and the plan's DEVICE, never
+    a runtime value.  On cc 10.7 a lean-grid-OVERFLOW launch (``heuristics.decode_combine_lean_walk_selected``: the lean grid
+    past the decode-grid kernel's bound, where that kernel is never eligible, at a split of at most
+    ``heuristics.DECODE_COMBINE_LEAN_WALK_MAX_SPLIT``) names the module's LEAN GROUP WALK, its former lean kernel, measured there
+    against the module's own forms (B 32 / B 128 x 24 heads at split 2-3: 3.3-8.9 us against 5.3-12.4 per launch on the Rubin
+    performance class); a deeper split past the grid bound keeps the AUTO entry (= the module's own forms there, as before the
+    restore); inside the bound the AUTO entry takes the decode-grid kernel on every sink-free
+    launch and the split-aware rule (``heuristics.decode_combine_grid_selected`` -- measured on the same class: that kernel
+    loses to the module's forms on a mid-sized grid below 32 splits and on any grid at 4) pins the module's own forms where the
+    two disagree.  Off cc 10.7 (the Blackwell line keeps the module's own three-way rule, measured on B200 / B300; a line the
+    rules were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound
+    (outside it the AUTO entry is the module's own forms by construction)."""
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import decode_combine_force_lean, decode_combine_lean_walk_selected
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100 import split_combine
+
+    device_cc = _plan_device_cc(api)
+    if decode_combine_lean_walk_selected(b, qh, s_q_max, split, device_cc=device_cc):
+        return split_combine.DECODE_GRID_LEAN_WALK
+    if decode_combine_force_lean(b, qh, s_q_max, split, device_cc=device_cc):
+        return split_combine.DECODE_GRID_OFF
+    return split_combine.DECODE_GRID_AUTO
 
 
 def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
@@ -746,10 +787,21 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if s.ragged and (s.split < 2 or not s.paged or not getattr(cfg, "RAGGED_Q", 0)):
         raise NotImplementedError("cudnn.sdpa: the ragged-Q decode leg needs a split, paged launch of a RAGGED_Q-compiled decode tile")
     s.combine = None
+    s.combine_q_lens = False
     if s.split > 1:
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.api_dsl import ws_align
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100 import split_combine
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _pybind_module
 
+        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
+            raise NotImplementedError(
+                "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
+            )
+
+        # The combine kernel's FORM (a plan-time specialization: the declared B / H_q / S_q, the split and the plan's device,
+        # never a runtime value; _split_combine_decode_grid states the rule and reads the device the adapter recorded).
+        decode_grid = _split_combine_decode_grid(api, s.b, s.qh, s.s_q_max, s.split)
         owner = split_combine.compile_ptr(
             dtype_o=api._combine_dtype_tag(),
             dtype_partial=api._partial_dtype_tag(),
@@ -763,6 +815,13 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
             gate=gate_in_combine,
             dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
+            # The plan's programmatic-dependent-launch form reaches the combine too (the dense half entries; a split tile
+            # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
+            **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
+            decode_grid=decode_grid,
+            # Half flavors fold the attention sink in the combine (sink-free partials).
+            has_sink=bool(s.has_sink) and s.quant is None,
+            has_q_lens=s.combine_q_lens,
         )
         fn = positional_entry(owner)
         if fn is None:

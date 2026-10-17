@@ -46,6 +46,24 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.constant
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
 
+# Whether the adapter routes per-tensor FP8 d128 decode shapes onto the two-KV-
+# stream specialization (TemplateParams.dual_kv_stream); heuristics mirror the
+# predicate through _sm100_fp8_dual_kv_stream.  Measured on B300 (llama 64/8,
+# 128k keys, same node, A/B/A/B): dense b=1 75 -> 63 us, b=8 469 -> 333, b=128
+# 6.85 -> 5.43 ms; paged (page 16) b=1 87 -> 73 us, b=128 5.40 -> 4.19 ms --
+# the latter at the HBM ceiling.  A module attribute so a test can switch it.
+FP8_DUAL_KV_STREAM_ROUTED = True
+# Q rows one 128-row tile holds: the two-stream decode serves S_q x packed heads
+# up to this many rows (one Q tile at cga1).
+FP8_DUAL_KV_STREAM_MAX_ROWS = 128
+
+
+def fp8_dual_kv_stream_routed() -> bool:
+    """Late-bound read of FP8_DUAL_KV_STREAM_ROUTED, so the adapter and the
+    heuristics agree with a test that monkeypatches the module attribute."""
+    return bool(FP8_DUAL_KV_STREAM_ROUTED)
+
+
 @dataclass(frozen=True)
 class TemplateParams:
     """Per-graph compile-time parameters threaded into a kernel template.
@@ -163,9 +181,10 @@ class TemplateParams:
     # at the DSv3 layer) and 32 on cc 10.7 (Rubin, where the same split is -9..-10 %: an emulated
     # exp2 costs 1.99x the MUFU time it frees); cc 10.3 (B300) has the doubled rate too -- MEASURED
     # -10 % causal / -6 % dense on d192x128 FP8 with the split on.  Auto-set by the adapter from the
-    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above) -- widen
-    # only after an A/B on the new cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the
-    # develop spelling).  Only those four kernels read it.
+    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above, and the d64
+    # decode tile, sm100/decode_d128_f16.py, through its own set) -- widen only after an A/B on the new
+    # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
+    # kernels read it.
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
@@ -208,13 +227,13 @@ class TemplateParams:
     # specializations of one template, and an ungated module traces byte-identically to before the field existed.
     epilogue_gate: bool = False
     # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g within the arch line's routed
-    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's on cc 10.7, where the
-    # 32-column tile serves the MTP step in token units) lower onto
+    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's table (16, 32, 64) on
+    # cc 10.7, where the 32- and 64-column tiles serve the MTP step in token units) lower onto
     # sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride the MMA M axis
     # and the packed Q rows ride N, so the MMA and exp work scale with the LIVE
     # rows instead of a 128-row Q tile.  The value is the N extent the kernel is
-    # compiled for -- the rows of ONE token unit (16, or 32 at the template level
-    # and on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
+    # compiled for -- the rows of ONE token unit (16; 32 at the template level, 32
+    # and 64 on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
     # Plan-time only (S_q is a declared shape).
     decode_q_tile: int = 0
     # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
@@ -225,6 +244,23 @@ class TemplateParams:
     # cache key, so one record must never name two kernels.  Set by
     # SdpaFwdDslSm100._d64_decode_tile, the twin of _decode_q_tile.
     decode_tile: bool = False
+    # The quadrant-cooperative softmax of the d64 decode tile (sm100/decode_d128_f16.py QUAD): the live Q rows (S_q x packed heads <= 32) are loaded into
+    # all four TMEM lane quadrants and each softmax warp owns a quarter of the key columns, the correction warps merging the four partials per unit.
+    # Needs decode_tile; set by SdpaFwdDslSm100._d64_decode_quad.
+    decode_quad: bool = False
+    # The decode tile's early-Q form (sm100/decode_d128_f16.py EARLY_Q): the Q slab is released by the last BMM1 of a unit instead of the O store's
+    # return edge, and the correction warps store the half output straight from TMEM.  Claimed per arch, like exp2_fma_split: set by
+    # SdpaFwdDslSm100._decode_early_q on the cc it was measured on (10.0, 10.3); an unmeasured part (cc 10.7 loads the same tile) keeps the staged
+    # TMA store.  The THD / ragged legs keep it whatever the field says.
+    early_q: bool = False
+    # Per-tensor FP8 d128 decode: the two Q sub-tiles of sm100/prefill_d128_fp8.py
+    # become two KV STREAMS over one 128-row Q tile (even KV tiles on sub-tile 0,
+    # odd on sub-tile 1, each with its own running max / sum, merged once in
+    # the epilogue).  Doubles the K/V bytes per pipeline step, which is what the
+    # decode-shaped step -- chain-latency-bound at ~1.1 us a 128-key tile -- is
+    # short of.  cga1, dense or paged, S_q x packed heads <= 128 rows; set by
+    # SdpaFwdDslSm100._fp8_dual_kv_stream.  Consumed by that template only.
+    dual_kv_stream: bool = False
     # Internal specialization of the shared one-Q-tile half pipeline.
     single_q_head_dim: int = 128
     # The graph declares capacity for exactly one sequence. Runtime lengths
@@ -404,6 +440,15 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # The loader routes a decode_tile record to sm100/decode_d128_f16.py at
         # d_flavor=64 (make_cfg_d64_decode); no other template consumes it.
         raise ValueError(f"{flavor}: decode_tile selects the d64 decode tile; this template does not consume it")
+    if k.decode_quad and not (k.decode_tile and k.early_q):
+        raise ValueError(f"{flavor}: decode_quad is the d64 decode tile's quadrant softmax; it needs decode_tile and early_q")
+    if k.dual_kv_stream and (flavor != "d128" or k.dtype_qkv > 1 or k.cta_mma != 1 or k.thd_varlen or k.pv_bf16):
+        # Two KV streams over one Q tile: the per-tensor FP8 d128 pipeline at cga1
+        # on a dense or paged graph (sm100/prefill_d128_fp8.py); nothing else
+        # consumes the record (the sibling templates raise on it at import).
+        raise ValueError(
+            f"{flavor}: dual_kv_stream is the per-tensor FP8 d128 cga1 dense/paged decode specialization; got dtype_qkv={k.dtype_qkv} cta_mma={k.cta_mma} thd={k.thd_varlen}"
+        )
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm100/decode_d256_f16.py
         # (make_cfg_d256_decode); a prefill template must never consume one.
@@ -439,10 +484,11 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             )
         ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
-        if k.has_sink:
-            # The sink logit is folded into the softmax denominator in the
-            # per-tile epilogue, so every split would add its own copy of it.
-            raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
+        if k.has_sink and fp8:
+            # The half kernels write sink-free partials under a split and the
+            # combine folds the sink once; the FP8 epilogues still fold it per
+            # tile, so a split would count it once per split.
+            raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported for FP8 (the sink would be counted once per split)")
     lpt_head_groups = (1, 8, 16, 32) if flavor == "d256" else (1, 8, 16)
     if k.lpt_head_group not in lpt_head_groups:
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be one of {lpt_head_groups}; got {k.lpt_head_group}")
@@ -1168,31 +1214,65 @@ def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
 D256_DECODE_MAX_Q_ROWS = 32
 _D256_DECODE_Q_TILES = (16, 32)
 # Largest packed Q-row count the adapter ROUTES onto the decode tile ON THE
-# BLACKWELL LINE (SM100 / SM103).  The 32-column tile (two softmax column groups
-# over the same 128 TMEM lanes) is compiled and tested at the template level but
-# issue-bound per CTA there: at b=32 x 2 KV heads x 4096 keys (B200) it streams
-# a KV tile in 2.8 us against the 16-column tile's 1.75 us -- 90 us unsplit
-# where the prefill tile takes 66 us -- and its split-2 plan (58 us of GPU time)
-# costs an eager caller 96-103 us per execute for the second launch.  Until its
-# per-CTA issue rate is fixed, S_q x G in (16, 32] stays on the prefill tile on
-# this line, which serves those shapes at its previous numbers in both regimes
-# (eager and CUDA-graph replay).  The Rubin line routes the wide tile, in TOKEN
-# UNITS of two tokens for the MTP step: config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS
-# (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS (2) and config_sm107.decode_d256_q_tile,
-# measured on cc 10.7 against the prefill body at the 24/2 geometry.
+# BLACKWELL LINE (SM100 / SM103) for every launch.  The 32-column tile (two
+# softmax column groups over the same 128 TMEM lanes) is issue-bound per CTA:
+# a lone CTA streams a KV tile in 2.8 us against the 16-column tile's 1.75 us
+# (b=32 x 2 KV heads x 4096 keys on B200: 90 us unsplit where the prefill tile
+# takes 66), so a launch too small to put ~130 of those streams in flight is
+# served better by the prefill tile.  A launch that is big enough saturates HBM
+# whatever the per-CTA rate, and there the wide tile is the faster one -- the
+# 256-row prefill tile reaches ~78 % of the HBM roofline on these shapes, the wide
+# tile the roofline itself (B200, d256 S_q x G = 32: -20 % at b=128 x 128K keys,
+# -12 % at b=4 x 128K).  D256_WIDE_DECODE_MIN_UNITS / D256_WIDE_DECODE_MIN_KV_TILES mark
+# that boundary (d256_wide_decode_launch); the Blackwell line routes S_q x G in
+# (16, 32] onto the wide tile for launches past it.  The Rubin line routes the
+# wide tile for every launch and its own 64-column tile, table-driven
+# (config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64),
+# D256_DECODE_ROUTED_MAX_Q_ROWS = 64), in up to two TOKEN UNITS of the widest
+# admitted width for a packed MTP step past the table
+# (D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2, config_sm107.decode_d256_q_tile); the
+# 32-column two-unit form was measured on cc 10.7 against the prefill body at the
+# 24/2 geometry, the 64-column form on the Rubin performance class (its
+# per-width stream rates: heuristics._DECODE_TILE_COST_BY_Q_TILE_SM107).
 D256_DECODE_ROUTED_MAX_Q_ROWS = 16
 # The 16-column tile: one unit covers S_q x pack_g <= 16 rows (today's decode step).
 _D256_DECODE_NARROW_Q_TILE = 16
 
 
-def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE_ROUTED_MAX_Q_ROWS, max_token_units: int = 1) -> int:
+# What a launch must stream for the wide tile to pay on the Blackwell line: batch x
+# KV-head groups (the decode tile's units: one CTA each before the split) and the
+# 128-key KV tiles of all of them.  Measured on B200 (S_q x G = 32, qwen3.5-like
+# d256, 2 heads x 16-wide groups and 1 head x 8-wide): wins from 8 units x 512
+# tiles (b=4 x 64K keys) up, loses at one or two units (+1..+10 % at b=1, the
+# serial combine of its 64-128 splits) and at 64 units x 16-32 tiles (+2..+7 %).
+D256_WIDE_DECODE_MIN_UNITS = 8
+D256_WIDE_DECODE_MIN_KV_TILES = 4096
+
+
+def d256_wide_decode_launch(batch: int, groups: int, s_kv: int, windowed: bool = False) -> bool:
+    """Whether a launch of ``batch`` x ``groups`` (KV-head groups, or heads when the
+    graph does not pack) units over ``s_kv`` keys is one the 32-column decode tile
+    serves faster than the prefill tile on the Blackwell line: at least
+    ``D256_WIDE_DECODE_MIN_UNITS`` units streaming at least
+    ``D256_WIDE_DECODE_MIN_KV_TILES`` 128-key tiles between them.  A windowed
+    (SWA) graph never qualifies: its declared ``s_kv`` says nothing about the
+    window's tiles."""
+    if windowed or min(int(batch), int(groups), int(s_kv)) <= 0:
+        return False
+    units = int(batch) * int(groups)
+    return units >= D256_WIDE_DECODE_MIN_UNITS and units * -(-int(s_kv) // 128) >= D256_WIDE_DECODE_MIN_KV_TILES
+
+
+def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE_ROUTED_MAX_Q_ROWS, max_token_units: int = 1, wide_launch: bool = False) -> int:
     """The decode tile's N extent -- the Q rows of ONE TOKEN UNIT -- for ``s_q``
     tokens packed ``pack_g`` heads per token (1 = unpacked), or 0 when the
     prefill tile serves the graph.
 
-    ``routed_max_rows`` is the widest tile the caller's arch line routes (16 on
-    SM100 / SM103, where the 32-column tile is a valid ``make_cfg_d256_decode``
-    record but is not routed; 32 on cc 10.7); ``max_token_units`` how many
+    ``routed_max_rows`` is the widest tile the caller's arch line routes for every
+    launch (16 on SM100 / SM103; 32 on cc 10.7); ``wide_launch`` says the launch is
+    one the 32-column tile pays for even where the line does not route it
+    unconditionally (:func:`d256_wide_decode_launch`: the Blackwell line's
+    boundary); ``max_token_units`` how many
     token units of ``N // pack_g`` consecutive tokens a (head group, batch,
     split) may be cut into (the kernel's ``Q_TOKEN_UNITS`` axis: each unit
     streams the KV range once more, so a line admits it only where it measured
@@ -1200,9 +1280,10 @@ def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE
     admits two units for every packed group the tile holds).  The rule: rows that fit
     the 16-column tile ride it in one unit (the KV streamed once, the cheapest
     per-CTA stream); past 16 rows the 32-column tile serves
-    ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap and
-    the group fits the tile, else 0.  With the defaults this is the SM100 rule
-    verbatim (16 for S_q x G <= 16 rows, 0 above)."""
+    ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap, the
+    line routes it (or the launch qualifies) and the group fits the tile, else 0.
+    With the defaults this is the SM100 rule for a launch too small for the wide
+    tile (16 for S_q x G <= 16 rows, 0 above)."""
     s_q, pack_g = int(s_q), int(pack_g)
     if s_q <= 0 or pack_g <= 0:
         return 0
@@ -1210,7 +1291,7 @@ def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE
     if rows <= _D256_DECODE_NARROW_Q_TILE:
         return _D256_DECODE_NARROW_Q_TILE
     wide = D256_DECODE_MAX_Q_ROWS
-    if wide > int(routed_max_rows) or pack_g > wide:
+    if (wide > int(routed_max_rows) and not wide_launch) or pack_g > wide:
         return 0
     if decode_d256_q_units(s_q, pack_g, wide) > int(max_token_units):
         return 0
@@ -1281,12 +1362,15 @@ class CfgD256Decode:
     THREADS_PER_CTA: int = 6 * 32
 
 
-def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
+def _validate_cfg_d256_decode(cfg: CfgD256Decode, q_tiles: Tuple[int, ...] = _D256_DECODE_Q_TILES) -> None:
+    """``q_tiles`` (appended): the tile widths the CALLING arch line compiles -- the Blackwell set by default; the
+    cc 10.7 factory passes its own (config_sm107._D256_DECODE_Q_TILES_SM107, which adds the 64-column tile the 320 KiB
+    Rubin carveout holds).  Every other predicate is arch-neutral."""
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
     checks = (
         (not fp8, "d256 decode: f16/bf16 inputs only"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d256 decode: half input requires DTYPE_O == DTYPE_QKV"),
-        (cfg.N_Q in _D256_DECODE_Q_TILES, f"d256 decode: N_Q must be one of {_D256_DECODE_Q_TILES}"),
+        (cfg.N_Q in q_tiles, f"d256 decode: N_Q must be one of {q_tiles}"),
         (cfg.SOFTMAX_WARPS == 4 * (cfg.N_Q // 16), "d256 decode: 4 softmax warps per 16 Q columns"),
         (
             cfg.MMA_WARP_ID == cfg.SOFTMAX_WARPS and cfg.TMALDG_WARP_ID == cfg.SOFTMAX_WARPS + 1 and cfg.TOTAL_WARPS == cfg.SOFTMAX_WARPS + 2,
@@ -1295,11 +1379,13 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
         (cfg.THREADS_PER_CTA == 32 * cfg.TOTAL_WARPS, "d256 decode: THREADS_PER_CTA must be 32 * TOTAL_WARPS"),
         (cfg.TILE_N == 128, "d256 decode: the KV tile is the 128-lane TMEM layout"),
         (cfg.STAGES_KV >= 2, "d256 decode: the K/V ring needs at least K(t) and V(t) resident"),
-        (cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64), "d256 decode: P^T row bytes must be the 32 B or 64 B swizzle atom"),
+        (
+            cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64, 128),
+            "d256 decode: P^T row bytes must be the 32 B, 64 B or 128 B swizzle atom (N_Q x BPE)",
+        ),
         (not cfg.PACK_GQA or cfg.QH_PER_KH <= cfg.N_Q, "d256 decode: a packed head group must fit the Q tile"),
         (cfg.QH_PER_KH >= 1, "d256 decode: qh_per_kh must be >= 1"),
         (cfg.SPLIT_KV >= 1, "d256 decode: split_kv must be >= 1"),
-        (not cfg.SPLIT_KV > 1 or not cfg.HAS_SINK, "d256 decode: split_kv > 1 with a sink is not supported (the sink would be counted once per split)"),
         (not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1, "d256 decode: paged KV requires per-batch KV lengths"),
         (
             not cfg.PAGED_KV or (cfg.PAGE_SIZE >= 8 and cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
@@ -1311,7 +1397,7 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
             raise ValueError(msg)
 
 
-def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIters]:
+def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D256_DECODE_Q_TILES) -> Tuple[CfgD256Decode, TmaIters]:
     """Config for sm100/decode_d256_f16.py from the adapter's TemplateParams.
 
     Backstop only (see TemplateParams): the adapter selects this tile for
@@ -1319,6 +1405,12 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
     prefill tile, so a ValueError here is an adapter gap, not a user error.
     ``cta_mma`` / ``sched_policy`` are accepted and unused — the decode tile
     is one cta_group::1 CTA per unit with nothing to schedule.
+
+    ``q_tiles`` (appended): the tile widths the calling arch line compiles.
+    The default is this line's ``_D256_DECODE_Q_TILES`` (16, 32: what 227 KiB
+    holds); ``config_sm107.make_cfg_d256_decode`` passes the Rubin set, which
+    adds the 64-column tile (four softmax groups, 258 KiB of SMEM under the
+    320 KiB Rubin carveout) and re-validates the record against its own facts.
     """
     if params.qsa_block_topk or params.qsa_block_size or params.qsa_softmax_groups:
         # Same decline as the prefill templates' _validate_params: an index-list record belongs to the cc 10.7 sparse
@@ -1327,8 +1419,8 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
             f"d256 decode: qsa_block_topk={params.qsa_block_topk} / qsa_block_size={params.qsa_block_size} / qsa_softmax_groups={params.qsa_softmax_groups} "
             f"select the index-list sparse kernel; the decode tile does not consume them"
         )
-    if params.decode_q_tile not in _D256_DECODE_Q_TILES:
-        raise ValueError(f"d256 decode: decode_q_tile must be one of {_D256_DECODE_Q_TILES}; got {params.decode_q_tile}")
+    if params.decode_q_tile not in q_tiles:
+        raise ValueError(f"d256 decode: decode_q_tile must be one of {q_tiles}; got {params.decode_q_tile}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError("d256 decode: f16/bf16 inputs only")
     if params.thd_varlen:
@@ -1372,7 +1464,7 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
-    _validate_cfg_d256_decode(cfg)
+    _validate_cfg_d256_decode(cfg, q_tiles)
     return cfg, _tma_iters(cfg)
 
 
@@ -2008,6 +2100,12 @@ class CfgD128:
     TILE_K_HW_BMM2: int = 16
 
     TILES_Q: int = 2
+    # Q sub-tiles that hold LIVE Q rows: TILES_Q, or 1 under DUAL_KV_STREAM, where
+    # sub-tile 1 re-uses sub-tile 0's rows as a second KV stream.  Sizes the
+    # per-CTA Q span (row bases, mask bounds, grid), never the TMEM / SMEM /
+    # barrier structure, which stays TILES_Q wide.
+    Q_TILES_LIVE: int = 2
+    DUAL_KV_STREAM: int = 0
     SCHEDULER_STAGES: int = 2
     STAGES_KV: int = 2
 
@@ -2106,7 +2204,10 @@ def _d128_smem_bytes(cfg) -> int:
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
     o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
-    qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
+    # Two KV streams over one Q tile: one Q slab and one O slab (the fp8 kernel
+    # never aliases them), while P stays one tile per stream.
+    q_tiles = getattr(cfg, "Q_TILES_LIVE", cfg.TILES_Q) if getattr(cfg, "DUAL_KV_STREAM", 0) else cfg.TILES_Q
+    qo = q_tiles * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
     # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
@@ -2124,9 +2225,18 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d128: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d128 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
         (
-            cfg.QO_ALIAS == 1 if cfg.CTA_MMA == 1 else True,
+            cfg.QO_ALIAS == 1 if cfg.CTA_MMA == 1 and not cfg.DUAL_KV_STREAM else True,
             "d128 cga1: QO_ALIAS is mandatory — cga1 doubles per-CTA K/V (no collective MMA to halve it), "
-            "so Q and O must share one slab to stay inside the SMEM cap",
+            "so Q and O must share one slab to stay inside the SMEM cap (the two-stream fp8 decode keeps "
+            "one unaliased Q and O slab and fits through its 1-byte K/V stages)",
+        ),
+        (
+            cfg.Q_TILES_LIVE == (1 if cfg.DUAL_KV_STREAM else cfg.TILES_Q),
+            "d128: Q_TILES_LIVE is TILES_Q, or 1 under DUAL_KV_STREAM (sub-tile 1 is a KV stream, not Q rows)",
+        ),
+        (
+            not cfg.DUAL_KV_STREAM or (_fp8 and cfg.CTA_MMA == 1 and not cfg.THD_VARLEN and not cfg.PV_BF16),
+            "d128: DUAL_KV_STREAM is the per-tensor fp8 cga1 dense/paged decode specialization",
         ),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -2139,9 +2249,10 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d128 (llama): 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d128 llama: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            (cfg.STAGES_KV in (2, 3) if cfg.CTA_MMA == 1 else cfg.STAGES_KV == 4) if _fp8 else cfg.STAGES_KV == 2,
+            (cfg.STAGES_KV == 4 if (cfg.CTA_MMA == 2 or cfg.DUAL_KV_STREAM) else cfg.STAGES_KV in (2, 3)) if _fp8 else cfg.STAGES_KV == 2,
             "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 or 3 at cga1 — "
-            "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
+            "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant; "
+            "the two-stream fp8 decode holds a K/V pair per step and runs 4 at cga1",
         ),
         (
             cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if _fp8 else 16)),
@@ -2196,7 +2307,9 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
         CTA_MMA=params.cta_mma,
         # cga1 has no collective MMA to halve per-CTA K/V, so Q and O must share
         # one slab to stay under the SMEM cap (_validate_cfg_d128 enforces it).
-        QO_ALIAS=1 if params.cta_mma == 1 else 0,
+        QO_ALIAS=1 if params.cta_mma == 1 and not params.dual_kv_stream else 0,
+        Q_TILES_LIVE=1 if params.dual_kv_stream else 2,
+        DUAL_KV_STREAM=int(params.dual_kv_stream),
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
         V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
@@ -2214,8 +2327,9 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
         # pushed a cga1 CTA to 237024 B against the 232448 B cap.
         # The MXFP8 kernel takes a THIRD full-width stage at cga1 (cga1_kv_stages=3): Q and O already share a slab
         # there, so 3 x (16 K + 16 V) KiB plus the scale factors still fit, and the deeper prefetch covers the
-        # tile boundary of the short packed GQA legs that run cga1.
-        STAGES_KV=(cga1_kv_stages if params.cta_mma == 1 else 4) if fp8 else 2,
+        # tile boundary of the short packed GQA legs that run cga1.  The two-stream per-tensor fp8 decode holds a
+        # K/V pair per step and runs 4 at cga1.
+        STAGES_KV=(4 if (params.cta_mma == 2 or params.dual_kv_stream) else cga1_kv_stages) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -2293,6 +2407,9 @@ class CfgD128Decode(CfgD128):
     QO_ALIAS: int = 1
 
     TILES_Q: int = 1
+    # One live Q tile and no second KV stream: the inherited CfgD128 defaults say 2.
+    Q_TILES_LIVE: int = 1
+    DUAL_KV_STREAM: int = 0
     STAGES_KV: int = 3
 
     SOFTMAX_WARPGROUPS: int = 1
@@ -2325,6 +2442,10 @@ class CfgD128Decode(CfgD128):
 def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
     """Consistency checks on the d128 decode-tile geometry."""
     checks = (
+        (
+            cfg.Q_TILES_LIVE == cfg.TILES_Q == 1 and cfg.DUAL_KV_STREAM == 0,
+            "d128 decode: one live Q tile, no second KV stream (Q_TILES_LIVE / DUAL_KV_STREAM must not inherit CfgD128's defaults)",
+        ),
         (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d128 decode: f16/bf16 only (the fp8 families keep the prefill tile)"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d128 decode: DTYPE_O must equal DTYPE_QKV"),
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d128 decode: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
@@ -2601,6 +2722,14 @@ class CfgD64Decode(CfgD64):
     QO_ALIAS: int = 1
 
     TILES_Q: int = 1
+    # One live Q tile and no second KV stream: the inherited CfgD128 defaults say 2.
+    Q_TILES_LIVE: int = 1
+    DUAL_KV_STREAM: int = 0
+    # Three 16 KiB K + 16 KiB V stages (96 KiB of KV in flight).  Six -- the
+    # d128 tile's 192 KiB -- was measured 2026-10-08 on a b=128 x 128k-key
+    # gpt-oss decode: B200 6.37 -> 6.19 ms (-3 %) but B300 4.99 -> 5.70 ms
+    # (+14 %), so the narrow tile keeps 3; B200's 66 % of HBM against B300's
+    # 86 % on this shape is not a ring-depth problem.
     STAGES_KV: int = 3
 
     SOFTMAX_WARPGROUPS: int = 1
@@ -2631,6 +2760,10 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
     128 B at cga1, so every operand still lands on the 128 B atom).
     """
     checks = (
+        (
+            cfg.Q_TILES_LIVE == cfg.TILES_Q == 1 and cfg.DUAL_KV_STREAM == 0,
+            "d64 decode: one live Q tile, no second KV stream (Q_TILES_LIVE / DUAL_KV_STREAM must not inherit CfgD128's defaults)",
+        ),
         (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d64 decode: f16/bf16 only"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d64 decode: DTYPE_O must equal DTYPE_QKV"),
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d64 decode: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
