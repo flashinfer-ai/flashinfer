@@ -71,6 +71,8 @@ def _prefill_kernel_name(
     state_dtype_str: str,
     HQ: int,
     HV: int,
+    head_size: int,
+    head_size_v: int,
     is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
@@ -94,6 +96,8 @@ def _prefill_kernel_name(
         state_dtype_str,
         HQ,
         HV,
+        head_size,
+        head_size_v,
         is_GQA,
         use_initial_state,
         store_final_state,
@@ -115,6 +119,8 @@ def _get_compiled_cache(
     state_dtype_str: str,
     HQ: int,
     HV: int,
+    head_size: int,
+    head_size_v: int,
     is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
@@ -225,21 +231,22 @@ def chunk_gated_delta_rule_sm100(
     Args:
         q: ``(total_tokens, HQ, DK)`` float16/bfloat16
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
-        v: ``(total_tokens, HV, DK)`` float16/bfloat16
+        v: ``(total_tokens, HV, DV)`` float16/bfloat16, ``DV <= DK``
         gate: ``(total_tokens, HO)`` float32, forget gate
         beta: ``(total_tokens, HO)`` float32, update gate
-        output: ``(total_tokens, HO, DK)`` float16/bfloat16, pre-allocated
+        output: ``(total_tokens, HO, DV)`` float16/bfloat16, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
-        initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
-        output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
+        initial_state: ``(num_seqs, HO, DV, DK)`` float32/bfloat16/float16/fp8, or None
+        output_state: ``(num_seqs, HO, DV, DK)`` float32/bfloat16/float16/fp8, or None
         scale: attention scale factor (must not be 0)
         checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
         cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
-        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
+        output_checkpoints: ``(total_checkpoints, HO, DV, DK)`` float32/bfloat16/float16/fp8, or None
     """
     HQ = q.size(1)
     HV = v.size(1)
     DK = q.size(2)
+    DV = v.size(2)
     is_GQA = HQ >= HV
     use_initial_state = initial_state is not None
     store_final_state = output_state is not None
@@ -271,6 +278,8 @@ def chunk_gated_delta_rule_sm100(
         str(state_torch_dtype),
         HQ,
         HV,
+        DK,
+        DV,
         is_GQA,
         use_initial_state,
         store_final_state,
@@ -304,10 +313,13 @@ def chunk_gated_delta_rule_sm100(
             inverse_dtype=io_dtype,
             acc_dtype=cutlass.Float32,
             state_dtype=state_dtype,
-            mma_tiler_qk=(64, 64, 128),
-            mma_tiler_qs=(128, 64, 128),
-            mma_tiler_qkv=(128, 64, 64),
-            mma_tiler_kv=(128, 128, 64),
+            # Mode 0 of qs/qkv/kv is the M (lane) extent of a value-shaped
+            # result, i.e. DV; DK is the qk/qs contraction extent and the kv
+            # N (column) extent.  See GatedDeltaNetChunkedKernel's docstring.
+            mma_tiler_qk=(64, 64, DK),
+            mma_tiler_qs=(DV, 64, DK),
+            mma_tiler_qkv=(DV, 64, 64),
+            mma_tiler_kv=(DV, DK, 64),
             max_active_clusters=max_active_clusters,
             num_sm=num_sm,
             is_GQA=is_GQA,

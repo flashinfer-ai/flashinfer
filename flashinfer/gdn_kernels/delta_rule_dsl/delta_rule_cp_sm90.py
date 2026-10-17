@@ -42,7 +42,6 @@ from .varlen_helper import (
 )
 from .delta_rule_sm90 import (
     _FullyFusedDeltaRuleSm90,
-    WarpGroupRole,
     LoadStoreWarpRole,
 )
 from .schedule import WorkDesc
@@ -68,13 +67,15 @@ class CPDeltaRuleTPrecomputeSm90(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: torch.dtype = torch.int64,
+        head_size: int = 128,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.inverse_dtype = cutlass.Float16
         self.BLK = 64
-        self.D = 128
+        # DK only sets the K tile width and the K @ K^T reduction depth.
+        self.D = head_size
         self.manual_cache_key(
             "dtype", "acc_dtype", "cu_seqlens_dtype", "inverse_dtype", "BLK", "D"
         )
@@ -461,8 +462,10 @@ class CPDeltaRuleTPrecomputeSm90(KeyedCompileMixin):
 
 
 @functools.cache
-def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleTPrecomputeSm90(kernel_dtype, cu_seqlens_dtype=cu_seqlens_dtype)
+def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype, head_size):
+    return CPDeltaRuleTPrecomputeSm90(
+        kernel_dtype, cu_seqlens_dtype=cu_seqlens_dtype, head_size=head_size
+    )
 
 
 def cp_delta_rule_t_precompute_dsl_sm90(
@@ -520,9 +523,9 @@ def cp_delta_rule_t_precompute_dsl_sm90(
                 "beta heads must be a positive multiple of k heads, "
                 f"got beta heads={num_sab_heads} and k heads={num_k_heads}"
             )
-        if k.shape[-1] != 128:
+        if k.shape[-1] not in (64, 128):
             raise RuntimeError(
-                f"CPDeltaRuleTPrecomputeSm90 only supports D=128, got {k.shape[-1]}"
+                f"CPDeltaRuleTPrecomputeSm90 only supports D in {{64, 128}}, got {k.shape[-1]}"
             )
         if k.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -559,7 +562,7 @@ def cp_delta_rule_t_precompute_dsl_sm90(
         else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     )
 
-    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype, d)
     compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
     if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
@@ -634,12 +637,22 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: torch.dtype = torch.int64,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.BLK = 64
+        # Both math warpgroups split a 128-row tile, so the kernel always works
+        # at D=128.  Smaller heads are zero-padded by the K/V TMA loads (OOB
+        # fill): padded K/V rows keep the extra transfer/state rows and columns
+        # decoupled from the real block, and the stores keep only the real
+        # (DK, DK) transfer and (DV, DK) state.
+        # ponytail: pads to 128 rows; the M=64 path would halve state MMA work.
         self.D = 128
+        self.DK = head_size
+        self.DV = head_size_v if head_size_v is not None else head_size
         self.k_stage = 3
         self.v_stage = 2
         self.t_stage = 2
@@ -650,6 +663,8 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
             "cu_seqlens_dtype",
             "BLK",
             "D",
+            "DK",
+            "DV",
             "k_stage",
             "v_stage",
             "t_stage",
@@ -709,13 +724,26 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
         gC: cute.Tensor,
         tiled_mma,
         thread_idx: cutlass.Int32,
+        rows: cutlass.Constexpr[int],
     ):
+        """Store the (D, D) accumulator's leading (rows, DK) block to gC.
+
+        gC is a (D, D) view with the real (rows, DK) row stride; entries
+        outside the real block are never written.
+        """
         copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.acc_dtype)
         tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
         thr_copy = tiled_copy.get_slice(thread_idx)
         tCgC = thr_copy.partition_D(gC)
         tCrC_cv = thr_copy.retile(tCrC)
-        cute.autovec_copy(tCrC_cv, tCgC)
+        if cutlass.const_expr(rows == self.D and self.DK == self.D):
+            cute.autovec_copy(tCrC_cv, tCgC)
+        else:
+            tCcC = thr_copy.partition_D(cute.make_identity_tensor((self.D, self.D)))
+            for i in cutlass.range(cute.size(tCrC_cv), unroll_full=True):
+                row, col = tCcC[i]
+                if row < rows and col < self.DK:
+                    tCgC[i] = tCrC_cv[i]
 
     @cute.jit
     def load_tensor_block_tma(
@@ -1192,17 +1220,24 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
                 False,
             )
 
-        out_layout = cute.make_layout(
-            (self.D, self.D, num_heads, num_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
-        )
-        mTransferT = cute.make_tensor(g_transfer_t.iterator, out_layout)
-        mStateT = cute.make_tensor(g_state_t.iterator, out_layout)
+        # Real (DK, DK) transfer / (DV, DK) state tiles, viewed as (D, D) with
+        # the real row stride so the padded accumulators can be stored masked.
+        tile_view = cute.make_layout((self.D, self.D), stride=(self.DK, 1))
+        transfer_offset = (chunk_idx * num_heads + head_idx) * (self.DK * self.DK)
+        state_offset = (chunk_idx * num_heads + head_idx) * (self.DV * self.DK)
         self.store_acc_to_gmem(
-            tTransferT, mTransferT[None, None, head_idx, chunk_idx], acc_mma, tidx
+            tTransferT,
+            cute.make_tensor(g_transfer_t.iterator + transfer_offset, tile_view),
+            acc_mma,
+            tidx,
+            self.DK,
         )
         self.store_acc_to_gmem(
-            tStateT, mStateT[None, None, head_idx, chunk_idx], acc_mma, tidx
+            tStateT,
+            cute.make_tensor(g_state_t.iterator + state_offset, tile_view),
+            acc_mma,
+            tidx,
+            self.DV,
         )
         return (
             k_consumer_state,
@@ -1627,8 +1662,13 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
 
 
 @functools.cache
-def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleMNPrecomputeSm90(kernel_dtype, cu_seqlens_dtype=cu_seqlens_dtype)
+def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype, head_size, head_size_v):
+    return CPDeltaRuleMNPrecomputeSm90(
+        kernel_dtype,
+        cu_seqlens_dtype=cu_seqlens_dtype,
+        head_size=head_size,
+        head_size_v=head_size_v,
+    )
 
 
 def cp_delta_rule_mn_precompute_dsl_sm90(
@@ -1660,11 +1700,11 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
     if not _skip_check:
         if k.ndim != 3:
             raise RuntimeError(
-                f"k must have shape (total_seqlen, num_k_heads, D), got {tuple(k.shape)}"
+                f"k must have shape (total_seqlen, num_k_heads, DimK), got {tuple(k.shape)}"
             )
-        if v.ndim != 3 or v.shape[0] != k.shape[0] or v.shape[2] != k.shape[2]:
+        if v.ndim != 3 or v.shape[0] != k.shape[0]:
             raise RuntimeError(
-                f"v must have shape (total_seqlen, num_v_heads, D), got {tuple(v.shape)}"
+                f"v must have shape (total_seqlen, num_v_heads, DimV), got {tuple(v.shape)}"
             )
         if alpha.ndim != 2 or alpha.shape[0] != k.shape[0]:
             raise RuntimeError(
@@ -1689,8 +1729,8 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
         raise RuntimeError("max_seqlen must be provided")
     if not _skip_check and max_seqlen <= 0:
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
-    _, num_k_heads, d = k.shape
-    num_v_heads = v.shape[1]
+    _, num_k_heads, dk = k.shape
+    _, num_v_heads, dv = v.shape
     num_sab_heads = alpha.shape[1]
     if not _skip_check:
         if num_sab_heads < num_k_heads or num_sab_heads % num_k_heads != 0:
@@ -1711,9 +1751,10 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
         )
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
     if not _skip_check:
-        if k.shape[-1] != 128:
+        if (dk, dv) not in ((128, 128), (128, 64), (64, 64)):
             raise RuntimeError(
-                f"CPDeltaRuleMNPrecomputeSm90 only supports D=128, got {k.shape[-1]}"
+                "CPDeltaRuleMNPrecomputeSm90 only supports (DimK, DimV) in "
+                f"{{(128, 128), (128, 64), (64, 64)}}, got {(dk, dv)}"
             )
         if k.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -1728,12 +1769,12 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
                 raise RuntimeError(f"{name} must be contiguous")
     max_cp_chunks_per_seq = max_num_chunks_host(max_seqlen, cp_chunk_len)
     k_tma = k.as_strided(
-        (d, total_seqlen, num_k_heads),
-        (1, num_k_heads * d, d),
+        (dk, total_seqlen, num_k_heads),
+        (1, num_k_heads * dk, dk),
     )
     v_tma = v.as_strided(
-        (d, total_seqlen, num_v_heads),
-        (1, num_v_heads * d, d),
+        (dv, total_seqlen, num_v_heads),
+        (1, num_v_heads * dv, dv),
     )
     t_tma = t.as_strided(
         (64, 64, num_sab_heads, total_t_blocks),
@@ -1744,12 +1785,17 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
             num_sab_heads * 64 * 64,
         ),
     )
-    workspace_shape = (total_cp_chunks, num_sab_heads, d, d)
     transfer_t = _get_cp_workspace(
-        "gdn_cp_sm90_local_transfer", workspace_shape, torch.float32, device
+        "gdn_cp_sm90_local_transfer",
+        (total_cp_chunks, num_sab_heads, dk, dk),
+        torch.float32,
+        device,
     )
     state_t = _get_cp_workspace(
-        "gdn_cp_sm90_local_state", workspace_shape, torch.float32, device
+        "gdn_cp_sm90_local_state",
+        (total_cp_chunks, num_sab_heads, dv, dk),
+        torch.float32,
+        device,
     )
     if total_cp_chunks == 0:
         return transfer_t, state_t
@@ -1765,7 +1811,7 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
         else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     )
 
-    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype, dk, dv)
     compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
     if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
@@ -1843,6 +1889,8 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
         cu_seqlens_dtype: torch.dtype = torch.int64,
         state_indices_dtype: torch.dtype | None = None,
         initial_state_inner_strides: tuple[int, ...] | None = None,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         self.needs_initial_state = needs_initial_state
         self.initial_state_dtype = initial_state_dtype
@@ -1850,9 +1898,16 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.state_indices_dtype = state_indices_dtype
         self.initial_state_inner_strides = initial_state_inner_strides
-        self.D = 128
+        self.DK = head_size
+        self.DV = head_size_v if head_size_v is not None else head_size
         self.rows_per_cta = 64
-        self.row_ctas = 2
+        # The fragment shapes and k_tiles below are sized for DK=128.
+        if self.DK != 128 or self.DV % self.rows_per_cta != 0:
+            raise ValueError(
+                f"{type(self).__name__} requires DK=128 and DV % 64 == 0, "
+                f"got DK={self.DK}, DV={self.DV}"
+            )
+        self.row_ctas = self.DV // self.rows_per_cta
         self.threads_per_cta = 256
         self.num_warps = 8
         self.m_stage = 2
@@ -1874,7 +1929,8 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
             "cu_seqlens_dtype",
             "state_indices_dtype",
             "initial_state_inner_strides",
-            "D",
+            "DK",
+            "DV",
             "rows_per_cta",
             "row_ctas",
             "threads_per_cta",
@@ -1912,12 +1968,12 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
                 (row_offset, 0),
                 tma_tensor[None, None, head_idx, chunk_idx],
             )
-            gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.D))[
+            gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.DK))[
                 ((None, None), (0, 0))
             ]
         else:
             gTensor = cute.zipped_divide(
-                tma_tensor[None, None, head_idx, chunk_idx], (self.D, self.D)
+                tma_tensor[None, None, head_idx, chunk_idx], (self.DK, self.DK)
             )[((None, None), (0, 0))]
 
         tTsT, tTgT = cpasync.tma_partition(
@@ -1985,30 +2041,30 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
         thr_store_C = tiled_store_C.get_slice(lane_idx)
 
         tSMrS = cute.make_rmem_tensor(
-            tiled_mma.partition_shape_C((16, self.D)), cutlass.Float32
+            tiled_mma.partition_shape_C((16, self.DK)), cutlass.Float32
         )
         tSMrM = cute.make_rmem_tensor(
-            tiled_mma.partition_shape_B((self.D, self.D)), cutlass.Float32
+            tiled_mma.partition_shape_B((self.DK, self.DK)), cutlass.Float32
         )
         sM_NK = select_tensor_10(sM)
         tSMrState = cute.make_rmem_tensor(
-            tiled_mma.partition_shape_C((16, self.D)), cutlass.Float32
+            tiled_mma.partition_shape_C((16, self.DK)), cutlass.Float32
         )
         tSMrState_cv = thr_copy_C.retile(tSMrState)
         tSMrState_store = thr_store_C.retile(tSMrState)
 
         row_base = warp_idx * 16
         global_row_base = row_cta_idx * self.rows_per_cta + row_base
-        sN_warp = cute.local_tile(sN, (16, self.D, self.n_stage), (warp_idx, 0, 0))
+        sN_warp = cute.local_tile(sN, (16, self.DK, self.n_stage), (warp_idx, 0, 0))
         gFixedState_warp = cute.local_tile(
             gFixedState[None, None, head_idx, None],
-            (16, self.D, total_cp_chunks),
+            (16, self.DK, total_cp_chunks),
             (global_row_base // 16, 0, 0),
         )
         if cutlass.const_expr(self.needs_initial_state):
             gInitialState_warp = cute.local_tile(
                 gInitialState[None, None, head_idx, seq_idx],
-                (16, self.D),
+                (16, self.DK),
                 (global_row_base // 16, 0),
             )
         tSMsN = thr_copy_C.partition_S(sN_warp)
@@ -2111,10 +2167,12 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
             cutlass.Float32,
         )
         transfer_layout = cute.tile_to_shape(
-            smem_layout_atom, (self.D, self.D, self.m_stage), order=(0, 1, 2)
+            smem_layout_atom, (self.DK, self.DK, self.m_stage), order=(0, 1, 2)
         )
         state_layout = cute.tile_to_shape(
-            smem_layout_atom, (self.rows_per_cta, self.D, self.n_stage), order=(0, 1, 2)
+            smem_layout_atom,
+            (self.rows_per_cta, self.DK, self.n_stage),
+            order=(0, 1, 2),
         )
         transfer_tma_layout = cute.slice_(transfer_layout, (None, None, 0))
         state_tma_layout = cute.slice_(state_layout, (None, None, 0))
@@ -2123,13 +2181,13 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
             tma_load_op,
             g_transfer_t,
             transfer_tma_layout,
-            (self.D, self.D),
+            (self.DK, self.DK),
         )
         tma_atom_n, tma_tensor_n = cpasync.make_tiled_tma_atom(
             tma_load_op,
             g_local_state_t,
             state_tma_layout,
-            (self.rows_per_cta, self.D),
+            (self.rows_per_cta, self.DK),
         )
         self.tma_load_m_bytes = cute.size(transfer_tma_layout) * 4
         self.tma_load_n_bytes = cute.size(state_tma_layout) * 4
@@ -2202,14 +2260,16 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
             cutlass.Float32,
         )
         transfer_layout = cute.tile_to_shape(
-            smem_layout_atom, (self.D, self.D, self.m_stage), order=(0, 1, 2)
+            smem_layout_atom, (self.DK, self.DK, self.m_stage), order=(0, 1, 2)
         )
         state_layout = cute.tile_to_shape(
-            smem_layout_atom, (self.rows_per_cta, self.D, self.n_stage), order=(0, 1, 2)
+            smem_layout_atom,
+            (self.rows_per_cta, self.DK, self.n_stage),
+            order=(0, 1, 2),
         )
         out_layout = cute.make_layout(
-            (self.D, self.D, num_heads, total_cp_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         allocator = cutlass.utils.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
@@ -2219,8 +2279,8 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
         sN = storage.smem_n.get_tensor(state_layout.outer, swizzle=state_layout.inner)
         gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
         fixed_state_layout = cute.make_layout(
-            (self.D, self.D, num_heads, num_seqs),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, num_seqs),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         state_idx = seq_idx
         if cutlass.const_expr(self.use_state_indices):
@@ -2230,8 +2290,8 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
                 (
                     g_initial_state_t.shape[0],
                     g_initial_state_t.shape[1],
-                    self.D,
-                    self.D,
+                    self.DV,
+                    self.DK,
                 ),
                 stride=g_initial_state_t.stride,
             )
@@ -2366,6 +2426,8 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         cu_seqlens_dtype: torch.dtype = torch.int64,
         state_indices_dtype: torch.dtype | None = None,
         initial_state_inner_strides: tuple[int, ...] | None = None,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         self.needs_initial_state = needs_initial_state
         self.initial_state_dtype = initial_state_dtype
@@ -2373,10 +2435,11 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.state_indices_dtype = state_indices_dtype
         self.initial_state_inner_strides = initial_state_inner_strides
-        self.D = 128
+        self.DK = head_size
+        self.DV = head_size_v if head_size_v is not None else head_size
         self.rows_per_cta = rows_per_cta
-        self.row_ctas = self.D // self.rows_per_cta
-        self.threads_per_cta = 128
+        self.row_ctas = self.DV // self.rows_per_cta
+        self.threads_per_cta = self.DK
         self.num_warps = 4
         self.min_blocks_per_mp = 2
         self.registers_per_thread = 256
@@ -2387,7 +2450,8 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
             "cu_seqlens_dtype",
             "state_indices_dtype",
             "initial_state_inner_strides",
-            "D",
+            "DK",
+            "DV",
             "rows_per_cta",
             "row_ctas",
             "threads_per_cta",
@@ -2545,7 +2609,9 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         num_heads: cutlass.Int32,
         stream,
     ):
-        state_layout = cute.make_layout((self.rows_per_cta, self.D), stride=(self.D, 1))
+        state_layout = cute.make_layout(
+            (self.rows_per_cta, self.DK), stride=(self.DK, 1)
+        )
 
         @cute.struct
         class SharedStorage:
@@ -2606,22 +2672,30 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
             )
 
         cute.arch.setmaxregister_increase(self.registers_per_thread)
-        state_layout = cute.make_layout((self.rows_per_cta, self.D), stride=(self.D, 1))
+        state_layout = cute.make_layout(
+            (self.rows_per_cta, self.DK), stride=(self.DK, 1)
+        )
         out_layout = cute.make_layout(
-            (self.D, self.D, num_heads, total_cp_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         workspace_layout = out_layout
+        transfer_layout_g = cute.make_layout(
+            (self.DK, self.DK, num_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DK * self.DK, self.DK * self.DK * num_heads),
+        )
         allocator = cutlass.utils.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
-        gTransfer = cute.make_tensor(g_transfer_t.iterator.align(128), workspace_layout)
+        gTransfer = cute.make_tensor(
+            g_transfer_t.iterator.align(128), transfer_layout_g
+        )
         gLocalState = cute.make_tensor(
             g_local_state_t.iterator.align(128), workspace_layout
         )
         gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
         fixed_state_layout = cute.make_layout(
-            (self.D, self.D, num_heads, num_seqs),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, num_seqs),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         state_idx = seq_idx
         if cutlass.const_expr(self.use_state_indices):
@@ -2631,8 +2705,8 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
                 (
                     g_initial_state_t.shape[0],
                     g_initial_state_t.shape[1],
-                    self.D,
-                    self.D,
+                    self.DV,
+                    self.DK,
                 ),
                 stride=g_initial_state_t.stride,
             )
@@ -2653,12 +2727,12 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         gTransfer_head = gTransfer[None, None, head_idx, None]
         gLocalState_cta = cute.local_tile(
             gLocalState[None, None, head_idx, None],
-            (self.rows_per_cta, self.D, total_cp_chunks),
+            (self.rows_per_cta, self.DK, total_cp_chunks),
             (row_cta_idx, 0, 0),
         )
         gFixedState_cta = cute.local_tile(
             gFixedState[None, None, head_idx, None],
-            (self.rows_per_cta, self.D, total_cp_chunks),
+            (self.rows_per_cta, self.DK, total_cp_chunks),
             (row_cta_idx, 0, 0),
         )
         gTransfer_seq = cute.domain_offset((0, 0, chunk_start), gTransfer_head)
@@ -2667,7 +2741,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         if cutlass.const_expr(self.needs_initial_state):
             gInitialState_cta = cute.local_tile(
                 gInitialState[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
         else:
@@ -2706,6 +2780,8 @@ def _get_fixup_kernel(
     cu_seqlens_dtype,
     state_indices_dtype,
     initial_state_inner_strides,
+    head_size,
+    head_size_v,
 ):
     if kernel_kind == "simt_row4":
         return CPDeltaRuleFixupSimtSm90(
@@ -2716,6 +2792,8 @@ def _get_fixup_kernel(
             cu_seqlens_dtype=cu_seqlens_dtype,
             state_indices_dtype=state_indices_dtype,
             initial_state_inner_strides=initial_state_inner_strides,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     if kernel_kind == "simt_row8":
         return CPDeltaRuleFixupSimtSm90(
@@ -2726,6 +2804,8 @@ def _get_fixup_kernel(
             cu_seqlens_dtype=cu_seqlens_dtype,
             state_indices_dtype=state_indices_dtype,
             initial_state_inner_strides=initial_state_inner_strides,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     if kernel_kind == "hmma":
         return CPDeltaRuleFixupHmmaSm90(
@@ -2735,6 +2815,8 @@ def _get_fixup_kernel(
             cu_seqlens_dtype=cu_seqlens_dtype,
             state_indices_dtype=state_indices_dtype,
             initial_state_inner_strides=initial_state_inner_strides,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
     raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
 
@@ -2763,19 +2845,26 @@ def cp_delta_rule_fixup_dsl_sm90(
 
     device = local_transfer.device if _device is None else _device
     if not _skip_check:
-        if local_transfer.ndim != 4:
+        if local_transfer.ndim != 4 or local_state.ndim != 4:
             raise RuntimeError(
-                "local_transfer must have shape (num_chunks, num_heads, DimV, DimK), "
-                f"got {tuple(local_transfer.shape)}"
+                "local_transfer/local_state must have shapes "
+                "(num_chunks, num_heads, DimK, DimK)/(num_chunks, num_heads, DimV, DimK), "
+                f"got {tuple(local_transfer.shape)} and {tuple(local_state.shape)}"
             )
-        if local_state.shape != local_transfer.shape:
+        dk = local_transfer.shape[-1]
+        if (
+            local_transfer.shape[-2] != dk
+            or local_state.shape[:2] != local_transfer.shape[:2]
+            or local_state.shape[-1] != dk
+        ):
             raise RuntimeError(
-                "local_state shape must match local_transfer shape, "
+                "local_state/local_transfer shapes must be (C, H, DimV, DimK)/(C, H, DimK, DimK), "
                 f"got {tuple(local_state.shape)} and {tuple(local_transfer.shape)}"
             )
-        if local_transfer.shape[-2:] != (128, 128):
+        if tuple(local_state.shape[-2:]) not in ((128, 128), (64, 128), (64, 64)):
             raise RuntimeError(
-                f"CPDeltaRuleFixupSm90 only supports D=128, got {tuple(local_transfer.shape[-2:])}"
+                "CPDeltaRuleFixupSm90 only supports (DimV, DimK) in "
+                f"{{(128, 128), (64, 128), (64, 64)}}, got {tuple(local_state.shape[-2:])}"
             )
         if local_transfer.dtype != torch.float32 or local_state.dtype != torch.float32:
             raise RuntimeError(
@@ -2784,7 +2873,7 @@ def cp_delta_rule_fixup_dsl_sm90(
             )
         use_state_indices = state_indices is not None
         if initial_state is not None:
-            expected_tail = (local_transfer.shape[1], 128, 128)
+            expected_tail = tuple(local_state.shape[1:])
             if (
                 not use_state_indices
                 and initial_state.shape != (cu_seqlens.shape[0] - 1, *expected_tail)
@@ -2816,7 +2905,7 @@ def cp_delta_rule_fixup_dsl_sm90(
         if initial_state is not None:
             if not use_state_indices and not initial_state.is_contiguous():
                 raise RuntimeError("initial_state must be contiguous")
-    total_cp_chunks, num_heads, _, _ = local_transfer.shape
+    total_cp_chunks, num_heads, dv, dk = local_state.shape
     if not _skip_check:
         if cp_chunk_len <= 0:
             raise RuntimeError(f"cp_chunk_len must be positive, got {cp_chunk_len}")
@@ -2847,22 +2936,22 @@ def cp_delta_rule_fixup_dsl_sm90(
         if _stream is not None
         else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     )
-    d = local_transfer.shape[-1]
     local_transfer_tma = local_transfer.as_strided(
-        (d, d, num_heads, total_cp_chunks),
-        (d, 1, d * d, num_heads * d * d),
+        (dk, dk, num_heads, total_cp_chunks),
+        (dk, 1, dk * dk, num_heads * dk * dk),
     )
     local_state_tma = local_state.as_strided(
-        (d, d, num_heads, total_cp_chunks),
-        (d, 1, d * d, num_heads * d * d),
+        (dv, dk, num_heads, total_cp_chunks),
+        (dk, 1, dv * dk, num_heads * dv * dk),
     )
 
     needs_initial_state = initial_state is not None
     use_state_indices = state_indices is not None
     if _kernel_kind is None:
+        # HMMA is sized for DK=128; DK=64 stays on SIMT.
         if num_heads <= 8:
             _kernel_kind = "simt_row4"
-        elif num_heads <= 16:
+        elif num_heads <= 16 or dk != 128:
             _kernel_kind = "simt_row8"
         else:
             _kernel_kind = "hmma"
@@ -2878,6 +2967,8 @@ def cp_delta_rule_fixup_dsl_sm90(
             if use_state_indices and needs_initial_state
             else None
         ),
+        dk,
+        dv,
     )
     compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
     if compiled is None:
@@ -2949,6 +3040,8 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         checkpoint_cu_starts_dtype: torch.dtype | None = None,
         state_inner_strides: tuple[int, ...] | None = None,
         initial_state_inner_strides: tuple[int, ...] | None = None,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         super().__init__(
             True,
@@ -2963,7 +3056,10 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
             state_inner_strides=state_inner_strides,
             init_state_inner_strides=initial_state_inner_strides,
+            head_size=head_size,
+            head_size_v=head_size_v,
         )
+
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
         self.initial_state_dtype = initial_state_dtype
@@ -2991,7 +3087,8 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             "inverse_dtype",
             "BLK_Q",
             "BLK_KV",
-            "D",
+            "DK",
+            "DV",
             "q_stage",
             "k_stage",
             "v_stage",
@@ -3436,24 +3533,25 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 warpgroup.MmaF16BF16Op(
                     self.dtype,
                     self.acc_dtype,
-                    (64, self.D, 16),
+                    # B is K, so N=DK
+                    (64, self.DK, 16),
                     warpgroup.OperandSource.RMEM,
                     cute.nvgpu.OperandMajorMode.K,
                     cute.nvgpu.OperandMajorMode.MN,
                 )
             ),
-            cute.make_layout((2, 1, 1)),
+            cute.make_layout(self.state_mma_atom_layout),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
         tKVrKV = kv_thr_mma.make_fragment_C(
-            kv_thr_mma.partition_shape_C((self.D, self.D))
+            kv_thr_mma.partition_shape_C((self.DV, self.DK))
         )
         tKVrKV.fill(self.acc_dtype(0.0))
 
         packed_state_layout = cute.make_ordered_layout(
-            (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
+            (self.DK, self.DV, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
-        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
+        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.DV, self.DK)
         state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
         indexed_state_layout = cute.select(state_ref_layout, mode=[3, 2, 1, 0])
         state_idx = public_seq_idx
@@ -3484,7 +3582,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             )
             gInitialKV = mInitialState[None, None, o_head_idx, state_idx]
         fixed_state_layout = cute.make_ordered_layout(
-            (self.D, self.D, num_sab_heads, num_chunks), order=(0, 1, 2, 3)
+            (self.DK, self.DV, num_sab_heads, num_chunks), order=(0, 1, 2, 3)
         )
         mFixedState = cute.make_tensor(g_fixed_state.iterator, fixed_state_layout)
         gFixedKV = mFixedState[None, None, o_head_idx, fixed_state_idx]
@@ -3535,7 +3633,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             first_B,
             tKVrKV,
             scale,
+            math_tidx,
             wg_idx,
+            self.first_q_in_blk(0),
         )
         self.maybe_store_checkpoint(
             tKVrKV,
@@ -3591,7 +3691,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 self.BLK_KV,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
+                self.first_q_in_blk(blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -3650,7 +3752,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 last_B,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
+                self.first_q_in_blk(last_blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -3708,7 +3812,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         q_storage_layout = cute.coalesce(
             cute.tile_to_shape(
                 qkv_smem_layout_atom,
-                (self.BLK_Q, self.D, self.q_stage),
+                (self.BLK_Q, self.DK, self.q_stage),
                 order=(0, 1, 2),
             ),
             target_profile=(1, 1, 1),
@@ -3717,7 +3821,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         k_storage_layout_sd = cute.coalesce(
             cute.tile_to_shape(
                 qkv_smem_layout_atom,
-                (self.BLK_KV, self.D, self.k_stage),
+                (self.BLK_KV, self.DK, self.k_stage),
                 order=(0, 1, 2),
             ),
             target_profile=(1, 1, 1),
@@ -3726,7 +3830,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         v_storage_layout_sd = cute.coalesce(
             cute.tile_to_shape(
                 qkv_smem_layout_atom,
-                (self.BLK_KV, self.D, self.v_stage),
+                (self.BLK_KV, self.DV, self.v_stage),
                 order=(0, 1, 2),
             ),
             target_profile=(1, 1, 1),
@@ -3740,7 +3844,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         )
         o_storage_layout = cute.tile_to_shape(
             o_smem_layout_atom,
-            (self.D, self.BLK_Q, self.o_stage),
+            (self.DV, self.BLK_Q, self.o_stage),
             order=(1, 0, 2),
         )
         o_smem_layout = cute.slice_(o_storage_layout, (None, None, 0))
@@ -3753,13 +3857,13 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
-            tma_load_op, g_q, q_smem_layout, (self.BLK_Q, self.D)
+            tma_load_op, g_q, q_smem_layout, (self.BLK_Q, self.DK)
         )
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
-            tma_load_op, g_k, k_smem_layout, (self.D, self.BLK_KV)
+            tma_load_op, g_k, k_smem_layout, (self.DK, self.BLK_KV)
         )
         tma_atom_v, tma_tensor_v = cpasync.make_tiled_tma_atom(
-            tma_load_op, g_v, v_smem_layout, (self.D, self.BLK_KV)
+            tma_load_op, g_v, v_smem_layout, (self.DV, self.BLK_KV)
         )
         tma_atom_t, tma_tensor_t = cpasync.make_tiled_tma_atom(
             tma_load_op, g_t, t_smem_layout, (self.BLK_KV, self.BLK_KV)
@@ -3767,7 +3871,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
 
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_o, tma_tensor_o = cpasync.make_tiled_tma_atom(
-            tma_store_op, g_o, o_smem_layout, (self.D, self.BLK_Q)
+            tma_store_op, g_o, o_smem_layout, (self.DV, self.BLK_Q)
         )
 
         dtype_bytes = self.dtype.width // 8
@@ -3860,8 +3964,8 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             checkpoint_every_n_tokens,
         ).launch(
             grid=(num_sab_heads * max_cp_chunks_per_seq, num_seqs, 1),
-            block=(512, 1, 1),
-            max_number_threads=(512, 1, 1),
+            block=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
+            max_number_threads=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -3900,7 +4004,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         checkpoint_every_n_tokens: cutlass.Int32,
     ):
         NUM_LOAD_WARP_GROUPS = 1
-        NUM_STATE_MMA_WARP_GROUPS = 2
+        NUM_STATE_MMA_WARP_GROUPS = self.warp_group_roles.num_state_warp_groups
         NUM_AUX_MMA_WARP_GROUPS = 1
         THREADS_PER_WARP_GROUP = 128
         WARPS_PER_WARP_GROUP = 4
@@ -3979,7 +4083,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         q_layout_sd = cute.coalesce(
             cute.tile_to_shape(
                 qkv_smem_layout_atom,
-                (self.BLK_Q, self.D, self.q_stage),
+                (self.BLK_Q, self.DK, self.q_stage),
                 order=(0, 1, 2),
             ),
             target_profile=(1, 1, 1),
@@ -3989,7 +4093,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         k_layout_sd = cute.coalesce(
             cute.tile_to_shape(
                 qkv_smem_layout_atom,
-                (self.BLK_KV, self.D, self.k_stage),
+                (self.BLK_KV, self.DK, self.k_stage),
                 order=(0, 1, 2),
             ),
             target_profile=(1, 1, 1),
@@ -4001,7 +4105,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         v_layout_sd = cute.coalesce(
             cute.tile_to_shape(
                 qkv_smem_layout_atom,
-                (self.BLK_KV, self.D, self.v_stage),
+                (self.BLK_KV, self.DV, self.v_stage),
                 order=(0, 1, 2),
             ),
             target_profile=(1, 1, 1),
@@ -4030,7 +4134,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         )
         o_layout = cute.tile_to_shape(
             o_smem_layout_atom,
-            (self.D, self.BLK_Q, self.o_stage),
+            (self.DV, self.BLK_Q, self.o_stage),
             order=(1, 0, 2),
         )
         sO = storage.smem_o.get_tensor(o_layout.outer, swizzle=o_layout.inner)
@@ -4135,7 +4239,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         cute.arch.sync_threads()
 
         if is_valid_chunk:
-            if warp_group_idx == WarpGroupRole.LDST:
+            if warp_group_idx == self.warp_group_roles.LDST:
                 cute.arch.setmaxregister_decrease(load_registers)
                 if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
                     self.run_load_qkv_role(
@@ -4158,7 +4262,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                         v_head_idx,
                     )
                 elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
-                    CollectiveStoreTma(self.BLK_Q, self.D).run(
+                    CollectiveStoreTma(self.BLK_Q, self.DV).run(
                         sO,
                         tma_atom_o,
                         tma_tensor_o,
@@ -4194,7 +4298,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                         num_sab_heads,
                     )
             else:
-                if warp_group_idx == WarpGroupRole.MATH_AUX:
+                if warp_group_idx == self.warp_group_roles.MATH_AUX:
                     cute.arch.setmaxregister_decrease(aux_mma_registers)
                     self.run_aux_math_role(
                         sQ_SD,
@@ -4276,6 +4380,8 @@ def _get_prefill_kernel(
     checkpoint_cu_starts_dtype,
     state_inner_strides,
     initial_state_inner_strides,
+    head_size,
+    head_size_v,
 ):
     return CPDeltaRulePrefillSm90(
         kernel_dtype,
@@ -4291,6 +4397,8 @@ def _get_prefill_kernel(
         checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
         state_inner_strides=state_inner_strides,
         initial_state_inner_strides=initial_state_inner_strides,
+        head_size=head_size,
+        head_size_v=head_size_v,
     )
 
 
@@ -4344,12 +4452,8 @@ def cp_delta_rule_prefill_dsl_sm90(
             or o.shape[0] != q.shape[0]
         ):
             raise RuntimeError("q, k, v, and o must have the same total_seqlen")
-        if (
-            k.shape[2] != q.shape[2]
-            or v.shape[2] != q.shape[2]
-            or o.shape[2] != q.shape[2]
-        ):
-            raise RuntimeError("q, k, v, and o must have the same D")
+        if k.shape[2] != q.shape[2] or o.shape[2] != v.shape[2]:
+            raise RuntimeError("q/k must share DimK and v/o must share DimV")
         if alpha.ndim != 2 or alpha.shape[0] != q.shape[0]:
             raise RuntimeError(
                 f"alpha must have shape (total_seqlen, num_sab_heads), got {tuple(alpha.shape)}"
@@ -4384,9 +4488,10 @@ def cp_delta_rule_prefill_dsl_sm90(
         raise RuntimeError("max_seqlen must be provided")
     if not _skip_check and max_seqlen <= 0:
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
-    _, num_q_heads, d = q.shape
-    num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, num_q_heads, dq = q.shape
+    _, num_k_heads, dk = k.shape
+    _, num_v_heads, dv = v.shape
+    assert dq == dk
     num_sab_heads = max(num_q_heads, num_v_heads)
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
@@ -4400,7 +4505,7 @@ def cp_delta_rule_prefill_dsl_sm90(
                 f"alpha heads must equal max(q heads, v heads)={num_sab_heads}, got {alpha.shape[1]}"
             )
         if not _FullyFusedDeltaRuleSm90.can_implement(
-            num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
+            num_q_heads, num_k_heads, num_v_heads, dk, dv, q.element_size()
         ):
             raise RuntimeError(
                 "CPDeltaRulePrefillSm90 only supports head counts where q/v heads are positive multiples "
@@ -4411,8 +4516,8 @@ def cp_delta_rule_prefill_dsl_sm90(
                 "t must have shape "
                 f"{(total_t_blocks, num_sab_heads, 64, 64)}, got {tuple(t.shape)}"
             )
-        expected_fixed_state_shape = (total_cp_chunks, num_sab_heads, d, d)
-        expected_state_shape = (num_seqs, num_sab_heads, d, d)
+        expected_fixed_state_shape = (total_cp_chunks, num_sab_heads, dv, dk)
+        expected_state_shape = (num_seqs, num_sab_heads, dv, dk)
         use_state_indices = state_indices is not None
         if fixed_state.shape != expected_fixed_state_shape or (
             state is not None
@@ -4449,9 +4554,10 @@ def cp_delta_rule_prefill_dsl_sm90(
             raise RuntimeError(
                 f"state_indices must have shape {(num_seqs,)} and an integer dtype"
             )
-        if q.shape[-1] != 128:
+        if (dk, dv) not in ((128, 128), (128, 64), (64, 64)):
             raise RuntimeError(
-                f"CPDeltaRulePrefillSm90 only supports D=128, got {q.shape[-1]}"
+                "CPDeltaRulePrefillSm90 only supports (DimK, DimV) in "
+                f"{{(128, 128), (128, 64), (64, 64)}}, got {(dk, dv)}"
             )
         if q.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -4477,10 +4583,10 @@ def cp_delta_rule_prefill_dsl_sm90(
             state_dtype_to_cutlass(state.dtype)
         if needs_checkpointing:
             state_dtype_to_cutlass(state_checkpoints.dtype)
-            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, dv, dk):
                 raise RuntimeError(
                     "state_checkpoints must have shape "
-                    f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                    f"[*, {num_sab_heads}, {dv}, {dk}], got {tuple(state_checkpoints.shape)}"
                 )
             if not is_integer_dtype(
                 checkpoint_cu_starts.dtype
@@ -4513,20 +4619,20 @@ def cp_delta_rule_prefill_dsl_sm90(
     if total_cp_chunks == 0:
         return
     q_tma = q.as_strided(
-        (total_seqlen, d, num_q_heads),
-        (num_q_heads * d, 1, d),
+        (total_seqlen, dk, num_q_heads),
+        (num_q_heads * dk, 1, dk),
     )
     k_tma = k.as_strided(
-        (d, total_seqlen, num_k_heads),
-        (1, num_k_heads * d, d),
+        (dk, total_seqlen, num_k_heads),
+        (1, num_k_heads * dk, dk),
     )
     v_tma = v.as_strided(
-        (d, total_seqlen, num_v_heads),
-        (1, num_v_heads * d, d),
+        (dv, total_seqlen, num_v_heads),
+        (1, num_v_heads * dv, dv),
     )
     o_tma = o.as_strided(
-        (d, total_seqlen, num_sab_heads),
-        (1, num_sab_heads * d, d),
+        (dv, total_seqlen, num_sab_heads),
+        (1, num_sab_heads * dv, dv),
     )
     t_tma = t.as_strided(
         (64, 64, num_sab_heads, total_t_blocks),
@@ -4582,6 +4688,8 @@ def cp_delta_rule_prefill_dsl_sm90(
             if use_state_indices and needs_initial_state
             else None
         ),
+        head_size=dk,
+        head_size_v=dv,
     )
     state_arg = state if store_final_state else fixed_state
     compiled = get_cached_compile(kernel, _SM90_COMPILE_OPTIONS)
@@ -4740,8 +4848,8 @@ def cp_delta_rule_dsl_sm90(
         )
     if k.shape[0] != q.shape[0] or v.shape[0] != q.shape[0] or o.shape[0] != q.shape[0]:
         raise RuntimeError("q, k, v, and o must have the same total_seqlen")
-    if k.shape[2] != q.shape[2] or v.shape[2] != q.shape[2] or o.shape[2] != q.shape[2]:
-        raise RuntimeError("q, k, v, and o must have the same D")
+    if k.shape[2] != q.shape[2] or o.shape[2] != v.shape[2]:
+        raise RuntimeError("q/k must share DimK and v/o must share DimV")
     if alpha.ndim != 2 or alpha.shape[0] != q.shape[0]:
         raise RuntimeError(
             f"alpha must have shape (total_seqlen, num_sab_heads), got {tuple(alpha.shape)}"
@@ -4770,9 +4878,10 @@ def cp_delta_rule_dsl_sm90(
         )
     if not cu_seqlens.is_contiguous():
         raise RuntimeError("cu_seqlens must be contiguous")
-    _, num_q_heads, d = q.shape
-    num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, num_q_heads, dq = q.shape
+    _, num_k_heads, dk = k.shape
+    _, num_v_heads, dv = v.shape
+    assert dq == dk
     num_sab_heads = max(num_q_heads, num_v_heads)
     if o.shape[1] != num_sab_heads:
         raise RuntimeError(
@@ -4787,13 +4896,13 @@ def cp_delta_rule_dsl_sm90(
             f"beta heads must equal max(q heads, v heads)={num_sab_heads}, got {beta.shape[1]}"
         )
     if not _FullyFusedDeltaRuleSm90.can_implement(
-        num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
+        num_q_heads, num_k_heads, num_v_heads, dk, dv, q.element_size()
     ):
         raise RuntimeError(
             "CPDeltaRuleSm90 only supports head counts where q/v heads are positive multiples "
             f"of k heads, got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
-    expected_state_shape = (num_seqs, num_sab_heads, d, d)
+    expected_state_shape = (num_seqs, num_sab_heads, dv, dk)
     use_state_indices = state_indices is not None
     if state is not None and (
         (not use_state_indices and state.shape != expected_state_shape)
@@ -4822,8 +4931,11 @@ def cp_delta_rule_dsl_sm90(
         raise RuntimeError(
             f"state_indices must have shape {(num_seqs,)} and an integer dtype"
         )
-    if q.shape[-1] != 128:
-        raise RuntimeError(f"CPDeltaRuleSm90 only supports D=128, got {q.shape[-1]}")
+    if (dk, dv) not in ((128, 128), (128, 64), (64, 64)):
+        raise RuntimeError(
+            "CPDeltaRuleSm90 only supports (DimK, DimV) in "
+            f"{{(128, 128), (128, 64), (64, 64)}}, got {(dk, dv)}"
+        )
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(
             f"CPDeltaRuleSm90 only supports fp16/bf16 inputs, got {q.dtype}"
@@ -4843,10 +4955,10 @@ def cp_delta_rule_dsl_sm90(
         state_dtype_to_cutlass(state.dtype)
     if needs_checkpointing:
         state_dtype_to_cutlass(state_checkpoints.dtype)
-        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, dv, dk):
             raise RuntimeError(
                 "state_checkpoints must have shape "
-                f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                f"[*, {num_sab_heads}, {dv}, {dk}], got {tuple(state_checkpoints.shape)}"
             )
         if not is_integer_dtype(
             checkpoint_cu_starts.dtype

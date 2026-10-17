@@ -25,12 +25,15 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         self,
         dtype: Type[cutlass.Numeric],
         cu_seqlens_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         self.dtype = dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.acc_dtype = cutlass.Float32
         self.BLK = 64
-        self.D = 128
+        self.DK = head_size
+        self.DV = head_size_v if head_size_v is not None else head_size
 
         self.k_stage = 3
         self.v_stage = 3
@@ -73,7 +76,8 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             "cu_seqlens_dtype",
             "acc_dtype",
             "BLK",
-            "D",
+            "DK",
+            "DV",
             "k_stage",
             "v_stage",
             "t_stage",
@@ -163,6 +167,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         is_transfer: bool,
         cta_coord,
         cta_layout,
+        rows: cutlass.Constexpr[int],
     ):
         handle = tensor_pipeline.acquire_and_advance()
         sTensor_stage = sTensor[None, None, handle.index]
@@ -175,7 +180,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             mTensor = cute.domain_offset(
                 (0, tok_offset + blk * self.BLK), tma_tensor[None, None, head_idx]
             )
-            gTensor = cute.zipped_divide(mTensor, (self.D, self.BLK))[
+            gTensor = cute.zipped_divide(mTensor, (rows, self.BLK))[
                 ((None, None), (0, 0))
             ]
         tTsT, tTgT = cpasync.tma_partition(
@@ -223,6 +228,20 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             handle.commit()
         return alpha_producer
 
+    def _make_acc_tmem_copy(self, rows: int, is_load: bool, tCtC, tCtC_mn):
+        """fp32 TMEM<->register copy for a (rows, DK) accumulator.
+
+        At M=64 the accumulator is split-lane ((16,4): row a+16b -> lane a+32b),
+        so only the 16-datapath atoms tile it; M=128 keeps the 32x32b atoms.
+        """
+        if rows == 64:
+            op = tcgen05.copy.Ld16x256bOp if is_load else tcgen05.copy.St16x256bOp
+            atom = cute.make_copy_atom(op(tcgen05.copy.Repetition(8)), self.acc_dtype)
+            return tcgen05.make_tmem_copy(atom, tCtC_mn[None, None, 0])
+        op = tcgen05.copy.Ld32x32bOp if is_load else tcgen05.copy.St32x32bOp
+        atom = cute.make_copy_atom(op(tcgen05.copy.Repetition(32)), self.acc_dtype)
+        return tcgen05.make_tmem_copy(atom, tCtC[(None, None), 0, 0, 0])
+
     @cute.jit
     def _initialize_tmem_matrix(
         self,
@@ -231,16 +250,14 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tiled_mma,
         tidx: cutlass.Int32,
         identity: bool,
+        rows: cutlass.Constexpr[int],
     ):
-        acc_shape = tiled_mma.partition_shape_C((self.D, self.D))
+        acc_shape = tiled_mma.partition_shape_C((rows, self.DK))
         tCtC_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
         tCtC = cute.make_tensor(tmem_ptr + offset, tCtC_fake.layout)
         tCtC_mn = self.transform_partitioned_tensor_layout(tCtC)
-        cC = cute.make_identity_tensor((self.D, self.D))
-        atom_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tiled_r2t = tcgen05.make_tmem_copy(atom_r2t, tCtC[(None, None), 0, 0, 0])
+        cC = cute.make_identity_tensor((rows, self.DK))
+        tiled_r2t = self._make_acc_tmem_copy(rows, False, tCtC, tCtC_mn)
         thr_r2t = tiled_r2t.get_slice(tidx)
         tRT_cC = thr_r2t.partition_S(cC)
         tRT_tC = thr_r2t.partition_D(tCtC_mn)
@@ -264,20 +281,15 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tiled_mma,
         tidx: cutlass.Int32,
         scale: cutlass.Float32,
+        rows: cutlass.Constexpr[int],
     ):
-        acc_shape = tiled_mma.partition_shape_C((self.D, self.D))
+        acc_shape = tiled_mma.partition_shape_C((rows, self.DK))
         tCtC_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
         tCtC = cute.make_tensor(tmem_ptr + offset, tCtC_fake.layout)
         tCtC_mn = self.transform_partitioned_tensor_layout(tCtC)
-        cC = cute.make_identity_tensor((self.D, self.D))
-        atom_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        atom_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tiled_t2r = tcgen05.make_tmem_copy(atom_t2r, tCtC[(None, None), 0, 0, 0])
-        tiled_r2t = tcgen05.make_tmem_copy(atom_r2t, tCtC[(None, None), 0, 0, 0])
+        cC = cute.make_identity_tensor((rows, self.DK))
+        tiled_t2r = self._make_acc_tmem_copy(rows, True, tCtC, tCtC_mn)
+        tiled_r2t = self._make_acc_tmem_copy(rows, False, tCtC, tCtC_mn)
         thr_t2r = tiled_t2r.get_slice(tidx)
         thr_r2t = tiled_r2t.get_slice(tidx)
         tTR_tC = thr_t2r.partition_S(tCtC_mn)
@@ -299,28 +311,38 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tiled_mma,
         tidx: cutlass.Int32,
         gC: cute.Tensor,
+        rows: cutlass.Constexpr[int],
     ):
-        acc_shape = tiled_mma.partition_shape_C((self.D, self.D))
+        acc_shape = tiled_mma.partition_shape_C((rows, self.DK))
         tCtC_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
         tCtC = cute.make_tensor(tmem_ptr + offset, tCtC_fake.layout)
         tCtC_mn = self.transform_partitioned_tensor_layout(tCtC)
-        cC = cute.make_identity_tensor((self.D, self.D))
-        atom_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tiled_t2r = tcgen05.make_tmem_copy(atom_t2r, tCtC[(None, None), 0, 0, 0])
+        cC = cute.make_identity_tensor((rows, self.DK))
+        tiled_t2r = self._make_acc_tmem_copy(rows, True, tCtC, tCtC_mn)
         thr_t2r = tiled_t2r.get_slice(tidx)
         tTR_tC = thr_t2r.partition_S(tCtC_mn)
         tTR_cC = thr_t2r.partition_D(cC)
-        tCgC = thr_t2r.partition_D(gC)
-        tCgC = cute.make_tensor(tCgC.iterator.align(16), tCgC.layout)
         rC = cute.make_rmem_tensor_like(tTR_cC, self.acc_dtype)
-        atom_r2g = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.acc_dtype, num_bits_per_copy=128
-        )
-        for sub in cutlass.range(cute.size(rC, mode=[2]), unroll_full=True):
-            cute.copy(tiled_t2r, tTR_tC[None, 0, sub, 0], rC[None, 0, sub])
-            cute.copy(atom_r2g, rC[None, 0, sub], tCgC[None, 0, sub])
+        if cutlass.const_expr(rows == 64):
+            # Partition GMEM through the MMA's C partition first: a raw (M, N)
+            # tile loses the split-lane ((16,4), N) C mode and gives wrong
+            # per-thread coordinates at M=64.
+            gC_mn = self.transform_partitioned_tensor_layout(
+                tiled_mma.get_slice(0).partition_C(gC)
+            )
+            tCgC = thr_t2r.partition_D(gC_mn)
+            for sub in cutlass.range(cute.size(rC, mode=[2]), unroll_full=True):
+                cute.copy(tiled_t2r, tTR_tC[None, 0, sub, 0], rC[None, 0, sub])
+                cute.autovec_copy(rC[None, 0, sub], tCgC[None, 0, sub])
+        else:
+            tCgC = thr_t2r.partition_D(gC)
+            tCgC = cute.make_tensor(tCgC.iterator.align(16), tCgC.layout)
+            atom_r2g = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), self.acc_dtype, num_bits_per_copy=128
+            )
+            for sub in cutlass.range(cute.size(rC, mode=[2]), unroll_full=True):
+                cute.copy(tiled_t2r, tTR_tC[None, 0, sub, 0], rC[None, 0, sub])
+                cute.copy(atom_r2g, rC[None, 0, sub], tCgC[None, 0, sub])
 
     @cute.jit
     def _materialize_x(
@@ -331,11 +353,11 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         sX: cute.Tensor,
         x_stage: cutlass.Int32,
     ):
-        acc_shape = tiled_mma_x.partition_shape_C((self.D, self.BLK))
+        acc_shape = tiled_mma_x.partition_shape_C((self.DK, self.BLK))
         tCtX_fake = tiled_mma_x.make_fragment_C(cute.append(acc_shape, 1))
         tCtX = cute.make_tensor(tmem_ptr + self.tmem_x_y_acc_offset, tCtX_fake.layout)
         tCtX_mn = self.transform_partitioned_tensor_layout(tCtX)
-        cX = cute.make_identity_tensor((self.D, self.BLK))
+        cX = cute.make_identity_tensor((self.DK, self.BLK))
         atom_t2r = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
         )
@@ -381,31 +403,37 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tiled_mma_update,
         tiled_mma_z,
         tidx: cutlass.Int32,
+        rows: cutlass.Constexpr[int],
     ):
-        src_shape = tiled_mma_update.partition_shape_C((self.D, self.D))
+        src_shape = tiled_mma_update.partition_shape_C((rows, self.DK))
         tCtSrc_fake = tiled_mma_update.make_fragment_C(cute.append(src_shape, 1))
         tCtSrc = cute.make_tensor(tmem_ptr + src_offset, tCtSrc_fake.layout)
         tCtSrc_mn = self.transform_partitioned_tensor_layout(tCtSrc)
-        cSrc = cute.make_identity_tensor((self.D, self.D))
-        src_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        src_copy = tcgen05.make_tmem_copy(src_atom, tCtSrc[(None, None), 0, 0, 0])
+        cSrc = cute.make_identity_tensor((rows, self.DK))
+        src_copy = self._make_acc_tmem_copy(rows, True, tCtSrc, tCtSrc_mn)
         src_thr = src_copy.get_slice(tidx)
         tTR_tSrc = src_thr.partition_S(tCtSrc_mn)
         tTR_cSrc = src_thr.partition_D(cSrc)
         rSrc = cute.make_rmem_tensor_like(tTR_cSrc, self.acc_dtype)
 
-        dst_shape = tiled_mma_z.partition_shape_A((self.D, self.D))
+        dst_shape = tiled_mma_z.partition_shape_A((rows, self.DK))
         tCtDst_fake = tiled_mma_z.make_fragment_A(cute.append(dst_shape, 1))
         tCtDst = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + dst_offset, dtype=self.dtype), tCtDst_fake.layout
         )
         tCtDst_mn = self.transform_partitioned_tensor_layout(tCtDst)
-        cDst = cute.make_identity_tensor((self.D, self.D))
-        dst_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.dtype
-        )
+        cDst = cute.make_identity_tensor((rows, self.DK))
+        # The bf16 store must match the fp32 load's register value layout:
+        # St16x128b(Rep 8) pairs with Ld16x256b(Rep 8), St32x32b(Rep 16) with
+        # Ld32x32b(Rep 32).
+        if cutlass.const_expr(rows == 64):
+            dst_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.dtype
+            )
+        else:
+            dst_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.dtype
+            )
         dst_copy = tcgen05.make_tmem_copy(dst_atom, tCtDst_mn[None, None, 0])
         dst_thr = dst_copy.get_slice(tidx)
         tRT_cDst = dst_thr.partition_S(cDst)
@@ -438,13 +466,13 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tiled_mma_update,
         tidx: cutlass.Int32,
     ):
-        src_shape = tiled_mma_x.partition_shape_C((self.D, self.BLK))
+        src_shape = tiled_mma_x.partition_shape_C((self.DK, self.BLK))
         tCtSrc_fake = tiled_mma_x.make_fragment_C(cute.append(src_shape, 1))
         tCtSrc = cute.make_tensor(
             tmem_ptr + self.tmem_scratch_offset, tCtSrc_fake.layout
         )
         tCtSrc_mn = self.transform_partitioned_tensor_layout(tCtSrc)
-        cSrc = cute.make_identity_tensor((self.D, self.BLK))
+        cSrc = cute.make_identity_tensor((self.DK, self.BLK))
         src_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
         )
@@ -454,13 +482,13 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tTR_cSrc = src_thr.partition_D(cSrc)
         rSrc = cute.make_rmem_tensor_like(tTR_cSrc, self.acc_dtype)
 
-        dst_shape = tiled_mma_update.partition_shape_A((self.D, self.BLK))
+        dst_shape = tiled_mma_update.partition_shape_A((self.DK, self.BLK))
         tCtDst_fake = tiled_mma_update.make_fragment_A(cute.append(dst_shape, 1))
         tCtDst = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + dst_offset, dtype=self.dtype), tCtDst_fake.layout
         )
         tCtDst_mn = self.transform_partitioned_tensor_layout(tCtDst)
-        cDst = cute.make_identity_tensor((self.D, self.BLK))
+        cDst = cute.make_identity_tensor((self.DK, self.BLK))
         dst_atom = cute.make_copy_atom(
             tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.dtype
         )
@@ -491,7 +519,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
     def _process_y(
         self,
         tmem_ptr: cutlass.Int64,
-        tiled_mma_x,
+        tiled_mma_y,
         tidx: cutlass.Int32,
         sV: cute.Tensor,
         sAlpha: cute.Tensor,
@@ -500,11 +528,11 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         block_coeff: cutlass.Float32,
         tiled_mma_update,
     ):
-        acc_shape = tiled_mma_x.partition_shape_C((self.D, self.BLK))
-        tCtY_fake = tiled_mma_x.make_fragment_C(cute.append(acc_shape, 1))
+        acc_shape = tiled_mma_y.partition_shape_C((self.DV, self.BLK))
+        tCtY_fake = tiled_mma_y.make_fragment_C(cute.append(acc_shape, 1))
         tCtY = cute.make_tensor(tmem_ptr + self.tmem_x_y_acc_offset, tCtY_fake.layout)
         tCtY_mn = self.transform_partitioned_tensor_layout(tCtY)
-        cY = cute.make_identity_tensor((self.D, self.BLK))
+        cY = cute.make_identity_tensor((self.DV, self.BLK))
         atom_t2r = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
         )
@@ -515,14 +543,14 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         rY = cute.make_rmem_tensor_like(tTR_cY, self.acc_dtype)
         sAlpha_blk = sAlpha[None, None, alpha_stage]
 
-        dst_shape = tiled_mma_update.partition_shape_A((self.D, self.BLK))
+        dst_shape = tiled_mma_update.partition_shape_A((self.DV, self.BLK))
         tCtDst_fake = tiled_mma_update.make_fragment_A(cute.append(dst_shape, 1))
         tCtDst = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_n_inp_offset, dtype=self.dtype),
             tCtDst_fake.layout,
         )
         tCtDst_mn = self.transform_partitioned_tensor_layout(tCtDst)
-        cDst = cute.make_identity_tensor((self.D, self.BLK))
+        cDst = cute.make_identity_tensor((self.DV, self.BLK))
         dst_atom = cute.make_copy_atom(
             tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.dtype
         )
@@ -592,22 +620,22 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
 
         m_init_consumer.wait_and_advance().release()
 
-        z_shape = tiled_mma_z.partition_shape_C((self.D, self.BLK))
+        z_shape = tiled_mma_z.partition_shape_C((self.DK, self.BLK))
         tCtScratch_fake = tiled_mma_z.make_fragment_C(cute.append(z_shape, 1))
         tCtScratch = cute.make_tensor(
             tmem_ptr + self.tmem_scratch_offset, tCtScratch_fake.layout
         )
-        update_shape = tiled_mma_update.partition_shape_C((self.D, self.D))
+        update_shape = tiled_mma_update.partition_shape_C((self.DK, self.DK))
         tCtUpdate_fake = tiled_mma_update.make_fragment_C(cute.append(update_shape, 1))
         tCtM = cute.make_tensor(tmem_ptr + self.tmem_m_offset, tCtUpdate_fake.layout)
 
-        z_inp_shape = tiled_mma_z.partition_shape_A((self.D, self.D))
+        z_inp_shape = tiled_mma_z.partition_shape_A((self.DK, self.DK))
         tCtZInp_fake = tiled_mma_z.make_fragment_A(cute.append(z_inp_shape, 1))
         tCtMInp = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_m_inp_offset, dtype=self.dtype),
             tCtZInp_fake.layout,
         )
-        update_inp_shape = tiled_mma_update.partition_shape_A((self.D, self.BLK))
+        update_inp_shape = tiled_mma_update.partition_shape_A((self.DK, self.BLK))
         tCtUpdateInp_fake = tiled_mma_update.make_fragment_A(
             cute.append(update_inp_shape, 1)
         )
@@ -694,23 +722,23 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
 
         n_init_consumer.wait_and_advance().release()
 
-        x_shape = tiled_mma_x.partition_shape_C((self.D, self.BLK))
+        x_shape = tiled_mma_x.partition_shape_C((self.DK, self.BLK))
         tCtX_fake = tiled_mma_x.make_fragment_C(cute.append(x_shape, 1))
         tCtX = cute.make_tensor(tmem_ptr + self.tmem_x_y_acc_offset, tCtX_fake.layout)
-        y_shape = tiled_mma_y.partition_shape_C((self.D, self.BLK))
+        y_shape = tiled_mma_y.partition_shape_C((self.DV, self.BLK))
         tCtY_fake = tiled_mma_y.make_fragment_C(cute.append(y_shape, 1))
         tCtY = cute.make_tensor(tmem_ptr + self.tmem_x_y_acc_offset, tCtY_fake.layout)
-        update_shape = tiled_mma_update.partition_shape_C((self.D, self.D))
+        update_shape = tiled_mma_update.partition_shape_C((self.DV, self.DK))
         tCtUpdate_fake = tiled_mma_update.make_fragment_C(cute.append(update_shape, 1))
         tCtN = cute.make_tensor(tmem_ptr + self.tmem_n_offset, tCtUpdate_fake.layout)
 
-        y_inp_shape = tiled_mma_y.partition_shape_A((self.D, self.D))
+        y_inp_shape = tiled_mma_y.partition_shape_A((self.DV, self.DK))
         tCtYInp_fake = tiled_mma_y.make_fragment_A(cute.append(y_inp_shape, 1))
         tCtNInp = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_n_inp_offset, dtype=self.dtype),
             tCtYInp_fake.layout,
         )
-        update_inp_shape = tiled_mma_update.partition_shape_A((self.D, self.BLK))
+        update_inp_shape = tiled_mma_update.partition_shape_A((self.DV, self.BLK))
         tCtUpdateInp_fake = tiled_mma_update.make_fragment_A(
             cute.append(update_inp_shape, 1)
         )
@@ -800,7 +828,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             done_producer,
         ) = math_pipelines
         self._initialize_tmem_matrix(
-            tmem_ptr, self.tmem_m_offset, tiled_mma_update, tidx, True
+            tmem_ptr, self.tmem_m_offset, tiled_mma_update, tidx, True, self.DK
         )
         m_init_producer.acquire_and_advance().commit()
         for blk in cutlass.range(num_blocks, unroll=1):
@@ -819,6 +847,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     tiled_mma_update,
                     tiled_mma_z,
                     tidx,
+                    self.DK,
                 )
                 m_in_producer.acquire_and_advance().commit()
                 z_handle = z_acc_consumer.wait_and_advance()
@@ -838,12 +867,17 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             )
             m_handle = m_acc_consumer.wait_and_advance()
             self._scale_tmem_matrix(
-                tmem_ptr, self.tmem_m_offset, tiled_mma_update, tidx, block_coeff
+                tmem_ptr,
+                self.tmem_m_offset,
+                tiled_mma_update,
+                tidx,
+                block_coeff,
+                self.DK,
             )
             m_handle.release()
             alpha_handle.release()
         self._store_tmem_matrix(
-            tmem_ptr, self.tmem_m_offset, tiled_mma_update, tidx, gM
+            tmem_ptr, self.tmem_m_offset, tiled_mma_update, tidx, gM, self.DK
         )
         done_producer.acquire_and_advance().commit()
 
@@ -852,7 +886,6 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         self,
         tidx: cutlass.Int32,
         tmem_ptr: cutlass.Int64,
-        tiled_mma_x,
         tiled_mma_z,
         tiled_mma_update,
         sV: cute.Tensor,
@@ -872,7 +905,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             done_consumer,
         ) = math_pipelines
         self._initialize_tmem_matrix(
-            tmem_ptr, self.tmem_n_offset, tiled_mma_update, tidx, False
+            tmem_ptr, self.tmem_n_offset, tiled_mma_update, tidx, False, self.DV
         )
         n_init_producer.acquire_and_advance().commit()
         for _ in cutlass.range(num_blocks, unroll=1):
@@ -885,15 +918,18 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                 tiled_mma_update,
                 tiled_mma_z,
                 tidx,
+                self.DV,
             )
             n_in_producer.acquire_and_advance().commit()
             y_handle = y_acc_consumer.wait_and_advance()
             block_coeff = cutlass.Float32(
                 sAlpha[self.BLK - 1, AlphaProcessor.CUMPROD, alpha_handle.index]
             )
+            # Y is tiled_mma_y's (DV, BLK) accumulator; at DV=64 its split-lane
+            # layout differs from tiled_mma_x's flat M=128 layout.
             self._process_y(
                 tmem_ptr,
-                tiled_mma_x,
+                tiled_mma_z,
                 tidx,
                 sV,
                 sAlpha,
@@ -904,7 +940,12 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             )
             y_handle.release()
             self._scale_tmem_matrix(
-                tmem_ptr, self.tmem_n_offset, tiled_mma_update, tidx, block_coeff
+                tmem_ptr,
+                self.tmem_n_offset,
+                tiled_mma_update,
+                tidx,
+                block_coeff,
+                self.DV,
             )
             cute.arch.fence_view_async_tmem_store()
             y_ready_producer.acquire_and_advance().commit()
@@ -912,7 +953,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             v_handle.release()
             alpha_handle.release()
         self._store_tmem_matrix(
-            tmem_ptr, self.tmem_n_offset, tiled_mma_update, tidx, gN
+            tmem_ptr, self.tmem_n_offset, tiled_mma_update, tidx, gN, self.DV
         )
         done_consumer.wait_and_advance().release()
 
@@ -948,55 +989,63 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             return cute.make_tiled_mma(op)
 
         tiled_mma_x = make_mma(
-            (self.D, self.BLK, self.BLK),
+            (self.DK, self.BLK, self.BLK),
             tcgen05.OperandSource.SMEM,
             OperandMajorMode.MN,
             OperandMajorMode.K,
         )
         tiled_mma_z = make_mma(
-            (self.D, self.BLK, self.D),
+            (self.DK, self.BLK, self.DK),
             tcgen05.OperandSource.TMEM,
             OperandMajorMode.K,
             OperandMajorMode.K,
         )
         tiled_mma_y = make_mma(
-            (self.D, self.BLK, self.D),
+            (self.DV, self.BLK, self.DK),
             tcgen05.OperandSource.TMEM,
             OperandMajorMode.K,
             OperandMajorMode.K,
         )
         tiled_mma_m_update = make_mma(
-            (self.D, self.D, self.BLK),
+            (self.DK, self.DK, self.BLK),
             tcgen05.OperandSource.TMEM,
             OperandMajorMode.K,
             OperandMajorMode.MN,
         )
         tiled_mma_n_update = make_mma(
-            (self.D, self.D, self.BLK),
+            (self.DV, self.DK, self.BLK),
             tcgen05.OperandSource.TMEM,
             OperandMajorMode.K,
             OperandMajorMode.MN,
         )
         tiled_mma_m_update_ss = make_mma(
-            (self.D, self.D, self.BLK),
+            (self.DK, self.DK, self.BLK),
             tcgen05.OperandSource.SMEM,
             OperandMajorMode.MN,
             OperandMajorMode.MN,
         )
         k_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma_x, (self.D, self.BLK, self.BLK), self.dtype, self.k_stage
+            tiled_mma_x, (self.DK, self.BLK, self.BLK), self.dtype, self.k_stage
         )
         k_trans_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma_z, (self.D, self.BLK, self.D), self.dtype, self.k_stage
+            tiled_mma_z, (self.DK, self.BLK, self.DK), self.dtype, self.k_stage
+        )
+        # V is read by ldmatrix, not an MMA; it only borrows an M=DV MN-major
+        # A-operand SMEM layout (identical to tiled_mma_x's when DV == DK).
+        tiled_mma_v_layout = make_mma(
+            (self.DV, self.BLK, self.BLK),
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
         )
         v_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma_x, (self.D, self.BLK, self.BLK), self.dtype, self.v_stage
+            tiled_mma_v_layout, (self.DV, self.BLK, self.BLK), self.dtype, self.v_stage
         )
         t_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma_x, (self.D, self.BLK, self.BLK), self.dtype, self.t_stage
+            tiled_mma_x, (self.DK, self.BLK, self.BLK), self.dtype, self.t_stage
         )
         x_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma_m_update, (self.D, self.D, self.BLK), self.dtype, self.x_stage
+            tiled_mma_m_update, (self.DK, self.DK, self.BLK), self.dtype, self.x_stage
         )
         k_semantic_layout = self.transform_partitioned_layout(k_layout)
         v_semantic_layout = self.transform_partitioned_layout(v_layout)
@@ -1013,10 +1062,10 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         v_tma_layout = cute.slice_(v_semantic_layout, (None, None, 0))
         t_tma_layout = cute.slice_(t_semantic_layout, (None, None, 0))
         tma_k = cpasync.make_tiled_tma_atom(
-            tma_op, g_k, k_tma_layout, (self.D, self.BLK)
+            tma_op, g_k, k_tma_layout, (self.DK, self.BLK)
         )
         tma_v = cpasync.make_tiled_tma_atom(
-            tma_op, g_v, v_tma_layout, (self.D, self.BLK)
+            tma_op, g_v, v_tma_layout, (self.DV, self.BLK)
         )
         tma_t = cpasync.make_tiled_tma_atom(
             tma_op, g_t, t_tma_layout, (self.BLK, self.BLK)
@@ -1339,12 +1388,16 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         )
         tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
 
-        out_layout = cute.make_layout(
-            (self.D, self.D, num_sab_heads, total_cp_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_sab_heads),
+        transfer_layout = cute.make_layout(
+            (self.DK, self.DK, num_sab_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DK * self.DK, self.DK * self.DK * num_sab_heads),
         )
-        mM = cute.make_tensor(g_transfer_t.iterator, out_layout)
-        mN = cute.make_tensor(g_state_t.iterator, out_layout)
+        state_layout = cute.make_layout(
+            (self.DV, self.DK, num_sab_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_sab_heads),
+        )
+        mM = cute.make_tensor(g_transfer_t.iterator, transfer_layout)
+        mN = cute.make_tensor(g_state_t.iterator, state_layout)
         gM = mM[None, None, sab_head_idx, cp_chunk_idx]
         gN = mN[None, None, sab_head_idx, cp_chunk_idx]
 
@@ -1395,7 +1448,6 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             self.run_compute_group_1(
                 tidx % 128,
                 tmem_ptr,
-                tiled_mma_x,
                 tiled_mma_y,
                 tiled_mma_n_update,
                 sV_tma,
@@ -1472,6 +1524,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     False,
                     tensor_cta_coord,
                     tensor_cta_layout,
+                    self.DK,
                 )
                 load_v_producer = self.load_tensor_block_tma_sm100(
                     tma_atom_v,
@@ -1485,6 +1538,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     False,
                     tensor_cta_coord,
                     tensor_cta_layout,
+                    self.DV,
                 )
                 load_t_producer = self.load_tensor_block_tma_sm100(
                     tma_atom_t,
@@ -1498,6 +1552,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     True,
                     tensor_cta_coord,
                     tensor_cta_layout,
+                    self.BLK,
                 )
         elif is_valid_chunk and warp_idx == self.alpha_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
@@ -1532,6 +1587,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         initial_state_inner_strides: tuple[int, ...] | None = None,
         output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
+        head_size: int = 128,
+        head_size_v: int | None = None,
     ):
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
@@ -1545,11 +1602,15 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.store_initial_state = store_initial_state
         self.acc_dtype = cutlass.Float32
         self.mma_dtype = cutlass.TFloat32
-        self.D = 128
-        if rows_per_cta not in (64, 128):
-            raise ValueError(f"rows_per_cta must be 64 or 128, got {rows_per_cta}")
+        self.DK = head_size
+        self.DV = head_size_v if head_size_v is not None else head_size
+        if rows_per_cta not in (64, 128) or self.DV % rows_per_cta != 0:
+            raise ValueError(
+                f"rows_per_cta must be 64 or 128 and divide DV={self.DV}, "
+                f"got {rows_per_cta}"
+            )
         self.rows_per_cta = rows_per_cta
-        self.row_ctas = self.D // rows_per_cta
+        self.row_ctas = self.DV // rows_per_cta
         # A second M stage hides the exposed UTC64 TMA load; UTC128 is unchanged by it.
         self.m_stage = 2 if rows_per_cta == 64 else 1
         self.n_stage = 1
@@ -1566,6 +1627,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.manual_cache_key(
             "rows_per_cta",
             "row_ctas",
+            "DK",
+            "DV",
             "needs_initial_state",
             "store_final_state",
             "initial_state_dtype",
@@ -1598,11 +1661,11 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         sTensor_stage = sTensor[None, None, handle.index]
         mTensor = tma_tensor[None, None, head_idx, chunk_idx]
         if cutlass.const_expr(is_transfer):
-            gTensor = cute.zipped_divide(mTensor, (self.D, self.D))[
+            gTensor = cute.zipped_divide(mTensor, (self.DK, self.DK))[
                 ((None, None), (0, 0))
             ]
         else:
-            gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.D))[
+            gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.DK))[
                 ((None, None), (row_cta_idx, 0))
             ]
         tTsT, tTgT = cpasync.tma_partition(
@@ -1617,14 +1680,14 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
 
     @cute.jit
     def make_tmem_tensor(self, tmem_ptr: cutlass.Int64, tiled_mma):
-        acc_shape = tiled_mma.partition_shape_C((self.rows_per_cta, self.D))
+        acc_shape = tiled_mma.partition_shape_C((self.rows_per_cta, self.DK))
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
         tCtAcc = cute.make_tensor(tmem_ptr + self.tmem_acc_offset, tCtAcc_fake.layout)
         return tCtAcc
 
     @cute.jit
     def make_tmem_operand(self, tmem_ptr: cutlass.Int64, tiled_mma):
-        opd_shape = tiled_mma.partition_shape_A((self.rows_per_cta, self.D))
+        opd_shape = tiled_mma.partition_shape_A((self.rows_per_cta, self.DK))
         tCtOpd_fake = tiled_mma.make_fragment_A(cute.append(opd_shape, 1))
         return cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_opd_offset, dtype=self.mma_dtype),
@@ -1642,7 +1705,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         stage: cutlass.Int32,
     ):
         tCtAcc_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc)
-        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.D))
+        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.DK))
         if cutlass.const_expr(self.rows_per_cta == 128):
             atom_r2t = cute.make_copy_atom(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -1673,7 +1736,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
     ):
         tCtAcc_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc)
         tCtOpd_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtOpd)
-        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.D))
+        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.DK))
         if cutlass.const_expr(self.rows_per_cta == 128):
             atom_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -1729,7 +1792,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         stage: cutlass.Int32,
     ):
         tCtAcc_mn = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc)
-        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.D))
+        cAcc = cute.make_identity_tensor((self.rows_per_cta, self.DK))
         if cutlass.const_expr(self.rows_per_cta == 128):
             atom_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -1921,11 +1984,14 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             )
         )
         m_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma, (self.rows_per_cta, self.D, self.D), self.acc_dtype, self.m_stage
+            tiled_mma,
+            (self.rows_per_cta, self.DK, self.DK),
+            self.acc_dtype,
+            self.m_stage,
         )
         n_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
-            (self.rows_per_cta, self.D, self.D),
+            (self.rows_per_cta, self.DK, self.DK),
             self.acc_dtype,
             self.n_stage,
             is_k_major=True,
@@ -1940,10 +2006,10 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         m_tma_layout = cute.slice_(m_semantic_layout, (None, None, 0))
         n_tma_layout = cute.slice_(n_semantic_layout, (None, None, 0))
         tma_m = cpasync.make_tiled_tma_atom(
-            tma_op, g_transfer_t, m_tma_layout, (self.D, self.D)
+            tma_op, g_transfer_t, m_tma_layout, (self.DK, self.DK)
         )
         tma_n = cpasync.make_tiled_tma_atom(
-            tma_op, g_local_state_t, n_tma_layout, (self.rows_per_cta, self.D)
+            tma_op, g_local_state_t, n_tma_layout, (self.rows_per_cta, self.DK)
         )
         tma_atom_m, tma_tensor_m = tma_m
         tma_atom_n, tma_tensor_n = tma_n
@@ -2082,18 +2148,18 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         pipeline.pipeline_init_wait(cluster_shape_mn=cute.make_layout((1, 1)))
 
         out_layout = cute.make_layout(
-            (self.D, self.D, num_heads, total_cp_chunks),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, total_cp_chunks),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
         gFixedStateCta = cute.local_tile(
             gFixedState[None, None, head_idx, None],
-            (self.rows_per_cta, self.D, total_cp_chunks),
+            (self.rows_per_cta, self.DK, total_cp_chunks),
             (row_cta_idx, 0, 0),
         )
         state_layout = cute.make_layout(
-            (self.D, self.D, num_heads, num_seqs),
-            stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
+            (self.DV, self.DK, num_heads, num_seqs),
+            stride=(self.DK, 1, self.DV * self.DK, self.DV * self.DK * num_heads),
         )
         state_idx = seq_idx
         if cutlass.const_expr(self.use_state_indices):
@@ -2101,7 +2167,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         if cutlass.const_expr(self.needs_initial_state):
             if cutlass.const_expr(self.use_state_indices):
                 initial_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
+                    (self.DV, self.DK, num_heads, g_initial_state_t.shape[0]),
                     stride=(
                         g_initial_state_t.stride[2],
                         g_initial_state_t.stride[3],
@@ -2118,7 +2184,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
                 )
             gInitialState = cute.local_tile(
                 gInitialStateTensor[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
             gInitialStateWorkspaceTensor = cute.make_tensor(
@@ -2126,7 +2192,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             )
             gInitialStateWorkspace = cute.local_tile(
                 gInitialStateWorkspaceTensor[None, None, head_idx, seq_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
         else:
@@ -2135,7 +2201,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         if cutlass.const_expr(self.store_final_state):
             if cutlass.const_expr(self.use_state_indices):
                 output_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
+                    (self.DV, self.DK, num_heads, g_output_state_t.shape[0]),
                     stride=(
                         g_output_state_t.stride[2],
                         g_output_state_t.stride[3],
@@ -2152,7 +2218,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
                 )
             gOutputState = cute.local_tile(
                 gOutputStateTensor[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D),
+                (self.rows_per_cta, self.DK),
                 (row_cta_idx, 0),
             )
         else:
