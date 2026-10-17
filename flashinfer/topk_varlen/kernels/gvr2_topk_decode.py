@@ -43,10 +43,11 @@ rename, this note, the ``_persist`` hook that routes the four
 ``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
 cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
 device), the main-family varlen prologue clamping each row's length to
-the envelope in launch slot ``n`` instead of the row stride, and the
-main family's in-kernel register path (``GvrMainKernel`` ``reg_vpt``, which
-calls ``GvrTopkRegKernel.row_topk``, the register kernel body split out of
-``kern``).  Keep future diffs against upstream mechanical.
+the envelope in launch slot ``n`` instead of the row stride, the clus
+family's solo rows (``GvrClusKernel`` ``solo``), and the in-kernel register
+paths of the main and clus families (``GvrMainKernel`` / ``GvrClusKernel``
+``reg_vpt``, which call ``GvrTopkRegKernel.row_topk``, the register kernel
+body split out of ``kern``).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
@@ -1434,7 +1435,9 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
 @dsl_user_op
 def _exit_thread(*, loc=None, ip=None):
     """PTX ``exit``: CUDA's ``if (...) return;``, which the DSL has no runtime
-    form of (FlashInfer-local, the main family's register path)."""
+    form of (FlashInfer-local, the main and clus families' register paths;
+    callers branch on a CTA-uniform predicate, so the whole CTA leaves, and
+    only where it owes no barrier or DSMEM access)."""
     nvvm.exit(loc=loc, ip=ip)
 
 
@@ -3947,9 +3950,10 @@ class GvrTopkRegKernel:
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
         # embedded: `row_topk` runs inside another family's kernel (the main
-        # family's in-kernel register path, GvrMainKernel `reg_vpt`) instead of
-        # being launched as this kernel. That host kernel waits on PDL, owns the
-        # smem window, and its (part, row) grid carries the row on block_idx.y.
+        # and clus families' in-kernel register paths, GvrMainKernel /
+        # GvrClusKernel `reg_vpt`) instead of being launched as this kernel.
+        # That host kernel waits on PDL, owns the smem window, and its (part or
+        # rank, row) grid carries the row on block_idx.y.
         self.embedded = bool(embedded)
         assert not (self.embedded and (pdl or prefill))
         self.blk = blk
@@ -4066,8 +4070,8 @@ class GvrTopkRegKernel:
     def row_topk(self, logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase):
         """Register-resident top-K of row ``row``: the whole kernel body, with the
         smem window (map in the family docstring) at byte address ``sbase``.
-        Separate from ``kern`` so the main family can call it for rows that fit
-        its CTA's registers."""
+        Separate from ``kern`` so the main and clus families can call it for
+        rows that fit their CTA's registers."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         KPT = cutlass.const_expr(self.kpt)
@@ -5486,6 +5490,14 @@ before any cluster barrier or DSMEM access (a cluster-uniform branch, like
 the short-row skip), and rank 0, whose chunk 0 is the whole row, merges its
 own histogram and uses CTA barriers in place of the clus.sync. Rows of more
 than one chunk keep the cluster path unchanged.
+
+FlashInfer-local: register rows. A solo row still streams (sample, row pass,
+staged emit, refine: a ~6 us floor), where the register family ranks the same
+row in ~3-4 us. With `reg_vpt`, a row of k < n <= BLK * reg_vpt * 4 columns
+(short = 2) skips the ladder and the streaming body on every rank, like a
+short row, and rank 0 ranks it with that family's body
+(GvrTopkRegKernel.row_topk, embedded) in the body guard's else arm; ranks != 0
+leave as a solo row's do.
 """
 
 
@@ -5533,6 +5545,7 @@ class GvrClusKernel:
         pt_smem: int = 0,
         pdl: bool = False,
         solo: bool = False,
+        reg_vpt: int = 0,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
@@ -5583,6 +5596,43 @@ class GvrClusKernel:
         self.ck_off = self.cbuf_bytes  # inside the blob
         self.dyn_bytes = nbs * 4 + self.cbuf_bytes + cmp_ * 8 + nbs * 4
         # == host smc = SNB*8 + (SCAP+4)*8 + CMP*8
+        # In-kernel register path (FlashInfer-local, varlen decode only; see the
+        # family note): rows of k < n <= BLK * reg_vpt * 4 columns run the register
+        # family's body on rank 0, at route()'s rung for this CTA shape (NBH 2048,
+        # CUR, non-DEG, CMP 2560). Its smem window is the cbuf | ck64c blob, which
+        # such a row never touches.
+        self.reg_vpt = int(reg_vpt)
+        if self.reg_vpt:
+            assert self.varlen
+            self.reg_cap = blk * self.reg_vpt * 4
+            # page-table entries a register row can span (the reg family's rule)
+            reg_pt = 0
+            if self.paged:
+                pages = (self.reg_cap + (1 << self.page_shift) - 1) >> self.page_shift
+                if pages <= 1024:
+                    reg_pt = 1 << max(pages - 1, 0).bit_length()
+            self.reg_body = GvrTopkRegKernel(
+                blk,
+                self.reg_vpt,
+                minb,
+                1,  # KPT: k <= BLK in this family
+                cur=True,
+                deg=False,
+                img=False,
+                nbh=2 * NB__reg,
+                varlen=True,
+                next_n=self.next_n,
+                cr_shift=self.cr_shift,
+                hint_free=self.hint_free,
+                paged=self.paged,
+                page_shift=self.page_shift,
+                pt_smem=reg_pt,
+                stage_out=True,  # one wave: rows * CS <= 148
+                embedded=True,
+            )
+            self.reg_win = STATIC_BYTES + (2 * NB__reg + 2 * REG_CMP) * 4 + 4 * reg_pt
+            # + k <= BLK staged outputs
+            assert self.reg_win + 4 * blk <= self.cbuf_bytes + cmp_ * 8, "register window must fit the blob"
 
     # ------------------------------------------------------------------
     # GVR_EMITK: classify+stage one survivor.
@@ -5829,6 +5879,13 @@ class GvrClusKernel:
                 nv = n
             if nv <= kq:
                 short = cutlass.Int32(1)
+            if cutlass.const_expr(self.reg_vpt > 0):
+                # register-path row (see the family note): short = 2. Like a
+                # short row it skips the ladder and, on every rank, the
+                # streaming body; rank 0 ranks it in the body guard's else arm.
+                if short == cutlass.Int32(0):
+                    if nv <= cutlass.Int32(self.reg_cap):
+                        short = cutlass.Int32(2)
             if short == cutlass.Int32(0):
                 n = nv
                 # ---- aim ladder (cheap mirror, all-thread) ----
@@ -5915,13 +5972,17 @@ class GvrClusKernel:
                     TGT2 = cutlass.Int32(1)
                 # NB: the Q launch slot is dead in this family (no in-kernel
                 # consumer); chunk ownership derives from n4/STEPC below.
-            if short != cutlass.Int32(0):
+            if short == cutlass.Int32(1):
                 if rank == cutlass.Int32(0):
                     if tidx < kq:
                         ov = cutlass.Int32(-1)
                         if tidx < nv:
                             ov = self._ox_g(pre_idx, tidx)
                         out[row, tidx] = ov
+                if cutlass.const_expr(self.reg_vpt > 0):
+                    # done: exit here rather than jump past the streaming body
+                    # to the register arm (that jump cost all-short batches ~1%)
+                    _exit_thread()
 
         # ---- shared memory (CUDA dynamic map order, then static allocs) ----
         smem = SmemAllocator()
@@ -6786,6 +6847,27 @@ class GvrClusKernel:
                             p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane, pre_idx, s_pt
                         )
                         it = it + cutlass.Int32(1)
+        else:
+            # ---- in-kernel register path (see the family note). Here, after the
+            # streaming body, it leaves that body's SASS as compiled without it
+            # up to register names and scheduling ----
+            if cutlass.const_expr(self.reg_vpt > 0):
+                if short == cutlass.Int32(2):
+                    if rank == cutlass.Int32(0):
+                        # n = the row's own length: the body's prologue clamps to
+                        # it and its envelope-bounded early load reads exactly the row
+                        self.reg_body.row_topk(
+                            logits,
+                            pre_idx,
+                            kv_lens,
+                            out,
+                            nv,
+                            cutlass.Int32(REG_CMP),
+                            cutlass.Int32(QUADC),  # O(mc^2) rank gate of a one-wave launch
+                            cutlass.Int32(self.reg_win) + k * cutlass.Int32(4),  # + k staged outputs
+                            row,
+                            sbase,
+                        )
 
     # ------------------------------------------------------------------
     # host launcher: grid dim3(CS, b) + cluster (CS,1,1);
@@ -6849,11 +6931,14 @@ def get_compiled__clus(
     pt_smem: int = 0,
     pdl: bool = False,
     solo: bool = False,
+    reg_vpt: int = 0,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
     reachable route has 8192/2048 — asserted by run__clus()). solo: rows of
-    at most one BLK * U chunk run on rank 0 alone (see the family note)."""
+    at most one BLK * U chunk run on rank 0 alone (see the family note).
+    reg_vpt (varlen only): rows of at most BLK * reg_vpt * 4 columns run the
+    register family's body on rank 0 (see the family note); 0 = off."""
     key = (
         tuple(tpl),
         scap,
@@ -6868,6 +6953,7 @@ def get_compiled__clus(
         int(pt_smem) if paged else 0,
         bool(pdl),
         bool(solo),
+        int(reg_vpt),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -6893,6 +6979,7 @@ def get_compiled__clus(
         pt_smem=int(pt_smem) if paged else 0,
         pdl=bool(pdl),
         solo=bool(solo),
+        reg_vpt=int(reg_vpt),
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6932,6 +7019,7 @@ def get_compiled__clus(
         + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
         + ("_pdl1" if pdl else "")
         + ("_solo" if solo else "")
+        + (f"_rg{int(reg_vpt)}" if reg_vpt else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
