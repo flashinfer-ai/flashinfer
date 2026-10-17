@@ -1082,24 +1082,32 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
         output_dtype = query.dtype
     else:
         output_dtype = None
-    fp16_output = (
+    explicit_output_dtype = None
+    if (
         isinstance(query, torch.Tensor)
         and query.dtype == torch.float8_e4m3fn
-        and output_dtype == torch.float16
+        and output_dtype in (torch.float16, torch.bfloat16)
+    ):
+        explicit_output_dtype = str(output_dtype).removeprefix("torch.")
+    return (
+        isinstance(kwargs.get(cache_param), torch.Tensor),
+        explicit_output_dtype,
+        q_mode,
     )
-    return isinstance(kwargs.get(cache_param), torch.Tensor), fp16_output, q_mode
 
 
 # fi_trace retains builders by template identity, so repeated traces must reuse
 # their templates, including each supported encoded fragment size.
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: int = 0
+    *, combined: bool, output_dtype: str | None, q_mode: str, encoded_page_size: int = 0
 ):
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
-    output_suffix = "_fp16_output" if fp16_output else ""
+    output_suffix = {"float16": "_fp16_output", "bfloat16": "_bf16_output"}.get(
+        output_dtype, ""
+    )
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
@@ -1166,7 +1174,10 @@ def _make_attention_ts_decode_trace(
             description="Semantic fragment size addressed by encoded locators.",
         )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -1210,8 +1221,8 @@ def _make_attention_ts_decode_trace(
         outputs={
             "output": Tensor(
                 output_shape,
-                dtype="float16" if fp16_output else None,
-                dtype_from=None if fp16_output else "q",
+                dtype=output_dtype,
+                dtype_from=None if output_dtype else "q",
                 param="out",
             )
         },
@@ -1223,14 +1234,19 @@ def _make_attention_ts_decode_trace(
 # Representative native/encoded layouts suffice for discovery. Other supported
 # fragment sizes are built lazily by the cached factories during dispatch.
 _ATTENTION_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode, encoded_page_size): _make_attention_ts_decode_trace(
+    (
+        combined,
+        output_dtype,
+        q_mode,
+        encoded_page_size,
+    ): _make_attention_ts_decode_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
-    for fp16_output in (False, True)
+    for output_dtype in (None, "float16", "bfloat16")
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
     for encoded_page_size in (0, 4)
 }
@@ -1239,12 +1255,12 @@ _ATTENTION_TS_DECODE_TRACES = {
 def attention_ts_decode_trace_dispatch(**kwargs):
     """Select one-shot FMHA storage, cache, and output-dtype schema."""
 
-    combined, fp16_output, q_mode = _fmha_trace_variant(
+    combined, output_dtype, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
     return _make_attention_ts_decode_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
     )
@@ -1258,7 +1274,7 @@ attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-define
 def _make_prims_ts_decode_wrapper_trace(
     *,
     combined: bool,
-    fp16_output: bool,
+    output_dtype: str | None,
     q_mode: str,
     mask_type: str,
     window_left: int,
@@ -1275,7 +1291,9 @@ def _make_prims_ts_decode_wrapper_trace(
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
-    output_suffix = "_fp16_output" if fp16_output else ""
+    output_suffix = {"float16": "_fp16_output", "bfloat16": "_bf16_output"}.get(
+        output_dtype, ""
+    )
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
@@ -1386,7 +1404,10 @@ def _make_prims_ts_decode_wrapper_trace(
         }
     )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -1438,8 +1459,8 @@ def _make_prims_ts_decode_wrapper_trace(
         outputs={
             "output": Tensor(
                 output_shape,
-                dtype="float16" if fp16_output else None,
-                dtype_from=None if fp16_output else "q",
+                dtype=output_dtype,
+                dtype_from=None if output_dtype else "q",
                 param="out",
             )
         },
@@ -1461,13 +1482,13 @@ def _make_prims_ts_decode_wrapper_trace(
 _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
     (
         combined,
-        fp16_output,
+        output_dtype,
         q_mode,
         plan_owns_seq_lens,
         encoded_page_size,
     ): _make_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type="dense",
         window_left=-1,
@@ -1479,7 +1500,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
         encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
-    for fp16_output in (False, True)
+    for output_dtype in (None, "float16", "bfloat16")
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
     for encoded_page_size in (0, 4)
     for plan_owns_seq_lens in (False, True)
@@ -1492,7 +1513,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
 def _get_prims_ts_decode_wrapper_trace(
     *,
     combined: bool,
-    fp16_output: bool,
+    output_dtype: str | None,
     q_mode: str,
     mask_type: str,
     window_left: int,
@@ -1508,7 +1529,7 @@ def _get_prims_ts_decode_wrapper_trace(
 
     return _make_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type=mask_type,
         window_left=window_left,
@@ -1570,7 +1591,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         wrapper_name="BatchDecodePagedTSWrapper",
         names=required_metadata,
     )
-    combined, fp16_output, q_mode = _fmha_trace_variant(
+    combined, output_dtype, q_mode = _fmha_trace_variant(
         kwargs,
         query_param="q",
         cache_param="paged_kv_cache",
@@ -1593,7 +1614,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     )
     return _get_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type=str(state.mask_type),
         window_left=int(state.window_left),
