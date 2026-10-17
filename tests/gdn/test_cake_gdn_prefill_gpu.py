@@ -1418,13 +1418,16 @@ def test_public_cake_gdn_prefill_absent_gates_reuse_one_cached_unit_tensor():
     assert list(prefill_mod._CAKE_GDN_UNIT_GATES) == [
         (device.index, total_tokens, num_o_heads)
     ]
-    gates, _stream, _ready = next(iter(prefill_mod._CAKE_GDN_UNIT_GATES.values()))
+    gates = next(iter(prefill_mod._CAKE_GDN_UNIT_GATES.values()))
     assert gates.dtype == torch.float32
     assert gates.is_contiguous()
     assert tuple(gates.shape) == (total_tokens, num_o_heads)
     assert gates.device == device
     assert torch.equal(gates, torch.ones_like(gates))
-    assert prefill_mod._cake_gdn_unit_gates(total_tokens, num_o_heads, device) is gates
+    assert (
+        prefill_mod._cake_gdn_unit_gates(device.index, total_tokens, num_o_heads)
+        is gates
+    )
 
     for _ in range(2):
         case["output"].zero_()
