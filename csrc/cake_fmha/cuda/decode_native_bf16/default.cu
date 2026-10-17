@@ -94,10 +94,10 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #ifndef Q_LEN
 #define Q_LEN 1
 #endif
-#define HAS_SINK 0
-#define HAS_WINDOW 1
-#define USE_SCALE_PTR 0
-#define RETAIN_KV_L2 0
+#define HAS_SINK CAKE_FMHA_HAS_SINK
+#define HAS_WINDOW CAKE_FMHA_HAS_WINDOW
+#define USE_SCALE_PTR CAKE_FMHA_USE_SCALE_PTR
+#define RETAIN_KV_L2 CAKE_FMHA_RETAIN_KV_L2
 #define FOUR_LANE_MAX 0
 
 #include <math_constants.h>
@@ -662,6 +662,31 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
             float* my_corr_ptr = ((is_wg1 != 0) ? smem_corr1 : smem_corr0);
             __nv_bfloat16* my_p_base = ((is_wg1 != 0) ? smem_p1 : smem_p0);
             float smx_scale = softmax_scale_log2;
+#if HAS_SINK
+#if HAS_WINDOW
+#else
+#if RETAIN_KV_L2
+#if USE_SCALE_PTR
+            {
+                smx_scale = scale_log2_ptr[0];
+            }
+#endif  // USE_SCALE_PTR
+#else
+            {
+                smx_scale = scale_log2_ptr[0];
+            }
+#endif  // RETAIN_KV_L2
+#endif  // HAS_WINDOW
+#else
+#if HAS_WINDOW
+#else
+#if USE_SCALE_PTR
+            {
+                smx_scale = scale_log2_ptr[0];
+            }
+#endif  // USE_SCALE_PTR
+#endif  // HAS_WINDOW
+#endif  // HAS_SINK
             float sv[8];
             float sv_lo[4];
             float sv_hi[4];
@@ -683,12 +708,14 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 int global_q_pos = causal_seqlens_kv_global[batch_idx] + q_row_idx;
                 int visible_local_keys = global_q_pos + 1;
                 int win_start = 0;
+#if HAS_WINDOW
                 {
                     int win_lo = global_q_pos - window_left;
                     if (win_lo > 0) {
                         win_start = win_lo;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks = num_n_blocks_total + num_n_blocks_total % 2;
                 if (cta_n_blocks < 4) {
@@ -764,6 +791,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     if (kv_pos3 >= visible_local_keys) {
                         sv[6] = -3.4028235e+38f;
                         sv[7] = -3.4028235e+38f;
+#if HAS_WINDOW
                     }
                     {
                         if (kv_pos0 < win_start) {
@@ -782,6 +810,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             sv[6] = -3.4028235e+38f;
                             sv[7] = -3.4028235e+38f;
                         }
+#endif  // HAS_WINDOW
                     }
                     float pair_max[2];
                     float _max_0 = max_noftz(sv[0], sv[2]);
@@ -872,6 +901,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     if (kv_pos3 >= visible_local_keys) {
                         exp_vals[6] = 0.0f;
                         exp_vals[7] = 0.0f;
+#if HAS_WINDOW
                     }
                     {
                         if (kv_pos0 < win_start) {
@@ -890,6 +920,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             exp_vals[6] = 0.0f;
                             exp_vals[7] = 0.0f;
                         }
+#endif  // HAS_WINDOW
                     }
                     #pragma unroll
                     for (int c_5 = 0; c_5 < 2; c_5++) {
@@ -1013,6 +1044,31 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
             const int group_ratio_rt = NUM_Q_HEADS / NUM_KV_HEADS;
             unsigned int total_tiles_c = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
             float smx_scale_c = softmax_scale_log2;
+#if HAS_SINK
+#if HAS_WINDOW
+#else
+#if RETAIN_KV_L2
+#if USE_SCALE_PTR
+            {
+                smx_scale_c = scale_log2_ptr[0];
+            }
+#endif  // USE_SCALE_PTR
+#else
+            {
+                smx_scale_c = scale_log2_ptr[0];
+            }
+#endif  // RETAIN_KV_L2
+#endif  // HAS_WINDOW
+#else
+#if HAS_WINDOW
+#else
+#if USE_SCALE_PTR
+            {
+                smx_scale_c = scale_log2_ptr[0];
+            }
+#endif  // USE_SCALE_PTR
+#endif  // HAS_WINDOW
+#endif  // HAS_SINK
             unsigned int _phase_corr_scale_0 = 0;
             unsigned int _phase_corr_scale_1 = 0;
             unsigned int _phase_o_ready_0_0 = 0;
@@ -1027,12 +1083,14 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 int global_q_pos_1 = causal_seqlens_kv_global[batch_idx_1] + q_row_idx_1;
                 int visible_local_keys_1 = global_q_pos_1 + 1;
                 int win_start_1 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_1 = global_q_pos_1 - window_left;
                     if (win_lo_1 > 0) {
                         win_start_1 = win_lo_1;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_1 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1 = num_n_blocks_total_1 + num_n_blocks_total_1 % 2;
                 if (cta_n_blocks_1 < 4) {
@@ -1219,15 +1277,46 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     float final_o = 0.0f;
                     float local_lse = -CAKE_FMHA_INF;
                     {
+#if HAS_SINK
+                        float merged_n = 0.0f;
+#endif  // HAS_SINK
                         if (local_sum[h_6] > 0.0f && local_sum[h_6] == local_sum[h_6]) {
+#if HAS_SINK
+                            merged_n = _tmem_load_2[h_6] * scale0[h_6] + _tmem_load_3[h_6] * scale1[h_6];
+#else
                             float merged = _tmem_load_2[h_6] * scale0[h_6] + _tmem_load_3[h_6] * scale1[h_6];
                             float _rcp_1 = approx_rcp(local_sum[h_6]);
                             final_o = merged * _rcp_1;
+#endif  // HAS_SINK
                             {
+#if HAS_SINK
+                                float _log2_0;
+                                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(local_sum[h_6]));
+                                local_lse = local_max[h_6] * smx_scale_c + _log2_0;
+#else
                                 float _log2_1;
                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(local_sum[h_6]));
                                 local_lse = local_max[h_6] * smx_scale_c + _log2_1;
+#endif  // HAS_SINK
                             }
+#if HAS_SINK
+                        }
+                        if (group_ratio_rt > h_6) {
+                            int q_head_s = kv_head_idx_1 * group_ratio_rt + h_6;
+                            float sink_b2 = sinks_ptr[q_head_s] * 1.4426950408889634f;
+                            float m2 = local_max[h_6] * smx_scale_c;
+                            float _max_11 = max_noftz(m2, sink_b2);
+                            float big2 = _max_11;
+                            float num_scale = 0.0f;
+                            if (local_sum[h_6] > 0.0f && local_sum[h_6] == local_sum[h_6]) {
+                                float _exp2_6 = approx_exp2(m2 - big2);
+                                num_scale = _exp2_6;
+                            }
+                            float _exp2_7 = approx_exp2(sink_b2 - big2);
+                            float denom = local_sum[h_6] * num_scale + _exp2_7;
+                            float _rcp_0 = approx_rcp(denom);
+                            final_o = merged_n * num_scale * _rcp_0;
+#endif  // HAS_SINK
                         }
                     }
                     if (group_ratio_rt > h_6) {
@@ -1274,12 +1363,14 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 int global_q_pos_2 = causal_seqlens_kv_global[batch_idx_2] + q_row_idx_2;
                 int visible_local_keys_2 = global_q_pos_2 + 1;
                 int win_start_2 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_2 = global_q_pos_2 - window_left;
                     if (win_lo_2 > 0) {
                         win_start_2 = win_lo_2;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_2 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_2 = num_n_blocks_total_2 + num_n_blocks_total_2 % 2;
                 if (cta_n_blocks_2 < 4) {
@@ -1811,12 +1902,14 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 int global_q_pos_3 = causal_seqlens_kv_global[batch_idx_3] + q_row_idx_3;
                 int visible_local_keys_3 = global_q_pos_3 + 1;
                 int win_start_3 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_3 = global_q_pos_3 - window_left;
                     if (win_lo_3 > 0) {
                         win_start_3 = win_lo_3;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_3 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_3 = num_n_blocks_total_3 + num_n_blocks_total_3 % 2;
                 if (cta_n_blocks_3 < 4) {
@@ -1850,7 +1943,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_la = 0; hg_la < 2; hg_la++) {
                                 int toff_la = hg_la * 16384 + pg_half_la * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(ldst_la + toff_la), "l"(K), "r"(0), "r"(0), "r"(hg_la), "r"(kv_head_idx_3), "r"(pg0_la),
+                                           "r"(kv_full_addr + (kv_stage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(ldst_la + toff_la, K, 0, 0, hg_la, kv_head_idx_3, pg0_la, kv_full_addr + (kv_stage_la) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1881,7 +1982,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_la_1 = 0; hg_la_1 < 2; hg_la_1++) {
                                 int vtoff_la = hg_la_1 * 16384 + pg_half_la_1 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(vdst_la + vtoff_la), "l"(V), "r"(0), "r"(0), "r"(hg_la_1), "r"(kv_head_idx_3), "r"(vpg0_la),
+                                           "r"(kv_full_addr + (stage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(vdst_la + vtoff_la, V, 0, 0, hg_la_1, kv_head_idx_3, vpg0_la, kv_full_addr + (stage_la) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1907,7 +2016,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_la_2 = 0; hg_la_2 < 2; hg_la_2++) {
                                 int ntoff_la = hg_la_2 * 16384 + pg_half_la_2 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(kdst_la + ntoff_la), "l"(K), "r"(0), "r"(0), "r"(hg_la_2), "r"(kv_head_idx_3), "r"(npg0_la),
+                                           "r"(kv_full_addr + (k_stage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(kdst_la + ntoff_la, K, 0, 0, hg_la_2, kv_head_idx_3, npg0_la, kv_full_addr + (k_stage_la) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1935,7 +2052,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_la_3 = 0; hg_la_3 < 2; hg_la_3++) {
                                 int tvtoff_la = hg_la_3 * 16384 + pg_half_la_3 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(tvdst_la + tvtoff_la), "l"(V), "r"(0), "r"(0), "r"(hg_la_3), "r"(kv_head_idx_3), "r"(tvpg0_la),
+                                           "r"(kv_full_addr + (tstage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(tvdst_la + tvtoff_la, V, 0, 0, hg_la_3, kv_head_idx_3, tvpg0_la, kv_full_addr + (tstage_la) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1963,12 +2088,14 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 int global_q_pos_4 = causal_seqlens_kv_global[batch_idx_4] + q_row_idx_4;
                 int visible_local_keys_4 = global_q_pos_4 + 1;
                 int win_start_4 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_4 = global_q_pos_4 - window_left;
                     if (win_lo_4 > 0) {
                         win_start_4 = win_lo_4;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_4 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_4 = num_n_blocks_total_4 + num_n_blocks_total_4 % 2;
                 if (cta_n_blocks_4 < 4) {
@@ -2009,7 +2136,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg = 0; hg < 2; hg++) {
                                 int toff = hg * 16384 + pg_i * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(ldst + toff), "l"(K), "r"(0), "r"(0), "r"(hg), "r"(kv_head_idx_4), "r"(pg0),
+                                           "r"(kv_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(ldst + toff, K, 0, 0, hg, kv_head_idx_4, pg0, kv_full_addr + (kv_stage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -2041,7 +2176,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_1 = 0; hg_1 < 2; hg_1++) {
                                 int vtoff = hg_1 * 16384 + pg_i_1 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(vdst + vtoff), "l"(V), "r"(0), "r"(0), "r"(hg_1), "r"(kv_head_idx_4), "r"(vpg0),
+                                           "r"(kv_full_addr + (stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(vdst + vtoff, V, 0, 0, hg_1, kv_head_idx_4, vpg0, kv_full_addr + (stage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -2068,7 +2211,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_2 = 0; hg_2 < 2; hg_2++) {
                                 int ntoff = hg_2 * 16384 + pg_i_2 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(kdst + ntoff), "l"(K), "r"(0), "r"(0), "r"(hg_2), "r"(kv_head_idx_4), "r"(npg0),
+                                           "r"(kv_full_addr + (k_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(kdst + ntoff, K, 0, 0, hg_2, kv_head_idx_4, npg0, kv_full_addr + (k_stage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -2097,7 +2248,15 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             for (int hg_3 = 0; hg_3 < 2; hg_3++) {
                                 int tvtoff = hg_3 * 16384 + pg_i_3 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(tvdst + tvtoff), "l"(V), "r"(0), "r"(0), "r"(hg_3), "r"(kv_head_idx_4), "r"(tvpg0),
+                                           "r"(kv_full_addr + (tstage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(tvdst + tvtoff, V, 0, 0, hg_3, kv_head_idx_4, tvpg0, kv_full_addr + (tstage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }

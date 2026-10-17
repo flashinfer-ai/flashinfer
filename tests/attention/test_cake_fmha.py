@@ -216,13 +216,47 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
         retain_kv_l2=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "default.cu",
         "cake_fmha_decode_native_bf16_binding.cu",
         "cake_fmha_decode_native_bf16_jit_binding.cu",
     }
     assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_USE_SCALE_PTR=1" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_RETAIN_KV_L2=1" in spec.extra_cuda_cflags
+
+
+def test_cake_fmha_decode_native_bf16_generic_members_share_one_folded_source() -> None:
+    """The 11 generic members compile one source whose flags come from the loader defines."""
+
+    component = get_cake_fmha_manifest()["components"]["decode_native_bf16"]
+    generic_members = [
+        member
+        for member in component["source_family"]
+        if "BATCH_SIZE" not in member["selector"]
+    ]
+    assert len(generic_members) == 11
+    sources = {
+        member["sources"][arch]
+        for member in generic_members
+        for arch in ("sm_100a", "sm_103a")
+    }
+    assert sources == {"cuda/decode_native_bf16/default.cu"}
+    text = (get_cake_fmha_csrc_dir() / "cuda/decode_native_bf16/default.cu").read_text(
+        encoding="utf-8"
+    )
+    for macro in ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"):
+        assert f"#define {macro} CAKE_FMHA_{macro}\n" in text
+        assert f"#define {macro} 0\n" not in text
+        assert f"#define {macro} 1\n" not in text
+        assert text.count(f"#if {macro}\n") == text.count(f"#endif  // {macro}\n") > 0
+    flag_sets = {
+        tuple(
+            member["selector"][macro]
+            for macro in ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR")
+        )
+        for member in generic_members
+    }
+    assert len(flag_sets) == 11
 
 
 @pytest.mark.parametrize(
@@ -1263,11 +1297,7 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
     lse_spec = gen_cake_fmha_decode_native_bf16_module(
         target, batch_size, 1, num_q_heads, 4, **flag_kwargs, return_lse=True
     )
-    generic_body = (
-        f"has_sink0_has_window0_retain_kv_l2{int(retain_kv_l2)}"
-        f"_use_scale_ptr{int(device_scale)}.cu"
-    )
-    assert Path(lse_spec.sources[0]).name == generic_body
+    assert Path(lse_spec.sources[0]).name == "default.cu"
     assert Path(lse_spec.sources[1]).name == "cake_fmha_decode_native_bf16_binding.cu"
     assert "-DBATCH_SIZE=128" in lse_spec.extra_cuda_cflags
     assert lse_spec.extra_cuda_cflags == spec.extra_cuda_cflags
