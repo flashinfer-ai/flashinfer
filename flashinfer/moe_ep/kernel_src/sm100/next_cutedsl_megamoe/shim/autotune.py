@@ -12,7 +12,7 @@ import dataclasses
 import math
 import statistics
 
-from .tuning import is_valid_sm100_genphase_knobs, sm100_genphase_candidates
+from .tuning import KNOB_KEYS, is_valid_sm100_genphase_knobs, sm100_genphase_candidates
 
 
 def autotune_sm100_genphase_mega_moe(
@@ -96,6 +96,10 @@ def autotune_sm100_genphase_mega_moe(
     )
     if not candidates:
         raise ValueError("autotune needs at least one candidate")
+    # Partial overrides are valid constraints, but a recorded winner must be
+    # complete. Reject on every rank before rank 0 can fail during publication.
+    if any(set(knobs) != set(KNOB_KEYS) for knobs in candidates):
+        raise ValueError("autotune candidates must set every GenPhase knob")
 
     def barrier():
         """Keep candidate lifetimes and cache publication ordered across EP ranks."""

@@ -60,6 +60,9 @@ in the backend and `shim/{tuning,knob_cache,autotune}.py`, without inspecting
 device routing during forward. Bump the cache implementation revision when the
 kernel or tuning behavior changes. Retuning must preserve staging/output
 pointers, and auto workspaces must remain unpooled.
+Caller-supplied candidates must contain exactly all GenPhase knob keys; reject
+incomplete or unknown key sets on all ranks before starting any trial, so cache
+publication cannot fail on rank 0 while peers wait at the final barrier.
 
 Reuse `tests/moe_ep/test_mega_workspace_knobs.py` for candidate, constraint,
 cache and host API contracts, and the existing MXFP8 multirank test for native

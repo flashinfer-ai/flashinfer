@@ -724,6 +724,60 @@ def test_blackwell_genphase_tuning_invalid_hardware_count(sms):
         sm100_genphase_candidates(_genphase_tuning_config(), sm_count=sms)
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("malformed", ["partial", "empty", "extra"])
+def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials(
+    monkeypatch, rank, malformed
+):
+    """Reject malformed shared candidates on every rank before trial collectives."""
+    from flashinfer.moe_ep.core import tuning as core_tuning
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        autotune,
+        correctness,
+        knob_cache,
+    )
+
+    cfg = _genphase_tuning_config(rank=rank)
+    valid = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[0]
+    invalid = {
+        "partial": {"schedule_policy": ("grouped", 296)},
+        "empty": {},
+        "extra": {**valid, "apply_topk_at_fc1": False},
+    }[malformed]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: mock.Mock(multi_processor_count=148),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda _: rank)
+
+    def gather(proposals, proposal, *, group):
+        proposals[:] = [proposal, proposal]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(core_tuning, "tuning_live_tokens", lambda *args: 16)
+    monkeypatch.setattr(knob_cache, "device_identity", lambda: "B200")
+    reference = mock.Mock(side_effect=AssertionError("entered candidate trials"))
+    record = mock.Mock()
+    monkeypatch.setattr(correctness, "sampled_reference", reference)
+    monkeypatch.setattr(knob_cache, "record_knobs", record)
+    with pytest.raises(ValueError, match="candidates must set every GenPhase knob"):
+        autotune.autotune_sm100_genphase_mega_moe(
+            None,
+            None,
+            None,
+            mock.Mock(config=cfg),
+            num_tokens=16,
+            candidates=[valid, invalid],
+        )
+    reference.assert_not_called()
+    record.assert_not_called()
+
+
 def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_record(
     tmp_path, monkeypatch
 ):
