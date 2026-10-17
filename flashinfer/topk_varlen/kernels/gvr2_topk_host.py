@@ -1207,8 +1207,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         _VARLEN_CACHE[key] = lc
         return lc
     tpl, r_const, clus, rt = _main_engine(num_rows, n_route, npad, k, paged)
-    # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
-    # machinery in whenever SPLIT); normalize it out of the compile key so
+    # TSHG (tpl[6]) is dead under varlen (the ctor never compiles the TSH
+    # floor into a varlen engine); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = _gate_first_call(
         dev.get_compiled(
@@ -1248,10 +1248,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
     sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
-    # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
-    # num_rows > 15 would strand small batches in SPLIT-main without the
-    # staged floor (a distribution-dependent tail regression); the kernel
-    # gates TSH per row at runtime anyway.
+    # TSH-floor gate: SPLIT and K only (the CUDA form also needs num_rows >
+    # 15). The varlen kernel gives the rows it admits (n4 <= 32768) a 4x
+    # denser sample in place of the floor; see GvrMainKernel's ladder.
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     # slot 0 (`n`) carries the envelope: the varlen prologue clamps each row's
     # kv-derived length to it, never to the row stride npad (arena tails)
