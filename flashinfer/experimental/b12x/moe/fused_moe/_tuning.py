@@ -595,6 +595,68 @@ def validate_moe_decode_config(
         raise ValueError("dynamic_route_mode is only valid for dynamic MoE")
 
 
+def _csf_default_config(query, config, device):
+    """Choose conservative SM120 scale and tile defaults from routing density."""
+    if (
+        not query.csf_inline_scales
+        or device is None
+        or device.compute_capability != (12, 0)
+        or _compact_w4a8_query(query)
+    ):
+        return config
+    nvfp4 = _nvfp4_query(query)
+    if (
+        nvfp4
+        and config.backend == "micro"
+        and query.num_tokens >= 4
+        and query.controls.get("dynamic_tile_mn") is None
+    ):
+        dynamic = replace(
+            config,
+            backend="dynamic",
+            dynamic_tile_m=16,
+            dynamic_route_mode="grouped",
+            nvfp4_share_input=query.shared_input_scales,
+        )
+        if _csf_inline_eligible(query, dynamic):
+            config = dynamic
+    if (
+        config.backend == "dynamic"
+        and query.controls.get("dynamic_tile_mn") is None
+        and _csf_inline_eligible(query, replace(config, dynamic_tile_m=16))
+    ):
+        rows, experts = query.routed_rows, query.num_experts
+        if nvfp4:
+            if 12 * experts <= rows < 48 * experts:
+                config = replace(config, dynamic_tile_m=32)
+            materialized = replace(config, dynamic_tile_m=128)
+            if (
+                rows >= 48 * experts
+                and _nvfp4_materialization_eligible(query, materialized)
+                and query.controls.get("dynamic_nvfp4_materialized") is not False
+            ):
+                config = materialized
+        elif query.quant_mode == "w4a8_mx" and config.dynamic_tile_m == 16:
+            if rows >= 16 * experts:
+                config = replace(config, dynamic_tile_m=32)
+    # Expansion amortizes repeated decoding at high expert occupancy; tiny
+    # launches and compact N64 kernels retain expansion as their default.
+    min_tokens = 8 if query.quant_mode == "w4a8_mx" else 16
+    max_rows_per_expert = 32 if query.quant_mode == "w4a8_mx" else 16
+    return replace(
+        config,
+        csf_inline_scales=bool(
+            _csf_inline_eligible(query, config)
+            and query.num_tokens >= min_tokens
+            and query.routed_rows <= max_rows_per_expert * query.num_experts
+            and (
+                config.backend == "w4a16"
+                or query.routed_rows <= config.dynamic_tile_m * query.num_experts
+            )
+        ),
+    )
+
+
 def _default_config(
     query: MoeDecodeQuery, device: DeviceIdentity | None
 ) -> MoeDecodeConfig:
@@ -616,6 +678,7 @@ def _default_config(
             and query.shared_input_scales
         ),
     )
+    config = _csf_default_config(query, config, device)
     config = replace(
         config,
         nvfp4_materialize_intermediate=bool(
@@ -889,7 +952,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=32,
+    candidate_contract_version=33,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(

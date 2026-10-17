@@ -51,13 +51,23 @@ payload and preserve native scale bytes, normalization, and arithmetic.
 
 The autotuner measures the complete invocation, including expansion, route
 planning, synchronization resets, and reduction. Token capacity is part of the
-tuning query. Explicit config overrides select either choice; preparation
-without autotuning defaults to expansion. Inline readers cover M16/M32 NVFP4
-W4A4 and MXFP4 W4A8 tiles, and packed W4A16 kernels. Scalar and compact micro
+tuning query. Explicit config overrides select either choice. On SM120,
+untuned preparation prefers inline scales for moderate routing density and
+expansion for tiny calls, compact N64 W4A8, and dense prefill. Inline readers
+cover M16/M32 NVFP4 W4A4 and MXFP4 W4A8 tiles, and packed W4A16 kernels. Scalar and compact micro
 kernels, M64/M128 activation-quantized tiles, materialized NVFP4 W4A4,
 source-native W4A16, dense GEMM, and the optional
 W4A16 activation-prefill path consume expanded scales. Unsupported inline
 overrides are rejected during planning.
+
+The SM120 defaults select inline from 16 tokens through 16 routed rows per
+expert for NVFP4 W4A4 and packed W4A16, and from 8 tokens through 32 routed
+rows per expert for noncompact MXFP4 W4A8. These density limits use total routed
+rows divided by the declared expert count. NVFP4 switches to M32 at 12 rows
+per expert and eligible materialized M128 at 48; noncompact MXFP4 uses M32
+from 16 rows per expert and retains its dense M64 crossover. These are untuned
+defaults; autotuning retains both supported scale choices, including compact
+N64 inline candidates. SM121 retains its device-specific defaults.
 
 M16/M32 inline candidates are omitted from autotuning when routed rows exceed
 the expert count times the tile height. Explicit overrides can still measure

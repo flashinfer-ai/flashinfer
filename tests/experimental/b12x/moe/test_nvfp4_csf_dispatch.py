@@ -205,9 +205,62 @@ def test_fp4_families_expose_inline_and_expansion_choices(source, mode, n, capac
     )
     configs = [c for _, c in TUNING.eligible_plan(query, DEVICE).candidates]
     assert {c.csf_inline_scales for c in configs} == {False, True}
-    assert not TUNING.configure(
-        query, device=DEVICE, search=False
-    ).default.csf_inline_scales
+    assert TUNING.configure(query, device=DEVICE, search=False).default in configs
     for c in configs:
         if c.csf_inline_scales:
             assert replace(c, csf_inline_scales=False) in configs
+
+
+@pytest.mark.parametrize(
+    "mode,n,tokens,backend,tile,inline,materialized",
+    [
+        ("nvfp4", 1024, 4, "dynamic", 16, False, False),
+        ("nvfp4", 1024, 8, "dynamic", 16, False, False),
+        ("nvfp4", 1024, 16, "dynamic", 16, True, False),
+        ("nvfp4", 1024, 512, "dynamic", 32, True, False),
+        ("nvfp4", 1024, 1024, "dynamic", 32, False, False),
+        ("nvfp4", 1024, 2048, "dynamic", 128, False, True),
+        ("w4a8_mx", 1152, 4, "micro", None, False, False),
+        ("w4a8_mx", 1152, 8, "dynamic", 16, True, False),
+        ("w4a8_mx", 1152, 512, "dynamic", 16, True, False),
+        ("w4a8_mx", 1152, 1024, "dynamic", 32, True, False),
+        ("w4a8_mx", 1152, 2048, "dynamic", 32, True, False),
+        ("w4a8_mx", 1152, 4096, "dynamic", 64, False, False),
+        ("w4a8_mx", 576, 8, "micro", None, False, False),
+        ("w4a8_mx", 576, 128, "dynamic", 16, False, False),
+        ("w4a8_mx", 576, 512, "dynamic", 16, False, False),
+        ("w4a16", 1024, 4, "w4a16", None, False, False),
+        ("w4a16", 1024, 8, "w4a16", None, False, False),
+        ("w4a16", 1024, 16, "w4a16", None, True, False),
+        ("w4a16", 1024, 64, "w4a16", None, True, False),
+    ],
+)
+def test_csf_defaults_follow_measured_routing_bands(
+    mode, n, tokens, backend, tile, inline, materialized
+):
+    mx = mode == "w4a8_mx"
+    experts, top_k = (384, 6) if mx else (288, 8)
+    query = replace(
+        _nvfp4_query(),
+        quant_mode=mode,
+        quant_modes=(mode,),
+        source_format="fp4_e8m0_k32" if mx else "modelopt_nvfp4",
+        num_experts=experts,
+        route_num_experts=experts,
+        hidden_size=5120 if mx else 4096,
+        intermediate_size=n,
+        top_k=top_k,
+        num_tokens=tokens,
+        routed_rows=tokens * top_k,
+        csf_inline_scales=True,
+        weight_layouts=("mma_packed",) if mode == "w4a16" else ("qmma_repacked",),
+        w4a16_weight_layout="packed" if mode == "w4a16" else None,
+        w4a16_scale_format="e4m3_k16" if mode == "w4a16" else None,
+    )
+    config = TUNING.configure(query, device=DEVICE, search=False).default
+    assert (
+        config.backend,
+        config.dynamic_tile_m,
+        config.csf_inline_scales,
+        config.nvfp4_materialize_intermediate,
+    ) == (backend, tile, inline, materialized)
