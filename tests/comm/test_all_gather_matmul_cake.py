@@ -83,6 +83,36 @@ def _cg2_programs():
     return sorted(classes)
 
 
+def _cg2s_classes(arch):
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered spill-wave
+    N-split pair main on ``arch``, read from the emitted table."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in loader.CG2S_CLASSES[arch]
+    }
+
+
+def _cg2s_programs():
+    """Every class with a delivered spill-wave N-split pair main (union over the
+    architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _cg2s_classes(arch)
+    return sorted(classes)
+
+
+def _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n):
+    """Form of the emitted spill point naming the class, padded rows and ``n`` on
+    ``arch``, or ``None`` when no point does."""
+
+    for entry in loader.CG2_SPILL_POINTS[arch]:
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n):
+            return str(entry[5])
+    return None
+
+
 def test_route_table_covers_every_world_size_dtype_layout_and_phase():
     for phase in (0, 1):
         assert loader.barrier_program(phase) in loader.PROGRAMS
@@ -120,7 +150,20 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         f"main_{dtype_name}_ws{world_size}_{b_layout}_cg2"
         for world_size, dtype_name, b_layout in _cg2_programs()
     }
-    assert len(loader.ROUTES) == 2 + 12 + 2 + len(twins) + len(pairs)
+    # One spill-wave N-split pair twin per class of the delivered spill-class
+    # table, each a program of its own; no other spill route exists.
+    spills = set()
+    for world_size, dtype_name, b_layout, form in _cg2s_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert program in loader.PROGRAMS and program not in mains | twins | pairs
+        spills.add(program)
+    assert len(spills) == len(_cg2s_programs())
+    spill_keys = {key for key in loader.ROUTES if key.endswith(("_cg2s1", "_cg2s2"))}
+    assert spill_keys == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
+        for world_size, dtype_name, b_layout, form in _cg2s_programs()
+    }
+    assert len(loader.ROUTES) == 2 + 12 + 2 + len(twins) + len(pairs) + len(spills)
     # ws2 never has a twin: asking for one names the missing route.
     with pytest.raises(ValueError, match="main_bfloat16_ws2_n_major_n128"):
         loader.main_program(2, "bfloat16", "n_major", block_n=128)
@@ -129,6 +172,14 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         loader.main_program(8, "bfloat16", "n_major", block_n=128, form="cg2")
     with pytest.raises(ValueError, match="form"):
         loader.main_program(8, "bfloat16", "n_major", form="cg3")
+    # A spill twin exists only for the classes with a point, at the public width,
+    # and only at the form of that point (the four-tile form is delivered nowhere).
+    with pytest.raises(ValueError, match="no all-gather matmul main program"):
+        loader.main_program(8, "bfloat16", "n_major", form="cg2s2")
+    with pytest.raises(ValueError, match="no all-gather matmul main program"):
+        loader.main_program(4, "bfloat16", "k_major", form="cg2s1")
+    with pytest.raises(ValueError, match="block_n=256 only"):
+        loader.main_program(4, "bfloat16", "k_major", block_n=128, form="cg2s2")
     assert loader.peer_push_program() in loader.PROGRAMS
     assert loader.peer_push_wide_program() in loader.PROGRAMS
     assert loader.peer_push_program() != loader.peer_push_wide_program()
@@ -177,11 +228,11 @@ _CG2_REGIONS = {
         [8, "bfloat16", "k_major", 1024, 1024, 7168, 7168],
     ],
     "sm_103a": [
-        # R2 regions (min_cols 1 keeps every R2-routed call routed).
+        # The two measured rectangles (min_cols 1 keeps every call in them routed).
         [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
         [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
-        # R3 lever alpha (arm a1): the two measured gate_up M=512 rows, as points. The M=2048
-        # rows of arm a2 are not routed (export gate blocked at the frozen 0.60 SM-clock floor, GAP-15c).
+        # The two measured gate_up M=512 rows, as points; the M=2048 gate_up rows are
+        # not routed.
         [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
         [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
         # The three measured ws2 M=1024 rows (N = 2048), as points: the bf16 n_major
@@ -216,7 +267,7 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
     rows at N = 2048), the ws4 bf16 k_major class at 1024..1536 padded rows /
     N <= 6058 and at its gate_up point (exactly 512 padded rows at N = 14336),
     and the ws8 bf16 k_major class at its gate_up point (exactly 512 padded rows
-    at N = 7168; the M=2048 gate_up rows of arm a2 are not routed); on sm_100a
+    at N = 7168; the M=2048 gate_up rows are not routed); on sm_100a
     the ws2 bf16 n_major class at its two measured points (exactly 2048 or 4096
     padded rows at N = 2048), the ws4 bf16 k_major class at its five (exactly
     1024, 1152 or 2048 padded rows at N = 2560; exactly 512 or 1024 padded rows
@@ -226,7 +277,8 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
 
     assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
     assert loader.CG2_REGIONS == _CG2_REGIONS
-    assert loader.MAIN_FORMS == ("cg1", "cg2")
+    assert loader.MAIN_FORMS == ("cg1", "cg2", "cg2s1", "cg2s2")
+    assert loader.PAIR_FORMS == ("cg2", "cg2s1", "cg2s2")
     assert loader.CG2_CLUSTER_DIMS == (2, 1, 1)
     for arch in loader.ARCH_FLAGS:
         classes = _cg2_classes(arch)
@@ -241,6 +293,66 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
         "chunk_m_tiles",
     ):
         assert not hasattr(loader, retired), retired
+
+
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` points: the spill-wave
+# N-split pair program of a measured row, on exact padded rows and exact N.
+_CG2_SPILL_POINTS = {
+    "sm_100a": [],
+    "sm_103a": [
+        # The two measured bf16 k_major gate_up rows -- the ws4 M=512 row and the
+        # ws8 M=512 row -- each to the form its entry names (``cg2s2``: two
+        # 256 x 128 spill tiles; ``cg2s1``, four 256 x 64, has no point).
+        [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
+        [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
+    ],
+}
+_CG2S_CLASSES = {
+    "sm_100a": set(),
+    "sm_103a": {
+        (4, "bfloat16", "k_major", "cg2s2"),
+        (8, "bfloat16", "k_major", "cg2s2"),
+    },
+}
+
+
+def test_cg2_spill_point_table_lists_the_measured_points_per_architecture():
+    """The spill-wave N-split pair twins are delivered for the classes with a
+    measured point: on sm_103a the ws4 bf16 k_major class at exactly 512 padded
+    rows / N = 14336 and the ws8 bf16 k_major class at exactly 512 padded rows /
+    N = 7168, each to the form its pinned entry names; sm_100a has no point.
+    Every point lies inside a pair rectangle of its class and names a delivered
+    spill class; the form order gives the host sequence's positional form
+    codes."""
+
+    assert set(loader.CG2_SPILL_POINTS) == set(loader.ARCH_FLAGS)
+    assert set(loader.CG2S_CLASSES) == set(loader.ARCH_FLAGS)
+    assert loader.CG2_SPILL_POINTS == _CG2_SPILL_POINTS
+    for arch in loader.ARCH_FLAGS:
+        classes = _cg2s_classes(arch)
+        assert len(classes) == len(loader.CG2S_CLASSES[arch])
+        assert classes == _CG2S_CLASSES[arch], arch
+        # every point belongs to a delivered spill class and every delivered
+        # spill class has a point
+        points = loader.CG2_SPILL_POINTS[arch]
+        assert {(*entry[:3], entry[5]) for entry in points} == classes, arch
+        assert len({tuple(entry[:5]) for entry in points}) == len(points), arch
+        for world_size, dtype_name, b_layout, padded, n, form in points:
+            assert (world_size, dtype_name, b_layout) in _cg2_classes(arch), arch
+            assert form in loader.PAIR_FORMS[1:] and b_layout == "k_major"
+            assert padded % loader.BLOCK_M == 0 and n % loader.BLOCK_N == 0
+            rectangles = [
+                entry[3:]
+                for entry in loader.CG2_REGIONS[arch]
+                if tuple(entry[:3]) == (world_size, dtype_name, b_layout)
+            ]
+            assert any(
+                min_rows <= padded <= max_rows and min_cols <= n <= max_cols
+                for min_rows, max_rows, min_cols, max_cols in rectangles
+            ), (arch, world_size, dtype_name, b_layout, padded, n)
+    assert [loader.main_form_code(form) for form in loader.MAIN_FORMS] == [0, 1, 2, 3]
+    with pytest.raises(ValueError, match="form"):
+        loader.main_form_code("pair")
 
 
 def test_every_program_lists_its_device_source_only():
@@ -309,6 +421,21 @@ def test_every_route_has_one_host_sequence_per_architecture():
                 assert row["programs"]["main_cg2"] == pair
                 assert arch in loader.PROGRAMS[pair]["arches"]
                 route.add(pair)
+            # A spill-wave N-split pair twin likewise, for the classes with a
+            # delivered point on this architecture (the per-call form is chosen
+            # by ``main_form`` over the point table; its pair base travels too).
+            for form in loader.PAIR_FORMS[1:]:
+                spill_class = (world_size, dtype_name, b_layout, form)
+                spill_delivered = spill_class in _cg2s_classes(arch)
+                assert (f"main_{form}" in row["programs"]) is spill_delivered
+                if spill_delivered:
+                    assert pair_delivered
+                    spill = loader.main_program(
+                        world_size, dtype_name, b_layout, form=form
+                    )
+                    assert row["programs"][f"main_{form}"] == spill
+                    assert arch in loader.PROGRAMS[spill]["arches"]
+                    route.add(spill)
             assert len(programs) == len(route) and set(programs) == route
     assert set(loader.SEQUENCES) == expected
     with pytest.raises(ValueError, match="host sequence"):
@@ -360,6 +487,20 @@ def test_every_program_is_delivered_for_both_architectures():
         assert loader.PROGRAMS[pair]["arches"] == (
             ["sm_103a"] if sm103a_only else ["sm_100a", "sm_103a"]
         ), pair
+    # A spill-wave N-split pair twin is delivered for exactly the architectures
+    # whose point table names its class (the pinned spill classes: the ws4 and
+    # ws8 bf16 k_major classes on sm_103a alone, each at the form of its points).
+    assert sorted(_cg2s_programs()) == sorted(
+        {cls for classes in _CG2S_CLASSES.values() for cls in classes}
+    )
+    for world_size, dtype_name, b_layout, form in _cg2s_programs():
+        spill = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert loader.PROGRAMS[spill]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout, form) in _cg2s_classes(arch)
+        ), spill
+        assert loader.PROGRAMS[spill]["arches"] == ["sm_103a"], spill
     sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
     loader.spec.cache_clear()
     try:
@@ -485,6 +626,18 @@ def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
         pair_smem.add(loader.dynamic_smem_bytes(program))
     assert pair_blocks == {(loader.MAIN_THREADS, 1, 1)}
     assert len(pair_smem) == 1 and pair_smem.pop() > 0
+    # The spill-wave N-split pair twins share the N256 block as well (one thread
+    # count per sequence) and, per form, one dynamic shared memory value of
+    # their own read from the twin's build receipt.
+    spill_blocks = set()
+    spill_smem = {}
+    for world_size, dtype_name, b_layout, form in _cg2s_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        spill_blocks.add(loader.launch_block(program))
+        spill_smem.setdefault(form, set()).add(loader.dynamic_smem_bytes(program))
+    assert spill_blocks == {(loader.MAIN_THREADS, 1, 1)}
+    for form, values in spill_smem.items():
+        assert len(values) == 1 and values.pop() > 0, form
 
 
 @pytest.mark.parametrize(
@@ -615,6 +768,12 @@ def test_main_grid_of_the_pair_main_is_even_and_bounded_by_the_pair_tiles(
     )
     assert grid == expected and grid[0] % 2 == 0 and grid[0] <= 2 * pair_tiles
     assert grid[0] == 2 * max(1, min(pair_tiles, sm_count // 2))
+    # The spill-wave N-split pair twins launch the same even grid.
+    for form in loader.PAIR_FORMS[1:]:
+        spill_grid = loader.main_grid(
+            rows, n, world_size=world_size, sm_count=sm_count, form=form
+        )
+        assert spill_grid == grid, form
     # The one-CTA grid of the same call is the default form.
     assert loader.main_grid(
         rows, n, world_size=world_size, sm_count=sm_count
@@ -625,6 +784,10 @@ def test_main_grid_of_the_pair_main_exists_at_the_public_width_only():
     with pytest.raises(ValueError, match="block_n=256 only"):
         loader.main_grid(
             1024, 2048, world_size=2, sm_count=148, block_n=128, form="cg2"
+        )
+    with pytest.raises(ValueError, match="block_n=256 only"):
+        loader.main_grid(
+            1024, 2048, world_size=2, sm_count=148, block_n=128, form="cg2s1"
         )
     with pytest.raises(ValueError, match="form"):
         loader.main_grid(1024, 2048, world_size=2, sm_count=148, form="pair")
@@ -731,11 +894,12 @@ _INVENTORY_ROWS = (
         (125, 14336, 4, "bfloat16", "k_major"),
         _N256,
     ),
-    # The R3 lever-alpha gate_up rows (896 / 3584 N256 tiles: beyond
-    # the cap of both architectures); on sm_103a the M=512 rows run the CTA-pair
-    # twin and the M=2048 rows (arm a2, not routed) keep the one-CTA program; on
-    # sm_100a the M=512 and M=1024 rows (measured points) run the twin and
-    # the M=1025 (1152 padded rows) / M=2048 rows keep the one-CTA program.
+    # The gate_up rows (896 / 3584 N256 tiles: beyond the cap of both
+    # architectures); on sm_103a the M=512 rows run the spill-wave N-split pair
+    # twin of their point and the M=2048 rows (not routed) keep the one-CTA
+    # program; on sm_100a the M=512 and M=1024 rows (measured points) run the
+    # CTA-pair twin and the M=1025 (1152 padded rows) / M=2048 rows keep the
+    # one-CTA program.
     (
         "llama_tp4_gate_up_bf16_m512_kmajor",
         (512, 14336, 4, "bfloat16", "k_major"),
@@ -778,7 +942,7 @@ _INVENTORY_ROWS = (
     ),
     # The pair-routed N256 rows (ws2 always 256; 320 / 360 / 640
     # N256 tiles at ws4 = three to five waves, beyond the cap of both
-    # architectures): on sm_103a the R2 regions route them, on sm_100a the
+    # architectures): on sm_103a the measured rectangles route them, on sm_100a the
     # measured points (the m2048 QKV row is pair-routed on sm_100a only).
     (
         "perf_bf16_m2048",
@@ -910,7 +1074,11 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     perf_bf16_m2048 / m4096 (ws2 bf16 n_major), llama_tp4_qkv_bf16_m1024 /
     m1025 / m2048_kmajor and llama_tp4_gate_up_bf16_m512 / m1024_kmajor (ws4
     bf16 k_major) and llama_tp8_gate_up_bf16_m512 / m1024_kmajor (ws8 bf16
-    k_major; the measured sm_100a points); the one-CTA form for every other row."""
+    k_major; the measured sm_100a points); the one-CTA form for every other row.
+    Of the pair rows, the two sm_103a spill points --
+    llama_tp4_gate_up_bf16_m512_kmajor and llama_tp8_gate_up_bf16_m512_kmajor --
+    run the spill-wave N-split pair twin of the form their point names instead;
+    llama_tp4_qkv_bf16_m1024_kmajor stays on the CTA-pair twin."""
 
     rows, n, world_size, dtype_name, b_layout = shape
     for arch, block_n in widths.items():
@@ -934,7 +1102,9 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
             min_rows <= padded <= max_rows and min_cols <= n <= max_cols
             for min_rows, max_rows, min_cols, max_cols in rectangles
         )
-        assert form == ("cg2" if qualifies and delivered else "cg1"), (label, arch)
+        point = _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n)
+        expected_form = (point or "cg2") if qualifies and delivered else "cg1"
+        assert form == expected_form, (label, arch)
         expected_pair = (
             label
             in {
@@ -963,7 +1133,13 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
                 },
             }[arch]
         )
-        assert (form == "cg2") is expected_pair, (label, arch)
+        assert (form in loader.PAIR_FORMS) is expected_pair, (label, arch)
+        expected_spill = arch == "sm_103a" and label in {
+            "llama_tp4_gate_up_bf16_m512_kmajor",
+            "llama_tp8_gate_up_bf16_m512_kmajor",
+        }
+        assert (point is not None) is expected_spill, (label, arch)
+        assert (form in loader.PAIR_FORMS[1:]) is expected_spill, (label, arch)
         # Every inventory row the rule qualifies belongs to a delivered class (the table is derived from the rows).
         assert delivered or not qualifies, (label, arch)
 
@@ -1024,7 +1200,10 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             elif world_size == 4:
                 # (4, bfloat16, k_major): exactly 1024, 1152 or 2048 padded rows
                 # at N = 2560 (897..1024, 1025..1152 and 1921..2048 pad onto the
-                # points; M = 1000 is inside the 1024 point) ...
+                # points; M = 1000 is inside the 1024 point); no spill point here.
+                cls = (4, "bfloat16", "k_major")
+                assert _spill_point_form(arch, *cls, 1024, 2560) is None
+                assert _spill_point_form(arch, *cls, 512, 14336) is None
                 assert [
                     rule(rows)
                     for rows in (897, 1000, 1024, 1025, 1100, 1152, 1921, 2048)
@@ -1037,7 +1216,7 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 assert rule(1024, n=5888) == "cg1" and rule(512, n=2560) == "cg1"
                 # ... and the gate_up points: exactly 512 or 1024 padded rows at
                 # N = 14336 (385..512 and 897..1024 pad onto them; 513 pads to 640,
-                # 1025 to 1152 and 2048 -- the arm a2 row -- stays one-CTA).
+                # 1025 to 1152 and 2048 stays one-CTA).
                 assert [
                     rule(rows, n=14336)
                     for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
@@ -1063,7 +1242,10 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             else:
                 # (8, bfloat16, k_major): exactly 512 or 1024 padded rows at
                 # N = 7168 (385..512 and 897..1024 pad onto the points; 513 pads
-                # to 640, 1025 to 1152); every N = 1280 call stays one-CTA.
+                # to 640, 1025 to 1152); every N = 1280 call stays one-CTA; no
+                # spill point here.
+                cls = (8, "bfloat16", "k_major")
+                assert _spill_point_form(arch, *cls, 512, 7168) is None
                 assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
                     "cg1"
                 ] * 6
@@ -1126,21 +1308,31 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 with pytest.raises(ValueError, match="multiple of 256"):
                     rule(1024, n=cols)
         elif world_size == 4:
-            # (4, bfloat16, k_major) R2 rectangle: 1024..1536 padded rows, N <= 6058.
+            # (4, bfloat16, k_major) rectangle: 1024..1536 padded rows, N <= 6058;
+            # every call of the rectangle runs the CTA-pair twin (the QKV M=1024
+            # row at N = 2560 is no spill point: 897..1024 pad onto it and keep
+            # the twin like 1025..1536).
+            assert _spill_point_form(arch, 4, "bfloat16", "k_major", 1024, 2560) is None
             assert [rule(rows) for rows in (1, 512, 896, 1537, 2048, 4096, 65536)] == [
                 "cg1"
             ] * 7
-            assert [rule(rows) for rows in (897, 1024, 1025, 1100, 1536)] == ["cg2"] * 5
+            assert [rule(rows) for rows in (897, 1000, 1024, 1025, 1100, 1536)] == [
+                "cg2"
+            ] * 6
+            assert rule(1024, n=2304) == "cg2" and rule(1024, n=2816) == "cg2"
             assert (
                 rule(1024, n=5888) == "cg2"
                 and rule(1024, n=6144) == "cg1"
                 and rule(1024, n=14336) == "cg1"
             )
-            # R3 alpha point (llama_tp4_gate_up m512): exactly 512 padded rows at
-            # exactly N = 14336; 511 pads to 512 (cg2), 513 pads to 640 (cg1); the
-            # M=2048 row (arm a2, not routed) and the neighbouring column multiples
-            # stay cg1.
-            assert [rule(rows, n=14336) for rows in (500, 511, 512)] == ["cg2"] * 3
+            # The gate_up point (llama_tp4_gate_up m512): exactly 512 padded rows at
+            # exactly N = 14336, the spill-wave N-split pair twin (385..511 pad to
+            # 512); 513 pads to 640 (cg1); the M=2048 row (not routed) and the
+            # neighbouring column multiples stay cg1.
+            p_gate = _spill_point_form(arch, 4, "bfloat16", "k_major", 512, 14336)
+            assert p_gate in loader.PAIR_FORMS[1:]
+            gate_rows = (385, 500, 511, 512)
+            assert [rule(rows, n=14336) for rows in gate_rows] == [p_gate] * 4
             assert [
                 rule(rows, n=14336)
                 for rows in (1, 513, 640, 1024, 1536, 1921, 2048, 2049, 4096)
@@ -1152,14 +1344,16 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 with pytest.raises(ValueError, match="multiple of 256"):
                     rule(512, n=cols)
         else:
-            # (8, bfloat16, k_major), R3 alpha point (llama_tp8_gate_up m512):
-            # exactly 512 padded rows at exactly N = 7168; the class has no other
-            # rectangle, so the M=2048 row (arm a2, not routed) and every N = 1280
-            # call stay cg1.
+            # (8, bfloat16, k_major), the gate_up point (llama_tp8_gate_up m512):
+            # exactly 512 padded rows at exactly N = 7168, the spill-wave N-split
+            # pair twin; the class has no other rectangle, so the M=2048 row (not
+            # routed) and every N = 1280 call stay cg1.
+            p_ws8 = _spill_point_form(arch, 8, "bfloat16", "k_major", 512, 7168)
+            assert p_ws8 in loader.PAIR_FORMS[1:]
             assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
                 "cg1"
             ] * 6
-            assert [rule(rows, n=7168) for rows in (500, 511, 512)] == ["cg2"] * 3
+            assert [rule(rows, n=7168) for rows in (500, 511, 512)] == [p_ws8] * 3
             assert [
                 rule(rows, n=7168)
                 for rows in (1, 513, 640, 1024, 1025, 1536, 1921, 2048, 2049, 4096)
@@ -2194,11 +2388,29 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
     assert args[14:17] == backend.loader.main_grid(
         512, 1280, world_size=8, sm_count=148, block_n=128
     )
-    # Four M tiles per chunk and the 128-wide program: the one-CTA form (main_cg2 = 0).
+    # Four M tiles per chunk and the 128-wide program: the one-CTA form (form code 0).
     assert args[17:] == (128, 0, 4242, 77) and len(args) == 21
     # No communication stream is involved on the SM push route.
     assert inp.streams == []
     assert state.next_phase == 1 and state.ready_epoch == 1
+
+
+def _pinned_spill_code(world_size, dtype_name, b_layout, padded, n):
+    """Host-sequence form code of the pinned sm_103a spill point naming the
+    class, padded rows and ``n`` (``_CG2_SPILL_POINTS``): the launch rows below
+    follow the pinned table when a point's form changes."""
+
+    [form] = [
+        entry[5]
+        for entry in _CG2_SPILL_POINTS["sm_103a"]
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n)
+    ]
+    return loader.main_form_code(form)
+
+
+# The two sm_103a points: the ws4 gate_up M=512 row and the ws8 gate_up M=512 row.
+_GATE_WS4_CODE = _pinned_spill_code(4, "bfloat16", "k_major", 512, 14336)
+_GATE_WS8_CODE = _pinned_spill_code(8, "bfloat16", "k_major", 512, 7168)
 
 
 @pytest.mark.parametrize(
@@ -2211,7 +2423,7 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
         "b_layout",
         "entry",
         "block_n",
-        "main_cg2",
+        "form_code",
     ),
     [
         # Two N256 waves: within the sm_100a cap of two, beyond the sm_103a cap of one.
@@ -2232,21 +2444,24 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
         (1024, 1280, 8, "sm_103a", "bfloat16", "k_major", "run_push", 256, 0),
         # Three N256 waves exceed the cap: the copy-engine route runs the N256 main;
         # a call inside a measured pair rectangle of its class on the architecture
-        # selects its CTA-pair twin (main_cg2 = 1): on sm_103a the ws2 bf16
+        # selects its CTA-pair twin (form code 1): on sm_103a the ws2 bf16
         # n_major calls of 2048..5760 padded rows (N <= 2048) and the ws4 bf16
-        # k_major calls of 1024..1536 padded rows (N <= 6058) (R2).
+        # k_major calls of 1024..1536 padded rows (N <= 6058), the QKV M=1024
+        # and M=1025 (1152 padded) rows among them: that rectangle holds no
+        # spill point.
         (2048, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
         (4096, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
         (1024, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
         (1025, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
-        # The R3 lever-alpha points: ws4 bf16 k_major at exactly 512
-        # padded rows and N = 14336, ws8 bf16 k_major at exactly 512 padded rows
-        # and N = 7168 (500 pads to 512; 513 pads to 640 and leaves); the M=2048
-        # gate_up rows (arm a2) are not routed.
-        (512, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        # The sm_103a gate_up points: ws4 bf16 k_major at exactly 512 padded rows
+        # and N = 14336, ws8 bf16 k_major at exactly 512 padded rows and N = 7168
+        # (500 pads to 512; 513 pads to 640 and leaves) select the spill-wave
+        # N-split pair twin of the form each pinned point names (the code derived
+        # from ``_CG2_SPILL_POINTS``); the M=2048 gate_up rows are not routed.
+        (512, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS4_CODE),
         (2048, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
-        (500, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
-        (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (500, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS4_CODE),
+        (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS8_CODE),
         (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         # The measured points on sm_100a: ws2 bf16 n_major at
@@ -2317,14 +2532,16 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
     b_layout,
     entry,
     block_n,
-    main_cg2,
+    form_code,
 ):
     """Both host-sequence entries receive ``block_n`` (128 for a call the
     loader routes to a delivered ``_n128`` main on that architecture within its
-    wave cap, 256 otherwise) and ``main_cg2`` (1 for an N256 call inside a
+    wave cap, 256 otherwise) and the form code (1 for an N256 call inside a
     measured pair region of its class on that architecture, whose class
-    delivers the CTA-pair twin there) positionally after ``grid_z``, with the
-    grid of that width and form."""
+    delivers the CTA-pair twin there; the point's form code -- 2 for the
+    four-tile split, 3 for the two-tile split -- when the call also names a
+    delivered spill-wave N-split point of its class; 0 otherwise) positionally
+    after ``grid_z``, with the grid of that width and form."""
 
     call, state, workspace, sequence = _launch_fixture(
         monkeypatch,
@@ -2340,14 +2557,15 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
     assert name == entry
     grid_z = 16 if entry == "run_push" else 15
     assert len(args) == grid_z + 5
-    form = "cg2" if main_cg2 else "cg1"
+    form = backend.loader.MAIN_FORMS[form_code]
+    assert backend.loader.main_form_code(form) == form_code
     grid = backend.loader.main_grid(
         rows, n, world_size=world_size, sm_count=148, block_n=block_n, form=form
     )
     assert args[grid_z - 2 : grid_z + 1] == grid
-    if main_cg2:
+    if form_code:
         assert grid[0] % 2 == 0
-    assert args[grid_z + 1 :] == (block_n, main_cg2, 4242, 77)
+    assert args[grid_z + 1 :] == (block_n, form_code, 4242, 77)
     assert block_n == backend.loader.main_block_n(
         rows,
         n,
