@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from flashinfer.utils import round_up
 
 # todo(Yingyi): add benchmark and quant test
 
@@ -101,8 +102,12 @@ def _run_correctness_worker(
                     quant_out = torch.empty(
                         seq_len * hidden_size // 4, dtype=dtype, device=device
                     )
+                    # E4M3 scales in the SWIZZLED_128x4 layout.
                     scale_out = torch.empty(
-                        seq_len * hidden_size // SF_VEC_SIZE, dtype=dtype, device=device
+                        round_up(seq_len, 128)
+                        * round_up(hidden_size // SF_VEC_SIZE, 4),
+                        dtype=torch.uint8,
+                        device=device,
                     )
                     routed_scaling_factor = 2.5
 
@@ -161,19 +166,18 @@ def _run_correctness_worker(
 
                     torch.cuda.synchronize()
 
-                    # == Calculate reference output ==
+                    # == Calculate reference output (in FP32, like the kernel) ==
                     expert_reduction = torch.sum(
-                        fc2_output_clone[expanded_idx_to_permuted_idx]
-                        * scale.unsqueeze(-1)
+                        fc2_output_clone.float()[expanded_idx_to_permuted_idx]
+                        * scale.float().unsqueeze(-1)
                         * routed_scaling_factor,
                         dim=1,
                     )
 
                     torch_before_residual = (
-                        expert_reduction + shared_expert_output
+                        expert_reduction + shared_expert_output.float()
                     ) * world_size
-                    torch_residual = torch_before_residual + residual
-                    torch_residual = torch_residual.to(torch.float32)
+                    torch_residual = torch_before_residual + residual.float()
                     torch_output_hidden_states = rms_norm(
                         torch_residual, norm_weight, eps
                     ).to(dtype)
