@@ -203,12 +203,23 @@ def test_frost_graph_reference(weight_format, tokens, hidden, intermediate, topk
                     graph.replay()
                     torch.cuda.synchronize()
                     raw, ref = _reference(
-                        dq, w1, s1, w2, s2, ids, inputs[3], cfg.activation
+                        dq,
+                        w1,
+                        s1,
+                        w2,
+                        s2,
+                        ids,
+                        inputs[3].bfloat16()
+                        if mode == RoutingInputMode.PackedPrecomputed
+                        else inputs[3],
+                        cfg.activation,
                     )
                     _assert_near(
                         output if finalize else output[0], ref if finalize else raw
                     )
                     if not finalize:
+                        if mode == RoutingInputMode.PackedPrecomputed:
+                            assert output[1].dtype == torch.bfloat16
                         torch.testing.assert_close(
                             output[2],
                             torch.arange(
@@ -221,6 +232,10 @@ def test_frost_graph_reference(weight_format, tokens, hidden, intermediate, topk
     result = layer(act, pack)
     _, expected = _reference(dq, w1, s1, w2, s2, ids, rw.bfloat16(), config.activation)
     _assert_near(result, expected)
+    # Packed FP32 and explicitly narrowed BF16 routing weights must produce
+    # identical outputs, even when the conversion moves into combine.
+    narrowed = MoEActivationPack(q, sf, ids, rw.bfloat16())
+    torch.testing.assert_close(layer(narrowed, pack), result, rtol=0, atol=0)
     # Reuse the compiled geometry with different activation and weight storage.
     # Negating only Down must negate the output; a cached pointer fails this.
     negative = {name: value.clone() for name, value in view.items()}

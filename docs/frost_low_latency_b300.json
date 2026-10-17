@@ -11,6 +11,70 @@
   "method": "CUDA events around 128 identical warm public calls per graph; 9 samples per sweep, two sweeps per process, independent opposite-order processes. First freeze the best observed tactic for each implementation from separate selection measurements; retain the native default heuristic as another original. Require every original/FROST repeat, cross-process and native A/A spread to be below 1%. Not an exhaustive backend or tactic-space comparison.",
   "cases": [
     {
+      "median_us": {
+        "trtllm": 25.614125188440084,
+        "cute_dsl": 19.505125004798174,
+        "frost": 13.683437369763851,
+        "trtllm_default": 26.437999680638313
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 25.618750602006912,
+          "cute_dsl": 19.506875425577164,
+          "frost": 13.684749603271484,
+          "trtllm_default": 26.438499800860882
+        },
+        {
+          "trtllm_default": 26.437499560415745,
+          "frost": 13.682125136256218,
+          "cute_dsl": 19.503374584019184,
+          "trtllm": 25.609499774873257
+        }
+      ],
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.425455057652286,
+      "baseline_aa": [
+        0.001073803536067121,
+        0.0007031004737415909
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.00036122638922967136,
+        "cute_dsl": 0.00017949927295392914,
+        "frost": 0.0001918172059625337,
+        "trtllm_default": 3.783415458225334e-05
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.001073803536067121,
+          "cute_dsl": 0.0004101754060927522,
+          "frost": 0.0003654567726375592,
+          "trtllm_default": 5.671600254341328e-05
+        },
+        {
+          "trtllm_default": 0.0001135089055169767,
+          "frost": 0.0004385777718601885,
+          "cute_dsl": 0.0008976925689570916,
+          "trtllm": 0.0007031004737415909
+        }
+      ],
+      "reference_norms": [
+        [
+          0.002572047743582844,
+          23.3458921468228,
+          201.44968442441905,
+          0.0017333162038833338,
+          16.99141999995718,
+          214.94109011034882
+        ],
+        [
+          0.002572047743582844,
+          23.3458921468228,
+          201.44968442441905,
+          0.0017333162038833338,
+          16.99141999995718,
+          214.94109011034882
+        ]
+      ],
       "label": "DSv4.1-Flash TP2 slice shape",
       "args": {
         "hidden": 5120,
@@ -21,67 +85,22 @@
         "tokens": 1,
         "weight_format": "mxfp4",
         "activation_limit": 10.0,
+        "routing_weights_dtype": "fp32",
         "include_cutedsl": true,
         "include_native_default": true,
         "trtllm_tactic": "(8, 269)",
         "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))",
         "frost_tile_k": 256
       },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 1152 --logical-intermediate 1152 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 269)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 1152 --logical-intermediate 1152 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 269)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 25.357124861329794,
-        "cute_dsl": 19.402749836444855,
-        "frost": 14.158687554299831,
-        "trtllm_default": 24.225374683737755
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 25.353124365210533,
-          "cute_dsl": 19.400875084102154,
-          "frost": 14.14812495931983,
-          "trtllm_default": 24.22574907541275
-        },
-        {
-          "trtllm_default": 24.22500029206276,
-          "frost": 14.169250149279833,
-          "cute_dsl": 19.404624588787556,
-          "trtllm": 25.361125357449055
-        }
-      ],
-      "best_original_backend": "cute_dsl",
-      "speedup": 1.3703777106482204,
-      "baseline_aa": [
-        0.000966826025489424,
-        0.0017956607462591993
-      ],
-      "cross_process_spread": {
-        "trtllm": 0.000315582100386038,
-        "cute_dsl": 0.0001932647197174322,
-        "frost": 0.001493144146008341,
-        "trtllm_default": 3.0909529038733636e-05
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.000966826025489424,
-          "cute_dsl": 0.00014172377786046065,
-          "frost": 0.00022969528869221746,
-          "trtllm_default": 0.0004851301346784
-        },
-        {
-          "trtllm_default": 0.00022706604146227456,
-          "frost": 0.0004940584800641882,
-          "cute_dsl": 0.00036082479670960046,
-          "trtllm": 0.0017956607462591993
-        }
-      ],
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 1152 --logical-intermediate 1152 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 269)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 1152 --logical-intermediate 1152 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 269)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --reverse --output reverse.json",
       "correctness": {
         "trtllm": {
           "relative_l2": 0.0,
           "normalized_max": 0.0
         },
         "cute_dsl": {
-          "relative_l2": 0.004965547486766747,
+          "relative_l2": 0.005000164509450262,
           "normalized_max": 0.012121212121212121
         },
         "frost": {
@@ -93,27 +112,9 @@
           "normalized_max": 0.0
         }
       },
-      "reference_norms": [
-        [
-          0.002572047743582844,
-          23.3458921468228,
-          201.44968442441905,
-          0.0017333162038833338,
-          16.99141999995718,
-          214.94109011034882
-        ],
-        [
-          0.002572047743582844,
-          23.3458921468228,
-          201.44968442441905,
-          0.0017333162038833338,
-          16.99141999995718,
-          214.94109011034882
-        ]
-      ],
       "source_sha256": [
-        "4f595d09d9fd71ce7995f05997b339cd08e3b5c233a195755e26863b8e63d140",
-        "f4950f6348ec502d3323c5044bb1c5bda8e3a1f6c9de5f5dbd3035431c54294d"
+        "c780c8096ab67e9dd1234f8ee34ac458bc50cd2165b7b64c3e1f9331870e3db1",
+        "1145e490ecb914dcbedc4531433b5ee6b2e0641d98edc0eeb537274b5ae20a94"
       ],
       "selection_tactics": {
         "trtllm": "(8, 269)",
@@ -122,6 +123,70 @@
       }
     },
     {
+      "median_us": {
+        "trtllm": 22.527750115841627,
+        "cute_dsl": 17.907374538481236,
+        "frost": 12.105874950066209,
+        "trtllm_default": 23.21100002154708
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 22.504249587655067,
+          "cute_dsl": 17.90899969637394,
+          "frost": 12.107999995350838,
+          "trtllm_default": 23.217500187456608
+        },
+        {
+          "trtllm_default": 23.20449985563755,
+          "frost": 12.10374990478158,
+          "cute_dsl": 17.90574938058853,
+          "trtllm": 22.551250644028187
+        }
+      ],
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.4792300938465663,
+      "baseline_aa": [
+        0.0011893400152582691,
+        0.0007765239975670292
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0020885413748211474,
+        "cute_dsl": 0.00018152358308620468,
+        "frost": 0.00035113833338366814,
+        "trtllm_default": 0.0005602504643468549
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0011893400152582691,
+          "cute_dsl": 0.00027928756602394464,
+          "frost": 0.00010323242094950442,
+          "trtllm_default": 0.00012925229832008115
+        },
+        {
+          "trtllm_default": 8.621461949490756e-05,
+          "frost": 0.00014459750181073934,
+          "cute_dsl": 4.192323408519134e-05,
+          "trtllm": 0.0007765239975670292
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0023737356308934587,
+          21.97080745862815,
+          212.34222812637069,
+          0.001718391017528661,
+          16.25074559154601,
+          205.1691456453757
+        ],
+        [
+          0.0023737356308934587,
+          21.97080745862815,
+          212.34222812637069,
+          0.001718391017528661,
+          16.25074559154601,
+          205.1691456453757
+        ]
+      ],
       "label": "DSv4.1-Flash TP4 slice shape",
       "args": {
         "hidden": 5120,
@@ -132,389 +197,22 @@
         "tokens": 1,
         "weight_format": "mxfp4",
         "activation_limit": 10.0,
+        "routing_weights_dtype": "fp32",
         "include_cutedsl": true,
         "include_native_default": true,
         "trtllm_tactic": "(8, 789)",
         "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))",
         "frost_tile_k": 256
       },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 640 --logical-intermediate 576 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 789)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 640 --logical-intermediate 576 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 789)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 22.357875015586615,
-        "cute_dsl": 17.714499961584806,
-        "frost": 12.829749844968319,
-        "trtllm_default": 21.745437756180763
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 22.379999980330467,
-          "cute_dsl": 17.715875059366226,
-          "frost": 12.834124732762575,
-          "trtllm_default": 21.742249839007854
-        },
-        {
-          "trtllm_default": 21.748625673353672,
-          "frost": 12.825374957174063,
-          "cute_dsl": 17.713124863803387,
-          "trtllm": 22.335750050842762
-        }
-      ],
-      "best_original_backend": "cute_dsl",
-      "speedup": 1.3807361932728743,
-      "baseline_aa": [
-        0.0010617635633821054,
-        0.0016126931391326036
-      ],
-      "cross_process_spread": {
-        "trtllm": 0.0019811257462578748,
-        "cute_dsl": 0.00015526315000802078,
-        "frost": 0.0006822237648200769,
-        "trtllm_default": 0.00029324630123505696
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.0010617635633821054,
-          "cute_dsl": 0.0007906497982086249,
-          "frost": 0.00023374228436385307,
-          "trtllm_default": 2.304532982107657e-05
-        },
-        {
-          "trtllm_default": 9.198776305802269e-05,
-          "frost": 1.9533792989866318e-05,
-          "cute_dsl": 0.0001411345768670753,
-          "trtllm": 0.0016126931391326036
-        }
-      ],
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 640 --logical-intermediate 576 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 789)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 5120 --intermediate 640 --logical-intermediate 576 --experts 384 --top-k 6 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 789)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))' --frost-tile-k 256 --reverse --output reverse.json",
       "correctness": {
         "trtllm": {
           "relative_l2": 0.0,
           "normalized_max": 0.0
         },
         "cute_dsl": {
-          "relative_l2": 0.004807945788667432,
-          "normalized_max": 0.011049723756906077
-        },
-        "frost": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        },
-        "trtllm_default": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        }
-      },
-      "reference_norms": [
-        [
-          0.0023737356308934587,
-          21.97080745862815,
-          212.34222812637069,
-          0.001718391017528661,
-          16.25074559154601,
-          205.1691456453757
-        ],
-        [
-          0.0023737356308934587,
-          21.97080745862815,
-          212.34222812637069,
-          0.001718391017528661,
-          16.25074559154601,
-          205.1691456453757
-        ]
-      ],
-      "source_sha256": [
-        "39aff7f3b03b94838f4f9c4aeebb37bae21f2a6b5e0161ac018564246f4e467f",
-        "93de2af627c3f21f78476e3b7e1fca52c9adfc68558b99dc9aaf4f2e835d8e52"
-      ],
-      "selection_tactics": {
-        "trtllm": "(8, 789)",
-        "cute_dsl": "(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))",
-        "frost": "256"
-      }
-    },
-    {
-      "label": "Generic MXFP8",
-      "args": {
-        "hidden": 4096,
-        "intermediate": 1024,
-        "logical_intermediate": 1024,
-        "experts": 64,
-        "top_k": 8,
-        "tokens": 1,
-        "weight_format": "mxfp8",
-        "activation_limit": 10.0,
-        "include_cutedsl": true,
-        "include_native_default": true,
-        "trtllm_tactic": "(8, 1091)",
-        "cute_tactic": null,
-        "frost_tile_k": 256
-      },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1024 --logical-intermediate 1024 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp8 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1091)' --frost-tile-k 256 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1024 --logical-intermediate 1024 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp8 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1091)' --frost-tile-k 256 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 24.164186790585518,
-        "frost": 18.347749952226877,
-        "trtllm_default": 24.11631215363741
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 24.145249277353287,
-          "frost": 18.3490002527833,
-          "trtllm_default": 24.117624387145042
-        },
-        {
-          "trtllm_default": 24.114999920129776,
-          "frost": 18.346499651670456,
-          "trtllm": 24.18312430381775
-        }
-      ],
-      "best_original_backend": "trtllm_default",
-      "speedup": 1.314401614172336,
-      "baseline_aa": [
-        0.0032957965216107448,
-        0.002173371945011361
-      ],
-      "cross_process_spread": {
-        "trtllm": 0.0015686326543742357,
-        "frost": 0.00013629853979338664,
-        "trtllm_default": 0.00010883130930784987
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.0032957965216107448,
-          "frost": 0.0006270773078455964,
-          "trtllm_default": 1.0349101450851345e-05
-        },
-        {
-          "trtllm_default": 0.0006325746018090846,
-          "frost": 0.0006269064087827821,
-          "trtllm": 0.002173371945011361
-        }
-      ],
-      "correctness": {
-        "trtllm": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        },
-        "frost": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        },
-        "trtllm_default": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        }
-      },
-      "reference_norms": [
-        [
-          0.0019808532947136535,
-          21.468510099984687,
-          176.73934236919962,
-          0.0016040117214993672,
-          18.491354398626815,
-          205.80322848386328
-        ],
-        [
-          0.0019808532947136535,
-          21.468510099984687,
-          176.73934236919962,
-          0.0016040117214993672,
-          18.491354398626815,
-          205.80322848386328
-        ]
-      ],
-      "source_sha256": [
-        "7f1a669991c64008b311024627cb91bc13f5b669677b7ba9f6b46ab1067abd1e",
-        "65ad31be677c8a607671bcce786039d1c4e50391092f3cfb02205d5a224a761e"
-      ],
-      "selection_tactics": {
-        "trtllm": "(8, 1091)",
-        "frost": "256"
-      }
-    },
-    {
-      "label": "Generic large MXFP4",
-      "args": {
-        "hidden": 7168,
-        "intermediate": 2048,
-        "logical_intermediate": 2048,
-        "experts": 64,
-        "top_k": 8,
-        "tokens": 1,
-        "weight_format": "mxfp4",
-        "activation_limit": 10.0,
-        "include_cutedsl": true,
-        "include_native_default": true,
-        "trtllm_tactic": "(8, 841)",
-        "cute_tactic": "(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))",
-        "frost_tile_k": 128
-      },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 7168 --intermediate 2048 --logical-intermediate 2048 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 841)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))' --frost-tile-k 128 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 7168 --intermediate 2048 --logical-intermediate 2048 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 841)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))' --frost-tile-k 128 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 47.627625055611134,
-        "cute_dsl": 50.68706348538399,
-        "frost": 42.22499951720238,
-        "trtllm_default": 47.41337615996599
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 47.634124755859375,
-          "cute_dsl": 50.695501267910004,
-          "frost": 42.22387447953224,
-          "trtllm_default": 47.4148765206337
-        },
-        {
-          "trtllm_default": 47.411875799298286,
-          "frost": 42.22612455487251,
-          "cute_dsl": 50.67862570285797,
-          "trtllm": 47.62112535536289
-        }
-      ],
-      "best_original_backend": "trtllm_default",
-      "speedup": 1.1228745222519156,
-      "baseline_aa": [
-        0.0004987705571734916,
-        0.0009295080298209465
-      ],
-      "cross_process_spread": {
-        "trtllm": 0.000272975499832847,
-        "cute_dsl": 0.0003329917656208422,
-        "frost": 5.328917272529564e-05,
-        "trtllm_default": 6.329050021377731e-05
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.0004987705571734916,
-          "cute_dsl": 0.00011839149827049936,
-          "frost": 0.0004145068942872427,
-          "trtllm_default": 4.745617610704102e-05
-        },
-        {
-          "trtllm_default": 0.00035871944076236526,
-          "frost": 0.00037894776220538244,
-          "cute_dsl": 0.000572414601403118,
-          "trtllm": 0.0009295080298209465
-        }
-      ],
-      "correctness": {
-        "trtllm": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        },
-        "cute_dsl": {
-          "relative_l2": 0.005339938864022345,
-          "normalized_max": 0.010471204188481676
-        },
-        "frost": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        },
-        "trtllm_default": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        }
-      },
-      "reference_norms": [
-        [
-          0.002124597805091651,
-          27.20440151302607,
-          217.56757392067942,
-          0.0017506779872973174,
-          17.43312122044898,
-          248.14656328406494
-        ],
-        [
-          0.002124597805091651,
-          27.20440151302607,
-          217.56757392067942,
-          0.0017506779872973174,
-          17.43312122044898,
-          248.14656328406494
-        ]
-      ],
-      "source_sha256": [
-        "f5adcfc579fd3441776c67222a0cb2b1b694b18e857407454d8dd5fc3335e2fc",
-        "126bdc2bcdb33407b91b683f117e7fa982ad67368d844286e76095a12d29c0cf"
-      ],
-      "selection_tactics": {
-        "trtllm": "(8, 841)",
-        "cute_dsl": "(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))",
-        "frost": "128"
-      }
-    },
-    {
-      "label": "Qwen3-Next shape / MXFP4",
-      "args": {
-        "hidden": 2048,
-        "intermediate": 512,
-        "logical_intermediate": 512,
-        "experts": 512,
-        "top_k": 10,
-        "tokens": 1,
-        "weight_format": "mxfp4",
-        "activation_limit": 0.0,
-        "include_cutedsl": true,
-        "include_native_default": true,
-        "trtllm_tactic": "(8, 1047)",
-        "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 64), (1, 2), False))",
-        "frost_tile_k": 256
-      },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1047)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 64), (1, 2), False))' --frost-tile-k 256 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1047)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 64), (1, 2), False))' --frost-tile-k 256 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 20.289937034249306,
-        "cute_dsl": 16.421687323600054,
-        "frost": 9.814250050112605,
-        "trtllm_default": 20.014625042676926
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 20.29074914753437,
-          "cute_dsl": 16.425374895334244,
-          "frost": 9.812125004827976,
-          "trtllm_default": 20.01625020056963
-        },
-        {
-          "trtllm_default": 20.01299988478422,
-          "frost": 9.816375095397234,
-          "cute_dsl": 16.417999751865864,
-          "trtllm": 20.28912492096424
-        }
-      ],
-      "best_original_backend": "cute_dsl",
-      "speedup": 1.6732493302849603,
-      "baseline_aa": [
-        0.00011089714042359587,
-        0.0005914485283242056
-      ],
-      "cross_process_spread": {
-        "trtllm": 8.005404749867364e-05,
-        "cute_dsl": 0.0004492108405313996,
-        "frost": 0.00043314680226418984,
-        "trtllm_default": 0.00016241022356069755
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.00011089714042359587,
-          "cute_dsl": 0.00010649356717611949,
-          "frost": 0.0004076775893886507,
-          "trtllm_default": 0.0005873094421537907
-        },
-        {
-          "trtllm_default": 8.74940150370565e-05,
-          "frost": 0.0009172968118263794,
-          "cute_dsl": 0.00021319140844296977,
-          "trtllm": 0.0005914485283242056
-        }
-      ],
-      "correctness": {
-        "trtllm": {
-          "relative_l2": 0.0,
-          "normalized_max": 0.0
-        },
-        "cute_dsl": {
-          "relative_l2": 0.005425869789708094,
+          "relative_l2": 0.004834813502211682,
           "normalized_max": 0.010869565217391304
         },
         "frost": {
@@ -526,6 +224,276 @@
           "normalized_max": 0.0
         }
       },
+      "source_sha256": [
+        "05b49cc34f8b07bcab491df4b31f0a44a3f8e07bd9ed2b6ae7af432335c2fa9b",
+        "c3babcda02de714014165782c92f6d610e272153b7a5b865d38a014256b8eae0"
+      ],
+      "selection_tactics": {
+        "trtllm": "(8, 789)",
+        "cute_dsl": "(128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False))",
+        "frost": "256"
+      }
+    },
+    {
+      "median_us": {
+        "trtllm": 24.69774940982461,
+        "frost": 17.660437151789665,
+        "trtllm_default": 25.604437571018934
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 24.690749123692513,
+          "frost": 17.664124257862568,
+          "trtllm_default": 25.608125142753124
+        },
+        {
+          "trtllm_default": 25.600749999284744,
+          "frost": 17.656750045716763,
+          "trtllm": 24.704749695956707
+        }
+      ],
+      "best_original_backend": "trtllm",
+      "speedup": 1.3984789389724592,
+      "baseline_aa": [
+        0.00142857962423487,
+        0.0009922690824328692
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0005670371601143504,
+        "frost": 0.00041764266508344337,
+        "trtllm_default": 0.00028808310180701845
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.00142857962423487,
+          "frost": 0.0005803578961578051,
+          "trtllm_default": 5.8554874427798855e-05
+        },
+        {
+          "trtllm_default": 0.0,
+          "frost": 0.0014880887958095724,
+          "trtllm": 0.0009922690824328692
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0019808532947136535,
+          21.468510099984687,
+          176.73934236919962,
+          0.0016040117214993672,
+          18.491354398626815,
+          205.80322848386328
+        ],
+        [
+          0.0019808532947136535,
+          21.468510099984687,
+          176.73934236919962,
+          0.0016040117214993672,
+          18.491354398626815,
+          205.80322848386328
+        ]
+      ],
+      "label": "Generic MXFP8",
+      "args": {
+        "hidden": 4096,
+        "intermediate": 1024,
+        "logical_intermediate": 1024,
+        "experts": 64,
+        "top_k": 8,
+        "tokens": 1,
+        "weight_format": "mxfp8",
+        "activation_limit": 10.0,
+        "routing_weights_dtype": "fp32",
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "trtllm_tactic": "(8, 1091)",
+        "cute_tactic": null,
+        "frost_tile_k": 256
+      },
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1024 --logical-intermediate 1024 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp8 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1091)' --frost-tile-k 256 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1024 --logical-intermediate 1024 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp8 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1091)' --frost-tile-k 256 --reverse --output reverse.json",
+      "correctness": {
+        "trtllm": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        },
+        "frost": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        },
+        "trtllm_default": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        }
+      },
+      "source_sha256": [
+        "c1fa4280c7da9c15ca3494afde0e1598d9ec2de3d81fc180a9c7d9c9cb0a5b1f",
+        "1d7d47b304f030e7221eb3619ad7bcb72d3e9e0df4c4c148a1c5c241f26bfe2a"
+      ],
+      "selection_tactics": {
+        "trtllm": "(8, 1091)",
+        "frost": "256"
+      }
+    },
+    {
+      "median_us": {
+        "trtllm": 47.79587592929602,
+        "cute_dsl": 50.76400097459555,
+        "frost": 41.829999536275864,
+        "trtllm_default": 47.927187755703926
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 47.79225029051304,
+          "cute_dsl": 50.76712556183338,
+          "frost": 41.82799905538559,
+          "trtllm_default": 47.94187471270561
+        },
+        {
+          "trtllm_default": 47.91250079870224,
+          "frost": 41.83200001716614,
+          "cute_dsl": 50.76087638735771,
+          "trtllm": 47.799501568078995
+        }
+      ],
+      "best_original_backend": "trtllm",
+      "speedup": 1.1426219569485392,
+      "baseline_aa": [
+        0.0010466285413778535,
+        0.000842449735288008
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.00015172496632567069,
+        "cute_dsl": 0.00012311005877798937,
+        "frost": 9.565271757920606e-05,
+        "trtllm_default": 0.000613074114556922
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0010466285413778535,
+          "cute_dsl": 0.00011814728328394263,
+          "frost": 0.00032284603388903416,
+          "trtllm_default": 0.0006208169581135125
+        },
+        {
+          "trtllm_default": 0.0004593923886164028,
+          "frost": 0.00019123464811978574,
+          "cute_dsl": 0.00036940599105616205,
+          "trtllm": 0.000842449735288008
+        }
+      ],
+      "reference_norms": [
+        [
+          0.002124597805091651,
+          27.20440151302607,
+          217.56757392067942,
+          0.0017506779872973174,
+          17.43312122044898,
+          248.14656328406494
+        ],
+        [
+          0.002124597805091651,
+          27.20440151302607,
+          217.56757392067942,
+          0.0017506779872973174,
+          17.43312122044898,
+          248.14656328406494
+        ]
+      ],
+      "label": "Generic large MXFP4",
+      "args": {
+        "hidden": 7168,
+        "intermediate": 2048,
+        "logical_intermediate": 2048,
+        "experts": 64,
+        "top_k": 8,
+        "tokens": 1,
+        "weight_format": "mxfp4",
+        "activation_limit": 10.0,
+        "routing_weights_dtype": "fp32",
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "trtllm_tactic": "(8, 841)",
+        "cute_tactic": "(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))",
+        "frost_tile_k": 128
+      },
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 7168 --intermediate 2048 --logical-intermediate 2048 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 841)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))' --frost-tile-k 128 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 7168 --intermediate 2048 --logical-intermediate 2048 --experts 64 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 10.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 841)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))' --frost-tile-k 128 --reverse --output reverse.json",
+      "correctness": {
+        "trtllm": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        },
+        "cute_dsl": {
+          "relative_l2": 0.005465716499601239,
+          "normalized_max": 0.010471204188481676
+        },
+        "frost": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        },
+        "trtllm_default": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        }
+      },
+      "source_sha256": [
+        "50ce95f31795a01784a5ad3933f5b6a4527707e12bc311afa909c1a1b6d942b1",
+        "a3f432b189a7c250917b23cc9bb938221019faf6e2468bc7f336b9ddf5a7bb2d"
+      ],
+      "selection_tactics": {
+        "trtllm": "(8, 841)",
+        "cute_dsl": "(128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))",
+        "frost": "128"
+      }
+    },
+    {
+      "median_us": {
+        "trtllm": 20.197374746203423,
+        "cute_dsl": 16.485937871038914,
+        "frost": 9.223937289789319,
+        "trtllm_default": 19.70525039359927
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 20.197125151753426,
+          "cute_dsl": 16.491125337779522,
+          "frost": 9.223499801009893,
+          "trtllm_default": 19.705750048160553
+        },
+        {
+          "trtllm_default": 19.70475073903799,
+          "frost": 9.224374778568745,
+          "cute_dsl": 16.480750404298306,
+          "trtllm": 20.19762434065342
+        }
+      ],
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.7872994311538153,
+      "baseline_aa": [
+        0.0004333803213047386,
+        0.0004704930730504151
+      ],
+      "cross_process_spread": {
+        "trtllm": 2.4715839320853002e-05,
+        "cute_dsl": 0.0006295182699029632,
+        "frost": 9.486394294229177e-05,
+        "trtllm_default": 5.071412147237321e-05
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0004333803213047386,
+          "cute_dsl": 0.0002273908487213755,
+          "frost": 0.0003794660595478982,
+          "trtllm_default": 5.066557168535621e-05
+        },
+        {
+          "trtllm_default": 0.0002664905566485754,
+          "frost": 2.705850887625104e-05,
+          "cute_dsl": 0.001290065062971096,
+          "trtllm": 0.0004704930730504151
+        }
+      ],
       "reference_norms": [
         [
           0.001077207962574251,
@@ -544,9 +512,46 @@
           120.53252391095681
         ]
       ],
+      "label": "Qwen3-Next shape / MXFP4",
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 1,
+        "weight_format": "mxfp4",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "trtllm_tactic": "(8, 1047)",
+        "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 64), (1, 2), False))",
+        "frost_tile_k": 256
+      },
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1047)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 64), (1, 2), False))' --frost-tile-k 256 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 1047)' --cute-tactic '(128, ((128, 128), (1, 1), False), ((128, 64), (1, 2), False))' --frost-tile-k 256 --reverse --output reverse.json",
+      "correctness": {
+        "trtllm": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        },
+        "cute_dsl": {
+          "relative_l2": 0.005555599189807001,
+          "normalized_max": 0.009900990099009901
+        },
+        "frost": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        },
+        "trtllm_default": {
+          "relative_l2": 0.0,
+          "normalized_max": 0.0
+        }
+      },
       "source_sha256": [
-        "6d9e97b21f705ab91dd0cea2324afa3eb92debe546288e38af59ce04ee5a44d0",
-        "c2e704bbe18b39138ecc7ddb00b05ae20feaccb19c89ec3dd3667561f8b5fd0d"
+        "28eb37ae5ea7c076f93d09f10c1ab65459d85fbbf4026907cdc84383c30b2e88",
+        "7abd5bc07984c1e1e99da160dc4176db9168c91de1cf97cd479fb2cd0007fa22"
       ],
       "selection_tactics": {
         "trtllm": "(8, 1047)",
@@ -555,6 +560,64 @@
       }
     },
     {
+      "median_us": {
+        "trtllm": 19.139000214636326,
+        "frost": 9.367624996230006,
+        "trtllm_default": 19.14856256917119
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 19.140999764204025,
+          "frost": 9.366875048726797,
+          "trtllm_default": 19.153875298798084
+        },
+        {
+          "trtllm_default": 19.143249839544296,
+          "frost": 9.368374943733215,
+          "trtllm": 19.137000665068626
+        }
+      ],
+      "best_original_backend": "trtllm",
+      "speedup": 2.043100596185138,
+      "baseline_aa": [
+        0.0007450191269614447,
+        0.0006403572913237138
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.00020897209575262998,
+        "frost": 0.0001601275770858183,
+        "trtllm_default": 0.0005550499180049845
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0007450191269614447,
+          "frost": 2.6746286417330958e-05,
+          "trtllm_default": 3.9191061481634126e-05
+        },
+        {
+          "trtllm_default": 7.84271674821892e-05,
+          "frost": 0.00048055430825589716,
+          "trtllm": 0.0006403572913237138
+        }
+      ],
+      "reference_norms": [
+        [
+          0.001017462951654691,
+          12.83348658422066,
+          116.24751061526551,
+          0.0009682186100606866,
+          11.298363049091531,
+          106.98351731963056
+        ],
+        [
+          0.001017462951654691,
+          12.83348658422066,
+          116.24751061526551,
+          0.0009682186100606866,
+          11.298363049091531,
+          106.98351731963056
+        ]
+      ],
       "label": "Qwen3-Next shape / MXFP8",
       "args": {
         "hidden": 2048,
@@ -565,54 +628,15 @@
         "tokens": 1,
         "weight_format": "mxfp8",
         "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
         "include_cutedsl": true,
         "include_native_default": true,
         "trtllm_tactic": "(8, 742)",
         "cute_tactic": null,
         "frost_tile_k": 256
       },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp8 --activation-limit 0.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 742)' --frost-tile-k 256 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp8 --activation-limit 0.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 742)' --frost-tile-k 256 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 19.102187361568213,
-        "frost": 9.86387487500906,
-        "trtllm_default": 19.016250036656857
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 19.1042497754097,
-          "frost": 9.864499792456627,
-          "trtllm_default": 19.018124788999557
-        },
-        {
-          "trtllm_default": 19.014375284314156,
-          "frost": 9.863249957561493,
-          "trtllm": 19.100124947726727
-        }
-      ],
-      "best_original_backend": "trtllm_default",
-      "speedup": 1.927868132718927,
-      "baseline_aa": [
-        0.0007070428314021836,
-        0.0006676339637540595
-      ],
-      "cross_process_spread": {
-        "trtllm": 0.00021595815180585435,
-        "frost": 0.00012671633594521321,
-        "trtllm_default": 0.00019719315672153887
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.0007070428314021836,
-          "frost": 0.00010139798937417047,
-          "trtllm_default": 0.0006705747771208311
-        },
-        {
-          "trtllm_default": 0.00015782887039790706,
-          "frost": 0.00010131897858383074,
-          "trtllm": 0.0006676339637540595
-        }
-      ],
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp8 --activation-limit 0.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 742)' --frost-tile-k 256 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 2048 --intermediate 512 --logical-intermediate 512 --experts 512 --top-k 10 --tokens 1 --weight-format mxfp8 --activation-limit 0.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 742)' --frost-tile-k 256 --reverse --output reverse.json",
       "correctness": {
         "trtllm": {
           "relative_l2": 0.0,
@@ -627,27 +651,9 @@
           "normalized_max": 0.0
         }
       },
-      "reference_norms": [
-        [
-          0.001017462951654691,
-          12.83348658422066,
-          116.24751061526551,
-          0.0009682186100606866,
-          11.298363049091531,
-          106.98351731963056
-        ],
-        [
-          0.001017462951654691,
-          12.83348658422066,
-          116.24751061526551,
-          0.0009682186100606866,
-          11.298363049091531,
-          106.98351731963056
-        ]
-      ],
       "source_sha256": [
-        "e9e589c331d0cb7e8c51f274064c12302dfa3d9f102949549cd790d156f92c0a",
-        "03ec3a00bc303a373845bc8aa4012a5ca71cf81314fa1da74d9cf60262212feb"
+        "91244c3a83a3817a51b0f3fa04e001d384873e541a2ce790c4a6a954f4fbd24d",
+        "2d491493eaf4410f8aaf0b5d64893f5af76c52aae8e2fc35ef885fa284c026a0"
       ],
       "selection_tactics": {
         "trtllm": "(8, 742)",
@@ -655,6 +661,70 @@
       }
     },
     {
+      "median_us": {
+        "trtllm": 28.232062701135874,
+        "cute_dsl": 24.272874929010868,
+        "frost": 17.69625023007393,
+        "trtllm_default": 27.432937640696764
+      },
+      "process_medians_us": [
+        {
+          "trtllm": 28.232499957084656,
+          "cute_dsl": 24.27512500435114,
+          "frost": 17.68887508660555,
+          "trtllm_default": 27.430875226855278
+        },
+        {
+          "trtllm_default": 27.43500005453825,
+          "frost": 17.70362537354231,
+          "cute_dsl": 24.270624853670597,
+          "trtllm": 28.231625445187092
+        }
+      ],
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.3716394497948656,
+      "baseline_aa": [
+        0.0010012006353656464,
+        0.00161317633608274
+      ],
+      "cross_process_spread": {
+        "trtllm": 3.0976321192055926e-05,
+        "cute_dsl": 0.0001854155262863538,
+        "frost": 0.0008338736558736417,
+        "trtllm_default": 0.00015037171249037218
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0010012006353656464,
+          "cute_dsl": 0.0002369125392120183,
+          "frost": 0.00011309980014823023,
+          "trtllm_default": 2.7297472783672688e-05
+        },
+        {
+          "trtllm_default": 0.0010213245750204784,
+          "frost": 0.000819282920650476,
+          "cute_dsl": 8.242607727774756e-05,
+          "trtllm": 0.00161317633608274
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0015951810103064503,
+          19.61976529905251,
+          157.2155379263318,
+          0.0013801015083247522,
+          13.911276688650785,
+          177.79647895461773
+        ],
+        [
+          0.0015951810103064503,
+          19.61976529905251,
+          157.2155379263318,
+          0.0013801015083247522,
+          13.911276688650785,
+          177.79647895461773
+        ]
+      ],
       "label": "Qwen3-235B shape / MXFP4",
       "args": {
         "hidden": 4096,
@@ -665,68 +735,23 @@
         "tokens": 1,
         "weight_format": "mxfp4",
         "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
         "include_cutedsl": true,
         "include_native_default": true,
         "trtllm_tactic": "(8, 447)",
         "cute_tactic": "(128, ((128, 256), (1, 1), False), ((128, 128), (1, 2), False))",
         "frost_tile_k": 128
       },
-      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1536 --logical-intermediate 1536 --experts 128 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 447)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 128), (1, 2), False))' --frost-tile-k 128 --output first.json",
-      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1536 --logical-intermediate 1536 --experts 128 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --include-cutedsl --include-native-default --trtllm-tactic '(8, 447)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 128), (1, 2), False))' --frost-tile-k 128 --reverse --output reverse.json",
-      "median_us": {
-        "trtllm": 27.807687409222126,
-        "cute_dsl": 24.06756253913045,
-        "frost": 18.33456289023161,
-        "trtllm_default": 25.704999919980764
-      },
-      "process_medians_us": [
-        {
-          "trtllm": 27.805374935269356,
-          "cute_dsl": 24.07162543386221,
-          "frost": 18.338125199079514,
-          "trtllm_default": 25.713625364005566
-        },
-        {
-          "trtllm_default": 25.696374475955963,
-          "frost": 18.331000581383705,
-          "cute_dsl": 24.06349964439869,
-          "trtllm": 27.809999883174896
-        }
-      ],
-      "best_original_backend": "cute_dsl",
-      "speedup": 1.3126881007865914,
-      "baseline_aa": [
-        0.0011335537610879436,
-        0.006137974919528909
-      ],
-      "cross_process_spread": {
-        "trtllm": 0.00016633287327746165,
-        "cute_dsl": 0.0003376811180252207,
-        "frost": 0.0003886649648052443,
-        "trtllm_default": 0.0006713354860913988
-      },
-      "sweep_spread": [
-        {
-          "trtllm": 0.0011335537610879436,
-          "cute_dsl": 0.00017658228014616245,
-          "frost": 0.001705228873894376,
-          "trtllm_default": 0.0005348859856683597
-        },
-        {
-          "trtllm_default": 6.81404725991212e-05,
-          "frost": 0.0008597332407174787,
-          "cute_dsl": 0.00019738790012172253,
-          "trtllm": 0.006137974919528909
-        }
-      ],
+      "reproduce_first": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1536 --logical-intermediate 1536 --experts 128 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 447)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 128), (1, 2), False))' --frost-tile-k 128 --output first.json",
+      "reproduce_reverse": "python benchmarks/bench_frost_low_latency.py --hidden 4096 --intermediate 1536 --logical-intermediate 1536 --experts 128 --top-k 8 --tokens 1 --weight-format mxfp4 --activation-limit 0.0 --routing-weights-dtype fp32 --include-cutedsl --include-native-default --trtllm-tactic '(8, 447)' --cute-tactic '(128, ((128, 256), (1, 1), False), ((128, 128), (1, 2), False))' --frost-tile-k 128 --reverse --output reverse.json",
       "correctness": {
         "trtllm": {
           "relative_l2": 0.0,
           "normalized_max": 0.0
         },
         "cute_dsl": {
-          "relative_l2": 0.005270383132344955,
-          "normalized_max": 0.009389671361502348
+          "relative_l2": 0.00523398656718386,
+          "normalized_max": 0.010638297872340425
         },
         "frost": {
           "relative_l2": 0.0,
@@ -737,27 +762,9 @@
           "normalized_max": 0.0
         }
       },
-      "reference_norms": [
-        [
-          0.0015951810103064503,
-          19.61976529905251,
-          157.2155379263318,
-          0.0013801015083247522,
-          13.911276688650785,
-          177.79647895461773
-        ],
-        [
-          0.0015951810103064503,
-          19.61976529905251,
-          157.2155379263318,
-          0.0013801015083247522,
-          13.911276688650785,
-          177.79647895461773
-        ]
-      ],
       "source_sha256": [
-        "d9da67112b368ae7ffc2e564086006561c311551f6828172db0b66dccf14d210",
-        "7be68e6d51c93b465aad902c289367a9b6181e7db683f553c13358ff806366e5"
+        "9cb7b0bb9e158c6fa23de01d7834f93134fb93a0d0e47143f2d212c4b9b4ced5",
+        "3bc7eecb93918ef17ac5d7f1b5a421010909e6ef12ba14a8bd620495f486b60a"
       ],
       "selection_tactics": {
         "trtllm": "(8, 447)",
@@ -765,5 +772,16 @@
         "frost": "128"
       }
     }
-  ]
+  ],
+  "frost_kernel_source_sha256": {
+    "flashinfer/fused_moe/backends/frost_low_latency/__init__.py": "19cca05a476f8244eec58829041dec176a248e5f16d0aeb9e3ef969f94ad320d",
+    "flashinfer/fused_moe/backends/frost_low_latency/gemm.py": "5d53868fb2190bc0499eb3b28fc46607c1d2c9b753c610780a8beb428c13cd83",
+    "flashinfer/fused_moe/backends/frost_low_latency/io.py": "bce77e22086f81bf78f65f62ab31d465d721094d4160e4ace568fea914e268db",
+    "flashinfer/fused_moe/backends/frost_low_latency/pipeline.py": "c2c330783f2252a5c876355abf168a4760eb746193757f4d515a93c7078c540e",
+    "flashinfer/fused_moe/backends/frost_low_latency/prepare.py": "c3637ad32f3f185971293dc2fd78603f944ac657c37cb967e2ca5328c2d859ff",
+    "flashinfer/fused_moe/backends/frost_low_latency/quantization.py": "de0c5a7d2b63f0e5381560e75f6f97d9b7401d6134d8ac2dbfe30e0a6efec446",
+    "flashinfer/fused_moe/backends/frost_low_latency/runner.py": "f8b45c1897594e0c2e8b5030b5c547da7eca582fd5c102050e884485fe35eb8e",
+    "flashinfer/fused_moe/backends/frost_low_latency/runtime.py": "46dd942baa26c2daf3c181f4c626c4483cda2243e810ecbfccb1b9ee0df2763b"
+  },
+  "routing_rounding": "Identical FP32 routing inputs. Packed FROST/TRT-LLM narrow to BF16; native CuTeDSL retains FP32. Cross-backend errors must satisfy relative L2 < 0.01 and normalized maximum < 0.03; bitwise equality is not required."
 }

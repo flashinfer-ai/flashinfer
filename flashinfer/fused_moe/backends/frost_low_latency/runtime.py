@@ -40,6 +40,7 @@ def _execute(inputs, config, tile_k):
         midsf,
         routes,
         output,
+        narrow_weights,
     ) = inputs
     t, h = q.shape
     p = midq.shape[1]
@@ -95,6 +96,7 @@ def _execute(inputs, config, tile_k):
         pdl,
         wd,
         weights.dtype,
+        narrow_weights,
         config.finalize.do_finalize,
         q.device,
     )
@@ -110,7 +112,7 @@ def _execute(inputs, config, tile_k):
                     cute.compile(pack_scale, *sfargs, stream),
                     cute.compile(pipeline.gate_up, p1, activation, stream),
                     cute.compile(pipeline.down_project, p2, stream),
-                    cute.compile(combine, *reduceargs, False, stream)
+                    cute.compile(combine, *reduceargs, narrow_weights, stream)
                     if config.finalize.do_finalize
                     else None,
                 )

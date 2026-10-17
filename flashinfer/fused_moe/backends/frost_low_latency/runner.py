@@ -157,9 +157,13 @@ class FrostLowLatencyRunner(MoERunner):
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=q.device)
 
+        packed_routing = act.routing_input_mode == RoutingInputMode.PackedPrecomputed
+        # Finalized output can narrow inside the existing combine kernel.
+        # Raw output still exposes BF16 weights under the packed contract.
+        narrow_in_combine = packed_routing and self.config.finalize.do_finalize
         routing_weights = (
             act.topk_weights.to(torch.bfloat16)
-            if act.routing_input_mode == RoutingInputMode.PackedPrecomputed
+            if packed_routing and not narrow_in_combine
             else act.topk_weights
         )
         return [
@@ -174,6 +178,7 @@ class FrostLowLatencyRunner(MoERunner):
             empty(t * k * 128 * (p // 32), torch.uint8),
             empty((t * k, h), torch.bfloat16),
             empty((t, h), torch.bfloat16),
+            narrow_in_combine,
         ]
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):

@@ -92,6 +92,10 @@ The compile cache stores executable metadata. `pack_inputs` owns each call's
 scratch tensors, and execution binds current pointers and stream. The packed
 routing contract rounds weights to BF16; the unpacked contract preserves BF16
 or FP32 weights. Raw outputs preserve this distinction for caller-side combine.
+For finalized packed output, BF16 narrowing happens inside the existing combine
+kernel. This removes a separate conversion launch while retaining the same
+rounding before the ordered FP32 weighted sum. Producers that already supply
+BF16 routing weights do not have that launch to remove.
 
 ## Reproduce correctness and performance
 
@@ -106,7 +110,11 @@ python benchmarks/bench_frost_low_latency.py \
 ```
 
 The benchmark prepares all backends from the same canonical weights and uses
-the same quantizer, routing and activation semantics. It autotunes each original
+the same quantizer, expert IDs, routing-weight inputs and activation parameters.
+FROST and TRT-LLM narrow packed routing weights to BF16; the native CuTe DSL
+interface retains FP32 weights. Comparisons allow the numerical tolerances below
+rather than requiring bitwise equality across those rounding boundaries.
+It autotunes each original
 backend, checks six changing inputs after graph replay, then measures paired
 warm CUDA Graphs with 128 public calls each and repeated original A/A controls.
 Each timing graph repeats the same routed input; it does not model cold weights
@@ -132,13 +140,13 @@ local weight-slice geometry; these rows do not include communication.
 
 | Workload (T=1) | H / physical I / E / top-k | Best measured original | Original µs | FROST µs | Speedup |
 |---|---|---|---:|---:|---:|
-| DSv4.1-Flash TP2 slice shape | 5120 / 1152 / 384 / 6 | CuTeDSL | 19.40 | 14.16 | 1.370× |
-| DSv4.1-Flash TP4 slice shape | 5120 / 640 / 384 / 6 | CuTeDSL | 17.71 | 12.83 | 1.381× |
-| Generic MXFP8 | 4096 / 1024 / 64 / 8 | TRT-LLM default | 24.12 | 18.35 | 1.314× |
-| Generic large MXFP4 | 7168 / 2048 / 64 / 8 | TRT-LLM default | 47.41 | 42.22 | 1.123× |
-| Qwen3-Next shape / MXFP4 | 2048 / 512 / 512 / 10 | CuTeDSL | 16.42 | 9.81 | 1.673× |
-| Qwen3-Next shape / MXFP8 | 2048 / 512 / 512 / 10 | TRT-LLM default | 19.02 | 9.86 | 1.928× |
-| Qwen3-235B shape / MXFP4 | 4096 / 1536 / 128 / 8 | CuTeDSL | 24.07 | 18.33 | 1.313× |
+| DSv4.1-Flash TP2 slice shape | 5120 / 1152 / 384 / 6 | CuTeDSL | 19.51 | 13.68 | 1.425× |
+| DSv4.1-Flash TP4 slice shape | 5120 / 640 / 384 / 6 | CuTeDSL | 17.91 | 12.11 | 1.479× |
+| Generic MXFP8 | 4096 / 1024 / 64 / 8 | TRT-LLM tuned | 24.70 | 17.66 | 1.398× |
+| Generic large MXFP4 | 7168 / 2048 / 64 / 8 | TRT-LLM tuned | 47.80 | 41.83 | 1.143× |
+| Qwen3-Next shape / MXFP4 | 2048 / 512 / 512 / 10 | CuTeDSL | 16.49 | 9.22 | 1.787× |
+| Qwen3-Next shape / MXFP8 | 2048 / 512 / 512 / 10 | TRT-LLM tuned | 19.14 | 9.37 | 2.043× |
+| Qwen3-235B shape / MXFP4 | 4096 / 1536 / 128 / 8 | CuTeDSL | 24.27 | 17.70 | 1.372× |
 
 All rows use MXFP8 activations and BF16 output. The two DS-shaped rows use MXFP4
 weights and SwiGLU limit 10. TP4 has logical I=576 with zero padding to 640 for
