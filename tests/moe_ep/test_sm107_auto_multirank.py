@@ -214,7 +214,7 @@ def test_rubin_auto_persistence_and_capture(
         torch.cuda.synchronize()
         assert_reference(old_output, reference(), kind)
         if rank == 0:
-            assert list((tmp_path / "managed").glob("v2/*/protocols/*/*.json"))
+            assert list((tmp_path / "managed").glob("v2/*/entries/*.json"))
         tuner.clear_cache()
         tuner._managed_cache = None
         tuner._managed_stores.clear()

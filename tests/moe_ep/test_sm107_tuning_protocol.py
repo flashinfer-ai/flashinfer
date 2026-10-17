@@ -100,7 +100,7 @@ def test_deferred_search_persistence_and_shared_hit_file_output(state, tmp_path)
     state.sweep.assert_not_called()
     with autotune_v2():
         assert state.run() == {"fc2_use_bulk": False}
-        assert list((tmp_path / "managed").glob("v2/*/protocols/*/*.json"))
+        assert list((tmp_path / "managed").glob("v2/*/entries/*.json"))
     state.sweep.assert_called_once()
     state.workspace.install_tuned_knobs.assert_called_once()
     state.path.unlink()
@@ -112,6 +112,27 @@ def test_deferred_search_persistence_and_shared_hit_file_output(state, tmp_path)
     assert state.path.is_file()
     state.sweep.assert_called_once()
     assert state.workspace.install_tuned_knobs.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "controls", [{"tuning_buckets": (64, 256)}, {"round_up": True}]
+)
+@pytest.mark.parametrize("mode", ["tune", "replay"])
+def test_bucket_overrides_are_rejected_before_selection(state, controls, mode):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.automatic import tuning_context
+
+    with autotune_v2(mode=mode, **controls):
+        for select in (state.run, tuning_context):
+            with pytest.raises(
+                NotImplementedError, match="tuning_buckets and round_up"
+            ):
+                select()
+    state.sweep.assert_not_called()
+    state.workspace.install_tuned_knobs.assert_not_called()
+    assert not state.path.exists()
+    with autotune_v2(skip_ops={tuning_protocol.NAMESPACE}, **controls):
+        assert state.run() is None
+        assert tuning_context().skipped
 
 
 def test_record_fallback_and_numerical_contract_are_shared(state):
@@ -499,6 +520,22 @@ def _subgroup_worker(rank, rendezvous):
                         tuning_protocol.NAMESPACE, protocol
                     ) == {"fc2_use_bulk": False}
                 workspace.install_tuned_knobs.assert_called_once()
+
+                # Both ranks have a hit, but only collective selection gives
+                # them the same closest-capacity winner.
+                tuner.clear_cache()
+                record = knob_cache.make_record(
+                    {"fc2_use_bulk": rank == 2},
+                    **{**protocol._query(16), "max_tokens": 128 * rank},
+                )
+                tuner.publish_protocol_record(
+                    tuning_protocol.NAMESPACE, "local-winner", record, persist=False
+                )
+                with autotune(False):
+                    assert tuner.choose_with_protocol(
+                        tuning_protocol.NAMESPACE, protocol
+                    ) == {"fc2_use_bulk": False}
+                assert workspace.install_tuned_knobs.call_count == 2
                 with autotune(rank == 1), pytest.raises(ValueError, match="controls"):
                     tuner.choose_with_protocol(tuning_protocol.NAMESPACE, protocol)
 

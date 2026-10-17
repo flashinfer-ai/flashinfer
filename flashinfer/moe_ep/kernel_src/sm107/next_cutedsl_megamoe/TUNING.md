@@ -140,6 +140,10 @@ No `cache=` filename is required. `persistent_cache=False` disables both managed
 storage and the MegaMoE compatibility file for the context. Protocol records
 are not read or written by the v1 JSON API.
 
+`tuning_buckets` and `round_up=True` are not supported for automatic selection
+and raise before cache lookup or tuning. Prepare workspaces with the desired
+capacities instead; selection retains MegaMoE's capacity/live-token lookup.
+
 The default measurement preserves the native CUDA-event loop. Explicit
 `MeasurementPolicy(execution_mode="eager")` includes per-call host overhead;
 `execution_mode="cuda_graph"` captures and replays the prepared candidate.

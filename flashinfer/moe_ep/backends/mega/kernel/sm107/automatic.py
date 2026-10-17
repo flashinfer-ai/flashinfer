@@ -7,9 +7,12 @@ def tuning_context():
     from flashinfer.autotuner import AutoTuner
     from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
         NAMESPACE,
+        validate_context,
     )
 
-    return AutoTuner.get().protocol_context(NAMESPACE)
+    context = AutoTuner.get().protocol_context(NAMESPACE)
+    validate_context(context)
+    return context
 
 
 def needs_selection(workspace, context):

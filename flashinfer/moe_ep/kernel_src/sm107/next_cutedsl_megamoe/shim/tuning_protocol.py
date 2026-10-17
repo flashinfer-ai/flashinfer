@@ -24,6 +24,14 @@ NAMESPACE = "moe_ep.sm107.cutedsl.native.v1"
 _UNCHECKED = object()
 
 
+def validate_context(context: TuningContext) -> None:
+    if not context.skipped and (context.tuning_buckets is not None or context.round_up):
+        raise NotImplementedError(
+            "Rubin MegaMoE uses its workspace capacity and live-token cache lookup; "
+            "tuning_buckets and round_up=True are not supported."
+        )
+
+
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -180,6 +188,7 @@ class RubinTuningProtocol:
         import torch
         import torch.distributed as dist
 
+        validate_context(context)
         workspace, cfg = self.workspace, self.cfg
         policy = context.measurement_policy
         policy_fields = policy.manifest_fields() if policy is not None else {}
