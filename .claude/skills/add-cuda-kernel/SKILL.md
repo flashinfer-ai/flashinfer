@@ -260,7 +260,11 @@ export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a 10.0a"
 
 #### Specifying Architectures in Your JIT Module
 
-When creating a JIT module, specify which major SM versions are supported:
+When creating a JIT module, specify supported major versions or exact targets.
+`supported_archs` accepts major versions and `(major, minor)` pairs with the full
+architecture suffix. It intersects with `supported_major_versions` when both
+are supplied, before any SM107 fallback mapping. `None` leaves targets
+unrestricted; an empty `supported_archs` list matches no targets.
 
 ```python
 from flashinfer.jit.core import gen_jit_spec
@@ -290,7 +294,7 @@ def gen_my_blackwell_only_module():
     # ... copy sources ...
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]  # SM100 only
+        supported_archs=[(10, "0a")]  # SM100a only; excludes SM103a and SM107a
     )
 
     return gen_jit_spec(
