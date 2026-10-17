@@ -991,12 +991,14 @@ def test_gvr2_graph_replay_lengths_change_after_capture(
 # ---------------------------------------------------------------------------
 # Rows on both edges of the branches a capacity-sized launch takes per row:
 # the hint-free small-row sample of the one-CTA-per-row slabs (2k < n <=
-# SCAP) and rows at, below and beyond a decode bound. The scores drive the
-# sample, the retry ladder and the degenerate paths (tie floods, +inf floods
-# and +inf in the sampled head, whole -inf rows and rows with fewer than top_k
-# finite scores, denormals, ramps); paged output is mapped back through its
-# injective page table and checked like the unpaged output. Floods of more
-# +inf than top_k are covered separately (test_gvr2_streaming_flood*).
+# SCAP), the clus rows of at most one BLK * U chunk that run on rank 0 alone
+# (n4 <= STEPC) and the first rows past them, and rows at, below and beyond a
+# decode bound. The scores drive the sample, the retry ladder and the
+# degenerate paths (tie floods, +inf floods and +inf in the sampled head,
+# whole -inf rows and rows with fewer than top_k finite scores, denormals,
+# ramps); paged output is mapped back through its injective page table and
+# checked like the unpaged output. Floods of more +inf than top_k are covered
+# separately (test_gvr2_streaming_flood*).
 
 _HARD_PATTERNS = [
     "ties",
@@ -1221,6 +1223,38 @@ def test_gvr2_streaming_flood_neginf_rows(rows, width, top_k, lens, family):
     _run_hard(logits, n_r, top_k, n_r, family)
 
 
+_SOLO_CASES = [
+    # rows, width, top_k, next_n, page size; a row of n columns is solo while
+    # n // 4 <= STEPC, i.e. up to 4 * STEPC + 3 columns
+    (32, 262144, 512, 1, None),  # CS 4, U 8: STEPC 8192
+    (64, 262144, 1024, 1, None),  # CS 2, U 8
+    (24, 98304, 512, 1, None),  # CS 4, U 4: STEPC 4096
+    (48, 131072, 512, 2, None),  # CS 2, U 8, two rows per request
+    (32, 262144, 512, 1, 64),  # paged
+    (24, 98304, 512, 1, 1),  # paged, one token per page
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,next_n,page_size,pattern", _with_patterns(_SOLO_CASES)
+)
+def test_gvr2_clus_solo_hard_rows(rows, width, top_k, next_n, page_size, pattern):
+    """clus rows on both sides of the solo bound (rank 0 alone vs the whole
+    cluster), short rows and multi-chunk rows, under hard scores."""
+    blk, u = _host.route(rows, width, width, top_k, sms=_host._sm_count())["tpl"][:2]
+    stepc4 = 4 * blk * u  # columns of one chunk
+    cols = [stepc4 + d for d in (-1, 0, 1, 2, 3, 4, 5, 7)]
+    cols += [top_k, top_k + 1, 2 * top_k + 1, 4099, 2 * stepc4 + 3, 2 * stepc4 + 4]
+    cols += [3 * stepc4 + 1, width, 0]
+    # with next_n = 2 the request's rows are one column apart: kv = c + 1
+    # gives rows of c and c + 1 columns, straddling the bound at c = 4 STEPC + 3
+    kv = [cols[b % len(cols)] + next_n - 1 for b in range(rows // next_n)]
+    n_r = _row_valid_lens(kv, rows, next_n, 1, width)
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width)
+    _run_hard(logits, kv, top_k, n_r, "clus", next_n=next_n, page_size=page_size)
+
+
 _ONECTA_CASES = [
     # rows, width, top_k, page size: one-CTA-per-row slabs off the big regime
     # (aim 7k/4), at widths that compile the register path in (longer rows stream)
@@ -1286,7 +1320,7 @@ _BOUND_EDGE_CASES = [
     (4, 262144, 65536, 1024, 4, 1, "reg"),  # cr 4 on a 1M-token buffer: 16K columns
     (8, 262144, 131072, 512, 4, 1, "reg_clus"),  # ... 32K columns
     (8, 1048576, 65536, 512, 1, 1, "reg_clus"),
-    (32, 1048576, 262144, 512, 1, 1, "clus"),  # one-chunk and longer rows
+    (32, 1048576, 262144, 512, 1, 1, "clus"),  # solo and cluster rows
     (48, 262144, 262147, 512, 4, 3, "clus"),  # 65536 columns, three rows per request
     (128, 1048576, 131072, 512, 1, 1, "main"),  # one-wave slab, sampled band
     (4, 1048576, 262144, 512, 1, 1, "main"),  # SPLIT slab
@@ -1345,6 +1379,8 @@ _REPLAY_BOTH_CASES = [
     # (the first two below the register-path envelope gate, _MAIN_REG_ENV)
     (148, 130944, 512, None, 128, (513, 1024), (1025, 16388), "main"),  # sample gate
     (296, 65472, 1024, None, 64, (1025, 2048), (2049, 4100), "main"),
+    # solo rows at capture, cluster rows at replay
+    (32, 262144, 512, None, 1, (513, 32771), (32772, 262144), "clus"),
     (64, 1048576, 512, 16384, 128, (0, 512), (513, 16384), "reg"),  # 16K graph variant
     (32, 1048576, 512, None, 128, (0, 512), (513, 16384), "clus"),  # V4.1 c1 capacity
 ]
