@@ -698,6 +698,61 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
 #endif
 }
 
+/*!
+ * \brief Use mma instructions to compute rowsum, accumulated in f16.
+ * \tparam mma_mode whether we are initializing the accumulator or updating it
+ * \param d pointer to the two accumulator registers; each holds the sum of one row (rows
+ *   lane/4 and lane/4 + 8) in both of its halves
+ * \param s pointer to the f16 fragment to be summed
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void m16k16_rowsum_f16f16f16(uint32_t* d, uint32_t* s) {
+#if defined(FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED)
+  // B = {1.0h, 1.0h} in every register, so each column of the result is the row sum.
+  if constexpr (mma_mode == MMAMode::kInit) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,  %1},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  %9};\n"
+        : "=r"(d[0]), "=r"(d[1])
+        : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(0x3C003C00), "r"(0x3C003C00), "r"(0),
+          "r"(0));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,  %1},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  %9};\n"
+        : "=r"(d[0]), "=r"(d[1])
+        : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(0x3C003C00), "r"(0x3C003C00), "r"(d[0]),
+          "r"(d[1]));
+  }
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+/*!
+ * \brief Adds the two halves of an f16x2 register to two f32 accumulators. On sm_100+ this is one
+ *   mixed-precision add (FHADD) per element; elsewhere a convert plus an add.
+ */
+__device__ __forceinline__ void add_f16x2_to_f32x2(float* acc, uint32_t x) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && \
+    (__CUDACC_VER_MAJOR__ * 100 + __CUDACC_VER_MINOR__ >= 1208)
+  uint16_t lo, hi;
+  asm("mov.b32 {%0, %1}, %2;" : "=h"(lo), "=h"(hi) : "r"(x));
+  asm("add.rn.f32.f16 %0, %1, %2;" : "=f"(acc[0]) : "h"(lo), "f"(acc[0]));
+  asm("add.rn.f32.f16 %0, %1, %2;" : "=f"(acc[1]) : "h"(hi), "f"(acc[1]));
+#else
+  const float2 f = __half22float2(*reinterpret_cast<half2*>(&x));
+  acc[0] += f.x;
+  acc[1] += f.y;
+#endif
+}
+
 }  // namespace mma
 
 }  // namespace flashinfer

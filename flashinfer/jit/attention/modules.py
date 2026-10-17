@@ -360,6 +360,8 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -370,7 +372,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_f16mma" if fp16_accum_mma else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -416,6 +420,8 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -427,7 +433,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_f16mma" if fp16_accum_mma else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -532,6 +540,8 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -544,6 +554,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        fp16_accum_mma=fp16_accum_mma,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -613,6 +624,7 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        fp16_accum_mma=fp16_accum_mma,
     )
 
 
@@ -1008,6 +1020,7 @@ def _gen_batch_prefill_module(
     *,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
     module_surface: BatchPrefillModuleSurface,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     base_uri = get_batch_prefill_uri(
         backend,
@@ -1021,6 +1034,7 @@ def _gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        fp16_accum_mma=fp16_accum_mma,
     )
     uri = _get_batch_prefill_module_uri(
         base_uri, backend, paged_kv_stride_mode, module_surface
@@ -1127,6 +1141,7 @@ def _gen_batch_prefill_module(
         fp8_enabled=fp8_enabled,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
+        fp16_accum_mma=fp16_accum_mma,
     )
 
 
@@ -1142,6 +1157,8 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     """Generate the public full batch-prefill module with runtime stride dispatch."""
     return _gen_batch_prefill_module(
@@ -1158,6 +1175,7 @@ def gen_batch_prefill_module(
         use_fp16_qk_reduction,
         paged_kv_stride_mode="runtime",
         module_surface="full",
+        fp16_accum_mma=fp16_accum_mma,
     )
 
 
@@ -1173,6 +1191,8 @@ def _gen_batch_prefill_primary_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     """Generate the internal full FA2 primary with equal-stride paged kernels."""
     return _gen_batch_prefill_module(
@@ -1189,6 +1209,7 @@ def _gen_batch_prefill_primary_module(
         use_fp16_qk_reduction,
         paged_kv_stride_mode="equal",
         module_surface="full",
+        fp16_accum_mma=fp16_accum_mma,
     )
 
 
@@ -1204,6 +1225,8 @@ def _gen_batch_prefill_independent_full_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     """Generate the feasibility-only full FA2 independent-stride module."""
     return _gen_batch_prefill_module(
@@ -1220,6 +1243,7 @@ def _gen_batch_prefill_independent_full_module(
         use_fp16_qk_reduction,
         paged_kv_stride_mode="independent",
         module_surface="full",
+        fp16_accum_mma=fp16_accum_mma,
     )
 
 
@@ -1235,6 +1259,8 @@ def _gen_batch_prefill_independent_paged_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     """Generate the internal paged-only FA2 independent-stride module."""
     return _gen_batch_prefill_module(
@@ -1251,6 +1277,7 @@ def _gen_batch_prefill_independent_paged_module(
         use_fp16_qk_reduction,
         paged_kv_stride_mode="independent",
         module_surface="paged",
+        fp16_accum_mma=fp16_accum_mma,
     )
 
 
@@ -1626,6 +1653,18 @@ def _fa2_prefill_head_dim_nvcc_flags(
     )
 
 
+def _fa2_prefill_nvcc_flags(
+    head_dim_qk: int,
+    head_dim_vo: int,
+    dtype_kv: torch.dtype,
+    fp16_accum_mma: bool = False,
+) -> Optional[List[str]]:
+    flags = _fa2_prefill_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv)
+    if fp16_accum_mma:
+        flags = (flags or []) + ["-DFLASHINFER_FP16_ACCUM_MMA"]
+    return flags
+
+
 def _append_nvfp4_sf_stride_setter(
     additional_params_setter: str,
     additional_tensor_names: List[str],
@@ -1764,6 +1803,8 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1840,8 +1881,8 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
-                head_dim_qk, head_dim_vo, dtype_kv
+            extra_cuda_cflags=_fa2_prefill_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv, fp16_accum_mma
             ),
         )
     elif backend == "fa3":
@@ -2021,6 +2062,8 @@ def gen_customize_batch_prefill_module(
     fp8_enabled: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
+    *,
+    fp16_accum_mma: bool = False,
 ) -> JitSpec:
     _validate_batch_prefill_module_mode(backend, paged_kv_stride_mode, module_surface)
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
@@ -2148,8 +2191,8 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        extra_cuda_cflags = _fa2_prefill_head_dim_nvcc_flags(
-            head_dim_qk, head_dim_vo, dtype_kv
+        extra_cuda_cflags = _fa2_prefill_nvcc_flags(
+            head_dim_qk, head_dim_vo, dtype_kv, fp16_accum_mma
         )
         if kwargs["require_fp4_kv_cache"]:
             # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
