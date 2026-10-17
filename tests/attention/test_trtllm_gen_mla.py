@@ -2113,6 +2113,72 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
+def test_trtllm_mla_blackwell_fp8_page64_attends_the_last_key(
+    q_len_per_request: int,
+) -> None:
+    """Every query row of the FP8 page-64 route attends its causal keys, the last one included.
+
+    The last key of each request is aimed at head 0's query of the request's last row, so its logit dominates: a route
+    that drops it moves head 0's output by about the whole value range, far beyond the FP8 tolerance.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in {(10, 0), (10, 3)}:
+        pytest.skip("TRT-LLM MLA Blackwell requires SM100a or SM103a")
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    page_size, batch_size, max_seq_len = 64, 2, 1024
+    pages = max_seq_len // page_size
+    query = (
+        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.5
+    ).to(torch.float8_e4m3fn)
+    kv_cache = (
+        torch.randn(batch_size * pages, page_size, 576, device=device) * 0.5
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(
+        batch_size * pages, dtype=torch.int32, device=device
+    ).reshape(batch_size, pages)
+    kv_lens = [max_seq_len, 600]
+    for batch, kv_len in enumerate(kv_lens):
+        page, slot = divmod(kv_len - 1, page_size)
+        kv_cache[block_tables[batch, page], slot] = (
+            (query[batch, -1, 0].float() * 6).clamp(-400, 400).to(torch.float8_e4m3fn)
+        )
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    bmm1_scale = 1.0 / (192**0.5)
+
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=torch.empty(1, dtype=torch.uint8, device=device),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+        backend="cake",
+    )
+    keys = kv_cache.float().reshape(-1, 576)
+    for batch, kv_len in enumerate(kv_lens):
+        tokens = (
+            block_tables[batch, :, None] * page_size
+            + torch.arange(page_size, device=device)[None, :]
+        ).reshape(-1)
+        for row in range(q_len_per_request):
+            visible = keys[tokens[: kv_len - q_len_per_request + row + 1].long()]
+            q = query[batch, row].float()
+            probabilities = torch.softmax(q @ visible.T * bmm1_scale, dim=-1)
+            reference = (probabilities @ visible[:, :512]).to(torch.bfloat16)
+            torch.testing.assert_close(
+                output[batch, row], reference, rtol=0.1, atol=0.1
+            )
+
+
 @pytest.mark.parametrize(
     "layer_dimensions",
     supported_mla_layer_dimensions,
