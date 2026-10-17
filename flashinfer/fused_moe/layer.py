@@ -40,6 +40,7 @@ from .api import (
     CudnnFrostMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeStepFunConfig,
     CakeWarpDecodeConfig,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
@@ -82,6 +83,7 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
     CudnnGroupedGemmFp8PerTensorRunner,
@@ -126,6 +128,7 @@ from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8MoeRunner,
     CudnnFrostNvfp4MoeRunner,
@@ -171,6 +174,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,
     CudnnFrostNvfp4Config: CudnnFrostNvfp4MoeRunner,

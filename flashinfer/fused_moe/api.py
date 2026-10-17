@@ -809,6 +809,183 @@ def _shuffle_deepseek_prims_ts_weights(view: dict) -> dict:
 
 
 @dataclass(frozen=True)
+class CakeStepFunConfig:
+    """Cake StepFun FC1 kernels inside the trtllm-gen fused-MoE pipeline.
+
+    The backend runs the trtllm-gen routing, GEMM2 and finalize stages unchanged
+    and serves the GEMM1 stage with exported Cake kernels that evaluate the
+    StepFun activation ``clamp(up, -L, L) * min(silu(gate), L)`` with a per-expert
+    limit ``L``. It accepts four weight families, each with :class:`SwiGLUStep`
+    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 or bf16 output),
+    BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is never part of the
+    default backend list; users opt in with ``CakeStepFunConfig(backend="cake_stepfun")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    the matching trtllm-gen config for the family (:class:`TrtllmFp4Config` for
+    NVFP4, :class:`TrtllmBf16Config` for BF16, :class:`TrtllmFp8PerTensorConfig`
+    for per-tensor FP8 and :class:`TrtllmFp8BlockConfig` for MXFP8); the view
+    additionally carries the per-expert ``gemm1_clamp_limit`` the Cake kernels
+    read.
+    """
+
+    backend: Literal["cake_stepfun"] = "cake_stepfun"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake_stepfun":
+            raise ValueError(
+                f"CakeStepFunConfig backend must be 'cake_stepfun', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+        step_limits: Optional[Tensor] = None,
+        hidden_states_scale_global=None,
+        intermediate_scale_global=None,
+    ):
+        """Build the TRTLLM weight view of ``quant`` plus the per-expert StepFun limits.
+
+        Register the returned dictionary with ``MoEWeightPack.prepare_for("cake_stepfun", view)``.
+        ``quant`` selects the FC1 family: NVFP4x NVFP4 (:class:`TrtllmFp4Config`), BF16xBF16
+        (:class:`TrtllmBf16Config`), FP8PerTensorxFP8PerTensor (:class:`TrtllmFp8PerTensorConfig`,
+        which needs ``hidden_states_scale_global`` and ``intermediate_scale_global``) or
+        MXFP8xMXFP8 (:class:`TrtllmFp8BlockConfig`). ``activation`` defaults to ``SwiGLUStep()``;
+        ``step_limits`` optionally gives one logical limit per physical expert row (routed experts
+        followed by fused shared experts) and overrides ``activation.limit`` row by row.
+        The view stores ``gemm1_clamp_limit`` in the units the kernels clamp: raw accumulator
+        units (the logical limit divided by the FC1 gate dequant scale) for NVFP4 and per-tensor
+        FP8, physical units for BF16 and MXFP8.
+        """
+        activation = SwiGLUStep() if activation is None else activation
+        if not isinstance(activation, SwiGLUStep):
+            raise ValueError(
+                "Cake StepFun weight preparation requires a SwiGLUStep activation, "
+                f"got {activation!r}."
+            )
+        common = dict(
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+        pair = quant.pair
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            view = TrtllmFp4Config.prepare_weights(
+                w1_bf16, w2_bf16, quant=quant, permute_cache=permute_cache, **common
+            )
+            gate_scale = view["output1_scale_gate_scalar"]
+        elif pair == (QuantFormat.BF16, QuantFormat.BF16):
+            view = TrtllmBf16Config.prepare_weights(
+                w1_bf16, w2_bf16, permute_cache=permute_cache, **common
+            )
+            gate_scale = None
+        elif pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if hidden_states_scale_global is None or intermediate_scale_global is None:
+                raise ValueError(
+                    "Cake StepFun FP8 per-tensor weight preparation requires "
+                    "hidden_states_scale_global and intermediate_scale_global."
+                )
+            view = TrtllmFp8PerTensorConfig.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
+                intermediate_scale_global=intermediate_scale_global,
+                **common,
+            )
+            gate_scale = view["output1_scales_gate_scalar"]
+        elif pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+            view = TrtllmFp8BlockConfig.prepare_weights(
+                w1_bf16, w2_bf16, quant=quant, **common
+            )
+            gate_scale = None
+        else:
+            raise ValueError(
+                "Cake StepFun weight preparation supports NVFP4xNVFP4, BF16xBF16, "
+                f"FP8PerTensorxFP8PerTensor and MXFP8xMXFP8, got {quant!r}."
+            )
+        rows = num_local_experts
+        reference = (
+            gate_scale
+            if gate_scale is not None
+            else torch.empty(
+                rows, dtype=torch.float32, device=view["gemm1_weights"].device
+            )
+        )
+        if step_limits is None:
+            limits = torch.full_like(reference, activation.limit)
+        else:
+            limits = torch.as_tensor(
+                step_limits, dtype=torch.float32, device=reference.device
+            )
+            if limits.shape != reference.shape:
+                raise ValueError(
+                    "step_limits must hold one limit per physical expert row "
+                    f"{tuple(reference.shape)}, got {tuple(limits.shape)}."
+                )
+            if not bool(torch.isfinite(limits).all()) or not bool((limits > 0).all()):
+                raise ValueError("step_limits must be finite and positive.")
+        view["gemm1_clamp_limit"] = (
+            (limits / gate_scale).contiguous()
+            if gate_scale is not None
+            else limits.contiguous()
+        )
+        return view
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        hidden_states_scale_global=None,
+    ):
+        """Build the activation view of ``quant`` as ``(hidden_states_q, hidden_states_scale)``.
+
+        BF16 returns the raw activations with ``None`` scales; per-tensor FP8 needs
+        ``hidden_states_scale_global`` (the calibrated E4M3 multiplier) and has no block scales.
+        """
+        pair = quant.pair
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return TrtllmFp4Config.prepare_activations(hidden_states_bf16, quant=quant)
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return hidden_states_bf16.to(torch.bfloat16).contiguous(), None
+        if pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if hidden_states_scale_global is None:
+                raise ValueError(
+                    "Cake StepFun FP8 per-tensor activation preparation requires "
+                    "hidden_states_scale_global."
+                )
+            return TrtllmFp8PerTensorConfig.prepare_activations(
+                hidden_states_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
+            )
+        if pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+            return TrtllmFp8BlockConfig.prepare_activations(
+                hidden_states_bf16, quant=quant
+            )
+        raise ValueError(
+            "Cake StepFun activation preparation supports NVFP4xNVFP4, BF16xBF16, "
+            f"FP8PerTensorxFP8PerTensor and MXFP8xMXFP8, got {quant!r}."
+        )
+
+    def __repr__(self) -> str:
+        return "CakeStepFunConfig(backend='cake_stepfun')"
+
+
+@dataclass(frozen=True)
 class PrimsTsConfig:
     """Explicit Prims-TS backend for SM100 and SM103.
 
