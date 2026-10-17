@@ -22,6 +22,7 @@ from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
+from tests.test_helpers.sampling import required_num_trials
 
 
 # H100 CI peak GPU memory: 39.5 GiB.
@@ -458,11 +459,11 @@ def test_softmax_blackwell_random_per_row_temperature_contract(vocab_size):
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
 def test_sampling_freq(vocab_size, distribution, zero_ratio):
     torch.manual_seed(42)
-    num_trials = 5000000
     logits = distribution((1, vocab_size), "cuda:0")
     zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
     logits[:, zero_indices] = -float("inf")
     probs = torch.softmax(logits, dim=-1)
+    num_trials = required_num_trials(probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
 
     samples = flashinfer.sampling.sampling_from_probs(
@@ -497,8 +498,8 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     mask.scatter_add_(1, indices, (cdf > (1 - p)).int())
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
+    num_trials = required_num_trials(renorm_probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
     samples = flashinfer.sampling.top_p_sampling_from_probs(
         probs,
         p,
@@ -532,8 +533,8 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
     mask = (probs >= pivot.unsqueeze(-1)).int()
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    num_trials = required_num_trials(renorm_probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         k,
@@ -581,9 +582,9 @@ def test_sampling_from_logits(batch_size, vocab_size):
 )
 def test_sampling_from_logits_freq(vocab_size, distribution):
     torch.manual_seed(42)
-    num_trials = 5000000
     logits = distribution((1, vocab_size), "cuda:0")
     probs = torch.softmax(logits, dim=-1)
+    num_trials = required_num_trials(probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
     samples = flashinfer.sampling.sampling_from_logits(
         logits, indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device)
