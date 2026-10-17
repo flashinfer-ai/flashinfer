@@ -50,6 +50,7 @@ from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from .helpers import fmha_helpers as fmha_utils
+from .helpers.expcast import expcast_pack_decode4
 
 """
 A fused multi-head attention (FMHA) example where Bmm1(Q@K) is block-scaled with MXFP8 or NVFP4 for
@@ -215,6 +216,8 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         qk_sf_vec_size: int,
         rescale_threshold: float = 8.0,
         use_tma_store: bool = True,
+        *,
+        p_exp_mode: str = "exp2",
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -239,6 +242,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             - window_size_left/right: Sliding window size for attention masking
             - enable_ex2_emulation: Whether to enable exp2 emulation
             - enable_skip_correction: Whether to skip the correction when rowmax is not updated larger than a threshold
+            - p_exp_mode: "exp2" (default) or approximate "expcast" (E4M3 PV only)
 
         :param qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
         :type qk_acc_dtype: Type[cutlass.Numeric]
@@ -258,6 +262,9 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         :type window_size_right: int
         """
 
+        if p_exp_mode not in ("exp2", "expcast"):
+            raise ValueError(f"Unsupported p_exp_mode: {p_exp_mode!r}")
+        self.p_exp_mode = p_exp_mode
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
         if mma_tiler != (128, 128):
@@ -455,6 +462,11 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         # more of E4M3's [0, 448] range, improving quantization precision.
         # Derived from rescale_threshold to guarantee P*2^offset <= 448.
         self.p_fp8_prescale_log2 = max(0.0, math.floor(math.log2(448) - self.rescale_threshold))
+        # With deferred rescaling, x <= threshold + prescale. Saturating byte
+        # packing handles the lower bound; omit clamps only with a proven cap.
+        self.expcast_remove_clamps = (
+            8.0 * (max(0.0, self.rescale_threshold) + self.p_fp8_prescale_log2) + 55.65 < 126.5
+        )
         # ln(2) * offset correction for LSE when pre-scale is active
         self.p_fp8_prescale_lse_correction = self.p_fp8_prescale_log2 * math.log(2)
         # For most cases, seq barrier is needed to help keep the pipeline stable
@@ -539,6 +551,8 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         self.k_dtype = k_tensor.element_type
         self.qk_sf_dtype = q_sf_tensor.element_type
         self.v_dtype = v_tensor.element_type
+        if cutlass.const_expr(self.p_exp_mode == "expcast" and self.v_dtype != cutlass.Float8E4M3FN):
+            raise ValueError("expcast requires E4M3 PV")
         self.o_dtype = o_tensor.element_type
 
         # s_q, s_k, s_v are the actual tensor dimensions (total seqlen for varlen)
@@ -2462,6 +2476,37 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         :return: The local row sum and the inplace consumer.
         :rtype: Tuple[float, cute.Tensor]
         """
+        if cutlass.const_expr(self.p_exp_mode == "expcast"):
+            # Sum exact decoded weights in the original single-pair reduction.
+            # The first FMA_COUNT scores were already scaled by softmax_step.
+            for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS), 4):
+                if cutlass.const_expr(i + FMA_COUNT < cute.size(tTMEM_LOADrS)):
+                    for j in cutlass.range_constexpr(0, 4, 2):
+                        tTMEM_LOADrS[i + FMA_COUNT + j], tTMEM_LOADrS[i + FMA_COUNT + j + 1] = (
+                            cute.arch.fma_packed_f32x2(
+                                (tTMEM_LOADrS[i + FMA_COUNT + j], tTMEM_LOADrS[i + FMA_COUNT + j + 1]),
+                                (scale, scale),
+                                (minus_row_max_scale, minus_row_max_scale),
+                            )
+                        )
+                packed, p0, p1, p2, p3 = expcast_pack_decode4(
+                    tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1],
+                    tTMEM_LOADrS[i + 2], tTMEM_LOADrS[i + 3],
+                    remove_clamps=self.expcast_remove_clamps,
+                )
+                local_row_sum = cute.arch.add_packed_f32x2(local_row_sum, (p0, p1))
+                local_row_sum = cute.arch.add_packed_f32x2(local_row_sum, (p2, p3))
+                cute.recast_tensor(tTMEM_STORErS_x4_e_cvt[None, i // 4], Int32)[0] = packed
+                if cutlass.const_expr(i == cute.size(tTMEM_LOADrS) - ARV_COUNT):
+                    if cutlass.const_expr(self.enable_sequence_barrier):
+                        if cutlass.const_expr(stage == 0):
+                            self.sequence_s1_s0_barrier.arrive()
+                        else:
+                            self.sequence_s0_s1_barrier.arrive()
+            inplace_peek_status = inplace_consumer.try_wait()
+            inplace_consumer.wait_and_advance(inplace_peek_status)
+            return local_row_sum, inplace_consumer
+
         for i in cutlass.range_constexpr(0, EXP2_EMULATION_OFFSET, 2):
             if cutlass.const_expr(i >= CVT_COUNT):
                 if cutlass.const_expr(i % CVT_PER_STEP == 0):
@@ -2871,7 +2916,9 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         # Notify correction wg that row_max is ready
         vec_i_handle.commit()
 
-        EXP2_EMULATION_COUNT = 20 if self.enable_ex2_emulation and not whether_apply_mask else 0
+        EXP2_EMULATION_COUNT = (
+            20 if self.p_exp_mode == "exp2" and self.enable_ex2_emulation and not whether_apply_mask else 0
+        )
         EXP2_EMULATION_OFFSET = cute.size(tTMEM_LOADrS) - EXP2_EMULATION_COUNT
         acc_scale_ = scale * (old_row_max - row_max_safe)
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
@@ -2993,6 +3040,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             inplace_consumer,
         )
         return stats_args, pipeline_args
+
 
     # For both softmax0 and softmax1 warp group
     @cute.jit
