@@ -1898,6 +1898,8 @@ NVFP4_FP8_TMA_SHAPES = [
     (4096, 1536),
     (4096, 2048),
     (1100, 1024),  # m not a multiple of 128
+    (1025, 1024),  # last row tile holds a single row
+    (1024, 3072),  # odd number of column chunks
 ]
 NON_TMA_ROWS = 512
 
