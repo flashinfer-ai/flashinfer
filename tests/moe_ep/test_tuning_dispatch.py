@@ -62,8 +62,6 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
 @pytest.mark.parametrize(
     "options",
     [
-        ["--arch", "sm100", "--autotune-cache", "cache.json"],
-        ["--dtype", "sm120_mxfp4_mxfp8", "--autotune-cache", "cache.json"],
         ["--arch", "sm107", "--dtype", "bf16"],
         ["--arch", "auto", "--dtype", "bf16_mxfp8_e4m3"],
         ["--arch", "sm107", "--dtype", "bf16_mxfp8_e5m2"],
@@ -93,6 +91,14 @@ def test_unsupported_tuner_options_fail_before_import(options, dispatched, capsy
     assert tune.main([*_GEOMETRY, *options]) == 2
     assert dispatched == []
     assert capsys.readouterr().err
+
+
+def test_v1_cache_option_is_rejected(dispatched, capsys):
+    with pytest.raises(SystemExit) as exc:
+        tune.main([*_GEOMETRY, "--autotune-cache", "cache.json"])
+    assert exc.value.code == 2
+    assert not dispatched
+    assert "unrecognized arguments: --autotune-cache" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
