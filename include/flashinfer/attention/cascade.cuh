@@ -516,6 +516,10 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
       continue;
     }
 
+    // Each CTA processes multiple (pos, head) rows in its grid-stride loop.  Reset the
+    // accumulator for every multi-index-set row before summing its partial outputs.
+    v_sum_vec.fill(0.f);
+
 #pragma unroll
     for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
