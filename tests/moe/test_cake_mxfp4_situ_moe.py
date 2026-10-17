@@ -27,6 +27,7 @@ class between the two backends (the same Cake programs lowered twice) and, when 
 installed FlashInfer exposes the hand-written wrapper, against it.
 """
 
+import ast
 import hashlib
 import importlib
 import importlib.util
@@ -730,6 +731,92 @@ def test_gemm_forms_carry_the_trace_time_constants():
         kernels.select_gemm2(32, 8, 1)
 
 
+# --- package binding: every producer helper the plan reaches is bound ----------------
+
+_MODULE_ACCESSORS = (
+    "_routing_module",
+    "_gemm_module",
+    "_moe_sort_module",
+    "_gemm1_dense_module",
+    "_gemm2_dense_module",
+    "_gemm2_gate_module",
+    "_finalize_module",
+    "_dispatch_module",
+)
+
+
+def _accessor_of(node):
+    """The accessor name when ``node`` is a call of one of ``_MODULE_ACCESSORS``."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id in _MODULE_ACCESSORS:
+            return node.func.id
+    return None
+
+
+def _reached_helpers():
+    """``(accessor, attribute, line)`` of every attribute the plan source reaches through a
+    package-bound module accessor: ``gm = _gemm_module()`` then ``gm.<name>`` within the
+    same function, or ``_gemm_module().<name>`` directly."""
+    tree = ast.parse(Path(plan.__file__).read_text(), filename=plan.__file__)
+    reached = set()
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        bound = {}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target, value = node.targets[0], node.value
+            if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
+                pairs = list(zip(target.elts, value.elts, strict=True))
+            else:
+                pairs = [(target, value)]
+            for name, call in pairs:
+                accessor = _accessor_of(call)
+                if isinstance(name, ast.Name) and accessor is not None:
+                    bound[name.id] = accessor
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if isinstance(node.value, ast.Name) and node.value.id in bound:
+                reached.add((bound[node.value.id], node.attr, node.lineno))
+            elif _accessor_of(node.value) is not None:
+                reached.add((_accessor_of(node.value), node.attr, node.lineno))
+    return sorted(reached)
+
+
+def test_plan_reaches_only_helpers_the_package_binds():
+    """Every ``<module>.<name>`` the plan reaches through a package-bound accessor exists on
+    the binding class.  The plain chain reached ``gm.pack_g1_geom`` (the late-item L2
+    prefetch geometry of its finalize launch) while ``_GemmModule`` did not bind it: every
+    plain-chain ``plan()`` raised AttributeError on the device."""
+    reached = _reached_helpers()
+    assert ("_gemm_module", "pack_g1_geom") in {(a, n) for a, n, _line in reached}
+    missing = [
+        (accessor, name, line)
+        for accessor, name, line in reached
+        if not hasattr(getattr(plan, accessor)(), name)
+    ]
+    assert not missing, missing
+
+
+def test_gemm_module_packs_the_plain_chain_prefetch_geometry():
+    """``_GemmModule.pack_g1_geom``: launched GEMM1 CTAs in bits 0-11, work items per valid
+    group in bits 12-23, the cluster split-K form in bit 24; both counts below 4096."""
+    gm = plan._gemm_module()
+    assert gm.pack_g1_geom(items_per_group=48, grid=148, split_form=True) == (
+        148 | (48 << 12) | (1 << 24)
+    )
+    assert gm.pack_g1_geom(items_per_group=6, grid=148, split_form=False) == (
+        148 | (6 << 12)
+    )
+    assert gm.pack_g1_geom(items_per_group=0, grid=0, split_form=False) == 0
+    with pytest.raises(ValueError):
+        gm.pack_g1_geom(items_per_group=4096, grid=148, split_form=False)
+    with pytest.raises(ValueError):
+        gm.pack_g1_geom(items_per_group=48, grid=4096, split_form=False)
+
+
 # --- GPU -----------------------------------------------------------------------------
 
 
@@ -1313,6 +1400,27 @@ def test_chain_runs_deterministically_and_replays_under_graph_capture(
     assert plan.kernel_stages(p)[1].startswith(
         "gemm1_swapab_situ_n"
     ) and plan.kernel_stages(p)[2].startswith("gemm2_swapab_finalize_n")
+
+
+@gpu
+@pytest.mark.parametrize("row", ["ep8_1", "ep8_16", "tp8_16"])
+def test_plain_chain_passes_the_gemm1_geometry_to_its_finalize(row):
+    """The decode rows' finalize launch receives the GEMM1 launch geometry the device-side
+    late-item L2 prefetch rule mirrors (``g1_geom``, packed by ``_GemmModule.pack_g1_geom``
+    into the bound finalize operand): the GEMM1 grid, the form's work items per valid group
+    (2 I / 128 of the shard) and the cluster split-K form.  The GEMM2 grid of these rows
+    fills the device, the precondition of the rule."""
+    layout = ROWS[row][0]
+    _inputs, p, _out = _run_row(pkg, ROWS[row])
+    assert p.decision.path == "plain"
+    sequence = p.launch_sequence()
+    assert sequence[2][1][0] == p.sm_count
+    g1 = p.decision.gemm1
+    geometry = p._gemm2_args["g1_geom"]
+    assert geometry & 4095 == sequence[1][1][0] > 0
+    shard = layout.get("intermediate_shard", INTERMEDIATE)
+    assert (geometry >> 12) & 4095 == 2 * shard // 128
+    assert (geometry >> 24) & 1 == int(bool(g1.cluster_split and g1.k_tiles >= 2))
 
 
 def _path_row(row):

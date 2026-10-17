@@ -5683,10 +5683,10 @@
         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
       },
       {
-        "bytes": 68334,
+        "bytes": 73035,
         "kind": "integration",
         "path": "tests/moe/test_cake_mxfp4_situ_moe_cute.py",
-        "sha256": "1795ac89102c8234834ff706bcb05037c9f81e64d878d7c6d8658bc684356363"
+        "sha256": "39aa2005cddf136162470b2012a59594318f7d02ab29b0fff753c140a7e4ad78"
       }
     ],
     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
