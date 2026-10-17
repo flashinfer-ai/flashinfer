@@ -105,11 +105,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_small_9ad0d4c44c87",
@@ -146,11 +141,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_small_eafa0e0ed1b3",
@@ -187,11 +177,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "1.0"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_nontranspose_fp32_t1_small_4d99ceef01d7",
@@ -695,17 +680,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_1a1604f98ea0",
@@ -743,17 +717,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "0",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_68e76b274180",
@@ -791,17 +754,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_5f48c638999f",
@@ -838,17 +790,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_4a14fb54f169",
@@ -884,17 +825,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_998d66b08fd4",
@@ -930,17 +860,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "0",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_d958b1c14cb5",
@@ -976,17 +895,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_faf5f1b62cf2",
@@ -1022,17 +930,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_daf27da4814d",
@@ -1068,17 +965,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_55aa88c9bc7e",
@@ -1114,17 +1000,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_bf048bd84dfd",
@@ -1160,17 +1035,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_aa2b90a7a34e",
@@ -1206,17 +1070,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_8d7cfc3f85d6",
@@ -1253,17 +1106,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_6cec300144d9",
@@ -1301,17 +1143,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_8a43f866d1b3",
@@ -1349,17 +1180,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "0",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_750b7e4c7c4d",
@@ -1397,17 +1217,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_c9386f4a65ba",
@@ -1445,17 +1254,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_d8b86de47147",
@@ -1493,17 +1291,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_78330e94a6b5",
@@ -1541,17 +1328,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_2703a93c460f",
@@ -1589,17 +1365,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_32208efacd44",
@@ -1637,17 +1402,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_3720eb85c93f",
@@ -1685,17 +1439,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "1",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_dc042ac28b04",
@@ -1733,17 +1476,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "1",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_f16io_ae782864247c",
@@ -1780,17 +1512,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_1d0d8a94d534",
@@ -1826,17 +1547,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_373d87a0efe5",
@@ -1872,17 +1582,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_59521ae9a3c7",
@@ -1918,17 +1617,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_0895b79b711c",
@@ -1964,17 +1652,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_642fc591b0ad",
@@ -2010,17 +1687,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_135bfa59984f",
@@ -2056,17 +1722,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_4ff556120404",
@@ -2103,17 +1758,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "1"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_d5faf444ff97",
@@ -2151,17 +1795,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "1"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_0dda2893e70c",
@@ -2199,17 +1832,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "1"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_a6d0b5edc69e",
@@ -2246,17 +1868,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_d8b5b50285af",
@@ -2293,17 +1904,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "1",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "1"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_1c987612a6c1",
@@ -2341,17 +1941,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state_bfe2903b97e5",
@@ -2389,17 +1978,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state_4d2db94adfb6",
@@ -2437,17 +2015,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state_fa7efebb6197",
@@ -2485,17 +2052,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_fee52475fff3",
@@ -2533,17 +2089,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_dd000093c596",
@@ -2581,17 +2126,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state_b3cba0e81801",
@@ -2629,17 +2163,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_2897cee67e22",
@@ -2676,17 +2199,6 @@
         "sm_100a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_ea662e66a1e2",
@@ -2723,17 +2235,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_f481beb70ea9",
@@ -2771,17 +2272,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_d2efe8eb2aae",
@@ -2819,17 +2309,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_3aa7d1f5b31b",
@@ -2867,17 +2346,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_e721e0dc6863",
@@ -2915,17 +2383,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_3840a7a6e012",
@@ -2963,17 +2420,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_13505860d821",
@@ -3011,17 +2457,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_bf1731d1a93d",
@@ -3057,17 +2492,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_62d16849250d",
@@ -3101,17 +2525,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_9a485d1222ca",
@@ -3145,17 +2558,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_f26ad2468753",
@@ -3189,17 +2591,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_b3777fef3d8b",
@@ -3233,17 +2624,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_bc94a6ebc83d",
@@ -3277,17 +2657,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_ff1fc1373ac7",
@@ -3321,17 +2690,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_aff8217cc85c",
@@ -3367,17 +2725,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_ac92807e7ba4",
@@ -3415,17 +2762,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_90d5603899d9",
@@ -3463,17 +2799,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_ebd3d17eac82",
@@ -3511,17 +2836,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_a29e0cc19c9b",
@@ -3559,17 +2873,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_1d2420c9188c",
@@ -3607,17 +2910,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_544749c20e9f",
@@ -3655,17 +2947,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_894d4f98a4c7",
@@ -3703,17 +2984,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_e097d48f3e09",
@@ -3751,17 +3021,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4_5aa991a25681",
@@ -3799,17 +3058,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_b3ab9312c7ec",
@@ -3847,17 +3095,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_7d708a5009e7",
@@ -3895,17 +3132,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state_c8c67771cb18",
@@ -3943,17 +3169,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "1",
-        "STORE_FINAL_STATE": "0",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_single_chunk_6d7aa504763f",
@@ -3991,17 +3206,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_f16io_6c7285a8d69d",
@@ -4039,17 +3243,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "0",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_f16io_2cb8220d9440",
@@ -4087,17 +3280,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_f16io_7b6737dd8c0f",
@@ -4135,17 +3317,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f756fe574915",
@@ -4183,17 +3354,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_58707c7c1ddd",
@@ -4231,17 +3391,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "1"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_569ec99dd76e",
@@ -4279,17 +3428,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_40b5d0844f6b",
@@ -4327,17 +3465,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_73c97cad2b18",
@@ -4375,17 +3502,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_4048f368a7a4",
@@ -4423,17 +3539,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_abb1b9070748",
@@ -4471,17 +3576,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_6c4b00dc9d1a",
@@ -4519,17 +3613,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_65ead80090b5",
@@ -4567,17 +3650,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_72bcb63ae70f",
@@ -4615,17 +3687,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_5cac235e5875",
@@ -4663,17 +3724,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_f16io_1bbd66851ffe",
@@ -5191,13 +4241,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_1e9bd6e0844d",
@@ -5227,13 +4270,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_276ba799eeb9",
@@ -5264,13 +4300,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_46cbbc5243ee",
@@ -5301,13 +4330,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_4d778b7da7e6",
@@ -5337,13 +4359,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_5094e721b0e1",
@@ -5373,13 +4388,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_65ef665f0d7c",
@@ -5410,13 +4418,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_6f3b27fc8f7d",
@@ -5448,13 +4449,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_8a8a1d37012c",
@@ -5487,13 +4481,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_8d9a6c14b062",
@@ -5526,13 +4513,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_9cfd6eb12e51",
@@ -5564,13 +4544,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_b221d9850bd8",
@@ -5603,13 +4576,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_b60083e3eeaf",
@@ -5642,13 +4608,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_d6a550a1a2f9",
@@ -5679,13 +4638,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_f2d632ee98a4",
@@ -5716,13 +4668,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_1a2020c60e52",
@@ -5755,13 +4700,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_2b435b5b66ce",
@@ -5794,13 +4732,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_2d4d52366065",
@@ -5833,13 +4764,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_45d94ac47fdc",
@@ -5873,13 +4797,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_4d6485b290bf",
@@ -5912,13 +4829,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_53ad1af382c9",
@@ -5950,13 +4860,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_801e173acab7",
@@ -5988,13 +4891,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_83f49627adfa",
@@ -6027,13 +4923,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_a3e615772627",
@@ -6067,13 +4956,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_a782c901f21e",
@@ -6106,13 +4988,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "64"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_c6292ad3e9ca",
@@ -6145,13 +5020,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_ea0da33a3ec1",
@@ -6183,13 +5051,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_2af99ac8bac0",
@@ -6219,13 +5080,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_3542e4b0d216",
@@ -6255,13 +5109,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_3faebd11b036",
@@ -6291,13 +5138,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_6eaa53b99a7e",
@@ -6327,13 +5167,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_72590b84e150",
@@ -6363,13 +5196,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_fdc1fc6e27f0",
@@ -6400,17 +5226,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_213e9426eae3",
@@ -6446,17 +5261,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_6f621efa7a83",
@@ -6492,17 +5296,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_91904a19c987",
@@ -6538,17 +5331,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_98bb8300a189",
@@ -6584,17 +5366,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_de5f57a8db05",
@@ -6631,17 +5402,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_1043e6a26811",
@@ -6679,17 +5439,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_338e84cc2e59",
@@ -6727,17 +5476,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_4d423a2e14a1",
@@ -6775,17 +5513,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_93928e6419d2",
@@ -6823,17 +5550,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_9fab0d41aac3",
@@ -6869,13 +5585,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_ca38f8b552a2",
@@ -6905,13 +5614,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_c82051d9ff56",
@@ -6941,13 +5643,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_028c642ac2ea",
@@ -6977,13 +5672,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_53a33fc57112",
@@ -7013,13 +5701,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_364e002bfdff",
@@ -7049,13 +5730,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_3f9bc8c205c0",
@@ -7085,13 +5759,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "32",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_c0d35f36a0b5",
@@ -7121,13 +5788,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "32"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8_4b0239d85109",
@@ -7157,13 +5817,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "16",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_a496cc65e217",
@@ -7193,13 +5846,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "2",
-        "HV": "8",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "TILE_V": "16"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_1e5e2afe22a3",
@@ -7229,14 +5875,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "4",
-        "HV": "8",
-        "INTERMEDIATE_BATCH_STRIDE": "524288",
-        "INTERMEDIATE_TOKEN_STRIDE": "131072",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_28bb7b95db1d",
@@ -7267,15 +5905,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "INTERMEDIATE_BATCH_STRIDE": "2097152",
-        "INTERMEDIATE_TOKEN_STRIDE": "262144",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "8"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_d29d515064e3",
@@ -7307,15 +5936,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "8",
-        "HV": "16",
-        "INTERMEDIATE_BATCH_STRIDE": "1835008",
-        "INTERMEDIATE_TOKEN_STRIDE": "262144",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "7"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_d4462ceb4b43",
@@ -7707,17 +6327,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "CACHE_INTERMEDIATE_STATES": "1",
-        "H": "16",
-        "HV": "32",
-        "INTERMEDIATE_BATCH_STRIDE": "2097152",
-        "INTERMEDIATE_TOKEN_STRIDE": "524288",
-        "SCALE": "0.08838834764831845",
-        "STRIDED_INPUTS": "1",
-        "T_STEPS": "4",
-        "UPDATE_STATE": "1"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_splitv8_pro_b7109a2df886",
@@ -7751,11 +6360,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "1.0"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_splitv8_tilev32_53407a96540d",
@@ -7783,11 +6387,6 @@
       "architectures": [
         "sm_107a"
       ],
-      "defines": {
-        "H": "16",
-        "HV": "32",
-        "SCALE": "0.08838834764831845"
-      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_splitv8_tilev32_a55a700443c5",
@@ -7815,17 +6414,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_02758b28da17",
@@ -7859,17 +6447,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_133e26131d0c",
@@ -7903,17 +6480,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_7d2cfe13cdc6",
@@ -7947,17 +6513,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_8571bbd41c3e",
@@ -7991,17 +6546,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_d5abb5418532",
@@ -8036,17 +6580,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_2c61b8ed0d75",
@@ -8082,17 +6615,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_5d5f08a3c151",
@@ -8128,17 +6650,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_667f95e65ccc",
@@ -8174,17 +6685,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_752a4089b99c",
@@ -8220,17 +6720,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_b7c6fbbafa43",
@@ -8266,17 +6755,6 @@
         "sm_100a",
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_caf801606f9b",
@@ -8311,17 +6789,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_132fbdbda0dd",
@@ -8355,17 +6822,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_1f8b043250f6",
@@ -8399,17 +6855,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_3f90a10baacf",
@@ -8443,17 +6888,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_409f5e116299",
@@ -8487,17 +6921,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_4e9171a98441",
@@ -8531,17 +6954,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_ae692862611e",
@@ -8575,17 +6987,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_b3572b5c6a15",
@@ -8619,17 +7020,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_c177239653e1",
@@ -8663,17 +7053,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state_sm100a_state_inp_late_d4a8025f247d",
@@ -8707,17 +7086,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_02deea33a9c6",
@@ -8751,17 +7119,6 @@
       "architectures": [
         "sm_103a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_sm103a_role_rebalanced_98eaa5bf4771",
@@ -8795,17 +7152,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_76588e086ab0",
@@ -8839,17 +7185,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_7f261cbd6656",
@@ -8883,17 +7218,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_a019e38a5425",
@@ -8927,17 +7251,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_b86ebf0b7799",
@@ -8971,17 +7284,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_ca3685a4cbfb",
@@ -9015,17 +7317,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_d66d587c4fe0",
@@ -9059,17 +7350,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_dbfc83cb28ef",
@@ -9103,17 +7383,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_f281bbbcb753",
@@ -9147,17 +7416,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late_fe218dc6e37c",
@@ -9191,17 +7449,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "0",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_066b7cab0ea9",
@@ -9235,17 +7482,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_12b57faaa6f2",
@@ -9279,17 +7515,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "-1",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_263036d928e3",
@@ -9323,17 +7548,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_306173cfb022",
@@ -9367,17 +7581,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_41ef1a145277",
@@ -9411,17 +7614,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "6",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_5a0b84e05389",
@@ -9455,17 +7647,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "2",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_ab0cfc2added",
@@ -9499,17 +7680,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "-1",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_b1c5fddd5ef1",
@@ -9543,17 +7713,6 @@
       "architectures": [
         "sm_100a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "0",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "0",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_dvsplit_sm100a_state_inp_late_e046755528f1",
@@ -9589,17 +7748,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_44f08693f3b8",
@@ -9637,17 +7785,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_b33799826e21",
@@ -9685,17 +7822,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_c5def3e56f2a",
@@ -9733,17 +7859,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_d631f6046fc1",
@@ -9781,17 +7896,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "2",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_bf16state_gatestream_full_d86226c380c5",
@@ -9829,17 +7933,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "3",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_015603a148b1",
@@ -9877,17 +7970,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "5",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_3eedc28472e3",
@@ -9925,17 +8007,6 @@
         "sm_103a",
         "sm_107a"
       ],
-      "defines": {
-        "ENABLE_CHECKPOINTS": "0",
-        "HEAD_GROUP_LOG2": "1",
-        "IS_GQA": "0",
-        "NUM_O_HEADS_LOG2": "4",
-        "SINGLE_CHUNK_NO_STATE": "0",
-        "STORE_FINAL_STATE": "1",
-        "UNIT_GATES": "0",
-        "USE_INITIAL_STATE": "1",
-        "USE_STATE_INDICES": "0"
-      },
       "domain": "prefill",
       "host_binding": {
         "entry": "run_prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_75c72d5b5cf9",

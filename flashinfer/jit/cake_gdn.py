@@ -15,8 +15,9 @@
 """JIT loader for the source-only Cake GDN backend.
 
 Every variant in ``csrc/gdn/cake/manifest.json`` names one kernel source, the
-compile-time ``defines`` that specialize it, and one TVM-FFI host shim.  The
-kernel is compiled to a cubin with ``nvcc`` and embedded into the host shim.
+compile-time specialization it is built with (passed as ``-D`` defines), and
+one TVM-FFI host shim.  The kernel is compiled to a cubin with ``nvcc`` and
+embedded into the host shim.
 """
 
 from __future__ import annotations
@@ -206,10 +207,15 @@ def _compile_cubin(
 
 
 def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
-    """``-D`` flags for the variant's compile-time specialization."""
+    """``-D`` flags for the variant's compile-time specialization.
+
+    A record passes its ``specializations`` unless it spells out ``defines``:
+    a body with its constants in-file takes none (``{}``), and some bodies
+    take only a subset of the specialization keys.
+    """
 
     flags = []
-    for key, value in record.get("defines", {}).items():
+    for key, value in record.get("defines", record["specializations"]).items():
         if not _DEFINE_NAME.match(key):
             raise RuntimeError(f"invalid Cake GDN define name {key!r}")
         flags.append(f"-D{key}={value}")
