@@ -328,6 +328,41 @@ def test_paged_warmup_and_cuda_graph_replay():
     assert _same_rows(out, _expected(loc, pt, 1, page_size))
 
 
+@requires_gvr2
+@pytest.mark.parametrize("rows", [32, 64], ids=lambda r: f"r{r}")
+def test_paged_cluster_rows_far_below_envelope(rows):
+    """Cluster family (CS = 4 / 2) at a large envelope with every row far
+    below it (solo rows), through capture and a replay with longer lengths
+    (cluster rows), against the transformed local output."""
+    ncols, top_k, page_size = 131072, 512, 64
+    assert _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, 6)[0] == "clus"
+    lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
+    gen = torch.Generator(device=_DEV).manual_seed(rows)
+    lens = torch.randint(top_k - 8, 9000, (rows,), generator=gen, device=_DEV)
+    lens = lens.to(torch.int32)
+    pt = _page_table(rows, ncols, page_size, seed=41)
+    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out, backend="gvr_2", page_table=pt, page_size=page_size)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        flashinfer.top_k_varlen(lg, lens, top_k, **kw)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(lg, lens, top_k, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    lens.copy_(torch.randint(20000, ncols + 1, (rows,), generator=gen, device=_DEV))
+    g.replay()
+    torch.cuda.synchronize()
+    loc, _ = flashinfer.top_k_varlen(lg, lens, top_k, backend="gvr_2")
+    torch.cuda.synchronize()
+    assert _same_rows(out, _expected(loc, pt, 1, page_size))
+
+
 def test_paged_api_validation():
     rows, ncols, k = 8, 4096, 512
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)

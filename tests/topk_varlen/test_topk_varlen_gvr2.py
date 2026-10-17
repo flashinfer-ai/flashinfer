@@ -638,6 +638,130 @@ def test_gvr2_family_parity_and_oracle(rows, msl_c, top_k, next_n, cr, family):
 
 
 # ---------------------------------------------------------------------------
+# clus family: rows far below the launch envelope (solo rows)
+# ---------------------------------------------------------------------------
+
+# Live lengths (compressed columns) around the clus boundaries: the short path,
+# single warp loads, the solo bound of one BLK * U chunk at U = 4 (16384) and at
+# U = 8 (32768) with one float4 past each, ragged n % 4 tails, and rows of
+# several chunks.
+_CLUS_LIVE_COLS = [256, 512, 513, 1031, 4099]
+_CLUS_LIVE_COLS += [16383, 16384, 16385, 32767, 32768, 32769, 32772, 40000, 65541]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,next_n,cr",
+    [
+        (32, 262144, 512, 1, 1),  # CS=4, U=8 (17-32 rows at 1M tokens, c4)
+        (64, 262144, 1024, 1, 1),  # CS=2, U=8 (33-74 rows)
+        (24, 98304, 512, 1, 1),  # CS=4, U=4
+        (48, 131072, 512, 2, 4),  # CS=2, U=8, next_n rows, compressed lengths
+    ],
+)
+def test_gvr2_clus_rows_far_below_envelope(rows, msl_c, top_k, next_n, cr, hinted):
+    """The cluster family at a large envelope with EVERY row far below it (no
+    row pinned to the envelope): rows of at most one chunk run on rank 0 alone
+    (solo), longer rows on the whole cluster. Lengths straddle the solo bound,
+    the n % 4 tail and the short path."""
+    batch = rows // next_n
+    cols = [c for c in _CLUS_LIVE_COLS if c <= msl_c // 2]
+    kv = [cols[b % len(cols)] * cr for b in range(batch)]
+    logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+        kv, next_n, cr, top_k, seed=rows + top_k, msl_c=msl_c
+    )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx if hinted else None,
+        out_indices=out,
+        next_n=next_n,
+        compress_ratio=cr,
+    )
+    _assert_family(rows, msl_c, top_k, next_n, cr, "clus", hint_free=not hinted)
+    _check_varlen_rows(logits, out, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "constant",
+        "two_values",
+        "huge_flood_gt_k",
+        "huge_flood_lt_k",
+        "quantized4",
+        "ramp_up",
+        "ramp_down",
+    ],
+)
+@pytest.mark.parametrize("rows", [32, 64])
+def test_gvr2_clus_adversarial_short_rows(pattern, rows):
+    """Tie floods and degenerate samples drive the retry ladder, the crossing
+    narrowing and the whole-row degen path of the cluster family through both
+    solo rows (rank 0 alone, CTA barriers) and cluster rows (all ranks); the
+    ramps put the whole top-k at the live row's tail (the last chunk, the
+    ragged n % 4 tail) or head."""
+    top_k, msl_c = 1024, 262144
+    gen = torch.Generator(device=_DEV).manual_seed(rows + len(pattern))
+    logits = _adversarial_logits(pattern, rows, msl_c, top_k, gen)
+    cols = [4096, 32768, 40000, 2049, 131072, 16388]
+    n_r = [cols[r % len(cols)] for r in range(rows)]
+    for r in range(rows):
+        logits[r, n_r[r] :] = 3e38  # per-row poison
+    seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    _assert_family(rows, msl_c, top_k, 1, 1, "clus", hint_free=True)
+    _check_varlen_rows(logits, out, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows", [32, 64])
+def test_gvr2_clus_graph_replay_lengths_change(rows):
+    """A clus launch captured at a large envelope, replayed with lengths
+    changed after capture: all rows solo at capture, then rows up to the
+    envelope (every rank busy), then a mix crossing the solo bound and the
+    short path. The solo choice comes from seq_lens at replay time and is
+    never frozen into the graph."""
+    top_k, msl = 512, 262144
+    gen = torch.Generator(device=_DEV).manual_seed(rows)
+    logits = torch.randn(rows, msl, generator=gen, device=_DEV) - 2.0
+    phases = [
+        [2048 + 97 * r for r in range(rows)],  # capture: all solo
+        [msl - 13 * r for r in range(rows)],  # up to the envelope: all cluster
+        [[300, 513, 8192, 32768, 32772, 70001, msl, 0][r % 8] for r in range(rows)],
+        [1000 + 31 * r for r in range(rows)],  # back to solo
+    ]
+    seq_lens = torch.tensor(phases[0], dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):  # eager warm-up on the capturing stream
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.synchronize()
+    _assert_family(rows, msl, top_k, 1, 1, "clus", hint_free=True)
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.current_stream().wait_stream(s)
+    for kv in phases:
+        n_r = _row_valid_lens(kv, rows, 1, 1, msl)
+        seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        logits.copy_(torch.randn(rows, msl, generator=gen, device=_DEV) - 2.0)
+        for r in range(rows):
+            logits[r, n_r[r] :] = 3e38
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, out, n_r, top_k)
+
+
+# ---------------------------------------------------------------------------
 # CUDA graph capture / replay
 # ---------------------------------------------------------------------------
 
@@ -1676,6 +1800,11 @@ def _adversarial_logits(pattern, rows, N, top_k, gen):
         x = torch.randn(rows, N, generator=gen, device=_DEV) * 1e-40
         x[:, : top_k // 2] = 1e-38  # some normals on top
         return x
+    if pattern in ("ramp_up", "ramp_down"):
+        # strictly monotone rows: the top-k is the live row's last (first) k
+        # columns, all in one chunk of a streaming family
+        x = torch.arange(N, device=_DEV, dtype=torch.float32).expand(rows, N) / N
+        return (x if pattern == "ramp_up" else 1.0 - x).contiguous()
     raise ValueError(pattern)
 
 
