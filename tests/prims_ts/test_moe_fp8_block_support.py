@@ -337,7 +337,7 @@ def test_mxfp8_block_support_accepts_bias(monkeypatch):
     assert reason == ""
 
 
-def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
+def test_deepseek_fp8_support_accepts_situ_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
 
@@ -346,16 +346,21 @@ def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
             dtype_act=DtypeTrtllmGen.E4m3,
             dtype_weights=DtypeTrtllmGen.E4m3,
             fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            activation_type=ActivationType.Situ,
         ),
         _inputs(hidden_states_scale=torch.empty((4, 1), dtype=torch.float32)),
         [8, 0],
         weight_layout=WeightLayout.MajorK,
         use_shuffled_weight=True,
+        gemm1_weights_scale=torch.empty((1,), dtype=torch.float32),
+        gemm2_weights_scale=torch.empty((1,), dtype=torch.float32),
         gemm1_alpha=torch.ones((1,), dtype=torch.float32),
+        gemm1_beta=torch.ones((1,), dtype=torch.float32),
+        gemm1_clamp_limit=torch.ones((1,), dtype=torch.float32),
     )
 
-    assert not ok
-    assert "DeepSeek FP8 Prims-TS OA params" in reason
+    assert ok
+    assert reason == ""
 
 
 def test_deepseek_fp8_support_rejects_bias(monkeypatch):
