@@ -950,12 +950,13 @@ def test_gvr2_decode_bound_validation():
 # hard rows on the per-row branches of the capacity-sized launches
 # ---------------------------------------------------------------------------
 # Rows on both edges of the branches a capacity-sized launch takes per row:
-# rows at, below and beyond a decode bound. The scores drive the retry ladder
-# and the degenerate paths (tie floods, +inf floods and +inf in the sampled
-# head, whole -inf rows and rows with fewer than top_k finite scores,
-# denormals, ramps); paged output is mapped back through its injective page
-# table and checked like the unpaged output. Floods of more +inf than top_k
-# are covered separately (test_gvr2_streaming_flood*).
+# the hint-free small-row sample of the one-CTA-per-row slabs (2k < n <=
+# SCAP) and rows at, below and beyond a decode bound. The scores drive the
+# sample, the retry ladder and the degenerate paths (tie floods, +inf floods
+# and +inf in the sampled head, whole -inf rows and rows with fewer than top_k
+# finite scores, denormals, ramps); paged output is mapped back through its
+# injective page table and checked like the unpaged output. Floods of more
+# +inf than top_k are covered separately (test_gvr2_streaming_flood*).
 
 _HARD_PATTERNS = [
     "ties",
@@ -969,6 +970,17 @@ _HARD_PATTERNS = [
     "ramp_up",
     "quantized4",
 ]
+_PAGED_PATTERNS = ["ties", "posinf_k", "neginf_most"]
+
+
+def _with_patterns(cases):
+    """Every pattern for unpaged output, one tie, +inf and -inf pattern for
+    paged output (the last field of each case is its page size)."""
+    return [
+        (*case, pattern)
+        for case in cases
+        for pattern in (_HARD_PATTERNS if case[-1] is None else _PAGED_PATTERNS)
+    ]
 
 
 def _hard_logits(pattern, n_r, width, top_k, seed):
@@ -1062,6 +1074,42 @@ def _run_hard(logits, kv, top_k, n_r, want, next_n=1, cr=1, page_size=None, **kw
     _check_varlen_rows(
         logits, out if unpage is None else unpage(out, next_n), n_r, top_k
     )
+
+
+_SAMPLE_GATE_CASES = [
+    # rows, width, top_k, SCAP of the slab the width launches, page size
+    (148, 130944, 512, 16384, None),  # one-wave 1024-thread slab
+    (75, 65540, 512, 16384, None),  # the same slab: first rows / first width
+    (128, 130944, 1024, 16384, None),  # the same at K = 1024 (aim 7k/4: gate at 2k)
+    (64, 130944, 2048, 16384, None),  # K = 2048: the slab from 33 rows on
+    (128, 130944, 1024, 16384, 64),  # paged: DSv4 page size
+    (149, 65472, 512, 4096, None),  # two-CTA (512, U 8, MINB 2) slab
+    (296, 65472, 1024, 4096, None),  # the same at K = 1024 (aim 7k/4)
+    (297, 32768, 1024, 4096, None),  # (256, U 8, MINB 4) slab
+    (148, 130944, 512, 16384, 128),  # paged: V4.1 page size
+    (296, 65472, 1024, 4096, 64),  # paged: DSv4 page size
+    (297, 32768, 1024, 4096, 1),  # paged: one token per page
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,scap,page_size,pattern", _with_patterns(_SAMPLE_GATE_CASES)
+)
+def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pattern):
+    """Hint-free rows on both edges of the small-row sample (2k < n <= SCAP)
+    and of SCAP itself on every one-CTA-per-row slab that samples them."""
+    edges = [2 * top_k + d for d in range(-1, 6)] + [scap + d for d in (-1, 0, 1, 3, 4)]
+    edges += [top_k, top_k + 1, 1, 0, scap // 2 + 3]
+    gen = torch.Generator().manual_seed(rows + width + top_k)
+    n_r = [
+        edges[r]
+        if r < len(edges)
+        else int(torch.randint(2 * top_k + 1, scap + 1, (1,), generator=gen))
+        for r in range(rows)
+    ]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
 
 
 # Streaming rows whose crossing refine narrows a flood in key space: more than
@@ -1174,6 +1222,8 @@ def test_gvr2_decode_bound_edges(
 
 _REPLAY_BOTH_CASES = [
     # rows, width, top_k, bound, page size, short / long live columns
+    (148, 130944, 512, None, 128, (513, 1024), (1025, 16388)),  # sample gate
+    (296, 65472, 1024, None, 64, (1025, 2048), (2049, 4100)),
     (64, 1048576, 512, 16384, 128, (0, 512), (513, 16384)),  # 16K graph variant
 ]
 
