@@ -401,21 +401,26 @@ def atomic_or_cta(ptr, val):
 
 
 # ---------------------------------------------------------------------------
-# gpu-scope fences + global u64 atomicAdd (SPLIT slab protocol)
+# gpu-scope acq_rel global u64 atomicAdd (SPLIT slab protocol)
 # ---------------------------------------------------------------------------
-def threadfence_gpu():
-    """__threadfence() == fence.acq_rel.gpu — required on BOTH the release and
-    acquire sides of the slab hand-off."""
-    cute.arch.fence_acq_rel_gpu()
+def atomic_add_u64_acq_rel_gpu(ptr, val):
+    """atom.acq_rel.gpu.global.add.u64 returning the OLD value: the slab arrival.
 
-
-def atomic_add_u64_gpu(ptr, val):
-    """atom.global.add.u64 returning the OLD value (arrival RMW).
+    One RMW is both halves of the hand-off. Its release half publishes the
+    calling CTA's slab entries (every thread's stores, ordered before it by a
+    CTA barrier); in the row's last arrival its acquire half covers every
+    earlier arrival's entries (each published by its own RMW on this word), and
+    a CTA barrier after it extends that to every thread of the CTA. (PTX: the
+    barriers synchronize, observation order runs through atomic RMWs, causality
+    order is transitive.) It replaces a fence.acq_rel.gpu before a relaxed RMW
+    plus one after it in the last CTA: ptxas lowers both forms' release half to
+    the same MEMBAR.ALL.GPU, while the acquire half needs only CCTL.IVALL, so
+    the last CTA no longer pays a second GPU-scope fence.
 
     ptr: cute Pointer to an Int64 gmem word; val: cutlass.Int64.
     Packed arrival word: `cutlass.Int64(1 << 32) + cutlass.Int64(myn)`.
     """
-    return cutlass.Int64(cute.arch.atomic_add(ptr, val))
+    return cutlass.Int64(cute.arch.atomic_add(ptr, val, sem="acq_rel", scope="gpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -2892,15 +2897,14 @@ class GvrMainKernel:
                                     )
                             i = i + cutlass.Int32(BLK)
                     cute.arch.barrier()  # ---- barrier (slab publish) ----
-                    if tidx == cutlass.Int32(0):  # release + RMW
-                        C.threadfence_gpu()
+                    if tidx == cutlass.Int32(0):  # release + acquire RMW
                         pdon = cute.make_ptr(
                             cutlass.Int64,
                             gdon_addr + row64 * cutlass.Int64(8),
                             cute.AddressSpace.gmem,
                             assumed_align=8,
                         )
-                        s_pk[0] = C.atomic_add_u64_gpu(
+                        s_pk[0] = C.atomic_add_u64_acq_rel_gpu(
                             pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
                         )
                     cute.arch.barrier()  # ---- barrier (arrival word) ----
@@ -2909,7 +2913,8 @@ class GvrMainKernel:
                     if cutlass.Int32(pk >> cutlass.Int64(32)) == R - cutlass.Int32(1):
                         alive = cutlass.Int32(1)
                     if alive != cutlass.Int32(0):
-                        C.threadfence_gpu()  # acquire
+                        # thread 0's RMW acquired every part's entries and the barrier
+                        # above orders this CTA's reads after it: no fence here
                         if tidx == cutlass.Int32(0):  # ZERO-RESTORE
                             _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
                             _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
