@@ -20,7 +20,6 @@ import pytest
 import pynvml
 import torch
 
-from flashinfer.comm.mapping import Mapping
 from flashinfer.fused_moe.utils import make_random_topk_ids
 from flashinfer.tllm_enums import SfLayout
 from flashinfer.utils import get_compute_capability
@@ -315,10 +314,6 @@ def test_moe_a2a_combine_rejects_noncontiguous_output_before_jit(monkeypatch):
 )
 @pytest.mark.parametrize("payload_in_workspace", [False, True])
 @pytest.mark.parametrize("use_output_buffer", [False, True])
-@pytest.mark.skipif(
-    not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform",
-)
 def test_moe_alltoall_single_gpu(
     num_tokens,
     vector_dim,
@@ -355,21 +350,25 @@ def test_moe_alltoall_single_gpu(
         payload_size_per_token,
         input_tensors[0].shape[-1] * input_tensors[0].itemsize,
     )
-    mapping = Mapping(rank=0, world_size=1)
-    moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
-        mapping,
-        num_tokens,
-        top_k,
-        num_experts,
-        workspace_size_per_rank=workspace_size,
+    workspace = torch.zeros(
+        1, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
     )
+    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(workspace, 0, 1, num_tokens)
 
-    output_tensors = moe_a2a.dispatch(
+    output_tensors, combine_payload_offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
         token_selected_experts,
         input_tensors,
+        workspace,
+        metainfo,
         num_tokens,
-        invalid_token_expert_id=-3,  # Tokens assigned to invalid expert are set to -3
-        expert_id_payload_index=2,
+        ep_rank=0,
+        ep_size=1,
+        top_k=top_k,
+        num_experts=num_experts,
+    )
+    # Tokens assigned to invalid experts are set to -3.
+    trtllm_moe_alltoall.moe_a2a_sanitize_expert_ids(
+        output_tensors[2], workspace, metainfo, 0, -3
     )
 
     # Sort to undo the shuffling that happens in the dispatch kernel.
@@ -379,10 +378,14 @@ def test_moe_alltoall_single_gpu(
         torch.testing.assert_close(output_tensor, input_tensor, atol=0, rtol=0)
 
     if payload_in_workspace:
-        combine_tensor = moe_a2a.get_combine_payload_tensor_in_workspace(
-            num_tokens,
-            input_tensors[hidden_state_index].shape[-1],
-            input_tensors[hidden_state_index].dtype,
+        hidden_state = input_tensors[hidden_state_index]
+        combine_tensor = trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+            workspace[0, :],
+            [1, num_tokens],
+            combine_payload_offset,
+            combine_payload_offset
+            + num_tokens * hidden_state.shape[-1] * hidden_state.itemsize,
+            hidden_state.dtype,
         )
         combine_tensor.copy_(output_tensors[hidden_state_index])
     else:
@@ -393,9 +396,16 @@ def test_moe_alltoall_single_gpu(
         if use_output_buffer
         else None
     )
-    output = moe_a2a.combine(
+    output = trtllm_moe_alltoall.moe_a2a_combine(
         combine_tensor,
         num_tokens,
+        workspace,
+        metainfo,
+        num_tokens,
+        0,
+        1,
+        top_k,
+        combine_payload_offset,
         payload_in_workspace=payload_in_workspace,
         output=output_buffer,
     )
@@ -1732,7 +1742,7 @@ def test_moe_combine_fp8(
     reason="Mnnvl memory is not supported on this platform",
 )
 def test_moe_workspace_size_per_rank():
-    """Test the workspace size per rank for the MoeAlltoAll operation."""
+    """Test the workspace size per rank of the MoE all-to-all ops."""
     ep_size = 8
     num_tokens = 10
     hidden_size = 128
@@ -1744,13 +1754,6 @@ def test_moe_workspace_size_per_rank():
         hidden_size * torch.bfloat16.itemsize,
     )
     assert raw_workspace_size > 0
-
-    moe_workspace_size = (
-        trtllm_moe_alltoall.MoeAlltoAll.get_moe_workspace_size_per_rank(
-            ep_size, topk, num_tokens, hidden_size
-        )
-    )
-    assert moe_workspace_size == raw_workspace_size
 
     empty_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
         ep_size, num_tokens, 0, 0
@@ -1770,17 +1773,6 @@ def test_moe_workspace_size_per_rank():
 
     actual_data_size = non_empty_workspace_size - empty_workspace_size
     assert actual_data_size == hidden_size * ep_size * num_tokens * 2
-
-    mapping = Mapping(rank=0, world_size=1)
-    moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
-        mapping, num_tokens, topk, ep_size, hidden_size=hidden_size
-    )
-    raw_workspace_size = (
-        trtllm_moe_alltoall.MoeAlltoAll.get_moe_workspace_size_per_rank(
-            mapping.moe_ep_size, topk, num_tokens, hidden_size
-        )
-    )
-    assert moe_a2a.workspace_size_per_rank == raw_workspace_size
 
 
 if __name__ == "__main__":

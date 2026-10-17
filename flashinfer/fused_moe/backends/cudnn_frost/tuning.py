@@ -1,9 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Factorized tuning of the bounded quantized Frost candidate pool."""
+"""Factorized tuning of the bounded Frost candidate pool for every dtype."""
 
 from itertools import product
 
 from ....autotuner import AutoTuner, TunableRunner, TuningConfig
+from ...utils import map_to_hybrid_bucket
 from .cache import retain_graph_resources
 from .heuristics import POLICY_VERSION
 
@@ -12,13 +13,19 @@ def prepared_state(runner, inputs, *, hidden_multiplier=1):
     state = runner.launch_state_for(inputs)
     if state is not None:
         return state
-    # The autotuner synthesizes plain tensor lists. Exact-shape plans were
-    # prepared by pack_inputs before this profile is visited.
+    # The autotuner synthesizes plain tensor lists. Find the same bucket state
+    # prepared by pack_inputs; its native executors accept the actual shape.
     t, h = inputs[1].shape
-    for key in reversed(runner._plans):
-        if key[:2] == (t, h * hidden_multiplier):
-            return runner._plans[key]
-    return None
+    bucket = map_to_hybrid_bucket(t, runner.config.execution.tune_max_num_tokens)
+    return runner._plans.get(
+        (
+            bucket,
+            h * hidden_multiplier,
+            runner.config.experts.intermediate_size,
+            runner.config.routing.num_experts,
+            runner.config.routing.top_k,
+        )
+    )
 
 
 class _StageRunner(TunableRunner):
@@ -41,7 +48,13 @@ class _StageRunner(TunableRunner):
         return list(self.plans)
 
     def get_cache_key_extras(self, inputs):
-        return (POLICY_VERSION, self.stage, tuple(self.plans))
+        kernels = self.state.first if self.stage == 1 else self.state.second
+        return (
+            POLICY_VERSION,
+            self.stage,
+            tuple(self.plans),
+            tuple(k.source_sha256 for k in kernels),
+        )
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         if tactic == -1:
@@ -58,12 +71,12 @@ class _StageRunner(TunableRunner):
 
 
 def ranked_tactics(state, inputs, tag):
-    first = tuple(a for a in state.first if not a.quantizes_output)
+    first = tuple(a for a in state.first if not getattr(a, "quantizes_output", False))
     second = state.second
     if len(first) <= 2 and len(second) <= 2:
         # Preserve every offline choice, including its existing fused variants.
         return list(state.launches)
-    fused = tuple(a for a in state.first if a.quantizes_output)
+    fused = tuple(a for a in state.first if getattr(a, "quantizes_output", False))
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:
         config = TuningConfig(

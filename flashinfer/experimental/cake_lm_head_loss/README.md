@@ -8,8 +8,10 @@ chunk 4096).  Tracking issue: flashinfer-ai/flashinfer#5680.
 
 Both the API and the backend are experimental: no compatibility guarantee,
 SM100 (B200 / GB200) is the acceptance architecture and SM103 (B300 / GB300)
-is compiled from the same sources.  The feature is JIT-only and does not
-participate in automatic backend selection, autotuning or trace-apply.
+is compiled from the same sources.  The feature does not participate in
+automatic backend selection, autotuning or trace-apply.  Its libraries are
+loaded prebuilt from `aot/` when the package ships them and JIT-built by
+FlashInfer from `build.json` otherwise (see "Layout of this package").
 
 ## Public entry points (`flashinfer/chunked_lm_head.py`)
 
@@ -334,9 +336,22 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 
 * `cake_jit.py` -- `MODULES` registry (one record per architecture, expanded
   from the compact tables the generated-program export writes between the
-  `generated registry` markers), stage names
-  (`STAGES`, `BASE_STAGES`, `GEMM_STAGES`), record selection
-  (`select_module`) and the JIT specs.
+  `generated registry` markers; a stage's physical record names its program
+  and the architecture-free `library` stem `cake_lm_head_loss_<unit>`), stage
+  names (`STAGES`, `BASE_STAGES`, `GEMM_STAGES`), record selection
+  (`select_module`) and the loader glue: `library_name(name, stage)` is the
+  `build.json` entry `<library>_<arch>` that
+  `load_cake_lm_head_loss_module(name, stage)` loads through `cake_build`.
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  package (byte-identical copies) and this package's build manifest (schema
+  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
+  with its translation units, digests, nvcc flags (including the
+  toolchain-conditional `nvcc_flags_if`, see the toolchain note), closure
+  digest and `aot/<name>.so` path.  `cake_build.load_library(name)` loads the
+  prebuilt library when `aot/` holds it and otherwise JIT-builds the entry
+  through FlashInfer (`gen_jit_spec`, sources digest-verified first);
+  `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
+  `flashinfer.jit.build_jit_specs`.
 * `cake_backend.py` -- validation, chunk plans, workspace layout, memory
   accounting, argument-plan binding, the prepared runner, the torch reference
   path, the autograd `Function`s and the eager entry points.
@@ -351,8 +366,10 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
   (`cake_lm_head_loss_shim_<digest>.cuh`, one per distinct host contract:
   descriptor encoders, argument checks, dynamic shared memory and launch
-  geometry).  `.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests.
+  geometry); `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the
+  launchers include (shipped with the package, no FlashInfer header).
+  `.clang-format` disables formatting: the sources are identity-checked by
+  the manifest's digests.
 
 ## Status
 
@@ -369,7 +386,10 @@ registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
 
 Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
-with `-Xptxas -O0` (`cake_jit.toolchain_workaround_flags`).  That toolchain's
+with `-Xptxas -O0` (build data: every `sm_103a` entry of `build.json` carries
+`{"cuda": "==13.0", "flags": ["-Xptxas", "-O0"]}` under `nvcc_flags_if`; the
+JIT path applies it when the local toolkit matches, a prebuilt `aot/` built by
+that toolkit already carries it).  That toolchain's
 ptxas mis-schedules their 2-CTA TMA producer loops: at -O3 (and -O2, which
 emits the same code), with a short K loop (`chunk_size <= 1024`) the dW
 accumulate GEMM's second B-operand TMA load is rejected by the TMA unit with
@@ -384,7 +404,9 @@ device-count logits GEMM queued before the count is read back) still reaches a
 schedule (the one-row tail chunk of a two-chunk call) in every run of the test
 file, while the host-count path passes (as does the -O0 code with the hidden
 count); so on CUDA 13.0 the `sm_103a` calls also take the host-count path
-(`cake_jit.toolchain_runs_hidden_count`; the same kernels per row, bitwise the
-same outputs).  Every other architecture / toolchain pair builds at the default
+(`cake_jit.toolchain_runs_hidden_count`, which reads the building toolkit's
+version from `cake_build.record_cuda_version` -- the prebuilt libraries'
+`aot/build_info.json`, else the local toolkit; the same kernels per row,
+bitwise the same outputs).  Every other architecture / toolchain pair builds at the default
 optimization level and runs the hidden count.  Both are mitigations of the
 observed ptxas 13.0 fault, not a root-cause fix.

@@ -31,7 +31,10 @@ process and the autograd wrapper end to end.
 from __future__ import annotations
 
 import pytest
+import re
 import statistics
+from pathlib import Path
+
 import torch
 
 import flashinfer
@@ -44,7 +47,8 @@ from flashinfer.cake_rmsnorm_train import (
     cake_rmsnorm_train_forward,
     is_cake_rmsnorm_train_supported,
 )
-from flashinfer.jit import cake_rmsnorm_train as loader
+from flashinfer.cake_rmsnorm_train_backend import cake_build
+from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
@@ -670,6 +674,47 @@ def test_argument_validation(hidden: int) -> None:
     cpu = torch.zeros(8, hidden, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
         cake_rmsnorm_train_forward(cpu, w.cpu(), eps)
+
+
+def test_registry_records_reference_the_build_manifest() -> None:
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding
+    sources under ``csrc/`` of this package, their digests and a closure digest;
+    the registry itself records the host plan only.
+    """
+
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == "flashinfer.cake_rmsnorm_train_backend"
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).parent
+    referenced = set()
+    for name, record in loader.MODULES.items():
+        assert record["library"] == record["kernel"], name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        for arch in record["arches"]:
+            library = loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{record['library']}_kernel.cu",
+                f"csrc/{record['library']}_binding.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (package / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert "--use_fast_math" not in entry["nvcc_flags"]
+            assert "--prec-div=true" in entry["nvcc_flags"]
+    assert referenced == set(libraries)
+    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
 
 def test_function_signature_is_exported() -> None:

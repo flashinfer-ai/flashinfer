@@ -1520,10 +1520,13 @@ class CudnnGroupedGemmBf16Config:
       ``m_indptr`` layout, gather the activations, GEMM1, the typed activation,
       GEMM2 and the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_bf16`.
     - Activations: raw ``bfloat16 [M, H]`` (``M`` tokens of hidden size ``H``).
+    - ``hidden_size`` and ``intermediate_size`` must be multiples of 8.
     - Weights: :meth:`prepare_weights` takes the canonical ``[up, gate]`` BF16
-      weights and stores the fc1 rows as ``[gate, up]``.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
-      SM103 and SM107, torch ops elsewhere.
+      weights as they are.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]`` for the caller to combine.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -1581,10 +1584,14 @@ class CudnnGroupedGemmFp8PerTensorConfig:
       ``hidden_states_scale=None``.
     - Weights: :meth:`prepare_weights` takes both static multipliers and folds
       them into the view.
-    - The fused Triton SwiGLU kernel requantizes the intermediate, so SwiGLU with
-      default scalars is the only supported activation.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
-      SM103 and SM107, torch ops elsewhere.
+    - The BF16 intermediate is requantized to E4M3 with the static
+      ``intermediate_scale_global`` multiplier before GEMM2.
+    - ``hidden_size`` must be a multiple of 16 and ``intermediate_size`` a
+      multiple of 8.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]``.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -1651,8 +1658,10 @@ class CudnnGroupedGemmMxfp8Config:
     - Weights: E4M3 with UE8M0 block scales per expert (see
       :meth:`prepare_weights`).
     - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
-      SM107, torch ops elsewhere.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]``.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -1728,8 +1737,10 @@ class CudnnGroupedGemmNvfp4Config:
       expert's global dequant; GEMM2's is applied by the finalize, or to the
       unfinalized rows.
     - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
-    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
-      SM107, torch ops elsewhere.
+    - Permute and finalize: FlashInfer's ``moe_sort``, ``moe_permute`` and
+      ``moe_unpermute`` kernels.
+    - Activation functions: SwiGLU with default scalars, GeGLU, GELU, ReLU, SiLU
+      and Identity, on FlashInfer's ``moe_activation`` kernel.
     - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
       ``[gemm2_out, expert_weights, token_to_row]``.
     - Expert parallelism: assignments to non-local experts are masked out.
@@ -2384,6 +2395,65 @@ class SM12xNvfp4Bf16Config:
 
 
 @dataclass(frozen=True)
+class SM12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL NVFP4-weight x NVFP4-activation backend.
+
+    The W4A4 peer of :class:`SM12xNvfp4Bf16Config`: it reads the same prepared
+    cuTile NVFP4 weight view in place and quantizes BF16 hidden states to NVFP4
+    inside the op, so one weight copy serves W4A4 and W4A16. Activation global
+    scales are taken from the optional view keys ``"w1_input_global_scale"``
+    and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
+    ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
+    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
+    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
+    supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the shared cuTile NVFP4 view from checkpoint NVFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("sm12x_nvfp4", ...)``, or
+        reuse a view already registered for ``"cutile_nvfp4"``.
+        """
+        return CuTileNvfp4Config.prepare_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "SM12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -2496,7 +2566,7 @@ class CudnnFrostBf16Config:
 
 @dataclass(frozen=True)
 class CudnnFrostMxfp8Config:
-    """Frost MXFP8 MoE on SM107, with packed precomputed routing.
+    """Frost MXFP8 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
     ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
@@ -2505,7 +2575,7 @@ class CudnnFrostMxfp8Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
@@ -2513,7 +2583,7 @@ class CudnnFrostMxfp8Config:
 
 @dataclass(frozen=True)
 class CudnnFrostNvfp4Config:
-    """Frost NVFP4 MoE on SM107, with packed precomputed routing.
+    """Frost NVFP4 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
     ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
@@ -2522,7 +2592,7 @@ class CudnnFrostNvfp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
@@ -2530,7 +2600,7 @@ class CudnnFrostNvfp4Config:
 
 @dataclass(frozen=True)
 class CudnnFrostMxfp8Mxfp4Config:
-    """Frost MXFP8-activation / MXFP4-weight MoE on SM107.
+    """Frost MXFP8-activation / MXFP4-weight MoE on SM107 and SM120.
 
     Requires packed precomputed routing and H/I divisible by 128. Register
     prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
@@ -2540,7 +2610,7 @@ class CudnnFrostMxfp8Mxfp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
@@ -2586,6 +2656,7 @@ BackendConfigType = Union[
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -2629,6 +2700,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )
@@ -2692,6 +2764,10 @@ _DEFAULT_BACKEND = BackendOptions(
         CuTileMxfp8Bf16Config(),
         CuTileMxfp8Config(),
         CuTileNvfp4Bf16Config(),
+        CudnnFrostBf16Config(),
+        CudnnFrostMxfp8Config(),
+        CudnnFrostNvfp4Config(),
+        CudnnFrostMxfp8Mxfp4Config(),
     )
 )
 
