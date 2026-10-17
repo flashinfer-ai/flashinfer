@@ -813,8 +813,18 @@ def _segment_bound(seqlen: int, num_sequences: int) -> int:
     return -(-int(seqlen) // _CHUNK_SIZE) + 2 * int(num_sequences)
 
 
+# Exact-scan launch grid.  This function mirrors the generator's host-side
+# grid rule: the Cake export refuses a loader whose body or values over the
+# generator's probe vector differ from that rule, and the source test
+# ``test_source_persistent_grid_mirrors_the_seed_rule`` pins the values on
+# the shipped SM counts.  The grid is a schedule knob only: every item's
+# arithmetic is the same at any grid (grid-stride loop), so the rule changes
+# the time of a call, never its output.
 def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
-    """Balanced persistent grid for ``total_work`` (sequence, head) items."""
+    """Balanced persistent grid for ``total_work`` (sequence, head) items:
+    one CTA per item up to one wave; beyond it the smallest count of two to
+    four items per CTA that divides ``total_work`` and keeps at least four
+    fifths of the SMs busy; else one CTA per SM."""
 
     full_grid = min(total_work, sm_count)
     if total_work <= sm_count:

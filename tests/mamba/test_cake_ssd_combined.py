@@ -6784,6 +6784,53 @@ def test_source_two_kernel_route_mirrors_the_seed_rule():
     assert route(mode_varlen=True, num_sequences=0, seqlen=100) == "exact"
 
 
+def test_source_persistent_grid_mirrors_the_seed_rule():
+    """``_persistent_grid_size`` mirrors the generator's host-side grid rule:
+    one CTA per (sequence, head) item up to one
+    wave; beyond it the smallest count of two to four items per CTA that
+    divides the items and keeps at least four fifths of the SMs busy; else
+    one CTA per SM.  Pinned on the shipped SM counts (B200 148, GB300 152)
+    at the gate rows' item counts, and checked as a property over four
+    waves."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    grid = module._persistent_grid_size
+    for sm_count in (148, 152):
+        # one wave: one CTA per item
+        for items in (1, 8, 16, 32, 64, 128, sm_count):
+            assert grid(total_work=items, sm_count=sm_count) == items
+        # 256 / 384 / 512 items: two / three / four per CTA on 128 CTAs
+        # (128 x 5 >= 4 x 152)
+        assert grid(total_work=256, sm_count=sm_count) == 128
+        assert grid(total_work=384, sm_count=sm_count) == 128
+        assert grid(total_work=512, sm_count=sm_count) == 128
+        # 296 items: two per CTA on 148 CTAs on either part
+        assert grid(total_work=296, sm_count=sm_count) == 148
+        # 1024 .. 20480 items (the saturated gate rows): one CTA per SM
+        for items in (1024, 2048, 4096, 8192, 20480):
+            assert grid(total_work=items, sm_count=sm_count) == sm_count
+        # odd counts just past one wave: one CTA per SM
+        for items in (sm_count + 1, 255, 257):
+            assert grid(total_work=items, sm_count=sm_count) == sm_count
+        for total_work in range(1, 4 * sm_count + 2):
+            value = grid(total_work=total_work, sm_count=sm_count)
+            assert 1 <= value <= sm_count
+            if total_work <= sm_count:
+                assert value == total_work
+            elif value != sm_count:
+                assert total_work % value == 0 and 2 <= total_work // value <= 4
+                assert value * 5 >= sm_count * 4
+            else:
+                # one CTA per SM only when no smaller balanced grid exists
+                # (296 items on 148 SMs: two per CTA on 148 CTAs is both)
+                assert not any(
+                    total_work % k == 0
+                    and total_work // k < sm_count
+                    and (total_work // k) * 5 >= sm_count * 4
+                    for k in range(2, 5)
+                )
+
+
 def test_source_retained_start_programs_are_the_round5_files():
     """The ``exact_*`` programs are the round-5 start files retained byte for
     byte: the 12 device sources the start loader bound,
