@@ -97,11 +97,12 @@ size_t genericFp4GemmKernelLauncherStreamK(void* D, void const* A, void const* B
 // ============================================================================
 
 // Unified prepareGemmArgs - works for both DP and StreamK schedulers
-template <typename Gemm>
+template <typename Gemm, bool SwapAB>
 inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void const* B,
                                                     void const* input_sf, void const* weight_sf,
                                                     float const* global_sf, int m, int n, int k,
-                                                    int batch_count) {
+                                                    int batch_count,
+                                                    CutlassGemmConfig const& gemmConfig) {
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   using ElementC = void;
   using ElementD = typename Gemm::ElementD;
@@ -136,11 +137,22 @@ inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void
       Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(operator_args.problem_shape);
 
   if constexpr (!std::is_const_v<decltype(operator_args.scheduler.max_swizzle_size)>) {
-    operator_args.scheduler.max_swizzle_size = 1;
+    operator_args.scheduler.max_swizzle_size = gemmConfig.max_swizzle_size;
   }
   if constexpr (!std::is_const_v<decltype(operator_args.scheduler.raster_order)>) {
     using Enum_t = decltype(operator_args.scheduler.raster_order);
-    operator_args.scheduler.raster_order = Enum_t::Heuristic;
+    auto raster = gemmConfig.raster_order;
+    if constexpr (SwapAB) {
+      if (raster == CutlassGemmConfig::RasterOrder::AlongM) {
+        raster = CutlassGemmConfig::RasterOrder::AlongN;
+      } else if (raster == CutlassGemmConfig::RasterOrder::AlongN) {
+        raster = CutlassGemmConfig::RasterOrder::AlongM;
+      }
+    }
+    operator_args.scheduler.raster_order =
+        raster == CutlassGemmConfig::RasterOrder::AlongM   ? Enum_t::AlongM
+        : raster == CutlassGemmConfig::RasterOrder::AlongN ? Enum_t::AlongN
+                                                           : Enum_t::Heuristic;
   }
   operator_args.hw_info.cluster_shape = dim3(1, 1, 1);
   operator_args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
@@ -149,14 +161,15 @@ inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void
 }
 
 // Unified runGemm - works for both DP and StreamK schedulers
-template <typename Gemm>
+template <typename Gemm, bool SwapAB>
 inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* input_sf,
                              void const* weight_sf, float const* global_sf, int m, int n, int k,
-                             int batch_count, char* workspace, size_t const workspaceBytes,
-                             cudaStream_t stream, const char* scheduler_name) {
+                             int batch_count, CutlassGemmConfig const& gemmConfig, char* workspace,
+                             size_t const workspaceBytes, cudaStream_t stream,
+                             const char* scheduler_name) {
   Gemm gemm;
-  auto args =
-      prepareGemmArgsImpl<Gemm>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count);
+  auto args = prepareGemmArgsImpl<Gemm, SwapAB>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+                                                batch_count, gemmConfig);
 
   // Return workspace size query
   if (!A && !B && !D) {
@@ -298,11 +311,13 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                           \
     using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_;                                  \
     if constexpr (SWAP_AB_) {                                                                                        \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                       \
-                                             batch_count, workspace, workspaceBytes, stream, "");                    \
+      return runFp4GemmImpl<Fp4GemmOperator, SWAP_AB_>(D, B, A, weight_sf, input_sf, global_sf, n,                   \
+                                                       m, k, batch_count, gemmConfig, workspace,                     \
+                                                       workspaceBytes, stream, "");                                  \
     } else {                                                                                                         \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,                       \
-                                             batch_count, workspace, workspaceBytes, stream, "");                    \
+      return runFp4GemmImpl<Fp4GemmOperator, SWAP_AB_>(D, A, B, input_sf, weight_sf, global_sf, m,                   \
+                                                       n, k, batch_count, gemmConfig, workspace,                     \
+                                                       workspaceBytes, stream, "");                                  \
     }                                                                                                                \
   }                                                                                                                  \
                                                                                                                      \
@@ -316,13 +331,13 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                           \
     using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK;                        \
     if constexpr (SWAP_AB_) {                                                                                        \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                       \
-                                             batch_count, workspace, workspaceBytes, stream,                         \
-                                             " StreamK");                                                            \
+      return runFp4GemmImpl<Fp4GemmOperator, SWAP_AB_>(D, B, A, weight_sf, input_sf, global_sf, n,                   \
+                                                       m, k, batch_count, gemmConfig, workspace,                     \
+                                                       workspaceBytes, stream, " StreamK");                          \
     } else {                                                                                                         \
-      return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,                       \
-                                             batch_count, workspace, workspaceBytes, stream,                         \
-                                             " StreamK");                                                            \
+      return runFp4GemmImpl<Fp4GemmOperator, SWAP_AB_>(D, A, B, input_sf, weight_sf, global_sf, m,                   \
+                                                       n, k, batch_count, gemmConfig, workspace,                     \
+                                                       workspaceBytes, stream, " StreamK");                          \
     }                                                                                                                \
   }
 
