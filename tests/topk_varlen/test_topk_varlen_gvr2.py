@@ -2415,6 +2415,85 @@ def test_gvr2_route_unsplit_slab_regime():
     assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
 
 
+def test_gvr2_small_row_sample_gate():
+    """sd_en, the small-row pair sample of the streaming slab (rows of
+    max(2k, sd_en) < n <= SCAP; 0 = off): upstream's K > 1024 off the big regime,
+    and (FlashInfer-local) for hint-free launches the row length past which the
+    sample stages fewer survivors than the row holds (see _small_row_sample)."""
+    g = _host._small_row_sample
+    # hinted: upstream, every row above 2k for K > 1024 off the big regime
+    assert g(2048, False, 1, 2816, False) == 1
+    assert g(512, False, 1, 768, False) == 0 and g(2048, True, 1, 8192, False) == 0
+    # hint-free, one CTA per row: rows longer than aim (the kernel floors sd_en
+    # at 2k): the one-wave slab (aim 2k at K = 512, 7k/4 above) and the 256/512-
+    # thread slabs (aim 7k/4)
+    assert g(512, True, 1, 1024, True) == 1024
+    assert g(1024, True, 1, 1792, True) == 1792
+    assert g(2048, True, 1, 3584, True) == 3584
+    assert g(512, False, 1, 768, True) == 768
+    # hint-free SPLIT: off, as upstream (every part of a row repeats the sample)
+    assert g(512, True, 37, 1024, True) == 0
+    assert g(2048, True, 4, 4096, True) == 0
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,want_hint_free,want_hinted",
+    [
+        (128, 131072, 512, 1024, 0),  # one-wave slab, K=512 (aim 2k)
+        (128, 131072, 1024, 1792, 0),  # one-wave slab, K=1024 (aim 7k/4: floored at 2k)
+        (64, 131072, 2048, 3584, 0),  # one-wave slab, K=2048 (aim 7k/4: floored at 2k)
+        (160, 131072, 512, 896, 0),  # two-CTA slab (aim 7k/4: floored at 2k)
+        (160, 131072, 2048, 3584, 1),  # two-CTA slab, K > 1024 (aim 7k/4)
+        (4, 262144, 512, 0, 0),  # SPLIT slab: off (as upstream)
+        (4, 262144, 2048, 0, 0),  # SPLIT slab, K > 1024: off (as upstream)
+    ],
+)
+def test_gvr2_launcher_small_row_sample(
+    rows, ncols, top_k, want_hint_free, want_hinted
+):
+    """The varlen launcher passes _small_row_sample's sd_en in its tail scalars
+    (aim_base, sfac, amin, sd_en, tsh_en), paged engines like hint-free ones."""
+    for hint_free, page_shift, want in (
+        (True, None, want_hint_free),
+        (True, 6, want_hint_free),
+        (False, None, want_hinted),
+    ):
+        lc = _host._varlen_launcher(
+            rows, ncols, top_k, ncols, 1, 1, hint_free, page_shift
+        )
+        assert lc[0] == "main", lc[0]
+        assert lc[3][3] == want, (hint_free, page_shift, lc[3])
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,cap_c,top_k",
+    [
+        (128, 130944, 1024),  # one-wave slab: aim 1792, sampled above 2k
+        (64, 130944, 2048),  # one-wave slab, K=2048: aim 3584, sampled above 2k
+        (148, 130944, 512),  # one-wave slab, K=512: aim 2k
+    ],
+)
+def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
+    """Hint-free rows on both sides of the launch's small-row sample threshold
+    max(2k, sd_en) (sampled above it, unsampled at or below it) rank exactly,
+    mixed with rows on the 4k and 8k marks and the SCAP edge, at a capacity far
+    above every row. The one-wave slab's aim (sd_en) is at most 2k, so its
+    threshold is the 2k floor."""
+    lc = _host._varlen_launcher(rows, cap_c, top_k, cap_c, 1, 1, True, None)
+    assert 0 < lc[3][3] <= 2 * top_k, lc[3]
+    thr = 2 * top_k
+    edges = [thr, thr + 1, thr - 1, thr + 4, 4 * top_k, 4 * top_k + 1, 8192, 8196]
+    edges += [16384, 16385]
+    cols = [edges[r % len(edges)] for r in range(rows)]
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(
+        cols, 1, 1, top_k, seed=rows + top_k, msl_c=cap_c
+    )
+    indices, _ = _run_gvr2(logits, seq_lens, top_k, None)
+    _check_varlen_rows(logits, indices, n_r, top_k)
+
+
 def test_gvr2_route_reg_clus_sm_count_aware():
     """The clustered-register admission (`av`) follows the SM count on parts with
     >= 148 SMs (Rubin/B300: bigger clusters, reg_clus where B200 falls to the
