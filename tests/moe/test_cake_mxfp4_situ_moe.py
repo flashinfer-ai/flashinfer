@@ -56,6 +56,11 @@ MODES = tuple(
 
 
 def _runner(layout, **overrides):
+    """The wrapper under test.  On a CUDA device that is not an ``sm_103a`` part the host-side tests decide for
+    the contract's SM count: the package carries the forms the plan selects at 148 / 152 SMs, and another part's
+    count must not steer the selection (the ``_cs`` twin's item gate reads the SM count)."""
+    if "sm_count" not in overrides and torch.cuda.is_available() and not _sm_103a():
+        overrides["sm_count"] = plan.CONTRACT_SM_COUNT
     return plan.CakeMxfp4MoEWrapper(
         EXPERTS, TOP_K, HIDDEN, INTERMEDIATE, backend=BACKEND, **layout, **overrides
     )
@@ -263,6 +268,7 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
                 decision.gemm1.kbps,
                 pdl_trigger_after_wait=decision.gemm1.pdl_trigger_after_wait,
                 weight_l2_hint=decision.gemm1.weight_l2_hint is not None,
+                cluster_split=decision.gemm1.cluster_split,
             ).stage,
             kernels.select_gemm2(
                 decision.gemm2.n_tile,
@@ -463,14 +469,24 @@ def test_plan_is_decided_for_the_device_sm_count():
     """The plan decides the cooperative ``moe_sort`` grid (``SMs - 8``) and its per-thread state from the device's
     SM count, read once at construction like the hand-written ``runPostTopKPipeline`` (B300 148 SMs, GB300 152);
     without CUDA the host-only decision table uses the contract's 148.  An explicit ``sm_count=`` is the caller's
-    decision.  The served rows' selections do not depend on the count across the ``sm_103a`` parts."""
+    decision.  The served rows' selections do not depend on the count across the ``sm_103a`` parts; on another
+    CUDA part the host-side tests pin the contract count (``_runner``), the wrapper itself reads the device."""
     runner = _runner(EP8)
-    if torch.cuda.is_available():
+    if _sm_103a():
         sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
         assert runner.sm_count_source == "device"
         assert runner.sm_count == runner.policy.sm_count == sms
+    elif torch.cuda.is_available():
+        assert runner.sm_count_source == "override"
+        assert runner.sm_count == runner.policy.sm_count
+        assert runner.sm_count == plan.CONTRACT_SM_COUNT == 148
+        direct = plan.CakeMxfp4MoEWrapper(
+            EXPERTS, TOP_K, HIDDEN, INTERMEDIATE, backend=BACKEND, **EP8
+        )
+        assert direct.sm_count_source == "device"
+        assert direct.sm_count == plan.device_sm_count()
     else:
         assert runner.sm_count_source == "contract"
         assert runner.sm_count == plan.CONTRACT_SM_COUNT == 148
