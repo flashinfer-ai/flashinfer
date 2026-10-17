@@ -967,6 +967,16 @@ def _main_reg_vpt(blk: int, split: bool, n_env: int) -> int:
     return 4 if blk in (512, 1024) and n_env >= _MAIN_REG_ENV * blk * 16 else 0
 
 
+# FlashInfer-local: the clus engines rank a row of k < n <= 8192 columns with the
+# register family's VPT 2 body on rank 0 (``GvrClusKernel`` ``reg_vpt``) instead
+# of streaming it there alone (a solo row). Measured B200, K <= 1024 presets at
+# serving capacity, 17-74 rows: such rows 1.6-1.8x faster, longer rows within
+# +0.8%, batches of rows n <= k ~60 ns slower (the body's code costs that even
+# when no row takes it). A VPT 4 body for rows up to 16384 was 11-18% slower on
+# rows <= 8192; both bodies together made ptxas spill the streaming loops.
+_CLUS_REG_VPT = 2
+
+
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
@@ -1108,6 +1118,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 pt_smem=pt_smem,
                 pdl=_DECODE_PDL,
                 solo=True,
+                reg_vpt=_CLUS_REG_VPT,
                 **pg,
             )
         )
