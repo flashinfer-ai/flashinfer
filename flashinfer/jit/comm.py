@@ -385,6 +385,9 @@ def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
+    # The kernels use no CUTLASS, so SM107 gets native sm_107a code instead of the
+    # sm100f fallback; the driver rejects that fallback for these kernels on SM107.
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list()
     return gen_jit_spec(
         "moe_ep_nvlink_one_sided_alltoall",
         [
@@ -404,7 +407,7 @@ def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
             str(nv_internal),
             str(nv_internal / "include"),
         ],
-        extra_cuda_cflags=["-DENABLE_BF16"],
+        extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
         extra_ldflags=["-lcuda"],
     )
 
