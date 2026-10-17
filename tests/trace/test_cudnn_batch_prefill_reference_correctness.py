@@ -38,10 +38,20 @@ from tests.trace.reference_utils import (
         ),
     ],
 )
-def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_cudnn_batch_prefill_reference_correctness(shape_kwargs, with_sinks):
     """cudnn_batch_prefill_with_kv_cache kernel vs reference (causal)."""
     from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
     from flashinfer.trace.templates.attention import cudnn_batch_prefill_trace
+
+    if with_sinks:
+        import cudnn
+        from flashinfer.utils import get_compute_capability
+
+        if get_compute_capability(torch.device("cuda")) != (10, 7) or tuple(
+            map(int, cudnn.__version__.split(".")[:2])
+        ) < (1, 32):
+            pytest.skip("Rubin paged sink qualification requires current FE")
 
     torch.manual_seed(0)
     B = shape_kwargs["batch_size"]
@@ -66,6 +76,7 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
     actual_seq_lens_kv = torch.full((B,), kv_len, dtype=torch.int32, device="cuda")
     scale = 1.0 / math.sqrt(D)
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    sinks = torch.linspace(4, 7, Hq, device="cuda") if with_sinks else None
     qo_indptr = torch.zeros(B + 1, dtype=torch.int32, device="cuda")
     qo_indptr[1:] = actual_seq_lens_q.cumsum(0)
     batch_offsets = (
@@ -87,8 +98,11 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
             return_lse=False,
             batch_offsets_q=batch_offsets,
             batch_offsets_o=batch_offsets,
+            sinks=sinks,
         )
     except Exception as exc:
+        if with_sinks:
+            raise
         pytest.skip(f"cudnn_batch_prefill_with_kv_cache unavailable: {exc}")
     ref_out, _ = cudnn_batch_prefill_trace.reference(
         q,
@@ -103,6 +117,7 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
         True,
         False,
         block_tables=block_tables,
+        sinks=sinks,
     )
     # Matches tests/attention/test_cudnn_prefill.py.
     _check(cudnn_batch_prefill_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)

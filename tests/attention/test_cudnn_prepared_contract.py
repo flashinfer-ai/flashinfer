@@ -70,7 +70,8 @@ def test_ordered_execution_errors_are_not_retried(monkeypatch):
 
 
 @pytest.mark.parametrize("ordered", [False, True])
-def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered, with_sinks):
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
     monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
@@ -92,7 +93,11 @@ def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
 
     graph = Graph() if ordered else SimpleNamespace(execute=execute)
     prepared = prefill.CudnnPrefillGraph(
-        None, graph, override_cache=None, return_lse=True
+        None,
+        graph,
+        override_cache=None,
+        return_lse=True,
+        sink_layout=((4,), (1,), torch.float32) if with_sinks else None,
     )
     previous = None
     sources = []
@@ -111,15 +116,22 @@ def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
             batch_offsets_v=indptr,
             batch_offsets_stats=indptr,
         )
-        q = torch.full((3, 4, 8), float(value))
+        q = torch.full((3, 4, 8), float(value), dtype=torch.bfloat16)
+        sinks = torch.full((4,), float(value)) if with_sinks else None
         out, lse, workspace = torch.empty_like(q), torch.empty(3, 4), torch.empty(8)
         plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device, previous)
-        prepared.run_planned(q, q, q, out, lse, workspace, plan=plan, lse_base="ln")
+        prepared.run_planned(
+            q, q, q, out, lse, workspace, plan=plan, lse_base="ln", sinks=sinks
+        )
         torch.testing.assert_close(out, q)
         torch.testing.assert_close(lse, torch.ones_like(lse))
         assert calls[-1][1][100].data_ptr() == indptr.data_ptr()
         assert calls[-1][1][1] is q
         assert calls[-1][1][1000] is out
+        if with_sinks:
+            assert calls[-1][1][prefill.UIDs.SINK_UID.value] is sinks
+        else:
+            assert prefill.UIDs.SINK_UID.value not in calls[-1][1]
         assert calls[-1][2] == dict(workspace=workspace, handle=23)
         sources.append((q, out, indptr))
         previous = plan
@@ -326,7 +338,8 @@ def test_decode_binding_is_per_call_and_lse_is_base2(
     assert packs[-1][decode.UIDs.SINK_UID.value].shape == (1, 4, 1, 1)
 
 
-def test_prefill_match_uses_complete_build_metadata(monkeypatch):
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_prefill_match_uses_complete_build_metadata(monkeypatch, with_sinks):
     monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
     q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
     kv = torch.empty(7, 2, 8, dtype=q.dtype)
@@ -343,13 +356,16 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     monkeypatch.setattr(
         prefill, "_build_prefill_graph", lambda **kw: (object(), []), raising=False
     )
+    sinks = torch.ones(4) if with_sinks else None
     prepared = prefill.prepare_cudnn_batch_prefill(
-        q, kv, kv, 0.5, torch.empty(0), metadata=metadata
+        q, kv, kv, 0.5, torch.empty(0), metadata=metadata, sinks=sinks
     )
 
     def matches(metadata):
         plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
-        return prepared.matches_plan(q, kv, kv, 0.5, plan, metadata.return_lse)
+        return prepared.matches_plan(
+            q, kv, kv, 0.5, plan, metadata.return_lse, sinks=sinks
+        )
 
     assert matches(metadata)
     assert not matches(
@@ -357,6 +373,18 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     )
     assert not matches(replace(metadata, return_lse=True))
     assert not matches(replace(metadata, causal=True))
+    plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
+    if with_sinks:
+        assert prepared.matches_plan(q, kv, kv, 0.5, plan, False, sinks=sinks + 1)
+        assert not prepared.matches_plan(q, kv, kv, 0.5, plan, False)
+        with pytest.raises(ValueError, match="sink layout changed"):
+            prepared.run_planned(
+                q, kv, kv, torch.empty_like(q), None, torch.empty(0), plan=plan
+            )
+    else:
+        assert not prepared.matches_plan(
+            q, kv, kv, 0.5, plan, False, sinks=torch.ones(4)
+        )
 
 
 @pytest.mark.parametrize(

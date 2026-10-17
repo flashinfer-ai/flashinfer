@@ -1938,7 +1938,7 @@ prims_ts_decode_mla_wrapper_trace_dispatch.templates = list(  # type: ignore[att
 
 @torch.no_grad()
 def _gqa_paged_prefill_reference(
-    q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, sm_scale
+    q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, sm_scale, sinks=None
 ):
     total_q, num_qo_heads, head_dim = q.shape
     num_pages, page_size, num_kv_heads, _ = k_cache.shape
@@ -1961,7 +1961,11 @@ def _gqa_paged_prefill_reference(
         q_end = int(qo_indptr[b + 1].item())
         kv_start = int(kv_indptr[b].item())
         kv_end = int(kv_indptr[b + 1].item())
-        if q_start >= q_end or kv_start >= kv_end:
+        if q_start >= q_end:
+            continue
+        if kv_start >= kv_end:
+            if sinks is not None:
+                lse[q_start:q_end] = sinks.float() / math.log(2.0)
             continue
         # kv_indices are page IDs. Gather pages and flatten to a token axis.
         page_ids = kv_indices[kv_start:kv_end].to(torch.long)
@@ -1971,15 +1975,17 @@ def _gqa_paged_prefill_reference(
         q_b = q_f32[q_start:q_end]
         delta = num_kv_tokens - q_b.shape[0]
         for q_idx in range(q_b.shape[0]):
-            max_kv = min(q_idx + 1 + delta, num_kv_tokens)
-            if max_kv <= 0:
+            max_kv = max(0, min(q_idx + 1 + delta, num_kv_tokens))
+            if max_kv == 0 and sinks is None:
                 continue
             global_q = q_start + q_idx
             for h in range(num_qo_heads):
                 kv_h = h // gqa_ratio
                 logits = torch.matmul(q_b[q_idx, h], k_b[:max_kv, kv_h].T) * sm_scale
+                if sinks is not None:
+                    logits = torch.cat([logits, sinks[h : h + 1].float()])
                 lse[global_q, h] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
-                attn = torch.softmax(logits, dim=-1)
+                attn = torch.softmax(logits, dim=-1)[:max_kv]
                 output[global_q, h] = torch.matmul(attn, v_b[:max_kv, kv_h]).to(
                     torch.bfloat16
                 )
@@ -2077,6 +2083,12 @@ gqa_paged_prefill_trace = TraceTemplate(
     },
     inputs={
         "q": Tensor(["total_q", "num_qo_heads", "head_dim"]),
+        "sinks": Tensor(
+            ["num_qo_heads"],
+            dtype="float32",
+            optional=True,
+            description="Per-head sink logits, with a zero value column.",
+        ),
         "k_cache": Tensor(
             ["num_pages", "page_size", "num_kv_heads", "head_dim"],
             param="paged_kv_cache",
@@ -5110,6 +5122,8 @@ def _cudnn_batch_prefill_reference(
     _, num_heads_kv, page_size, _ = k_cache.shape
     gqa_ratio = num_heads_qo // num_heads_kv
     block_tables = kwargs.get("block_tables")
+    actual_seq_lens_q = actual_seq_lens_q.flatten()
+    actual_seq_lens_kv = actual_seq_lens_kv.flatten()
     batch_size = actual_seq_lens_q.shape[0]
     q_offsets = torch.cat(
         [
@@ -5154,10 +5168,13 @@ def _cudnn_batch_prefill_reference(
             if causal:
                 mask = torch.full_like(logits, float("-inf"))
                 for i in range(qi):
-                    mask[i, : i + 1 + max(0, delta)] = 0.0
+                    mask[i, : max(0, i + 1 + delta)] = 0.0
                 logits = logits + mask
+            sinks = kwargs.get("sinks")
+            if sinks is not None:
+                logits = torch.cat([logits, sinks[h].float().expand(qi, 1)], dim=-1)
             lse[q_start:q_end, h] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
-            attn = torch.softmax(logits, dim=-1)
+            attn = torch.softmax(logits, dim=-1)[..., :kv_len]
             output[q_start:q_end, h] = torch.matmul(attn, v_b[kv_h].to(torch.float32))
     return (output.to(q.dtype), lse if return_lse else None)
 
@@ -5227,6 +5244,12 @@ cudnn_batch_prefill_trace = TraceTemplate(
     },
     inputs={
         "q": Tensor(["num_tokens", "num_heads_qo", "head_dim"]),
+        "sinks": Tensor(
+            ["num_heads_qo"],
+            dtype="float32",
+            optional=True,
+            description="Per-head sink logits, with a zero value column.",
+        ),
         "k_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
         "v_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
         "scale": Scalar("float32", description="Softmax scale."),
