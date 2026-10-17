@@ -8,9 +8,10 @@ also check the CUDA, CPU, and NIC visibility assumptions used by the models.
 The model toolchain is Quint 0.33.0 and Apalache 0.62.1. TLC runs through Quint's
 TLA+ translation. An Apalache success covers the requested transition bound. A TLC
 success covers the reachable state graph of the selected finite configuration.
-The six-transition Apalache cases check source reads with three collective
-ranks or four ring origins. Ring checks can reach a relay's NIC read, but
-cannot complete an acknowledgment chain.
+The six-transition bounded cases check source reads with three collective
+ranks or four ring origins. The four-origin, two-rail case uses a finite TLC
+wrapper; the other bounded cases use Apalache. Those ring bounds reach a
+relay's NIC read but cannot complete an acknowledgment chain.
 The exhaustive TLC cases check acknowledgment ordering, finite queue bounds,
 deadlock freedom, and fair progress in their smaller configurations.
 
@@ -80,6 +81,13 @@ ordering.
 ## Ring ownership and queue admission
 
 `ring.qnt` represents each origin, rail, serial, direction, and hop explicitly.
+The constant `QPWorks` map groups work items by queue pair. Queue occupancy,
+posting tickets, and ordered-visibility guards scan that fixed group. Filtering
+the group equals filtering all work items by queue-pair membership and the same
+state predicate; universal quantification has the corresponding equivalence.
+Every lookup uses a member of `Works`, including the first-hop data work created
+from a packet. These helpers preserve the protocol transition relation.
+
 Every relay has a private mailbox for each origin and rail. A packet occupies
 that mailbox while forwarding or waiting for its downstream acknowledgment. The
 origin admits the following serial only after the acknowledgment returns along
@@ -108,6 +116,14 @@ and CQ polling can run between native waiting-loop iterations. The model permits
 additional origin concurrency and abstracts an RDMA payload/header chain as one
 source-lifetime unit; it does not model individual header cache lines, provider
 queue internals, or recursive C call stacks.
+
+`ring_prefix.qnt` adds a transition counter to the four-origin, two-rail ring.
+Every protocol step, including polling, increments it until six. At six only
+polling remains enabled. Every canonical execution prefix of at most six steps
+lifts to a wrapper execution, and every wrapper execution projects to such a
+prefix followed by polling. The projected reachable states are exactly those
+of the six-transition source-ownership query. The wrapper checks `sourceSafe`
+and its counter range; it establishes no temporal progress property.
 
 ## Progress and failures
 
@@ -164,16 +180,18 @@ The runner records the exact command, source hashes, tool version, raw log,
 elapsed time, and TLC state counts. An expected mutation counterexample is an
 accepted test result; a backend error or time limit is an unsuccessful check.
 `tlc.json` caps TLC at a 2 GiB heap and four workers. The runner also supplies
-bounded JVM arguments for the Apalache server. Hardware measurements and model
-results should be stored outside the repository with the source hashes recorded
-by the runner.
+a 512 MiB translation-server heap for TLC and a 2 GiB heap for Apalache.
+Explicit JVM environment arguments override these server defaults. Hardware
+measurements and model results should be stored outside the repository with the
+source hashes recorded by the runner.
 
 The default exhaustive four-rank ring case has adjacent active origins zero and
 one, whose own and relayed data share a QP. Larger four-origin, two-rail, and
-three-rank configurations also have short six-transition Apalache checks; those
-bounds do not reach complete operations or establish behavior after serial
-reuse. Deeper bounds and the unrestricted four-origin TLC graph are optional
-cases selected with `--include-expensive`. Backend time limits remain
+three-rank configurations also have short six-transition source-read checks;
+those bounds do not reach complete operations or establish behavior after serial
+reuse. The two-rail ring uses the TLC wrapper; its direct Apalache query remains
+available with `--include-expensive`. Deeper bounds and the unrestricted
+four-origin TLC graph are optional cases selected with that flag. Backend time limits remain
 inconclusive even when shorter or more restricted checks pass.
 
 Separate exhaustive single-origin cases cover two consecutive serials through

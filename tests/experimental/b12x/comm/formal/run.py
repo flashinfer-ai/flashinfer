@@ -60,8 +60,10 @@ def main() -> int:
     if "step" in case:
         command += ["--step", case["step"]]
     environment = dict(os.environ)
-    environment.setdefault("JAVA_TOOL_OPTIONS", "-Xmx2g -XX:ActiveProcessorCount=4")
-    environment.setdefault("JVM_ARGS", "-Xmx2g -XX:ActiveProcessorCount=4")
+    server_heap = "512m" if case["backend"] == "tlc" else "2g"
+    jvm_args = f"-Xmx{server_heap} -XX:ActiveProcessorCount=4"
+    environment.setdefault("JAVA_TOOL_OPTIONS", jvm_args)
+    environment.setdefault("JVM_ARGS", jvm_args)
     start = time.monotonic()
     log_path = output / f"{args.case}.log"
     timed_out = False

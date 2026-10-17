@@ -43,14 +43,15 @@ module ring {
     sender(a) == sender(b) and receiver(a) == receiver(b) and a._2 == b._2
   pure def data(p: Packet, hop: int): Work = (p._1, p._2, p._3, 0, hop)
   pure def ack(p: Packet, hop: int): Work = (p._1, p._2, p._3, 1, hop)
-  def outstanding(w: Work): int = Works.filter(v => sameQP(v, w) and
+  pure val QPWorks = Works.mapBy(w => Works.filter(v => sameQP(v, w)))
+  def outstanding(w: Work): int = QPWorks.get(w).filter(v =>
     s.wire.get(v) > 0 and s.wire.get(v) < 5).size()
   def healthy(w: Work): bool = sender(w) != FAILED_RANK and receiver(w) != FAILED_RANK
-  def orderReady(w: Work, level: int): bool = Works.forall(v =>
-    not(sameQP(v, w)) or s.ticket.get(v) == 0 or
+  def orderReady(w: Work, level: int): bool = QPWorks.get(w).forall(v =>
+    s.ticket.get(v) == 0 or
     s.ticket.get(v) >= s.ticket.get(w) or s.wire.get(v) >= level)
   def nextTicket(w: Work): int =
-    Works.filter(v => sameQP(v, w) and s.ticket.get(v) > 0).size() + 1
+    QPWorks.get(w).filter(v => s.ticket.get(v) > 0).size() + 1
   def servicing(rank: int): bool = SERVICE_WHILE_WAITING or
     not(s.admitted.exists(p => p._1 == rank and not(s.acknowledged.contains(p))))
 

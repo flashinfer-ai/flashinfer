@@ -42,14 +42,6 @@
       "max_steps": 6,
       "expected": "pass"
     },
-    "ring-apalache-4r2h": {
-      "file": "ring.qnt",
-      "module": "ring_4r2h",
-      "backend": "apalache",
-      "invariant": "sourceSafe",
-      "max_steps": 6,
-      "expected": "pass"
-    },
     "ring-tlc-ack-chain": {
       "file": "ring.qnt",
       "module": "ring_ack_chain",
@@ -112,6 +104,13 @@
       "invariant": "healthySafety",
       "temporal": "healthyProgress",
       "expected": "pass"
+    },
+    "ring-tlc-4r2h-prefix6": {
+      "file": "ring_prefix.qnt",
+      "module": "ring_prefix6",
+      "backend": "tlc",
+      "invariant": "sourceSafe,counterBound",
+      "expected": "pass"
     }
   },
   "optional_cases": {
@@ -161,6 +160,14 @@
       "backend": "tlc",
       "invariant": "healthySafety",
       "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-apalache-4r2h": {
+      "file": "ring.qnt",
+      "module": "ring_4r2h",
+      "backend": "apalache",
+      "invariant": "sourceSafe",
+      "max_steps": 6,
       "expected": "pass"
     }
   }
