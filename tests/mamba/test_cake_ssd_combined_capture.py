@@ -847,6 +847,394 @@ def test_prepare_and_run_refuse_other_capabilities_alike_without_gpu(monkeypatch
     assert calls == [] and loads == []
 
 
+# ---------------------------------------------------------------------------
+# CPU: the two-kernel family's tail-wave pair program against the other route
+# rules -- the chunk-parallel override, the fused window with its capability
+# split of the derived triple form, and the ring / noring choice.
+
+_TAIL_SM_COUNTS = (148, 152)
+# 64 sequences x 8 heads = 512 (sequence, head) items of 16 chunks each: the
+# pair program's measured row (4 sequences x 128 heads on the production head
+# count) at this runner's head count.  Above one item per SM on both devices,
+# the balanced persistent grid is 128 CTAs (makespan 4 items) and the pair
+# makespan ceil(512 / 74) / 2 = 3.5 beats it.
+_TAIL_NUM_SEQS, _TAIL_SEQLEN = 64, 2048
+_TAIL_FORMS = ("batched", "cu_seqlens", "trusted", "triple_i32", "triple_i64")
+
+
+def _tail_call(form, *, num_seqs=_TAIL_NUM_SEQS, seqlen=_TAIL_SEQLEN):
+    """Inputs and keyword arguments of a 512-item x 16-chunk call on CPU
+    tensors: batched, or packed varlen (``num_seqs`` sequences of ``seqlen``
+    tokens) on the ``cu_seqlens`` form, the seq_idx triple with the caller's
+    trusted table (``trusted``) or the triple deriving its table
+    (``triple_i32`` / ``triple_i64``)."""
+
+    if form == "batched":
+        x = torch.empty((num_seqs, seqlen, 8, 64), dtype=torch.bfloat16)
+        dt = torch.empty((num_seqs, seqlen, 8), dtype=torch.float32)
+        B = torch.empty((num_seqs, seqlen, 8, 128), dtype=torch.bfloat16)
+        A = torch.empty((8,), dtype=torch.float32)
+        return (x, dt, A, B, torch.empty_like(B)), {}
+    total = num_seqs * seqlen
+    tensors = _cpu_inputs(total)
+    if form == "cu_seqlens":
+        cu_seqlens = torch.arange(0, total + 1, seqlen, dtype=torch.int32)
+        return tensors, {"cu_seqlens": cu_seqlens}
+    dtype = torch.int64 if form == "triple_i64" else torch.int32
+    chunks = total // 128  # sequences aligned to chunk boundaries
+    ids = torch.arange(num_seqs, dtype=dtype)
+    kwargs = {
+        "seq_idx": torch.repeat_interleave(ids, seqlen).reshape(1, total),
+        "chunk_indices": torch.arange(chunks, dtype=torch.int32),
+        "chunk_offsets": torch.zeros(chunks, dtype=torch.int32),
+        "num_seqs": num_seqs,
+    }
+    if form == "trusted":
+        kwargs["seq_chunk_cumsum"] = torch.arange(
+            0, num_seqs + 1, dtype=torch.int32
+        ) * (seqlen // 128)
+    return tensors, kwargs
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
+@pytest.mark.parametrize("sm_count", _TAIL_SM_COUNTS)
+@pytest.mark.parametrize("form", _TAIL_FORMS)
+def test_prepare_and_run_resolve_the_tail_pair_program_without_gpu(
+    monkeypatch, arch, sm_count, form
+):
+    """``prepare`` and ``run`` of a two-kernel exact-scan call above one item
+    per SM with 16 chunks per item resolve the ``exactpre_*_tail`` pair
+    program -- the even grid ``2 * (sm_count // 2)``, the 2-CTA cluster shape,
+    the two-kernel preprocess ahead of it -- on 148 and 152 SMs, both
+    capabilities, batched and every packed-varlen form, from the one route
+    path.  The capability split of the derived triple form (``exactmeta`` /
+    ``exactone``) acts inside the fused window only, so on this shape both
+    capabilities reach the pair program."""
+
+    module = _module()
+    seq_idx_dtype = torch.int64 if form == "triple_i64" else torch.int32
+    varlen = form != "batched"
+    calls, loads = [], []
+    runner = _cpu_runner(
+        module,
+        monkeypatch,
+        calls,
+        loads,
+        has_varlen=varlen,
+        arch=arch,
+        seq_idx_dtype=seq_idx_dtype,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
+    (x, dt, A, B, C), kwargs = _tail_call(form)
+    out = torch.empty_like(x)
+    items, chunks = _TAIL_NUM_SEQS * 8, _TAIL_SEQLEN // 128
+    total_tokens = _TAIL_NUM_SEQS * _TAIL_SEQLEN
+    # The route's quantities for this shape: outside the fused window, the
+    # pair rule met, no noring condition (that is one-chunk geometry).
+    assert not module.fused_selected(
+        nheads=8,
+        num_sequences=_TAIL_NUM_SEQS,
+        nchunks=chunks,
+        mode_varlen=varlen,
+        total_tokens=total_tokens,
+    )
+    assert (
+        module.host_chunks_per_item(
+            mode_varlen=varlen,
+            num_sequences=_TAIL_NUM_SEQS,
+            seqlen=total_tokens if varlen else _TAIL_SEQLEN,
+        )
+        == chunks
+    )
+    assert module.tail_selected(
+        total_work=items, chunks_per_item=chunks, sm_count=sm_count
+    )
+    assert (
+        module._exact_scan_variant(
+            mode_varlen=varlen,
+            has_z=False,
+            nheads=8,
+            num_sequences=_TAIL_NUM_SEQS,
+            total_tokens=total_tokens,
+            batch=1 if varlen else _TAIL_NUM_SEQS,
+            seqlen=total_tokens if varlen else _TAIL_SEQLEN,
+            state_dtype=torch.bfloat16,
+        )
+        == ""
+    )
+
+    prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs, out=out)
+
+    assert calls == [] and runner.last_program_name is None
+    mode = "varlen" if varlen else "batched"
+    assert prepared.program_name == f"exactpre_bf16_{mode}_tail"
+    program = module._PROGRAMS[prepared.program_name]
+    assert program.family == "exactpre" and program.variant == "tail"
+    assert program.cluster_dims == (2, 1, 1)
+    assert prepared.grid == (module._tail_grid_size(sm_count=sm_count), 1, 1)
+    assert prepared.grid == (sm_count, 1, 1) and prepared.grid[0] % 2 == 0
+    # the two-kernel preprocess publishes delta / cumsum ahead of the scan
+    assert prepared.preprocess_grid[0] >= 1
+    assert prepared.workspace_key.from_cu_seqlens == (form == "cu_seqlens")
+    assert prepared.workspace_key.caller_cumsum == (form == "trusted")
+    assert prepared.workspace_key.publish_table is False
+    assert loads == [(prepared.program_name, arch)]
+
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "invalid-after-prepare")
+    out_run, _final = runner.run(x, dt, A, B, C, **kwargs, out=out)
+    name, launch = calls[-1]
+    assert out_run is out
+    assert name == runner.last_program_name == prepared.program_name
+    assert launch["main_grid"] == prepared.grid
+    assert launch["preprocess_grid"] == prepared.preprocess_grid
+    # the two-kernel main kernel reads the published table
+    assert launch["main"]["metadata_from_cu_seqlens"] == module._TABLE_PUBLISHED
+    assert loads == [(prepared.program_name, arch)]  # no new load
+    assert runner._allocations_in_last_run == 0
+    assert len(runner._workspaces) == 1
+    assert prepared.workspace_key in runner._workspaces
+
+
+@pytest.mark.parametrize("sm_count", _TAIL_SM_COUNTS)
+def test_tail_route_precedes_the_noring_variant_without_gpu(monkeypatch, sm_count):
+    """The variant is decided in order -- chunk-parallel, fused, the pair
+    rule, then the ring / noring choice -- so where the pair rule fires the
+    ``_tail`` program wins over a ``noring`` reading of the same shape; with
+    the pair rule off, the same shape takes the variant function's answer on
+    the balanced persistent grid, from ``prepare`` and ``run`` alike.  The
+    two readings never coincide on a real shape (``noring`` is one-chunk
+    geometry, the pair rule needs 16 chunks), so each is forced here."""
+
+    module = _module()
+    rule = module.tail_selected
+    for pair_rule, expected in (
+        (True, "exactpre_bf16_batched_tail"),
+        (False, "exactpre_bf16_batched_noring"),
+    ):
+        calls, loads = [], []
+        runner = _cpu_runner(module, monkeypatch, calls, loads)
+        monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
+        monkeypatch.setattr(module, "_exact_scan_variant", lambda **_: "noring")
+        monkeypatch.setattr(
+            module,
+            "tail_selected",
+            lambda _on=pair_rule, **kwargs: _on and rule(**kwargs),
+        )
+        (x, dt, A, B, C), _ = _tail_call("batched")
+        out = torch.empty_like(x)
+        grid = (
+            module._tail_grid_size(sm_count=sm_count)
+            if pair_rule
+            else module._persistent_grid_size(total_work=512, sm_count=sm_count)
+        )
+
+        prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, out=out)
+
+        assert prepared.program_name == expected, (pair_rule, prepared.program_name)
+        assert prepared.grid == (grid, 1, 1)
+        runner.run(x, dt, A, B, C, out=out)
+        name, launch = calls[-1]
+        assert name == runner.last_program_name == prepared.program_name
+        assert launch["main_grid"] == prepared.grid
+        assert runner._allocations_in_last_run == 0
+    # Disjoint on real shapes: every noring window lies below the pair rule's
+    # chunk floor.
+    assert module._TAIL_MIN_CHUNKS == 16
+    _low, high = module._EXACT_NORING_BATCHED_SEQLEN
+    assert -(-(high - 1) // 128) < module._TAIL_MIN_CHUNKS
+    _low, high = module._EXACT_NORING_VARLEN_TOKENS
+    assert -(-(high - 1) // 128) < module._TAIL_MIN_CHUNKS
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
+@pytest.mark.parametrize("sm_count", _TAIL_SM_COUNTS)
+def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
+    monkeypatch, arch, sm_count
+):
+    """The fused window and the pair rule are disjoint on both capabilities
+    and both devices: no shape is both ``fused_selected`` and
+    ``tail_selected`` (the window caps batched calls at 16 chunks and 2048
+    chunk-items and varlen calls at 256 items and 512 chunk-items; the pair
+    rule needs more items than SMs and 16 chunks per item), so the fused
+    programs -- ``exactfused``, and the derived triple form's ``exactmeta``
+    on SM100 / ``exactone`` on SM103 -- ship no pair program and never launch
+    on the even grid.  Asserted over a grid of shapes on the route functions,
+    on the program table, and through ``prepare`` / ``run`` for every
+    packed-varlen form inside the window, including the publishing form that
+    keeps the two-kernel program on SM103."""
+
+    module = _module()
+    rule, fused = module.tail_selected, module.fused_selected
+    for nheads in (8, 128):
+        for num_sequences in (1, 2, 4, 8, 16, 19, 32, 37, 64, 128, 256):
+            items = num_sequences * nheads
+            for chunks in (1, 2, 4, 8, 15, 16, 17, 32, 64):
+                tail = rule(total_work=items, chunks_per_item=chunks, sm_count=sm_count)
+                in_window = any(
+                    fused(
+                        nheads=nheads,
+                        num_sequences=num_sequences,
+                        nchunks=chunks,
+                        mode_varlen=mode_varlen,
+                        total_tokens=num_sequences * chunks * 128,
+                    )
+                    for mode_varlen in (False, True)
+                )
+                assert not (tail and in_window), (nheads, num_sequences, chunks)
+    for name, program in module._PROGRAMS.items():
+        if program.family in ("exactfused", "exactmeta", "exactone"):
+            assert program.variant != "tail" and not name.endswith("_tail"), name
+    assert set(module._VARIANT_CLUSTER_DIMS) == {("exactpre", "tail")}
+
+    # Inside the window (2 sequences x 8 heads, 3 packed chunks): the program
+    # of every form by capability, none on the pair program's grid.
+    seqlen, num_seqs = 300, 2
+    derived = "exactmeta" if arch == "sm_100a" else "exactone"
+    two_kernel = module.two_kernel_family(
+        mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
+    )
+    families = {
+        "cu_seqlens": "exactfused",
+        "trusted": "exactfused",
+        "triple_i32": derived,
+        "triple_i64": derived,
+        "publish": "exactmeta" if arch == "sm_100a" else two_kernel,
+    }
+    assert fused(
+        nheads=8,
+        num_sequences=num_seqs,
+        nchunks=3,
+        mode_varlen=True,
+        total_tokens=seqlen,
+    )
+    assert not rule(
+        total_work=num_seqs * 8,
+        chunks_per_item=module.host_chunks_per_item(
+            mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
+        ),
+        sm_count=sm_count,
+    )
+    grid = module._persistent_grid_size(total_work=num_seqs * 8, sm_count=sm_count)
+    for form, family in families.items():
+        seq_idx_dtype = torch.int64 if form == "triple_i64" else torch.int32
+        calls, loads = [], []
+        runner = _cpu_runner(
+            module,
+            monkeypatch,
+            calls,
+            loads,
+            has_varlen=True,
+            arch=arch,
+            seq_idx_dtype=seq_idx_dtype,
+        )
+        monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
+        x, dt, A, B, C = _cpu_inputs(seqlen)
+        out = torch.empty_like(x)
+        if form == "cu_seqlens":
+            kwargs = {"cu_seqlens": torch.tensor([0, 150, seqlen], dtype=torch.int32)}
+        else:
+            kwargs = {
+                "seq_idx": torch.zeros((1, seqlen), dtype=seq_idx_dtype),
+                "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+                "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+                "num_seqs": num_seqs,
+            }
+            if form == "trusted":
+                kwargs["seq_chunk_cumsum"] = torch.tensor([0, 1, 3], dtype=torch.int32)
+            elif form == "publish":
+                kwargs["seq_chunk_cumsum"] = torch.full(
+                    (num_seqs + 1,), -1, dtype=torch.int32
+                )
+                kwargs["update_seq_chunk_cumsum"] = True
+        if form == "publish":
+            # ``prepare`` reads a caller table as trusted; the publishing
+            # form is a ``run`` shape of its own (``publish_table``): its
+            # first call materialises the workspace, the second resolves the
+            # same program from the same key and allocates nothing.
+            runner.run(x, dt, A, B, C, **kwargs, out=out)
+            first, _launch = calls[-1]
+            runner.run(x, dt, A, B, C, **kwargs, out=out, return_final_states=False)
+            name, launch = calls[-1]
+            assert name == first
+            (key,) = runner._workspaces.keys()
+            assert runner._workspaces.get(key).workspace["program"] == name
+            assert len(runner._workspaces) == 1
+        else:
+            prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs, out=out)
+            runner.run(x, dt, A, B, C, **kwargs, out=out)
+            name, launch = calls[-1]
+            assert name == prepared.program_name
+            assert launch["main_grid"] == prepared.grid
+            assert launch["preprocess_grid"] == prepared.preprocess_grid
+            assert prepared.workspace_key.publish_table is False
+            assert runner._allocations_in_last_run == 0
+        program = module._PROGRAMS[name]
+        assert program.family == family, (arch, form, name)
+        assert program.variant == "" and program.cluster_dims == (1, 1, 1)
+        assert not name.endswith("_tail")
+        assert launch["main_grid"] == (grid, 1, 1) == (16, 1, 1)
+        if family == "exactone":
+            # one launch; its private table has one row per CTA of the
+            # persistent grid, never of the pair program's grid
+            assert launch["preprocess_grid"] == (0, 1, 1)
+            scratch = launch["main"]["seq_chunk_cumsum"]
+            assert scratch.numel() == grid * (num_seqs + 1)
+        else:
+            assert launch["preprocess_grid"][0] >= (family != "exactfused")
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
+@pytest.mark.parametrize("sm_count", _TAIL_SM_COUNTS)
+@pytest.mark.parametrize("mode", ("always", "three_phase", "never"))
+def test_chunk_parallel_override_decides_before_the_tail_route_without_gpu(
+    monkeypatch, arch, sm_count, mode
+):
+    """``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` is read first: on the pair
+    program's shape ``always`` / ``three_phase`` run the forced chunk-parallel
+    program (one CTA per SM, no variant, no cluster shape) and ``never`` only
+    disables the chunk-parallel rule -- the exact-scan route still reaches
+    the pair program.  ``prepare`` freezes the reading and ``run`` launches
+    it, allocating nothing."""
+
+    module = _module()
+    calls, loads = [], []
+    runner = _cpu_runner(module, monkeypatch, calls, loads, arch=arch)
+    monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
+    (x, dt, A, B, C), _ = _tail_call("batched")
+    out = torch.empty_like(x)
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, mode)
+    expected = {
+        "always": "chunkpar_bf16_batched",
+        "three_phase": "chunkpar3_bf16_batched",
+        "never": "exactpre_bf16_batched_tail",
+    }[mode]
+
+    prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, out=out)
+
+    assert calls == [] and runner.last_program_name is None
+    assert prepared.program_name == expected
+    assert prepared.workspace_key.chunk_parallel_mode == mode
+    program = module._PROGRAMS[expected]
+    if mode == "never":
+        assert program.variant == "tail" and program.cluster_dims == (2, 1, 1)
+    else:
+        assert program.variant == "" and program.cluster_dims == (1, 1, 1)
+    # the pair program's even grid and the chunk-parallel one-CTA-per-SM grid
+    # (8192 tiles here) both fill the device
+    assert prepared.grid == (sm_count, 1, 1)
+    assert loads == [(expected, arch)]
+
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "invalid-after-prepare")
+    runner.run(x, dt, A, B, C, out=out)
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == prepared.program_name
+    assert launch["main_grid"] == prepared.grid
+    assert launch["preprocess_grid"] == prepared.preprocess_grid
+    assert loads == [(expected, arch)]  # no new load
+    assert runner._allocations_in_last_run == 0
+    assert len(runner._workspaces) == 1
+
+
 def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
     """``prepare`` materialises the workspace (with the static final-states
     buffer), loads the program exactly once, freezes the family override and
