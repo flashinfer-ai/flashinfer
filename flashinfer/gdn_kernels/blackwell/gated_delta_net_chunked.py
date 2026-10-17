@@ -211,7 +211,15 @@ class GatedDeltaNetChunkedKernel:
         store_final_state: bool = True,
         enable_checkpoints: bool = False,
         is_persistent: bool = True,
+        state_stride_divisibility: int = 1,
     ):
+        if state_stride_divisibility < 1 or (
+            state_stride_divisibility & (state_stride_divisibility - 1)
+        ):
+            raise ValueError(
+                "state_stride_divisibility must be a positive power of two, got "
+                f"{state_stride_divisibility}"
+            )
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
         self.state_dtype = state_dtype
@@ -227,6 +235,8 @@ class GatedDeltaNetChunkedKernel:
         self.store_final_state = store_final_state
         self.enable_checkpoints = enable_checkpoints
         self.is_persistent = is_persistent
+        # Divisibility of the state slot/head/V strides; 1 = unknown.
+        self.state_stride_divisibility = state_stride_divisibility
 
         # ------------------------------------------------------------------
         # Warp assignments  (12 warps total)
@@ -508,32 +518,31 @@ class GatedDeltaNetChunkedKernel:
                 stride=(o.stride[2], o.stride[0], (o.stride[1], h_r * o.stride[1])),
             ),
         )
+
+        def _state_view(s):
+            """(V, K, (h_r, h_qv), N) view of an ``[N, H, V, K]`` state tensor."""
+            stride_n, stride_h, stride_v = s.stride[0], s.stride[1], s.stride[2]
+            if cutlass.const_expr(self.state_stride_divisibility > 1):
+                stride_n = cute.assume(stride_n, divby=self.state_stride_divisibility)
+                stride_h = cute.assume(stride_h, divby=self.state_stride_divisibility)
+                stride_v = cute.assume(stride_v, divby=self.state_stride_divisibility)
+            return cute.make_tensor(
+                s.iterator,
+                cute.make_layout(
+                    (s.shape[2], s.shape[3], (h_r, h_qv), s.shape[0]),
+                    stride=(
+                        stride_v,
+                        s.stride[3],
+                        (stride_h, h_r * stride_h),
+                        stride_n,
+                    ),
+                ),
+            )
+
         if cutlass.const_expr(s_in is not None):
-            s_in = cute.make_tensor(
-                s_in.iterator,
-                cute.make_layout(
-                    (s_in.shape[2], s_in.shape[3], (h_r, h_qv), s_in.shape[0]),
-                    stride=(
-                        s_in.stride[2],
-                        s_in.stride[3],
-                        (s_in.stride[1], h_r * s_in.stride[1]),
-                        s_in.stride[0],
-                    ),
-                ),
-            )
+            s_in = _state_view(s_in)
         if cutlass.const_expr(s_out is not None):
-            s_out = cute.make_tensor(
-                s_out.iterator,
-                cute.make_layout(
-                    (s_out.shape[2], s_out.shape[3], (h_r, h_qv), s_out.shape[0]),
-                    stride=(
-                        s_out.stride[2],
-                        s_out.stride[3],
-                        (s_out.stride[1], h_r * s_out.stride[1]),
-                        s_out.stride[0],
-                    ),
-                ),
-            )
+            s_out = _state_view(s_out)
         if cutlass.const_expr(self.enable_checkpoints):
             s_checkpoints = cute.make_tensor(
                 s_checkpoints.iterator,
