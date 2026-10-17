@@ -33,6 +33,37 @@ def _mixed_paged_supported() -> bool:
     return cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True)
 
 
+@pytest.mark.parametrize(
+    "backend_version,frontend_version,mixed,expected",
+    [
+        (92400, "1.27.0", True, False),
+        (92500, "1.26.0", True, False),
+        (92500, "1.27.0", True, True),
+        (92400, "1.25.0", False, True),
+    ],
+)
+def test_cudnn_direct_seqlens_version_gate(
+    monkeypatch, backend_version, frontend_version, mixed, expected
+):
+    class FakeCudnn:
+        __version__ = frontend_version
+
+        @staticmethod
+        def backend_version():
+            return backend_version
+
+    cudnn_prefill._cudnn_supports_direct_seqlens.cache_clear()
+    monkeypatch.setattr(cudnn_prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(cudnn_prefill, "cudnn", FakeCudnn)
+    try:
+        assert (
+            cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=mixed)
+            is expected
+        )
+    finally:
+        cudnn_prefill._cudnn_supports_direct_seqlens.cache_clear()
+
+
 def _make_paged_inputs(
     batch_size, s_qo, s_kv, page_size, num_qo_heads, num_kv_heads, head_dim, device
 ):
