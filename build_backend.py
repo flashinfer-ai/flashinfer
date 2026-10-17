@@ -1086,7 +1086,48 @@ def write_if_different(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _ensure_jit_submodules() -> None:
+    """Initialize cutlass/cccl/spdlog submodules when they are empty.
+
+    SM120 kernels are JIT-only (no pre-built cache wheel exists), so the
+    CUTLASS and CCCL headers must be present at runtime.  Without this
+    step, ``pip install .`` from a source checkout that did not pass
+    ``--recurse-submodules`` silently produces a wheel with no JIT
+    headers, and every SM120 JIT compilation fails at runtime with
+    ``cutlass/arch/arch.h not found``.
+
+    Guarded on ``.git`` because an sdist install has no git metadata:
+    the submodule trees travel inside the sdist as plain directories.
+    """
+    in_git_repo = (_root / ".git").exists()
+    _JIT_SUBMODULES = ("cutlass", "cccl", "spdlog")
+    for name in _JIT_SUBMODULES:
+        submod = _root / "3rdparty" / name
+        if submod.exists() and any(submod.iterdir()):
+            continue
+        if not in_git_repo:
+            print(
+                f"[flashinfer] WARNING: 3rdparty/{name} is empty and this is "
+                f"not a git checkout.  SM120 JIT compilation will fail.  "
+                f"Install from a git clone with --recurse-submodules, or "
+                f"symlink the {name} headers into "
+                f"$(python -c 'import flashinfer,os;print(os.path.dirname(flashinfer.__file__))')/data/{name}",
+                flush=True,
+            )
+            continue
+        print(
+            f"[flashinfer] Initializing 3rdparty/{name} submodule...",
+            flush=True,
+        )
+        subprocess.run(
+            ["git", "submodule", "update", "--init", f"3rdparty/{name}"],
+            cwd=_root,
+            check=True,
+        )
+
+
 def _create_data_dir(use_symlinks=True):
+    _ensure_jit_submodules()
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
