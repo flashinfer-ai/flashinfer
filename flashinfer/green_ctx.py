@@ -316,8 +316,12 @@ def _indexed(dev) -> torch.device:
 def get_locality_domain_count(dev: torch.device) -> int:
     r"""Number of locality domains (uGPUs, one per die) of ``dev``.
 
-    Returns 1 when the device or the installed driver / cuda-python does not expose
-    locality domains.
+    Args:
+        dev: The CUDA device (``"cuda"`` without an index means the current device).
+
+    Returns:
+        The number of locality domains: 2 on Rubin VR200, 1 when the device or the
+        installed driver / cuda-python does not expose locality domains.
     """
     attr = getattr(
         driver.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT", None
