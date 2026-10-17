@@ -1974,11 +1974,11 @@ class GvrMainKernel:
         # the mirror chain (runtime divides + isqrt fixups) per thread costs
         # more instructions than the rest of the kernel on 1-row launches.
         # warp0 alone walks the chain and publishes the four derived scalars
-        # through s_lad; the other warps spend the wait issuing L2 prefetch
-        # hints for this CTA's own P3 slice (register-free, so zero pressure
-        # on the 64-register arms — the PRIME-LATE register loads below are
-        # untouched and simply hit L2).  Values are bit-identical to the
-        # per-thread derivation this replaces.
+        # through s_lad; in prefill the other warps spend the wait issuing L2
+        # prefetch hints for this CTA's own P3 slice (register-free, so zero
+        # pressure on the 64-register arms — the PRIME-LATE register loads
+        # below are untouched and simply hit L2).  Values are bit-identical to
+        # the per-thread derivation this replaces.
         if cutlass.const_expr(self.varlen):
             if tidx < cutlass.Int32(32):
                 if short == cutlass.Int32(0):
@@ -2086,26 +2086,27 @@ class GvrMainKernel:
                         else:
                             s_ofs[0] = cutlass.Int32(0) - lead
             # Register-free L2 hints for the first U-batch of this CTA's own
-            # P3 slice (clamped in-row): the data P3 touches first starts
-            # flowing while warp0 walks the chain. Short rows clamp every
-            # hint to the row's last line — harmless.
-            # prefill: the base is shifted to col0, so clamp within the row's own
-            # window [col0, ke) — n4-1 is the last full in-window float4.
+            # P3 slice, prefill only: the data P3 touches first starts flowing
+            # while warp0 walks the chain. The base is shifted to col0, so
+            # clamp within the row's own window [col0, ke) — n4-1 is the last
+            # full in-window float4. Decode issues none: one hint per float4
+            # is eight per L2 line, and on a short row or a SPLIT part's small
+            # slice nearly every hint clamps to one line. Without them decode
+            # is faster on every main plan at the serving capacity (B200,
+            # 708 cells: SPLIT 0.87x, one CTA per row 0.97x geomean).
             if cutlass.const_expr(self.prefill):
                 plim4 = n4 - cutlass.Int32(1)
                 if plim4 < cutlass.Int32(0):
                     plim4 = cutlass.Int32(0)
-            else:
-                plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
-            for uu in cutlass.range_constexpr(U):
-                # NOTE: names must not collide with the PRIME-LATE block's
-                # i_/ic — the DSL kills inner-scope names at region exit and
-                # a later same-name assignment inside a dynamic `if` trips
-                # "is None prior to this if".
-                pic = c0 + tidx + cutlass.Int32(uu * BLK)
-                if pic >= c1:
-                    pic = plim4
-                C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+                for uu in cutlass.range_constexpr(U):
+                    # NOTE: names must not collide with the PRIME-LATE block's
+                    # i_/ic — the DSL kills inner-scope names at region exit and
+                    # a later same-name assignment inside a dynamic `if` trips
+                    # "is None prior to this if".
+                    pic = c0 + tidx + cutlass.Int32(uu * BLK)
+                    if pic >= c1:
+                        pic = plim4
+                    C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
             cute.arch.barrier()  # publish s_lad (also covers the smem inits)
             SMP = s_lad[0]
             SS2 = s_lad[1]
