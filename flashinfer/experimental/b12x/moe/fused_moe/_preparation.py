@@ -60,6 +60,7 @@ class RouteTopKInvocation:
     has_correction_bias: bool = False
     has_image_correction_bias: bool = False
     has_image_mask: bool = False
+    has_valid_tokens: bool = False
     routed_scaling_factor: float = 1.0
     logits_row_stride: int | None = None
     topk_row_stride: int | None = None
@@ -79,6 +80,7 @@ class RouteTopKInvocation:
             has_correction_bias=self.has_correction_bias,
             has_image_correction_bias=self.has_image_correction_bias,
             has_image_mask=self.has_image_mask,
+            has_valid_tokens=self.has_valid_tokens,
             routed_scaling_factor=self.routed_scaling_factor,
             logits_row_stride=self.logits_row_stride or self.num_experts,
             topk_row_stride=self.topk_row_stride or self.top_k,
@@ -454,7 +456,7 @@ class _W4A16PrimaryLaunches:
             )
         )
         if native_direct:
-            return self.packed, self.topk_sum, None
+            return self.packed, self.topk_sum[route_ids_dtype], None
         direct = (
             int(tokens) == self.tokens
             and self.route_mode != "packed"
@@ -465,7 +467,9 @@ class _W4A16PrimaryLaunches:
         if direct:
             return (
                 self.direct_mapped if has_route_map else self.direct,
-                self.mapped_topk_sum if has_route_map else self.topk_sum,
+                (self.mapped_topk_sum if has_route_map else self.topk_sum)[
+                    route_ids_dtype
+                ],
                 None,
             )
         if self.route_pack is None:
@@ -474,7 +478,7 @@ class _W4A16PrimaryLaunches:
             )
         return (
             self.packed_mapped if has_route_map else self.packed,
-            self.topk_sum,
+            (self.mapped_topk_sum if has_route_map else self.topk_sum)[route_ids_dtype],
             self.route_pack,
         )
 
@@ -486,8 +490,12 @@ class _W4A16PrimaryLaunches:
                 self.packed_mapped,
                 self.direct,
                 self.direct_mapped,
-                self.topk_sum,
-                self.mapped_topk_sum,
+                *(() if self.topk_sum is None else self.topk_sum.values()),
+                *(
+                    ()
+                    if self.mapped_topk_sum is None
+                    else self.mapped_topk_sum.values()
+                ),
                 self.native_direct,
                 *(() if self.route_pack is None else self.route_pack.carriers()),
                 *(() if self.a4_prefill is None else self.a4_prefill.carriers()),
@@ -679,21 +687,32 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                     direct_topk_routes=True,
                     use_expert_map=True,
                 )
-        topk_sum = compile_w4a16_topk_sum(
-            m=tokens,
-            topk=core.num_topk,
-            hidden_size=core.k,
-            element_dtype=element_dtype,
+        topk_sum = MappingProxyType(
+            {
+                dtype: compile_w4a16_topk_sum(
+                    m=tokens,
+                    topk=core.num_topk,
+                    hidden_size=core.k,
+                    element_dtype=element_dtype,
+                    route_ids_dtype=dtype,
+                )
+                for dtype in (torch.int32, torch.int64)
+            }
         )
-        mapped_topk_sum = compile_w4a16_topk_sum(
-            m=tokens,
-            topk=core.num_topk,
-            hidden_size=core.k,
-            element_dtype=element_dtype,
-            num_experts=core.weight_E,
-            route_num_experts=caps.route_num_experts or core.weight_E,
-            route_ids_dtype=torch.int32,
-            use_expert_map=True,
+        mapped_topk_sum = MappingProxyType(
+            {
+                dtype: compile_w4a16_topk_sum(
+                    m=tokens,
+                    topk=core.num_topk,
+                    hidden_size=core.k,
+                    element_dtype=element_dtype,
+                    num_experts=core.weight_E,
+                    route_num_experts=caps.route_num_experts or core.weight_E,
+                    route_ids_dtype=dtype,
+                    use_expert_map=True,
+                )
+                for dtype in (torch.int32, torch.int64)
+            }
         )
         route_pack = compile_w4a16_route_pack_launches(
             tokens=tokens,
@@ -1649,6 +1668,7 @@ def compile_route_topk(query_payload, ordinal):
             1 if query.has_image_mask else 0,
             query.routed_scaling_factor,
             query.num_experts,
+            torch.int32,
             BLOCK_E=block_e,
             TOP_K=query.top_k,
             TOPK_BLOCK=topk_block,
@@ -1656,6 +1676,7 @@ def compile_route_topk(query_payload, ordinal):
             SCORE_FUNC=query.score_func,
             HAS_CORRECTION_BIAS=query.has_correction_bias,
             HAS_IMAGE_BIAS=query.has_image_correction_bias,
+            HAS_VALID_TOKENS=query.has_valid_tokens,
             num_warps=4 if block_e <= 256 else 8,
             grid=(query.num_tokens,),
         )
@@ -1690,6 +1711,11 @@ class _RouteTopKState:
         correction_bias = kwargs.pop("correction_bias", None)
         image_correction_bias = kwargs.pop("image_correction_bias", None)
         image_mask = kwargs.pop("image_mask", None)
+        num_valid_tokens = kwargs.pop("num_valid_tokens", None)
+        if (num_valid_tokens is not None) != self.query.has_valid_tokens:
+            raise ValueError(
+                "valid-token count differs from the prepared route invocation"
+            )
         if (correction_bias is not None) != self.query.has_correction_bias:
             raise ValueError(
                 "correction bias differs from the prepared route invocation"
@@ -1712,6 +1738,7 @@ class _RouteTopKState:
             correction_bias=correction_bias,
             image_correction_bias=image_correction_bias,
             image_mask=image_mask,
+            num_valid_tokens=num_valid_tokens,
             routed_scaling_factor=self.query.routed_scaling_factor,
             _launcher=self.launcher,
             **kwargs,

@@ -749,6 +749,7 @@ class MoeRouteQuery:
     topk_row_stride: int
     ids_row_stride: int
     weights_row_stride: int
+    has_valid_tokens: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -805,7 +806,9 @@ def _validate_fc2_query(query: MoeFC2Query, _device) -> None:
 ROUTE_TUNING = make_fixed_contract(
     component_id="moe.route_topk", query_type=MoeRouteQuery, backend="triton"
 )
-ROUTE_TUNING = replace(ROUTE_TUNING, validate_query=_validate_route_query)
+ROUTE_TUNING = replace(
+    ROUTE_TUNING, query_schema_version=23, validate_query=_validate_route_query
+)
 
 FC2_TUNING = make_fixed_contract(
     component_id="moe.fc2_w4a16", query_type=MoeFC2Query, backend="cutedsl"

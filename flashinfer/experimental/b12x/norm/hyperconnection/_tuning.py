@@ -117,6 +117,7 @@ def _validate_query(query, device):
         "combine_norm",
         "engram_mix",
         "swiglu",
+        "relu2",
         "add",
         "sigmoid",
         "head_gate",

@@ -4,6 +4,7 @@
 - ``ple_embedding``: fused PLE hashing and BF16, FP8, or NVFP4 table lookup.
 - ``ple``: stateful PLE residual contribution and short-convolution state.
 - ``short_conv``: raw-input depthwise convolution, SiLU, and persistent history.
+- ``mamba_ssd``: chunked Mamba-2 selective scan with explicit recurrent state.
 - ``gdn_decode``: packed gated-delta recurrent decode and output gating.
 - ``gdn_prefill``: chunked scalar-gated GDN prefill over the state pool.
 - ``kda_prefill``: chunked lower-bounded KDA prefill over the state pool.
@@ -22,6 +23,7 @@ _OP_MODULES = (
     "ple_embedding",
     "ple",
     "short_conv",
+    "mamba_ssd",
     "gdn_decode",
     "kda_prefill",
     "gdn_prefill",

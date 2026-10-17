@@ -65,6 +65,7 @@ _OPS: tuple[str, ...] = (
     "sequence.ple_embedding",
     "sequence.ple",
     "sequence.short_conv",
+    "sequence.mamba_ssd",
     "sequence.engram",
     "sequence.embedding",
     "sequence.gdn_decode",

@@ -12,7 +12,10 @@ from b12x.moe._shared import routing
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("top_k,renormalize", [(1, True), (8, True), (8, False)])
-def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
+@pytest.mark.parametrize("with_valid_tokens", [False, True])
+def test_sigmoid_fp32_router_selection_and_weights(
+    top_k, renormalize, with_valid_tokens
+):
     from b12x.moe import fused_moe
     from b12x.preparation import PreparationSession, PreparedCall
 
@@ -21,6 +24,11 @@ def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
     selected = torch.empty((65, top_k), device="cuda")
     ids = torch.empty((65, top_k), device="cuda", dtype=torch.int32)
     weights = torch.empty_like(selected)
+    count = (
+        torch.tensor([65], device="cuda", dtype=torch.int32)
+        if with_valid_tokens
+        else None
+    )
     plan = fused_moe.plan_route_topk(
         fused_moe.RouteTopKInvocation(
             num_tokens=65,
@@ -30,6 +38,7 @@ def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
             score_func="sigmoid",
             renormalize=renormalize,
             has_correction_bias=True,
+            has_valid_tokens=with_valid_tokens,
             routed_scaling_factor=2.5,
         )
     )
@@ -42,7 +51,12 @@ def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
                     name="sigmoid",
                     prepare_call=lambda state: PreparedCall(
                         run=lambda: state.run(
-                            logits, selected, ids, weights, correction_bias=bias
+                            logits,
+                            selected,
+                            ids,
+                            weights,
+                            correction_bias=bias,
+                            num_valid_tokens=count,
                         )
                     ),
                 ),
@@ -50,7 +64,13 @@ def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
         )
         run = torch.compile(
             lambda: fused_moe.route_topk(
-                plan, logits, selected, ids, weights, correction_bias=bias
+                plan,
+                logits,
+                selected,
+                ids,
+                weights,
+                correction_bias=bias,
+                num_valid_tokens=count,
             ),
             fullgraph=True,
         )
@@ -60,7 +80,9 @@ def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
         with session.capture(), torch.cuda.graph(graph):
             run()
         session.freeze()
-        for offset in (-2.0, 2.0):
+        for live, offset in ((65, -2.0), (41, 2.0), (0, -2.0), (8, 2.0), (65, -2.0)):
+            if count is not None:
+                count.fill_(live)
             logits.add_(offset)
             logits[0].fill_(-1000)
             graph.replay()
@@ -77,12 +99,15 @@ def test_sigmoid_fp32_router_selection_and_weights(top_k, renormalize):
             if renormalize:
                 expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20
             expected_weights *= 2.5
+            expected_logits = logits.gather(1, expected_ids)
+            if count is not None:
+                expected_ids[live:] = -1
+                expected_weights[live:] = 0
+                expected_logits[live:] = 0
             torch.testing.assert_close(
                 ids, expected_ids.to(torch.int32), rtol=0, atol=0
             )
-            torch.testing.assert_close(
-                selected, logits.gather(1, expected_ids), rtol=0, atol=0
-            )
+            torch.testing.assert_close(selected, expected_logits, rtol=0, atol=0)
             torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=1e-7)
         graph.reset()
 
@@ -158,6 +183,7 @@ def test_prepared_route_uses_complete_positional_abi(score_func, with_bias):
                 int(with_bias),
                 1.5,
                 384,
+                None,
                 512,
                 6,
                 8,
@@ -165,6 +191,7 @@ def test_prepared_route_uses_complete_positional_abi(score_func, with_bias):
                 score_func,
                 with_bias,
                 with_bias,
+                False,
             ),
             None,
         )
@@ -186,7 +213,7 @@ def test_unprepared_route_preserves_jit_arguments(monkeypatch):
     routing.route_topk(logits, selected, ids, weights, renormalize=False)
     grid, args, options = calls[0]
     assert grid == (1,)
-    assert len(args) == 16 and args[:4] == (logits, selected, ids, weights)
+    assert len(args) == 17 and args[:4] == (logits, selected, ids, weights)
     assert options == {
         "BLOCK_E": 128,
         "TOP_K": 2,
@@ -195,6 +222,7 @@ def test_unprepared_route_preserves_jit_arguments(monkeypatch):
         "SCORE_FUNC": "softmax",
         "HAS_CORRECTION_BIAS": False,
         "HAS_IMAGE_BIAS": False,
+        "HAS_VALID_TOKENS": False,
         "num_warps": 4,
     }
 

@@ -377,6 +377,11 @@ class _Pointwise:
                 value = activated * up
             elif cutlass.const_expr(self.operation == "add"):
                 value = Float32(left[offset]) + Float32(right[offset])
+            elif cutlass.const_expr(self.operation == "relu2"):
+                activated = Float32(left[offset])
+                if activated < Float32(0):
+                    activated = Float32(0)
+                value = activated * activated
             elif cutlass.const_expr(self.operation == "head_gate"):
                 row = offset // Int64(self.width * self.heads)
                 head = (offset // Int64(self.width)) % Int64(self.heads)

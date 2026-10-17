@@ -18,6 +18,7 @@ OPERANDS = (
     "out",
     "gathered_state",
     "request_ids",
+    "conv_bias",
 )
 
 
@@ -31,12 +32,21 @@ class ShortConvQuery:
     max_seqs: int
     max_state_slots: int
     max_speculative_tokens: int
+    round_before_silu: bool = True
+    bias_dtype: str | None = None
     weight_dtype: str = "bfloat16"
     state_strides: tuple[int, int, int] | None = None
     input_row_stride: int | None = None
     input_alignments: tuple[int, ...] = (16,) * len(OPERANDS)
 
     def __post_init__(self):
+        if (
+            self.bias_dtype not in (None, "bfloat16", "float32")
+            or type(self.round_before_silu) is not bool
+        ):
+            raise ValueError(
+                "short convolution requires BF16/FP32 bias and a boolean rounding contract"
+            )
         if self.weight_dtype not in ("bfloat16", "float32"):
             raise ValueError("short convolution weights require BF16 or FP32")
         if self.mode not in ("decode", "prefill", "mixed"):

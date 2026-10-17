@@ -13,6 +13,51 @@ from b12x.norm.hyperconnection import _impl
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("rows,width", [(1, 257), (32, 5376), (4096, 5376)])
+def test_prepared_relu2_replays_changed_inputs(rows, width):
+    device = require_b12x()
+    source = torch.randn((rows, width), dtype=torch.bfloat16, device=device)
+    output = torch.empty_like(source)
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=rows, hidden_size=width),
+        invocation={"operation": "relu2"},
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="relu2",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.launch(source, source, output)
+                    ),
+                ),
+            )
+        )
+        hc.run_relu2(source, out=output, plan=plan)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hc.run_relu2(source, out=output, plan=plan)
+        for scale in (1.0, 8.0, 0.125):
+            source.normal_().mul_(scale)
+            source.flatten()[:5] = torch.tensor(
+                [float("nan"), float("inf"), -float("inf"), -0.0, 0.0],
+                device=device,
+                dtype=source.dtype,
+            )
+            expected = source.relu().square()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, expected, rtol=0, atol=0, equal_nan=True)
+        with pytest.raises(ValueError, match="overlap"):
+            hc.run_relu2(source, out=source, plan=plan)
+        with pytest.raises(ValueError, match="width"):
+            hc.run_relu2(source[:, : width - 1], out=output[:, : width - 1], plan=plan)
+
+
 def _engram_reference(
     state: torch.Tensor,
     projected_kv: torch.Tensor,

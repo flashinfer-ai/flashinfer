@@ -7944,12 +7944,9 @@ def _validate_frozen_w4a16_launch(
         getattr(fused, "tc_decode_fused_sum", False)
         or getattr(fused, "prefill_fused_sum_fp32", False)
     )
-    has_topk_sum = planned_capacity in workspace.planned_topk_sum_launches
-    if workspace.full_rotation:
-        has_topk_sum = any(
-            isinstance(key, tuple) and key[0] == planned_capacity
-            for key in workspace.planned_topk_sum_launches
-        )
+    has_topk_sum = any(
+        key[0] == planned_capacity for key in workspace.planned_topk_sum_launches
+    )
     if not fused_reduces_routes and not has_topk_sum:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned top-k sum launch "
@@ -8019,7 +8016,7 @@ def _w4a16_preplanned_launches(
     ):
         tc_decode = workspace.planned_tc_decode_launches.get(token_count)
         if tc_decode is not None:
-            return tc_decode, workspace.planned_topk_sum_launches.get(token_count)
+            return tc_decode, None
     if (
         not collect_activation_amax
         and route_mode == "direct"
@@ -8027,7 +8024,9 @@ def _w4a16_preplanned_launches(
     ):
         direct = workspace.planned_direct_topk_launches.get(token_count)
         if direct is not None:
-            return direct, workspace.planned_topk_sum_launches.get(token_count)
+            return direct, workspace.planned_topk_sum_launches.get(
+                (token_count, route_ids_dtype, sum_uses_expert_map)
+            )
     planned_capacity = min(
         (
             planned
@@ -8049,13 +8048,7 @@ def _w4a16_preplanned_launches(
         or getattr(fused, "prefill_fused_sum_fp32", False)
     ):
         return fused, None
-    topk_sum_key: object = planned_capacity
-    if workspace.full_rotation:
-        topk_sum_key = (
-            planned_capacity,
-            route_ids_dtype,
-            sum_uses_expert_map,
-        )
+    topk_sum_key = (planned_capacity, route_ids_dtype, sum_uses_expert_map)
     topk_sum = workspace.planned_topk_sum_launches.get(topk_sum_key)
     if fused is None or topk_sum is None:
         raise RuntimeError(
@@ -9220,7 +9213,7 @@ def _prewarm_w4a16_planned_launches(
         input_element_dtype = _w4a16_element_dtype(workspace.dtype)
         element_dtype = "fp16" if full_rotation else input_element_dtype
         fused_launches: dict[object, object] = {}
-        topk_sum_launches: dict[int, object] = {}
+        topk_sum_launches: dict[tuple[int, torch.dtype, bool], object] = {}
         mapped_direct_launches: dict[int, object] = {}
         direct_topk_launches: dict[int, object] = {}
         tc_decode_launches: dict[int, object] = {}
@@ -9326,12 +9319,20 @@ def _prewarm_w4a16_planned_launches(
                                     resolved_topk_sum
                                 )
             elif not build_prefill_fused_sum:
-                topk_sum_launches[token_count] = compile_w4a16_topk_sum(
-                    m=token_count,
-                    topk=workspace.num_topk,
-                    hidden_size=workspace.k,
-                    element_dtype=element_dtype,
-                )
+                for ids_dtype in (torch.int32, torch.int64):
+                    for mapped in (False, True):
+                        topk_sum_launches[(token_count, ids_dtype, mapped)] = (
+                            compile_w4a16_topk_sum(
+                                m=token_count,
+                                topk=workspace.num_topk,
+                                hidden_size=workspace.k,
+                                element_dtype=element_dtype,
+                                num_experts=workspace.weight_E if mapped else 0,
+                                route_num_experts=workspace.route_E if mapped else 0,
+                                route_ids_dtype=ids_dtype,
+                                use_expert_map=mapped,
+                            )
+                        )
             t_sum = time.perf_counter() if _B12X_TIMING else 0.0
 
             # The real route-pack launch happens in run_w4a16_moe. During CUDA
@@ -9565,12 +9566,20 @@ def _prewarm_w4a16_planned_launches(
                     w13_layout=w13_layout,
                     direct_topk_routes=True,
                 )
-                topk_sum_launches[direct_m] = compile_w4a16_topk_sum(
-                    m=direct_m,
-                    topk=workspace.num_topk,
-                    hidden_size=workspace.k,
-                    element_dtype=element_dtype,
-                )
+                for ids_dtype in (torch.int32, torch.int64):
+                    for mapped in (False, True):
+                        topk_sum_launches[(direct_m, ids_dtype, mapped)] = (
+                            compile_w4a16_topk_sum(
+                                m=direct_m,
+                                topk=workspace.num_topk,
+                                hidden_size=workspace.k,
+                                element_dtype=element_dtype,
+                                num_experts=workspace.weight_E if mapped else 0,
+                                route_num_experts=workspace.route_E if mapped else 0,
+                                route_ids_dtype=ids_dtype,
+                                use_expert_map=mapped,
+                            )
+                        )
 
         workspace.planned_fused_moe_launches = fused_launches
         workspace.planned_topk_sum_launches = topk_sum_launches

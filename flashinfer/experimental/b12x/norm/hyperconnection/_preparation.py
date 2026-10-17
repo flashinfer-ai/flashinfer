@@ -144,7 +144,7 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
                 torch.bfloat16,
             ),
         )
-    if role in ("swiglu", "add", "sigmoid", "head_gate"):
+    if role in ("swiglu", "relu2", "add", "sigmoid", "head_gate"):
         dtypes = tuple(
             getattr(torch, name)
             for name in (query.left_dtype, query.right_dtype, query.output_dtype)

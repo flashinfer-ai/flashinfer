@@ -186,13 +186,17 @@ def test_capacity_state_binds_the_planned_variant_with_the_live_activations():
     variants = {count: _Variant(count) for count in (4, 128)}
     state = _FusedMoeCapacityState(variants)
     activations = torch.empty(11, 16)
-    count, kwargs = state.bind(a=activations, topk_ids=None)
+    count, kwargs = state.bind(
+        a=activations, topk_ids=torch.zeros(11, 2, dtype=torch.int32)
+    )
     assert count == 128
     assert kwargs["a"] is activations
     with pytest.raises(TypeError):
         state.bind(a=torch.empty(11))
     with pytest.raises(ValueError, match="exceeds prepared MoE capacity 128"):
-        state.bind(a=torch.empty(129, 16))
+        state.bind(
+            a=torch.empty(129, 16), topk_ids=torch.zeros(129, 2, dtype=torch.int32)
+        )
 
 
 def test_a16_capacity_covers_unlisted_counts_without_crossing_cutoff():
@@ -208,11 +212,16 @@ def test_a16_capacity_covers_unlisted_counts_without_crossing_cutoff():
         (64, 64),
         (127, 128),
     ):
-        count, _ = state.bind(a=torch.empty(rows, 16))
+        count, _ = state.bind(
+            a=torch.empty(rows, 16), topk_ids=torch.zeros(rows, 2, dtype=torch.int32)
+        )
         assert count == expected
     for rows in (0, 129):
         with pytest.raises(ValueError):
-            state.bind(a=torch.empty(rows, 16))
+            state.bind(
+                a=torch.empty(rows, 16),
+                topk_ids=torch.zeros(rows, 2, dtype=torch.int32),
+            )
 
 
 @pytest.mark.parametrize(
@@ -292,8 +301,10 @@ def _launches(*, direct, route_pack, route_mode="auto"):
         packed_mapped="packed_mapped",
         direct="direct" if direct else None,
         direct_mapped="direct_mapped" if direct else None,
-        topk_sum="topk_sum",
-        mapped_topk_sum="mapped_topk_sum",
+        topk_sum={dtype: "topk_sum" for dtype in (torch.int32, torch.int64)},
+        mapped_topk_sum={
+            dtype: "mapped_topk_sum" for dtype in (torch.int32, torch.int64)
+        },
         route_pack=route_pack,
     )
 
@@ -324,7 +335,7 @@ def test_w4a16_select_preserves_exact_direct_and_dynamic_packed_routes(route_mod
         route_ids_dtype=torch.int64,
         has_route_map=True,
         activation_amax=None,
-    ) == ("packed_mapped", "topk_sum", "route_pack")
+    ) == ("packed_mapped", "mapped_topk_sum", "route_pack")
     with pytest.raises(RuntimeError, match="requested=9, prepared=8"):
         launches.select(
             tokens=9,
@@ -357,7 +368,7 @@ def test_native_w4a16_selects_retained_micro_and_keeps_packed_boundary(dtype):
     )
     assert launches.select(**{**exact, "has_route_map": True}) == (
         "packed_mapped",
-        "topk_sum",
+        "mapped_topk_sum",
         "route_pack",
     )
     assert launches.select(**{**exact, "activation_amax": object()}) == (

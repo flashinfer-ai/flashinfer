@@ -24,6 +24,7 @@ def _route_topk_kernel(
     image_mask_stride,
     routed_scaling_factor,
     num_experts,
+    num_valid_tokens_ptr,
     BLOCK_E: tl.constexpr,
     TOP_K: tl.constexpr,
     TOPK_BLOCK: tl.constexpr,
@@ -31,6 +32,7 @@ def _route_topk_kernel(
     SCORE_FUNC: tl.constexpr,
     HAS_CORRECTION_BIAS: tl.constexpr,
     HAS_IMAGE_BIAS: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     expert_offsets = tl.arange(0, BLOCK_E)
@@ -38,6 +40,19 @@ def _route_topk_kernel(
     topk_offsets = tl.arange(0, TOPK_BLOCK)
     topk_mask = topk_offsets < TOP_K
     neg_inf = float("-inf")
+
+    if HAS_VALID_TOKENS:
+        if pid >= tl.load(num_valid_tokens_ptr):
+            tl.store(
+                topk_logits_ptr + pid * topk_row_stride + topk_offsets, 0.0, topk_mask
+            )
+            tl.store(topk_ids_ptr + pid * ids_row_stride + topk_offsets, -1, topk_mask)
+            tl.store(
+                topk_weights_ptr + pid * weights_row_stride + topk_offsets,
+                0.0,
+                topk_mask,
+            )
+            return
 
     row_ptr = logits_ptr + pid * logits_row_stride
     logits = tl.load(
@@ -121,6 +136,7 @@ def route_topk(
     correction_bias: torch.Tensor | None = None,
     image_correction_bias: torch.Tensor | None = None,
     image_mask: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
     _launcher=None,
 ) -> None:
@@ -128,6 +144,8 @@ def route_topk(
 
     Correction tensors steer selection but do not alter selected logits. The
     Selected softmax, sigmoid, or sqrt-softplus weights receive the scale last.
+    Rows at or beyond the device-side valid-token count receive ID -1 and zero
+    logits and weights without reading their input logits.
     """
     if router_logits.ndim != 2:
         raise ValueError(
@@ -154,6 +172,12 @@ def route_topk(
         )
     if not router_logits.is_cuda:
         raise ValueError("route_topk requires CUDA tensors")
+    if num_valid_tokens is not None and (
+        num_valid_tokens.shape != (1,)
+        or num_valid_tokens.dtype != torch.int32
+        or num_valid_tokens.device != router_logits.device
+    ):
+        raise ValueError("num_valid_tokens must be int32 [1] on the logits device")
     for tensor in (topk_logits, topk_ids, topk_weights):
         if tensor.device != router_logits.device:
             raise ValueError("top-k outputs must be on the router_logits device")
@@ -203,6 +227,7 @@ def route_topk(
         image_mask.stride(0) if image_mask is not None else 0,
         float(routed_scaling_factor),
         num_experts,
+        num_valid_tokens,
     )
     if _launcher is not None:
         # Compiled Triton launchers take the full positional source signature.
@@ -215,6 +240,7 @@ def route_topk(
             score_func,
             correction_bias is not None,
             image_correction_bias is not None and image_mask is not None,
+            num_valid_tokens is not None,
         )
         return
     _route_topk_kernel[(num_tokens,)](
@@ -226,6 +252,7 @@ def route_topk(
         SCORE_FUNC=score_func,
         HAS_CORRECTION_BIAS=correction_bias is not None,
         HAS_IMAGE_BIAS=image_correction_bias is not None and image_mask is not None,
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
         num_warps=4 if block_e <= 256 else 8,
     )
 

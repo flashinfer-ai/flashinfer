@@ -37,6 +37,7 @@ META = OpMeta(
         "run_combine_norm",
         "run_engram_mix",
         "run_swiglu",
+        "run_relu2",
         "run_add",
         "run_sigmoid",
         "reference",
@@ -78,6 +79,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         run_scaled_silu,
         run_engram_mix,
         run_swiglu,
+        run_relu2,
         run_add,
         run_sigmoid,
     )

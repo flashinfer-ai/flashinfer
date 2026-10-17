@@ -18,6 +18,7 @@ def route_topk_out(
     correction_bias: torch.Tensor | None,
     image_correction_bias: torch.Tensor | None,
     image_mask: torch.Tensor | None,
+    num_valid_tokens: torch.Tensor | None,
 ) -> None:
     state = require_prepared(
         plan_from_handle(plan_handle), "moe.route_topk", router_logits.device
@@ -30,6 +31,7 @@ def route_topk_out(
         correction_bias=correction_bias,
         image_correction_bias=image_correction_bias,
         image_mask=image_mask,
+        num_valid_tokens=num_valid_tokens,
     )
 
 
@@ -43,5 +45,6 @@ def _fake(
     correction_bias,
     image_correction_bias,
     image_mask,
+    num_valid_tokens,
 ) -> None:
     pass

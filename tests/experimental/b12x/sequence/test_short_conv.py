@@ -74,6 +74,8 @@ class _Case:
         kernel_size=4,
         max_tokens=12,
         weight_dtype=torch.bfloat16,
+        bias_dtype=None,
+        round_before_silu=True,
     ):
         device = require_b12x()
         self.caps = short_conv.Caps(
@@ -86,6 +88,7 @@ class _Case:
             max_seqs=4,
             max_state_slots=6,
             max_speculative_tokens=speculative_tokens,
+            round_before_silu=round_before_silu,
         )
         self.length = dilation * (kernel_size - 1)
         capacity = self.length + speculative_tokens
@@ -118,6 +121,10 @@ class _Case:
         if mode == "mixed":
             self.args["request_is_prefill"] = torch.zeros(
                 4, dtype=torch.bool, device=device
+            )
+        if bias_dtype is not None:
+            self.args["conv_bias"] = torch.randn(
+                channels, device=device, dtype=bias_dtype
             )
 
     def batch(self, lengths, slots, fresh, accepted, prefill=None):
@@ -169,13 +176,19 @@ class _Case:
             if bool(self.args["state_is_fresh"][request]):
                 history.zero_()
             sequence = torch.cat((history, self.x[start:end].T), dim=1)
+            dtype = self.weight.dtype if self.caps.round_before_silu else torch.float32
             conv = F.conv1d(
-                sequence.unsqueeze(0).to(self.weight.dtype),
-                self.weight.unsqueeze(1),
+                sequence.unsqueeze(0).to(dtype),
+                self.weight.unsqueeze(1).to(dtype),
+                bias=None
+                if "conv_bias" not in self.args
+                else self.args["conv_bias"].to(dtype),
                 groups=self.caps.channels,
                 dilation=self.caps.dilation,
-            ).to(self.x.dtype)
-            expected[start:end] = F.silu(conv).squeeze(0).T
+            )
+            if self.caps.round_before_silu:
+                conv = conv.to(self.x.dtype)
+            expected[start:end] = F.silu(conv).squeeze(0).T.to(self.x.dtype)
             committed = end - start if prefill else 1
             state[slot, :, : self.length] = sequence[
                 :, committed : committed + self.length
@@ -495,3 +508,40 @@ def test_speculative_decode_matches_the_staged_kernels_bitwise(
             results[mode] = (binding.out.clone(), case.state.clone())
     assert torch.equal(results["decode"][0], results["mixed"][0])
     assert torch.equal(results["decode"][1], results["mixed"][1])
+
+
+@pytest.mark.parametrize(
+    "mode,tokens,speculative",
+    [("decode", 4, 0), ("decode", 32, 7), ("prefill", 32, 7), ("prefill", 512, 7)],
+)
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+def test_bias_and_unrounded_silu_graph(mode, tokens, speculative, bias_dtype):
+    case = _Case(
+        mode,
+        channels=10240,
+        max_tokens=tokens,
+        speculative_tokens=speculative,
+        input_padding=8192,
+        bias_dtype=bias_dtype,
+        round_before_silu=False,
+    )
+    with _prepared(case) as binding:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            short_conv.run(binding)
+        lengths = (
+            [1, 1]
+            if speculative == 0
+            else [7, min(tokens - 7, 137)]
+            if mode == "prefill"
+            else [7, 5]
+        )
+        for fresh in ([False, True], [True, False]):
+            case.state.normal_()
+            case.batch(lengths, [1, 4], fresh, [1, 1])
+            expected, state = case.oracle()
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(binding.out, expected, rtol=0.008, atol=0.02)
+            torch.testing.assert_close(case.state, state, rtol=0, atol=0)
+        graph.reset()

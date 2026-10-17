@@ -674,6 +674,25 @@ def run_swiglu_impl(
     return out
 
 
+def run_relu2_impl(source, *, out, plan: _HyperConnectionState):
+    """Apply squared ReLU to BF16 input with one final BF16 rounding."""
+    _require_cuda(plan)
+    plan.require_operation("relu2")
+    if source.ndim != 2 or source.shape[1] != plan.query.hidden_size:
+        raise ValueError("ReLU-squared input must match the prepared matrix width")
+    plan._live_tokens(source.shape[0])
+    if source.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise TypeError("ReLU-squared operands must be BF16")
+    for name, tensor in (("source", source), ("out", out)):
+        _validate_pointwise_tensor(
+            tensor, name=name, shape=tuple(source.shape), device=plan.caps.device
+        )
+    _validate_output_disjoint("out", out, (("source", source),))
+    if out.numel():
+        plan.launch(source, source, out)
+    return out
+
+
 def run_add_impl(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -734,6 +753,7 @@ __all__ = [
     "run_combine_norm_impl",
     "run_engram_mix_impl",
     "run_swiglu_impl",
+    "run_relu2_impl",
     "run_add_impl",
     "run_sigmoid_impl",
 ]

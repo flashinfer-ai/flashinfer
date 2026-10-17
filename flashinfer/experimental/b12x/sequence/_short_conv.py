@@ -21,6 +21,8 @@ def _decode_short_conv_kernel(
     INPUT_ROW_STRIDE: tl.constexpr,
     STATE_SLOT_STRIDE: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    conv_bias_ptr=None,
+    ROUND_CONV: tl.constexpr = True,
 ):
     token = tl.program_id(0)
     channels = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -67,7 +69,13 @@ def _decode_short_conv_kernel(
             other=0.0,
         ).to(tl.float32)
         accumulator += value.to(tl.float32) * weight
-    convolved = accumulator.to(tl.bfloat16).to(tl.float32)
+    if conv_bias_ptr is not None:
+        accumulator += tl.load(conv_bias_ptr + channels, channel_mask, other=0).to(
+            tl.float32
+        )
+    convolved = (
+        accumulator.to(tl.bfloat16).to(tl.float32) if ROUND_CONV else accumulator
+    )
     activated = (convolved * tl.sigmoid(convolved)).to(tl.bfloat16)
     tl.store(
         out_ptr + token.to(tl.int64) * CHANNELS + channels.to(tl.int64),
@@ -111,6 +119,8 @@ def _speculative_decode_short_conv_kernel(
     MAX_SEQS: tl.constexpr,
     MAX_TOKENS: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    conv_bias_ptr=None,
+    ROUND_CONV: tl.constexpr = True,
 ):
     """Speculative decode in one launch: the history gather, convolution and state update that
     ``_prepare_history``, ``_short_conv`` and ``_update_state`` perform, with identical arithmetic.
@@ -202,7 +212,15 @@ def _speculative_decode_short_conv_kernel(
                     other=0.0,
                 ).to(tl.float32)
                 accumulator += source * weight
-            convolved = accumulator.to(tl.bfloat16).to(tl.float32)
+            if conv_bias_ptr is not None:
+                accumulator += tl.load(
+                    conv_bias_ptr + channels, channel_mask, other=0
+                ).to(tl.float32)
+            convolved = (
+                accumulator.to(tl.bfloat16).to(tl.float32)
+                if ROUND_CONV
+                else accumulator
+            )
             activated = (convolved * tl.sigmoid(convolved)).to(tl.bfloat16)
             tl.store(
                 out_ptr
@@ -346,6 +364,8 @@ def _short_conv_kernel(
     BLOCK_C: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
     INPUT_ROW_STRIDE: tl.constexpr = None,
+    conv_bias_ptr=None,
+    ROUND_CONV: tl.constexpr = True,
 ):
     if INPUT_ROW_STRIDE is None:
         INPUT_ROW_STRIDE = CHANNELS
@@ -406,8 +426,13 @@ def _short_conv_kernel(
         ).to(tl.float32)
         accumulator += source * weight
 
-    conv_bf16 = accumulator.to(tl.bfloat16)
-    conv_float = conv_bf16.to(tl.float32)
+    if conv_bias_ptr is not None:
+        accumulator += tl.load(conv_bias_ptr + channels, channel_mask, other=0).to(
+            tl.float32
+        )
+    conv_float = (
+        accumulator.to(tl.bfloat16).to(tl.float32) if ROUND_CONV else accumulator
+    )
     activated = (conv_float * tl.sigmoid(conv_float)).to(tl.bfloat16)
     output_offsets = token.to(tl.int64) * CHANNELS + channels.to(tl.int64)
     contribution = activated
@@ -441,6 +466,8 @@ def _short_conv_tiled_kernel(
     INPUT_ROW_STRIDE: tl.constexpr,
     BLOCK_T: tl.constexpr,
     MAX_TOKENS: tl.constexpr,
+    conv_bias_ptr=None,
+    ROUND_CONV: tl.constexpr = True,
 ):
     """``_short_conv_kernel`` over a tile of tokens, with identical arithmetic."""
     tokens = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -517,7 +544,13 @@ def _short_conv_tiled_kernel(
             ).to(tl.float32)
             accumulator += query_value * weight[None, :]
 
-    conv_float = accumulator.to(tl.bfloat16).to(tl.float32)
+    if conv_bias_ptr is not None:
+        accumulator += tl.load(conv_bias_ptr + channels, channel_mask, other=0).to(
+            tl.float32
+        )[None, :]
+    conv_float = (
+        accumulator.to(tl.bfloat16).to(tl.float32) if ROUND_CONV else accumulator
+    )
     activated = (conv_float * tl.sigmoid(conv_float)).to(tl.bfloat16)
     output_rows = tokens.to(tl.int64) * CHANNELS
     tl.store(

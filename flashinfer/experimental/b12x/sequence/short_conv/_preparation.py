@@ -25,12 +25,14 @@ _I32 = frozenset(
 
 
 def _alignment(tensor):
+    if tensor is None:
+        return 16
     pointer = tensor.data_ptr()
     return min(16, pointer & -pointer) if pointer else 16
 
 
 def invocation_from_tensors(*, conv_state, scratch=None, **tensors):
-    tensors = {**tensors, "conv_state": conv_state}
+    tensors = {"conv_bias": None, **tensors, "conv_state": conv_state}
     if tensors.get("request_is_prefill") is None:
         tensors["request_is_prefill"] = tensors["state_is_fresh"]
     missing = set(OPERANDS) - _SCRATCH - tensors.keys()
@@ -49,6 +51,9 @@ def invocation_from_tensors(*, conv_state, scratch=None, **tensors):
         alignment = _alignment(scratch)
     return FrozenMapping(
         {
+            "bias_dtype": None
+            if tensors["conv_bias"] is None
+            else str(tensors["conv_bias"].dtype).removeprefix("torch."),
             "weight_dtype": str(tensors["conv_weight"].dtype).removeprefix("torch."),
             "state_strides": tuple(conv_state.stride()),
             "input_row_stride": tensors["x"].stride(0),
@@ -109,7 +114,9 @@ def compile_pipeline(payload, ordinal):
 
     q = ShortConvQuery(**dict(payload))
     p = {
-        name: _CompilePointer(
+        name: None
+        if name == "conv_bias" and q.bias_dtype is None
+        else _CompilePointer(
             torch.bool
             if name in _BOOL
             else torch.int32
@@ -118,6 +125,8 @@ def compile_pipeline(payload, ordinal):
             if name == "state_slot_ids"
             else getattr(torch, q.weight_dtype)
             if name == "conv_weight"
+            else getattr(torch, q.bias_dtype)
+            if name == "conv_bias"
             else torch.bfloat16,
             alignment,
         )
@@ -145,6 +154,8 @@ def compile_pipeline(payload, ordinal):
                         )
                     ),
                     *_speculative_args(q),
+                    conv_bias_ptr=p["conv_bias"],
+                    ROUND_CONV=q.round_before_silu,
                     num_warps=4,
                     grid=(q.max_seqs + 1, channel_grid),
                 ),
@@ -172,6 +183,8 @@ def compile_pipeline(payload, ordinal):
                     q.input_row_stride,
                     q.state_strides[0],
                     128,
+                    conv_bias_ptr=p["conv_bias"],
+                    ROUND_CONV=q.round_before_silu,
                     num_warps=4,
                     grid=(q.max_tokens, channel_grid),
                 ),
@@ -215,6 +228,8 @@ def compile_pipeline(payload, ordinal):
                 q.input_row_stride,
                 _token_block(q),
                 q.max_tokens,
+                conv_bias_ptr=p["conv_bias"],
+                ROUND_CONV=q.round_before_silu,
                 num_warps=4,
                 grid=(token_tiles, channel_grid),
             )
@@ -235,6 +250,8 @@ def compile_pipeline(payload, ordinal):
                 128,
                 False,
                 q.input_row_stride,
+                conv_bias_ptr=p["conv_bias"],
+                ROUND_CONV=q.round_before_silu,
                 num_warps=4,
                 grid=(q.max_tokens, channel_grid),
             ),
@@ -277,7 +294,13 @@ class PreparedShortConv:
         for name, tensor, alignment in zip(
             OPERANDS, tensors, self.query.input_alignments
         ):
-            if tensor.device != self.device or _alignment(tensor) != alignment:
+            if name == "conv_bias" and tensor is None and self.query.bias_dtype is None:
+                continue
+            if (
+                tensor is None
+                or tensor.device != self.device
+                or _alignment(tensor) != alignment
+            ):
                 raise ValueError(
                     f"short convolution {name} device/alignment differs from preparation"
                 )
@@ -304,6 +327,7 @@ class PreparedShortConv:
         conv_state,
         out,
         request_is_prefill=None,
+        conv_bias=None,
     ):
         from ..ple._contracts import (
             _require_conv_state_tensor,
@@ -348,16 +372,24 @@ class PreparedShortConv:
             out=out,
             gathered_state=gathered,
             request_ids=ids,
+            conv_bias=conv_bias,
         )
         shapes = {
             "x": (q.max_tokens, q.channels),
             "out": (q.max_tokens, q.channels),
             "conv_weight": (q.channels, q.kernel_size),
+            "conv_bias": (q.channels,),
             "query_start_loc": (q.max_seqs + 1,),
             "num_seqs": (1,),
             "num_tokens": (1,),
         }
         for name in OPERANDS:
+            if name == "conv_bias" and q.bias_dtype is None:
+                if conv_bias is not None:
+                    raise ValueError(
+                        "bias was not declared during short convolution preparation"
+                    )
+                continue
             if name in _SCRATCH or name in ("conv_state", "x"):
                 continue
             dtype = (
@@ -369,6 +401,8 @@ class PreparedShortConv:
                 if name == "state_slot_ids"
                 else getattr(torch, q.weight_dtype)
                 if name == "conv_weight"
+                else getattr(torch, q.bias_dtype)
+                if name == "conv_bias"
                 else torch.bfloat16
             )
             _require_tensor(
@@ -397,7 +431,9 @@ class PreparedShortConv:
             read_only=tuple(
                 (name, tensors[name])
                 for name in OPERANDS
-                if name not in _SCRATCH and name not in ("conv_state", "out")
+                if name not in _SCRATCH
+                and name not in ("conv_state", "out")
+                and tensors[name] is not None
             ),
         )
         self._check(tuple(tensors[name] for name in OPERANDS))
@@ -422,6 +458,7 @@ class PreparedShortConv:
         out,
         gathered_state,
         request_ids,
+        conv_bias,
     ):
         self._check(
             (
@@ -438,6 +475,7 @@ class PreparedShortConv:
                 out,
                 gathered_state,
                 request_ids,
+                conv_bias,
             )
         )
         q, p = self.query, self.programs
@@ -456,6 +494,8 @@ class PreparedShortConv:
                     conv_state,
                     out,
                     *_speculative_args(q),
+                    conv_bias,
+                    q.round_before_silu,
                 )
                 return
             if q.mode == "decode" and q.max_speculative_tokens == 0:
@@ -475,6 +515,8 @@ class PreparedShortConv:
                     q.input_row_stride,
                     q.state_strides[0],
                     128,
+                    conv_bias,
+                    q.round_before_silu,
                 )
                 return
             p[0][(q.max_tokens, 1, 1)](
@@ -513,6 +555,8 @@ class PreparedShortConv:
                     q.input_row_stride,
                     token_block,
                     q.max_tokens,
+                    conv_bias,
+                    q.round_before_silu,
                 )
             else:
                 p[2][(q.max_tokens, channels, 1)](
@@ -531,6 +575,8 @@ class PreparedShortConv:
                     128,
                     False,
                     q.input_row_stride,
+                    conv_bias,
+                    q.round_before_silu,
                 )
             p[3][(q.max_seqs, channels, 1)](
                 x,
@@ -556,6 +602,7 @@ def make_plan(caps, *, invocation=None, override=None):
         "input_alignments",
         "input_row_stride",
         "weight_dtype",
+        "bias_dtype",
     }:
         raise ValueError("unknown short convolution invocation metadata")
     query = ShortConvQuery(

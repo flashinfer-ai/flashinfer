@@ -344,6 +344,7 @@ def route_topk(
     correction_bias = kwargs.pop("correction_bias", None)
     image_correction_bias = kwargs.pop("image_correction_bias", None)
     image_mask = kwargs.pop("image_mask", None)
+    num_valid_tokens = kwargs.pop("num_valid_tokens", None)
     if kwargs:
         raise TypeError(f"unexpected route_topk arguments: {', '.join(kwargs)}")
     route_topk_out(
@@ -355,6 +356,7 @@ def route_topk(
         correction_bias,
         image_correction_bias,
         image_mask,
+        num_valid_tokens,
     )
 
 

@@ -9625,6 +9625,10 @@ class W4A16TopKSumKernel:
                         expert = expert_map_flat[raw_expert].to(Int32)
                     if expert < Int32(0) or expert >= weight_num_experts:
                         valid_route = Int32(0)
+                elif weight_num_experts > Int32(0):
+                    expert = route_expert_ids_flat[row]
+                    if expert < 0 or expert >= weight_num_experts:
+                        valid_route = Int32(0)
                 if valid_route != Int32(0):
                     route_value = fc2_flat[
                         Int64(row) * Int64(self.hidden_size) + Int64(col)
@@ -12322,6 +12326,10 @@ def _w4a16_topk_sum_launch_flat(
     route_ids_dtype = (
         torch.int32 if route_expert_ids is None else route_expert_ids.dtype
     )
+    if num_experts and route_expert_ids is None:
+        raise ValueError("top-k sum with an expert count requires route expert IDs")
+    if launcher is not None and launcher.route_ids_dtype != route_ids_dtype:
+        raise ValueError("prepared top-k sum route-ID dtype differs from its binding")
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     broadcast_svh = (
         full_rotation and svh_table is not None and svh_table.numel() == hidden_size
@@ -12418,6 +12426,8 @@ def _w4a16_topk_sum_launch_flat(
 def _w4a16_topk_sum_launch_op(
     fc2_out: torch.Tensor,
     output: torch.Tensor,
+    route_expert_ids: torch.Tensor,
+    num_experts: int,
     m: int,
     topk: int,
     hidden_size: int,
@@ -12432,6 +12442,8 @@ def _w4a16_topk_sum_launch_op(
         hidden_size=hidden_size,
         element_dtype=element_dtype,
         stream_int=stream_int,
+        route_expert_ids=route_expert_ids,
+        num_experts=num_experts,
     )
 
 
@@ -12439,6 +12451,8 @@ def _w4a16_topk_sum_launch_op(
 def _w4a16_topk_sum_launch_fake(
     fc2_out: torch.Tensor,
     output: torch.Tensor,
+    route_expert_ids: torch.Tensor,
+    num_experts: int,
     m: int,
     topk: int,
     hidden_size: int,
@@ -14216,9 +14230,7 @@ def run_w4a16_moe(
         return output
 
     sum_expert_map = output_expert_map if output_expert_map is not None else expert_map
-    sum_uses_map = sum_expert_map is not None and (
-        full_rotation or use_direct_topk_routes
-    )
+    sum_uses_map = sum_expert_map is not None
     if topk_sum_launch is not None:
         expected_sum = (
             topk,
@@ -14227,7 +14239,7 @@ def run_w4a16_moe(
             intermediate_hadamard,
             int(prepared.num_experts) if full_rotation or sum_uses_map else 0,
             0 if not sum_uses_map else int(sum_expert_map.numel()),
-            topk_ids.dtype if full_rotation or sum_uses_map else torch.int32,
+            topk_ids.dtype,
             sum_uses_map,
         )
         actual_sum = (
@@ -14276,6 +14288,8 @@ def run_w4a16_moe(
         torch.ops.b12x.w4a16_topk_sum_launch(
             fc2_out,
             output,
+            topk_ids,
+            int(prepared.num_experts),
             m,
             topk,
             hidden_size,

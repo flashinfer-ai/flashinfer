@@ -24,6 +24,7 @@ class Caps:
     max_state_slots: int
     dilation: int = 1
     max_speculative_tokens: int = 0
+    round_before_silu: bool = True
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class Binding:
     out: torch.Tensor
     gathered_state: torch.Tensor
     request_ids: torch.Tensor
+    conv_bias: torch.Tensor | None = None
 
 
 def plan(caps: Caps, *, invocation=None, override=None) -> Plan:
@@ -75,6 +77,7 @@ def bind(
     conv_state,
     out,
     request_is_prefill=None,
+    conv_bias=None,
 ) -> Binding:
     """Bind BF16 ``x/out [max_tokens, channels]`` and caller-owned history.
 
@@ -101,6 +104,7 @@ def bind(
         conv_state=conv_state,
         out=out,
         request_is_prefill=request_is_prefill,
+        conv_bias=conv_bias,
     )
 
 
@@ -122,6 +126,7 @@ def _pipeline(
     out: torch.Tensor,
     gathered_state: torch.Tensor,
     request_ids: torch.Tensor,
+    conv_bias: torch.Tensor | None,
     plan_handle: int,
 ) -> None:
     require_prepared(
@@ -140,6 +145,7 @@ def _pipeline(
         out,
         gathered_state,
         request_ids,
+        conv_bias,
     )
 
 
@@ -158,6 +164,7 @@ def _pipeline_fake(
     out,
     gathered_state,
     request_ids,
+    conv_bias,
     plan_handle,
 ) -> None:
     pass
