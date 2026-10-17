@@ -1569,6 +1569,10 @@ class AutoTuner:
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
         self._profiling_cache_policies: dict[tuple, tuple | None] = {}
+        # Best measured time per (winner identity, cache key); lets `auto`
+        # rank cached winners of different runners instead of taking the
+        # first runner in list order.
+        self._winner_times: dict[tuple, float] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
         # Set after a CUPTI infrastructure failure (e.g. another profiler
@@ -1986,6 +1990,8 @@ class AutoTuner:
                 self.is_tuning_mode and self._active_managed_store is None
             )
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
+            memory_hits: list[tuple[float, int, Any, OptimizationProfile | None]] = []
+            unmeasured_runners = 0
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
                     custom_op,
@@ -1995,9 +2001,12 @@ class AutoTuner:
                     r.get_cache_key_extras(inputs) if inputs is not None else (),
                 )
                 runner_keys.append((r_id, cache_key))
+                time_key = (winner_identity, cache_key)
+                if cache_key not in winners and time_key not in self._winner_times:
+                    unmeasured_runners += 1
                 if cache_key in winners:
                     cached_policy = self._profiling_cache_policies.get(
-                        (winner_identity, cache_key),
+                        time_key,
                         default_policy if winner_identity is None else None,
                     )
                     if check_memory_policy and cached_policy != requested_policy:
@@ -2009,7 +2018,25 @@ class AutoTuner:
                         # Fall through: another runner, a disk source, or
                         # (in tuning mode) a re-profile may still serve.
                         continue
-                    return True, r_id, tactic, stored_profile
+                    memory_hits.append(
+                        (
+                            self._winner_times.get(time_key, float("inf")),
+                            r_id,
+                            tactic,
+                            stored_profile,
+                        )
+                    )
+            # A tuning-mode lookup only counts as a hit when every candidate
+            # runner has been measured for this bucket; otherwise fall through
+            # so choose_one races the missing ones.
+            if memory_hits and not (
+                require_profiling_policy
+                and self.is_tuning_mode
+                and unmeasured_runners > 0
+            ):
+                # Fastest measured winner; list order only breaks ties.
+                _, r_id, tactic, stored_profile = min(memory_hits, key=lambda h: h[0])
+                return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
@@ -2433,6 +2460,8 @@ class AutoTuner:
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
+                        # Best (time, tactic) of every runner, for cross-runner ranking.
+                        runner_best: dict[int, tuple[float, Any]] = {}
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
@@ -2554,6 +2583,11 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                if (
+                                    time_measured
+                                    < runner_best.get(r_id, (float("inf"), None))[0]
+                                ):
+                                    runner_best[r_id] = (time_measured, tac)
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
@@ -2578,6 +2612,15 @@ class AutoTuner:
                             self._profiling_cache_policies[
                                 (self._winner_cache_identity(), cache_key)
                             ] = profiling_policy
+                            self._record_runner_times(
+                                custom_op,
+                                runners,
+                                p,
+                                tuning_config,
+                                tensors,
+                                runner_best,
+                                runner_id,
+                            )
                             self._dirty = True
                             self._dirty_seq += 1
                             publish_store = self._active_managed_store
@@ -2634,6 +2677,36 @@ class AutoTuner:
 
             return runners[runner_id], tactic
 
+    def _record_runner_times(
+        self,
+        custom_op,
+        runners,
+        profile,
+        tuning_config,
+        tensors,
+        runner_best: dict[int, tuple[float, Any]],
+        winner_id: int,
+    ) -> None:
+        """Store every raced runner's best time (inf when it had no working tactic).
+
+        A losing runner that already holds a winner entry for this bucket is
+        refreshed to the tactic just measured, so its stored time matches it.
+        """
+        winners = self._winner_cache()
+        identity = self._winner_cache_identity()
+        for r_id, r in enumerate(runners):
+            key = AutoTuner._get_cache_key(
+                custom_op,
+                r,
+                profile.get_opt_shapes(),
+                tuning_config,
+                r.get_cache_key_extras(tensors),
+            )
+            best_time, best_tactic = runner_best.get(r_id, (float("inf"), None))
+            self._winner_times[(identity, key)] = best_time
+            if r_id != winner_id and key in winners and best_time < float("inf"):
+                winners[key] = (best_tactic, profile)
+
     def _discard_profile_cache(
         self, custom_op, runners, input_shapes, tuning_config, inputs
     ) -> None:
@@ -2655,6 +2728,7 @@ class AutoTuner:
             )
             winners.pop(key, None)
             self._profiling_cache_policies.pop((identity, key), None)
+            self._winner_times.pop((identity, key), None)
             self._file_configs.pop(key.file_key, None)
             self._file_config_policies.pop(key.file_key, None)
             if store is not None:
@@ -2813,6 +2887,7 @@ class AutoTuner:
             # profiling_cache is the unpartitioned winner cache, so its
             # provenance lives under the None winner identity.
             self._profiling_cache_policies[(None, cache_key)] = policy
+            self._winner_times[(None, cache_key)] = scored[0][0]
             self._ranked_tactics_cache[cache_key] = (policy, tuple(ranked))
             self._dirty = True
             self._dirty_seq += 1
@@ -3990,6 +4065,7 @@ class AutoTuner:
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()
+            self._winner_times.clear()
             self._file_configs.clear()
             self._file_config_policies.clear()
             self._namespaced_records.clear()

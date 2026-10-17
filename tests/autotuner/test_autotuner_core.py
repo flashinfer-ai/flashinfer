@@ -2841,3 +2841,108 @@ def test_cute_dsl_runner_cache_tracks_split_workspace_geometry(
 
     key_small_workspace = _cute_dsl_runner_cache_extras(backend_type, 257, 800_000)
     assert key_257 != key_small_workspace
+
+
+def test_search_cache_ranks_cached_winners_by_measured_time():
+    """`auto` must serve the fastest cached runner, not the first in list order."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner()
+    b = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+
+    key_a = AutoTuner._get_cache_key("dummy", a, shapes, config)
+    key_b = AutoTuner._get_cache_key("dummy", b, shapes, config)
+    tuner.profiling_cache[key_a] = (3, None)
+    tuner._winner_times[(None, key_a)] = 2.0
+    tuner.profiling_cache[key_b] = (5, None)
+    tuner._winner_times[(None, key_b)] = 1.0
+
+    assert tuner.search_cache("dummy", [a, b], shapes, config) == (True, 1, 5, None)
+    assert tuner.search_cache("dummy", [b, a], shapes, config) == (True, 0, 5, None)
+
+    # Entries without a recorded time (legacy / promoted) fall back to list order.
+    tuner._winner_times.clear()
+    assert tuner.search_cache("dummy", [a, b], shapes, config) == (True, 0, 3, None)
+
+
+def test_choose_one_tuning_races_runners_never_measured(monkeypatch):
+    """A winner tuned with runner A alone must not short-circuit `auto` over [A, B]."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner(valid_tactics=(0,))
+    b = OtherDummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    times = {"DummyRunner": 2.0, "OtherDummyRunner": 1.0}
+    profiled: list[str] = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        name = type(runner_obj).__name__
+        profiled.append(name)
+        return times[name]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    with autotune(tune_mode=True):
+        assert tuner.choose_one("dummy_auto", [a], config, inputs)[0] is a
+        assert profiled == ["DummyRunner"]
+
+        # B was never measured for this bucket, so `auto` must race it.
+        runner, _ = tuner.choose_one("dummy_auto", [a, b], config, inputs)
+        assert runner is b
+        assert profiled.count("OtherDummyRunner") == 1
+
+        # Everyone is measured now: a repeat is a pure cache hit.
+        n_profiled = len(profiled)
+        assert tuner.choose_one("dummy_auto", [a, b], config, inputs)[0] is b
+        assert len(profiled) == n_profiled
+
+    # Serving mode agrees, whichever order the caller lists the runners in.
+    assert tuner.choose_one("dummy_auto", [a, b], config, inputs)[0] is b
+    assert tuner.choose_one("dummy_auto", [b, a], config, inputs)[0] is b
+
+
+def test_choose_one_tuning_per_backend_then_auto_picks_fastest(monkeypatch):
+    """Backends tuned one at a time: `auto` ranks their winners without re-profiling."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner(valid_tactics=(0, 1))
+    b = OtherDummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    times = {("DummyRunner", 0): 4.0, ("DummyRunner", 1): 2.0}
+    times.update({("OtherDummyRunner", 0): 1.0, ("OtherDummyRunner", 1): 3.0})
+    profiled: list[tuple[str, int]] = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        item = (type(runner_obj).__name__, tactic)
+        profiled.append(item)
+        return times[item]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    with autotune(tune_mode=True):
+        assert tuner.choose_one("dummy_each", [a], config, inputs) == (a, 1)
+        assert tuner.choose_one("dummy_each", [b], config, inputs) == (b, 0)
+        n_profiled = len(profiled)
+        assert tuner.choose_one("dummy_each", [a, b], config, inputs) == (b, 0)
+        assert len(profiled) == n_profiled
+
+    assert tuner.choose_one("dummy_each", [a, b], config, inputs) == (b, 0)

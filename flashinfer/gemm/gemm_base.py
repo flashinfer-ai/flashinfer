@@ -1888,6 +1888,31 @@ def get_gemm_sm120_module_cutlass_fp8():
     )
 
 
+# CTA tiles (M, N) of CutlassFp8GemmRunner::getConfigs(), in enumeration order;
+# each tile is followed by its 5 cluster shapes, 1x1x1 first.
+_CUTLASS_FP8_SM100_TILES = (
+    (64, 64),
+    (64, 128),
+    (64, 256),
+    (128, 64),
+    (128, 128),
+    (128, 256),
+)
+_CUTLASS_FP8_SM100_CLUSTERS_PER_TILE = 5
+
+
+def _cutlass_fp8_sm100_default_tactic(batch: int, m: int, n: int, num_sms: int) -> int:
+    """Untuned pick: the largest tile that still gives every SM a CTA (cluster 1x1x1)."""
+    best = 0
+    for idx, (tile_m, tile_n) in enumerate(_CUTLASS_FP8_SM100_TILES):
+        if tile_m > 64 and m <= 64:
+            continue
+        ctas = batch * -(-m // tile_m) * -(-n // tile_n)
+        if ctas >= num_sms:
+            best = idx
+    return best * _CUTLASS_FP8_SM100_CLUSTERS_PER_TILE
+
+
 @functools.cache
 def get_gemm_sm100_module_cutlass_fp8():
     module = gen_gemm_sm100_module_cutlass_fp8().build_and_load()
@@ -1909,6 +1934,14 @@ def get_gemm_sm100_module_cutlass_fp8():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                if tactic == -1:
+                    # C++ maps -1 to config 0 (64x64 tile) regardless of shape.
+                    tactic = _cutlass_fp8_sm100_default_tactic(
+                        a.shape[0] if a.dim() == 3 else 1,
+                        a.shape[-2],
+                        out.shape[-1],
+                        get_device_sm_count(a.device),
+                    )
                 module.fp8_gemm(
                     a,
                     b.transpose(-2, -1),

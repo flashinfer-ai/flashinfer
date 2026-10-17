@@ -184,3 +184,19 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_cutlass_fp8_sm100_default_tactic_fills_sms():
+    """Untuned CUTLASS picks the largest 1x1x1-cluster tile that still fills every SM."""
+    from flashinfer.gemm.gemm_base import _cutlass_fp8_sm100_default_tactic as pick
+
+    # Weight-streaming shapes keep the 64x64 tile (config 0): nothing bigger fills the GPU.
+    assert pick(1, 1, 8192, 148) == 0
+    assert pick(1, 16, 4384, 148) == 0
+    assert pick(1, 64, 8192, 216) == 0
+    # Short M never gets a 128-row tile; wider N tiles are fine while CTAs >= SMs.
+    assert pick(4, 64, 8192, 216) == 5  # 64x128
+    # Large M: 128x128 when 128x256 would under-fill, 128x256 once it fills.
+    assert pick(1, 512, 8192, 148) == 20
+    assert pick(1, 2048, 8192, 148) == 25
+    assert pick(1, 9216, 1280, 216) == 25

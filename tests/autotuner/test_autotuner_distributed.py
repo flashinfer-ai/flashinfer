@@ -546,6 +546,11 @@ try:
         if case == "all_hit" or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
             if case == "partial_memory":
                 tuner._winner_cache()[key] = (0, None)
+                # A tuning-mode hit needs every runner measured for the bucket:
+                # give RunnerB a recorded time so rank 0 still hits and rank 1 misses.
+                key_b = tuner._get_cache_key(op, runners[1], (inputs[0].shape,), config,
+                                             runners[1].get_cache_key_extras(inputs))
+                tuner._winner_times[(tuner._winner_cache_identity(), key_b)] = 1.0
             elif case == "partial_file":
                 tuner._file_configs[key.file_key] = ("RunnerA", 0)
             else:
