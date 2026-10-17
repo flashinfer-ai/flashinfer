@@ -4418,8 +4418,9 @@ class GvrTopkRegKernel:
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
-                # w_ < 3.5e38 (> FLT_MAX) rejects an infinite bracket width.
-                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
+                # w_ < +inf rejects an infinite bracket width (the former
+                # Float32(3.5e38) overflowed to the same +inf, with a DSL warning).
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(_POS_INF):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -7260,7 +7261,7 @@ class GvrRegClusKernel:
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
-                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(_POS_INF__regclus):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
