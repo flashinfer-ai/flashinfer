@@ -304,7 +304,7 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
-MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
+MoeAlltoAllTarget = Literal["sm100a", "sm103a"]
 
 _MOE_ALLTOALL_GENERATED_SOURCE = {
     "sm100a": "mnnvl_moe_alltoall_sm100.cu",
@@ -316,33 +316,23 @@ _MOE_ALLTOALL_NVCC_FLAGS = {
 }
 
 
-def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
-    communication_kernels = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / "nv_internal"
-        / "tensorrt_llm"
-        / "kernels"
-        / "communicationKernels"
-    )
-    if target == "legacy":
-        module_name = "mnnvl_moe_alltoall"
-        kernel_sources = [communication_kernels / "moeAlltoAllKernels.cu"]
-        arch_flags = []
-    elif target in _MOE_ALLTOALL_GENERATED_SOURCE:
-        module_name = f"mnnvl_moe_alltoall_{target}"
-        kernel_sources = [
-            communication_kernels / "moeAlltoAllFusedKernels.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "generated"
-            / _MOE_ALLTOALL_GENERATED_SOURCE[target],
-        ]
-        arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
-    else:
+def gen_moe_alltoall_module(target: MoeAlltoAllTarget) -> JitSpec:
+    """Cake MoE all-to-all module behind the ``flashinfer.comm`` ``moe_a2a_*`` ops."""
+    if target not in _MOE_ALLTOALL_GENERATED_SOURCE:
         raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
+    module_name = f"mnnvl_moe_alltoall_{target}"
+    kernel_sources = [
+        jit_env.FLASHINFER_CSRC_DIR / "cake_moe_alltoall_dispatch.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "generated"
+        / "moe_alltoall"
+        / _MOE_ALLTOALL_GENERATED_SOURCE[target],
+    ]
+    arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
     return gen_jit_spec(
         module_name,
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "cake_moe_alltoall.cu",
             *kernel_sources,
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
@@ -385,6 +375,9 @@ def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
+    # The kernels use no CUTLASS, so SM107 gets native sm_107a code instead of the
+    # sm100f fallback; the driver rejects that fallback for these kernels on SM107.
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list()
     return gen_jit_spec(
         "moe_ep_nvlink_one_sided_alltoall",
         [
@@ -404,7 +397,7 @@ def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
             str(nv_internal),
             str(nv_internal / "include"),
         ],
-        extra_cuda_cflags=["-DENABLE_BF16"],
+        extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
         extra_ldflags=["-lcuda"],
     )
 

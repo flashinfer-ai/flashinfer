@@ -35,7 +35,7 @@ def workspace_bytes_per_rank(
     extra_payload_bytes_per_token: int = 0,
     eplb_stats_num_experts: int = 0,
     *,
-    backend: MoeAlltoAllBackend = "trtllm",
+    backend: MoeAlltoAllBackend = "cake",
 ) -> int:
     """Workspace bytes per rank for 16-bit hidden states, int32 expert ids and
     FP32 weights, plus ``extra_payload_bytes_per_token``."""
@@ -49,7 +49,7 @@ def workspace_bytes_per_rank(
     )
 
 
-def metainfo_index(backend: MoeAlltoAllBackend = "trtllm") -> dict:
+def metainfo_index(backend: MoeAlltoAllBackend = "cake") -> dict:
     """Metainfo field indices, keyed by name without the ``MOE_A2A_`` prefix."""
     names, values = get_moe_alltoall_module(backend).moe_a2a_get_metainfo_index_pairs()
     return {
@@ -74,7 +74,7 @@ class MoeA2ADriver:
         eplb_stats_num_experts: int = 0,
         enable_rank_mask: bool = False,
         *,
-        backend: MoeAlltoAllBackend = "trtllm",
+        backend: MoeAlltoAllBackend = "cake",
     ):
         MnnvlMemory.initialize()
         if mnnvl_config:

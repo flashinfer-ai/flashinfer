@@ -4,12 +4,11 @@ MoE All-to-All Operations (Throughput Backend)
 This module provides the throughput-optimized all-to-all backend for MoE expert parallelism,
 supporting multiple payloads per collective operation.
 
-The TensorRT-LLM implementation remains the default on every architecture.
-Pass ``backend="cake"`` explicitly to use the generated Blackwell implementation.
-All ranks in a collective must select the same backend, and use it consistently
-for workspace sizing, initialization, dispatch, combine, and sanitization.
-:class:`flashinfer.moe_ep.CakeAlltoAll` drives these ops with ``backend="cake"``;
-:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` runs newer one-sided kernels.
+The ops run the generated Cake kernels (``backend="cake"``, compute capability
+10.0 or 10.3) and are driven by :class:`flashinfer.moe_ep.CakeAlltoAll`. The
+TensorRT-LLM kernels (``backend="trtllm"``) were removed; use
+:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`, which runs the current
+TensorRT-LLM one-sided kernels.
 """
 
 from types import SimpleNamespace
@@ -25,11 +24,11 @@ from ..utils import register_custom_op, device_support_pdl
 from ..tllm_enums import SfLayout
 
 # Number of uint64 words in the active_rank_mask ABI (must match kRankMaskWords in
-# csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h, which is
+# csrc/cake_moe_alltoall_dispatch.cuh, which is
 # derived from kMaxRanks there). A single word covers up to 64 ranks.
 MOE_A2A_RANK_MASK_WORDS = 1
-MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
-MoeAlltoAllBackend = Literal["trtllm", "cake"]
+MoeAlltoAllTarget = Literal["sm100a", "sm103a"]
+MoeAlltoAllBackend = Literal["cake"]
 
 
 def moe_a2a_active_rank_mask(active_ranks: Sequence[int], ep_size: int) -> torch.Tensor:
@@ -71,17 +70,17 @@ def _moe_alltoall_target(device_index: int) -> MoeAlltoAllTarget:
     if capability == (10, 3):
         return "sm103a"
     raise ValueError(
-        f'backend="cake" requires compute capability 10.0 or 10.3, got {capability}'
+        "The MoE all-to-all ops require compute capability 10.0 or 10.3, got "
+        f"{capability}; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll on other GPUs."
     )
 
 
 @functools.cache
 def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
-    """Build or load the legacy or exact-architecture all-to-all module."""
+    """Build or load the all-to-all module of one exact architecture."""
     module = gen_moe_alltoall_module(target).build_and_load()
-    # Keep legacy names stable, but do not let loading an opt-in module replace
-    # the default backend's custom-op implementations (or captured graphs).
-    op_suffix = "" if target == "legacy" else f"_{target}"
+    # Each architecture registers its own custom ops.
+    op_suffix = f"_{target}"
 
     @register_custom_op(
         f"flashinfer::moe_a2a_initialize{op_suffix}",
@@ -362,14 +361,16 @@ def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
     )
 
 
-def get_moe_alltoall_module(backend: MoeAlltoAllBackend = "trtllm"):
-    """Use TRT-LLM by default; exact-architecture kernels require explicit opt-in."""
+def get_moe_alltoall_module(backend: MoeAlltoAllBackend = "cake"):
+    """Return the Cake all-to-all module for the current device."""
     if backend == "trtllm":
-        return _get_moe_alltoall_module_for_target("legacy")
-    if backend != "cake":
         raise ValueError(
-            f"Unknown MoE all-to-all backend {backend!r}; expected 'trtllm' or 'cake'"
+            'The backend="trtllm" MoE all-to-all ops were removed; use '
+            "flashinfer.moe_ep.NVLinkOneSidedAlltoAll, which runs the current "
+            "TensorRT-LLM one-sided kernels."
         )
+    if backend != "cake":
+        raise ValueError(f"Unknown MoE all-to-all backend {backend!r}; expected 'cake'")
     device_index = torch.cuda.current_device()
     return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
 
@@ -392,7 +393,7 @@ def moe_a2a_initialize(
     max_num_tokens: int,
     eplb_stats_num_experts: int = 0,
     *,
-    backend: MoeAlltoAllBackend = "trtllm",
+    backend: MoeAlltoAllBackend = "cake",
 ):
     r"""Initialize the MoE all-to-all workspace and return a metainfo tensor.
 
@@ -418,10 +419,8 @@ def moe_a2a_initialize(
         region.  ``0`` (default) disables the EPLB region; when non-zero it
         must match the ``eplb_local_stats`` length passed to
         :func:`moe_a2a_dispatch`.
-    backend : {"trtllm", "cake"}
-        Defaults to ``"trtllm"`` on all architectures. ``"cake"`` explicitly
-        opts in to generated Blackwell kernels (CC 10.0/10.3). Use the same
-        backend for all operations on this workspace and on all ranks.
+    backend : {"cake"}
+        The generated Blackwell kernels (CC 10.0/10.3), the only backend.
 
     Returns
     -------
@@ -503,7 +502,7 @@ def moe_a2a_dispatch(
     enable_rank_mask: bool = False,
     active_rank_mask: Optional[torch.Tensor] = None,
     *,
-    backend: MoeAlltoAllBackend = "trtllm",
+    backend: MoeAlltoAllBackend = "cake",
     recv_view_cache: Optional[dict] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
@@ -551,8 +550,8 @@ def moe_a2a_dispatch(
         Masking a peer does not advance that peer's transport epoch. Before a
         skipped peer rejoins, all ranks must quiesce and coordinate workspace
         reinitialization; merely restoring its mask bit is insufficient.
-    backend : {"trtllm", "cake"}
-        Defaults to ``"trtllm"``. Pass ``"cake"`` to opt in on CC 10.0/10.3;
+    backend : {"cake"}
+        The generated Blackwell kernels (CC 10.0/10.3), the only backend;
         must match workspace initialization, combine, and all peer ranks.
     recv_view_cache : dict, optional
         Opaque cache of receive views. Pass an empty dictionary to enable
@@ -675,16 +674,12 @@ def moe_a2a_combine(
     enable_pdl: Optional[bool] = None,
     enable_rank_mask: bool = False,
     active_rank_mask: Optional[torch.Tensor] = None,
-    backend: MoeAlltoAllBackend = "trtllm",
+    backend: MoeAlltoAllBackend = "cake",
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
     Inverse of :func:`moe_a2a_dispatch`: scatters the rank-local expert
     output rows back to the ranks that supplied the original tokens.
-
-    ``backend="trtllm"`` is the default, including on Blackwell. Opt in with
-    ``backend="cake"`` only for workspaces initialized and dispatched with
-    that backend; all peer ranks must use the same selection.
 
     Parameters
     ----------
@@ -748,9 +743,8 @@ def moe_a2a_combine(
         :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
         corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).  Requires
         ``enable_rank_mask=True``.
-    backend : MoeAlltoAllBackend
-        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
-        with a workspace initialized by the Cake backend.
+    backend : {"cake"}
+        The generated Blackwell kernels (CC 10.0/10.3), the only backend.
 
     Returns
     -------
@@ -803,13 +797,10 @@ def moe_a2a_sanitize_expert_ids(
     invalid_expert_id: int,
     enable_pdl: Optional[bool] = None,
     *,
-    backend: MoeAlltoAllBackend = "trtllm",
+    backend: MoeAlltoAllBackend = "cake",
 ):
     r"""Sanitize invalid slots that contain no token routed to this rank by
     setting their expert IDs to ``invalid_expert_id``.
-
-    ``backend="trtllm"`` is the default. For a workspace initialized with
-    ``backend="cake"``, explicitly pass ``backend="cake"`` here as well.
 
     Parameters
     ----------
@@ -828,9 +819,8 @@ def moe_a2a_sanitize_expert_ids(
     enable_pdl : Optional[bool]
         Whether to use programmatic dependent launch.  ``None`` auto-detects
         from the device.
-    backend : MoeAlltoAllBackend
-        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
-        with a workspace initialized by the Cake backend.
+    backend : {"cake"}
+        The generated Blackwell kernels (CC 10.0/10.3), the only backend.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(expert_ids.device)
@@ -847,12 +837,9 @@ def moe_a2a_get_workspace_size_per_rank(
     combine_payload_size_per_token: int,
     eplb_stats_num_experts: int = 0,
     *,
-    backend: MoeAlltoAllBackend = "trtllm",
+    backend: MoeAlltoAllBackend = "cake",
 ):
     r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
-
-    ``backend="trtllm"`` is the default. Pass ``backend="cake"`` to size a
-    workspace for the explicitly selected Blackwell implementation.
 
     Parameters
     ----------
@@ -869,9 +856,8 @@ def moe_a2a_get_workspace_size_per_rank(
     eplb_stats_num_experts : int
         Number of experts reserved for the EPLB gathered-stats region
         (``0`` disables it).
-    backend : MoeAlltoAllBackend
-        Communication backend used to size the workspace. Defaults to
-        ``"trtllm"``; pass ``"cake"`` for the Cake backend.
+    backend : {"cake"}
+        The generated Blackwell kernels (CC 10.0/10.3), the only backend.
 
     Returns
     -------
