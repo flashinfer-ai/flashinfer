@@ -126,8 +126,11 @@ shared `cake_build.py` loader loads it (prebuilt from `aot/`, else JIT).
 `jit.variant(role, capability)` returns the record selected by the device
 compute capability and `jit.library_name(role, capability)` the name of its
 `build.json` entry, a plain string like the other Cake loaders. The bindings include the
-package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The BF16 kernels, scheduler, communication and
-epilogue sources are shared by SM100a, SM103a and SM107a. The MXFP8 fused
+package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The fused bindings
+(`csrc/sm_100a/*_binding.cu`) and the scheduler, communication and epilogue
+sources are shared by SM100a, SM103a and SM107a; the BF16 fused kernels have a
+per-target copy under `csrc/sm_100a` and `csrc/sm_107a` that differs only in
+the UMMA shared-memory descriptor address mask. The MXFP8 fused
 kernels have target-specific schedules: SM100a/SM103a (512 tensor-memory
 columns) use 256 x 256 routed tiles with a six-stage operand ring, and SM107a
 (576 columns) uses 256 x 512 tiles that compute and save gate and up in one
