@@ -50,6 +50,19 @@ MlaKernelPolicy = Literal["throughput_2cta", "throughput_latency_1cta"]
 MlaKernelName = MlaKernelPolicy
 """Concrete TS MLA kernel family selected for a launch."""
 
+# B200 H64 family crossover from 480 paired BF16/FP8 RL/production samples,
+# B={4,8,16,32,64,128}, fixed seed 20260831. A scheduler-emitted physical-cost
+# model was also evaluated, but its 1.28% held-out mean regret was worse than
+# this boundary's 0.58%; retain that score as calibration telemetry instead of
+# placing the less accurate learned selector on the production route.
+_BALANCED_H64_1CTA_MIN_BATCH = {
+    "bf16": 16,
+    "bfloat16": 16,
+    "fp8": 4,
+    "e4m3": 4,
+    "float8_e4m3fn": 4,
+}
+
 
 @dataclass(frozen=True)
 class MlaKernelDecision:
@@ -111,6 +124,37 @@ def select_default_mla_kernel_policy(
         if one_cta_split_kv is not None:
             if one_cta_split_kv > 1 and two_cta_split_kv == 1:
                 return "throughput_2cta"
+        return "throughput_latency_1cta"
+    return "throughput_2cta"
+
+
+def select_balanced_decode_mla_kernel_policy(
+    num_heads: int,
+    seq_len_q: int,
+    *,
+    batch_size: int | None = None,
+    dtype_name: str | None = None,
+) -> MlaKernelPolicy | None:
+    """Choose the measured balanced family for single-token decode.
+
+    Balanced scheduling replaces the ordinary split topology, so its family
+    choice must not inherit the default path's direct-output preference.
+    H64 is the measured crossover: BF16 favors 2CTA below B16 and 1CTA from
+    B16 onward, while FP8 favors 1CTA throughout the calibrated B4--B128
+    range. Other measured production head counts have one stable winner.
+    Multi-token query shapes retain the ordinary automatic selector until
+    separately calibrated.
+    """
+
+    if seq_len_q != 1:
+        return None
+    h64_min_batch = _BALANCED_H64_1CTA_MIN_BATCH.get(dtype_name or "")
+    if num_heads <= 32 or (
+        num_heads == 64
+        and h64_min_batch is not None
+        and batch_size is not None
+        and batch_size >= h64_min_batch
+    ):
         return "throughput_latency_1cta"
     return "throughput_2cta"
 
