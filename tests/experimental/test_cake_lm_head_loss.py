@@ -31,7 +31,7 @@ import torch
 
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss
-from flashinfer.experimental.cake_lm_head_loss import cake_backend, cake_jit
+from flashinfer.experimental.cake_lm_head_loss import cake_backend, cake_build, cake_jit
 from flashinfer.experimental.cake_lm_head_loss.cake_backend import (
     ABI_CONTRACT,
     COMMON_SCALARS,
@@ -125,12 +125,14 @@ def _require_program(*, entry: str = "loss"):
 
 
 def _require_hidden_count():
-    """Skip when the hidden valid-row count does not run on this device with the nvcc this checkout invokes
-    (``cake_jit.toolchain_runs_hidden_count``: sm_103a on nvcc 13.0.x takes the host-count path)."""
+    """Skip when the hidden valid-row count does not run on this device with the CUDA toolkit that built
+    this checkout's libraries (``cake_jit.toolchain_runs_hidden_count``: sm_103a on CUDA 13.0 takes the
+    host-count path)."""
     arch = cake_backend.arch_for(torch.device("cuda"))
     if not cake_jit.toolchain_runs_hidden_count(arch):
         pytest.skip(
-            f"the hidden valid-row count does not run on {arch} with nvcc {cake_jit.get_cuda_version()}"
+            f"the hidden valid-row count does not run on {arch} with CUDA "
+            f"{'.'.join(map(str, cake_build.record_cuda_version(arch)))}"
         )
 
 
@@ -325,11 +327,16 @@ def test_registry_records_are_well_formed():
     )
     assert set(STAGE_TENSORS) == set(cake_jit.STAGES)
     assert set(CONTRACT_ALIASES.values()) <= set().union(*_STAGE_VALUES.values())
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>`` per stage
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    package = Path(cake_jit.__file__).resolve().parent
     for name, record in cake_jit.MODULES.items():
-        assert record["arch"] in cake_jit.ARCH_NVCC_FLAGS
+        assert record["arch"] in manifest["arch_flags"]
         assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
         assert record_abi(record) in SUPPORTED_ABIS
-        assert len(record["closure_sha256"]) == 64
         assert (
             cake_jit.select_module(record["arch"], *cake_jit.record_geometry(record))
             == name
@@ -353,10 +360,19 @@ def test_registry_records_are_well_formed():
         for stage in stages:
             physical = record[stage]
             assert physical["module"] and physical["ffi_entry"]
-            assert len(physical["sources"]) == 2
-            assert all(s.startswith("cake_lm_head_loss/") for s in physical["sources"])
-            assert isinstance(physical["compile_flags"], list)
-            assert len(physical["closure_sha256"]) == 64
+            unit = physical["module"].removeprefix("cake_lm_head_loss_")
+            assert physical["library"] == cake_jit.library_stem(unit)
+            entry = libraries[cake_jit.library_name(name, stage)]
+            assert entry["arch"] == record["arch"]
+            assert entry["path"] == f"aot/{entry['name']}.so"
+            assert entry["entry"] == physical["ffi_entry"]
+            assert isinstance(entry["nvcc_flags"], list)
+            assert len(entry["closure_sha256"]) == 64
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_lm_head_loss/") for s in entry["sources"]
+            )
+            assert set(entry["sha256"]) == set(entry["sources"])
             kinds = {kind for kind, _ in physical["arg_plan"]}
             assert kinds <= {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
             names = [n for _, n in physical["arg_plan"]]
@@ -371,12 +387,11 @@ def test_registry_records_are_well_formed():
                     )
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
-            unit = physical["module"].removeprefix("cake_lm_head_loss_")
-            kernel, launch = physical["sources"]
+            kernel, launch = (s.removeprefix("csrc/") for s in entry["sources"])
             # one architecture-neutral translation unit per kernel (no architecture directory)
             assert kernel == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_kernel.cu"
             assert launch == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu"
-            csrc = Path(cake_jit.__file__).resolve().parent / "csrc"
+            csrc = package / "csrc"
             assert (csrc / kernel).is_file() and (csrc / launch).is_file()
             symbol = f"kernel_{physical['module']}"
             assert symbol in (csrc / kernel).read_text()
@@ -407,16 +422,15 @@ def test_registry_records_are_well_formed():
         )
         == cake_jit.MODULES
     )
-    shim_dir = (
-        Path(cake_jit.__file__).resolve().parent / "csrc" / "cake_lm_head_loss" / "shim"
-    )
+    shim_dir = package / "csrc" / "cake_lm_head_loss" / "shim"
     used = set()
-    for record in cake_jit.MODULES.values():
+    for name, record in cake_jit.MODULES.items():
         for stage in record["stages"]:
+            launch = libraries[cake_jit.library_name(name, stage)]["sources"][1]
             used.add(
                 re.search(
                     r'#include "cake_lm_head_loss/shim/([^"]+)"',
-                    (shim_dir.parent.parent / record[stage]["sources"][1]).read_text(),
+                    (package / launch).read_text(),
                 ).group(1)
             )
     if cake_jit.MODULES:
@@ -1995,33 +2009,38 @@ def test_gemm_tuning_default_env(monkeypatch):
         stage_values("gemm_dx", narrow.tensors, narrow.plan, 0)
 
 
-def test_toolchain_workaround_flags(monkeypatch):
-    """The CUDA 13.0 ptxas workaround (``-Xptxas -O0``) applies to the sm_103a programs on nvcc 13.0.x only."""
-    from packaging.version import Version
-
-    for version, expected in (
-        ("13.0", ["-Xptxas", "-O0"]),
-        ("12.9", []),
-        ("13.1", []),
-        ("13.4", []),
-    ):
-        monkeypatch.setattr(cake_jit, "get_cuda_version", lambda v=version: Version(v))
-        assert cake_jit.toolchain_workaround_flags("sm_103a") == expected, version
-        assert cake_jit.toolchain_workaround_flags("sm_100a") == [], version
+def test_toolchain_workaround_flags():
+    """The CUDA 13.0 ptxas workaround (``-Xptxas -O0``) is build data: every sm_103a entry of ``build.json``
+    carries it under ``nvcc_flags_if`` for CUDA 13.0 only, and no sm_100a entry carries it."""
+    workaround = {"cuda": "==13.0", "flags": ["-Xptxas", "-O0"]}
+    entries = cake_build.manifest()["libraries"]
+    for arch in sorted({record["arch"] for record in cake_jit.MODULES.values()}):
+        of_arch = [entry for entry in entries if entry["arch"] == arch]
+        assert of_arch, arch
+        for entry in of_arch:
+            assert "-Xptxas" not in entry["nvcc_flags"], entry["name"]
+            conditional = [
+                item for item in entry["nvcc_flags_if"] if item["cuda"] == "==13.0"
+            ]
+            if arch == "sm_103a":
+                assert conditional == [workaround], entry["name"]
+            else:
+                assert workaround not in entry["nvcc_flags_if"], entry["name"]
 
 
 def test_toolchain_runs_hidden_count(monkeypatch):
-    """On nvcc 13.0.x the sm_103a calls take the host-count path; every other architecture / toolchain pair runs the
-    hidden valid-row count."""
-    from packaging.version import Version
-
+    """On CUDA 13.0 the sm_103a calls take the host-count path; every other architecture / toolchain pair runs
+    the hidden valid-row count.  The toolkit version is ``cake_build.record_cuda_version`` (the toolkit that
+    built the prebuilt libraries, else the local one)."""
     for version, sm_103a in (
-        ("13.0", False),
-        ("12.9", True),
-        ("13.1", True),
-        ("13.4", True),
+        ((13, 0), False),
+        ((12, 9), True),
+        ((13, 1), True),
+        ((13, 4), True),
     ):
-        monkeypatch.setattr(cake_jit, "get_cuda_version", lambda v=version: Version(v))
+        monkeypatch.setattr(
+            cake_build, "record_cuda_version", lambda arch, v=version: v
+        )
         assert cake_jit.toolchain_runs_hidden_count("sm_103a") is sm_103a, version
         assert cake_jit.toolchain_runs_hidden_count("sm_100a") is True, version
 
@@ -2355,17 +2374,14 @@ def _fake_record(arg_plan):
         "stages": ["row_grad"],
         "row_grad": {
             "module": "fake",
-            "sources": ["cake_lm_head_loss/fake/a.cu", "cake_lm_head_loss/fake/b.cu"],
-            "compile_flags": [],
+            "library": "cake_lm_head_loss_fake",
             "ffi_entry": "run",
             "arg_plan": arg_plan,
-            "closure_sha256": "0" * 64,
             "tma_workspace_bytes": 0,
             "workspace_bytes": 0,
             "grid": ["rows_c", 1, 1],
             "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
         },
-        "closure_sha256": "0" * 64,
     }
 
 
@@ -3478,9 +3494,7 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     (``HIDDEN_COUNT_MIN_CHUNKS``: one- and two-chunk calls cannot hide the path's fixed host cost behind chunk 0's GEMM
     and take the previous path), ``T > 0``, an ``X`` the GEMM reads in place (no contiguous copy, a 16-byte-aligned
     base) and a toolchain whose sm_103a code runs it (not nvcc 13.0.x)."""
-    from packaging.version import Version
-
-    monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.4"))
+    monkeypatch.setattr(cake_build, "record_cuda_version", lambda arch: (13, 4))
     assert cake_backend.HIDDEN_COUNT_MIN_CHUNKS == 3
     name = "cake_lm_head_loss_fake"
 
@@ -3549,10 +3563,10 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     sm_103a = dict(full, arch="sm_103a")
     monkeypatch.setitem(cake_jit.MODULES, name, sm_103a)
     assert elig(short, X, sm_103a, name, stats=True)  # the same rules on sm_103a
-    monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.0"))
+    monkeypatch.setattr(cake_build, "record_cuda_version", lambda arch: (13, 0))
     assert not elig(
         short, X, sm_103a, name, stats=True
-    )  # nvcc 13.0.x: the sm_103a calls take the host-count path
+    )  # CUDA 13.0: the sm_103a calls take the host-count path
     monkeypatch.setitem(cake_jit.MODULES, name, full)
     assert elig(short, X, full, name, stats=True)  # sm_100a is not affected
 

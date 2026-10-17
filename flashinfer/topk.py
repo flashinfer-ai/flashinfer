@@ -37,6 +37,9 @@ from .utils import (
     register_fake_op,
 )
 
+# RadixRowState's global histograms and inter-CTA counters require 1 MiB.
+_ROW_STATES_NBYTES = 1024 * 1024
+
 
 class TopKTieBreak(IntEnum):
     """Top-k tie-break mode.
@@ -1049,14 +1052,9 @@ def top_k(
             return sorted_values, sorted_indices
         return output_values, indices
 
-    # Allocate row_states buffer for multi-CTA path
-    # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
-    # mode and ~300 groups for non-deterministic mode)
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{input.device}",
-        1024 * 1024,  # 1MB
-        input.device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=input.device
     )
 
     # Allocate output_values for kernel to write directly
@@ -1315,12 +1313,9 @@ def top_k_page_table_transform(
     if clusters_eligible:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=device
     )
 
     if out is None:
@@ -1565,12 +1560,10 @@ def top_k_ragged_transform(
         if workspace is None:
             workspace = _get_cache_buf(f"cub_topk_workspace_{device}", needed, device)
     else:
-        needed = _RADIX_ROW_STATES_BYTES
+        needed = _ROW_STATES_NBYTES
         if workspace is None:
-            # Allocate row_states buffer for multi-CTA path
-            workspace = _get_cache_buf(
-                f"radix_topk_row_states_{device}", needed, device, zero_init=True
-            )
+            # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+            workspace = torch.zeros(needed, dtype=torch.uint8, device=device)
     if (
         workspace.dtype != torch.uint8
         or workspace.device != device
@@ -1603,8 +1596,6 @@ def top_k_ragged_transform(
     return out
 
 
-_RADIX_ROW_STATES_BYTES = 1024 * 1024
-
 #: What the CUB size query calls each dtype it serves.
 _CUB_DTYPE_CODES = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
 
@@ -1634,7 +1625,7 @@ def _ragged_transform_workspace_size(
     """Bytes of scratch top_k_ragged_transform needs on ``backend`` for this geometry,
     answered without a scores tensor so a caller can size an arena before it exists."""
     if backend == "radix":
-        return _RADIX_ROW_STATES_BYTES
+        return _ROW_STATES_NBYTES
     if backend != "cub":
         raise NotImplementedError(_CLUSTERS_OWNS_ITS_BUFFERS)
     code = _CUB_DTYPE_CODES.get(dtype)

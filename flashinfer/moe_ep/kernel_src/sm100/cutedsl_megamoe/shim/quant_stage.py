@@ -21,6 +21,7 @@ exists in the kernel but is not wired here.
 from __future__ import annotations
 
 import dataclasses
+from functools import cache
 from typing import Any, Optional
 
 import torch
@@ -53,6 +54,45 @@ _LAST_STAGED_N: dict[int, int] = {}
 _GRAPH_CAPTURED_BUFFERS: set[int] = set()
 
 
+@cache
+def _int32_routing_stager_class():
+    """Adapt routing stores for GenPhase without changing the vendored kernel."""
+    import cutlass
+    import cutlass.cute as cute
+    from src.inputs_process import DataPreprocess
+
+    class Int32RoutingDataPreprocess(DataPreprocess):
+        @cute.jit
+        def _repack_routing(
+            self,
+            token_idx,
+            tid,
+            topk_idx,
+            topk_weights,
+            token_padding_info,
+            topk_idx_output,
+            topk_weights_output,
+        ):
+            if tid < cutlass.Int32(self.topk):
+                is_padding = False
+                if cutlass.const_expr(token_padding_info is not None):
+                    is_padding = token_padding_info[token_idx] != cutlass.Int32(0)
+                idx = (
+                    cutlass.Int32(-1)
+                    if is_padding
+                    else cutlass.Int32(topk_idx[token_idx, tid])
+                )
+                weight = (
+                    cutlass.Float32(0.0)
+                    if is_padding
+                    else cutlass.Float32(topk_weights[token_idx, tid])
+                )
+                topk_idx_output[token_idx, tid] = idx
+                topk_weights_output[token_idx, tid] = weight
+
+    return Int32RoutingDataPreprocess
+
+
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     import cutlass.torch as cutlass_torch
 
@@ -67,9 +107,13 @@ def note_staged_tokens(topk_idx_out: torch.Tensor, num_tokens: int) -> None:
     The torch fallback paths stage live rows and re-mask the full tail; they
     must update the memo so a later fused call cannot skip a fill over rows
     the fallback left live. Unknown buffers default to "assume fully live"
-    (prev_n = capacity), which is always safe.
+    (prev_n = capacity), which is always safe. Captured writers also disable
+    tail memoization because replays update routes without updating the memo.
     """
-    _LAST_STAGED_N[topk_idx_out.data_ptr()] = num_tokens
+    ptr = topk_idx_out.data_ptr()
+    if topk_idx_out.is_cuda and torch.cuda.is_current_stream_capturing():
+        _GRAPH_CAPTURED_BUFFERS.add(ptr)
+    _LAST_STAGED_N[ptr] = num_tokens
 
 
 def staged_tokens(topk_idx_out: torch.Tensor) -> Optional[int]:
@@ -172,14 +216,23 @@ def fused_quant_stage(
             f"for hidden={hidden}, {quant_type}."
         )
 
-    key = (topk, hidden, quant_type)
+    key: tuple = (topk, hidden, quant_type)
+    if topk_idx_out.dtype != torch.int64:
+        # GenPhase stages int32 routing. Keep the legacy specialization/key
+        # intact and never bind a different output dtype to its compiled ABI.
+        key += (topk_ids.dtype, topk_idx_out.dtype)
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
         from src.inputs_process import DataPreprocess
 
+        stager_class = (
+            _int32_routing_stager_class()
+            if topk_idx_out.dtype == torch.int32
+            else DataPreprocess
+        )
         stager = _CompiledStager(
-            dp=DataPreprocess(topk=topk, hidden=hidden, quant_type=quant_type)
+            dp=stager_class(topk=topk, hidden=hidden, quant_type=quant_type)
         )
         _STAGERS[key] = stager
 

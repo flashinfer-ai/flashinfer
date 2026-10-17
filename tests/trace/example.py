@@ -27,6 +27,9 @@ dsv41_fp8_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp8_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
 dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
+gated_residual_rmsnorm_h8192.json
+gated_residual_next_rmsnorm_h8192.json
+gated_residual_next_rmsnorm_scalar_alpha_h8192.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
@@ -126,6 +129,7 @@ qsa_selection_h4_d128_ps16_w35.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
+rmsnorm_sigmoid_gate_nh32_h64.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
@@ -316,6 +320,40 @@ x = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 res = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 w = torch.ones(5120, dtype=torch.bfloat16, device=device)
 flashinfer.fused_add_rmsnorm(x, res, w)
+
+# ── fused gated normalization (SM103) ──────────────────────────────
+if torch.cuda.get_device_capability() == (10, 3):
+    gated_h = 8192
+    gated_branch = torch.randn(8, gated_h, dtype=torch.bfloat16, device=device)
+    gated_residual = torch.randn(8, gated_h, dtype=torch.float32, device=device)
+    gated_weight = torch.randn(gated_h, dtype=torch.bfloat16, device=device)
+    gated_alpha = torch.randn(gated_h, dtype=torch.float32, device=device)
+    gated_beta = torch.randn(gated_h, dtype=torch.float32, device=device)
+    flashinfer.norm.gated_residual_rmsnorm(
+        gated_branch,
+        gated_residual,
+        gated_weight,
+        gated_alpha,
+        gated_beta,
+        1e-6,
+    )
+    for alpha in (gated_alpha, 1.0):
+        flashinfer.norm.gated_residual_next_rmsnorm(
+            gated_branch,
+            gated_residual,
+            gated_weight,
+            alpha,
+            gated_beta,
+            post_eps=1e-8,
+            next_eps=1e-5,
+            next_gain_center=1.0,
+            post_weight=gated_weight,
+            post_gain_center=1.0,
+        )
+
+    gate_input = torch.randn(8, 32, 64, dtype=torch.bfloat16, device=device)
+    gate = torch.randn_like(gate_input)
+    flashinfer.norm.rmsnorm_sigmoid_gate(gate_input, gate)
 
 # ── rmsnorm_quant + fused_add_rmsnorm_quant (DeepSeek-V3 down-proj, h=7168) ──
 # Quantize to FP8 E4M3 after normalization; scale is per-tensor.
@@ -1308,45 +1346,57 @@ flashinfer.kda_decode.fused_kda_decode(
 )
 
 # ── packed fused Kimi K3 speculative decode (conv + KDA + gated RMSNorm) ────
-fkp_N, fkp_T = 2, 3
-fkp_rows = fkp_N * fkp_T
-fkp_slots = fkp_rows + 1
-fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
-fkp_conv_storage = torch.zeros(
-    fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
-)
-fkp_conv_state = fkp_conv_storage.transpose(1, 2)
-fkp_raw_gate = torch.randn(1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
-fkp_indices = torch.arange(fkp_rows, 0, -1, dtype=torch.int32, device=device).reshape(
-    fkp_N, fkp_T
-)
-fkp_query_start = torch.arange(0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device)
-fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
-fkp_state = torch.zeros(fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
-fkp_output_gate = torch.randn(fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-flashinfer.kda_decode.packed_fused_kda_decode(
-    fkp_x,
-    fk_weight,
-    fkp_conv_state,
-    fkp_raw_gate,
-    fkp_raw_beta,
-    fk_A_log,
-    fk_dt_bias,
-    fkp_indices,
-    fkp_state,
-    fkp_output_gate,
-    fk_norm_weight,
-    query_start_loc=fkp_query_start,
-    num_accepted_tokens=fkp_accepted,
-)
+# T>1 packed decode is SM10x-only.
+if torch.cuda.get_device_capability(device)[0] == 10:
+    fkp_N, fkp_T = 2, 3
+    fkp_rows = fkp_N * fkp_T
+    fkp_slots = fkp_rows + 1
+    fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+    fkp_conv_storage = torch.zeros(
+        fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
+    )
+    fkp_conv_state = fkp_conv_storage.transpose(1, 2)
+    fkp_raw_gate = torch.randn(
+        1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
+    )
+    fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
+    fkp_indices = torch.arange(
+        fkp_rows, 0, -1, dtype=torch.int32, device=device
+    ).reshape(fkp_N, fkp_T)
+    fkp_query_start = torch.arange(
+        0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device
+    )
+    fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
+    fkp_state = torch.zeros(
+        fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device
+    )
+    fkp_output_gate = torch.randn(
+        fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
+    )
+    flashinfer.kda_decode.packed_fused_kda_decode(
+        fkp_x,
+        fk_weight,
+        fkp_conv_state,
+        fkp_raw_gate,
+        fkp_raw_beta,
+        fk_A_log,
+        fk_dt_bias,
+        fkp_indices,
+        fkp_state,
+        fkp_output_gate,
+        fk_norm_weight,
+        query_start_loc=fkp_query_start,
+        num_accepted_tokens=fkp_accepted,
+    )
+else:
+    print("Skipping packed fused KDA example: requires SM10x")
 
 # ── AlphaMoE fused router (SM100/SM103) ──────────────────────────────────────
 _alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
 _alpha_router_cc = torch.cuda.get_device_capability(device)
 if (
     _alpha_router_cc in {(10, 0), (10, 3)}
-    and is_sm100a_supported(device)
+    and is_sm100a_supported(torch.device(device))
     and is_cuda_version_at_least("12.9" if _alpha_router_cc == (10, 3) else "12.8")
 ):
     flashinfer.fused_moe.alphamoe_fused_router(

@@ -1355,7 +1355,7 @@ def single_prefill_with_kv_cache(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Prefill/Append attention with KV cache for single request, return the attention
+    r"""Prefill/append attention with a KV cache for a single request and return the attention
     output.
 
     Parameters
@@ -2634,7 +2634,7 @@ def _blackwell_ragged_auto_upgrade(
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
-    r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
+    r"""Wrapper class for prefill/append attention with a paged KV cache for a batch of
     requests.
 
     Check :ref:`our tutorial <kv-layout>` for page table layout.
@@ -4183,7 +4183,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             directly when supported; other paths transpose and rescale as needed.
             A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only effective on backends and devices that support PDL.
         window_left : Optional[int]
             Per-call override for the left (inclusive) sliding-window size.  When
@@ -4809,7 +4809,7 @@ def _compute_mask_indptr(
 
 
 class BatchPrefillWithRaggedKVCacheWrapper:
-    r"""Wrapper class for prefill/append attention with ragged (tensor) kv-cache for
+    r"""Wrapper class for prefill/append attention with a ragged (tensor) KV cache for a
     batch of requests.
 
     Check :ref:`our tutorial <kv-layout>` for ragged kv-cache layout.
@@ -4919,7 +4919,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors. The buffer must be
             16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
@@ -6082,7 +6082,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             directly when supported; other paths transpose and rescale as needed.
             A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only effective on backends and devices that support PDL.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
@@ -7750,8 +7750,8 @@ def trtllm_batch_context_with_kv_cache(
     max_kv_len : int
         max sequence length for kv_cache
     bmm1_scale : Union[float, torch.Tensor]
-        fused scale for bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        Fused scale for bmm1 input.
+        When using the trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
         when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
@@ -7773,7 +7773,7 @@ def trtllm_batch_context_with_kv_cache(
     o_sf_vec_size : Optional[int] = None
         vector size for nvfp4 output tensor scale factor.
     enable_pdl : Optional[bool] = None
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
         Defaults to ``None``, which means it will be enabled if the device supports PDL.
     kv_layout : str = "HND"
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
