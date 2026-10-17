@@ -826,6 +826,8 @@ __device__ __forceinline__ void page_produce_kv_sf(
     for (uint32_t k = 0; k < NUM_SF_ITERS; ++k) {
       const uint32_t flat_uint32_idx = thread_id + k * THREADS_PER_CTA;
       const uint32_t flat_byte = flat_uint32_idx * 4;
+      // A zero-filling cp.async writes even with a false predicate; stop at the end of the SF tile.
+      if (SF_TOTAL_BYTES % (THREADS_PER_CTA * 4) != 0 && flat_byte >= SF_TOTAL_BYTES) break;
       // sf_smem_col is 4-byte aligned: flat_byte is a multiple of 4, and SF_COLS is a power of 2
       // (HEAD_DIM / 16), so flat_byte % SF_COLS is always a multiple of 4 (or 0 when SF_COLS < 4).
       const uint32_t sf_smem_row = flat_byte / SF_COLS;
@@ -936,6 +938,8 @@ __device__ __forceinline__ void produce_kv_sf(SmemStorage* smem_storage, uint8_t
 #pragma unroll
     for (uint32_t i = 0; i < NUM_SF_ITERS; ++i) {
       const uint32_t flat_byte = (thread_id + i * THREADS_PER_CTA) * 4;
+      // A zero-filling cp.async writes even with a false predicate; stop at the end of the SF tile.
+      if (SF_TOTAL_BYTES % (THREADS_PER_CTA * 4) != 0 && flat_byte >= SF_TOTAL_BYTES) break;
       const uint32_t sf_smem_row = flat_byte / SF_COLS;
       const uint32_t sf_smem_col = flat_byte % SF_COLS;
       const uint32_t abs_kv_row = kv_idx_base + sf_smem_row;
