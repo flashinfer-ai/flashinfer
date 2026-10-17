@@ -34,7 +34,7 @@ with per-variant SASS equivalence checks against the generated originals.
   `cake_`) and are delivered as `sm_107a`-only outputs of the same records,
   while the SM100a/SM103a outputs keep the shipped text byte for byte. In the
   manifest this reads as follows: a decode record exported for SM107a together
-  with SM100a/SM103a (35 three-architecture decode records in the current
+  with SM100a/SM103a (23 three-architecture decode records in the current
   manifest) keeps its shipped body as `outputs[0]` with `architectures`
   reduced to `["sm_100a", "sm_103a"]` and gains an `sm_107a` output; a decode
   record exported for SM107a alone (the `_vpre` / `_pro` bodies; the fp32 T=1
