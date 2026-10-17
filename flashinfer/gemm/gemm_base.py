@@ -18,10 +18,11 @@ import functools
 import logging
 import os
 import warnings
+import weakref
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Callable, cast, List, Literal, Optional, Tuple
+from typing import Any, Callable, cast, List, Literal, Optional, Tuple
 
 from packaging.version import Version
 import torch
@@ -3806,8 +3807,29 @@ def _is_cudnn_engine_knob_tactic(tactic) -> bool:
     return isinstance(tactic, tuple) and len(tactic) == 2
 
 
-def _tactic_for_graph_cache(tactic) -> int:
-    return 0 if _is_cudnn_engine_knob_tactic(tactic) or tactic >= 0 else -1
+_cudnn_override_all_plans: weakref.WeakValueDictionary[tuple, Any] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _get_cudnn_override_graph(builder, tactic, **kwargs):
+    """Reuse an existing search graph, or build only a persisted winner.
+
+    The builder's LRU owns the graph lifetime. Weak references let profiling
+    and immediate CUDA Graph capture reuse its all-plans graph without retaining
+    graphs after eviction. A fresh process with a saved tactic builds just that
+    engine and knob combination.
+    """
+    key = (builder, tuple(sorted(kwargs.items())))
+    if _is_cudnn_engine_knob_tactic(tactic):
+        graph = _cudnn_override_all_plans.get(key)
+        if graph is not None:
+            return graph
+        return builder(tactic=tactic, **kwargs)
+    graph = builder(tactic=0 if tactic >= 0 else -1, **kwargs)
+    if tactic >= 0:
+        _cudnn_override_all_plans[key] = graph
+    return graph
 
 
 def _cudnn_knob_items_to_dict(knob_items) -> dict:
@@ -3978,7 +4000,15 @@ def clear_cudnn_graph_cache() -> None:
           shape-keyed, not graph-keyed, and stays correct across
           rebuilds.
     """
+    from .gemm_bf16_fp4_cudnn import (
+        build_cudnn_bf16_fp4_graph,
+        build_cudnn_bf16_fp4_graph_override_shape,
+    )
+
+    _cudnn_override_all_plans.clear()
     cached_builders = (
+        build_cudnn_bf16_fp4_graph,
+        build_cudnn_bf16_fp4_graph_override_shape,
         build_cudnn_gemm_fp4_graph,
         build_cudnn_gemm_fp4_graph_override_shape,
         build_cudnn_gemm_mxfp8_graph,
@@ -5055,8 +5085,9 @@ def _cudnn_gemm_fp8_runner():
             n = b.shape[-1]
             cache_m = self._m_bucket_mapper(actual_m)
 
-            # tactic value only be 0 or -1 to hit the graph cache
-            return build_cudnn_gemm_fp8_graph_override_shape(
+            return _get_cudnn_override_graph(
+                build_cudnn_gemm_fp8_graph_override_shape,
+                tactic,
                 batch=batch,
                 n=n,
                 k=k,
@@ -5065,7 +5096,6 @@ def _cudnn_gemm_fp8_runner():
                 o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
                 device=a.device,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(
@@ -5557,7 +5587,9 @@ def _cudnn_gemm_bf16_runner(
             # call, breaking tactic-index alignment.
             cache_m = self._m_bucket_mapper(actual_m)
 
-            graph = build_cudnn_gemm_bf16_graph_override_shape(
+            graph = _get_cudnn_override_graph(
+                build_cudnn_gemm_bf16_graph_override_shape,
+                tactic,
                 batch=batch,
                 n=n,
                 k=k,
@@ -5567,7 +5599,6 @@ def _cudnn_gemm_bf16_runner(
                 cache_m=cache_m,
                 is_a_k_major=self._is_a_k_major,
                 is_b_k_major=self._is_b_k_major,
-                tactic=_tactic_for_graph_cache(tactic),
             )
             return graph
 
@@ -6960,7 +6991,9 @@ def _cudnn_mm_mxfp8_runner():
             k = a.shape[1]
             n = b.shape[1]
             cache_m = self._m_bucket_mapper(actual_m)
-            return build_cudnn_gemm_mxfp8_graph_override_shape(
+            return _get_cudnn_override_graph(
+                build_cudnn_gemm_mxfp8_graph_override_shape,
+                tactic,
                 batch=1,
                 n=n,
                 k=k,
@@ -6970,7 +7003,6 @@ def _cudnn_mm_mxfp8_runner():
                 block_size=32,
                 device=a.device,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(
@@ -7403,7 +7435,9 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             # at runtime, which has a different plan-index meaning.
             cache_m = self._m_bucket_mapper(actual_m)
 
-            graph = build_cudnn_gemm_fp4_graph_override_shape(
+            graph = _get_cudnn_override_graph(
+                build_cudnn_gemm_fp4_graph_override_shape,
+                tactic,
                 batch=batch,
                 n=n,
                 k=k,
@@ -7414,7 +7448,6 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                 alpha_is_not_none=alpha is not None,
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
             return graph
 
@@ -12111,7 +12144,9 @@ def _cudnn_gemm_mxfp8_runner():
             n = b.shape[-1]
             cache_m = self._m_bucket_mapper(actual_m)
 
-            return build_cudnn_gemm_mxfp8_graph_override_shape(
+            return _get_cudnn_override_graph(
+                build_cudnn_gemm_mxfp8_graph_override_shape,
+                tactic,
                 batch=batch,
                 n=n,
                 k=k,
@@ -12121,7 +12156,6 @@ def _cudnn_gemm_mxfp8_runner():
                 block_size=32,
                 device=a.device,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(
