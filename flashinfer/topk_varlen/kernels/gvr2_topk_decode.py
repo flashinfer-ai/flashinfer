@@ -42,9 +42,11 @@ collapsed histogram dropping the +inf).  FlashInfer-local changes: module
 rename, this note, the ``_persist`` hook that routes the four
 ``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
 cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
-device), and the main-family varlen prologue clamping each row's length to
-the envelope in launch slot ``n`` instead of the row stride.  Keep future
-diffs against upstream mechanical.
+device), the main-family varlen prologue clamping each row's length to
+the envelope in launch slot ``n`` instead of the row stride, and the
+main family's in-kernel register path (``GvrMainKernel`` ``reg_vpt``, which
+calls ``GvrTopkRegKernel.row_topk``, the register kernel body split out of
+``kern``).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
@@ -1429,6 +1431,13 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _exit_thread(*, loc=None, ip=None):
+    """PTX ``exit``: CUDA's ``if (...) return;``, which the DSL has no runtime
+    form of (FlashInfer-local, the main family's register path)."""
+    nvvm.exit(loc=loc, ip=ip)
+
+
 def _pt_xf(pre_idx, req, v, ps: int):
     """Paged output: physical KV slot of a VALID (>= 0) column index ``v`` of request
     ``req`` — the paged compiles carry the page table [batch, max_pages] in the pre_idx
@@ -1464,6 +1473,7 @@ class GvrMainKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         pdl: bool = False,
+        reg_vpt: int = 0,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1551,6 +1561,56 @@ class GvrMainKernel:
         assert self.ck_off % 16 == 0, "ck64 must stay 16B aligned (ulonglong2)"
         self.dyn_bytes = self.ck_off + (self.cmpb + 1) * 8
         self.lb = self.nbs.bit_length() - 1  # log2(NBS)=8
+        # In-kernel register path (FlashInfer-local, decode, 1024 threads). Under
+        # a CUDA graph the launch is planned for the capacity, so this streaming
+        # kernel gets rows far shorter than that, which the register family ranks
+        # ~2x faster. With reg_vpt > 0, a row of at most BLK * reg_vpt * 4 columns
+        # (short rows included) runs that family's body (GvrTopkRegKernel.row_topk)
+        # on its own CTA instead of streaming: the narrowest of VPT 2 and VPT 4
+        # that holds it (the rungs route() picks for this CTA shape, NBH 2048), as
+        # SGLang's topk_v2 picks Register2 / Register4 per row. The kernel takes
+        # that branch as soon as it knows the row's length and then exits, so the
+        # smem window can start at the smem base and the streaming body never sees
+        # such a row.
+        self.reg_vpt = int(reg_vpt)
+        self.regs = []  # (row capacity, embedded body, smem window bytes), narrowest first
+        if self.reg_vpt:
+            assert self.varlen and not self.prefill and blk == 1024 and self.reg_vpt in (2, 4)
+            nbh = 2 * NB__reg
+            for vpt in (2, 4)[: self.reg_vpt // 2]:
+                cap = blk * vpt * 4
+                # page-table entries a register row can span (the reg family's rule)
+                reg_pt = 0
+                if self.paged:
+                    pages = (cap + (1 << self.page_shift) - 1) >> self.page_shift
+                    if pages <= 1024:
+                        reg_pt = 1 << max(pages - 1, 0).bit_length()
+                body = GvrTopkRegKernel(
+                    blk,
+                    vpt,
+                    minb,
+                    kpt,
+                    cur=True,
+                    deg=False,
+                    img=False,
+                    nbh=nbh,
+                    varlen=True,
+                    next_n=self.next_n,
+                    cr_shift=self.cr_shift,
+                    hint_free=self.hint_free,
+                    paged=self.paged,
+                    page_shift=self.page_shift,
+                    pt_smem=reg_pt,
+                    # staged emit for one-wave launches (_reg_stage_out): 1024-thread
+                    # main is one wave by construction (rows * R <= 148)
+                    stage_out=True,
+                    embedded=True,
+                )
+                win = STATIC_BYTES + (nbh + 2 * REG_CMP) * 4 + 4 * reg_pt
+                # + k staged outputs (k <= KPT * BLK)
+                assert win + 4 * kpt * blk <= self.dyn_bytes, "register window must fit the smem"
+                self.regs.append((cap, body, win))
+            self.reg_cap = self.regs[-1][0]
 
     # ------------------------------------------------------------------
     # GVR_EMITC: classify+stage one survivor.
@@ -1648,6 +1708,43 @@ class GvrMainKernel:
                 v & cutlass.Int32((1 << ps) - 1)
             )
         return self._ox_g(pre_idx, v)
+
+    @cute.jit
+    def _reg_arm(self, logits, pre_idx, kv_lens, out, n_row, k, row, part, sbase):
+        """In-kernel register path (reg_vpt > 0, see the ctor). Only part 0 of a
+        SPLIT row ranks it; the other parts never touch the slab, so the row
+        owes no arrivals and its g_off / g_don stay zero."""
+        if part == cutlass.Int32(0):
+            if cutlass.const_expr(len(self.regs) == 1):
+                self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+            else:
+                if n_row <= cutlass.Int32(self.regs[0][0]):
+                    self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                else:
+                    self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+
+    @cute.jit
+    def _reg_rank(self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase):
+        _, body, win = self.regs[vi]
+        smem_bytes = cutlass.Int32(win)
+        if cutlass.const_expr(body.stage_out):
+            smem_bytes = smem_bytes + k * cutlass.Int32(4)
+        # n = the row's own length: the body's prologue clamps to it and its
+        # envelope-bounded early load reads exactly the row. QC: the O(mc^2)
+        # rank gate route() gives these rungs while one wave.
+        body.row_topk(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n_row,
+            cutlass.Int32(REG_CMP),
+            cutlass.Int32(QUADC),
+            smem_bytes,
+            row,
+            sbase,
+        )
+
     @cute.kernel
     def kern(
         self,
@@ -1685,6 +1782,30 @@ class GvrMainKernel:
 
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
+
+        if cutlass.const_expr(self.reg_vpt > 0):
+            # In-kernel register path (see the ctor): a row of at most reg_cap
+            # columns, short rows included, is ranked by part 0 with the register
+            # body, and every CTA of the row leaves before any other work, so the
+            # code below never sees such a row. Row length as in the varlen
+            # prologue below.
+            bx0, row0, _ = cute.arch.block_idx()
+            rr0 = row0 % cutlass.Int32(self.next_n)
+            kv0 = kv_lens[row0 // cutlass.Int32(self.next_n)]
+            nv0 = (kv0 - cutlass.Int32(self.next_n) + rr0 + cutlass.Int32(1)) >> cutlass.Int32(
+                self.cr_shift
+            )
+            if nv0 < cutlass.Int32(0):
+                nv0 = cutlass.Int32(0)
+            if nv0 > n:
+                nv0 = n
+            if nv0 <= cutlass.Int32(self.reg_cap):
+                part0 = cutlass.Int32(0)
+                if cutlass.const_expr(self.split):
+                    part0 = bx0
+                sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
+                self._reg_arm(logits, pre_idx, kv_lens, out, nv0, k, row0, part0, sbase0)
+                _exit_thread()
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
@@ -3388,6 +3509,7 @@ def get_compiled(
     page_shift: int = 0,
     pt_smem: int = 0,
     pdl: bool = False,
+    reg_vpt: int = 0,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3401,11 +3523,16 @@ def get_compiled(
     so it is part of the cache key and the persist name; the compile retypes
     the pre_idx ABI slot to a 1-D align-4 fake (it carries row_starts; the
     kv_lens slot carries the window lengths and ke = ks + len is formed on
-    device)."""
+    device).
+
+    ``reg_vpt`` (decode tuple only) compiles in the per-row register path for
+    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     paged = bool(paged)
     if paged and not (hint_free and len(tpl) == 10 and not prefill):
         raise RuntimeError("paged compile requires the hint-free varlen (decode) tuple")
+    if reg_vpt and (len(tpl) != 10 or prefill):
+        raise RuntimeError("the register path needs the varlen decode tuple")
     key = (
         tuple(tpl),
         options_extra,
@@ -3416,6 +3543,7 @@ def get_compiled(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(pdl),
+        int(reg_vpt),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3449,6 +3577,7 @@ def get_compiled(
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
             pdl=bool(pdl),
+            reg_vpt=int(reg_vpt),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3512,6 +3641,8 @@ def get_compiled(
             name += f"_pts{int(pt_smem)}"
     if pdl:
         name += "_pdl1"
+    if reg_vpt:
+        name += f"_rg{int(reg_vpt)}"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -3619,6 +3750,7 @@ __launch_bounds__ sets no carveout either); `.reqntid`/`.minnctapersm`
 NB__reg = 1024  # NBH default
 STATIC_WORDS = 128  # DSL smem prelude (static-__shared__ mirror)
 STATIC_BYTES = STATIC_WORDS * 4
+REG_CMP = 2560  # crossing-slot cap of the non-DEG rungs (route(): CMP = min(n, 2560))
 _NEG_INF__reg = float("-inf")
 _POS_INF = float("inf")
 
@@ -3808,10 +3940,17 @@ class GvrTopkRegKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         stage_out: bool = True,
+        embedded: bool = False,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
+        # embedded: `row_topk` runs inside another family's kernel (the main
+        # family's in-kernel register path, GvrMainKernel `reg_vpt`) instead of
+        # being launched as this kernel. That host kernel waits on PDL, owns the
+        # smem window, and its (part, row) grid carries the row on block_idx.y.
+        self.embedded = bool(embedded)
+        assert not (self.embedded and (pdl or prefill))
         self.blk = blk
         self.vpt = vpt
         self.minb = minb
@@ -3885,6 +4024,8 @@ class GvrTopkRegKernel:
     def _pt_req(self):
         # request of this CTA's row, re-derived from the block index (no live register)
         bx, by, _ = cute.arch.block_idx()
+        if self.embedded:
+            return by // cutlass.Int32(self.next_n)
         return bx // cutlass.Int32(self.next_n)
 
     def _ox_g(self, pre_idx, v):
