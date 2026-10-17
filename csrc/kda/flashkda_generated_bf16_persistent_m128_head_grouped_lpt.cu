@@ -791,6 +791,30 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                         {
                             if (use_initial_state != 0) {
                                 {
+#if FLASHKDA_GENERATED_STATE_DTYPE_IS_FP32
+                                    #pragma unroll
+                                    for (int state_quarter = 0; state_quarter < 4; state_quarter++) {
+                                        {
+                                            unsigned _ldv8_0_0;
+                                            unsigned _ldv8_0_1;
+                                            unsigned _ldv8_0_2;
+                                            unsigned _ldv8_0_3;
+                                            unsigned _ldv8_0_4;
+                                            unsigned _ldv8_0_5;
+                                            unsigned _ldv8_0_6;
+                                            unsigned _ldv8_0_7;
+                                            asm volatile(
+                                                "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                                : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(initial_state_f32 + (state_base + (long long)(state_col_block * 32) + (long long)(state_quarter * 8)))) : "memory");
+                                            state_frag[state_quarter * 8 + 0] = __uint_as_float(_ldv8_0_0);
+                                            state_frag[state_quarter * 8 + 1] = __uint_as_float(_ldv8_0_1);
+                                            state_frag[state_quarter * 8 + 2] = __uint_as_float(_ldv8_0_2);
+                                            state_frag[state_quarter * 8 + 3] = __uint_as_float(_ldv8_0_3);
+                                            state_frag[state_quarter * 8 + 4] = __uint_as_float(_ldv8_0_4);
+                                            state_frag[state_quarter * 8 + 5] = __uint_as_float(_ldv8_0_5);
+                                            state_frag[state_quarter * 8 + 6] = __uint_as_float(_ldv8_0_6);
+                                            state_frag[state_quarter * 8 + 7] = __uint_as_float(_ldv8_0_7);
+#else
                                     {
                                         const uint4* _vptr_0 = reinterpret_cast<const uint4*>(initial_state + state_base + (long long)(state_col_block * 32));
                                         uint4 _vld_0[2];
@@ -827,6 +851,7 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                                                     : "=f"((&state_frag[16 + _blk * 8 + _pair * 2])[0]), "=f"((&state_frag[16 + _blk * 8 + _pair * 2])[1])
                                                     : "r"(_vpairs_1[_pair]));
                                             }
+#endif  // FLASHKDA_GENERATED_STATE_DTYPE_IS_FP32
                                         }
                                     }
                                 }
@@ -949,6 +974,23 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                                     : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1]), "=f"(_tmem_load_4[2]), "=f"(_tmem_load_4[3]), "=f"(_tmem_load_4[4]), "=f"(_tmem_load_4[5]), "=f"(_tmem_load_4[6]), "=f"(_tmem_load_4[7]), "=f"(_tmem_load_4[8]), "=f"(_tmem_load_4[9]), "=f"(_tmem_load_4[10]), "=f"(_tmem_load_4[11]), "=f"(_tmem_load_4[12]), "=f"(_tmem_load_4[13]), "=f"(_tmem_load_4[14]), "=f"(_tmem_load_4[15]), "=f"(_tmem_load_4[16]), "=f"(_tmem_load_4[17]), "=f"(_tmem_load_4[18]), "=f"(_tmem_load_4[19]), "=f"(_tmem_load_4[20]), "=f"(_tmem_load_4[21]), "=f"(_tmem_load_4[22]), "=f"(_tmem_load_4[23]), "=f"(_tmem_load_4[24]), "=f"(_tmem_load_4[25]), "=f"(_tmem_load_4[26]), "=f"(_tmem_load_4[27]), "=f"(_tmem_load_4[28]), "=f"(_tmem_load_4[29]), "=f"(_tmem_load_4[30]), "=f"(_tmem_load_4[31])
                                     : "r"(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_2 * 32)));
                                 {
+#if FLASHKDA_GENERATED_STATE_DTYPE_IS_FP32
+                                    #pragma unroll
+                                    for (int state_quarter_1 = 0; state_quarter_1 < 4; state_quarter_1++) {
+                                        {
+                                            unsigned _stv8_1_0 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 0]);
+                                            unsigned _stv8_1_1 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 1]);
+                                            unsigned _stv8_1_2 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 2]);
+                                            unsigned _stv8_1_3 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 3]);
+                                            unsigned _stv8_1_4 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 4]);
+                                            unsigned _stv8_1_5 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 5]);
+                                            unsigned _stv8_1_6 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 6]);
+                                            unsigned _stv8_1_7 = __float_as_uint(_tmem_load_4[state_quarter_1 * 8 + 7]);
+                                            asm volatile(
+                                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                                :: "l"((void*)(final_state_f32 + (state_base + (long long)(state_col_block_2 * 32) + (long long)(state_quarter_1 * 8)) + (0))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
+                                        }
+#else
                                     {
                                         __nv_bfloat162 _pk[8];
                                         _pk[0] = __floats2bfloat162_rn(_tmem_load_4[0 + 0], _tmem_load_4[0 + 1]);
@@ -974,6 +1016,7 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                                         _pk[7] = __floats2bfloat162_rn(_tmem_load_4[16 + 14], _tmem_load_4[16 + 15]);
                                         *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_2 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                         *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_2 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+#endif  // FLASHKDA_GENERATED_STATE_DTYPE_IS_FP32
                                     }
                                 }
                             }

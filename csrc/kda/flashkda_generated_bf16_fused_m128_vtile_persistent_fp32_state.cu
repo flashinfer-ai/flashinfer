@@ -111,14 +111,14 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_TOTAL 226304
 #define THREADS 1024
 #define FULL_CHUNKS 1
-#define NUM_HEADS 96
+#define NUM_HEADS FLASHKDA_GENERATED_NUM_HEADS
 #define USE_INITIAL_STATE 1
 #define STORE_FINAL_STATE 1
 #define SCALE_VALUE 0.08838834764831845
 #define LOWER_BOUND_VALUE -5.0
 #define PERSISTENT_MODE 1
-#define PERSISTENT_SIX_TASK_SCHEDULE 1
-#define PERSISTENT_STRIDE_HEAD_ALIGNED 0
+#define PERSISTENT_SIX_TASK_SCHEDULE FLASHKDA_GENERATED_PERSISTENT_SIX_TASK_SCHEDULE
+#define PERSISTENT_STRIDE_HEAD_ALIGNED FLASHKDA_GENERATED_PERSISTENT_STRIDE_HEAD_ALIGNED
 
 #include <math_constants.h>
 
@@ -846,23 +846,28 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                 state_init[31] = 0.0f;
                 {
                     {
-                        {
-                            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(initial_state + state_base + (long long)(state_col_block * 32));
-                            uint4 _vld_0[4];
-                            #pragma unroll
-                            for (int _blk = 0; _blk < 4; _blk++) {
-                                _vld_0[_blk] = _vptr_0[_blk];
-                                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 4; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        "shl.b32 %0, %2, 16;\n\t"
-                                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                                        "}\n"
-                                        : "=f"((&state_init[0 + _blk * 8 + _pair * 2])[0]), "=f"((&state_init[0 + _blk * 8 + _pair * 2])[1])
-                                        : "r"(_vpairs_0[_pair]));
-                                }
+                        #pragma unroll
+                        for (int state_col_group = 0; state_col_group < 4; state_col_group++) {
+                            {
+                                unsigned _ldv8_0_0;
+                                unsigned _ldv8_0_1;
+                                unsigned _ldv8_0_2;
+                                unsigned _ldv8_0_3;
+                                unsigned _ldv8_0_4;
+                                unsigned _ldv8_0_5;
+                                unsigned _ldv8_0_6;
+                                unsigned _ldv8_0_7;
+                                asm volatile(
+                                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                    : "=r"(_ldv8_0_0), "=r"(_ldv8_0_1), "=r"(_ldv8_0_2), "=r"(_ldv8_0_3), "=r"(_ldv8_0_4), "=r"(_ldv8_0_5), "=r"(_ldv8_0_6), "=r"(_ldv8_0_7) : "l"((const void*)(initial_state_f32 + (state_base + (long long)(state_col_block * 32) + (long long)(state_col_group * 8)))) : "memory");
+                                state_init[state_col_group * 8 + 0] = __uint_as_float(_ldv8_0_0);
+                                state_init[state_col_group * 8 + 1] = __uint_as_float(_ldv8_0_1);
+                                state_init[state_col_group * 8 + 2] = __uint_as_float(_ldv8_0_2);
+                                state_init[state_col_group * 8 + 3] = __uint_as_float(_ldv8_0_3);
+                                state_init[state_col_group * 8 + 4] = __uint_as_float(_ldv8_0_4);
+                                state_init[state_col_group * 8 + 5] = __uint_as_float(_ldv8_0_5);
+                                state_init[state_col_group * 8 + 6] = __uint_as_float(_ldv8_0_6);
+                                state_init[state_col_group * 8 + 7] = __uint_as_float(_ldv8_0_7);
                             }
                         }
                     }
@@ -955,23 +960,28 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                             state_init_1[31] = 0.0f;
                             {
                                 {
-                                    {
-                                        const uint4* _vptr_3 = reinterpret_cast<const uint4*>(initial_state + current_state_base + (long long)(state_col_block_1 * 32));
-                                        uint4 _vld_3[4];
-                                        #pragma unroll
-                                        for (int _blk = 0; _blk < 4; _blk++) {
-                                            _vld_3[_blk] = _vptr_3[_blk];
-                                            uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-                                            #pragma unroll
-                                            for (int _pair = 0; _pair < 4; _pair++) {
-                                                asm volatile(
-                                                    "{\n\t"
-                                                    "shl.b32 %0, %2, 16;\n\t"
-                                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                                    "}\n"
-                                                    : "=f"((&state_init_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&state_init_1[0 + _blk * 8 + _pair * 2])[1])
-                                                    : "r"(_vpairs_3[_pair]));
-                                            }
+                                    #pragma unroll
+                                    for (int state_col_group_1 = 0; state_col_group_1 < 4; state_col_group_1++) {
+                                        {
+                                            unsigned _ldv8_3_0;
+                                            unsigned _ldv8_3_1;
+                                            unsigned _ldv8_3_2;
+                                            unsigned _ldv8_3_3;
+                                            unsigned _ldv8_3_4;
+                                            unsigned _ldv8_3_5;
+                                            unsigned _ldv8_3_6;
+                                            unsigned _ldv8_3_7;
+                                            asm volatile(
+                                                "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                                : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(initial_state_f32 + (current_state_base + (long long)(state_col_block_1 * 32) + (long long)(state_col_group_1 * 8)))) : "memory");
+                                            state_init_1[state_col_group_1 * 8 + 0] = __uint_as_float(_ldv8_3_0);
+                                            state_init_1[state_col_group_1 * 8 + 1] = __uint_as_float(_ldv8_3_1);
+                                            state_init_1[state_col_group_1 * 8 + 2] = __uint_as_float(_ldv8_3_2);
+                                            state_init_1[state_col_group_1 * 8 + 3] = __uint_as_float(_ldv8_3_3);
+                                            state_init_1[state_col_group_1 * 8 + 4] = __uint_as_float(_ldv8_3_4);
+                                            state_init_1[state_col_group_1 * 8 + 5] = __uint_as_float(_ldv8_3_5);
+                                            state_init_1[state_col_group_1 * 8 + 6] = __uint_as_float(_ldv8_3_6);
+                                            state_init_1[state_col_group_1 * 8 + 7] = __uint_as_float(_ldv8_3_7);
                                         }
                                     }
                                 }
@@ -1193,48 +1203,20 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                             : "=f"(_tmem_load_6[0]), "=f"(_tmem_load_6[1]), "=f"(_tmem_load_6[2]), "=f"(_tmem_load_6[3]), "=f"(_tmem_load_6[4]), "=f"(_tmem_load_6[5]), "=f"(_tmem_load_6[6]), "=f"(_tmem_load_6[7]), "=f"(_tmem_load_6[8]), "=f"(_tmem_load_6[9]), "=f"(_tmem_load_6[10]), "=f"(_tmem_load_6[11]), "=f"(_tmem_load_6[12]), "=f"(_tmem_load_6[13]), "=f"(_tmem_load_6[14]), "=f"(_tmem_load_6[15]), "=f"(_tmem_load_6[16]), "=f"(_tmem_load_6[17]), "=f"(_tmem_load_6[18]), "=f"(_tmem_load_6[19]), "=f"(_tmem_load_6[20]), "=f"(_tmem_load_6[21]), "=f"(_tmem_load_6[22]), "=f"(_tmem_load_6[23]), "=f"(_tmem_load_6[24]), "=f"(_tmem_load_6[25]), "=f"(_tmem_load_6[26]), "=f"(_tmem_load_6[27]), "=f"(_tmem_load_6[28]), "=f"(_tmem_load_6[29]), "=f"(_tmem_load_6[30]), "=f"(_tmem_load_6[31])
                             : "r"(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_2 * 32)));
                         {
-                            {
+                            #pragma unroll
+                            for (int state_col_group_2 = 0; state_col_group_2 < 4; state_col_group_2++) {
                                 {
-                                    __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_6[0 + 0], _tmem_load_6[0 + 1]);
-                                    unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
-                                    __nv_bfloat162 _pk1 = __floats2bfloat162_rn(_tmem_load_6[0 + 2], _tmem_load_6[0 + 3]);
-                                    unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
-                                    __nv_bfloat162 _pk2 = __floats2bfloat162_rn(_tmem_load_6[0 + 4], _tmem_load_6[0 + 5]);
-                                    unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
-                                    __nv_bfloat162 _pk3 = __floats2bfloat162_rn(_tmem_load_6[0 + 6], _tmem_load_6[0 + 7]);
-                                    unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
-                                    __nv_bfloat162 _pk4 = __floats2bfloat162_rn(_tmem_load_6[0 + 8], _tmem_load_6[0 + 9]);
-                                    unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
-                                    __nv_bfloat162 _pk5 = __floats2bfloat162_rn(_tmem_load_6[0 + 10], _tmem_load_6[0 + 11]);
-                                    unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
-                                    __nv_bfloat162 _pk6 = __floats2bfloat162_rn(_tmem_load_6[0 + 12], _tmem_load_6[0 + 13]);
-                                    unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
-                                    __nv_bfloat162 _pk7 = __floats2bfloat162_rn(_tmem_load_6[0 + 14], _tmem_load_6[0 + 15]);
-                                    unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
+                                    unsigned _stv8_6_0 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 0]);
+                                    unsigned _stv8_6_1 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 1]);
+                                    unsigned _stv8_6_2 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 2]);
+                                    unsigned _stv8_6_3 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 3]);
+                                    unsigned _stv8_6_4 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 4]);
+                                    unsigned _stv8_6_5 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 5]);
+                                    unsigned _stv8_6_6 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 6]);
+                                    unsigned _stv8_6_7 = __float_as_uint(_tmem_load_6[state_col_group_2 * 8 + 7]);
                                     asm volatile(
                                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(&((__nv_bfloat16*)(final_state + (current_state_base + (long long)(state_col_block_2 * 32))))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
-                                }
-                                {
-                                    __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_6[0 + 16], _tmem_load_6[0 + 17]);
-                                    unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
-                                    __nv_bfloat162 _pk1 = __floats2bfloat162_rn(_tmem_load_6[0 + 18], _tmem_load_6[0 + 19]);
-                                    unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
-                                    __nv_bfloat162 _pk2 = __floats2bfloat162_rn(_tmem_load_6[0 + 20], _tmem_load_6[0 + 21]);
-                                    unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
-                                    __nv_bfloat162 _pk3 = __floats2bfloat162_rn(_tmem_load_6[0 + 22], _tmem_load_6[0 + 23]);
-                                    unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
-                                    __nv_bfloat162 _pk4 = __floats2bfloat162_rn(_tmem_load_6[0 + 24], _tmem_load_6[0 + 25]);
-                                    unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
-                                    __nv_bfloat162 _pk5 = __floats2bfloat162_rn(_tmem_load_6[0 + 26], _tmem_load_6[0 + 27]);
-                                    unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
-                                    __nv_bfloat162 _pk6 = __floats2bfloat162_rn(_tmem_load_6[0 + 28], _tmem_load_6[0 + 29]);
-                                    unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
-                                    __nv_bfloat162 _pk7 = __floats2bfloat162_rn(_tmem_load_6[0 + 30], _tmem_load_6[0 + 31]);
-                                    unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(&((__nv_bfloat16*)(final_state + (current_state_base + (long long)(state_col_block_2 * 32))))[16])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
+                                        :: "l"((void*)(final_state_f32 + (current_state_base + (long long)(state_col_block_2 * 32) + (long long)(state_col_group_2 * 8)) + (0))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
                                 }
                             }
                         }
@@ -1404,48 +1386,20 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                         state_copy_stage_1 += 1;
                         if (state_copy_stage_1 == 4) { state_copy_stage_1 = 0; }
                         {
-                            {
+                            #pragma unroll
+                            for (int state_col_group_3 = 0; state_col_group_3 < 4; state_col_group_3++) {
                                 {
-                                    __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_11[0 + 0], _tmem_load_11[0 + 1]);
-                                    unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
-                                    __nv_bfloat162 _pk1 = __floats2bfloat162_rn(_tmem_load_11[0 + 2], _tmem_load_11[0 + 3]);
-                                    unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
-                                    __nv_bfloat162 _pk2 = __floats2bfloat162_rn(_tmem_load_11[0 + 4], _tmem_load_11[0 + 5]);
-                                    unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
-                                    __nv_bfloat162 _pk3 = __floats2bfloat162_rn(_tmem_load_11[0 + 6], _tmem_load_11[0 + 7]);
-                                    unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
-                                    __nv_bfloat162 _pk4 = __floats2bfloat162_rn(_tmem_load_11[0 + 8], _tmem_load_11[0 + 9]);
-                                    unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
-                                    __nv_bfloat162 _pk5 = __floats2bfloat162_rn(_tmem_load_11[0 + 10], _tmem_load_11[0 + 11]);
-                                    unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
-                                    __nv_bfloat162 _pk6 = __floats2bfloat162_rn(_tmem_load_11[0 + 12], _tmem_load_11[0 + 13]);
-                                    unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
-                                    __nv_bfloat162 _pk7 = __floats2bfloat162_rn(_tmem_load_11[0 + 14], _tmem_load_11[0 + 15]);
-                                    unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
+                                    unsigned _stv8_1_0 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 0]);
+                                    unsigned _stv8_1_1 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 1]);
+                                    unsigned _stv8_1_2 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 2]);
+                                    unsigned _stv8_1_3 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 3]);
+                                    unsigned _stv8_1_4 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 4]);
+                                    unsigned _stv8_1_5 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 5]);
+                                    unsigned _stv8_1_6 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 6]);
+                                    unsigned _stv8_1_7 = __float_as_uint(_tmem_load_11[state_col_group_3 * 8 + 7]);
                                     asm volatile(
                                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(&((__nv_bfloat16*)(final_state + (state_base_1 + (long long)(state_col_block_3 * 32))))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
-                                }
-                                {
-                                    __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_11[0 + 16], _tmem_load_11[0 + 17]);
-                                    unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
-                                    __nv_bfloat162 _pk1 = __floats2bfloat162_rn(_tmem_load_11[0 + 18], _tmem_load_11[0 + 19]);
-                                    unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
-                                    __nv_bfloat162 _pk2 = __floats2bfloat162_rn(_tmem_load_11[0 + 20], _tmem_load_11[0 + 21]);
-                                    unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
-                                    __nv_bfloat162 _pk3 = __floats2bfloat162_rn(_tmem_load_11[0 + 22], _tmem_load_11[0 + 23]);
-                                    unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
-                                    __nv_bfloat162 _pk4 = __floats2bfloat162_rn(_tmem_load_11[0 + 24], _tmem_load_11[0 + 25]);
-                                    unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
-                                    __nv_bfloat162 _pk5 = __floats2bfloat162_rn(_tmem_load_11[0 + 26], _tmem_load_11[0 + 27]);
-                                    unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
-                                    __nv_bfloat162 _pk6 = __floats2bfloat162_rn(_tmem_load_11[0 + 28], _tmem_load_11[0 + 29]);
-                                    unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
-                                    __nv_bfloat162 _pk7 = __floats2bfloat162_rn(_tmem_load_11[0 + 30], _tmem_load_11[0 + 31]);
-                                    unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(&((__nv_bfloat16*)(final_state + (state_base_1 + (long long)(state_col_block_3 * 32))))[16])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
+                                        :: "l"((void*)(final_state_f32 + (state_base_1 + (long long)(state_col_block_3 * 32) + (long long)(state_col_group_3 * 8)) + (0))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
                                 }
                             }
                         }
@@ -1640,6 +1594,7 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                 elect_commit(u2_acc_ready_addr + (mma_stage) * 8);
                 mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready);
                 {
+#if NUM_HEADS == 96
                     int _mma_b_lo_11 = make_warp_uniform(((((smem_kr_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2560);
                     asm volatile(
                     "{\n\t"
@@ -1664,6 +1619,9 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                     :: "r"(tmem_tmem_state), "r"(_mma_b_lo_11), "r"(tmem_tmem_u2_inp), "r"(1));
                     elect_commit(state_ready_addr + (mma_stage) * 8);
                     int _mma_b_lo_12 = make_warp_uniform(((((smem_mqk_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2560);
+#else
+                    int _mma_b_lo_13 = make_warp_uniform(((((smem_mqk_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2560);
+#endif  // NUM_HEADS
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1684,8 +1642,36 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
+#if NUM_HEADS == 96
                     :: "r"(tmem_tmem_out), "r"(_mma_b_lo_12), "r"(tmem_tmem_u2_inp), "r"(1));
                     elect_commit2(final_ready_addr + (mma_stage) * 8, smem_free_addr + (mma_stage) * 8);
+#else
+                    :: "r"(tmem_tmem_out), "r"(_mma_b_lo_13), "r"(tmem_tmem_u2_inp), "r"(1));
+                    elect_commit(final_ready_addr + (mma_stage) * 8);
+                    int _mma_b_lo_14 = make_warp_uniform(((((smem_kr_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2560);
+                    asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
+                    ".reg .b64 db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 dhi, 0x40004040;\n\t"
+                    "mov.b32 id, 136381584;\n\t"
+                    "mov.b32 ta, %2;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(tmem_tmem_state), "r"(_mma_b_lo_14), "r"(tmem_tmem_u2_inp), "r"(1));
+                    elect_commit2(state_ready_addr + (mma_stage) * 8, smem_free_addr + (mma_stage) * 8);
+#endif  // NUM_HEADS
                 }
                 mma_stage += 1;
                 if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; _phase_state_inp_ready ^= 1; _phase_state_diag_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; }
@@ -1797,6 +1783,21 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
             int head_idx_3 = base_head_idx_2;
             long long bos_3 = base_bos_2;
             long long eos_3 = base_eos_2;
+#if NUM_HEADS != 96
+            {
+                int cached_head_idx = blockIdx.x % NUM_HEADS;
+                float gate_rate_lane = 0.0f;
+                if (lane == 0) {
+                    float _expf_0 = __expf(A_log[cached_head_idx]);
+                    gate_rate_lane = _expf_0;
+                }
+                float _shfl_0 = __shfl_sync(0xFFFFFFFF, gate_rate_lane, 0);
+                gate_rate_task_cached = _shfl_0;
+                if (prep_tid < 128) {
+                    gate_bias_task_cached = dt_bias[cached_head_idx * 128 + prep_tid];
+                }
+            }
+#endif  // NUM_HEADS
             unsigned int _phase_raw_inputs_free = 1;
             unsigned int _phase_smem_free = 1;
             unsigned int _phase_gate_raw_full = 0;
@@ -1808,6 +1809,7 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                 int global_chunk_idx_3 = prep_iter * 5 + prep_instance;
                 float gate_rate_cached = gate_rate_task_cached;
                 float gate_bias_cached = gate_bias_task_cached;
+#if NUM_HEADS == 96
                 {
                     if (task_round_3 != cached_task_round) {
                         float gate_rate_lane = 0.0f;
@@ -1825,6 +1827,7 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                     gate_rate_cached = gate_rate_task_cached;
                     gate_bias_cached = gate_bias_task_cached;
                 }
+#endif  // NUM_HEADS
                 int stage_f32 = prep_stage * 10240;
                 int stage_bf16 = prep_stage * 20480;
                 int chunk_is_full_2 = ((seq_len_3 >= (chunk_idx_3 + 1) * 32) ? 1 : 0);
@@ -1864,10 +1867,17 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                         float _cvt_f32_0 = __bfloat162float(early_gate_raw);
                         float early_gate_arg = early_gate_rate * (_cvt_f32_0 + early_gate_bias);
                         {
+#if NUM_HEADS == 96
                             float _tanh_approx_2;
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_2) : "f"(early_gate_arg * 0.5f));
                             float early_gate_sigmoid = _tanh_approx_2 * 0.5f + 0.5f;
                             early_gate0 = specialized_lower_bound * 1.4426950408889634f * early_gate_sigmoid;
+#else
+                            float _tanh_approx_1;
+                            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(early_gate_arg * 0.5f));
+                            float early_gate_tanh = _tanh_approx_1;
+                            early_gate0 = gate_half_log2 * early_gate_tanh + gate_half_log2;
+#endif  // NUM_HEADS
                         }
                     }
                 }
@@ -1921,7 +1931,12 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                                     asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(gate_arg * 0.5f));
                                     float gate_tanh = _tanh_approx_4;
                                     {
+#if NUM_HEADS == 96
                                         gate_block[gate_row_in_block] = specialized_lower_bound * 1.4426950408889634f * (gate_tanh * 0.5f + 0.5f);
+#else
+                                        float _fma_0 = __fmaf_rn(gate_half_log2, gate_tanh, gate_half_log2);
+                                        gate_block[gate_row_in_block] = _fma_0;
+#endif  // NUM_HEADS
                                     }
                                 }
                             }

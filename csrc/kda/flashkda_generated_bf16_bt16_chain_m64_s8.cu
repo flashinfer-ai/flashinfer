@@ -761,11 +761,13 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
             int warp_id_in_role_1 = (warp - 4);
             int compute_left_local_warp = warp_id_in_role_1;
             int state_slot = seq_idx_1;
+#if FLASHKDA_GENERATED_SERVING_NATIVE_ABI
             {
                 if (use_state_indices != 0) {
                     state_slot = reinterpret_cast<int*>(state_indices_addr)[seq_idx_1];
                 }
             }
+#endif  // FLASHKDA_GENERATED_SERVING_NATIVE_ABI
             long long state_head_base = (long long)state_slot * state_slot_stride + (long long)head_idx_1 * 128 * 128;
             long long state_base_top = state_head_base + (long long)state_row_top_1 * 128;
             long long state_base_bot = state_head_base + (long long)state_row_bot_1 * 128;
@@ -808,6 +810,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                     int state_col_pair = state_col_group * 8 + lane_quad_1 * 2;
                     const int state_reg_base = state_col_group * 4;
                     {
+#if FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                         {
                             float2 _v2_0 = *reinterpret_cast<const float2*>(initial_state_f32 + state_base_top + (long long)state_col_pair);
                             state_init[state_reg_base] = _v2_0.x;
@@ -818,6 +821,12 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                             state_init[state_reg_base + 2] = _v2_1.x;
                             state_init[state_reg_base + 2 + 1] = _v2_1.y;
                         }
+#else
+                        state_init[state_reg_base] = (float)initial_state[state_base_top + (long long)state_col_pair];
+                        state_init[state_reg_base + 1] = (float)initial_state[state_base_top + (long long)state_col_pair + 1];
+                        state_init[state_reg_base + 2] = (float)initial_state[state_base_bot + (long long)state_col_pair];
+                        state_init[state_reg_base + 3] = (float)initial_state[state_base_bot + (long long)state_col_pair + 1];
+#endif  // FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                     }
                 }
             }
@@ -897,6 +906,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                     int state_col_pair_2 = state_col_group_2 * 8 + lane_quad_1 * 2;
                     const int state_reg_base_2 = state_col_group_2 * 4;
                     {
+#if FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                         {
                             float2 _v2 = make_float2(_tmem_load_1[state_reg_base_2 + 0], _tmem_load_1[state_reg_base_2 + 1]);
                             *reinterpret_cast<float2*>(final_state_f32 + (state_base_top + (long long)state_col_pair_2) + 0) = _v2;
@@ -905,6 +915,12 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                             float2 _v2 = make_float2(_tmem_load_1[state_reg_base_2 + 2 + 0], _tmem_load_1[state_reg_base_2 + 2 + 1]);
                             *reinterpret_cast<float2*>(final_state_f32 + (state_base_bot + (long long)state_col_pair_2) + 0) = _v2;
                         }
+#else
+                        final_state[state_base_top + (long long)state_col_pair_2] = _tmem_load_1[state_reg_base_2];
+                        final_state[state_base_top + (long long)state_col_pair_2 + 1] = _tmem_load_1[state_reg_base_2 + 1];
+                        final_state[state_base_bot + (long long)state_col_pair_2] = _tmem_load_1[state_reg_base_2 + 2];
+                        final_state[state_base_bot + (long long)state_col_pair_2 + 1] = _tmem_load_1[state_reg_base_2 + 3];
+#endif  // FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                     }
                 }
             }
@@ -940,11 +956,13 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
             int warp_id_in_role_2 = (warp - 8);
             int compute_right_local_warp = warp_id_in_role_2;
             int state_slot_1 = seq_idx_2;
+#if FLASHKDA_GENERATED_SERVING_NATIVE_ABI
             {
                 if (use_state_indices != 0) {
                     state_slot_1 = reinterpret_cast<int*>(state_indices_addr)[seq_idx_2];
                 }
             }
+#endif  // FLASHKDA_GENERATED_SERVING_NATIVE_ABI
             long long state_head_base_1 = (long long)state_slot_1 * state_slot_stride + (long long)head_idx_2 * 128 * 128;
             long long state_base_top_1 = state_head_base_1 + (long long)state_row_top_2 * 128;
             long long state_base_bot_1 = state_head_base_1 + (long long)state_row_bot_2 * 128;
@@ -989,6 +1007,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                         int state_col_pair_3 = state_col_half * 64 + state_col_group_3 * 8 + lane_quad_2 * 2;
                         const int state_reg_base_3 = state_col_group_3 * 4;
                         {
+#if FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                             {
                                 float2 _v2_0 = *reinterpret_cast<const float2*>(initial_state_f32 + state_base_top_1 + (long long)state_col_pair_3);
                                 state_init_1[state_reg_base_3] = _v2_0.x;
@@ -999,6 +1018,12 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                                 state_init_1[state_reg_base_3 + 2] = _v2_1.x;
                                 state_init_1[state_reg_base_3 + 2 + 1] = _v2_1.y;
                             }
+#else
+                            state_init_1[state_reg_base_3] = (float)initial_state[state_base_top_1 + (long long)state_col_pair_3];
+                            state_init_1[state_reg_base_3 + 1] = (float)initial_state[state_base_top_1 + (long long)state_col_pair_3 + 1];
+                            state_init_1[state_reg_base_3 + 2] = (float)initial_state[state_base_bot_1 + (long long)state_col_pair_3];
+                            state_init_1[state_reg_base_3 + 3] = (float)initial_state[state_base_bot_1 + (long long)state_col_pair_3 + 1];
+#endif  // FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                         }
                     }
                 }
@@ -1126,6 +1151,7 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                         int state_col_pair_5 = state_col_half_1 * 64 + state_col_group_5 * 8 + lane_quad_2 * 2;
                         const int state_reg_base_5 = state_col_group_5 * 4;
                         {
+#if FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                             {
                                 float2 _v2 = make_float2(_tmem_load_4[state_reg_base_5 + 0], _tmem_load_4[state_reg_base_5 + 1]);
                                 *reinterpret_cast<float2*>(final_state_f32 + (state_base_top_1 + (long long)state_col_pair_5) + 0) = _v2;
@@ -1134,6 +1160,12 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, FlashKDAT
                                 float2 _v2 = make_float2(_tmem_load_4[state_reg_base_5 + 2 + 0], _tmem_load_4[state_reg_base_5 + 2 + 1]);
                                 *reinterpret_cast<float2*>(final_state_f32 + (state_base_bot_1 + (long long)state_col_pair_5) + 0) = _v2;
                             }
+#else
+                            final_state[state_base_top_1 + (long long)state_col_pair_5] = _tmem_load_4[state_reg_base_5];
+                            final_state[state_base_top_1 + (long long)state_col_pair_5 + 1] = _tmem_load_4[state_reg_base_5 + 1];
+                            final_state[state_base_bot_1 + (long long)state_col_pair_5] = _tmem_load_4[state_reg_base_5 + 2];
+                            final_state[state_base_bot_1 + (long long)state_col_pair_5 + 1] = _tmem_load_4[state_reg_base_5 + 3];
+#endif  // FLASHKDA_GENERATED_SERVING_NATIVE_ABI
                         }
                     }
                 }

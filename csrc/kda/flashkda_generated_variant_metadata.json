@@ -4,7 +4,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_bt16_chain_m64_c68ffebac9",
-      "body": "flashkda_generated_bf16_bt16_chain_m64_c68ffebac9.cu",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_s8.cu",
+      "knobs": ["state_dtype_is_fp32", "serving_native_abi"],
       "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
       "threads": 512,
       "smem_bytes": 138240,
@@ -24,7 +25,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_bt16_chain_m64_d3d65ffa34",
-      "body": "flashkda_generated_bf16_bt16_chain_m64_d3d65ffa34.cu",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_s8.cu",
+      "knobs": ["state_dtype_is_fp32", "serving_native_abi"],
       "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
       "threads": 512,
       "smem_bytes": 138240,
@@ -164,7 +166,8 @@
     {
       "archs": ["sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_388c6ad8eb",
-      "body": "flashkda_generated_bf16_fused_m128_388c6ad8eb.cu",
+      "body": "flashkda_generated_bf16_fused_m128_direct_serving_fp32_state.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "n32_prediction_first"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -204,7 +207,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_4d394413ab",
-      "body": "flashkda_generated_bf16_fused_m128_4d394413ab.cu",
+      "body": "flashkda_generated_bf16_fused_m128_affine_main_correction_fp32.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "pdl_wait_initial_state_f32", "pdl_publish_final_state", "affine_main_indexed_initial"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -224,7 +228,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_5ae1699f79",
-      "body": "flashkda_generated_bf16_fused_m128_5ae1699f79.cu",
+      "body": "flashkda_generated_bf16_fused_m128_scalar_lpt_fp32_state.cu",
+      "knobs": ["num_heads"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 231424,
@@ -284,7 +289,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_79d0e71824",
-      "body": "flashkda_generated_bf16_fused_m128_79d0e71824.cu",
+      "body": "flashkda_generated_bf16_fused_m128_scalar_lpt_bf16_state.cu",
+      "knobs": ["num_heads"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 231424,
@@ -304,7 +310,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_7bb2a02766",
-      "body": "flashkda_generated_bf16_fused_m128_7bb2a02766.cu",
+      "body": "flashkda_generated_bf16_fused_m128_direct_serving_fp32_state.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "n32_prediction_first"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -324,7 +331,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_7c0223cea8",
-      "body": "flashkda_generated_bf16_fused_m128_7c0223cea8.cu",
+      "body": "flashkda_generated_bf16_fused_m128_scalar_lpt_bf16_state.cu",
+      "knobs": ["num_heads"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 231424,
@@ -344,7 +352,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_7feb233c12",
-      "body": "flashkda_generated_bf16_fused_m128_7feb233c12.cu",
+      "body": "flashkda_generated_bf16_fused_m128_affine_main_correction_fp32.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "pdl_wait_initial_state_f32", "pdl_publish_final_state", "affine_main_indexed_initial"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -364,7 +373,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_8838afb6eb",
-      "body": "flashkda_generated_bf16_fused_m128_8838afb6eb.cu",
+      "body": "flashkda_generated_bf16_fused_m128_affine_main_correction_fp32.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "pdl_wait_initial_state_f32", "pdl_publish_final_state", "affine_main_indexed_initial"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -384,7 +394,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_97e6762e88",
-      "body": "flashkda_generated_bf16_fused_m128_97e6762e88.cu",
+      "body": "flashkda_generated_bf16_fused_m128_direct_serving_bf16_state.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "n32_prediction_first"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -544,7 +555,8 @@
     {
       "archs": ["sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_b21b675208",
-      "body": "flashkda_generated_bf16_fused_m128_b21b675208.cu",
+      "body": "flashkda_generated_bf16_fused_m128_direct_serving_bf16_state.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "n32_prediction_first"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -624,7 +636,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_c8af151b6d",
-      "body": "flashkda_generated_bf16_fused_m128_c8af151b6d.cu",
+      "body": "flashkda_generated_bf16_fused_m128_scalar_lpt_fp32_state.cu",
+      "knobs": ["num_heads"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 231424,
@@ -724,7 +737,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_de729ccf63",
-      "body": "flashkda_generated_bf16_fused_m128_de729ccf63.cu",
+      "body": "flashkda_generated_bf16_fused_m128_direct_serving_fp32_state.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "n32_prediction_first"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -764,7 +778,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_ea99273d0c",
-      "body": "flashkda_generated_bf16_fused_m128_ea99273d0c.cu",
+      "body": "flashkda_generated_bf16_fused_m128_direct_serving_bf16_state.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "n32_prediction_first"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -824,7 +839,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_fca13c24e7",
-      "body": "flashkda_generated_bf16_fused_m128_fca13c24e7.cu",
+      "body": "flashkda_generated_bf16_fused_m128_affine_main_correction_fp32.cu",
+      "knobs": ["pair_packed_beta", "scalar_beta", "pdl_wait_initial_state_f32", "pdl_publish_final_state", "affine_main_indexed_initial"],
       "kernel": "kernel_flashkda_bf16_fused_m128",
       "threads": 1024,
       "smem_bytes": 227968,
@@ -844,7 +860,8 @@
     {
       "archs": ["sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_vtile_11bf731116",
-      "body": "flashkda_generated_bf16_fused_m128_vtile_11bf731116.cu",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_persistent_fp32_state.cu",
+      "knobs": ["num_heads", "persistent_six_task_schedule", "persistent_stride_head_aligned"],
       "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
       "threads": 1024,
       "smem_bytes": 226304,
@@ -884,7 +901,8 @@
     {
       "archs": ["sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_vtile_603e2d906d",
-      "body": "flashkda_generated_bf16_fused_m128_vtile_603e2d906d.cu",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_persistent_bf16_state.cu",
+      "knobs": ["num_heads", "persistent_six_task_schedule", "persistent_stride_head_aligned"],
       "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
       "threads": 1024,
       "smem_bytes": 226304,
@@ -904,7 +922,8 @@
     {
       "archs": ["sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_vtile_a8f9b5a463",
-      "body": "flashkda_generated_bf16_fused_m128_vtile_a8f9b5a463.cu",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_persistent_fp32_state.cu",
+      "knobs": ["num_heads", "persistent_six_task_schedule", "persistent_stride_head_aligned"],
       "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
       "threads": 1024,
       "smem_bytes": 226304,
@@ -924,7 +943,8 @@
     {
       "archs": ["sm_103a"],
       "module_ident": "flashkda_bf16_fused_m128_vtile_b784466ef6",
-      "body": "flashkda_generated_bf16_fused_m128_vtile_b784466ef6.cu",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_persistent_bf16_state.cu",
+      "knobs": ["num_heads", "persistent_six_task_schedule", "persistent_stride_head_aligned"],
       "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
       "threads": 1024,
       "smem_bytes": 226304,
@@ -964,7 +984,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m64_2eb7864cd4",
-      "body": "flashkda_generated_bf16_fused_m64_2eb7864cd4.cu",
+      "body": "flashkda_generated_bf16_fused_m64_dvsplit.cu",
+      "knobs": ["num_heads", "state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_fused_m64",
       "threads": 1024,
       "smem_bytes": 227328,
@@ -984,7 +1005,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m64_5eb5b5da39",
-      "body": "flashkda_generated_bf16_fused_m64_5eb5b5da39.cu",
+      "body": "flashkda_generated_bf16_fused_m64_dvsplit.cu",
+      "knobs": ["num_heads", "state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_fused_m64",
       "threads": 1024,
       "smem_bytes": 227328,
@@ -1004,7 +1026,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m64_9f7512076a",
-      "body": "flashkda_generated_bf16_fused_m64_9f7512076a.cu",
+      "body": "flashkda_generated_bf16_fused_m64_dvsplit.cu",
+      "knobs": ["num_heads", "state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_fused_m64",
       "threads": 1024,
       "smem_bytes": 227328,
@@ -1024,7 +1047,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_fused_m64_c2b2a382bb",
-      "body": "flashkda_generated_bf16_fused_m64_c2b2a382bb.cu",
+      "body": "flashkda_generated_bf16_fused_m64_dvsplit.cu",
+      "knobs": ["num_heads", "state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_fused_m64",
       "threads": 1024,
       "smem_bytes": 227328,
@@ -1044,7 +1068,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_persistent_m128_47722a5d98",
-      "body": "flashkda_generated_bf16_persistent_m128_47722a5d98.cu",
+      "body": "flashkda_generated_bf16_persistent_m128_piece_tasks.cu",
+      "knobs": ["state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_persistent_m128",
       "threads": 1024,
       "smem_bytes": 221696,
@@ -1064,7 +1089,8 @@
     {
       "archs": ["sm_100a"],
       "module_ident": "flashkda_bf16_persistent_m128_4b0769bf08",
-      "body": "flashkda_generated_bf16_persistent_m128_4b0769bf08.cu",
+      "body": "flashkda_generated_bf16_persistent_m128_head_grouped_lpt.cu",
+      "knobs": ["state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_persistent_m128",
       "threads": 1024,
       "smem_bytes": 221696,
@@ -1085,7 +1111,8 @@
     {
       "archs": ["sm_100a"],
       "module_ident": "flashkda_bf16_persistent_m128_c258a6e650",
-      "body": "flashkda_generated_bf16_persistent_m128_c258a6e650.cu",
+      "body": "flashkda_generated_bf16_persistent_m128_head_grouped_lpt.cu",
+      "knobs": ["state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_persistent_m128",
       "threads": 1024,
       "smem_bytes": 221696,
@@ -1106,7 +1133,8 @@
     {
       "archs": ["sm_100a", "sm_103a"],
       "module_ident": "flashkda_bf16_persistent_m128_ddb5283bd6",
-      "body": "flashkda_generated_bf16_persistent_m128_ddb5283bd6.cu",
+      "body": "flashkda_generated_bf16_persistent_m128_piece_tasks.cu",
+      "knobs": ["state_dtype_is_fp32"],
       "kernel": "kernel_flashkda_bf16_persistent_m128",
       "threads": 1024,
       "smem_bytes": 221696,

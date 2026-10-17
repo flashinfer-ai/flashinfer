@@ -115,7 +115,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_GATE_ALL_STRIDE 184320
 #define SMEM_TOTAL 231424
 #define THREADS 1024
-#define NUM_HEADS 64
+#define NUM_HEADS FLASHKDA_GENERATED_NUM_HEADS
 #define USE_INITIAL_STATE 1
 #define STORE_FINAL_STATE 1
 #define SCALE_VALUE 0.08838834764831845
@@ -1725,10 +1725,17 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                         float _cvt_f32_0 = __bfloat162float(early_gate_raw);
                         float early_gate_arg = early_gate_rate * (_cvt_f32_0 + early_gate_bias);
                         {
+#if NUM_HEADS == 96
+                            float _tanh_approx_2;
+                            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_2) : "f"(early_gate_arg * 0.5f));
+                            float early_gate_sigmoid = _tanh_approx_2 * 0.5f + 0.5f;
+                            early_gate0 = specialized_lower_bound * 1.4426950408889634f * early_gate_sigmoid;
+#else
                             float _tanh_approx_1;
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(early_gate_arg * 0.5f));
                             float early_gate_tanh = _tanh_approx_1;
                             early_gate0 = gate_half_log2 * early_gate_tanh + gate_half_log2;
+#endif  // NUM_HEADS
                         }
                     }
                 } else if (PERSISTENT_SCHEDULE) {
@@ -1804,15 +1811,23 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                                     asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(gate_arg * 0.5f));
                                     float gate_tanh = _tanh_approx_4;
                                     {
+#if NUM_HEADS == 96
+                                        gate_block[gate_row_in_block] = specialized_lower_bound * 1.4426950408889634f * (gate_tanh * 0.5f + 0.5f);
+#else
                                         gate_block[gate_row_in_block] = gate_tanh;
+#endif  // NUM_HEADS
                                     }
                                 }
                             }
                             for (int gate_row_in_block_1 = 0; gate_row_in_block_1 < 8; gate_row_in_block_1++) {
                                 if (1 + gate_block_idx * 8 + gate_row_in_block_1 < 32) {
                                     {
+#if NUM_HEADS == 96
+                                        prefix_log2 += gate_block[gate_row_in_block_1];
+#else
                                         prefix_log2 += gate_half_log2;
                                         prefix_log2 += gate_half_log2 * gate_block[gate_row_in_block_1];
+#endif  // NUM_HEADS
                                     }
                                     int segment_0 = gate_col / 8;
                                     int elem_1 = gate_col & 7;
