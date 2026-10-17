@@ -7,15 +7,15 @@ import re
 import subprocess
 import sys
 import sysconfig
+from packaging.version import Version
 from pathlib import Path
 from typing import List, Mapping, Optional
 
-import torch
 import tvm_ffi
-from packaging.version import Version
+import torch
 
-from ..compilation_context import CompilationContext
 from . import env as jit_env
+from ..compilation_context import CompilationContext
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +429,11 @@ def _memory_aware_job_cap() -> Optional[int]:
     if mem_available_gb is None:
         return None
 
-    cpu_count = os.cpu_count() or 1
+    # ninja counts only the CPUs this process may run on (sched_getaffinity).
+    if hasattr(os, "sched_getaffinity"):
+        cpu_count = len(os.sched_getaffinity(0))
+    else:
+        cpu_count = os.cpu_count() or 1
     # ninja's GuessParallelism: 2 for <=1 core, 3 for 2 cores, else N + 2.
     if cpu_count <= 1:
         ninja_default = 2
