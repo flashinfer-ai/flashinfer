@@ -47,9 +47,13 @@ the envelope in launch slot ``n`` instead of the row stride, the clus
 family's solo rows (``GvrClusKernel`` ``solo``), the in-kernel register
 paths of the main and clus families (``GvrMainKernel`` / ``GvrClusKernel``
 ``reg_vpt``, which call ``GvrTopkRegKernel.row_topk``, the register kernel
-body split out of ``kern``), and the decode rows of n <= k columns, whose
-output one CTA writes right after the length read while the row's other CTAs
-leave (``_short_row_out``).  Keep future diffs against upstream mechanical.
+body split out of ``kern``), the decode rows of n <= k columns, whose output
+one CTA writes right after the length read while the row's other CTAs leave
+(``_short_row_out``), and the main family's cluster register path
+(``GvrMainKernel`` ``clus_cs``, which calls ``GvrRegClusKernel.row_topk``,
+the clustered register kernel body split out of ``kern``, with
+``embedded``: a finite-only bracket whose top also covers runs spread over
+the row).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
@@ -1529,6 +1533,8 @@ class GvrMainKernel:
         pt_smem: int = 0,
         pdl: bool = False,
         reg_vpt: int = 0,
+        clus_cs: int = 0,
+        clus_stage: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1667,6 +1673,47 @@ class GvrMainKernel:
                 assert win + 4 * kpt * blk <= self.dyn_bytes, "register window must fit the smem"
                 self.regs.append((cap, body, win))
             self.reg_cap = self.regs[-1][0]
+        # Cluster register path (FlashInfer-local, decode SPLIT engines with the
+        # register path). With clus_cs > 0 the launch groups each row's parts into
+        # clusters of clus_cs (R a multiple of it), and a row too long for the
+        # register path but of at most clus_cs * BLK * 16 columns runs the
+        # clustered register family's body (GvrRegClusKernel.row_topk, embedded) on
+        # the first cluster of its parts, part p as rank p, as route() ranks such a
+        # row at a launch sized to it; every other part leaves at once and longer
+        # rows stream as before. Bodies: the narrowest of VPT 2 and VPT 4 that holds
+        # the row (VPT 2 only where it holds more than the register path), each
+        # with live slots where its rows can need fewer than VPT.
+        self.clus_cs = int(clus_cs)
+        self.rcs = []  # (row capacity, embedded body), narrowest first
+        if self.clus_cs:
+            assert self.reg_vpt and self.split and self.clus_cs in (2, 4, 8)
+            assert self.r_const % self.clus_cs == 0
+            rc_pt = 0 if clus_stage else self.pt_smem
+            lo = self.reg_cap
+            for vpt in (2, 4):
+                cap = self.clus_cs * blk * vpt * 4
+                if cap <= lo:
+                    continue
+                body = GvrRegClusKernel(
+                    blk,
+                    vpt,
+                    self.clus_cs,
+                    varlen=True,
+                    next_n=self.next_n,
+                    cr_shift=self.cr_shift,
+                    hint_free=self.hint_free,
+                    paged=self.paged,
+                    page_shift=self.page_shift,
+                    pt_smem=rc_pt,
+                    stage_out=bool(clus_stage),
+                    embedded=True,
+                    live=lo < cap - self.clus_cs * blk * 4,
+                )
+                self.rcs.append((cap, body))
+                lo = cap
+            # the window (+ k staged outputs) at the smem base of every CTA
+            win = SMEM_BYTES + 4 * rc_pt + (4 * kpt * blk if clus_stage else 0)
+            assert win <= self.dyn_bytes, "cluster register window must fit the smem"
 
     # ------------------------------------------------------------------
     # GVR_EMITC: classify+stage one survivor.
@@ -1894,6 +1941,19 @@ class GvrMainKernel:
                 sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
                 self._reg_arm(logits, pre_idx, kv_lens, out, nv0, k, row0, part0, sbase0)
                 _exit_thread()
+            if cutlass.const_expr(self.clus_cs > 0):
+                # cluster register path (see the ctor)
+                if nv0 <= cutlass.Int32(self.rcs[-1][0]):
+                    if bx0 < cutlass.Int32(self.clus_cs):
+                        sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
+                        if cutlass.const_expr(len(self.rcs) == 1):
+                            self.rcs[0][1].row_topk(logits, pre_idx, kv_lens, out, nv0, row0, bx0, sbase0)
+                        else:
+                            if nv0 <= cutlass.Int32(self.rcs[0][0]):
+                                self.rcs[0][1].row_topk(logits, pre_idx, kv_lens, out, nv0, row0, bx0, sbase0)
+                            else:
+                                self.rcs[1][1].row_topk(logits, pre_idx, kv_lens, out, nv0, row0, bx0, sbase0)
+                    _exit_thread()
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
@@ -3577,6 +3637,7 @@ class GvrMainKernel:
         ).launch(
             grid=(R, b, 1),
             block=(self.blk, 1, 1),
+            cluster=(self.clus_cs, 1, 1) if self.clus_cs else None,
             stream=stream,
             min_blocks_per_mp=self.minb,
             use_pdl=self.pdl,
@@ -3600,6 +3661,8 @@ def get_compiled(
     pt_smem: int = 0,
     pdl: bool = False,
     reg_vpt: int = 0,
+    clus_cs: int = 0,
+    clus_stage: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3616,7 +3679,10 @@ def get_compiled(
     device).
 
     ``reg_vpt`` (decode tuple only) compiles in the per-row register path for
-    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off."""
+    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off.
+    ``clus_cs`` (SPLIT, with the register path) launches the parts in clusters of
+    that size with the cluster register path; ``clus_stage`` selects its staged
+    emit. 0 = off."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     paged = bool(paged)
     if paged and not (hint_free and len(tpl) == 10 and not prefill):
@@ -3634,6 +3700,8 @@ def get_compiled(
         int(pt_smem) if paged else 0,
         bool(pdl),
         int(reg_vpt),
+        int(clus_cs),
+        bool(clus_stage) if clus_cs else False,
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3668,6 +3736,8 @@ def get_compiled(
             pt_smem=int(pt_smem) if paged else 0,
             pdl=bool(pdl),
             reg_vpt=int(reg_vpt),
+            clus_cs=int(clus_cs),
+            clus_stage=bool(clus_stage),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3733,6 +3803,8 @@ def get_compiled(
         name += "_pdl1"
     if reg_vpt:
         name += f"_rg{int(reg_vpt)}"
+    if clus_cs:
+        name += f"_cl{int(clus_cs)}" + ("s" if clus_stage else "")
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -7311,9 +7383,28 @@ class GvrRegClusKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         stage_out: bool = False,
+        embedded: bool = False,
+        live: bool = False,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
+        # embedded (FlashInfer-local): `row_topk` runs inside the main family's
+        # kernel (its cluster register path, GvrMainKernel `clus_cs`) on rows of
+        # any length up to this body's capacity, not on rows sized to the launch.
+        # The bracket then folds only finite scores (as the register family's
+        # does), and its top also covers NW runs of 32 columns spread over the
+        # row (hint-free): a row whose scores rise past its first values would
+        # otherwise pile its top-k into the top bin and refine thousands of
+        # candidates on rank 0 (B200: 2-4x slower than streaming it).
+        self.embedded = bool(embedded)
+        assert not (self.embedded and pdl)
+        # live slots (embedded only): a row of n4 float4s takes vl = ceil(n4 /
+        # (CS * BLK)) <= VPT slots per thread, rank r holding [r * vl * BLK,
+        # (r + 1) * vl * BLK), and the histogram skips the others, so a row a
+        # narrower VPT would hold is spread over every rank instead of piling
+        # onto the low ones
+        self.live = bool(live)
+        assert self.embedded or not self.live
         self.blk = blk
         self.vpt = vpt
         self.cs = cs
@@ -7584,7 +7675,15 @@ class GvrRegClusKernel:
 
             n4 = n >> cutlass.Int32(2)
             ntail = n - (n4 << cutlass.Int32(2))
-            base4 = rank * cutlass.Int32(self.span)
+            # slots per thread holding the row, and the end of this rank's part
+            vl = cutlass.Int32(VPT)
+            lim4 = n4
+            if cutlass.const_expr(self.live):
+                vl = (n4 + cutlass.Int32(CS * BLK - 1)) >> cutlass.Int32((CS * BLK).bit_length() - 1)
+                lim4 = (rank + cutlass.Int32(1)) * vl * cutlass.Int32(BLK)
+                if lim4 > n4:
+                    lim4 = n4
+            base4 = rank * vl * cutlass.Int32(BLK)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
             # ---- P0: redundant hint gather, EVERY CTA. One coalesced word per
@@ -7608,11 +7707,11 @@ class GvrRegClusKernel:
             frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
             for u in cutlass.range_constexpr(VPT):
                 i = base4 + tid + cutlass.Int32(u * self.blk)
-                if i < n4:
+                if i < lim4:
                     ld_g_f32x4(atom128, x_addr, i, frags[u])
             for u in cutlass.range_constexpr(VPT):
                 i = base4 + tid + cutlass.Int32(u * self.blk)
-                if i >= n4:  # -INFINITY fill
+                if i >= lim4:  # -INFINITY fill
                     for z in cutlass.range_constexpr(4):
                         frags[u][z] = cutlass.Float32(_NEG_INF__regclus)
             # tail element: rank 0 only
@@ -7630,10 +7729,26 @@ class GvrRegClusKernel:
             # ---- P3: GMIN/GMAX from the hint, ONE barrier fold.
             lmin = cutlass.Uint32(0xFFFFFFFF)
             lmax = cutlass.Uint32(0)
-            if cutlass.Uint32(pv0) < cutlass.Uint32(n):
-                uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
-                lmin = uk
-                lmax = uk
+            if cutlass.const_expr(not self.embedded):
+                if cutlass.Uint32(pv0) < cutlass.Uint32(n):
+                    uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
+                    lmin = uk
+                    lmax = uk
+            else:
+                # finite scores only, and (hint-free) a top that also covers warp
+                # w's 32 columns at w * n / NW (see the ctor)
+                if cutlass.Uint32(pv0) < cutlass.Uint32(n):
+                    xb = ldg_f32(x_addr, pv0)
+                    if fabs_f32(xb) != cutlass.Float32(_POS_INF__regclus):
+                        lmin = fkey(xb)
+                        lmax = lmin
+                if cutlass.const_expr(self.hint_free):
+                    run = n >> cutlass.Int32((self.blk // 32).bit_length() - 1)
+                    xr = ldg_f32(x_addr, (tid >> cutlass.Int32(5)) * run + lane)
+                    if fabs_f32(xr) != cutlass.Float32(_POS_INF__regclus):
+                        uk = fkey(xr)
+                        if uk > lmax:
+                            lmax = uk
             lmin = warp_min_u32(lmin)
             lmax = warp_max_u32(lmax)
             if lane == cutlass.Int32(0):
@@ -7676,9 +7791,10 @@ class GvrRegClusKernel:
             # ---- P4: histogram; tval add UNCONDITIONAL (trash bin swallows
             # -INFINITY via the saturating cvt).
             for s in cutlass.range_constexpr(S):
-                qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)
-                bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
-                atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                if cutlass.Int32(s // 4) < vl:  # (always, unless live)
+                    qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)
+                    bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
+                    atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
             qv = _fmaf__regclus(tval, SC, CQ)
             bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
             atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
