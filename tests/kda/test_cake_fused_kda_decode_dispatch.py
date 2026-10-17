@@ -205,7 +205,10 @@ def test_cake_targets_share_programs_but_have_distinct_build_identities():
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
     # 17 FACTORIES entries (export.py) x 2 slot-offset widths (32/64-bit twins).
+    # The twins and the LAUNCH_MIN_BLOCKS=1 wide512 instantiation compile shared
+    # kernel bodies selected by -D knobs: 34 programs own 16 bodies.
     assert len(sm100_variants) == len(sm103_variants) == 34
+    assert len({variant.body_path for variant in sm100_variants}) == 16
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
         assert sm100.module == sm103.module
         assert sm100.body_path == sm103.body_path
@@ -237,6 +240,11 @@ def test_registry_routes_every_variant_to_one_generated_program():
         assert variant.body_path.name.startswith("cake_fused_kda_decode_")
         assert variant.binding_path.name.startswith("cake_fused_kda_decode_")
         assert variant.body_path.is_file() and variant.binding_path.is_file()
+        assert variant.body_path.name == record["sources"][0]
+        assert variant.binding_path.name == record["sources"][1]
+        assert [
+            flag for flag in variant.extra_cuda_cflags if flag.startswith("-D")
+        ] == [f"-D{define}" for define in record["defines"]]
         assert variant.kernel_symbol == record["kernel_symbol"]
         assert variant.threads == record["launch"]["block"][0]
         assert variant.dynamic_smem_bytes == record["launch"]["dynamic_smem_bytes"]
@@ -249,6 +257,176 @@ def test_registry_routes_every_variant_to_one_generated_program():
         else:
             assert "--use_fast_math" in variant.extra_cuda_cflags
         assert len(variant.source_sha256) == 64
+
+
+# Shared kernel bodies: a route compiles ``MODULES[...]["sources"][0]`` with the
+# ``-D`` knobs below.  A 64-bit slot-offset twin shares its base schedule's body
+# (``CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS`` selects the ``long long`` slot math and
+# the twin's kernel symbol); the two wide512 positive-FP32 instantiations share
+# one body (``CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS``).  Values are the 20-hex program
+# id of the body file ``cake_fused_kda_decode_<id>_kernel.cu``.
+_ROUTE_BODIES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "cluster2_wide_positive_f32": (
+        "7e841caca37f5c48f0a3",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "cluster2_wide_positive_f32_wide_slot_offsets": (
+        "7e841caca37f5c48f0a3",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "compact_async_bf16": (
+        "59e2055a73df5c6ec7fa",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "compact_async_bf16_wide_slot_offsets": (
+        "59e2055a73df5c6ec7fa",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "compact_async_f32": (
+        "4d1216db0b67e580d6f7",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "compact_async_f32_wide_slot_offsets": (
+        "4d1216db0b67e580d6f7",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "compact_async_positive_f32": (
+        "0743aa5d22f746909b3c",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "compact_async_positive_f32_wide_slot_offsets": (
+        "0743aa5d22f746909b3c",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "direct_bf16": (
+        "3fcc8696ad27c9a56a84",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "direct_bf16_wide_slot_offsets": (
+        "3fcc8696ad27c9a56a84",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "direct_f32": (
+        "7e5629eb5984e1177160",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "direct_f32_wide_slot_offsets": (
+        "7e5629eb5984e1177160",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "high_work_bf16": (
+        "a07c16f264b1fc295f84",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "high_work_bf16_wide_slot_offsets": (
+        "a07c16f264b1fc295f84",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "high_work_f32": (
+        "9fb82e69235a7fdd5f96",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "high_work_f32_wide_slot_offsets": (
+        "9fb82e69235a7fdd5f96",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "high_work_positive_f32": (
+        "7caf25be4378d6f0f0ed",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "high_work_positive_f32_wide_slot_offsets": (
+        "7caf25be4378d6f0f0ed",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "repeated_safe_bf16": (
+        "dd24f0fe2c61f6730898",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "repeated_safe_bf16_wide_slot_offsets": (
+        "dd24f0fe2c61f6730898",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "repeated_safe_f32": (
+        "97a7e6ab6064b0fa1bc8",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "repeated_safe_f32_wide_slot_offsets": (
+        "97a7e6ab6064b0fa1bc8",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "stream_bf16": (
+        "3d014ff47814a933a847",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "stream_bf16_wide_slot_offsets": (
+        "3d014ff47814a933a847",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "wide512_bf16": (
+        "753293b369d11fb0880f",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "wide512_bf16_wide_slot_offsets": (
+        "753293b369d11fb0880f",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "wide512_f32": (
+        "26bd2da2218a44305e35",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "wide512_f32_wide_slot_offsets": (
+        "26bd2da2218a44305e35",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+    "wide512_positive_f32": (
+        "f415905e21bbc11b4581",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0", "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2"),
+    ),
+    "wide512_positive_f32_wide_slot_offsets": (
+        "f415905e21bbc11b4581",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1", "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2"),
+    ),
+    "wide512_regcap128_positive_f32": (
+        "f415905e21bbc11b4581",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0", "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1"),
+    ),
+    "wide512_regcap128_positive_f32_wide_slot_offsets": (
+        "f415905e21bbc11b4581",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1", "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1"),
+    ),
+    "wide512_vector4_positive_f32": (
+        "903332461e85b6c8df36",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",),
+    ),
+    "wide512_vector4_positive_f32_wide_slot_offsets": (
+        "903332461e85b6c8df36",
+        ("CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",),
+    ),
+}
+
+
+def test_route_table_pins_shared_kernel_bodies_and_knob_defines():
+    assert set(_ROUTE_BODIES) == set(cake_jit.ROUTES)
+    variants = cake_jit.get_cake_fused_kda_decode_variants()
+    assert len({variant.body_path for variant in variants}) == 16
+    for variant in variants:
+        body, defines = _ROUTE_BODIES[variant.name]
+        record = cake_jit.MODULES[variant.module]
+        assert variant.body_path.name == f"cake_fused_kda_decode_{body}_kernel.cu"
+        assert record["sources"][0] == variant.body_path.name
+        assert tuple(record["defines"]) == defines
+        assert [
+            flag for flag in variant.extra_cuda_cflags if flag.startswith("-D")
+        ] == [f"-D{define}" for define in defines]
+        wide = f"CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS={int(variant.slot_offset_bits == 64)}"
+        assert wide in defines
+        base = variant.name.removesuffix("_wide_slot_offsets")
+        assert _ROUTE_BODIES[base][0] == body
+        assert _ROUTE_BODIES[f"{base}_wide_slot_offsets"][0] == body
+        text = variant.body_path.read_text()
+        assert variant.kernel_symbol in text
+        for define in defines:
+            assert define.partition("=")[0] in text
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
@@ -567,13 +745,18 @@ def test_cluster_variants_launch_two_ctas_per_work_item(target, name):
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_regcap128_is_the_h8_one_wave_instantiation_of_wide512(target):
     # "wide512_regcap128_positive_f32" is wide512_positive_f32's schedule with the
-    # declared constant LAUNCH_MIN_BLOCKS = 1 (one template, two instantiations);
-    # the H=8 rows 10..18 bucket selects it, wide512_positive_f32 starts at 19.
+    # declared constant LAUNCH_MIN_BLOCKS = 1 (one template, two instantiations:
+    # both programs compile the same kernel body with their own
+    # -DCAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS value); the H=8 rows 10..18 bucket
+    # selects it, wide512_positive_f32 starts at 19.
     regcap = cake_jit.get_cake_fused_kda_decode_variant(
         "wide512_regcap128_positive_f32", target
     )
     wide = cake_jit.get_cake_fused_kda_decode_variant("wide512_positive_f32", target)
     assert regcap.module != wide.module
+    assert regcap.body_path == wide.body_path
+    assert "-DCAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1" in regcap.extra_cuda_cflags
+    assert "-DCAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2" in wide.extra_cuda_cflags
     assert regcap.abi_kind == wide.abi_kind == "standard"
     assert regcap.threads == wide.threads == 512
     assert [
@@ -661,6 +844,7 @@ def test_lower_bound_is_passed_in_log2_units():
         ("compact_async_f32", False),
         ("stream_bf16", False),
         ("cluster2_wide_positive_f32", False),
+        ("wide512_regcap128_positive_f32", False),
     ),
 )
 def test_cake_jit_spec_uses_exact_target_flags(
@@ -682,6 +866,8 @@ def test_cake_jit_spec_uses_exact_target_flags(
         assert not set(spec.extra_cuda_cflags) & cake_jit._FAST_MATH_FLAGS
     else:
         assert "--use_fast_math" in spec.extra_cuda_cflags
+    knobs = [f"-D{define}" for define in cake_jit.MODULES[variant.module]["defines"]]
+    assert [flag for flag in spec.extra_cuda_cflags if flag in knobs] == knobs
     expected_occupancy_flags = ["-Xptxas=--minnctapersm=3"] if min_blocks else []
     assert [
         flag

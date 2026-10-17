@@ -45,14 +45,20 @@ _TARGET_NVCC_FLAGS = {
 }
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 
-# Generated programs: one device/binding source pair per physical schedule,
-# shared by every target architecture (the exporter writes this registry).
+# Generated programs, shared by every target architecture (the exporter
+# writes this registry).  The 64-bit slot-offset twin of a schedule and the
+# LAUNCH_MIN_BLOCKS=1 instantiation of the wide512 positive-FP32 schedule
+# compile the same ``_kernel.cu`` body as their base program; ``defines``
+# lists the ``-D`` knobs (``CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS``,
+# ``CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS``) that select one member's text, so
+# the body's ``#if`` blocks expand to exactly the former per-program source.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_fused_kda_decode_0743aa5d22f746909b3c": {
         "sources": [
             "cake_fused_kda_decode_0743aa5d22f746909b3c_kernel.cu",
             "cake_fused_kda_decode_0743aa5d22f746909b3c_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_0743aa5d22f746909b3c",
         "ffi_entry": "run",
         "arg_plan": [
@@ -95,9 +101,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_1105a251fd33b55719ae": {
         "sources": [
-            "cake_fused_kda_decode_1105a251fd33b55719ae_kernel.cu",
+            "cake_fused_kda_decode_7e841caca37f5c48f0a3_kernel.cu",
             "cake_fused_kda_decode_1105a251fd33b55719ae_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_1105a251fd33b55719ae",
         "ffi_entry": "run",
         "arg_plan": [
@@ -140,8 +147,12 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_23498e31ce2702fee03c": {
         "sources": [
-            "cake_fused_kda_decode_23498e31ce2702fee03c_kernel.cu",
+            "cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu",
             "cake_fused_kda_decode_23498e31ce2702fee03c_binding.cu",
+        ],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_23498e31ce2702fee03c",
         "ffi_entry": "run",
@@ -188,6 +199,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_26bd2da2218a44305e35_kernel.cu",
             "cake_fused_kda_decode_26bd2da2218a44305e35_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_26bd2da2218a44305e35",
         "ffi_entry": "run",
         "arg_plan": [
@@ -230,9 +242,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_3109b5a8356a11c3dabb": {
         "sources": [
-            "cake_fused_kda_decode_3109b5a8356a11c3dabb_kernel.cu",
+            "cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_kernel.cu",
             "cake_fused_kda_decode_3109b5a8356a11c3dabb_rows_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_3109b5a8356a11c3dabb",
         "ffi_entry": "run",
         "arg_plan": [
@@ -279,6 +292,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_3d014ff47814a933a847_kernel.cu",
             "cake_fused_kda_decode_3d014ff47814a933a847_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_3d014ff47814a933a847",
         "ffi_entry": "run",
         "arg_plan": [
@@ -325,6 +339,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_3fcc8696ad27c9a56a84_kernel.cu",
             "cake_fused_kda_decode_3fcc8696ad27c9a56a84_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84",
         "ffi_entry": "run",
         "arg_plan": [
@@ -367,9 +382,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_47e6858f50f60799991b": {
         "sources": [
-            "cake_fused_kda_decode_47e6858f50f60799991b_kernel.cu",
+            "cake_fused_kda_decode_9fb82e69235a7fdd5f96_kernel.cu",
             "cake_fused_kda_decode_47e6858f50f60799991b_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_47e6858f50f60799991b",
         "ffi_entry": "run",
         "arg_plan": [
@@ -415,6 +431,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_4d1216db0b67e580d6f7_kernel.cu",
             "cake_fused_kda_decode_4d1216db0b67e580d6f7_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_4d1216db0b67e580d6f7",
         "ffi_entry": "run",
         "arg_plan": [
@@ -457,9 +474,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_4dc09b8c1d1bab526c64": {
         "sources": [
-            "cake_fused_kda_decode_4dc09b8c1d1bab526c64_kernel.cu",
+            "cake_fused_kda_decode_0743aa5d22f746909b3c_kernel.cu",
             "cake_fused_kda_decode_4dc09b8c1d1bab526c64_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_4dc09b8c1d1bab526c64",
         "ffi_entry": "run",
         "arg_plan": [
@@ -502,9 +520,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_583b3404f8230ee830a8": {
         "sources": [
-            "cake_fused_kda_decode_583b3404f8230ee830a8_kernel.cu",
+            "cake_fused_kda_decode_59e2055a73df5c6ec7fa_kernel.cu",
             "cake_fused_kda_decode_583b3404f8230ee830a8_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_583b3404f8230ee830a8",
         "ffi_entry": "run",
         "arg_plan": [
@@ -550,6 +569,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_59e2055a73df5c6ec7fa_kernel.cu",
             "cake_fused_kda_decode_59e2055a73df5c6ec7fa_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_59e2055a73df5c6ec7fa",
         "ffi_entry": "run",
         "arg_plan": [
@@ -592,9 +612,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_5b7fd31f6c4783cbe2c6": {
         "sources": [
-            "cake_fused_kda_decode_5b7fd31f6c4783cbe2c6_kernel.cu",
+            "cake_fused_kda_decode_903332461e85b6c8df36_kernel.cu",
             "cake_fused_kda_decode_5b7fd31f6c4783cbe2c6_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_5b7fd31f6c4783cbe2c6",
         "ffi_entry": "run",
         "arg_plan": [
@@ -640,6 +661,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_753293b369d11fb0880f_kernel.cu",
             "cake_fused_kda_decode_753293b369d11fb0880f_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_753293b369d11fb0880f",
         "ffi_entry": "run",
         "arg_plan": [
@@ -682,9 +704,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_7c97fb1858b20c965ee0": {
         "sources": [
-            "cake_fused_kda_decode_7c97fb1858b20c965ee0_kernel.cu",
+            "cake_fused_kda_decode_7e5629eb5984e1177160_kernel.cu",
             "cake_fused_kda_decode_7c97fb1858b20c965ee0_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7c97fb1858b20c965ee0",
         "ffi_entry": "run",
         "arg_plan": [
@@ -730,6 +753,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_7caf25be4378d6f0f0ed_kernel.cu",
             "cake_fused_kda_decode_7caf25be4378d6f0f0ed_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7caf25be4378d6f0f0ed",
         "ffi_entry": "run",
         "arg_plan": [
@@ -775,6 +799,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_7e5629eb5984e1177160_kernel.cu",
             "cake_fused_kda_decode_7e5629eb5984e1177160_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7e5629eb5984e1177160",
         "ffi_entry": "run",
         "arg_plan": [
@@ -820,6 +845,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_7e841caca37f5c48f0a3_kernel.cu",
             "cake_fused_kda_decode_7e841caca37f5c48f0a3_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7e841caca37f5c48f0a3",
         "ffi_entry": "run",
         "arg_plan": [
@@ -862,9 +888,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_82fc564c161daa575154": {
         "sources": [
-            "cake_fused_kda_decode_82fc564c161daa575154_kernel.cu",
+            "cake_fused_kda_decode_3d014ff47814a933a847_kernel.cu",
             "cake_fused_kda_decode_82fc564c161daa575154_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_82fc564c161daa575154",
         "ffi_entry": "run",
         "arg_plan": [
@@ -908,9 +935,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_836d666a9d0b6decc492": {
         "sources": [
-            "cake_fused_kda_decode_836d666a9d0b6decc492_kernel.cu",
+            "cake_fused_kda_decode_a07c16f264b1fc295f84_kernel.cu",
             "cake_fused_kda_decode_836d666a9d0b6decc492_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_836d666a9d0b6decc492",
         "ffi_entry": "run",
         "arg_plan": [
@@ -953,9 +981,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_8b697d61d1b15a6fac4d": {
         "sources": [
-            "cake_fused_kda_decode_8b697d61d1b15a6fac4d_kernel.cu",
+            "cake_fused_kda_decode_3fcc8696ad27c9a56a84_kernel.cu",
             "cake_fused_kda_decode_8b697d61d1b15a6fac4d_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_8b697d61d1b15a6fac4d",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1001,6 +1030,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_903332461e85b6c8df36_kernel.cu",
             "cake_fused_kda_decode_903332461e85b6c8df36_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_903332461e85b6c8df36",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1046,6 +1076,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_kernel.cu",
             "cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_rows_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_97a7e6ab6064b0fa1bc8",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1089,9 +1120,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_9823df19f9a25b5b670e": {
         "sources": [
-            "cake_fused_kda_decode_9823df19f9a25b5b670e_kernel.cu",
+            "cake_fused_kda_decode_dd24f0fe2c61f6730898_kernel.cu",
             "cake_fused_kda_decode_9823df19f9a25b5b670e_rows_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_9823df19f9a25b5b670e",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1135,9 +1167,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_9dc0bb23b72067eaee2f": {
         "sources": [
-            "cake_fused_kda_decode_9dc0bb23b72067eaee2f_kernel.cu",
+            "cake_fused_kda_decode_7caf25be4378d6f0f0ed_kernel.cu",
             "cake_fused_kda_decode_9dc0bb23b72067eaee2f_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_9dc0bb23b72067eaee2f",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1183,6 +1216,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_9fb82e69235a7fdd5f96_kernel.cu",
             "cake_fused_kda_decode_9fb82e69235a7fdd5f96_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_9fb82e69235a7fdd5f96",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1228,6 +1262,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_a07c16f264b1fc295f84_kernel.cu",
             "cake_fused_kda_decode_a07c16f264b1fc295f84_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_a07c16f264b1fc295f84",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1270,8 +1305,12 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_c988ce55655115a24ea5": {
         "sources": [
-            "cake_fused_kda_decode_c988ce55655115a24ea5_kernel.cu",
+            "cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu",
             "cake_fused_kda_decode_c988ce55655115a24ea5_binding.cu",
+        ],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_c988ce55655115a24ea5",
         "ffi_entry": "run",
@@ -1315,9 +1354,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_ceb0985ab93695f02817": {
         "sources": [
-            "cake_fused_kda_decode_ceb0985ab93695f02817_kernel.cu",
+            "cake_fused_kda_decode_753293b369d11fb0880f_kernel.cu",
             "cake_fused_kda_decode_ceb0985ab93695f02817_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_ceb0985ab93695f02817",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1363,6 +1403,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_dd24f0fe2c61f6730898_kernel.cu",
             "cake_fused_kda_decode_dd24f0fe2c61f6730898_rows_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_dd24f0fe2c61f6730898",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1406,8 +1447,12 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_e71bdc5861ac91ffb4bc": {
         "sources": [
-            "cake_fused_kda_decode_e71bdc5861ac91ffb4bc_kernel.cu",
+            "cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu",
             "cake_fused_kda_decode_e71bdc5861ac91ffb4bc_binding.cu",
+        ],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_e71bdc5861ac91ffb4bc",
         "ffi_entry": "run",
@@ -1451,9 +1496,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_f2aada6c39fd5dce4bee": {
         "sources": [
-            "cake_fused_kda_decode_f2aada6c39fd5dce4bee_kernel.cu",
+            "cake_fused_kda_decode_4d1216db0b67e580d6f7_kernel.cu",
             "cake_fused_kda_decode_f2aada6c39fd5dce4bee_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_f2aada6c39fd5dce4bee",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1499,6 +1545,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu",
             "cake_fused_kda_decode_f415905e21bbc11b4581_binding.cu",
         ],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2",
+        ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_f415905e21bbc11b4581",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1541,9 +1591,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_fused_kda_decode_fd601115ded1c0f96ee1": {
         "sources": [
-            "cake_fused_kda_decode_fd601115ded1c0f96ee1_kernel.cu",
+            "cake_fused_kda_decode_26bd2da2218a44305e35_kernel.cu",
             "cake_fused_kda_decode_fd601115ded1c0f96ee1_binding.cu",
         ],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_fd601115ded1c0f96ee1",
         "ffi_entry": "run",
         "arg_plan": [
@@ -1808,7 +1859,11 @@ def _variant(
 
 
 def _twins(name: str, **spec: Any) -> tuple[dict[str, Any], ...]:
-    """The 64-bit slot-offset program and its 32-bit twin share one launch contract."""
+    """The 64-bit slot-offset program and its 32-bit twin share one launch contract.
+
+    Both compile the base schedule's kernel body; the program's ``defines``
+    (``CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS``) select the member's text.
+    """
 
     return (
         _variant(f"{name}_wide_slot_offsets", slot_offset_bits=64, **spec),
@@ -2037,6 +2092,7 @@ def get_cake_fused_kda_decode_variants(
                     if name not in _PRECISE_MATH_VARIANTS
                     or flag not in _FAST_MATH_FLAGS
                 )
+                + tuple(f"-D{define}" for define in record["defines"])
                 + _OCCUPANCY_FLAGS.get(name, ()),
                 threads=int(record["launch"]["block"][0]),
                 dynamic_smem_bytes=int(record["launch"]["dynamic_smem_bytes"]),
