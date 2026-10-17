@@ -244,7 +244,12 @@ _SCALE_FORMATS = {
     "q8_0": "q8_0",
 }
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
-_E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
+# BF16 E8M0 path: FP4 unpack (2^-126) x scale materialized as 2^(e + 71 - 127)
+# gives true_weight * 2^-55 in the MMA; the epilogue restores 2^55.  Keep in
+# sync with the bias in intrinsics.packed_dequant_e8m0x4_to_bfloat2x2 and
+# _E8M0_K32_BF16_MAX_SCALE_BYTE (= 254 - 71) in prepare.py / reference.py.
+_E8M0_K32_BF16_SCALE_BIAS = 71
+_E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0 ** (126 - _E8M0_K32_BF16_SCALE_BIAS))
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
