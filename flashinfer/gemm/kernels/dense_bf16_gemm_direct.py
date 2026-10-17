@@ -111,6 +111,13 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
             ):
                 continue
             tactics.append(tactic)
+    # Narrow projections can underfill the GPU when one CTA owns every row.
+    # Add at most three schedules that trade some B reuse for more CTAs; keep
+    # the original schedules available so autotuning decides the crossover.
+    if n <= 256:
+        for rows in (1, 2, 4):
+            if rows < default.rows_per_block and m % rows == 0:
+                tactics.append(DirectTactic(default.block_size, 1, rows))
     return list(dict.fromkeys(tactics))
 
 
