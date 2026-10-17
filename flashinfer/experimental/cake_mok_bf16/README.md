@@ -117,8 +117,8 @@ memory, not work.
 
 ## Targets
 
-`sources.json` lists every kernel role with the exact targets each variant
-was generated for, its argument plan and its architecture-free `library`
+`sources.json` lists every kernel role with the targets it is generated
+for, the argument names of its entry and its architecture-free `library`
 stem (`cake_mok_<role>`); `build.json` (schema `cake-build/1`) records the
 sources, digests and nvcc flags of every `<library>_<arch>` build
 (`cake_mok_<role>_<arch>`, for example `cake_mok_forward_sm_100a`), and the
