@@ -1924,8 +1924,7 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         **_F32,
         eligibility=_rules(
             _NULLABLE, {8: ((19, 37), (56, 147)), **_DIRECT_NULLABLE_BANDS}
-        )
-        + _rules(_POSITIVE, {24: ((19, 49),), 96: ((5, 12),)}),
+        ),
     ),
     *_twins(
         "direct_bf16",
