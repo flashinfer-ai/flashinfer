@@ -44,10 +44,12 @@ rename, this note, the ``_persist`` hook that routes the four
 cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
 device), the main-family varlen prologue clamping each row's length to
 the envelope in launch slot ``n`` instead of the row stride, the clus
-family's solo rows (``GvrClusKernel`` ``solo``), and the in-kernel register
+family's solo rows (``GvrClusKernel`` ``solo``), the in-kernel register
 paths of the main and clus families (``GvrMainKernel`` / ``GvrClusKernel``
 ``reg_vpt``, which call ``GvrTopkRegKernel.row_topk``, the register kernel
-body split out of ``kern``).  Keep future diffs against upstream mechanical.
+body split out of ``kern``), and the decode rows of n <= k columns, whose
+output one CTA writes right after the length read while the row's other CTAs
+leave (``_short_row_out``).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
@@ -1435,9 +1437,10 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
 @dsl_user_op
 def _exit_thread(*, loc=None, ip=None):
     """PTX ``exit``: CUDA's ``if (...) return;``, which the DSL has no runtime
-    form of (FlashInfer-local, the main and clus families' register paths;
-    callers branch on a CTA-uniform predicate, so the whole CTA leaves, and
-    only where it owes no barrier or DSMEM access)."""
+    form of (FlashInfer-local, the main and clus families' register paths and
+    every family's rows of n <= k columns; callers branch on a CTA-uniform
+    predicate, so the whole CTA leaves, and only where it owes no barrier or
+    DSMEM access)."""
     nvvm.exit(loc=loc, ip=ip)
 
 
@@ -1451,6 +1454,55 @@ def _pt_xf(pre_idx, req, v, ps: int):
     return (pre_idx[req, v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
         v & cutlass.Int32((1 << ps) - 1)
     )
+
+
+@cute.jit
+def _short_row_out(
+    out,
+    row,
+    pre_idx,
+    req,
+    n,
+    k,
+    tid,
+    slots: cutlass.Constexpr,
+    blk: cutlass.Constexpr,
+    paged: cutlass.Constexpr,
+    ps: cutlass.Constexpr,
+):
+    """Output row of a decode row of n <= k columns (FlashInfer-local): every
+    live column is selected, so position i holds column i (paged: its KV slot,
+    as ``_pt_xf``) for i < n and -1 for n <= i < k. One CTA writes it in
+    coalesced stores; a thread's positions are tid + j * blk (j < slots), and
+    the page-table entries of its live ones are all read before its first
+    store, so the row waits on one global read instead of one per position.
+    Positions past slots * blk take the strided tail (one read per position)."""
+    orow = out[row, None]
+    pv = cute.make_rmem_tensor((slots,), cutlass.Int32)
+    if cutlass.const_expr(paged):
+        prow = pre_idx[req, None]
+        for j in cutlass.range_constexpr(slots):
+            i = tid + cutlass.Int32(j * blk)
+            if i < n:
+                pv[j] = prow[i >> cutlass.Int32(ps)]
+    for j in cutlass.range_constexpr(slots):
+        i = tid + cutlass.Int32(j * blk)
+        if i < k:
+            ov = cutlass.Int32(-1)
+            if i < n:
+                ov = i
+                if cutlass.const_expr(paged):
+                    ov = (pv[j] << cutlass.Int32(ps)) | (i & cutlass.Int32((1 << ps) - 1))
+            orow[i] = ov
+    i = tid + cutlass.Int32(slots * blk)
+    while i < k:
+        ov = cutlass.Int32(-1)
+        if i < n:
+            ov = i
+            if cutlass.const_expr(paged):
+                ov = _pt_xf(pre_idx, req, i, ps)
+        orow[i] = ov
+        i = i + cutlass.Int32(blk)
 
 
 class GvrMainKernel:
@@ -1567,8 +1619,8 @@ class GvrMainKernel:
         # In-kernel register path (FlashInfer-local, decode, 512/1024 threads). Under
         # a CUDA graph the launch is planned for the capacity, so this streaming
         # kernel gets rows far shorter than that, which the register family ranks
-        # ~2x faster. With reg_vpt > 0, a row of at most BLK * reg_vpt * 4 columns
-        # (short rows included) runs that family's body (GvrTopkRegKernel.row_topk)
+        # ~2x faster. With reg_vpt > 0, a row of k < n <= BLK * reg_vpt * 4 columns
+        # runs that family's body (GvrTopkRegKernel.row_topk)
         # on its own CTA instead of streaming: the narrowest of VPT 2 and VPT 4
         # that holds it (the rungs route() picks for this CTA shape, NBH 2 * BLK), as
         # SGLang's topk_v2 picks Register2 / Register4 per row. The kernel takes
@@ -1787,12 +1839,44 @@ class GvrMainKernel:
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
 
+        if cutlass.const_expr(self.varlen and not self.prefill):
+            # Decode rows of n <= k columns (FlashInfer-local): every live column
+            # is selected, so the output follows from the row's length alone. The
+            # row's first CTA writes it (_short_row_out) and every CTA of the row
+            # leaves here, before any other work, so the code below never sees
+            # such a row (a SPLIT row then owes the slab nothing). Row length as in
+            # the varlen prologue below.
+            tid_s, _, _ = cute.arch.thread_idx()
+            bx_s, row_s, _ = cute.arch.block_idx()
+            req_s = row_s // cutlass.Int32(self.next_n)
+            own_s = cutlass.Int32(1)
+            if cutlass.const_expr(self.split):
+                if bx_s != cutlass.Int32(0):
+                    own_s = cutlass.Int32(0)
+            kv_s = kv_lens[req_s]
+            nv_s = (
+                kv_s
+                - cutlass.Int32(self.next_n)
+                + row_s % cutlass.Int32(self.next_n)
+                + cutlass.Int32(1)
+            ) >> cutlass.Int32(self.cr_shift)
+            if nv_s < cutlass.Int32(0):
+                nv_s = cutlass.Int32(0)
+            if nv_s > n:
+                nv_s = n
+            if nv_s <= k:
+                if own_s != cutlass.Int32(0):
+                    _short_row_out(
+                        out, row_s, pre_idx, req_s, nv_s, k, tid_s,
+                        KPT, BLK, self.paged, self.page_shift,
+                    )
+                _exit_thread()
+
         if cutlass.const_expr(self.reg_vpt > 0):
             # In-kernel register path (see the ctor): a row of at most reg_cap
-            # columns, short rows included, is ranked by part 0 with the register
-            # body, and every CTA of the row leaves before any other work, so the
-            # code below never sees such a row. Row length as in the varlen
-            # prologue below.
+            # columns is ranked by part 0 with the register body, and every CTA
+            # of the row leaves before any other work, so the code below never
+            # sees such a row. Row length as in the varlen prologue below.
             bx0, row0, _ = cute.arch.block_idx()
             rr0 = row0 % cutlass.Int32(self.next_n)
             kv0 = kv_lens[row0 // cutlass.Int32(self.next_n)]
@@ -1828,8 +1912,9 @@ class GvrMainKernel:
         # envelope the per-row length is clamped to).  n <= k rows have no runtime
         # `return` in CuTe DSL: they run the body as a zero-work pass
         # (n = 0, TGT = INT_MAX so no rung ever accepts) and the identity/pad
-        # emission happens in the epilogue at the end of the kernel.  Every
-        # value below is a pure function of `row`, so all R split CTAs of a
+        # emission happens in the epilogue at the end of the kernel (FlashInfer:
+        # prefill windows only; decode rows of n <= k left at the kernel top).
+        # Every value below is a pure function of `row`, so all R split CTAs of a
         # row (and all threads) compute identical scalars — grid-uniform per
         # row by construction.
         short = cutlass.Int32(0)
@@ -3415,7 +3500,8 @@ class GvrMainKernel:
         # convention): every valid position is in the top-K — emit identity
         # indices and pad the tail with -1.  The body above is skipped for
         # these rows (block-uniform `short`, so its barriers stay converged)
-        # and nothing was written; only part 0 of a SPLIT row emits.
+        # and nothing was written; only part 0 of a SPLIT row emits. Prefill
+        # windows only (decode rows of n <= k left at the kernel top).
         if cutlass.const_expr(self.varlen):
             if short != cutlass.Int32(0):
                 if part == cutlass.Int32(0):
@@ -4116,6 +4202,9 @@ class GvrTopkRegKernel:
         # tail here (k can exceed BLK on this family -> strided loop, unlike
         # the reg_clus k <= BLK single predicate) and SKIP the body entirely:
         # a zero-work pass would reach the degenerate emitter and poison out.
+        # FlashInfer-local: a decode short row writes its output with
+        # _short_row_out and the CTA leaves (embedded, the host kernel has
+        # already sent such rows away); prefill windows keep the loop below.
         short = cutlass.Int32(0)
         prow = row
         # prefill window frame (0 in every non-prefill compile): lead = ks & 3
@@ -4164,6 +4253,14 @@ class GvrTopkRegKernel:
                     nv = cutlass.Int32(0)
                 if nv > n:
                     nv = n
+                if cutlass.const_expr(not self.embedded):
+                    if nv <= kq:
+                        # 2048 // BLK positions per thread: the API's largest k
+                        _short_row_out(
+                            out, row, pre_idx, req, nv, kq, tid,
+                            2048 // BLK, BLK, self.paged, self.page_shift,
+                        )
+                        _exit_thread()
             if nv <= kq:
                 short = cutlass.Int32(1)
             if short == cutlass.Int32(0):
@@ -5859,7 +5956,8 @@ class GvrClusKernel:
         # untested; sampling only steers the rung — exactness is
         # schedule-invariant). All values are pure functions of `row`, so the
         # whole-body guard and the cluster barriers stay cluster-uniform.
-        # Short rows (n <= k): rank 0 emits identity + (-1); body is SKIPped.
+        # Short rows (n <= k): rank 0 writes the row (_short_row_out) and every
+        # rank leaves before any cluster barrier or DSMEM access.
         short = cutlass.Int32(0)
         prow = row
         if cutlass.const_expr(self.varlen):
@@ -5879,6 +5977,12 @@ class GvrClusKernel:
                 nv = n
             if nv <= kq:
                 short = cutlass.Int32(1)
+            if short == cutlass.Int32(1):
+                if rank == cutlass.Int32(0):
+                    _short_row_out(
+                        out, row, pre_idx, req, nv, kq, tidx, 1, BLK, self.paged, self.page_shift
+                    )
+                _exit_thread()
             if cutlass.const_expr(self.reg_vpt > 0):
                 # register-path row (see the family note): short = 2. Like a
                 # short row it skips the ladder and, on every rank, the
@@ -5972,17 +6076,6 @@ class GvrClusKernel:
                     TGT2 = cutlass.Int32(1)
                 # NB: the Q launch slot is dead in this family (no in-kernel
                 # consumer); chunk ownership derives from n4/STEPC below.
-            if short == cutlass.Int32(1):
-                if rank == cutlass.Int32(0):
-                    if tidx < kq:
-                        ov = cutlass.Int32(-1)
-                        if tidx < nv:
-                            ov = self._ox_g(pre_idx, tidx)
-                        out[row, tidx] = ov
-                if cutlass.const_expr(self.reg_vpt > 0):
-                    # done: exit here rather than jump past the streaming body
-                    # to the register arm (that jump cost all-short batches ~1%)
-                    _exit_thread()
 
         # ---- shared memory (CUDA dynamic map order, then static allocs) ----
         smem = SmemAllocator()
@@ -7322,8 +7415,9 @@ class GvrRegClusKernel:
         # envelope arg; the launcher admits this family only when the envelope
         # fits its capacity window). Pure functions of `row` keep the body
         # guard and cluster barriers cluster-uniform. Short rows (n <= k):
-        # rank 0 emits identity + (-1) and the body is SKIPped — a zero-work
-        # pass would reach the crossing-overflow emitter and poison the output.
+        # rank 0 writes the row (_short_row_out) and every rank leaves, before
+        # any cluster barrier — a zero-work pass would reach the
+        # crossing-overflow emitter and poison the output.
         short = cutlass.Int32(0)
         prow = row
         if cutlass.const_expr(self.varlen):
@@ -7343,19 +7437,16 @@ class GvrRegClusKernel:
                 nv = n
             if nv <= kq:
                 short = cutlass.Int32(1)
-            if short == cutlass.Int32(0):
-                n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    # k may exceed BLK (K = 2048 rows are admitted to this
-                    # family): stride the identity write
-                    jq = tid
-                    while jq < kq:
-                        ov = cutlass.Int32(-1)
-                        if jq < nv:
-                            ov = self._ox_g(pre_idx, jq)
-                        out[row, jq] = ov
-                        jq = jq + cutlass.Int32(BLK)
+                    # one position per thread (k <= BLK); K = 2048 rows, admitted
+                    # to this family, take the strided tail
+                    _short_row_out(
+                        out, row, pre_idx, req, nv, kq, tid, 1, BLK, self.paged, self.page_shift
+                    )
+                _exit_thread()
+            if short == cutlass.Int32(0):
+                n = nv
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
