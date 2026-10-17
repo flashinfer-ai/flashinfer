@@ -774,23 +774,51 @@ def cake_gdn_prefill_geometries(
         "float8_e5m2",
     }:
         raise CakeGDNUnsupportedError(f"unsupported state dtype {state_dtype}")
-    # The base template of the contract: every performance twin the resolver
-    # may substitute on ``arch`` (sm_100a late state input, sm_103a role
-    # rebalance, gate-stream full) is exported for exactly the geometry
-    # triples of its base record, so the base records enumerate the contract.
-    schedule_attr = _prefill_schedule_attr(
-        dvsplit=dvsplit,
-        use_initial_state=use_initial_state,
-        io_dtype=io_dtype,
-        state_dtype=state_dtype,
-        single_chunk=False,
-        gatepipe4=False,
-        fullgrid_vhold=False,
-        sm100a_state_inp_late=False,
-        sm103a_role_rebalanced=False,
-        gate_stream_full=False,
+    # The schedules the resolver can select for the contract on ``arch``: the
+    # base template and the twin it is forced to substitute on this
+    # architecture.  On sm_100a the late-``state_inp_ready`` twin replaces the
+    # bf16-I/O DV-split bases for every geometry, so only the twin records
+    # list sm_100a; on sm_103a the role-rebalanced twin replaces the f16-I/O
+    # fp32-state stateful DV-split base for the one geometry it is exported
+    # for, so its records are read next to the base.  The contract fixes the
+    # remaining terms of both rules (packed state, no single chunk, no
+    # checkpoints); the geometry terms of the sm_103a rule are the twin
+    # record's own specializations.  The other performance twins (gatepipe4,
+    # fullgrid_vhold, gate-stream full) are exported for exactly the geometry
+    # triples of their base record.
+    sm100a_state_inp_late = (
+        arch == "sm_100a"
+        and dvsplit
+        and io_dtype == "bfloat16"
+        and state_dtype in ("float32", "bfloat16")
     )
-    expected_source = f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
+    sm103a_role_rebalanced = (
+        arch == "sm_103a"
+        and dvsplit
+        and use_initial_state
+        and store_final_state
+        and io_dtype == "float16"
+        and state_dtype == "float32"
+    )
+
+    def _source(*, role_rebalanced: bool) -> str:
+        schedule_attr = _prefill_schedule_attr(
+            dvsplit=dvsplit,
+            use_initial_state=use_initial_state,
+            io_dtype=io_dtype,
+            state_dtype=state_dtype,
+            single_chunk=False,
+            gatepipe4=False,
+            fullgrid_vhold=False,
+            sm100a_state_inp_late=sm100a_state_inp_late,
+            sm103a_role_rebalanced=role_rebalanced,
+            gate_stream_full=False,
+        )
+        return f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
+
+    expected_sources = {_source(role_rebalanced=False)}
+    if sm103a_role_rebalanced:
+        expected_sources.add(_source(role_rebalanced=True))
     fixed: dict[str, int] = {
         "ENABLE_CHECKPOINTS": 0,
         "SINGLE_CHUNK_NO_STATE": 0,
@@ -805,7 +833,7 @@ def cake_gdn_prefill_geometries(
         specializations = record["specializations"]
         if (
             record["domain"] != "prefill"
-            or record["source_schedule"] != expected_source
+            or record["source_schedule"] not in expected_sources
             or record["tma_abi"] != "grid_constant"
             or not _serves_arch(record, arch)
             or set(specializations) != set(fixed) | set(geometry_keys)
