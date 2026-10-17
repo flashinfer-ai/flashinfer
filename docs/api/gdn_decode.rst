@@ -27,8 +27,9 @@ indexed by the same pool slots as the checkpoints. Verify produces outputs
 without changing the checkpoint or storing a full state for every token.
 
 Once the accepted lengths are known, call ``gated_delta_rule_replayssm_commit``
-once across all layers. It replays only the accepted prefix and updates each
-live checkpoint in place. Zero acceptance leaves the checkpoint unchanged.
+once across all layers. It replays only the accepted prefix, or the accepted
+root-to-node path when ``accept_paths`` is given, and updates each live
+checkpoint in place. Zero acceptance leaves the checkpoint unchanged.
 The next verify overwrites the raw windows; no circular cache or deferred
 state update is retained between rounds. Use identical Q/K normalization
 settings for verify and commit.
