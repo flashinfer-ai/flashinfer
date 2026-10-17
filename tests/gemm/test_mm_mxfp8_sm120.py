@@ -95,6 +95,39 @@ def test_mm_mxfp8_sm120_all_tactics(out_dtype):
         assert cos_sim > 0.99, f"tactic {tactic}: cos_sim={cos_sim:.4f}"
 
 
+def test_mm_mxfp8_sm120_untuned_tactic_uses_swap_ab_128x32():
+    """tactic=-1 (no tuned tactic) must launch the swap-AB 128x32 tile.
+
+    Every tile gives the same output here, so check the launched kernel: its name
+    carries the tile shape and the swap-AB flag.
+    """
+    _skip_if_not_sm120()
+    from torch.profiler import ProfilerActivity, profile, supported_activities
+
+    from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
+
+    if ProfilerActivity.CUDA not in supported_activities():
+        pytest.skip("Requires CUDA profiling (Kineto/CUPTI)")
+    m, n, k = 8, 256, 256
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_fp8, b_fp8, a_sf, b_sf = _prepare_mxfp8(a, b, swizzled=True)
+    out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    workspace = torch.zeros(32 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    module = gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
+
+    module.mxfp8_gemm(a_fp8, b_fp8, a_sf, b_sf, out, workspace, -1)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        module.mxfp8_gemm(a_fp8, b_fp8, a_sf, b_sf, out, workspace, -1)
+        torch.cuda.synchronize()
+    gemm_kernels = [
+        e.name for e in prof.events() if "DeviceGemmMxfp8GemmSm120" in e.name
+    ]
+    assert len(gemm_kernels) == 1, gemm_kernels
+    assert "_128_32_128true" in gemm_kernels[0], gemm_kernels[0]
+
+
 def test_mm_mxfp8_sm120_auto_tactic():
     """Verify SM120 MXFP8 produces correct results (tactic auto-selected)."""
     _skip_if_not_sm120()
