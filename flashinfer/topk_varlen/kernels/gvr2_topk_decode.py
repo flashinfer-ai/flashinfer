@@ -4405,8 +4405,6 @@ class GvrTopkRegKernel:
         it = cutlass.Int32(0)
         it2 = cutlass.Int32(0)
         idv = cutlass.Int32(0)
-        q1e = cutlass.Int32(0)
-        q2e = cutlass.Int32(0)
         q1f = cutlass.Int32(0)
         q2f = cutlass.Int32(0)
         b_lv = cutlass.Int32(0)
@@ -5011,84 +5009,69 @@ class GvrTopkRegKernel:
                 ofs_e = cutlass.Int32(0) - lead
                 if cutlass.const_expr(self.prefill_abs):
                     ofs_e = ks & cutlass.Int32(-4)
-                lml = cutlass.Int32(cute.arch.lanemask_lt())
-                for s in cutlass.range_constexpr(S):
-                    ixv = (
-                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                    ) + cutlass.Int32(s % 4)
+                # FlashInfer-local: this thread's winners (key > ethr) and ties (key ==
+                # ethr) as two bit masks over its S register slots and its tail element (bit
+                # S); one warp scan and one pair of block atomics per warp place them, and a
+                # walk over the set bits writes them (ties past nT dropped). The per-slot
+                # ballot / atomic / shuffle steps this replaces were S times the code of a
+                # path that rows almost never take, laid out ahead of the common emit.
+                m1 = cutlass.Int32(0)
+                m2 = cutlass.Int32(0)
+                for s in cutlass.range_constexpr(S + 1):
                     u64 = cutlass.Int64(-1)
-                    okl = cutlass.Int32(1)
-                    if cutlass.const_expr(self.prefill and s < 4):
-                        okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
-                    if ixv < nvec:
-                        if okl != cutlass.Int32(0):
-                            u64 = cutlass.Int64(fkey(_val(frags, s)))
-                    q1e = cutlass.Int32(0)
-                    q2e = cutlass.Int32(0)
+                    if cutlass.const_expr(s < S):
+                        ixv = (
+                            (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                        ) + cutlass.Int32(s % 4)
+                        okl = cutlass.Int32(1)
+                        if cutlass.const_expr(self.prefill and s < 4):
+                            okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                        if ixv < nvec:
+                            if okl != cutlass.Int32(0):
+                                u64 = cutlass.Int64(fkey(_val(frags, s)))
+                    else:
+                        if tid < ntail:
+                            u64 = cutlass.Int64(fkey(tval))
                     if u64 > ethr:
-                        q1e = cutlass.Int32(1)
+                        m1 = m1 | cutlass.Int32(1 << s)
                     if u64 == ethr:
-                        q2e = cutlass.Int32(1)
-                    n1 = ballot(q1e == cutlass.Int32(1))
-                    n2 = ballot(q2e == cutlass.Int32(1))
-                    b1 = cutlass.Int32(0)
-                    b2 = cutlass.Int32(0)
-                    if lane == cutlass.Int32(0):
-                        if n1 != cutlass.Int32(0):
-                            b1 = atomic_add_cta(s_e12.iterator, popc(n1))
-                        if n2 != cutlass.Int32(0):
-                            b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
-                    b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                    b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                    p1e = b1 + popc(n1 & lml)
-                    p2e = b2 + popc(n2 & lml)
-                    if q1e == cutlass.Int32(1):
+                        m2 = m2 | cutlass.Int32(1 << s)
+                c1 = popc(m1)
+                c2 = popc(m2)
+                s1, s2 = warp_incl_scan_add2(c1, c2, lane)
+                b1 = cutlass.Int32(0)
+                b2 = cutlass.Int32(0)
+                if lane == cutlass.Int32(31):
+                    b1 = atomic_add_cta(s_e12.iterator, s1)
+                    b2 = atomic_add_cta(s_e12.iterator + 1, s2)
+                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(31))
+                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(31))
+                p1e = b1 + (s1 - c1)
+                p2e = b2 + (s2 - c2)
+                wm = m1 | m2  # sparse set-bit walk
+                while wm != cutlass.Int32(0):
+                    sdyn = ffs_m1(wm)
+                    ixv = (
+                        (tid + (sdyn >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                        << cutlass.Int32(2)
+                    ) + (sdyn & cutlass.Int32(3))
+                    if sdyn == cutlass.Int32(S):
+                        ixv = tix
+                    if ((m1 >> sdyn) & cutlass.Int32(1)) != cutlass.Int32(0):
                         if p1e < nA:
                             if cutlass.const_expr(self.stage_out):
                                 s_out[p1e] = ixv + ofs_e
                             else:
                                 out_row[p1e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
-                    if q2e == cutlass.Int32(1):
+                        p1e = p1e + cutlass.Int32(1)
+                    else:
                         if p2e < nT:
                             if cutlass.const_expr(self.stage_out):
                                 s_out[nA + p2e] = ixv + ofs_e
                             else:
                                 out_row[nA + p2e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
-                # tail element
-                u64 = cutlass.Int64(-1)
-                if tid < ntail:
-                    u64 = cutlass.Int64(fkey(tval))
-                q1e = cutlass.Int32(0)
-                q2e = cutlass.Int32(0)
-                if u64 > ethr:
-                    q1e = cutlass.Int32(1)
-                if u64 == ethr:
-                    q2e = cutlass.Int32(1)
-                n1 = ballot(q1e == cutlass.Int32(1))
-                n2 = ballot(q2e == cutlass.Int32(1))
-                b1 = cutlass.Int32(0)
-                b2 = cutlass.Int32(0)
-                if lane == cutlass.Int32(0):
-                    if n1 != cutlass.Int32(0):
-                        b1 = atomic_add_cta(s_e12.iterator, popc(n1))
-                    if n2 != cutlass.Int32(0):
-                        b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
-                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                p1e = b1 + popc(n1 & lml)
-                p2e = b2 + popc(n2 & lml)
-                if q1e == cutlass.Int32(1):
-                    if p1e < nA:
-                        if cutlass.const_expr(self.stage_out):
-                            s_out[p1e] = tix + ofs_e
-                        else:
-                            out_row[p1e] = self._ox(pre_idx, s_pt, tix + ofs_e)
-                if q2e == cutlass.Int32(1):
-                    if p2e < nT:
-                        if cutlass.const_expr(self.stage_out):
-                            s_out[nA + p2e] = tix + ofs_e
-                        else:
-                            out_row[nA + p2e] = self._ox(pre_idx, s_pt, tix + ofs_e)
+                        p2e = p2e + cutlass.Int32(1)
+                    wm = wm & (wm - cutlass.Int32(1))
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
