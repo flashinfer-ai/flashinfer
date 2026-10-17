@@ -56,6 +56,33 @@ _H20_COUNTER_BUCKETS = (
     (6144, 384, 8, 17, 32, True, False),
 )
 
+# H200 (EP8): push wins by about 10 us per call at small M (1.03-1.16x kernel time);
+# at BM64 it loses (0.89-0.95x at M=256). Bounds are the largest M that does not lose on
+# any measured router (uniform, global Zipf skew, hot experts on one rank). The rotated
+# pool only pays on Pro above M=32; the clean barrier is ~1 us on H200.
+_H200_COUNTER_BUCKETS = (
+    (4096, 256, 6, 1, 32, True, False),
+    (6144, 384, 8, 1, 32, True, False),
+    (7168, 384, 6, 1, 32, True, False),
+    (7168, 384, 6, 33, 64, True, True),
+)
+
+# Counter dispatch is validated only on the small-M plans (BLOCK_M <= 24, M <= 64); larger
+# plans keep the barrier path even when forced. Unmeasured geometries push up to M=32,
+# where every measured geometry wins on both GPUs.
+_PUSH_MAX_TOKENS = 64
+_PUSH_MAX_BLOCK_M = 24
+_PUSH_DEFAULT_MAX_TOKENS = 32
+
+# The H20 tile buckets were tuned (and are only legal) together with the RS arm of these
+# geometries; any other geometry with the same hidden size uses the generic schedule.
+_H20_TUNED_GEOMETRIES = {(4096, 256, 6), (7168, 384, 6), (6144, 384, 8)}
+
+# A BLOCK_M=8 plan with 4 stages leaves this many bytes of the 232448-byte SM90 budget for
+# the per-expert count table and the per-dispatch-warp FP8 send row, each 1 KiB aligned
+# (SMEM_EXPERT_COUNT_SIZE / SMEM_SEND_BUFFER_SIZE in sm90_nvfp4_mega_moe_fused_body.inl).
+_BM8_STAGE4_SMEM_HEADROOM = 8400
+
 # All-M arm table: which fused schedule to use. Every arm here runs the same
 # fused kernel; they differ in scheduler mode and the RS epilogue.
 #   "dynamic-rs"  -> interleaved scheduler + RS swap-AB (mode5)
@@ -223,17 +250,26 @@ def _select_arm(
 def _select_counter_policy(
     num_sms: int, hidden: int, num_experts: int, num_topk: int, m: int
 ) -> Tuple[bool, bool]:
-    """(push_dispatch, no_clean_barrier). H200 is unmeasured and keeps barriers.
+    """(push_dispatch, no_clean_barrier) from the measured per-GPU counter buckets.
 
     Matching on (hidden, num_experts, num_topk) rather than hidden alone: the
     payoff depends on the pushed row count (m * num_topk) and the per-expert
     pool pressure, so a model that merely shares a hidden size must not inherit
-    a measured range. Unmatched shapes keep the always-correct barrier path.
+    a measured range. A measured geometry uses only its measured range; an
+    unmeasured one pushes (without the rotated pool) up to M=32.
     """
-    if num_sms != H20_NUM_SMS:
-        return False, False
-    for h, e, k, lo, hi, push, rotated in _H20_COUNTER_BUCKETS:
-        if h == hidden and e == num_experts and k == num_topk and lo <= m <= hi:
+    buckets = [
+        b
+        for b in {
+            H20_NUM_SMS: _H20_COUNTER_BUCKETS,
+            H200_NUM_SMS: _H200_COUNTER_BUCKETS,
+        }.get(num_sms, ())
+        if b[:3] == (hidden, num_experts, num_topk)
+    ]
+    if not buckets:
+        return m <= _PUSH_DEFAULT_MAX_TOKENS, False
+    for _, _, _, lo, hi, push, rotated in buckets:
+        if lo <= m <= hi:
             return push, push and rotated
     return False, False
 
@@ -257,15 +293,25 @@ def select_fused_plan(
     num_experts_per_rank = num_experts // num_ranks
     if num_experts_per_rank * num_ranks != num_experts:
         raise ValueError("num_experts must be divisible by num_ranks")
-    supported_experts_per_rank = (32, 48) if num_ranks == 8 else (64, 96)
-    if num_experts_per_rank not in supported_experts_per_rank:
-        raise ValueError(f"unsupported experts per rank: {num_experts_per_rank}")
+    if num_experts_per_rank < 1:
+        raise ValueError("every rank needs at least one local expert")
     if not 0 < num_tokens <= num_max_tokens_per_rank:
         raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
+    # Compile-time shape requirements of the fused kernel (scheduler / combine static asserts).
+    if hidden % (512 if hidden > 4096 else 256) != 0:
+        raise ValueError("hidden must be a multiple of 256 (512 above 4096)")
+    if intermediate_hidden % 128 != 0 or 2 * intermediate_hidden > hidden:
+        raise ValueError(
+            "intermediate_hidden must be a multiple of 128 and at most hidden / 2"
+        )
 
     # (block_m, block_n, experts per wave, stages, swap_ab, mode2, single warp)
     tuning: Optional[Tuple[int, int, int, int, bool, bool, bool]] = None
-    if num_ranks == 8 and num_sms == H20_NUM_SMS:
+    if (
+        num_ranks == 8
+        and num_sms == H20_NUM_SMS
+        and (hidden, num_experts, num_topk) in _H20_TUNED_GEOMETRIES
+    ):
         for h, lo, hi, bm, epw, stages, swap, mode2, single in _H20_FUSED_BUCKETS:
             if h == hidden and lo <= num_tokens <= hi:
                 tuning = (bm, 256, epw, stages, swap, mode2, single)
@@ -294,15 +340,12 @@ def select_fused_plan(
     while epw < num_experts_per_rank and num_experts_per_rank % epw != 0:
         epw += 1
 
-    # Pro at BLOCK_M=8 does not fit 4 stages.
-    is_pro = (
-        num_experts == 384
-        and num_topk == 6
-        and hidden == 7168
-        and intermediate_hidden == 3072
-    )
-    if is_pro and block_m == 8 and stages == 4:
-        stages = 3
+    # Large hidden / expert counts do not fit 4 stages at BLOCK_M=8 (e.g. Pro, Kimi-K2).
+    if block_m == 8 and stages == 4:
+        kib = lambda n: -(-n // 1024) * 1024  # noqa: E731
+        dispatch_rows = hidden * (1 if single_warp else 2)
+        if kib(num_experts * 4) + kib(dispatch_rows) > _BM8_STAGE4_SMEM_HEADROOM:
+            stages = 3
 
     # Deployment arm and counter ranges were measured at EP8.
     arm = (
@@ -322,7 +365,15 @@ def select_fused_plan(
         push = force_push_dispatch
     if force_no_clean_barrier is not None:
         no_clean = force_no_clean_barrier
-    push = push and use_interleaved
+    push = (
+        push
+        and use_interleaved
+        and num_tokens <= _PUSH_MAX_TOKENS
+        and block_m <= _PUSH_MAX_BLOCK_M
+        and hidden % 1024 == 0  # push row copy: two 512-element chunks per lane
+        and num_experts_per_rank
+        <= num_sms  # SM e publishes local expert e's arrival counts
+    )
     no_clean = no_clean and push
 
     num_max_pool_tokens = get_num_max_pool_tokens(

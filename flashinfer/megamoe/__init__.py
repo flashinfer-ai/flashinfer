@@ -299,7 +299,10 @@ def nvfp4_mega_moe(
         FP32 vectors with one multiplier per local expert. Omitted scales use 1.
     force_push_dispatch, force_no_clean_barrier : bool, optional
         Override the fused counter-dispatch policy. None uses the default
-        policy. These overrides do not apply to the split family.
+        policy. Counter dispatch is limited to the validated small-M plans
+        (``num_tokens <= 64`` and ``BLOCK_M <= 24``); outside them the
+        overrides are ignored and the barrier path is used. These overrides
+        do not apply to the split family.
     kernel_family : str
         ``"auto"``, ``"fused"`` or ``"split"``. Auto selects fused through
         ``family_threshold`` tokens per rank, then split.

@@ -240,6 +240,29 @@ def test_megamoe_fp4_sm90(ep):
     )
 
 
+def test_hot_expert_workspace_cleanup():
+    """Every row on one expert must not leave stale pool-block counters for the next launch.
+
+    Single-dispatch-warp plans clean the pool from every dispatch warp; past 32 blocks
+    per expert the second warp's blocks need the same per-expert offsets.
+    """
+    if torch.cuda.device_count() < 8 or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires 8 Hopper GPUs")
+    _run(
+        argparse.Namespace(
+            hidden=4096,
+            intermediate=2048,
+            capacity=384,
+            tokens=[97, 128],
+            formats=["nvfp4", "mxfp4"],
+            fast_math=True,
+            routing="hot",
+            cuda_graph=True,
+            repeats=3,
+        )
+    )
+
+
 def test_mxfp4_no_swap_decoded_b_reuse():
     if torch.cuda.device_count() < 8 or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("requires 8 Hopper GPUs")
