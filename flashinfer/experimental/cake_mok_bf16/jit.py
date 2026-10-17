@@ -90,9 +90,3 @@ def load_kernel(role):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Prepare the MoK backend before CUDA Graph capture")
     return _load(role, torch.cuda.current_device())
-
-
-def specs_for_arch(arch):
-    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
-    ``flashinfer.jit.build_jit_specs`` warm-up)."""
-    return cake_build.jit_specs(arch)
