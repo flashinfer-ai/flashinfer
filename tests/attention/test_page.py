@@ -487,27 +487,6 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scal
         )
 
 
-@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("nan")])
-def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_cuda_scale(
-    bad_scale,
-):
-    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
-        _make_small_nvfp4_append_inputs()
-    )
-    slot_mapping = torch.zeros(1, dtype=torch.int32, device="cuda:0")
-
-    with pytest.raises(ValueError, match="positive finite global decode scale"):
-        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
-            k_append,
-            v_append,
-            slot_mapping,
-            (k_cache, v_cache),
-            (k_scales, v_scales),
-            torch.tensor([bad_scale], dtype=torch.float32, device="cuda:0"),
-            torch.ones(1, dtype=torch.float32, device="cuda:0"),
-        )
-
-
 @pytest.mark.parametrize("k_scale", [1.0, torch.ones(1, dtype=torch.float32)])
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_capture_temp_scale(
     k_scale,
@@ -591,6 +570,21 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_captu
     )
     torch.cuda.synchronize()
 
+    # CUDA scales are checked in the kernel, so an eager append must not sync.
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            k_scale,
+            v_scale,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
@@ -608,10 +602,16 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_captu
 
 @pytest.mark.skipif(
     _is_compute_sanitizer_active(),
-    reason="the replay below makes the kernel execute its `trap;` guard on purpose, "
+    reason="the append below makes the kernel execute its `trap;` guard on purpose, "
     "which compute-sanitizer reports as errors and slows past this test's timeout",
 )
-def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_bad_scale():
+@pytest.mark.parametrize(
+    "mode, bad_scale",
+    [("eager", 0.0), ("eager", -1.0), ("eager", float("nan")), ("graph", 0.0)],
+)
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_bad_cuda_scale(
+    mode, bad_scale
+):
     _skip_if_fp8_e4m3_scale_unsupported()
 
     script = textwrap.dedent(
@@ -627,6 +627,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_bad_s
         if major < 8:
             print(f"SKIP_FP8_UNSUPPORTED_SM{major}{minor}", flush=True)
             sys.exit(0)
+        mode, bad_value = sys.argv[1], float(sys.argv[2])
 
         nnz_kv = 1
         num_kv_heads = 1
@@ -657,58 +658,58 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_bad_s
         v_scales = torch.zeros_like(k_scales)
         slot_mapping = torch.zeros(1, dtype=torch.int32, device="cuda:0")
         good_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
-        bad_scale = torch.zeros(1, dtype=torch.float32, device="cuda:0")
+        bad_scale = torch.tensor([bad_value], dtype=torch.float32, device="cuda:0")
 
-        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
-            k_append,
-            v_append,
-            slot_mapping,
-            (k_cache, v_cache),
-            (k_scales, v_scales),
-            good_scale,
-            good_scale,
-        )
-        torch.cuda.synchronize()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        def append(k_scale):
             flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
                 k_append,
                 v_append,
                 slot_mapping,
                 (k_cache, v_cache),
                 (k_scales, v_scales),
-                bad_scale,
+                k_scale,
                 good_scale,
             )
 
-        print("BEGIN_BAD_SCALE_GRAPH_TEST", flush=True)
+        append(good_scale)
+        torch.cuda.synchronize()
+
+        graph = None
+        if mode == "graph":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                append(bad_scale)
+
+        print("BEGIN_BAD_SCALE_TEST", flush=True)
         try:
-            graph.replay()
+            if graph is None:
+                append(bad_scale)
+            else:
+                graph.replay()
             torch.cuda.synchronize()
-        except BaseException as exc:
+        except RuntimeError as exc:
+            if "CUDA error" not in str(exc):
+                raise
             print(
                 f"EXPECTED_CUDA_ERROR {type(exc).__name__}: {exc}",
                 flush=True,
             )
             sys.exit(0)
 
-        print("BAD_SCALE_REPLAY_SUCCEEDED", flush=True)
+        print("BAD_SCALE_APPEND_SUCCEEDED", flush=True)
         sys.exit(2)
         """
     )
     result = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", script, mode, str(bad_scale)],
         capture_output=True,
         text=True,
         timeout=60,
     )
     if "SKIP_FP8_UNSUPPORTED" in result.stdout:
         pytest.skip(result.stdout.strip())
-    assert "BEGIN_BAD_SCALE_GRAPH_TEST" in result.stdout, result.stdout + result.stderr
-    assert "BAD_SCALE_REPLAY_SUCCEEDED" not in result.stdout, (
-        result.stdout + result.stderr
-    )
+    assert "BEGIN_BAD_SCALE_TEST" in result.stdout, result.stdout + result.stderr
+    assert "EXPECTED_CUDA_ERROR" in result.stdout, result.stdout + result.stderr
     assert result.returncode == 0 or result.returncode < 0, (
         result.stdout + result.stderr
     )
