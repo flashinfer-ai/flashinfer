@@ -170,7 +170,7 @@ def _fmha_v2_specs(items):
     sink_keys = set()  # (dtype, use_swa, head_dim)
     test_names = {it.name.split("[")[0] for it in items}
     need_sm120_module = sm12x and any(
-        name == "test_fmha_v2_prefill_deepseek"
+        name.startswith("test_fmha_v2_prefill_deepseek")
         or name.startswith("test_fmha_v2_prefill_sm120")
         for name in test_names
     )
@@ -180,7 +180,7 @@ def _fmha_v2_specs(items):
             continue
         p = cs.params
         fn = it.name.split("[")[0]
-        if fn == "test_fmha_v2_prefill_deepseek":
+        if fn.startswith("test_fmha_v2_prefill_deepseek"):
             continue
         if fn == "test_trtllm_fmha_v2_prefill_sm120_large_head_dim" and not sm12x:
             continue  # test skips on non-SM12x

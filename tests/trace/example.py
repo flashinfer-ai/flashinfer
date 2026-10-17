@@ -31,7 +31,11 @@ gated_residual_rmsnorm_h8192.json
 gated_residual_next_rmsnorm_h8192.json
 gated_residual_next_rmsnorm_scalar_alpha_h8192.json
 fused_add_rmsnorm_quant_h7168.json
+fmha_v2_prefill_deepseek_h96_d128.json
+fmha_v2_prefill_deepseek_h20_d256.json
 fmha_v2_prefill_sm120_h4_d128.json
+fmha_v2_prefill_sm120_h96_d128.json
+fmha_v2_prefill_sm120_h20_d256.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
@@ -204,10 +208,12 @@ from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
+    fmha_v2_prefill_deepseek,
     fmha_v2_prefill_sm120,
 )
 from flashinfer.utils import is_sm100a_supported
 from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
+from tests.utils_fp8 import to_float8
 
 # Public MoELayer pack schemas, including all four Frost quantization formats.
 generate_moe_layer_traces(SAVE_DIR)
@@ -2840,7 +2846,7 @@ with contextlib.suppress(Exception):
     )
 
 # ── SM120 FP8 self-attention with separate Q/K/V ─────────────────────────────
-if torch.cuda.get_device_capability() == (12, 0):
+if torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
     _fmha_B, _fmha_S, _fmha_H, _fmha_D = 1, 128, 4, 128
     _fmha_shape = (_fmha_B, _fmha_S, _fmha_H, _fmha_D)
     _fmha_q = torch.randn(_fmha_shape, dtype=torch.bfloat16, device=device)
@@ -2875,6 +2881,71 @@ if torch.cuda.get_device_capability() == (12, 0):
         scale_bmm1_d=_fmha_scale_bmm1_d,
         scale_bmm2_d=_fmha_scale_bmm2_d,
         causal=True,
+    )
+
+    # GLM-4.7 has 96 query heads and 8 KV heads, each with head dimension 128.
+    _glm47_q, _glm47_q_scale = to_float8(
+        torch.randn((1, 128, 96, 128), dtype=torch.bfloat16, device=device)
+    )
+    _glm47_k, _glm47_k_scale = to_float8(
+        torch.randn((1, 128, 8, 128), dtype=torch.bfloat16, device=device)
+    )
+    _glm47_v, _glm47_v_scale = to_float8(
+        torch.randn((1, 128, 8, 128), dtype=torch.bfloat16, device=device)
+    )
+    _glm47_bmm1_scale = (_glm47_q_scale * _glm47_k_scale).item() / (128**0.5)
+    _glm47_bmm2_scale = _glm47_v_scale.item()
+    fmha_v2_prefill_deepseek(
+        _glm47_q,
+        _glm47_k,
+        _glm47_v,
+        torch.empty((1, 128, 96, 128), dtype=torch.bfloat16, device=device),
+        num_heads=96,
+        head_dim=128,
+        seq_len=128,
+        scale_softmax=1.0,
+        scale_bmm1=_glm47_bmm1_scale,
+        scale_bmm2=_glm47_bmm2_scale,
+        scale_bmm1_d=torch.tensor(
+            [_glm47_bmm1_scale], dtype=torch.float32, device=device
+        ),
+        scale_bmm2_d=torch.tensor(
+            [_glm47_bmm2_scale], dtype=torch.float32, device=device
+        ),
+    )
+
+    # MLA context uses expanded per-head Q/K/V, not the compressed latent cache.
+    _glm47_flash_shape = (1, 128, 20, 256)
+    _glm47_flash_q, _glm47_flash_q_scale = to_float8(
+        torch.randn(_glm47_flash_shape, dtype=torch.bfloat16, device=device)
+    )
+    _glm47_flash_k, _glm47_flash_k_scale = to_float8(
+        torch.randn(_glm47_flash_shape, dtype=torch.bfloat16, device=device)
+    )
+    _glm47_flash_v, _glm47_flash_v_scale = to_float8(
+        torch.randn(_glm47_flash_shape, dtype=torch.bfloat16, device=device)
+    )
+    _glm47_flash_bmm1_scale = (_glm47_flash_q_scale * _glm47_flash_k_scale).item() / (
+        256**0.5
+    )
+    _glm47_flash_bmm2_scale = _glm47_flash_v_scale.item()
+    fmha_v2_prefill_deepseek(
+        _glm47_flash_q,
+        _glm47_flash_k,
+        _glm47_flash_v,
+        torch.empty(_glm47_flash_shape, dtype=torch.bfloat16, device=device),
+        num_heads=20,
+        head_dim=256,
+        seq_len=128,
+        scale_softmax=1.0,
+        scale_bmm1=_glm47_flash_bmm1_scale,
+        scale_bmm2=_glm47_flash_bmm2_scale,
+        scale_bmm1_d=torch.tensor(
+            [_glm47_flash_bmm1_scale], dtype=torch.float32, device=device
+        ),
+        scale_bmm2_d=torch.tensor(
+            [_glm47_flash_bmm2_scale], dtype=torch.float32, device=device
+        ),
     )
 
 # ── Minimax Sparse Attention (MSA) numeric ops (SM120/SM121) ─────────────────

@@ -5563,6 +5563,7 @@ def enumerate_qmma_flash_kernels(
         ((128, 128), (64, 64), 1),
         # MLA kernels.
         ((192, 128), (64, 64), 1),
+        ((256, 256), (64, 64), 1),
         ((576, 512), (64, 64), 1),
     ]
     input_layouts = [
@@ -5584,11 +5585,11 @@ def enumerate_qmma_flash_kernels(
         # skip if head_size is not in head_sizes
         if head_sizes is not None and head_size not in head_sizes:
             continue
-        # Separate Q/K/V supports standard 64/64 and 128/128 attention plus
-        # the existing MLA specializations with V dimension 128 or 512.
+        # Separate Q/K/V supports standard attention and MLA context layouts.
         if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v not in (
             64,
             128,
+            256,
             512,
         ):
             continue
