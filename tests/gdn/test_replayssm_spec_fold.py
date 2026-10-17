@@ -335,6 +335,48 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
         )
 
 
+@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+def test_replayssm_commit_pool_beyond_int32_elements(backend):
+    """A slot whose element offset passes 2^31 must still be addressed correctly."""
+    layers, slots, hv, steps = 70, 1000, 2, 4
+    big = slots - 2
+    assert (layers - 1) * slots * hv * 128 * 128 + big * hv * 128 * 128 > 2**31
+    free, _ = torch.cuda.mem_get_info()
+    if free < layers * slots * hv * 128 * 128 * 4 + 2 * 2**30:
+        pytest.skip("needs ~12 GB free for the checkpoint pool")
+    args, cache = _inputs(batch=1, steps=steps, heads=hv, value_heads=hv)
+    slot = int(args["initial_state_indices"].item())
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+    pool = torch.zeros(layers, slots, hv, 128, 128, device="cuda")
+    pool[:, big] = args["initial_state"][slot]
+    windows = {}
+    for name, value in cache.items():
+        window = torch.zeros(
+            (layers, slots, *value.shape[1:]), device="cuda", dtype=value.dtype
+        )
+        window[:, big] = value[slot]
+        windows[name] = window
+    indices = torch.tensor([big], device="cuda", dtype=torch.int32)
+    accepts = torch.tensor([steps], device="cuda", dtype=torch.int32)
+    before = pool[:, big].clone()
+    gated_delta_rule_replayssm_commit(
+        pool,
+        windows["replayssm_rawv"],
+        windows["replayssm_rawk"],
+        windows["replayssm_g"],
+        windows["replayssm_beta"],
+        indices,
+        accepts,
+        backend=backend,
+    )
+    torch.cuda.synchronize()
+    committed = pool[:, big]
+    assert not torch.equal(committed[-1], before[-1]), "last layer was not committed"
+    torch.testing.assert_close(committed[-1], committed[0], atol=0, rtol=0)
+    assert torch.equal(pool[:, big - 1], torch.zeros_like(pool[:, big - 1]))
+    assert torch.equal(pool[:, big + 1], torch.zeros_like(pool[:, big + 1]))
+
+
 @pytest.mark.parametrize(
     "steps,accept",
     [
