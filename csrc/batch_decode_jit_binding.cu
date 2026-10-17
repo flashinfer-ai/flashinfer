@@ -33,6 +33,12 @@ Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSize(
     double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo, TensorView empty_q_data,
     TensorView empty_kv_data);
 
+Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSizeUpperBound(
+    TensorView device_buffer, int64_t max_batch_size, int64_t max_num_pages_per_request,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
+    int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
+    TensorView empty_q_data, TensorView empty_kv_data);
+
 void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                     TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
                                     TensorView q, TensorView paged_k_cache,
@@ -46,5 +52,8 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchDecodeWithPagedKVCachePlan);
 // Batched decode with paged KV-Cache workspace size
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(workspace_size, BatchDecodeWithPagedKVCacheWorkspaceSize);
+// Batched decode with paged KV-Cache workspace size upper bound
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(workspace_size_upper_bound,
+                              BatchDecodeWithPagedKVCacheWorkspaceSizeUpperBound);
 // Batched decode with paged KV-Cache run
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchDecodeWithPagedKVCacheRun);
