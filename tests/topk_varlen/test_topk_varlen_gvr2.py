@@ -2570,6 +2570,234 @@ def test_gvr2_max_clusters_without_current_context(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# main engines: rows above the cluster band stream through the slab, and the
+# row's last arrival ranks the staged candidates
+# ---------------------------------------------------------------------------
+
+# (rows, msl_c, top_k, next_n, cr): clustered SPLIT launches of every cluster size
+# (B200: 8 parts at 1-3 rows, 4 at 4, 8-11, 16 and 25-32, 2 at 12, 13 and 17-24)
+_MAIN_SLAB_SHAPES = [
+    (1, 262208, 1024, 1, 4),
+    (3, 1048832, 512, 1, 1),
+    (8, 524416, 512, 2, 1),
+    (12, 262208, 512, 1, 4),
+    (16, 262208, 1024, 1, 4),
+    (24, 1048640, 2048, 1, 1),
+    (32, 1048640, 2048, 1, 1),
+]
+
+
+def _slab_lengths(n, top_k, reg_cap, cap, msl_c, gen):
+    """n compressed row lengths, mostly above the cluster band (slab rows: the
+    band edge, the envelope, n % 4 tails, random), plus a band, a register, a
+    short and an empty row; none is pinned to the envelope but one."""
+
+    def rnd(lo, hi):
+        return int(torch.randint(lo, hi + 1, (1,), generator=gen))
+
+    kinds = [
+        lambda: rnd(cap + 1, msl_c),
+        lambda: cap + 1,
+        lambda: rnd(cap + 1, msl_c) | 3,
+        lambda: msl_c,
+        lambda: rnd(cap + 1, msl_c),
+        lambda: cap,
+        lambda: rnd(top_k + 1, reg_cap),
+        lambda: top_k,
+        lambda: 0,
+    ]
+    return [min(kinds[i % len(kinds)](), msl_c) for i in range(n)]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,msl_c,top_k,next_n,cr", _MAIN_SLAB_SHAPES)
+def test_gvr2_main_slab_rows(rows, msl_c, top_k, next_n, cr):
+    """Rows above the cluster band on clustered SPLIT launches of every cluster
+    size, hinted and hint-free: every part publishes its candidates to the slab
+    and the row's last arrival ranks them. Small batches cycle through several
+    sets of lengths, so different parts (and clusters) arrive last."""
+    reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
+    assert cs >= 2 and cap > reg_cap
+    gen = torch.Generator().manual_seed(rows * 13 + top_k)
+    for t in range(max(1, 12 // rows)):
+        targets = _slab_lengths(rows // next_n, top_k, reg_cap, cap, msl_c, gen)
+        targets = targets[t % len(targets) :] + targets[: t % len(targets)]
+        kv = [x * cr + next_n - 1 for x in targets]
+        logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+            kv, next_n, cr, top_k, seed=rows + top_k + 17 * t, msl_c=msl_c
+        )
+        for hint_free in (False, True):
+            indices, _ = _run_gvr2(
+                logits,
+                seq_lens,
+                top_k,
+                None if hint_free else pre_idx,
+                next_n=next_n,
+                compress_ratio=cr,
+            )
+            _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+            _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(1, 262208, 1024), (4, 524416, 512), (12, 262208, 512), (32, 1048640, 2048)],
+    ids=["cs8", "cs4", "cs2", "cs4_k2048"],
+)
+def test_gvr2_main_slab_hot_part(rows, msl_c, top_k):
+    """Slab rows whose top scores all sit in one part's slice: that part stages
+    nearly every candidate and tends to arrive last, so the part (and cluster)
+    that ranks the row moves across rows and calls. Exact every time."""
+    tpl, r_parts, clus, _ = _host._main_engine(rows, msl_c, msl_c, top_k, False)
+    cap = clus["clus_cs"] * tpl[0] * 16
+    n = max(cap + 4, (3 * msl_c // 4) & ~3)
+    q4 = (n // 4 + r_parts - 1) // r_parts  # float4s per part (the kernel's Q)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    logits = torch.full((rows, msl_c), 3e38, device=_DEV)
+    lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    for t in range(4):
+        for r in range(rows):
+            p = (r * 5 + 3 * t + 1) % r_parts
+            logits[r, :n] = torch.randn(n, generator=gen, device=_DEV)
+            logits[r, p * q4 * 4 : min((p + 1) * q4 * 4, n)] += 4.0
+        out, _ = _run_gvr2(logits, lens, top_k, None)
+        _check_varlen_rows(logits, out, [n] * rows, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(1, 262208, 1024), (4, 524416, 512), (32, 1048640, 2048)],
+    ids=["cs8_k1024", "cs4_k512", "cs4_k2048"],
+)
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "constant",
+        "two_values",
+        "quantized4",
+        "huge_flood_gt_k",
+        "huge_flood_lt_k",
+        "ramp_up",
+        "ramp_down",
+        "posinf",
+        "neginf_tail",
+    ],
+)
+def test_gvr2_main_slab_adversarial(rows, msl_c, top_k, pattern):
+    """Tie floods (a crossing bin wider than the refine buffer; more staged
+    candidates than the slab holds), monotone ramps, +inf (more than K) and -inf
+    tails (fewer than K finite values) in rows above the cluster band, hinted and
+    hint-free: the slab's degenerate paths and crossing refinement."""
+    reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
+    lens = [min(msl_c, cap + 1 + 4099 * r) for r in range(rows)]
+    n = max(lens)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + 3 * len(pattern))
+    if pattern == "posinf":
+        x = torch.randn(rows, n, generator=gen, device=_DEV) * 2.0
+        x[0::3, 700] = float("inf")
+        for r in range(rows):
+            x[r, lens[r] - 2] = float("inf")
+        x[1::2, 0 : 4 * (top_k + 5) : 4] = float("inf")  # more +inf than K
+    elif pattern == "neginf_tail":
+        x = torch.randn(rows, n, generator=gen, device=_DEV)
+        for r in range(rows):
+            x[r, lens[r] - 1] = float("-inf")
+        x[1::2, 900:] = float("-inf")  # odd rows: fewer than K finite values
+    else:
+        x = _adversarial_logits(pattern, rows, n, top_k, gen)
+    logits = torch.full((rows, msl_c), 3e38, device=_DEV)
+    for r in range(rows):
+        logits[r, : lens[r]] = x[r, : lens[r]]
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=_DEV)
+    hint = torch.stack(
+        [torch.randint(0, n_, (top_k,), generator=gen, device=_DEV) for n_ in lens]
+    ).to(torch.int32)
+    for pre_idx in (None, hint):
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        torch.cuda.synchronize()
+        _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
+        _check_varlen_rows(logits, out, lens, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(2, 1048832, 512), (16, 262208, 1024), (24, 1048640, 2048)],
+    ids=["cs8", "cs4", "cs2"],
+)
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+def test_gvr2_main_slab_graph_replay(rows, msl_c, top_k, paged):
+    """Capture a clustered SPLIT launch on slab rows, then replay with the lengths
+    rewritten in place so rows move between the slab, the cluster band, the
+    register path and short rows in both directions. The slab's arrival words and
+    offsets are zero after every replay."""
+    reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
+    gen = torch.Generator().manual_seed(rows + top_k + 1)
+    gdev = torch.Generator(device=_DEV).manual_seed(rows + top_k + 1)
+    logits = torch.randn(rows, msl_c, generator=gdev, device=_DEV)
+    seq_lens = torch.full((rows,), msl_c, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ws = torch.zeros(_host.workspace_bytes(), dtype=torch.uint8, device=_DEV)
+    kw = dict(workspace={"gvr2_workspace": ws})
+    pages = (msl_c + 63) // 64
+    if paged:
+        r_ = torch.arange(rows, device=_DEV).unsqueeze(1)
+        p_ = torch.arange(pages, device=_DEV).unsqueeze(0)
+        pt = ((pages - 1 - p_) + r_ * pages).to(torch.int32).contiguous()
+        kw.update(page_table=pt, page_size=64)
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, out_indices=out, backend="gvr_2", **kw
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()  # compile outside capture
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        call()
+    torch.cuda.synchronize()
+
+    def rnd(lo, hi, m):
+        return [int(v) for v in torch.randint(lo, hi + 1, (m,), generator=gen)]
+
+    steps = [
+        rnd(cap + 1, msl_c, rows),  # slab
+        rnd(reg_cap + 1, cap, rows),  # cluster band
+        rnd(cap + 1, msl_c, rows),  # slab after a band step
+        _slab_lengths(rows, top_k, reg_cap, cap, msl_c, gen),  # mixed
+        rnd(0, top_k, rows),  # short
+        rnd(cap + 1, cap + 4096, rows),  # just above the band
+        rnd(top_k + 1, reg_cap, rows),  # register path
+        rnd(cap + 1, msl_c, rows),  # slab again
+    ]
+    for lens in steps:
+        seq_lens.copy_(torch.tensor(lens, dtype=torch.int32, device=_DEV))
+        logits.normal_(generator=gdev)
+        for r, n in enumerate(lens):
+            logits[r, n:] = 3e38  # poison past each row
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = out
+        if paged:
+            # invert the page map back to row-local columns (pads stay -1)
+            q = (out.to(torch.int64) >> 6) - torch.arange(rows, device=_DEV).unsqueeze(
+                1
+            ) * pages
+            col = (pages - 1 - q) * 64 + (out.to(torch.int64) & 63)
+            got = torch.where(out >= 0, col, out.to(torch.int64)).to(torch.int32)
+        _check_varlen_rows(logits, got, lens, top_k)
+        assert int(ws[:2048].sum()) == 0, "slab counters not restored"
+
+
+# ---------------------------------------------------------------------------
 # backend registration / guards / cross-backend
 # ---------------------------------------------------------------------------
 
