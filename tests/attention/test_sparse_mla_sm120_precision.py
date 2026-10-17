@@ -523,19 +523,21 @@ def test_nvfp4_precision_envelope_and_warmup(monkeypatch):
         torch.zeros(2, 64, 512, device="cuda", dtype=torch.bfloat16)
     )
     wrapper = SparseMLASm120Wrapper(kv_cache_format="nvfp4", compute_precision="nvfp4")
-    for heads, topk in [(8, 128), (16, 64)]:
+    for heads, topk in [(8, 256), (12, 128), (16, 64)]:
         q = torch.zeros(2, heads, 512, device="cuda", dtype=torch.bfloat16)
         idx = torch.zeros(2, topk, device="cuda", dtype=torch.int32)
         with pytest.raises(ValueError, match="no NVFP4"):
             wrapper.run(q, cache, idx, torch.empty_like(q), 512**-0.5)
+    q = torch.zeros(2, 8, 512, device="cuda", dtype=torch.bfloat16)
+    idx = torch.zeros(2, 128, device="cuda", dtype=torch.int32)
+    wrapper.run(q, cache, idx, torch.empty_like(q), 512**-0.5)
     q = torch.zeros(2, 16, 512, device="cuda", dtype=torch.bfloat16)
     idx = torch.zeros(2, 128, device="cuda", dtype=torch.int32)
     with monkeypatch.context() as patch:
         patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
         with pytest.raises(ValueError, match="warm up"):
             wrapper.run(q, cache, idx, torch.empty_like(q), 512**-0.5)
-    with pytest.raises(ValueError, match="no NVFP4"):
-        wrapper.run(q, cache[:, :, :2], idx, torch.empty_like(q), 512**-0.5)
+    wrapper.run(q, cache[:, :, :2], idx, torch.empty_like(q), 512**-0.5)
     with pytest.raises(ValueError, match="prefill_impl"):
         wrapper.run(
             q, cache, idx, torch.empty_like(q), 512**-0.5, prefill_impl="swapab"
