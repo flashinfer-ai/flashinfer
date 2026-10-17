@@ -17,31 +17,8 @@
  * DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_deepgemm_sparse_mqa_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 376
@@ -81,145 +58,12 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SFQ_WORDS_STRIDE 1024
 #define SMEM_TOTAL 229376
 #define THREADS 768
-
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_mxf8_bs(
-    int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
-    int sfa_taddr, int sfb_taddr, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale"
-        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
-           "r"(enable_input_d));
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
-    const int SBO = 128;
-    return (uint64_t)(uint32_t)lo
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
-
-
-__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(
-    int taddr, uint64_t s_desc) {
-    asm volatile(
-        "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-        :: "r"(taddr), "l"(s_desc));
-}
-
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
-        : "r"(tmem_addr));
-}
-
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(768, 1) void
-kernel_cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+kernel_cake_deepgemm_sparse_mqa_231ab2b2db576cf301be(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -247,24 +91,24 @@ kernel_cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322(const __grid_constant__ CUt
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* q = reinterpret_cast<uint8_t*>(smem_raw + 0);
-    const int q_addr = smem + 0;
-    uint8_t* kv = reinterpret_cast<uint8_t*>(smem_raw + 16384);
-    const int kv_addr = smem + 16384;
-    uint8_t* sfq = reinterpret_cast<uint8_t*>(smem_raw + 212992);
-    const int sfq_addr = smem + 212992;
-    uint8_t* sfkv = reinterpret_cast<uint8_t*>(smem_raw + 214016);
-    const int sfkv_addr = smem + 214016;
-    uint8_t* weights = reinterpret_cast<uint8_t*>(smem_raw + 220160);
-    const int weights_addr = smem + 220160;
-    unsigned int* infos = reinterpret_cast<unsigned int*>(smem_raw + 220416);
-    const int infos_addr = smem + 220416;
-    unsigned int* qblocks = reinterpret_cast<unsigned int*>(smem_raw + 228096);
-    const int qblocks_addr = smem + 228096;
-    unsigned int* headers = reinterpret_cast<unsigned int*>(smem_raw + 228128);
-    const int headers_addr = smem + 228128;
-    unsigned int* sfq_words = reinterpret_cast<unsigned int*>(smem_raw + 212992);
-    const int sfq_words_addr = smem + 212992;
+    uint8_t* q = reinterpret_cast<uint8_t*>(smem_raw + SMEM_Q_OFF);
+    const int q_addr = smem + SMEM_Q_OFF;
+    uint8_t* kv = reinterpret_cast<uint8_t*>(smem_raw + SMEM_KV_OFF);
+    const int kv_addr = smem + SMEM_KV_OFF;
+    uint8_t* sfq = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SFQ_OFF);
+    const int sfq_addr = smem + SMEM_SFQ_OFF;
+    uint8_t* sfkv = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SFKV_OFF);
+    const int sfkv_addr = smem + SMEM_SFKV_OFF;
+    uint8_t* weights = reinterpret_cast<uint8_t*>(smem_raw + SMEM_WEIGHTS_OFF);
+    const int weights_addr = smem + SMEM_WEIGHTS_OFF;
+    unsigned int* infos = reinterpret_cast<unsigned int*>(smem_raw + SMEM_INFOS_OFF);
+    const int infos_addr = smem + SMEM_INFOS_OFF;
+    unsigned int* qblocks = reinterpret_cast<unsigned int*>(smem_raw + SMEM_QBLOCKS_OFF);
+    const int qblocks_addr = smem + SMEM_QBLOCKS_OFF;
+    unsigned int* headers = reinterpret_cast<unsigned int*>(smem_raw + SMEM_HEADERS_OFF);
+    const int headers_addr = smem + SMEM_HEADERS_OFF;
+    unsigned int* sfq_words = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFQ_WORDS_OFF);
+    const int sfq_words_addr = smem + SMEM_SFQ_WORDS_OFF;
     if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_Q))) : "memory"); }
     if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
