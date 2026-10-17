@@ -178,3 +178,68 @@ def validate_mxfp8_forward_inputs(
             f"scales.shape[1] ({scales.shape[1]}) must be >= {hidden_sf_cols} "
             f"for hidden={hidden}"
         )
+
+
+def validate_genphase_forward_inputs(t, fleet_params, *, top_k, quantize_input):
+    """GenPhase metadata checks; callers provide valid, unique expert routing."""
+    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        if getattr(t, name) is not None:
+            raise MoEEpConfigError(f"Blackwell GenPhase does not accept {name}.")
+    if t.topk_ids.ndim != 2 or t.topk_weights.ndim != 2:
+        raise MoEEpConfigError("GenPhase routing tensors must be 2D.")
+    validate_mxfp8_forward_inputs(
+        t.hidden_states,
+        t.topk_ids,
+        t.topk_weights,
+        fleet_params,
+        top_k=top_k,
+        quantize_input=quantize_input,
+        scales=t.scales,
+    )
+    if quantize_input and t.hidden_states.dtype != torch.bfloat16:
+        raise MoEEpConfigError("GenPhase quantize_input=True requires BF16 inputs.")
+    if t.topk_ids.dtype not in (torch.int32, torch.int64):
+        raise MoEEpConfigError("GenPhase expert IDs must be int32 or int64.")
+    if t.topk_weights.dtype != torch.float32:
+        raise MoEEpConfigError("GenPhase top-k weights must be float32.")
+    device = torch.device("cuda", torch.cuda.current_device())
+    tensors = (t.hidden_states, t.topk_ids, t.topk_weights)
+    if not quantize_input:
+        tensors += (t.scales,)
+    if any(tensor.device != device for tensor in tensors):
+        raise MoEEpConfigError("GenPhase inputs must be on the current CUDA device.")
+
+
+def stage_genphase_inputs(t, workspace, *, quantize_input: bool) -> None:
+    """Stage the GenPhase int32 router and its padded linear SF rows."""
+    # Match the legacy SM100 input contract without per-step device scans:
+    # valid routes are unique IDs in [0, E) with finite scores; -1 is masked.
+    num_tokens = t.hidden_states.shape[0]
+    sf_cols = workspace.config.hidden // 32
+    if quantize_input:
+        # Only the logical SF columns are staged. The padded columns were
+        # zeroed at allocation and are never written by either input path.
+        stage_mega_moe_inputs(
+            t.hidden_states,
+            t.topk_weights,
+            t.topk_ids,
+            workspace.x,
+            workspace.x_sf[:, :sf_cols],
+            workspace.topk_idx,
+            workspace.topk_weights,
+        )
+    else:
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+
+        workspace.x[:num_tokens].view(torch.uint8).copy_(
+            t.hidden_states.view(torch.uint8)
+        )
+        workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
+            t.scales[:, :sf_cols].view(torch.uint8)
+        )
+        workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
+        workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+        workspace.topk_idx[num_tokens:].fill_(-1)
+        # A later fused stage may share this workspace with a different layer.
+        note_staged_tokens(workspace.topk_idx, num_tokens)
+    workspace.note_staged_tokens(num_tokens)

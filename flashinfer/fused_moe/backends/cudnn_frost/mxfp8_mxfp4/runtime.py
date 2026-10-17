@@ -10,8 +10,6 @@ cuDNN is needed only by the exporter, never by this runtime.
 
 from __future__ import annotations
 
-import functools
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +45,9 @@ class Mxfp8Mxfp4Kernel:
     tactic_metadata: dict
     launch_tail: tuple[str, ...]
     op: str
+    source_parameters: dict | None = None
+    template_path: Path | None = None
+    source_identity: str = ""
 
     @property
     def gated(self):
@@ -73,22 +74,18 @@ class Mxfp8Mxfp4Kernel:
         return (
             "cudnn_frost-mxfp8_mxfp4-v1",
             self.artifact_id,
-            runtime._tactic_digest(self.source_sha256),
+            runtime._tactic_digest(self.source_identity or self.source_sha256),
         )
 
 
-@functools.lru_cache(maxsize=8)
+@runtime.cache_discovery
 def discover(
     root: Path | None = None, *, quantized_output: bool = False
 ) -> tuple[Mxfp8Mxfp4Kernel, ...]:
     """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("mxfp8_mxfp4") if root is None else Path(root)
     path = root / runtime._MANIFEST
-    payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 2 or not isinstance(
-        payload.get("kernels"), list
-    ):
-        raise RuntimeError(f"invalid MXFP8 × MXFP4 manifest: {path}")
+    payload = runtime._read_manifest(path)
     result, seen = [], set()
     for raw in payload["kernels"]:
         op, identity = raw.get("op"), raw.get("id")
@@ -169,9 +166,12 @@ def discover(
                 raw["tactic"],
                 tail,
                 op,
+                **runtime.source_binding(root, raw, digest),
             )
         )
-    return tuple(result)
+    return tuple(
+        bound for k in result if (bound := runtime.discovery_binding(k)) is not None
+    )
 
 
 def clear_artifact_cache() -> None:
@@ -355,6 +355,7 @@ class PreparedMxfp8Mxfp4GroupedGemm:
     ):
         if tokens.device.type != "cuda":
             raise ValueError("MXFP8 × MXFP4 grouped GEMM requires CUDA tensors")
+        kernel = runtime.bind_kernel(kernel, tokens.device)
         with torch.cuda.device(tokens.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare MXFP8 × MXFP4 grouped GEMM outside capture")
