@@ -1395,7 +1395,8 @@ def test_prefill_resolver_routes_the_sm103a_hq16_hv16_fp16_stateful_key_to_the_r
     monkeypatch,
 ) -> None:
     """Cake rule mirror (``_should_use_sm103a_initial_state_role_rebalance``): sm_103a builds the 224/56 role-split
-    twin for exactly this key; sm_107a takes the plain body, sm_100a the full-grid V-hold body."""
+    twin for exactly this key; sm_107a (CC 10.7) takes the ``l7_vec2`` sequential twin of the plain body
+    (``CAKE_GDN_PREFILL_SEQ_ARCH_BODIES``, CAKE-1096), sm_100a the full-grid V-hold body."""
     base = "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io"
     key = _HQ16_HV16_F16_STATEFUL_128_TILES
     twin, twin_specs, route = _requested_prefill_source(
@@ -1416,7 +1417,7 @@ def test_prefill_resolver_routes_the_sm103a_hq16_hv16_fp16_stateful_key_to_the_r
     plain, plain_specs, _ = _requested_prefill_source(
         monkeypatch, arch="sm_107a", **key
     )
-    assert plain == base and plain_specs == twin_specs
+    assert plain == f"{base}_sm107a_l7_vec2" and plain_specs == twin_specs
     vhold, vhold_specs, _ = _requested_prefill_source(
         monkeypatch, arch="sm_100a", **key
     )

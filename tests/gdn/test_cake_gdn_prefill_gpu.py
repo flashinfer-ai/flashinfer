@@ -1365,6 +1365,11 @@ def test_public_cake_gdn_prefill_absent_gates_reuse_one_cached_unit_tensor():
     per device and ``[tokens, heads]`` shape and passes it for both gates.  The
     output must match explicit unit gates bitwise, stay bitwise-identical across
     launches, and the kernel must never write the shared tensor.
+
+    The rows are stateless 64-token sequences; the exact host bound
+    (``cu_seqlens_cpu``) lets the resolver reach the shipped single-chunk
+    kernel (``_dvsplit_single_chunk``), the only stateless (3, 1) key the
+    manifest ships (CAKE-1096 R26).
     """
     from flashinfer import gdn_prefill as prefill_mod
 
@@ -1391,6 +1396,7 @@ def test_public_cake_gdn_prefill_absent_gates_reuse_one_cached_unit_tensor():
             initial_state=None,
             output_final_state=False,
             cu_seqlens=case["cu_seqlens"],
+            cu_seqlens_cpu=_host_cu_seqlens(case["seq_lens"]),
             use_qk_l2norm_in_kernel=False,
             output=case["output"],
             use_cp=False,
