@@ -130,10 +130,12 @@ def create_dlpack_capsule(
     bits_per_elements = 0
     dldata_type_code = 0
     # refer to https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h#L160
-    if torch_dtype in [
+    if torch_dtype == torch.bfloat16:
+        bits_per_elements = 16
+        dldata_type_code = 4
+    elif torch_dtype in [
         torch.float8_e5m2,
         torch.float8_e4m3fn,
-        torch.bfloat16,
         torch.float16,
         torch.float32,
         torch.float64,
