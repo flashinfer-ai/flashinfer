@@ -225,38 +225,54 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
     assert "-DCAKE_FMHA_RETAIN_KV_L2=1" in spec.extra_cuda_cflags
 
 
-def test_cake_fmha_decode_native_bf16_generic_members_share_one_folded_source() -> None:
-    """The 11 generic members compile one source whose flags come from the loader defines."""
+@pytest.mark.parametrize(
+    ("component", "macros", "generic_count"),
+    (
+        (
+            "decode_native_bf16",
+            ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"),
+            11,
+        ),
+        (
+            "decode_native_fp16_nhd",
+            ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"),
+            16,
+        ),
+        (
+            "decode_native_fp16_hd512",
+            ("HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"),
+            8,
+        ),
+    ),
+)
+def test_cake_fmha_decode_generic_members_share_one_folded_source(
+    component, macros, generic_count
+) -> None:
+    """The generic members compile one source whose flags come from the loader defines."""
 
-    component = get_cake_fmha_manifest()["components"]["decode_native_bf16"]
-    generic_members = [
-        member
-        for member in component["source_family"]
-        if "BATCH_SIZE" not in member["selector"]
-    ]
-    assert len(generic_members) == 11
+    members = get_cake_fmha_manifest()["components"][component]["source_family"]
+    generic_members = [m for m in members if "BATCH_SIZE" not in m["selector"]]
+    assert len(generic_members) == generic_count
     sources = {
         member["sources"][arch]
         for member in generic_members
         for arch in ("sm_100a", "sm_103a")
     }
-    assert sources == {"cuda/decode_native_bf16/default.cu"}
-    text = (get_cake_fmha_csrc_dir() / "cuda/decode_native_bf16/default.cu").read_text(
+    assert sources == {f"cuda/{component}/default.cu"}
+    text = (get_cake_fmha_csrc_dir() / f"cuda/{component}/default.cu").read_text(
         encoding="utf-8"
     )
-    for macro in ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR"):
+    for macro in macros:
         assert f"#define {macro} CAKE_FMHA_{macro}\n" in text
         assert f"#define {macro} 0\n" not in text
         assert f"#define {macro} 1\n" not in text
         assert text.count(f"#if {macro}\n") == text.count(f"#endif  // {macro}\n") > 0
     flag_sets = {
-        tuple(
-            member["selector"][macro]
-            for macro in ("HAS_SINK", "HAS_WINDOW", "RETAIN_KV_L2", "USE_SCALE_PTR")
-        )
+        tuple(member["selector"][macro] for macro in macros)
         for member in generic_members
     }
-    assert len(flag_sets) == 11
+    assert len(flag_sets) == generic_count
+    assert all(set(member["selector"]) == set(macros) for member in generic_members)
 
 
 @pytest.mark.parametrize(
@@ -581,7 +597,7 @@ def test_cake_fmha_decode_native_fp16_nhd_jit_selects_one_manifest_member(
         retain_kv_l2=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "default.cu",
         "cake_fmha_decode_native_fp16_nhd_binding.cu",
         "cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
     }
@@ -616,12 +632,13 @@ def test_cake_fmha_decode_native_fp16_hd512_jit_selects_one_manifest_member(
         retain_kv_l2=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "has_window1_retain_kv_l20_use_scale_ptr1.cu",
+        "default.cu",
         "cake_fmha_decode_native_fp16_hd512_binding.cu",
         "cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     }
     assert "-DCAKE_FMHA_HAS_WINDOW=1" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_USE_SCALE_PTR=1" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_RETAIN_KV_L2=0" in spec.extra_cuda_cflags
     assert not any("HAS_SINK" in flag for flag in spec.extra_cuda_cflags)
 
 

@@ -1635,6 +1635,7 @@ def gen_cake_fmha_decode_native_fp16_nhd_module(
             f"-DCAKE_FMHA_HAS_SINK={selector['HAS_SINK']}",
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+            f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
@@ -1859,6 +1860,7 @@ def gen_cake_fmha_decode_native_fp16_hd512_module(
             f"-DNUM_KV_HEADS={num_kv_heads}",
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+            f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )

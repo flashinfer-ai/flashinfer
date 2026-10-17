@@ -4174,8 +4174,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4185,8 +4185,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4196,8 +4196,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4207,8 +4207,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4218,8 +4218,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4229,8 +4229,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4240,8 +4240,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         },
         {
@@ -4251,8 +4251,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_hd512/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/default.cu"
           }
         }
       ],
@@ -4392,8 +4392,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4404,8 +4404,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4416,8 +4416,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4428,8 +4428,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4440,8 +4440,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4452,8 +4452,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4464,8 +4464,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4476,8 +4476,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4488,8 +4488,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4500,8 +4500,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4512,8 +4512,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4524,8 +4524,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4536,8 +4536,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4548,8 +4548,8 @@
             "USE_SCALE_PTR": 0
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4560,8 +4560,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         },
         {
@@ -4572,8 +4572,8 @@
             "USE_SCALE_PTR": 1
           },
           "sources": {
-            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu",
-            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu"
+            "sm_100a": "cuda/decode_native_fp16_nhd/default.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/default.cu"
           }
         }
       ],

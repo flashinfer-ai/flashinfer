@@ -100,9 +100,9 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #ifndef Q_LEN
 #define Q_LEN 1
 #endif
-#define HAS_WINDOW 1
-#define USE_SCALE_PTR 0
-#define RETAIN_KV_L2 0
+#define HAS_WINDOW CAKE_FMHA_HAS_WINDOW
+#define USE_SCALE_PTR CAKE_FMHA_USE_SCALE_PTR
+#define RETAIN_KV_L2 CAKE_FMHA_RETAIN_KV_L2
 
 #include <math_constants.h>
 
@@ -674,6 +674,11 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
             unsigned int p_release_phase_0 = 1;
             unsigned int p_release_phase_1 = 1;
             float smx_scale = softmax_scale_log2;
+#if USE_SCALE_PTR
+            {
+                smx_scale = scale_log2_ptr[0];
+            }
+#endif  // USE_SCALE_PTR
             float sv[8];
             float sv_lo[4];
             float sv_hi[4];
@@ -695,12 +700,14 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 int global_q_pos = causal_seqlens_kv_global[batch_idx] + q_row_idx;
                 int visible_local_keys = global_q_pos + 1;
                 int win_start = 0;
+#if HAS_WINDOW
                 {
                     int win_lo = global_q_pos - window_left;
                     if (win_lo > 0) {
                         win_start = win_lo;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks = num_n_blocks_total + num_n_blocks_total % 2;
                 if (cta_n_blocks < 4) {
@@ -769,6 +776,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                     if (kv_pos3 >= visible_local_keys) {
                         sv[6] = -3.4028235e+38f;
                         sv[7] = -3.4028235e+38f;
+#if HAS_WINDOW
                     }
                     {
                         if (kv_pos0 < win_start) {
@@ -787,6 +795,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                             sv[6] = -3.4028235e+38f;
                             sv[7] = -3.4028235e+38f;
                         }
+#endif  // HAS_WINDOW
                     }
                     float pair_max[2];
                     float _max_0 = max_noftz(sv[0], sv[2]);
@@ -885,6 +894,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                     if (kv_pos3 >= visible_local_keys) {
                         exp_vals[6] = 0.0f;
                         exp_vals[7] = 0.0f;
+#if HAS_WINDOW
                     }
                     {
                         if (kv_pos0 < win_start) {
@@ -903,6 +913,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                             exp_vals[6] = 0.0f;
                             exp_vals[7] = 0.0f;
                         }
+#endif  // HAS_WINDOW
                     }
                     #pragma unroll
                     for (int c_5 = 0; c_5 < 2; c_5++) {
@@ -1038,6 +1049,11 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
             const int group_ratio_rt = NUM_Q_HEADS / NUM_KV_HEADS;
             unsigned int total_tiles_c = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
             float smx_scale_c = softmax_scale_log2;
+#if USE_SCALE_PTR
+            {
+                smx_scale_c = scale_log2_ptr[0];
+            }
+#endif  // USE_SCALE_PTR
             unsigned int _phase_corr_scale_0_0 = 0;
             unsigned int _phase_o_ready_0_0 = 0;
             unsigned int _phase_o_ready_1_0 = 0;
@@ -1051,12 +1067,14 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 int global_q_pos_1 = causal_seqlens_kv_global[batch_idx_1] + q_row_idx_1;
                 int visible_local_keys_1 = global_q_pos_1 + 1;
                 int win_start_1 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_1 = global_q_pos_1 - window_left;
                     if (win_lo_1 > 0) {
                         win_start_1 = win_lo_1;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_1 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1 = num_n_blocks_total_1 + num_n_blocks_total_1 % 2;
                 if (cta_n_blocks_1 < 4) {
@@ -1551,12 +1569,14 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 int global_q_pos_2 = causal_seqlens_kv_global[batch_idx_2] + q_row_idx_2;
                 int visible_local_keys_2 = global_q_pos_2 + 1;
                 int win_start_2 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_2 = global_q_pos_2 - window_left;
                     if (win_lo_2 > 0) {
                         win_start_2 = win_lo_2;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_2 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_2 = num_n_blocks_total_2 + num_n_blocks_total_2 % 2;
                 if (cta_n_blocks_2 < 4) {
@@ -3478,12 +3498,14 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 int global_q_pos_3 = causal_seqlens_kv_global[batch_idx_3] + q_row_idx_3;
                 int visible_local_keys_3 = global_q_pos_3 + 1;
                 int win_start_3 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_3 = global_q_pos_3 - window_left;
                     if (win_lo_3 > 0) {
                         win_start_3 = win_lo_3;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_3 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_3 = num_n_blocks_total_3 + num_n_blocks_total_3 % 2;
                 if (cta_n_blocks_3 < 4) {
@@ -3501,34 +3523,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, ph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr), "l"(K), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr, K, 0, 0, 0, kv_head_idx_3, pg_k_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384), "l"(K), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384, K, 0, 0, 1, kv_head_idx_3, pg_k_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, ph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768), "l"(K), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768, K, 0, 0, 2, kv_head_idx_3, pg_k_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384), "l"(K), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384, K, 0, 0, 3, kv_head_idx_3, pg_k_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, ph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536), "l"(K), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536, K, 0, 0, 4, kv_head_idx_3, pg_k_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384), "l"(K), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384, K, 0, 0, 5, kv_head_idx_3, pg_k_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, ph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304), "l"(K), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304, K, 0, 0, 6, kv_head_idx_3, pg_k_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384), "l"(K), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_3), "r"(pg_k_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384, K, 0, 0, 7, kv_head_idx_3, pg_k_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                     }
                     int main_ni_la = cta_n_blocks_3 - 2;
@@ -3539,34 +3625,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr), "l"(V), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr, V, 0, 0, 0, kv_head_idx_3, pg_v_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384), "l"(V), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384, V, 0, 0, 1, kv_head_idx_3, pg_v_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768), "l"(V), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768, V, 0, 0, 2, kv_head_idx_3, pg_v_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384), "l"(V), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384, V, 0, 0, 3, kv_head_idx_3, pg_v_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536), "l"(V), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536, V, 0, 0, 4, kv_head_idx_3, pg_v_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384), "l"(V), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384, V, 0, 0, 5, kv_head_idx_3, pg_v_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304), "l"(V), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304, V, 0, 0, 6, kv_head_idx_3, pg_v_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384), "l"(V), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_3), "r"(pg_v_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384, V, 0, 0, 7, kv_head_idx_3, pg_v_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         int next_ni_la = ni_la_1 + 2;
                         int next_n_la = split_start_block_la + cta_n_blocks_3 - 1 - next_ni_la;
@@ -3574,34 +3724,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr), "l"(K), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr, K, 0, 0, 0, kv_head_idx_3, pg_nk_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384), "l"(K), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384, K, 0, 0, 1, kv_head_idx_3, pg_nk_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768), "l"(K), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768, K, 0, 0, 2, kv_head_idx_3, pg_nk_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384), "l"(K), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384, K, 0, 0, 3, kv_head_idx_3, pg_nk_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536), "l"(K), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536, K, 0, 0, 4, kv_head_idx_3, pg_nk_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384), "l"(K), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384, K, 0, 0, 5, kv_head_idx_3, pg_nk_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304), "l"(K), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304, K, 0, 0, 6, kv_head_idx_3, pg_nk_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384), "l"(K), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_3), "r"(pg_nk_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384, K, 0, 0, 7, kv_head_idx_3, pg_nk_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                     }
                     #pragma unroll 1
@@ -3612,34 +3826,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, tph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr), "l"(V), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr, V, 0, 0, 0, kv_head_idx_3, tpg_v_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384), "l"(V), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384, V, 0, 0, 1, kv_head_idx_3, tpg_v_la, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, tph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768), "l"(V), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768, V, 0, 0, 2, kv_head_idx_3, tpg_v_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384), "l"(V), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384, V, 0, 0, 3, kv_head_idx_3, tpg_v_la, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, tph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536), "l"(V), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536, V, 0, 0, 4, kv_head_idx_3, tpg_v_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384), "l"(V), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384, V, 0, 0, 5, kv_head_idx_3, tpg_v_la, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, tph_la);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304), "l"(V), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304, V, 0, 0, 6, kv_head_idx_3, tpg_v_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384), "l"(V), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_3), "r"(tpg_v_la),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384, V, 0, 0, 7, kv_head_idx_3, tpg_v_la, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                     }
                 }
@@ -3665,12 +3943,14 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 int global_q_pos_4 = causal_seqlens_kv_global[batch_idx_4] + q_row_idx_4;
                 int visible_local_keys_4 = global_q_pos_4 + 1;
                 int win_start_4 = 0;
+#if HAS_WINDOW
                 {
                     int win_lo_4 = global_q_pos_4 - window_left;
                     if (win_lo_4 > 0) {
                         win_start_4 = win_lo_4;
                     }
                 }
+#endif  // HAS_WINDOW
                 int num_n_blocks_total_4 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_4 = num_n_blocks_total_4 + num_n_blocks_total_4 % 2;
                 if (cta_n_blocks_4 < 4) {
@@ -3697,34 +3977,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, ph);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 8192), "l"(K), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 8192, K, 0, 0, 0, kv_head_idx_4, pg_k, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384 + 8192, K, 0, 0, 1, kv_head_idx_4, pg_k, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, ph);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 8192), "l"(K), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 8192, K, 0, 0, 2, kv_head_idx_4, pg_k, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384 + 8192, K, 0, 0, 3, kv_head_idx_4, pg_k, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, ph);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 8192), "l"(K), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 8192, K, 0, 0, 4, kv_head_idx_4, pg_k, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384 + 8192, K, 0, 0, 5, kv_head_idx_4, pg_k, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, ph);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 8192), "l"(K), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 8192, K, 0, 0, 6, kv_head_idx_4, pg_k, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_4), "r"(pg_k),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384 + 8192, K, 0, 0, 7, kv_head_idx_4, pg_k, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                     }
                     int main_ni = cta_n_blocks_4 - 2;
@@ -3735,34 +4079,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 8192), "l"(V), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 8192, V, 0, 0, 0, kv_head_idx_4, pg_v, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384 + 8192, V, 0, 0, 1, kv_head_idx_4, pg_v, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 8192), "l"(V), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 8192, V, 0, 0, 2, kv_head_idx_4, pg_v, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384 + 8192, V, 0, 0, 3, kv_head_idx_4, pg_v, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 8192), "l"(V), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 8192, V, 0, 0, 4, kv_head_idx_4, pg_v, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384 + 8192, V, 0, 0, 5, kv_head_idx_4, pg_v, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, 1);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 8192), "l"(V), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 8192, V, 0, 0, 6, kv_head_idx_4, pg_v, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_4), "r"(pg_v),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384 + 8192, V, 0, 0, 7, kv_head_idx_4, pg_v, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         int next_ni = ni_1 + 2;
                         int next_n = split_start_block_1 + cta_n_blocks_4 - 1 - next_ni;
@@ -3770,34 +4178,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 8192), "l"(K), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 8192, K, 0, 0, 0, kv_head_idx_4, pg_nk, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384 + 8192, K, 0, 0, 1, kv_head_idx_4, pg_nk, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 8192), "l"(K), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 8192, K, 0, 0, 2, kv_head_idx_4, pg_nk, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384 + 8192, K, 0, 0, 3, kv_head_idx_4, pg_nk, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 8192), "l"(K), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 8192, K, 0, 0, 4, kv_head_idx_4, pg_nk, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384 + 8192, K, 0, 0, 5, kv_head_idx_4, pg_nk, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 8192), "l"(K), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 8192, K, 0, 0, 6, kv_head_idx_4, pg_nk, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384 + 8192), "l"(K), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_4), "r"(pg_nk),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384 + 8192, K, 0, 0, 7, kv_head_idx_4, pg_nk, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                     }
                     #pragma unroll 1
@@ -3808,34 +4280,98 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                         mbarrier_wait(kv_empty_addr, tph);
                         mbarrier_arrive_expect_tx(kv_full_addr, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 8192), "l"(V), "r"(0), "r"(0), "r"(0), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 8192, V, 0, 0, 0, kv_head_idx_4, tpg_v, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(1), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 16384 + 8192, V, 0, 0, 1, kv_head_idx_4, tpg_v, kv_full_addr);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 8, tph);
                         mbarrier_arrive_expect_tx(kv_full_addr + 8, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 8192), "l"(V), "r"(0), "r"(0), "r"(2), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 8192, V, 0, 0, 2, kv_head_idx_4, tpg_v, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 32768 + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(3), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 32768 + 16384 + 8192, V, 0, 0, 3, kv_head_idx_4, tpg_v, kv_full_addr + 8);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 16, tph);
                         mbarrier_arrive_expect_tx(kv_full_addr + 16, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 8192), "l"(V), "r"(0), "r"(0), "r"(4), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 8192, V, 0, 0, 4, kv_head_idx_4, tpg_v, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 65536 + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(5), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr + 16), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 65536 + 16384 + 8192, V, 0, 0, 5, kv_head_idx_4, tpg_v, kv_full_addr + 16);
+#endif  // RETAIN_KV_L2
                         }
                         mbarrier_wait(kv_empty_addr + 24, tph);
                         mbarrier_arrive_expect_tx(kv_full_addr + 24, 16384);
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 8192), "l"(V), "r"(0), "r"(0), "r"(6), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 8192, V, 0, 0, 6, kv_head_idx_4, tpg_v, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                         {
+#if RETAIN_KV_L2
+                            asm volatile(
+                                "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                :: "r"(smem_kv_addr + 98304 + 16384 + 8192), "l"(V), "r"(0), "r"(0), "r"(7), "r"(kv_head_idx_4), "r"(tpg_v),
+                                   "r"(kv_full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
+#else
                             tma_5d_gmem2smem(smem_kv_addr + 98304 + 16384 + 8192, V, 0, 0, 7, kv_head_idx_4, tpg_v, kv_full_addr + 24);
+#endif  // RETAIN_KV_L2
                         }
                     }
                 }
