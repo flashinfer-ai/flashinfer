@@ -117,7 +117,7 @@ def stepfun_moe(
     """
     from .cake_backend import prepare_stepfun_moe
 
-    return prepare_stepfun_moe(
+    launch = prepare_stepfun_moe(
         family=family,
         hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
@@ -144,7 +144,9 @@ def stepfun_moe(
         reserved_sms=reserved_sms,
         global_scale_inv=global_scale_inv,
         poison_routing_tail=poison_routing_tail,
-    ).launch()
+    )
+    launch.launch()
+    return launch.outputs()
 
 
 @flashinfer_experimental_api(feature="cake_stepfun_moe.routing")

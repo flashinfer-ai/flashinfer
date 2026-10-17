@@ -101,11 +101,11 @@ operations, as keywords).
   tile `>= num_tokens * top_k / num_experts`, else the largest). A
   `(family, tile)` without an exported unit is not servable; nothing falls
   back to a native kernel.
-* Buffers follow the trtllm-gen launcher: the routing tables in the router's
+* Buffers follow the Cake stage launcher: the routing tables in the router's
   sizes, `gemm1_output` (+ block scales), the requantization triple,
-  `gemm2_output` `[max(max_padded, ceil(128 KiB / (hidden_size * 2 B))), hidden_size]`
-  bf16 and `output` `[num_tokens, hidden_size]` bf16, allocated once in
-  `prepare_stepfun_moe`.
+  `gemm2_output` `[max_padded, hidden_size]` bf16 and `output`
+  `[num_tokens, hidden_size]` bf16, allocated once in `prepare_stepfun_moe`
+  (`max_padded = max_num_ctas * tile`, the trtllm-gen row capacity).
 * Launch attributes (cluster, cooperative, PDL) are baked into every binding;
   `enable_pdl` is a per-launch argument of the bindings. The cooperative
   routing grid is `SM count - reserved_sms` (`reserved_sms` keyword, default 8;

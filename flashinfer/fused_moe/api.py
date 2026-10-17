@@ -28,6 +28,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 import math
+import os
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
@@ -795,17 +796,26 @@ def _shuffle_deepseek_prims_ts_weights(view: dict) -> dict:
     return shuffled
 
 
+CAKE_STEPFUN_FULL_PATH_ENV = "FLASHINFER_CAKE_STEPFUN_FULL_PATH"
+CAKE_STEPFUN_RESERVED_SMS_ENV = "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS"
+CAKE_STEPFUN_DEFAULT_RESERVED_SMS = 8
+# The exported NVFP4 requantization unit bakes e4m3_max = 448 (no 4over6 recipe).
+CAKE_STEPFUN_GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
+
+
 @dataclass(frozen=True)
 class CakeStepFunConfig:
-    """Cake StepFun FC1 kernels inside the trtllm-gen fused-MoE pipeline.
+    """The StepFun fused MoE on exported Cake kernels (experimental backend
+    :mod:`flashinfer.experimental.cake_stepfun_moe`).
 
-    The backend runs the trtllm-gen routing, GEMM2 and finalize stages unchanged
-    and serves the GEMM1 stage with exported Cake kernels that evaluate the
-    StepFun activation ``clamp(up, -L, L) * min(silu(gate), L)`` with a per-expert
-    limit ``L``. It accepts four weight families, each with :class:`SwiGLUStep`
-    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 or bf16 output),
-    BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is never part of the
-    default backend list; users opt in with ``CakeStepFunConfig(backend="cake_stepfun")``.
+    Every stage of the forward -- Renormalize routing, FC1 with the StepFun
+    activation ``clamp(up, -L, L) * min(silu(gate), L)`` and a per-expert limit
+    ``L``, the NVFP4 per-token requantization, FC2 and finalize -- is an exported
+    Cake kernel. It accepts four weight families, each with :class:`SwiGLUStep`
+    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 output, or bf16 output with
+    ``per_token_scale``), BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is
+    never part of the default backend list; users opt in with
+    ``CakeStepFunConfig(backend="cake_stepfun")``.
 
     The physical weight and activation layouts are exactly those produced by
     the matching trtllm-gen config for the family (:class:`TrtllmFp4Config` for
@@ -813,14 +823,36 @@ class CakeStepFunConfig:
     for per-tensor FP8 and :class:`TrtllmFp8BlockConfig` for MXFP8); the view
     additionally carries the per-expert ``gemm1_clamp_limit`` the Cake kernels
     read.
+
+    ``full_path`` and ``reserved_sms`` are the backend knobs; ``None`` reads
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (``auto`` / ``1``; the former FC1-only
+    hybrid no longer exists, so ``0`` raises) and
+    ``FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS`` (default 8, the SMs the
+    cooperative router leaves free) once in ``check_support``. An explicit value
+    wins over the environment. The package itself reads no environment variable.
     """
 
     backend: Literal["cake_stepfun"] = "cake_stepfun"
+    full_path: Optional[bool] = None
+    reserved_sms: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.backend != "cake_stepfun":
             raise ValueError(
                 f"CakeStepFunConfig backend must be 'cake_stepfun', got {self.backend!r}."
+            )
+        if self.full_path is not None and not isinstance(self.full_path, bool):
+            raise TypeError(
+                f"CakeStepFunConfig.full_path must be a bool or None, got {self.full_path!r}."
+            )
+        if self.reserved_sms is not None and (
+            isinstance(self.reserved_sms, bool)
+            or not isinstance(self.reserved_sms, int)
+            or self.reserved_sms < 0
+        ):
+            raise ValueError(
+                "CakeStepFunConfig.reserved_sms must be a non-negative int or None, "
+                f"got {self.reserved_sms!r}."
             )
 
     @classmethod
@@ -969,7 +1001,88 @@ class CakeStepFunConfig:
         )
 
     def __repr__(self) -> str:
-        return "CakeStepFunConfig(backend='cake_stepfun')"
+        parts = ["backend='cake_stepfun'"]
+        if self.full_path is not None:
+            parts.append(f"full_path={self.full_path!r}")
+        if self.reserved_sms is not None:
+            parts.append(f"reserved_sms={self.reserved_sms!r}")
+        return f"CakeStepFunConfig({', '.join(parts)})"
+
+
+def _resolve_cake_stepfun_full_path(explicit: Optional[bool]) -> bool:
+    """``full_path`` of the Cake StepFun backend: the explicit value, else
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (unset / ``""`` / ``auto`` / ``1`` / ``true`` /
+    ``on`` -> ``True``; ``0`` / ``false`` / ``off`` -> ``False``; anything else raises
+    ``ValueError`` naming the variable)."""
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get(CAKE_STEPFUN_FULL_PATH_ENV, "")
+    token = raw.strip().lower()
+    if token in ("", "auto", "1", "true", "on"):
+        return True
+    if token in ("0", "false", "off"):
+        return False
+    raise ValueError(
+        f"{CAKE_STEPFUN_FULL_PATH_ENV}={raw!r} is not one of auto, 1, true, on, 0, "
+        "false, off."
+    )
+
+
+def _resolve_cake_stepfun_reserved_sms(explicit: Optional[int]) -> int:
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get(CAKE_STEPFUN_RESERVED_SMS_ENV)
+    if raw is None or raw.strip() == "":
+        return CAKE_STEPFUN_DEFAULT_RESERVED_SMS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{CAKE_STEPFUN_RESERVED_SMS_ENV}={raw!r} is not an integer."
+        ) from None
+    if value < 0:
+        raise ValueError(f"{CAKE_STEPFUN_RESERVED_SMS_ENV}={raw!r} must be >= 0.")
+    return value
+
+
+def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
+    """Resolve the Cake StepFun backend knobs of ``config`` once (``check_support``).
+
+    Returns ``{"full_path": True, "reserved_sms": int, "global_scale_inv": float}``.
+    ``full_path`` resolves through :func:`_resolve_cake_stepfun_full_path`; ``False``
+    raises ``NotImplementedError`` because the FC1-only hybrid module was removed
+    with the cake-build/1 migration (owner item O1: keep the variable, raise on
+    ``0``). ``reserved_sms`` sizes the cooperative routing grid. The NVFP4 4over6
+    recipe of ``config.quant`` (explicit or from ``FLASHINFER_NVFP4_4OVER6*``)
+    must resolve to ``None``: only the ``e4m3_max = 448`` requantization unit is
+    exported, so ``global_scale_inv`` is always ``1 / (448 * 6)``.
+    """
+    backend = config.backend
+    if not isinstance(backend, CakeStepFunConfig):
+        raise TypeError(
+            f"_resolve_cake_stepfun_knobs expects a CakeStepFunConfig backend, got "
+            f"{backend!r}."
+        )
+    full_path = _resolve_cake_stepfun_full_path(backend.full_path)
+    if not full_path:  # O1 default: keep FLASHINFER_CAKE_STEPFUN_FULL_PATH, raise on 0
+        raise NotImplementedError(
+            "The Cake StepFun FC1-only hybrid (FLASHINFER_CAKE_STEPFUN_FULL_PATH=0 / "
+            "CakeStepFunConfig(full_path=False)) was removed with the cake-build/1 "
+            "migration; every stage runs on the exported Cake kernels (full_path=True)."
+        )
+    reserved_sms = _resolve_cake_stepfun_reserved_sms(backend.reserved_sms)
+    if config.quant.activation is QuantFormat.NVFP4:
+        recipe = resolve_nvfp4_4over6(config.quant.nvfp4_4over6)
+        if recipe is not None:
+            raise NotImplementedError(
+                "The Cake StepFun backend exports only the e4m3_max = 448 NVFP4 "
+                f"requantization unit; the 4over6 recipe {recipe!r} is unavailable."
+            )
+    return {
+        "full_path": True,
+        "reserved_sms": reserved_sms,
+        "global_scale_inv": CAKE_STEPFUN_GLOBAL_SCALE_INV,
+    }
 
 
 @dataclass(frozen=True)
