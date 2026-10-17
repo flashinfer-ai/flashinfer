@@ -5901,10 +5901,10 @@
         "sha256": "4b86adf8db4b2fc320f6343cfcccac7bf0a16c81cdde3ab761675be4a90935ae"
       },
       {
-        "bytes": 287911,
+        "bytes": 288619,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py",
-        "sha256": "95fba24e6f383126ed4ba233453ab2e54bbbdd2b354599f8b72ce3c87a8dccdf"
+        "sha256": "6576e9f7f4bd757813c9dd15f5c7c530229e0accaf660f60bf44291927f3c211"
       },
       {
         "bytes": 454,
