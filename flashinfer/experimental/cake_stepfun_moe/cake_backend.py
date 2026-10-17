@@ -601,9 +601,11 @@ def _bind(
     stage: str,
 ) -> _Launch:
     """Bind ``values`` (keyed by kernel parameter name) to ``program``: every tensor is
-    viewed to the storage dtype the binding checks, tensor-map views are checked for
-    their rank, the grid for positivity and cluster divisibility; the generated
-    positional launcher of ``cake_launch`` orders the arguments."""
+    viewed to the storage dtype the binding checks, tensor-map views are checked against
+    the descriptor's minimum source rank (``unit["tma_ranks"]`` is the floor the
+    binding's own ``ndim >=`` guard derives from the descriptor's trailing-axis
+    expressions, not the view rank), the grid for positivity and cluster divisibility;
+    the generated positional launcher of ``cake_launch`` orders the arguments."""
     record = _record(program)
     unit = record["unit"]
     cluster = [int(c) for c in record["launch"]["cluster"]]
@@ -654,10 +656,10 @@ def _bind(
         tensor = value if value.dtype == storage else value.view(storage)
         if kind == "tma_buffer":
             rank = int(unit["tma_ranks"][key])
-            if tensor.dim() != rank:
+            if tensor.dim() < rank:
                 raise ValueError(
-                    f"{stage} {program}: tensor-map operand {key!r} must be {rank}-D for "
-                    f"the exported descriptor, got shape {tuple(tensor.shape)}"
+                    f"{stage} {program}: tensor-map operand {key!r} needs at least {rank} "
+                    f"dimensions for the exported descriptor, got shape {tuple(tensor.shape)}"
                 )
         if not tensor.is_contiguous():
             raise ValueError(f"{stage} {program}: argument {key!r} must be contiguous")
@@ -885,6 +887,8 @@ def _fc1_values(
     weights = _tensor("gemm1_weights", operands["gemm1_weights"], device=device)
     if unit["weight_layout"] == "BlockMajorK":
         weights = _reshape("gemm1_weights", weights, (E, H // 64, 2 * I, 64))
+    else:
+        weights = _reshape("gemm1_weights", weights, (E, 2 * I, H // act_per_byte(family)))
     clamp = _tensor("gemm1_clamp_limit", operands["gemm1_clamp_limit"], device=device, dtype=torch.float32, shape=(E,))
     out_dtype = str(unit["dtypes"][2])
     out_cols = I // 2 if out_dtype == "E2m1" else I
@@ -960,6 +964,8 @@ def _fc2_values(
     weights = _tensor("gemm2_weights", operands["gemm2_weights"], device=device)
     if unit["weight_layout"] == "BlockMajorK":
         weights = _reshape("gemm2_weights", weights, (E, I // 64, H, 64))
+    else:
+        weights = _reshape("gemm2_weights", weights, (E, H, I // act_per_byte(family)))
     act_dtype = str(unit["dtypes"][0])
     in_cols = I // 2 if act_dtype == "E2m1" else I
     gemm2_input = _tensor(
@@ -1818,8 +1824,12 @@ def prepare_fc2(
     enable_pdl: bool = True,
 ) -> StepFunStageLaunch:
     """Bind the FC2 unit of ``(family, tile_tokens_dim)`` on the permuted FC1 (or
-    requantized) output and caller-owned routing tables.  The CTA capacity follows the
-    weight rows (``gemm2_weights.shape[0]`` experts), as the former operation did."""
+    requantized) output and caller-owned routing tables.  As the former operation did,
+    ``hidden_size`` is the ``gemm2_output`` column count and ``intermediate_size`` the
+    ``gemm2_input`` column count times the elements per byte; ``gemm2_weights`` gives
+    the expert rows (the CTA capacity) and is cross-checked by element count, so both
+    the MajorK ``[E, H, I/act_per_byte]`` view and the bf16 BlockMajorK
+    ``[E, I/64, H, 64]`` view are accepted."""
     _require_registry()
     device = _tensor("gemm2_input", gemm2_input, dim=2).device
     arch = arch_for(device)
@@ -1827,14 +1837,21 @@ def prepare_fc2(
     _positive_int("top_k", top_k)
     _positive_int("tile_tokens_dim", tile_tokens_dim)
     program = fc2_program(family, tile_tokens_dim)
-    weights = _tensor("gemm2_weights", gemm2_weights, device=device)
-    if weights.dim() < 3:
-        raise ValueError(f"gemm2_weights must be [E, hidden_size, ...], got {tuple(weights.shape)}")
-    num_rows, hidden_size = int(weights.shape[0]), int(weights.shape[1])
     per_byte = act_per_byte(family)
-    if weights.numel() % (num_rows * hidden_size):
-        raise ValueError(f"gemm2_weights shape {tuple(weights.shape)} is not [E, hidden_size, K]")
-    intermediate_size = weights.numel() * per_byte // (num_rows * hidden_size)
+    output = _tensor("gemm2_output", gemm2_output, device=device, dtype=torch.bfloat16, dim=2)
+    hidden_size = int(output.shape[1])
+    intermediate_size = int(gemm2_input.shape[1]) * per_byte
+    weights = _tensor("gemm2_weights", gemm2_weights, device=device)
+    if weights.dim() < 2:
+        raise ValueError(f"gemm2_weights must be [E, ...], got {tuple(weights.shape)}")
+    num_rows = int(weights.shape[0])
+    if num_rows < 1 or weights.numel() * per_byte != num_rows * hidden_size * intermediate_size:
+        raise ValueError(
+            f"gemm2_weights ({tuple(weights.shape)}, {weights.dtype}) does not hold "
+            f"E x hidden_size x intermediate_size elements for E={num_rows}, "
+            f"hidden_size={hidden_size} (gemm2_output columns), "
+            f"intermediate_size={intermediate_size} (gemm2_input columns x {per_byte})"
+        )
     error = _fc2_shape_error(program, hidden_size, intermediate_size)
     if error is not None:
         raise ValueError(f"FC2 family {family!r} tile {tile_tokens_dim}: {error}")
