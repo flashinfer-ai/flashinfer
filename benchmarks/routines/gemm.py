@@ -11,6 +11,8 @@ from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
     dequantize_fp8,
+    per_block_cast_to_fp8,
+    per_token_cast_to_fp8,
     quantize_fp8,
 )
 
@@ -56,6 +58,8 @@ def run_gemm_test(args):
         return testBmmBf16(args)
     elif args.routine == "tinygemm_bf16":
         return testTinygemmBf16(args)
+    elif args.routine == "fp8_blockscale_gemm_sm90":
+        return testFp8BlockscaleGemmSm90(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -161,6 +165,7 @@ def parse_gemm_args(line, parser):
             "tinygemm",
             "cutile",
             "trtllm_low_latency",
+            "deepgemm",
         ],
         help="Kernel backends to test. Default: cudnn",
     )
@@ -214,6 +219,9 @@ def parse_gemm_args(line, parser):
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
+    if args.routine == "fp8_blockscale_gemm_sm90":
+        if not has_backends_arg:
+            args.backends = ["deepgemm"]
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -2673,6 +2681,169 @@ def testBmmBf16(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["backend"] = backend_name
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testFp8BlockscaleGemmSm90(args):
+    """
+    Test fp8_blockscale_gemm_sm90 API (DeepGEMM-based FP8 block-scale GEMM on SM90).
+
+    This test:
+    1. Generates a BF16 weight and quantizes it to FP8 with 128x128 block scales
+    2. Uses an FP8 input with 1x128 scales (--input_dtype fp8_e4m3, W8A8) or a BF16
+       input that the op quantizes internally (--input_dtype bfloat16)
+    3. Runs fp8_blockscale_gemm_sm90
+    4. Runs reference check against the dequantized operands
+    5. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testFp8BlockscaleGemmSm90")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = list(args.backends)
+    m = args.m
+    n = args.n
+    k = args.k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype not in [torch.float8_e4m3fn, torch.bfloat16]:
+        raise ValueError(f"Unsupported input dtype: {args.input_dtype}")
+    if dtype_str_to_torch_dtype(args.out_dtype) != torch.bfloat16:
+        raise ValueError("fp8_blockscale_gemm_sm90 only supports bfloat16 outputs.")
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+    input_bf16 = torch.randn([m, k], device=device, dtype=torch.bfloat16)
+    weight_fp8, weight_scale = per_block_cast_to_fp8(
+        torch.randn([n, k], device=device, dtype=torch.bfloat16) / np.sqrt(k)
+    )
+    input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
+    if input_dtype == torch.float8_e4m3fn:
+        # The kernel reads MN-major input scales with M padded to a multiple of 4
+        input_scale_mn = torch.zeros(
+            [k // 128, (m + 3) // 4 * 4], device=device, dtype=torch.float32
+        )
+        input_scale_mn[:, :m] = input_scale.T
+        input_args = (input_fp8, input_scale_mn[:, :m].T)
+    else:
+        input_args = (input_bf16, None)
+    out = torch.empty([m, n], device=device, dtype=torch.bfloat16)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_args[0].shape = }")
+        print(f"[VVERBOSE] {input_args[0].dtype = }")
+        print(f"[VVERBOSE] {weight_fp8.shape = }")
+        print(f"[VVERBOSE] {weight_scale.shape = }")
+
+    def run_backend(backend, input, input_scale, weight, weight_scale, out):
+        if backend == "deepgemm":
+            return fp8_blockscale_gemm_sm90(
+                input, weight, input_scale, weight_scale, out=out
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    has_reference_output = False
+    if run_refcheck:
+        weight_dequant = weight_fp8.float() * weight_scale.repeat_interleave(128, 0)[
+            :n
+        ].repeat_interleave(128, 1)
+        if input_dtype == torch.float8_e4m3fn:
+            input_ref = (
+                input_fp8.float().view(m, k // 128, 128)
+                * input_scale.view(m, k // 128, 1)
+            ).view(m, k)
+        else:
+            # The op quantizes BF16 input with its own scales, so compare against BF16
+            input_ref = input_bf16.float()
+        reference_output = (input_ref @ weight_dequant.T).bfloat16()
+        has_reference_output = True
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        cur_args = (cur_backend, *input_args, weight_fp8, weight_scale, out)
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(*cur_args).detach().clone()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=cur_args,
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0:
+        if run_refcheck and has_reference_output:
+            for i in range(len(tested_backends)):
+                cos_sim = F.cosine_similarity(
+                    reference_output.reshape(-1).float(),
+                    tested_outputs[i].reshape(-1).float(),
+                    dim=0,
+                )
+                if cos_sim < 0.99:
+                    print(
+                        f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch, cosine similarity {cos_sim:.4f}"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            problem_flops = 2 * m * n * k
+            problem_bytes = (
+                n * k * torch.float8_e4m3fn.itemsize
+                + m * k * input_dtype.itemsize
+                + m * n * torch.bfloat16.itemsize
+            )
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                cur_res["input_dtype"] = input_dtype
+                cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

@@ -439,7 +439,7 @@ __global__ void __launch_bounds__(
 template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages, uint32_t kNumTMAThreads,
           uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast, typename SchedulerType,
-          typename InputType>
+          typename InputType, uint32_t kNumSplitK = 1>
 __global__ void __launch_bounds__(
     get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
     fp8_gemm_kernel_swapAB(
@@ -473,14 +473,27 @@ __global__ void __launch_bounds__(
       ceil_div<uint32_t>(SHAPE_K_SCALES * sizeof(float), sizeof(Barrier)) *
       sizeof(Barrier);  // renamed to A (weight)
 
+  // Split-K: the CTAs of a (kNumSplitK, 1, 1) cluster share one output tile, each reducing a
+  // contiguous K slice; rank 0 sums the partial accumulators over DSMEM in rank order.
+  DG_STATIC_ASSERT(kNumSplitK >= 1 and kNumSplitK <= 8, "Invalid number of K splits");
+  DG_STATIC_ASSERT(kNumSplitK == 1 or kNumTMAMulticast == 1,
+                   "Split-K and TMA multicast are exclusive");
+  DG_STATIC_ASSERT(kNumSplitK == 1 or SHAPE_K % (kNumSplitK * BLOCK_K) == 0,
+                   "K must split into whole K blocks");
+  DG_STATIC_ASSERT(kNumSplitK == 1 or SchedulerType::gemm_type == GemmType::Normal,
+                   "Split-K only supports the normal GEMM type");
+  constexpr uint32_t SHAPE_K_PER_SPLIT = SHAPE_K / kNumSplitK;
+
   // Configs
   constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
   constexpr uint32_t kNumThreads =
       get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
   constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;
-  constexpr uint32_t kNumIterations = ceil_div(SHAPE_K, kFullKOfAllStages);
+  constexpr uint32_t kNumIterations = ceil_div(SHAPE_K_PER_SPLIT, kFullKOfAllStages);
   const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
   const uint32_t lane_idx = get_lane_id();
+  const uint32_t split_k_idx = kNumSplitK > 1 ? cute::block_rank_in_cluster() : 0;
+  const uint32_t k_offset = split_k_idx * SHAPE_K_PER_SPLIT;
 
   // Prefetch TMA descriptors at very beginning
   if (threadIdx.x == kNumMathThreads) {
@@ -531,6 +544,11 @@ __global__ void __launch_bounds__(
     full_barriers[i] = barrier_start_ptr + i;
     empty_barriers[i] = barrier_start_ptr + kNumStages + i;
   }
+  // Split-K reduction: one barrier plus (kNumSplitK - 1) partial tiles, used by rank 0 only
+  Barrier* reduce_barrier = barrier_start_ptr + kNumStages * 2;
+  auto smem_reduce = reinterpret_cast<float4*>(
+      ceil_div<uintptr_t>(reinterpret_cast<uintptr_t>(barrier_start_ptr + kNumStages * 2 + 1), 16) *
+      16);
 
   // Initialize barriers
   DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
@@ -540,14 +558,15 @@ __global__ void __launch_bounds__(
       full_barriers[i]->init(1);
       empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
     }
+    if constexpr (kNumSplitK > 1) reduce_barrier->init(1);
 
     // Make initialized barrier visible in async proxy
     cutlass::arch::fence_view_async_shared();
-    (kNumTMAMulticast > 1) ? cutlass::arch::fence_barrier_init() : void();
+    (kNumTMAMulticast > 1 or kNumSplitK > 1) ? cutlass::arch::fence_barrier_init() : void();
   }
 
   // Synchronize all threads to make barrier visible in normal memory model
-  (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+  (kNumTMAMulticast > 1 or kNumSplitK > 1) ? cute::cluster_sync() : __syncthreads();
 
   // For pipeline unrolling
   struct DivisibleK {};
@@ -555,7 +574,7 @@ __global__ void __launch_bounds__(
   struct NotDivisibleK {};
 
   auto launch_k_iterations = [](auto const& func) {
-    if constexpr (SHAPE_K % kFullKOfAllStages == 0) {
+    if constexpr (SHAPE_K_PER_SPLIT % kFullKOfAllStages == 0) {
       for (int k_iter = 0; k_iter < kNumIterations; ++k_iter) func(k_iter, DivisibleK{});
     } else {
       for (int k_iter = 0; k_iter < kNumIterations - 1; ++k_iter) func(k_iter, DivisibleK{});
@@ -582,7 +601,7 @@ __global__ void __launch_bounds__(
         launch_k_iterations([&](int k_iter, auto type) {
           constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
           constexpr int kNumInnerStages =
-              kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+              kHasDivisibleStages ? kNumStages : (SHAPE_K_PER_SPLIT % kFullKOfAllStages) / BLOCK_K;
           DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
 #pragma unroll
@@ -592,7 +611,7 @@ __global__ void __launch_bounds__(
 
             // Issue TMA A (weight) now without broadcasting
             auto& full_barrier = *full_barriers[s];
-            int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+            int k_idx = k_offset + k_iter * kFullKOfAllStages + s * BLOCK_K;
             tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
                      scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
 
@@ -678,13 +697,13 @@ __global__ void __launch_bounds__(
       launch_k_iterations([&](int k_iter, auto type) {
         constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
         constexpr int kNumInnerStages =
-            kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+            kHasDivisibleStages ? kNumStages : (SHAPE_K_PER_SPLIT % kFullKOfAllStages) / BLOCK_K;
         DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
 #pragma unroll
         for (int s = 0; s < kNumInnerStages; ++s) {
           // Read weight scales (A scales)
-          float scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
+          float scale_a_0 = ld_shared(smem_scales_a + k_offset / BLOCK_K + k_iter * kNumStages + s);
 
           // Wait TMA arrivals
           full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
@@ -737,6 +756,46 @@ __global__ void __launch_bounds__(
           empty_barrier_arrive(s);
         }
       });
+
+      if constexpr (kNumSplitK > 1) {
+        // Partial tile layout in rank 0: [split - 1][kNumAccum / 4][kNumMathThreads] float4
+        constexpr uint32_t kNumVec = WGMMA::kNumAccum / 4;
+        constexpr uint32_t kReduceBytes = (kNumSplitK - 1) * kNumVec * kNumMathThreads * 16;
+        if (split_k_idx != 0) {
+          auto const remote_barrier = cute::set_block_rank(
+              static_cast<uint32_t>(__cvta_generic_to_shared(reduce_barrier)), 0);
+#pragma unroll
+          for (uint32_t i = 0; i < kNumVec; ++i) {
+            auto const remote_addr = cute::set_block_rank(
+                static_cast<uint32_t>(__cvta_generic_to_shared(
+                    smem_reduce + ((split_k_idx - 1) * kNumVec + i) * kNumMathThreads +
+                    threadIdx.x)),
+                0);
+            asm volatile(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, "
+                "%4}, [%5];" ::"r"(remote_addr),
+                "f"(final_accum[i * 4 + 0]), "f"(final_accum[i * 4 + 1]),
+                "f"(final_accum[i * 4 + 2]), "f"(final_accum[i * 4 + 3]), "r"(remote_barrier)
+                : "memory");
+          }
+          // No cluster barrier is needed before exiting: only rank 0's shared memory is accessed
+          // remotely, and rank 0 cannot pass `reduce_barrier` until these stores have landed.
+          continue;
+        }
+        if (threadIdx.x == 0) reduce_barrier->arrive_and_expect_tx(kReduceBytes);
+        reduce_barrier->wait(0);
+#pragma unroll
+        for (uint32_t r = 0; r < kNumSplitK - 1; ++r) {
+#pragma unroll
+          for (uint32_t i = 0; i < kNumVec; ++i) {
+            float4 const v = smem_reduce[(r * kNumVec + i) * kNumMathThreads + threadIdx.x];
+            final_accum[i * 4 + 0] += v.x;
+            final_accum[i * 4 + 1] += v.y;
+            final_accum[i * 4 + 2] += v.z;
+            final_accum[i * 4 + 3] += v.w;
+          }
+        }
+      }
 
       // Write back to shared memory using STSM
       DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");

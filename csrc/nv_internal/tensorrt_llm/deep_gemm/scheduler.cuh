@@ -160,7 +160,7 @@ struct NormalScheduler {
 
 template <uint32_t SHAPE_M, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups,
           uint32_t kNumTMAMulticast, uint32_t kNumMBlocks = ceil_div(SHAPE_M, BLOCK_M),
-          uint32_t kNumMBlocksPerGroup = 16>
+          uint32_t kNumMBlocksPerGroup = 16, uint32_t kNumSplitK = 1>
 struct NormalSchedulerSwapAB {
   static constexpr GemmType gemm_type = GemmType::Normal;
 
@@ -206,7 +206,8 @@ struct NormalSchedulerSwapAB {
 
   __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
     ++current_iter;
-    auto const next_block_idx = current_iter * gridDim.x + blockIdx.x;
+    // With split-K, the CTAs of one cluster work on the same block
+    auto const next_block_idx = current_iter * (gridDim.x / kNumSplitK) + blockIdx.x / kNumSplitK;
     if (next_block_idx >= num_blocks) {
       return false;
     }
@@ -687,14 +688,17 @@ struct SchedulerSelector {
 
 template <GemmType GT, uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t BLOCK_K, uint32_t kNumGroups, uint32_t kNumTMAMulticast,
-          uint32_t kNumMBlocks = ceil_div(SHAPE_M, BLOCK_M), uint32_t kNumMBlocksPerGroup = 16>
+          uint32_t kNumMBlocks = ceil_div(SHAPE_M, BLOCK_M), uint32_t kNumMBlocksPerGroup = 16,
+          uint32_t kNumSplitK = 1>
 struct SchedulerSelectorSwapAB {
   static constexpr auto select_type() {
     static_assert(GT == GemmType::GroupedWithOffset || GT == GemmType::Normal,
                   "Only GroupedWithOffset and Normal are supported for SwapAB");
+    static_assert(kNumSplitK == 1 || GT == GemmType::Normal,
+                  "Split-K is only supported for Normal SwapAB");
     if constexpr (GT == GemmType::Normal)
       return NormalSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast,
-                                   kNumMBlocks, kNumMBlocksPerGroup>();
+                                   kNumMBlocks, kNumMBlocksPerGroup, kNumSplitK>();
     if constexpr (GT == GemmType::GroupedWithOffset)
       return GroupedWithOffsetSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups,
                                               kNumTMAMulticast, kNumMBlocks, kNumMBlocksPerGroup>();
