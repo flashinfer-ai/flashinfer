@@ -1451,20 +1451,31 @@ cudaError_t moefinalize_allreduce_fusion_kernel_launcher(
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle VEC_SIZE
   int warps_per_token = (threads_per_token + 31) / 32;
+  auto kernel = moefinalize_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut,
+                                                                    QuantOut, ScaleType>;
   // Clamp to the largest cluster the device can launch.
-  static const int max_cluster_size = GetMaxClusterSize(
-      reinterpret_cast<void const*>(
-          moefinalize_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut,
-                                                              QuantOut, ScaleType>),
-      128);
+  static const int max_cluster_size = GetMaxClusterSize(reinterpret_cast<void const*>(kernel), 128);
+  static const int max_threads_per_block = [&] {
+    cudaFuncAttributes attr;
+    return cudaFuncGetAttributes(&attr, kernel) == cudaSuccess
+               ? std::min(attr.maxThreadsPerBlock, 1024)
+               : 1024;
+  }();
   int cluster_size = std::min(8, max_cluster_size);
   while (warps_per_token % cluster_size != 0) {
     cluster_size /= 2;
   }
   int block_size = warps_per_token / cluster_size * 32;
+  int sm_count = get_sm_count();
+  // A cluster handles its tokens one after another, so while one cluster per token would not fit on
+  // the GPU, trade cluster size for block size (as allreduce_fusion does).
+  while (cluster_size > 1 && block_size * 2 <= max_threads_per_block &&
+         cluster_num * cluster_size > sm_count) {
+    block_size *= 2;
+    cluster_size /= 2;
+  }
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
                    "block_size <= 1024 && cluster_size > 0");
-  int sm_count = get_sm_count();
   int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
   cudaLaunchAttribute attribute[2];
