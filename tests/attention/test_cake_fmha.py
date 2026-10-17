@@ -279,8 +279,8 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
             "NUM_M_BLOCKS",
             "CAKE_FMHA_CONTEXT_",
             {
-                "sm_100a": "cuda/context_bf16/sm_100a/default.cu",
-                "sm_103a": "cuda/context_bf16/sm_103a/default.cu",
+                "sm_100a": "cuda/context_bf16/default.cu",
+                "sm_103a": "cuda/context_bf16/default.cu",
             },
         ),
     ),
@@ -310,6 +310,37 @@ def test_cake_fmha_generic_members_share_one_folded_source(
     }
     assert len(flag_sets) == generic_count
     assert all(set(member["selector"]) == set(macros) for member in generic_members)
+
+
+def test_cake_fmha_context_bf16_generic_members_share_one_arch_source() -> None:
+    """Both arches compile one context_bf16 source split only by __CUDA_ARCH__."""
+
+    members = get_cake_fmha_manifest()["components"]["context_bf16"]["source_family"]
+    generic_members = [m for m in members if "NUM_M_BLOCKS" not in m["selector"]]
+    exact_members = [m for m in members if "NUM_M_BLOCKS" in m["selector"]]
+    assert len(generic_members) == 6
+    assert len(exact_members) == 2
+    assert {
+        member["sources"][arch]
+        for member in generic_members
+        for arch in ("sm_100a", "sm_103a")
+    } == {"cuda/context_bf16/default.cu"}
+    csrc_dir = get_cake_fmha_csrc_dir()
+    for arch in ("sm_100a", "sm_103a"):
+        assert not (csrc_dir / f"cuda/context_bf16/{arch}/default.cu").exists()
+        for member in exact_members:
+            assert member["sources"][arch].startswith(f"cuda/context_bf16/{arch}/")
+    text = (csrc_dir / "cuda/context_bf16/default.cu").read_text(encoding="utf-8")
+    assert "#define __CUDA_ARCH__" not in text
+    assert (
+        text.count("#if __CUDA_ARCH__ == 1030\n")
+        == text.count("#endif  // __CUDA_ARCH__\n")
+        > 0
+    )
+    # The arch guards only split the kernel body; the host-visible preamble
+    # (defines, includes, kernel signature) is shared by both arches.
+    assert text.index("#if __CUDA_ARCH__ == 1030\n") > text.index("__global__ ")
+    assert text.rindex("#endif  // __CUDA_ARCH__\n") < text.index('} // extern "C"')
 
 
 def test_cake_fmha_smallm_components_share_one_folded_source() -> None:
