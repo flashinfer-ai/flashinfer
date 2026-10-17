@@ -46,6 +46,9 @@ def merge_state(
     KV-segments.
     Check :ref:`our tutorial <recursive-attention>` on the mathematical details.
 
+    Empty states are represented by ``V = 0`` and ``S = -inf``. Merging two
+    empty states returns the same empty state.
+
     Parameters
     ----------
     v_a : torch.Tensor
@@ -116,6 +119,9 @@ def merge_state_in_place(
     r"""Merge the self-attention state ``(v, s)`` with another state
     ``(v_other, s_other)`` in-place.
 
+    Empty states are represented by ``v = 0`` and ``s = -inf``. Merging two
+    empty states preserves that representation.
+
     Parameters
     ----------
     v : torch.Tensor
@@ -169,6 +175,9 @@ def _fake_merge_state_in_place(
 @register_custom_op("flashinfer::merge_states", mutates_args=())
 def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge multiple attention states (v, s).
+
+    Empty states are represented by ``v = 0`` and ``s = -inf``. If all states
+    are empty, or ``num_states`` is zero, the result is also an empty state.
 
     Parameters
     ----------
