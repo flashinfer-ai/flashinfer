@@ -758,6 +758,43 @@ def compute_reference_moe_fp4(
     return output
 
 
+def _block_scale_ramp(size: int, block: int, device) -> torch.Tensor:
+    """Power-of-two magnitudes (1/4 .. 2) that change every ``block`` elements.
+
+    Multiplying weights by this ramp gives neighbouring rows or scale blocks
+    distinct block scales, so reading the wrong scale factor produces a large
+    error instead of a near-identical one. The range stays small enough that
+    FC1 outputs remain within the NVFP4 range at a unit FC2 input scale.
+    """
+    exponents = (torch.arange(size, device=device) // block * 3) % 4 - 2
+    return torch.pow(2.0, exponents.float()).to(torch.bfloat16)
+
+
+def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size):
+    """Quantize ``[E, rows, k]`` weights one expert at a time.
+
+    Swizzled scale factors pad each expert's rows to a multiple of 128, as
+    per-expert weights are stored; quantizing the flattened ``[E * rows, k]``
+    tensor instead only pads at the end, which matches the per-expert layout
+    only when ``rows`` is a multiple of 128.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+
+    quantized, scales = zip(
+        *(
+            fp4_quantize(
+                expert,
+                global_scale=global_scale,
+                sf_vec_size=sf_vec_size,
+                is_sf_swizzled_layout=True,
+            )
+            for expert in weight
+        ),
+        strict=True,
+    )
+    return torch.stack(quantized), torch.cat([sf.reshape(-1) for sf in scales])
+
+
 def create_moe_tensors(
     num_tokens: int,
     hidden_size: int,
@@ -771,6 +808,7 @@ def create_moe_tensors(
     use_per_token_activation: bool = False,
     interleave_gated_weights: bool = True,
     use_nontrivial_alphas: bool = True,
+    vary_block_scales: bool = False,
 ):
     """Create properly quantized MoE tensors for testing.
 
@@ -862,17 +900,15 @@ def create_moe_tensors(
         / 10
     )
 
+    if vary_block_scales:
+        w1_bf16 = w1_bf16 * _block_scale_ramp(fc1_rows, 1, device)[None, :, None]
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w1_for_quant = (
         interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
         if gated and interleave_gated_weights
         else w1_bf16
     )
-    w1_flat = w1_for_quant.reshape(num_local_experts * fc1_rows, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat, global_scale=w1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
-    )
-    w1_q = w1_q_flat.view(num_local_experts, fc1_rows, hidden_size // 2)
+    w1_q, w1_sf_flat = _fp4_quantize_per_expert(w1_for_quant, w1_gs, sf_vec_size)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
         m=fc1_rows,
@@ -898,6 +934,11 @@ def create_moe_tensors(
         )
         / 10
     )
+    if vary_block_scales:
+        w2_bf16 = (
+            w2_bf16
+            * _block_scale_ramp(intermediate_size, sf_vec_size, device)[None, None, :]
+        )
 
     w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
@@ -950,6 +991,7 @@ def create_b12x_moe_tensors(
     top_k: int,
     device: str = "cuda",
     seed: int = 42,
+    vary_block_scales: bool = False,
 ):
     """Create B12x MoE tensors with non-interleaved weights and unity alphas."""
     return create_moe_tensors(
@@ -963,6 +1005,7 @@ def create_b12x_moe_tensors(
         seed=seed,
         interleave_gated_weights=False,
         use_nontrivial_alphas=False,
+        vary_block_scales=vary_block_scales,
     )
 
 
@@ -975,6 +1018,7 @@ def create_relu2_moe_tensors(
     top_k: int,
     device: str = "cuda",
     seed: int = 42,
+    vary_block_scales: bool = False,
 ):
     """Create MoE tensors for ReLU2 (non-gated: w1_rows = n, not 2*n)."""
     from flashinfer.fp4_quantization import fp4_quantize
@@ -1013,15 +1057,12 @@ def create_relu2_moe_tensors(
         )
         / 10
     )
+    if vary_block_scales:
+        w1_bf16 = (
+            w1_bf16 * _block_scale_ramp(intermediate_size, 1, device)[None, :, None]
+        )
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16.view(num_local_experts * intermediate_size, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=w1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=True,
-    )
-    w1_q = w1_q_flat.view(num_local_experts, intermediate_size, hidden_size // 2)
+    w1_q, w1_sf_flat = _fp4_quantize_per_expert(w1_bf16, w1_gs, sf_vec_size)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
         m=intermediate_size,
@@ -1042,6 +1083,11 @@ def create_relu2_moe_tensors(
         )
         / 10
     )
+    if vary_block_scales:
+        w2_bf16 = (
+            w2_bf16
+            * _block_scale_ramp(intermediate_size, sf_vec_size, device)[None, None, :]
+        )
     w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
     w2_q_flat, w2_sf_flat = fp4_quantize(

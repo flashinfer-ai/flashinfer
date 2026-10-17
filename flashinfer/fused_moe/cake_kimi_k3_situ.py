@@ -39,9 +39,36 @@ _N8_W2A_M16_TOKENS = (16,)
 _N32_CLAIM8_TOKENS = (512, 1024)
 _MID_WORK5FD_TOKENS = (2048, 4096)
 _LARGE_C7_TOKENS = (8192, 16384)
+# Architectures whose single-token route runs the fused quantization + routing
+# FC1 (three kernels: FC1, FC2, finalize) -- both today; an architecture outside
+# this set would launch the separate single-token quantization + router kernel
+# before the FC1 (four kernels, the "m1" selector).
+_M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 8192- and 16384-token route runs the FC2 that stores an
+# 8-bit per-tile partial with per-tile FP32 scales and the finalize that
+# consumes it (eight kernels) -- both today; an architecture outside this set
+# would run the pre-shuffled scale-factor route (nine kernels, the "large_c7"
+# selector).
+_LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
+# and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
+# keeps the BF16 expert output everywhere.
+_MID_Q8I_ARCHES = ("sm_103a",)
+_MID_Q8I_TOKENS = (4096,)
+# Architectures and token counts whose large route runs the routing histogram
+# and scatter kernels that privatize the expert histogram in per-CTA shared
+# memory and reserve a block of rows per CTA (1024 routed pairs per CTA; the
+# "large_q8i_p1024" selector) -- the 16384-token row of sm_100a today.  Every
+# other large row keeps the production routing kernels (256 pairs per CTA).
+_LARGE_P1024_ARCHES = ("sm_100a",)
+_LARGE_P1024_TOKENS = (16384,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
+# Routed (token, expert-slot) pairs one CTA of the routing histogram and
+# scatter kernels handles: 256 for the production kernels, 1024 for the
+# per-CTA privatized kernels of the "large_q8i_p1024" selector.
+_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024}
 # FC2 device-workfeed pools. The 16-token route runs an FC2 program built for
 # two resident CTAs per SM (__launch_bounds__(512, 2)), so its pool holds
 # 2 * SM // (_H // 128) rows (280 CTAs on a 148-SM part); the 32..256-token
@@ -52,7 +79,8 @@ _ROUTE_MC_CLUSTER = 8
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 _M64_CLAIM8_FC2_GRID_N = 12
 _N32_CLAIM8_FC2_GRID_N = 7
-# Pre-shuffled FC1 scale factors (the 16384-token route). The tile-N128 FC1
+# Pre-shuffled FC1 scale factors (the ``large_c7`` route, which no delivered
+# architecture selects today). The tile-N128 FC1
 # consumes K in steps of 512 elements; for every (N-tile, K-step) the writer
 # emits the 4096-byte shared-memory image FC1 expects (128 rows x 32 bytes).
 _FC1_K_STEP = 512
@@ -77,6 +105,7 @@ _GENERIC = (
 )
 _FUSED = ("quant", "fused_router", "fc1", "fc2", "finalize")
 _QUANT_ROUTE = ("quant_route", "fc1", "fc2", "finalize")
+_M1_FUSED = ("fc1", "fc2", "finalize")
 _LARGE = _GENERIC[:5] + ("sfb_shuffle",) + _GENERIC[5:]
 
 
@@ -97,6 +126,15 @@ _SELECTORS = {
         {
             "quant_route": "quant_route:m1",
             "fc1": "fc1:n8_small",
+            "fc2": "fc2:n8_m1",
+            "finalize": "finalize:feature",
+        },
+        None,
+    ),
+    "m1_s2a": (
+        _M1_FUSED,
+        {
+            "fc1": "fc1:n8_s2a",
             "fc2": "fc2:n8_m1",
             "finalize": "finalize:feature",
         },
@@ -145,6 +183,16 @@ _SELECTORS = {
         _N32_CLAIM8_FC2_GRID_N,
     ),
     "mid_work5fd": (_GENERIC, _generic(128, fc1="fc1:n128_work5fd"), None),
+    "mid_q8i": (
+        _GENERIC,
+        _generic(
+            128,
+            fc1="fc1:n128_work5fd",
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+        ),
+        None,
+    ),
     "large_c7": (
         _LARGE,
         _generic(
@@ -152,6 +200,24 @@ _SELECTORS = {
             fc1="fc1:n128_sfbs",
             extra={"sfb_shuffle": "sfb_shuffle:n128"},
             stages=_LARGE,
+        ),
+        None,
+    ),
+    "large_q8i": (
+        _GENERIC,
+        _generic(128, fc2="fc2:n128_q8i", finalize="finalize:n128_q8i"),
+        None,
+    ),
+    "large_q8i_p1024": (
+        _GENERIC,
+        _generic(
+            128,
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+            extra={
+                "route_histogram": "route_histogram:n128_p1024",
+                "route_scatter": "route_scatter:n128_p1024",
+            },
         ),
         None,
     ),
@@ -179,7 +245,7 @@ def _tile_n(num_tokens):
 def _selector(arch, num_tokens):
     tile_n = _tile_n(num_tokens)
     if num_tokens == 1:
-        return "m1"
+        return "m1_s2a" if arch in _M1_FUSED_ARCHES else "m1"
     if num_tokens in _N8_W2A_M16_TOKENS:
         return "n8_w2a_m16"
     if num_tokens == 8:
@@ -189,9 +255,13 @@ def _selector(arch, num_tokens):
     if num_tokens in _N32_CLAIM8_TOKENS:
         return "n32_claim8"
     if num_tokens in _MID_WORK5FD_TOKENS:
+        if arch in _MID_Q8I_ARCHES and num_tokens in _MID_Q8I_TOKENS:
+            return "mid_q8i"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
-        return "large_c7"
+        if arch in _LARGE_P1024_ARCHES and num_tokens in _LARGE_P1024_TOKENS:
+            return "large_q8i_p1024"
+        return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
     return tile_n
 
 
@@ -247,12 +317,14 @@ def _workspace_layout(num_tokens, arch=None):
         ("intermediate_scales", torch.uint8, (rows, _I // 16), 1),
         ("expert_output", torch.bfloat16, (rows, _H), 2),
     )
-    # The layout is architecture-independent: every selector that needs the
-    # FC2 work counter or the pre-shuffled scale images gets the field on both.
-    selector = _selector("sm_100a", num_tokens)
-    if _SELECTORS[selector][2] is not None:
+    # The layout is architecture-independent: a field that any architecture's
+    # selector of this token count needs (the FC2 work counter; the pre-shuffled
+    # scale images of a ``large_c7`` selector, which no delivered architecture
+    # uses today) is present on both.
+    selectors = {_selector(name, num_tokens) for name in ("sm_100a", "sm_103a")}
+    if any(_SELECTORS[selector][2] is not None for selector in selectors):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
-    if selector == "large_c7":
+    if "large_c7" in selectors:
         fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
@@ -326,10 +398,10 @@ def _cake_situ_workspace_size(options):
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
     # that force tile-N16 need more scratch rows than the tile-N8 counts that
-    # follow them, and the pre-shuffled scale-factor route carries
-    # ``sfb_shuffled`` (the 8192-token layout is larger than the ordinary
-    # layout up to 8647 tokens), so a maximum-size buffer covers every forced
-    # and pre-shuffled count at or below ``max_num_tokens`` as well as
+    # follow them, and an architecture whose large route is ``large_c7`` would
+    # carry ``sfb_shuffled`` on the 8192- and 16384-token layouts (none of the
+    # delivered architectures does today), so a maximum-size buffer covers
+    # every forced and large count at or below ``max_num_tokens`` as well as
     # ``max_num_tokens`` itself.
     return max(
         _workspace_layout(num_tokens)[1]
@@ -399,10 +471,37 @@ _CALL_ARGS = {
         "clamp_limit": "qa",
         "act_alpha": "alpha",
         "act_beta": "beta",
+        # The single-token fused program quantizes and routes inside FC1: its
+        # plan also names the quantizer and router inputs.
+        "x": "x",
+        "qx": "qx",
+        "topk_ids": "ids",
     },
     "fc2": {"A": "w2", "SFA": "sf2", "scale_c": "decode2"},
     "finalize": {"route_weights": "weights", "out": "out"},
 }
+
+
+def _plan_names(prepared, stage, name):
+    """Whether the program bound to ``stage`` takes an argument called ``name``."""
+    plan = MODULES[prepared["modules"][stage]]["arg_plan"]
+    return any(item == name for _kind, item in plan)
+
+
+def _q8_partial_views(views, tile_n, max_tiles):
+    """The 8-bit FC2 partial ``[rows, H]`` and its per-tile FP32 scales.
+
+    The programs that store the FC2 result as an 8-bit per-tile partial write
+    ``max_tiles * (H // 128)`` FP32 scales next to it; both are carved out of
+    the BF16 ``expert_output`` scratch, whose byte size (``2 * rows * H``)
+    exceeds ``rows * H + 4 * max_tiles * (H // 128)`` for every token count,
+    so the workspace layout and size are those of every other route.
+    """
+    rows = max_tiles * tile_n
+    scratch = views["expert_output"].view(torch.uint8).view(-1)
+    partial = scratch[: rows * _H].view(rows, _H)
+    scales = scratch[rows * _H : rows * _H + max_tiles * (_H // 128) * 4]
+    return partial, scales.view(torch.float32)
 
 
 def _stage_constants(stage, views, prepared, num_tokens):
@@ -412,7 +511,8 @@ def _stage_constants(stage, views, prepared, num_tokens):
     max_tiles = prepared["max_tiles"]
     selector = prepared["selector"]
     workfeed = _SELECTORS[selector][2] is not None
-    route_grid = ((total_pairs + 255) // 256, 1, 1)
+    pairs_per_cta = _ROUTE_PAIRS_PER_CTA.get(selector, 256)
+    route_grid = ((total_pairs + pairs_per_cta - 1) // pairs_per_cta, 1, 1)
     route_views = {
         name: views[name]
         for name in (
@@ -557,11 +657,16 @@ def _stage_constants(stage, views, prepared, num_tokens):
                 num_non_exiting_ctas=views["total_tiles"],
                 work_counter=views["fc2_work_counter"],
             )
+        if _plan_names(prepared, stage, "partial_scale"):
+            # The program stores an 8-bit per-tile partial and its FP32 scales
+            # instead of the BF16 expert output.
+            partial, partial_scale = _q8_partial_views(views, tile_n, max_tiles)
+            values.update(C_tma=partial, C=partial, partial_scale=partial_scale)
         return values
     if stage == "finalize":
-        feature = selector in ("m1", "n8_feature", "n8_w2a_m16", "m64_claim8")
+        feature = selector in ("m1", "m1_s2a", "n8_feature", "n8_w2a_m16", "m64_claim8")
         vec = 2 if tile_n == 8 else 8
-        return dict(
+        values = dict(
             grid=(
                 num_tokens,
                 1
@@ -575,6 +680,11 @@ def _stage_constants(stage, views, prepared, num_tokens):
             token_to_permuted=views["token_to_permuted"],
             M=num_tokens,
         )
+        if _plan_names(prepared, stage, "partial_scale"):
+            # The program reads the FC2 stage's 8-bit partial and its scales.
+            partial, partial_scale = _q8_partial_views(views, tile_n, max_tiles)
+            values.update(expert_output=partial, partial_scale=partial_scale)
+        return values
     raise ValueError(f"unknown SiTU stage {stage!r}")
 
 

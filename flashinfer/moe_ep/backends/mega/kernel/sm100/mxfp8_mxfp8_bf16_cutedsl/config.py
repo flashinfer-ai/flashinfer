@@ -35,3 +35,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+    # Opt-in decoding pipeline. Existing callers keep the legacy inference
+    # path, including its knob cache and online autotuner.
+    kernel_variant: Literal["inference", "genphase"] = "inference"
+    # GenPhase only: None selects N128/CGA4. N64 admits CGA2 or CGA4.
+    mma_tiler_mnk: tuple[int, int, int] | None = None
+    cluster_shape_mn: tuple[int, int] | None = None
