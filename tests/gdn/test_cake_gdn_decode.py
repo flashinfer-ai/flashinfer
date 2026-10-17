@@ -74,8 +74,12 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
     assert manifest["binary_artifacts"] is False
     assert "sha256" not in json.dumps(manifest)
     architectures = set(manifest["architectures"])
+    # Every shared header's sha256 enters every variant's compile-cache digest,
+    # so the manifest lists only headers that a listed kernel body includes.
+    header_names = {Path(header["path"]).name for header in manifest["cuda_headers"]}
     for header in manifest["cuda_headers"]:
         assert (root / header["path"]).is_file()
+    included_headers: set[str] = set()
     for record in variants:
         # One body per architecture: a kernel whose lowering differs on one
         # architecture (the sm_107a F64-free q scale) carries that architecture
@@ -85,6 +89,10 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
             assert output["architectures"]
             assert set(output["architectures"]) <= architectures
             assert (root / output["path"]).is_file()
+            source = (root / output["path"]).read_text(encoding="utf-8")
+            included_headers.update(
+                name for name in header_names if f'#include "{name}"' in source
+            )
             served.extend(output["architectures"])
         assert sorted(served) == sorted(record["architectures"])
         assert (root / record["host_binding"]["path"]).is_file()
@@ -92,6 +100,7 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
             assert key.isidentifier()
             assert isinstance(value, str) and value
         assert set(record["defines"]) <= set(record["specializations"])
+    assert included_headers == header_names
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
