@@ -38,6 +38,7 @@ incompatible entries).
 """
 
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import json
@@ -295,6 +296,68 @@ class ManagedAutotuneCache:
         # on the next attach.
         self._hits: Dict[str, ManagedCacheEntry] = {}
         self._missing: Set[str] = set()
+        self._protocol_records: Dict[str, Dict[str, Any]] = {}
+        self._protocols_preloaded = False
+
+    def _protocol_dir(self, namespace: str) -> pathlib.Path:
+        return (
+            self.env_dir / "protocols" / hashlib.sha256(namespace.encode()).hexdigest()
+        )
+
+    def preload_protocol_records(self) -> None:
+        """Hydrate protocol records when the managed store is attached."""
+        if self._protocols_preloaded:
+            return
+        self._protocols_preloaded = True
+        try:
+            paths = sorted((self.env_dir / "protocols").glob("*/*.json"))
+        except OSError as exc:
+            logger.warning(f"[Autotuner]: Cannot read protocol cache: {exc}")
+            return
+        for path in paths:
+            try:
+                with path.open() as stream:
+                    entry = json.load(stream)
+                namespace, key = entry["namespace"], entry["key"]
+                if (
+                    not isinstance(namespace, str)
+                    or not isinstance(key, str)
+                    or path.parent != self._protocol_dir(namespace)
+                    or path.stem != hashlib.sha256(key.encode()).hexdigest()
+                ):
+                    raise ValueError("protocol cache identity mismatch")
+                self._protocol_records.setdefault(namespace, {})[key] = entry["value"]
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    f"[Autotuner]: Ignoring invalid protocol cache {path}: {exc}"
+                )
+
+    def protocol_records(self, namespace: str) -> Dict[str, Any]:
+        """Return records for the protocol's own compatibility and bucket lookup."""
+        self.preload_protocol_records()
+        return copy.deepcopy(self._protocol_records.get(namespace, {}))
+
+    def publish_protocol_record(
+        self, namespace: str, key: str, value: Any, *, persist: bool
+    ) -> None:
+        """Keep the record in memory and atomically publish when permitted."""
+        self.protocol_records(namespace)
+        self._protocol_records.setdefault(namespace, {})[key] = copy.deepcopy(value)
+        if not persist:
+            return
+        try:
+            self._ensure_dirs()
+            directory = self._protocol_dir(namespace)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+            _atomic_write_json(
+                path, {"namespace": namespace, "key": key, "value": value}
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(
+                f"[Autotuner]: Failed to persist protocol record: {exc}. "
+                "The selected result remains available in memory."
+            )
 
     def _entry_path(self, file_key: str) -> pathlib.Path:
         op_hash = hashlib.sha256(file_key.encode()).hexdigest()[:24]
@@ -456,6 +519,8 @@ class ManagedAutotuneCache:
         """Forget memoized lookups (e.g. after AutoTuner.clear_cache)."""
         self._hits.clear()
         self._missing.clear()
+        self._protocol_records.clear()
+        self._protocols_preloaded = False
 
     def __repr__(self) -> str:
         return (
@@ -528,6 +593,7 @@ def _hydrate_from_store(tuner, store) -> None:
     try:
         from .autotuner.autotuner import _json_to_tactic
 
+        store.preload_protocol_records()
         entries, total, skipped = store.preload()
         for key_fields, entry in entries:
             memo_key = (*marker, key_fields)
@@ -571,11 +637,15 @@ def autotune_v2_reload() -> None:
         tuner.profiling_cache.clear()
         tuner._ranked_tactics_cache.clear()
         tuner._winner_partitions.clear()
+        tuner._protocol_record_partitions.clear()
+        tuner._protocol_cache_generation += 1
         tuner._profiling_cache_policies.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.
         tuner._preloaded_stores.clear()
+        for registered_store in tuner._managed_stores.values():
+            registered_store.clear_memo()
         store = tuner._managed_cache
         if store is not None:
             store.clear_memo()
