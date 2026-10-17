@@ -24,7 +24,7 @@ from .trace.templates.page import xqa_mla_trace, xqa_trace
 from .jit.xqa import (
     gen_xqa_module,
     gen_xqa_module_mla,
-    ragged_q_changes_build,
+    xqa_module_key,
     swap_ab_eligible,
 )
 from .jit.utils import filename_safe_dtype_map
@@ -48,9 +48,10 @@ def get_xqa_module(
     q_seq_len: int,
     use_ragged_q: bool = False,
 ):
-    # Ragged Q must reuse the uniform module unless it changes the compile
-    # flags; a second cache entry would re-register the same torch op.
-    use_ragged_q = use_ragged_q and ragged_q_changes_build(q_seq_len, head_group_ratio)
+    # Requests that compile the same module must share one cache entry: a
+    # second entry would re-register the same torch op and rebuild an identical
+    # module under a second name.
+    q_seq_len, use_ragged_q = xqa_module_key(q_seq_len, head_group_ratio, use_ragged_q)
     return _get_xqa_module_cached(
         input_dtype,
         kv_cache_dtype,
