@@ -543,13 +543,23 @@ def _cpu_inputs(seqlen, nheads=8, ngroups=8):
     return x, dt, A, B, torch.empty_like(B)
 
 
-def _cpu_runner(module, monkeypatch, calls, loads=None, *, has_varlen=False):
+def _cpu_runner(
+    module,
+    monkeypatch,
+    calls,
+    loads=None,
+    *,
+    has_varlen=False,
+    arch="sm_103a",
+    seq_idx_dtype=torch.int32,
+):
     """A real bf16 runner (8 heads, 8 groups; batched unless ``has_varlen``)
-    on CPU tensors: the device queries answer for a 148-SM sm_103a device,
-    the launcher records its calls and the program loader builds nothing."""
+    on CPU tensors: the device queries answer for a 148-SM device of ``arch``
+    (default sm_103a), the launcher records its calls and the program loader
+    builds nothing."""
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
+    monkeypatch.setattr(module, "_target_arch", lambda *_: arch)
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
     monkeypatch.setattr(module, "_sm_count", lambda _: 148)
 
@@ -583,12 +593,16 @@ def _cpu_runner(module, monkeypatch, calls, loads=None, *, has_varlen=False):
         has_initial_states=False,
         has_varlen=has_varlen,
         has_z=False,
-        seq_idx_dtype=torch.int32,
+        seq_idx_dtype=seq_idx_dtype,
     )
 
 
+_ROUTE_ARCHES = ("sm_100a", "sm_103a")
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
 def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_gpu(
-    monkeypatch,
+    monkeypatch, arch
 ):
     """The seq_idx triple form with a caller ``seq_chunk_cumsum`` the
     preprocess does not rewrite is one workspace key (``caller_cumsum``) for
@@ -596,12 +610,13 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     ``run`` default), freezes the fused single-launch program for the shape
     and the following ``run`` is a pure launch of that program; a ``run``
     that asks the preprocess to rewrite the table is another shape with the
-    two-kernel program; the ``cu_seqlens`` form with a caller buffer is still
-    prepared as the publishing call (its only reading)."""
+    publishing program of the capability (``exactmeta`` on SM100, the
+    two-kernel program on SM103); the ``cu_seqlens`` form with a caller
+    buffer is still prepared as the publishing call (its only reading)."""
 
     module = _module()
     calls, loads = [], []
-    runner = _cpu_runner(module, monkeypatch, calls, loads, has_varlen=True)
+    runner = _cpu_runner(module, monkeypatch, calls, loads, has_varlen=True, arch=arch)
     seqlen, num_seqs = 300, 2  # 2 sequences x 8 heads, 3 packed chunks
     x, dt, A, B, C = _cpu_inputs(seqlen)
     out = torch.empty_like(x)
@@ -624,7 +639,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert prepared.workspace_key == module._WorkspaceKey(
         None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, True, "never"
     )
-    assert loads == [("exactfused_bf16_varlen", "sm_103a")]
+    assert loads == [("exactfused_bf16_varlen", arch)]
     assert runner._workspaces.get(prepared.workspace_key).prepared
 
     # The run of the same call: the frozen program, a pure launch, the
@@ -637,7 +652,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert out_run is out
     assert name == runner.last_program_name == prepared.program_name
     assert runner._allocations_in_last_run == 0
-    assert loads == [("exactfused_bf16_varlen", "sm_103a")]  # no new load
+    assert loads == [("exactfused_bf16_varlen", arch)]  # no new load
     assert launch["preprocess_grid"] == (0, 1, 1)
     assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
     assert launch["main"]["metadata_from_cu_seqlens"] == 0
@@ -645,17 +660,30 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert launch["main"]["chunk_indices"] is triple["chunk_indices"]
     assert len(runner._workspaces) == 1
 
-    # Asking the preprocess to rewrite the table is another call shape: the
-    # two-kernel program under its own key (unprepared, so it reads the
-    # environment).
+    # Asking the publishing stage to rewrite the table is another call shape
+    # under its own key (unprepared, so it reads the environment): on SM100
+    # the exactmeta program (the light metadata kernel publishing into the
+    # caller's buffer, then the same fused main kernel), on SM103 the
+    # two-kernel program (the segment preprocess publishes).
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     runner.run(
         x, dt, A, B, C, **triple, seq_chunk_cumsum=table, update_seq_chunk_cumsum=True
     )
     name, launch = calls[-1]
-    assert name == runner.last_program_name == "exactpre_bf16_varlen"
-    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
-    assert launch["preprocess_grid"][0] >= 1
+    assert name == runner.last_program_name
+    if arch == "sm_100a":
+        assert name == "exactmeta_bf16_varlen"
+        assert launch["preprocess"]["sequence_offsets"] is table
+        assert launch["preprocess_grid"] == (1, 1, 1)
+    else:
+        family = module.two_kernel_family(
+            mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
+        )
+        assert module._PROGRAMS[name].family == family
+        assert launch["preprocess"]["seq_chunk_cumsum"] is table
+        assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
+        assert launch["preprocess_grid"][0] >= 1
+    assert launch["main"]["seq_chunk_cumsum"] is table
     assert (
         module._WorkspaceKey(
             None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, "never"
@@ -692,6 +720,100 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert launch["preprocess_grid"] == prepared_cu.preprocess_grid
     assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
     assert runner._allocations_in_last_run == 0
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
+@pytest.mark.parametrize("form", ("cu_seqlens", "triple_i32", "triple_i64", "trusted"))
+def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
+    monkeypatch, arch, form
+):
+    """``prepare`` and ``run`` of one call resolve the same program, workspace
+    key and launch grids for every packed-varlen form on both capabilities:
+    the ``cu_seqlens`` form and the trusted-table triple form (the fused
+    program, one launch), and the triple form deriving its table with int32
+    or int64 ``seq_idx`` (``exactmeta`` on SM100, the two-kernel program on
+    SM103; the table published ahead of the main kernel)."""
+
+    module = _module()
+    seq_idx_dtype = torch.int64 if form == "triple_i64" else torch.int32
+    calls, loads = [], []
+    runner = _cpu_runner(
+        module,
+        monkeypatch,
+        calls,
+        loads,
+        has_varlen=True,
+        arch=arch,
+        seq_idx_dtype=seq_idx_dtype,
+    )
+    seqlen, num_seqs = 300, 2
+    x, dt, A, B, C = _cpu_inputs(seqlen)
+    out = torch.empty_like(x)
+    if form == "cu_seqlens":
+        kwargs = {"cu_seqlens": torch.tensor([0, 150, seqlen], dtype=torch.int32)}
+    else:
+        kwargs = {
+            "seq_idx": torch.zeros((1, seqlen), dtype=seq_idx_dtype),
+            "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+            "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+            "num_seqs": num_seqs,
+        }
+        if form == "trusted":
+            kwargs["seq_chunk_cumsum"] = torch.tensor([0, 1, 3], dtype=torch.int32)
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+
+    prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs, out=out)
+    assert calls == [] and runner.last_program_name is None
+    family = module._PROGRAMS[prepared.program_name].family
+    if form in ("cu_seqlens", "trusted"):
+        assert family == "exactfused" and prepared.preprocess_grid == (0, 1, 1)
+    else:
+        assert family == (
+            "exactmeta"
+            if arch == "sm_100a"
+            else module.two_kernel_family(
+                mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
+            )
+        ), (arch, form, prepared.program_name)
+        assert prepared.preprocess_grid[0] >= 1
+    assert loads == [(prepared.program_name, arch)]
+
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "invalid-after-prepare")
+    out_run, _final = runner.run(x, dt, A, B, C, **kwargs, out=out)
+    name, launch = calls[-1]
+    assert out_run is out
+    assert name == runner.last_program_name == prepared.program_name
+    assert launch["preprocess_grid"] == prepared.preprocess_grid
+    assert launch["main_grid"] == prepared.grid
+    assert loads == [(prepared.program_name, arch)]  # no new load
+    assert runner._allocations_in_last_run == 0
+    assert len(runner._workspaces) == 1
+    assert prepared.workspace_key in runner._workspaces
+
+
+def test_prepare_and_run_refuse_other_capabilities_alike_without_gpu(monkeypatch):
+    """Neither ``prepare`` nor ``run`` guesses a route for a device that is
+    not SM100 or SM103: both raise ``_target_arch``'s ``ValueError``."""
+
+    module = _module()
+    target_arch = module._target_arch
+    calls, loads = [], []
+    runner = _cpu_runner(module, monkeypatch, calls, loads, has_varlen=True)
+    monkeypatch.setattr(module, "_target_arch", target_arch.__wrapped__)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    seqlen = 300
+    x, dt, A, B, C = _cpu_inputs(seqlen)
+    triple = {
+        "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+        "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+        "num_seqs": 2,
+    }
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **triple)
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        runner.run(x, dt, A, B, C, **triple)
+    assert calls == [] and loads == []
 
 
 def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
