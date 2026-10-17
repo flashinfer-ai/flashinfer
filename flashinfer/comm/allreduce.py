@@ -300,7 +300,6 @@ def _trtllm_workspace_check(
 # HEURISTIC - Performance-based backend selection
 # ============================================================================
 
-
 def _workspace_creation_heuristic(
     suitable_backends: list[str],
     backend: str,
@@ -310,44 +309,17 @@ def _workspace_creation_heuristic(
     hidden_dim: int,
     dtype: torch.dtype,
 ) -> list[str]:
-    """
-    Select best backend for workspace creation based on performance.
+    """Select the preferred backend for workspace creation.
 
-    Called by decorator after checking which backends pass requirements.
-    Uses benchmarking data to pick fastest option.
-
-    Args:
-        suitable_backends: List of backends that passed hard requirement checks
-        backend: Requested backend ("auto", "trtllm", or "mnnvl")
-        world_size: Number of ranks
-        rank: Current rank
-        max_token_num: Maximum number of tokens
-        hidden_dim: Hidden dimension size
-        dtype: Data type
-        **kwargs: Additional arguments
-
-    Note that at this point, the backend selection does not take "runtime parameters" into account, such as layout_code, and fusion pattern.
-
-    Returns:
-        List containing the selected backend (single element)
+    Hard requirements are assumed to have already been checked. MNNVL is
+    preferred when multiple suitable backends are available, based on
+    benchmark results.
     """
     if not suitable_backends:
         return []
 
-    if len(suitable_backends) == 1:
-        return suitable_backends
-
-    # Decision tree based on benchmark data
-
-    # Single-node scenarios
-    # From benchmarking data, we can see that MNNVL is either on par (smaller problem sizes) or significantly faster than TRTLLM (larger problem sizes such as hidden_dim=8192, token_num=64 for TP=4), for single-node scenarios.
-    # TRTLLM still has the larger specialized-fusion surface, such as MoE
-    # patterns and packed group FP8 quantization.
-    if "mnnvl" in suitable_backends:
-        return ["mnnvl"]
-    else:
-        return [suitable_backends[0]]
-
+    preferred_backend = "mnnvl" if "mnnvl" in suitable_backends else suitable_backends[0]
+    return [preferred_backend]
 
 # ============================================================================
 # WORKSPACE CREATION
