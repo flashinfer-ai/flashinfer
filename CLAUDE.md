@@ -35,12 +35,14 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| GDN ReplaySSM u-cache flush kernel with an fp16 state pool (on SM100 served by the UMMA backend; `gated_delta_rule_mtp_ucache_flush(backend=...)`) | `export GDN_UCACHE_STATE_DTYPE=fp16` |
 | Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override ragged-prefill `auto` backend order (Blackwell) | `export FLASHINFER_RAGGED_AUTO_BACKEND_ORDER=cutlass,cudnn` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
+| Log MegaMoE compilation and workspace diagnostics | `export FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC=1` |
 | Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
@@ -123,8 +125,10 @@ Caveats:
 
 Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
 `1e-6` without an epsilon argument. Auto selection also requires CuTe DSL 4.7+.
-The bounded SM100 policies live in `kda.py` and `gdn_prefill.py`. Validate both
-output and final state before changing a policy. Explicit state-pool calls
+The bounded KDA SM100/SM103 and GDN SM100 policies live in `kda.py` and
+`gdn_prefill.py`. KDA's head/length regions are documented in `docs/api/kda.rst`.
+Auto-selected cuDNN ignores the native KDA workspace; native fallback uses it.
+Validate output and final state before changing a policy. Explicit state-pool calls
 require unique, in-range slots; auto keeps pools on their native route.
 
 Use `benchmarks/bench_cudnn_linear_attention.py` for public-call comparisons.
@@ -157,6 +161,42 @@ Run specific test function:
 ```bash
 pytest tests/attention/test_hopper.py::test_single_prefill
 ```
+
+The sharded test runner defaults to one worker per visible GPU. H100 PR CI opts
+into `--workers-per-gpu 2`: eight workers on four GPUs. Other CI lanes retain
+the default. Locally, `scripts/task_run_unit_tests.sh --workers-per-gpu 2` enables
+sharing; `--workers N` sets the total instead. Workers share the existing JIT
+compilation budget.
+
+Scheduling markers apply to the whole source file:
+
+- `node_exclusive`: run alone across the allocation after parallel work, with
+  all GPUs visible. Use for multi-GPU requirements or host-memory OOM risk.
+- `gpu_exclusive`: run alone on the assigned GPU; other GPUs can keep working.
+- `host_memory_heavy`: prioritize this file and serialize its units with other
+  host-heavy work, while lighter files can overlap.
+
+Host and GPU reservations cover setup, execution, and process cleanup, and are
+acquired together. Blocked units stay queued so workers can take runnable work
+from their own queue or steal from another. Pending GPU-exclusive work can
+drain one GPU without reserving the host-heavy slot or blocking other GPUs.
+`RESOURCE WAIT` reports worker idle time of at least one second while work is
+queued but cannot run on that worker's resources.
+
+These markers enforce overlap rules, not memory limits. Most H100 annotations
+use measured peaks above 128 GiB host RSS or 32 GiB GPU memory. Attention sink
+also uses both narrower markers: its single-GPU H100 run peaked at 89.2 GiB host
+RSS and 4.5 GiB GPU memory, and other GPUs can keep working while it runs.
+Cold JIT compilation and other GPU families can change the peaks. Validate
+completion rate, OOM failures, and repeated wall times with matching scope and
+cache conditions when changing a CI lane's concurrency policy.
+
+Capacity reports include the serial floor from host-heavy and node-exclusive
+work. They remain optimistic about GPU contention because the estimator uses
+worker counts without GPU topology or measured memory capacity.
+
+Run the CPU-only coordinator suite with
+`pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
 ### Skipping Tests Based on CUDA Architecture
 
@@ -660,18 +700,17 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
 | `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
 | `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS` | `0` | `flashinfer/gdn_decode.py` | `1` enables extra slot-validation checks in the CAKE GDN path for debugging or invariant validation. Leave disabled in normal runs to avoid extra validation overhead. |
-| `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` | `0` | `flashinfer/experimental/cake_dsa_train/cake_backend.py` | `1` makes the CAKE DSA training backward validate the values of a caller-provided `dkv_dst_map` (every destination row must lie in `[0, S_dst)` of `dkv_acc`) on each call, at the cost of one device synchronization; the kernel itself does not range-check the map. Leave disabled in normal runs. |
-| `FLASHINFER_CAKE_DSA_DKV_DIRECT` | `auto` | `flashinfer/experimental/cake_dsa_train/cake_backend.py` | Selects how the CAKE DSA training backward accumulates dK / dV when the caller passes `dkv_acc`: `auto` takes the direct path (the main stage reduces into the caller's packed fp32 rows; no workspace accumulators, zero fill or cast launch) whenever the program registers the natural-layout stages and the row has at least `dkv_direct.min_keys_per_query` (4) keys per query token, `1` forces the direct path whenever the stages are registered, `0` always uses the accumulator-and-cast path. Any other value raises `ValueError`. Read on every plan. |
-| `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE` | `1` | `flashinfer/experimental/cake_dsa_train/cake_backend.py` | `0` disables the CAKE DSA training binding cache (every call re-validates and re-binds its inputs instead of launching from the remembered argument plans). Read once at import. |
-| `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` | `256` | `flashinfer/experimental/cake_dsa_train/cake_backend.py` | Number of forward / backward bindings the CAKE DSA training binding cache keeps before evicting the least recently used one. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | unset | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | JSON object of explicit per-GEMM knobs for the eager chunked LM-head + loss entry points (the `gemm_tuning` argument of `prepare_lm_head_loss` takes the same object), e.g. `{"dx": {"tile_n": 256, "k_slices": 2}}`; a knob given as `null` pins the default form. Unset / empty: the per-geometry rules choose. A variant the compiled record does not register fails closed. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST` | `1` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | `0` turns off the fused weight-gradient cast: every chunk then accumulates into the FP32 `dW_acc` and a separate kernel applies the upstream scale and the output cast (by default the last chunk's weight-gradient GEMM fuses both into its epilogue). `dW` is bitwise the same either way. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE` | `1` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | `0` turns off the fused dX finalize: a K-sliced dX GEMM's FP32 slabs are then added by in-place `add_` launches and a compacted call's `dX` is cast, zero-filled and `index_copy_`-scattered on the host instead of the `slab_sum` and `scale_cast_scatter_bf16` kernels (bitwise the same `dX`; read once per forward). |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `auto` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | Launches each chunk's weight-gradient accumulate GEMM on a per-device side stream (forked after the chunk's row gradients, joined before the chunk buffer is reused and before the call returns) so it overlaps the tail of the chunk's dX GEMM: `auto` for calls of three or more chunks, `1` for every multi-chunk call, `0` never. Same kernels in the same order per kernel; bitwise the same outputs. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `1` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | `0` turns off the hidden valid-row count of the eager entry points (served to calls of three or more chunks; one- and two-chunk calls take the host-count path on every setting): a compacted call then counts its valid rows and forms their index on the host before its first launch, instead of forming the index on the device and queueing chunk 0's row gather kernel and device-count logits GEMM before the count is read back through a pinned cell and a CUDA event. Bitwise the same outputs. On CUDA 13.0 the `sm_103a` calls take the host-count path regardless (`cake_jit.toolchain_runs_hidden_count`; the README's toolchain note). |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS` | `1` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | `0` turns off valid-row compaction: the chunk loop then covers every row instead of only the rows whose label is not `-100`. |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | `0` disables the per-process LRU cache of compiled bindings (read at import). |
-| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/experimental/cake_lm_head_loss/cake_backend.py` | Capacity of that binding cache (a positive integer). |
+| `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` | `0` | `flashinfer/dsa_sparse_attention.py` | Fallback of the `check_dst_map` keyword of `dsa_sparse_attention` / `dsa_sparse_attention_varlen` when it is `None`: unset, empty or `0` leaves the values of a caller-provided `dkv_dst_map` unchecked; any other value makes the backward validate them (every destination row in `[0, S_dst)` of `dkv_acc`) at the cost of one device synchronization and raise `ValueError` on a violation. The kernel itself does not range-check the map; the package backend reads no environment variable. |
+| `FLASHINFER_CAKE_DSA_DKV_DIRECT` | `auto` | `flashinfer/dsa_sparse_attention.py` | Fallback of the `dkv_direct` keyword of the two public entries when it is `None`, read on every call: `auto` -> `None` (the record's size rule: at least `dkv_direct.min_keys_per_query` keys per query token), `1` -> `True` (direct dK / dV accumulation whenever the natural-layout stages are registered), `0` -> `False` (the accumulate-and-cast path); any other value raises `ValueError`. The resolved value is part of the backend's binding key. |
+| `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/dsa_sparse_attention.py` | Capacity of the CAKE DSA training binding cache (`cake_backend.BINDING_CACHE`, least recently used first out): read once when `flashinfer.dsa_sparse_attention` is imported (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `BINDING_CACHE.configure(capacity=...)` when the wrapper first reaches the backend. Direct users of the package call `configure` themselves. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | unset | `flashinfer/chunked_lm_head.py` | Fallback of the `gemm_tuning` keyword of `chunked_lm_head_loss` / `chunked_lm_head_logprob` when it is `None`: a JSON object of explicit per-GEMM knobs, e.g. `{"dx": {"tile_n": 256, "k_slices": 2}}` (the package backend takes the same dict as a keyword and reads no environment variable). Unset / empty: the per-geometry rules choose. Invalid JSON or a non-object is a `ValueError`. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `fuse_dw_cast` keyword when it is `None`: `0` turns off the fused weight-gradient cast (every chunk then accumulates into the FP32 `dW_acc` and a separate kernel applies the upstream scale and the output cast). `dW` is bitwise the same either way. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `dx_finalize` keyword when it is `None`: `0` turns off the fused dX finalize (a K-sliced dX GEMM's FP32 slabs are then added by in-place `add_` launches and a compacted call's `dX` is cast, zero-filled and `index_copy_`-scattered on the host instead of by the `slab_sum` and `scale_cast_scatter_bf16` kernels). Bitwise the same `dX`; resolved once per forward. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM` | `auto` | `flashinfer/chunked_lm_head.py` | Fallback of the `dw_stream` keyword when it is `None` (`0` / `false` / `off` / `no` -> never, `1` / `true` / `on` / `yes` -> every multi-chunk call, anything else -> `auto` = calls of three or more chunks): launches each chunk's weight-gradient accumulate GEMM on a per-device side stream (forked after the chunk's row gradients, joined before the chunk buffer is reused and before the call returns) so it overlaps the tail of the chunk's dX GEMM. Same kernels in the same per-kernel order; bitwise the same outputs. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `hidden_count` keyword when it is `None`: `0` turns off the hidden valid-row count of the eager entry points (served to calls of three or more chunks): a compacted call then counts its valid rows and forms their index on the host before its first launch instead of on the device with chunk 0's gather kernel and device-count logits GEMM queued ahead of the read-back. Bitwise the same outputs. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS` | `1` | `flashinfer/chunked_lm_head.py` | Fallback of the `compact_rows` keyword when it is `None`: `0` turns off valid-row compaction (the chunk loop then covers every row instead of only the rows whose label is not `-100`). |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure`: `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
+| `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache (a positive integer), read once at the same import and applied through `configure`. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
@@ -730,6 +769,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
+| `FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC` | unset | `flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/shim/runtime.py` | Exactly `1` prints MegaMoE split-kernel compile choices, workspace memory diagnostics, and frontend compile/capture timings; other values leave these diagnostics off. |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
 | `FLASHINFER_PRIMS_TS_DEBUG_CHECKS` | `0` | `flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py`, `batched_gemm_run.py`, `flashinfer/prims_ts/gemm/kernel.py` | `1`/`true`/`yes`/`on` enables exhaustive deadlock/race checks and TaskManager verification in Prims-TS batched GEMM and dense GEMM. Production JIT leaves both off. `tests/prims_ts` turns the variable on for `test_batched_gemm_*` and `test_gemm_*`. |
 | `FLASHINFER_PRIMS_TS_COMPILE_OPTIONS` | `--opt-level 2` | `flashinfer/prims_ts/utils.py`, `batched_gemm_run.py` | Extra CuTe-DSL / nvc compile options passed when building Prims-TS kernels. |

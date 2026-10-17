@@ -72,6 +72,7 @@ from .api import (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -110,6 +111,7 @@ from .runners import (
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -157,6 +159,7 @@ _RunnerT = Union[
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -201,6 +204,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Config: SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Config: SM12xNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
@@ -230,8 +234,8 @@ class MoELayer:
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
         """Build the layer and the set of backend runners it will autotune over.
 
-        Every backend in ``config.backend`` whose hardware preconditions the
-        target device satisfies gets a runner; the rest are skipped here rather
+        Every backend in ``config.backend`` whose hardware preconditions are
+        satisfied by the target device gets a runner; the rest are skipped here rather
         than at call time, so an unsupported backend costs nothing per call.
 
         Parameters

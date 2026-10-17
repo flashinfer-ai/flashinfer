@@ -1,6 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Distributed public-API guards for source lengths; run with torchrun EP4."""
+"""Distributed MoK adapter guards for source lengths; run with torchrun EP4.
+
+Backend suite: the package is imported only through
+:func:`tests.test_helpers.cake_package.cake_package`.
+"""
 
 import dataclasses
 import os
@@ -11,15 +15,17 @@ pytest_plugins = ["tests.experimental._mok_bf16_test_utils"]
 import torch
 import torch.distributed as dist
 
+from tests.test_helpers.cake_package import cake_package
+
+MoKConfig = cake_package("cake_mok_bf16", "workspace").MoKConfig
+prepare_mok_bf16 = cake_package("cake_mok_bf16", "api").prepare_mok_bf16
+
 
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) not in (4, 16, 64),
     reason="Requires a 4-, 16- or 64-rank symmetric-memory group",
 )
 def test_source_capacity_and_context_ownership(mok_distributed_group):
-    from flashinfer.experimental.cake_mok_bf16.workspace import MoKConfig
-    from flashinfer.mok import prepare_mok_bf16
-
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     rank, ep = dist.get_rank(), dist.get_world_size()
@@ -73,6 +79,13 @@ def test_source_capacity_and_context_ownership(mok_distributed_group):
         )
     row = torch.arange(n, device=device)
     ids = torch.stack([(row + slot) % (ep * le) for slot in range(k)], -1)
+    with pytest.raises(TypeError, match="comm_split_log"):
+        f.build_schedule(
+            workspace,
+            dataclasses.replace(config, comm_split_log=1),
+            ids,
+            num_local_experts=le,
+        )
     x = torch.zeros(n, h, device=device, dtype=torch.bfloat16)
     dy, scores = torch.zeros_like(x), torch.ones(n, k, device=device)
     shared = [

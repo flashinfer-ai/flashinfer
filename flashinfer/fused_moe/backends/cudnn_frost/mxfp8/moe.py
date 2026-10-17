@@ -18,7 +18,7 @@ from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
-from ..support import weight_view
+from ..support import SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
 from ..cache import require_graph_resource_retention
 from ..engine import (
@@ -32,8 +32,9 @@ from ..engine import (
     seal_kernels,
 )
 from ..capabilities import require_compiler
-from ..shortlist import _read, select, capture_profiles
-from ..heuristics import POLICY_VERSION, select_stages
+from ..shortlist import _read, capture_profiles
+from ..heuristics import POLICY_VERSION
+from ..catalog import can_implement, select_kernels as select_catalog
 from ..tuning import prepared_state, ranked_tactics
 from . import runtime, fma
 from .support import is_eligible
@@ -47,9 +48,10 @@ _WEIGHT_KEYS = (
     "fc2_input_scale",
 )
 _TAG = "cudnn_frost-mxfp8-moe-v2"
+_UNSUPPORTED = "cuDNN Frost MXFP8 MoE kernels require SM107a or SM120a"
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=None)
 def _module(arch):
     from .....jit.cudnn_frost import gen_cudnn_frost_moe_module
 
@@ -88,10 +90,7 @@ def _matching_kernels(
         for kernel in runtime.discover(root, quantized_output=quantized_output):
             n, k = (intermediate, hidden) if kernel.fc1 else (hidden, intermediate)
             dims = dict(s=rows, n=n, k=k, experts=experts, groups=experts)
-            if kernel.arch != arch or not all(
-                common._dimension_matches(v, kernel.contract.get(d))
-                for d, v in dims.items()
-            ):
+            if kernel.arch != arch or not can_implement(kernel, dims):
                 continue
             if kernel.fc1:
                 if kernel.activation == name:
@@ -135,42 +134,11 @@ def _selected_kernels_cached(
 ):
     # Admission and packing share metadata only; per-call validation stays outside.
     profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
-    if not profiles or tokens > max(profiles):
-        first, second = _matching_kernels(
-            roots, arch, tokens * topk, hidden, intermediate, experts, name
-        )
-        if not first or not second:
-            return (), ()
-        fused, _ = _matching_kernels(
-            roots,
-            arch,
-            tokens * topk,
-            hidden,
-            intermediate,
-            experts,
-            name,
-            quantized_output=True,
-        )
-        return select_stages(
-            first,
-            second,
-            fused,
-            tokens=tokens,
-            hidden=hidden,
-            intermediate=intermediate,
-            experts=experts,
-            topk=topk,
-            sm_count=sm_count,
-        )
-    bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
-    if any(len(ids) != 2 for ids in profiles[bucket]):
-        return (), ()
     first, second = _matching_kernels(
         roots, arch, tokens * topk, hidden, intermediate, experts, name
     )
-    first, second = select(
-        roots, arch, name, tokens, hidden, intermediate, experts, topk, first, second
-    )
+    if not first or not second:
+        return (), ()
     fused, _ = _matching_kernels(
         roots,
         arch,
@@ -181,14 +149,18 @@ def _selected_kernels_cached(
         name,
         quantized_output=True,
     )
-    tiles = {kernel.tactic_metadata["tile"] for kernel in first}
-    # Retain the measured unfused choices: fusion can trade mainloop overlap
-    # for fewer launches. Include available data-store modes in full-pipeline tuning;
-    # the fused scale output uses STG in both variants.
-    variants = tuple(
-        kernel for kernel in fused if kernel.tactic_metadata["tile"] in tiles
+    return select_catalog(
+        first,
+        second,
+        fused,
+        profiles,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        sm_count=sm_count,
     )
-    return first + variants, second
 
 
 def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
@@ -222,7 +194,6 @@ def _capture_selection(roots, arch, sm_count, activation):
             arch,
             name,
             sm_count,
-            quantized=True,
         ),
         select_fma,
         validate_fma_sources,
@@ -247,6 +218,8 @@ class _Plans:
         validate_fma_sources=None,
     ):
         self.plans, self.launches = {}, {}
+        first = tuple(common.bind_kernel(k, device) for k in first)
+        second = tuple(common.bind_kernel(k, device) for k in second)
         self.first, self.second = first, second
         required = 0
         module = _module(common._arch_for(device))
@@ -393,8 +366,12 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
 
     def _check_support(self):
         super()._check_support()
-        if self.device.type != "cuda" or get_compute_capability(self.device) != (10, 7):
-            raise NotImplementedError("cuDNN Frost MXFP8 MoE kernels require SM107a")
+        if self.device.type != "cuda":
+            raise NotImplementedError(_UNSUPPORTED)
+        major, minor = get_compute_capability(self.device)
+        arch = f"sm_{major}{minor}a"
+        if arch not in SUPPORTED_ARCHS:
+            raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize or self.config.quant.per_token_scale:
             raise NotImplementedError(
@@ -407,14 +384,16 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
                     for root in _artifact_roots()
                     for quantized in (False, True)
                     for kernel in runtime.discover(root, quantized_output=quantized)
-                    if kernel.arch == "sm_107a"
+                    if kernel.arch == arch
                     and (not kernel.fc1 or kernel.activation == name)
                 }
             )
         )
         require_graph_resource_retention()
-        require_moe_assembler()
-        require_compiler("sm_107a", sources)
+        # Only the SM107 sources patch tensor maps and need the assembler floor.
+        if arch == "sm_107a":
+            require_moe_assembler()
+        require_compiler(arch, sources)
 
     def _build(self):
         device, activation = self.device, self.config.activation
@@ -426,7 +405,7 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
             artifact_version=lambda: runtime._artifact_cache_version,
             policy_version=POLICY_VERSION,
             tactic_tag=_TAG,
-            require_assembler=True,
+            require_assembler=get_compute_capability(device) == (10, 7),
             refresh_artifacts=runtime.clear_artifact_cache,
             capture_selection=lambda roots, arch, sm_count: _capture_selection(
                 roots, arch, sm_count, activation

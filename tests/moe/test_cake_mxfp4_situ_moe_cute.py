@@ -101,7 +101,7 @@ def test_manifest_is_authentic():
     compiler_backend = {"cake": "cuda_cpp", "cake_cute": "cutedsl"}[BACKEND]
     for item in kernels.modules():
         form = item["route"]["form"]
-        assert form["gate"] in {"e2e_registry", "plan_gate", "plan_variant"}
+        assert form["gate"] in {"e2e_registry", "plan_gate"}
         assert compiler_backend in form["backends"]
     with pytest.raises(KeyError):
         kernels.record("not_a_stage")
@@ -499,13 +499,13 @@ def test_plan_is_decided_for_the_device_sm_count():
 # --- coverage: every plan selection over the served geometry is in the package -------------
 
 
-def _served_decisions():
-    """The decisions the plain chain executes over the sweep (``_executed_chain(decision) == "plain"``)."""
+def _served_decisions(chain="plain"):
+    """The decisions ``chain`` executes over the sweep (``_executed_chain(decision) == chain``)."""
     for layout in (EP8, TP8):
         runner = _runner(layout)
         for T in range(1, runner.swapab_max_tokens + 1):
             decision = runner.decide(T)
-            if _executed_chain(decision) == "plain":
+            if _executed_chain(decision) == chain:
                 yield runner, decision
 
 
@@ -597,6 +597,38 @@ def test_every_plan_selection_resolves_to_a_module():
             assert kernel.form["cluster"] == cfg.cluster and kernel.form["mode"] == mode
             seen.add(kernel.stage)
     assert "separate_bf16" in MODES and len(seen) >= 9 + 10 * len(MODES)
+    # Every route layout the operands select (``_route_operands``: BF16 weights, packed ids, FP32 weights) is
+    # carried on every chain: the split chain's split-layout routing closure and the dense / hybrid / mixed192
+    # chains' K1 route preprocess under both clear decisions (the output clear below the fill-in threshold,
+    # conversion only from it: the dual-tile dense rows and the mixed192 rows zero-fill in GEMM1).
+    assert set(MODES) == {"packed", "separate_bf16", "separate_fp32"}
+    split_seen = set()
+    for runner, decision in _served_decisions("split_two_stage"):
+        for mode in MODES:
+            cfg = plan.routing_config(
+                runner.policy, decision, mode=mode, split_layout=True
+            )
+            kernel = kernels.select_routing(cfg)
+            assert kernel.form["split_layout"] is True and kernel.form["mode"] == mode
+            split_seen.add(kernel.stage)
+    if "split_two_stage" in plan.EXECUTABLE_PATHS:
+        assert len(split_seen) >= len(MODES)
+    for mode in MODES:
+        for clear in (True, False):
+            kernel = kernels.find_kernel(
+                kind="route_preprocess",
+                mode=mode,
+                threads=plan.ROUTE_PREPROCESS_THREADS,
+                clear=clear,
+            )
+            assert kernel.form["mode"] == mode and kernel.form["clear"] is clear
+            assert kernel.stage.endswith("_noclear") is (not clear)
+    ep8 = _runner(EP8)
+    for T, clear in ((2048, True), (8192, False)):
+        decision = ep8.decide(T)
+        assert decision.supported and decision.path == "dense"
+        cfg = plan.dense_launch_config(ep8.policy, decision)
+        assert cfg["clear"] is clear, (T, cfg["clear"])
     with pytest.raises(KeyError, match="not in this package"):
         kernels.select_gemm2(192, 4, 7)
     # The n192 2-CTA finalize exists under both scheduler rasters: the row-group-major form (the default
@@ -894,6 +926,23 @@ def _contract_inputs(row, *, device="cuda"):
     )
 
 
+def _packed_inputs(inputs):
+    """The same routing in the packed route layout (``topk_weights=None``): ``topk_ids`` carries the global
+    expert id in the high 16 bits and the BF16 weight bits in the low 16 bits."""
+    bits = inputs["topk_weights"].view(torch.int16).to(torch.int32) & 0xFFFF
+    packed = dict(inputs)
+    packed["topk_ids"] = ((inputs["topk_ids"] << 16) | bits).contiguous()
+    packed["topk_weights"] = None
+    return packed
+
+
+def _fp32_inputs(inputs):
+    """The same routing with FP32 ``topk_weights`` (the BF16 weights widened: the kernels see equal values)."""
+    fp32 = dict(inputs)
+    fp32["topk_weights"] = inputs["topk_weights"].to(torch.float32).contiguous()
+    return fp32
+
+
 def _adversarial_inputs(T, layout, seed, *, device="cuda"):
     """Uniform random operand bytes: every E2M1 / E4M3 code, scales up to 2**1; O(1e3) outputs."""
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -1120,12 +1169,15 @@ GATE_ROWS = ["ep8_1", "ep8_16", "ep8_16_empty", "ep8_128", "ep8_512", "tp8_16"]
 CLASS_ROWS = ["ep8_1", "ep8_16", "ep8_128", "ep8_512", "ep8_512_skew"]
 # Canonical rows of the hand-written paths beyond the plain chain (``decide`` serves them; the chain runs them
 # only when its path is in ``EXECUTABLE_PATHS`` at the pinned revision, otherwise ``plan`` refuses by name):
-# EP8 rank 3 dense rows (T 2048 / 4096: the single-tile dense chain), TP8 rank 0 split_two_stage rows
+# EP8 rank 3 dense rows (T 2048 / 4096: the single-tile dense chain; T 8192: the dual-tile dense chain), TP8
+# rank 0 split_two_stage rows
 # (T 128 / 512: the split two-stage chain, or the plain chain while ``SPLIT_CHAIN_EXECUTABLE`` is off) and the
 # TP8 rank 0 T = 8192 row (the two-stream mixed192 chain); same contract seeds.
 PATH_ROWS = {
     "ep8_2048": (EP8, 2048, "uniform_cycle", 120481),
     "ep8_4096_skew": (EP8, 4096, "hotset_skew", 140962),
+    # the dual-tile dense row (gather GEMM1 zero-fills; the K1 preprocess converts without clearing)
+    "ep8_8192": (EP8, 8192, "uniform_cycle", 181921),
     "tp8_128": (TP8, 128, "uniform_cycle", 201281),
     "tp8_512_skew": (TP8, 512, "hotset_skew", 205122),
     "tp8_8192": (TP8, 8192, "uniform_cycle", 281921),
@@ -1248,12 +1300,18 @@ def test_executable_path_rows_match_the_gate_oracle(row, record_property):
         assert len(stages) == 3 and stages[1].startswith("gemm1_swapab_situ_n")
         assert stages[2].startswith("gemm2_swapab_finalize_n")
     elif chain == "dense":
-        assert len(stages) == 5 and stages[0].startswith("route_preprocess_")
+        # The single-tile chain (5 launches) or the dual-tile chain (7: the alternate GEMM1 / GEMM2 pair over
+        # the 256-row groups, ``ep8_8192``).
+        dual = p.decision.dense.dual is not None
+        assert len(stages) == (7 if dual else 5) and stages[0].startswith(
+            "route_preprocess_"
+        ), stages
         assert stages[1].startswith("moe_sort_init_t") and stages[2].startswith(
             "moe_sort_coop_t"
         )
-        assert stages[3].startswith("gemm1_dense_situ_m")
-        assert stages[-1].startswith("gemm2_dense_finalize_n")
+        gemm1, gemm2 = (stages[3:5], stages[5:]) if dual else (stages[3:4], stages[4:])
+        assert all(s.startswith("gemm1_dense_situ_m") for s in gemm1), stages
+        assert all(s.startswith("gemm2_dense_finalize_n") for s in gemm2), stages
         assert p.executed_chain["chain"] == "dense"
     elif chain == "split_two_stage":
         # Hand-written enqueue order: split routing, wide row-group GEMM1 / finalize GEMM2, narrow swap-AB SiTU
@@ -1324,6 +1382,81 @@ def test_executable_path_rows_match_the_gate_oracle(row, record_property):
         ref_abs,
         _local_counts(inputs, layout),
         f"{row}_run2_vs_run1",
+        record_property,
+    )
+
+
+# The route layouts the public operands select beside BF16 weights, on one plain row per routing cluster and on
+# every path row: the layout changes the first launch only (the same routing / preprocess configuration in the
+# other mode), the GEMM launches are the same modules, and the output must be the BF16-weights run's in the
+# contract's accumulation class (bit-identical on tokens with at most one local contribution; the finalize
+# reduces further contributions with ``red.add.bf16x2``, whose arrival order is not fixed -- the run-to-run
+# criterion).
+LAYOUT_ROWS = {"ep8_16": ROWS["ep8_16"], "ep8_512": ROWS["ep8_512"], **PATH_ROWS}
+# The configuration fields a routing / route-preprocess form shares across the modes (the mode-specific
+# staging sizes and the registry / gate bookkeeping are not compared: the registry's packed split closure
+# keeps its registry stage name and gate).
+_ROUTE_FORM_KEYS = (
+    "kind",
+    "threads",
+    "clear",
+    "cluster",
+    "split_layout",
+    "dispatch_lists",
+    "single_tile_per_expert",
+    "max_routes",
+)
+_LAYOUT_ORACLE: dict = {}
+
+
+def _launches(p):
+    """The package modules an executable plan launches, in construction order."""
+    return [v for v in vars(p).values() if isinstance(v, plan.PackageLaunch)]
+
+
+def _layout_oracle(row, inputs, layout):
+    """The FP64 gate oracle of a ``LAYOUT_ROWS`` row, computed once per row (one-entry cache; the inputs are
+    the row's seeded operands)."""
+    if _LAYOUT_ORACLE.get("row") != row:
+        _LAYOUT_ORACLE.clear()
+        _LAYOUT_ORACLE.update(row=row, oracle=_gate_oracle(inputs, layout))
+    return _LAYOUT_ORACLE["oracle"]
+
+
+@gpu
+@pytest.mark.parametrize("mode", [m for m in MODES if m != "separate_bf16"])
+@pytest.mark.parametrize("row", sorted(LAYOUT_ROWS))
+def test_every_route_layout_matches_the_bf16_weights_run(row, mode, record_property):
+    layout, T = LAYOUT_ROWS[row][0], LAYOUT_ROWS[row][1]
+    if row in PATH_ROWS:
+        _path_row(row)  # skips the rows no shipped chain runs
+    inputs = _contract_inputs(LAYOUT_ROWS[row])
+    p_ref, out_ref = _run_chain(pkg, inputs, T, layout)
+    other = _packed_inputs(inputs) if mode == "packed" else _fp32_inputs(inputs)
+    p_other, out_other = _run_chain(pkg, other, T, layout)
+    torch.cuda.synchronize()
+    assert p_other.decision.path == p_ref.decision.path
+    stages_ref, stages_other = plan.kernel_stages(p_ref), plan.kernel_stages(p_other)
+    record_property(f"{row}_{mode}_stages", ",".join(stages_other))
+    first_ref = _launches(p_ref)[0].kernel.form
+    first_other = _launches(p_other)[0].kernel.form
+    assert first_ref["mode"] == "separate_bf16" and first_other["mode"] == mode, (
+        first_ref,
+        first_other,
+    )
+    assert {k: first_other.get(k) for k in _ROUTE_FORM_KEYS} == {
+        k: first_ref.get(k) for k in _ROUTE_FORM_KEYS
+    }, (first_ref, first_other)
+    assert stages_other[1:] == stages_ref[1:]
+    assert out_ref.abs().sum() > 0
+    ref, ref_abs = _layout_oracle(row, inputs, layout)
+    _assert_same_accumulation_class(
+        out_other,
+        out_ref,
+        ref,
+        ref_abs,
+        _local_counts(inputs, layout),
+        f"{row}_{mode}",
         record_property,
     )
 
