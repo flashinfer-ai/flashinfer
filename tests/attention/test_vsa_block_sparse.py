@@ -1820,3 +1820,94 @@ def test_vsa_variable_blocks_per_q(workspace):
 
 
 # ---------------------------------------------------------------------------
+# 8. block_sizes (partial last KV block) — blk128 direct API
+# ---------------------------------------------------------------------------
+
+
+def _blk128_tail_inputs(num_full_blocks, tail, num_heads, num_selected, seed):
+    """Inputs for bsa_attn_sm100_blk128_fwd with seqlen = 128 * num_full_blocks + tail.
+
+    Every Q block attends to the last (partial) KV block plus random other blocks,
+    in shuffled order, so the partial block is visited at different steps.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(seed)
+    seqlen = num_full_blocks * C + tail
+    num_blocks = (seqlen + C - 1) // C
+    dtype = torch.bfloat16
+
+    q = torch.randn(1, seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(1, seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(1, seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    index = torch.empty(1, num_heads, num_blocks, num_selected, dtype=torch.int32)
+    for h in range(num_heads):
+        for i in range(num_blocks):
+            others = torch.randperm(num_blocks - 1)[: num_selected - 1]
+            row = torch.cat([others, torch.tensor([num_blocks - 1])])
+            index[0, h, i] = row[torch.randperm(num_selected)]
+
+    block_sizes = torch.full((num_blocks,), C, dtype=torch.int32)
+    block_sizes[-1] = seqlen - (num_blocks - 1) * C
+    return q, k, v, index.to(device), block_sizes.to(device)
+
+
+def _blk128_tail_ref(q, k, v, index):
+    """FP32 reference over the selected KV blocks; keys past seqlen do not exist."""
+    _, seqlen, num_heads, _ = q.shape
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    num_blocks = index.shape[2]
+    out = torch.empty_like(q)
+    for h in range(num_heads):
+        token_mask = torch.zeros(
+            num_blocks * R, num_blocks * C, dtype=torch.bool, device=q.device
+        )
+        for i in range(num_blocks):
+            for j in index[0, h, i].tolist():
+                token_mask[i * R : (i + 1) * R, j * C : (j + 1) * C] = True
+        token_mask = token_mask[:seqlen, :seqlen]
+        scores = (q[0, :, h].float() @ k[0, :, h].float().t()) * sm_scale
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        out[0, :, h] = (torch.softmax(scores, dim=-1) @ v[0, :, h].float()).to(q.dtype)
+    return out
+
+
+@pytest.mark.parametrize("tail", [1, 64, 127, 128])
+@pytest.mark.parametrize("num_selected", [2, 4])
+def test_vsa_blk128_block_sizes_tail(tail, num_selected):
+    """block_sizes path with seqlen = 128 * n + tail must match an FP32 reference."""
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import (
+        bsa_attn_sm100_blk128_fwd,
+    )
+
+    q, k, v, index, block_sizes = _blk128_tail_inputs(
+        num_full_blocks=8,
+        tail=tail,
+        num_heads=4,
+        num_selected=num_selected,
+        seed=tail * 10 + num_selected,
+    )
+    o, _ = bsa_attn_sm100_blk128_fwd(
+        q, k, v, index, num_selected, block_sizes=block_sizes
+    )
+    o_ref = _blk128_tail_ref(q, k, v, index)
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+def test_vsa_blk128_full_block_sizes_bitwise():
+    """With every block full, passing block_sizes must not change a single bit.
+
+    The block-size mask runs unconditionally; for full blocks its bitmask is all
+    ones, so the output must equal the block_sizes=None kernel exactly.
+    """
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import (
+        bsa_attn_sm100_blk128_fwd,
+    )
+
+    q, k, v, index, block_sizes = _blk128_tail_inputs(
+        num_full_blocks=8, tail=128, num_heads=4, num_selected=4, seed=7
+    )
+    assert bool((block_sizes == C).all())
+    o_masked, _ = bsa_attn_sm100_blk128_fwd(q, k, v, index, 4, block_sizes=block_sizes)
+    o_plain, _ = bsa_attn_sm100_blk128_fwd(q, k, v, index, 4, block_sizes=None)
+    assert torch.equal(o_masked, o_plain)
