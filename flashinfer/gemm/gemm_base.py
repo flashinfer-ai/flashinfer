@@ -6385,13 +6385,33 @@ def _check_cute_dsl_availability():
         raise ValueError("CuTe DSL is not available.")
 
 
+def _sm107_low_m_split_k(
+    m: int, n: int, real_k: int, ab_dtype, split_k_kernel_cls, sm_count: int
+) -> int:
+    """Most split-K slices that fit one wave with >= 8 K blocks per slice."""
+    tile_k = (
+        split_k_kernel_cls.MMA_INST_BITS_K * split_k_kernel_cls.MMA_INST_TILE_K
+    ) // ab_dtype.width
+    n_tiles = (n + 127) // 128
+    for slices in sorted(split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES, reverse=True):
+        if (
+            split_k_kernel_cls.is_valid_tactic(m, real_k, ab_dtype, slices)
+            and real_k // (tile_k * slices) >= 8
+            and n_tiles * slices <= sm_count
+        ):
+            return slices
+    return 1
+
+
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
     sm_minor: int,
     enable_pdl: bool,
     out_dtype: torch.dtype,
     warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
+    low_m_only: bool = False,
 ):
+    """``low_m_only``: only the M <= 32 narrow-tile / split-K tactics (SM107)."""
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -6433,6 +6453,8 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             n = b.shape[1]
             real_k = a.shape[1]
+            if low_m_only and not split_k_kernel_cls.supports_m(m):
+                return []  # wide tiles are the SM107 kernel's job
             warp_serves = warp_splitk_supports is not None and warp_splitk_supports(
                 inputs
             )
@@ -6454,6 +6476,12 @@ def _cute_dsl_gemm_mxfp8_runner(
                 device=a.device,
             )
             valid_tactics = [(*tactic, 1) for tactic in base_tactics]
+            if low_m_only:
+                valid_tactics = [
+                    t
+                    for t in valid_tactics
+                    if t[2] and split_k_kernel_cls.supports_mma_tiler_for_m(t[0], m)
+                ]
             if not out.is_contiguous():
                 return valid_tactics
 
@@ -6495,12 +6523,24 @@ def _cute_dsl_gemm_mxfp8_runner(
 
             if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
                 # Untuned low-M execution uses the corresponding base tactic.
+                fallback_split = (
+                    _sm107_low_m_split_k(
+                        m,
+                        n,
+                        real_k,
+                        cutlass.Float8E4M3FN,
+                        split_k_kernel_cls,
+                        get_device_sm_count(a.device),
+                    )
+                    if low_m_only
+                    else 1
+                )
                 fallback_tactic = (
                     split_k_kernel_cls.mma_tiler_mn_for_m(m),
                     (1, 1),
                     True,
                     False,
-                    1,
+                    fallback_split,
                 )
             else:
                 fallback_tactic = (
@@ -6924,6 +6964,33 @@ def _cute_dsl_mxfp8_runners(
     return [tcgen05, warp]
 
 
+def _cute_dsl_mxfp8_runners_sm107(
+    out_dtype: torch.dtype, inputs: List[torch.Tensor]
+) -> List[TunableRunner]:
+    """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default."""
+    from ..cute_dsl.availability import is_cute_dsl_experimental_available
+    from .kernels.dense_blockscaled_gemm_sm100_splitk import (
+        Sm100BlockScaledSplitKGemmKernel,
+    )
+
+    sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
+    low_m = _cute_dsl_gemm_mxfp8_runner(10, 7, True, out_dtype, low_m_only=True)
+    a, _, _, _, _, out, _ = inputs
+    m, k = a.shape
+    warp = None
+    if is_cute_dsl_experimental_available():
+        warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl=True)
+        # The runner set must not depend on M; the warp runner gates M per tactic.
+        if not warp.supports_inputs(inputs, check_m=False):
+            warp = None
+    tail = [warp] if warp is not None else []
+    if warp is not None and warp.supports_inputs(inputs) and m <= 8 and k <= 2048:
+        return [warp, low_m, sm107]
+    if Sm100BlockScaledSplitKGemmKernel.supports_m(m) and out.is_contiguous():
+        return [low_m, sm107] + tail
+    return [sm107, low_m] + tail
+
+
 def _cudnn_mm_mxfp8_runner():
     """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
 
@@ -7244,7 +7311,7 @@ def mm_mxfp8(
             use_8x4_sf_layout
         ),
         "cute-dsl": lambda: (
-            _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
+            _cute_dsl_mxfp8_runners_sm107(out_dtype, inputs)
             if _use_sm107_mxfp8_cute_dsl(major, minor, a, b, out)
             else _cute_dsl_mxfp8_runners(major, minor, True, out_dtype, inputs)
         ),
