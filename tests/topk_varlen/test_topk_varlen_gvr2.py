@@ -663,6 +663,150 @@ def test_gvr2_warmup_then_capture():
 
 
 # ---------------------------------------------------------------------------
+# rows far shorter than the launch envelope (capacity-sized buffers)
+# ---------------------------------------------------------------------------
+# A serving stack captures its CUDA graphs on a logits buffer as wide as the
+# longest row it may ever hold (the capacity), while the rows of a replay are
+# usually far shorter. The launch plan then comes from the capacity and every
+# row runs it with its own length. The cases below reach each family's
+# capacity plan; the row lengths walk the edges those plans branch on per row
+# (top_k, the 2 * top_k small-row sample gate, the 4096 / 8192 / 16384 sample
+# caps) and, unlike the family parity cases above, no row is pinned to the
+# capacity.
+
+_ENVELOPE_CASES = [
+    # rows, capacity (columns), top_k, next_n, cr, family at the capacity
+    (100, 131072, 512, 1, 1, "main"),  # one-wave 1024-thread slab
+    (148, 262144, 1024, 1, 4, "main"),  # the same at cr=4 (1M-token graph)
+    (40, 131072, 2048, 1, 1, "main"),  # K=2048 unsplit slab, 33-74 rows
+    (4, 262144, 512, 1, 1, "main"),  # SPLIT slab, R=37
+    (8, 1048576, 2048, 1, 1, "main"),  # SPLIT slab, R=18
+    (16, 131072, 1024, 2, 1, "main"),  # SPLIT slab, R=9, next_n rows
+    (64, 131072, 512, 1, 1, "clus"),  # 2-CTA cluster split
+    (24, 262144, 1024, 1, 4, "clus"),  # 4-CTA cluster split
+    (8, 65536, 512, 1, 1, "reg_clus"),  # clustered register-resident
+    (200, 65536, 512, 1, 1, "main"),  # two-CTA (512, 8, 2) slab
+    (320, 32768, 2048, 1, 1, "main"),  # (256, 8, 4) slab
+]
+
+
+def _envelope_cols(batch, cap_c, top_k, seed):
+    """Live column counts far below ``cap_c``: the per-row branch edges of the
+    streaming plans first, then random counts up to min(cap_c, 32768)."""
+    edges = [
+        2 * top_k + 1,  # the first count the small-row sample gate admits
+        4100,  # just above each sample cap
+        8196,
+        16388,
+        2 * top_k,
+        top_k + 1,
+        4096,
+        8192,
+        16384,
+        2 * top_k + 4,
+        top_k,
+        1,
+        0,
+    ]
+    gen = torch.Generator().manual_seed(seed)
+    cols = edges[:batch]
+    while len(cols) < batch:
+        cols.append(int(torch.randint(1, min(cap_c, 32768) + 1, (1,), generator=gen)))
+    return cols
+
+
+def _refill(logits, n_r, gen):
+    """New scores in every row, +3e38 poison past each row's live count."""
+    logits.copy_(torch.randn(logits.shape, generator=gen, device=_DEV) - 2.0)
+    for r, n in enumerate(n_r):
+        logits[r, n:] = 3e38
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,cap_c,top_k,next_n,cr,family", _ENVELOPE_CASES)
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+def test_gvr2_rows_far_shorter_than_envelope(
+    rows, cap_c, top_k, next_n, cr, family, hinted
+):
+    batch = rows // next_n
+    cols = _envelope_cols(batch, cap_c, top_k, seed=rows + cap_c + top_k)
+    kv = [c * cr for c in cols]
+    logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+        kv, next_n, cr, top_k, seed=rows, msl_c=cap_c
+    )
+    indices, _ = _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx if hinted else None,
+        next_n=next_n,
+        compress_ratio=cr,
+    )
+    _assert_family(rows, cap_c, top_k, next_n, cr, family, hint_free=not hinted)
+    _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+_REPLAY_CASES = [
+    # rows, capacity (columns), top_k, family at the capacity
+    (100, 131072, 512, "main"),  # one-wave 1024-thread slab
+    (4, 262144, 1024, "main"),  # SPLIT slab, R=37
+    (64, 131072, 512, "clus"),  # 2-CTA cluster split
+    (8, 65536, 2048, "reg_clus"),  # clustered register-resident, K > 1024
+    (200, 65536, 512, "main"),  # two-CTA (512, 8, 2) slab
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,cap_c,top_k,family", _REPLAY_CASES)
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+def test_gvr2_graph_replay_lengths_change_after_capture(
+    rows, cap_c, top_k, family, hinted
+):
+    """One capture at the capacity, then replays whose lengths were rewritten
+    in place: all far below the capacity, full-width rows mixed with short
+    ones, every row short (identity path, empty rows included), and a random
+    draw. Scores are redrawn and the output poisoned before each replay."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    hgen = torch.Generator().manual_seed(rows)
+
+    def draw():
+        return [
+            int(torch.randint(0, cap_c + 1, (1,), generator=hgen)) for _ in range(rows)
+        ]
+
+    cols = draw()
+    logits = torch.empty(rows, cap_c, device=_DEV)
+    _refill(logits, cols, gen)
+    seq_lens = torch.tensor(cols, dtype=torch.int32, device=_DEV)
+    pre_idx = None
+    if hinted:
+        pre_idx = torch.randint(
+            0, 1000, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+        )
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):  # eager warm-up on the capturing stream
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+    torch.cuda.synchronize()
+    _assert_family(rows, cap_c, top_k, 1, 1, family, hint_free=not hinted)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+    torch.cuda.current_stream().wait_stream(s)
+    short = _envelope_cols(rows, cap_c, top_k, seed=rows)
+    mixed = [cap_c if r % 3 == 0 else c for r, c in enumerate(short)]
+    tiny = [(r * 37) % (top_k + 1) for r in range(rows)]
+    for cols in (short, mixed, tiny, draw()):
+        seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
+        _refill(logits, cols, gen)
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, out, cols, top_k)
+
+
+# ---------------------------------------------------------------------------
 # backend registration / guards / cross-backend
 # ---------------------------------------------------------------------------
 
