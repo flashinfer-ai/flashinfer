@@ -90,6 +90,16 @@ remain valid. No device length read or extra preparation is added to ``run()``.
 Wrappers without an initialized lifetime capacity retain the batch/Q envelope.
 Other inputs retain their existing cache policy.
 
+Paged ``backend="auto"`` additionally considers cuDNN on SM100 for causal
+BF16 HND D128/V128 prefixes with page size 16, B1–4, 8–64 query heads,
+GQA1/2/4/8/16, Q64–1024, and KV2K–32K at least four times Q. This admission
+requires stable cuDNN Frontend 1.32 or newer, its matching native paged
+capability, a compatible FROST runtime, and cuDNN 9.27 or newer. Older stacks
+and unsupported attention options retain their existing auto route.
+The wrapper reuses bounded plans and refreshes metadata in ``plan()``;
+first use of a new bucket still requires prewarming. GPU replay gains do not
+imply lower eager submission cost or higher serving throughput.
+
 A new graph signature can require graph construction and kernel compilation.
 Warm the signatures needed by the serving schedule **before** CUDA Graph
 capture or latency-sensitive requests, using the existing ``plan`` and ``run``
