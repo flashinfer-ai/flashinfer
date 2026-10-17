@@ -18,6 +18,8 @@
 #ifdef ENABLE_FP8_BLOCK_SCALE
 #include "fp8_blockscale_gemm_kernel.cuh"
 #endif
+#include <limits>
+
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
@@ -91,12 +93,25 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
 #endif  // ENABLE_FP8_BLOCK_SCALE
 }
 
+/**
+ * @brief Run grouped FP8 expert GEMMs using the configured workspace.
+ * @param expected_m Positive uint32 token estimate for DeepGEMM configuration
+ * selection, or -1 to use the stored estimate. Explicit hints require DeepGEMM
+ * and apply only to this invocation, preserving workspace capacity and runner state.
+ */
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
     void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
     size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a,
-    float const* scales_b) {
+    float const* scales_b, int64_t expected_m) {
 #ifdef ENABLE_FP8_BLOCK_SCALE
+  TLLM_CHECK_WITH_INFO(
+      expected_m == -1 || (expected_m > 0 && expected_m <= std::numeric_limits<uint32_t>::max()),
+      "expected_m must be -1 or a positive uint32 value");
+  TLLM_CHECK_WITH_INFO(expected_m == -1 || getDeepGemmEnabled(),
+                       "expected_m requires the DeepGEMM backend");
+  // A per-call scheduling hint must not change the runner's legacy load estimate.
+  int64_t const effective_m = expected_m == -1 ? expected_m_ : expected_m;
   constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
   constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
 
@@ -137,7 +152,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
     fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a,
                          per_token_per_128c_scales, reinterpret_cast<__nv_bfloat16 const*>(mat_b),
                          fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d),
-                         problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
+                         problem_m_offsets, num_problems, effective_m, max_shape_m_4_align_,
                          max_shape_m_32_align_padded_, shape_n, shape_k, stream,
                          internal_quantize_a, internal_quantize_b);
   } else if constexpr (std::is_same_v<ElementA, __nv_bfloat16> &&
@@ -145,14 +160,14 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
     fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a,
                          per_token_per_128c_scales, nullptr, fp8_mat_b, per_block_scales,
                          reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems,
-                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
+                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
                          shape_k, stream, internal_quantize_a, internal_quantize_b);
   } else if constexpr (std::is_same_v<ElementA, __nv_fp8_e4m3> &&
                        std::is_same_v<ElementB, __nv_fp8_e4m3>) {
     fp8_grouped_gemm_run(nullptr, fp8_mat_a, per_token_per_128c_scales,
                          reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
                          reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems,
-                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
+                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
                          shape_k, stream, internal_quantize_a, internal_quantize_b);
   } else {
     TLLM_THROW("fp8 blockscale gemm only support __nv_fp8_e4m3 or bfloat16 as dataType.");

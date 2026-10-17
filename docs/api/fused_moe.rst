@@ -270,6 +270,26 @@ CUTLASS Fused MoE
 
     cutlass_fused_moe
 
+On SM90, the DeepSeek FP8 block-scale path accepts a per-call ``expected_m``
+keyword for DeepGEMM configuration selection:
+
+.. code-block:: python
+
+    outputs = cutlass_fused_moe(
+        **moe_inputs,
+        use_deepseek_fp8_block_scale=True,
+        expected_m=4,
+    )
+
+The hint estimates tokens per local expert and applies to both expert GEMMs.
+``None`` keeps the existing estimate. Explicit hints must be positive integers
+fitting in uint32, require DeepGEMM to be enabled, and are unsupported by other
+quantization modes, backends, or minimum-latency mode. Workspace sizing and
+the runner's stored estimate remain unchanged; subsequent calls without a hint
+use the original dispatch policy. Choose the value from the local routing
+distribution, since a small estimate can reduce performance for concentrated
+routing. CUDA Graph replay retains the configuration selected during capture.
+
 cuTile Fused MoE
 ----------------
 
