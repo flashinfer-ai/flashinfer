@@ -768,7 +768,6 @@ GEMM2_DENSE_TRACED_N = (128, 192, 256)                              # gemm2_dens
 GEMM1_DENSE_FORMS = {
     "gemm1_dense_situ_m128_n256": (128, 256, False, False, False, False, True, False),
     "gemm1_dense_situ_m128_n256_rowgroup": (128, 256, False, False, True, False, True, False),
-    "gemm1_dense_situ_m128_n128_rowgroup": (128, 128, False, False, True, False, True, False),
     "gemm1_dense_situ_m128_n256_zero_fill": (128, 256, True, False, False, False, True, False),
     "gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary": (256, 256, True, True, False, False, True, False),
     "gemm1_dense_situ_m128_n256_rowgroup_early": (128, 256, False, False, True, True, True, False),
@@ -777,8 +776,6 @@ GEMM1_DENSE_FORMS = {
     # (mxfp4.py:1552-1676; base (128, 256) / (1, 1) primary, alternate (256, 256) / (2, 1) secondary).
     "gemm1_dense_situ_m128_n256_rowgroup_zero_fill": (128, 256, True, False, True, False, True, False),
     "gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary": (256, 256, True, True, True, False, True, False),
-    # Lever L13: the plain 2-CTA row-group alternate for SWAP_WIDE192_ZERO_FILL = "route".
-    "gemm1_dense_situ_m256_n256_2cta_rowgroup": (256, 256, False, False, True, False, True, False),
     # Lever c10 (``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``): the mixed192 zero-fill pair without the
     # weight-stream hint (``_nol2``, same bodies; ``SWAP_WIDE192_ZERO_FILL = "dense"``, the default placement -- the
     # one the lever was measured on). The L13 ``"route"`` placement's plain row-group pair keeps the hint: not measured,
