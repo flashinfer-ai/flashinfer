@@ -1029,6 +1029,140 @@ def test_gvr2_posinf_reg_clus(batch, n_valid, mode):
         assert torch.equal(got, ref), "selected value multiset differs from torch.topk"
 
 
+# +inf and -inf among finite scores on every family. DeepSeek-V4.1's block top-k
+# forces each row's newest key (column n - 1) to +inf; these cases also put +inf
+# and -inf at the row head, in the scalar tail lane (n % 4 != 0), at K and more
+# than K random columns, and leave fewer than K finite scores. Hint-free and
+# unpaged; the ids name the launch each shape gets on a 148-SM B200.
+_INF_SHAPES = [
+    # rows, logits width (launch envelope), live length, top_k
+    # DEG rung (bracket = the whole row); the first is the v41block 4K-block launch
+    pytest.param(1, 4160, 4101, 2048, id="reg_deg_vpt2"),
+    pytest.param(160, 4160, 4100, 2048, id="reg_deg_vpt4"),
+    pytest.param(4, 1024, 1021, 512, id="reg_deg_vpt1"),
+    pytest.param(256, 4096, 4093, 1024, id="reg_deg_nonbrl"),
+    # rows > SMs with n < 2K: ballot emit (CUR off)
+    pytest.param(160, 4000, 3997, 2048, id="reg_deg_ballot"),
+    pytest.param(160, 1000, 997, 512, id="reg_deg_ballot_vpt1"),
+    # bracket = the first K values (register fold, identity gather)
+    pytest.param(1, 4096, 4093, 512, id="reg_fold_vpt1"),
+    pytest.param(1, 12288, 12001, 2048, id="reg_gather_vpt4"),
+    pytest.param(256, 4096, 4093, 512, id="reg_gather_nonbrl"),
+    pytest.param(2, 32832, 32773, 2048, id="reg_clus_cs8"),
+    pytest.param(16, 32832, 32773, 2048, id="reg_clus_cs4"),
+    pytest.param(32, 131072, 32773, 1024, id="clus_cs4"),
+    # main at the v41block serving width (SPLIT), big, and 512-thread slabs
+    pytest.param(1, 131104, 4101, 2048, id="main_split"),
+    pytest.param(64, 131072, 32773, 2048, id="main_big"),
+    pytest.param(160, 131072, 4101, 2048, id="main_b512"),
+]
+
+_INF_PATTERNS = [
+    "pos_newest",  # one +inf at column n - 1
+    "pos_first",
+    "pos_16",
+    "pos_k",  # exactly K +inf
+    "pos_gt_k",  # 1.5 K +inf: the selection is all +inf
+    "pos_head_run",  # +inf at columns 0 .. K - 2
+    "neg_newest",
+    "neg_64",
+    "neg_most",  # K / 2 finite scores left (newest one finite): -inf ties are selected
+    "neg_most_tail",  # the same with the newest column -inf
+    "mixed",  # +inf newest + K / 4 random +inf, 64 random -inf
+    "mixed_neg_most",  # 16 +inf, K / 2 - 16 finite, the rest -inf
+]
+
+
+def _inf_columns(pattern, n, top_k, gen):
+    """(+inf columns, -inf columns) for one row of live length n."""
+
+    def rand(count):
+        return torch.randperm(n, generator=gen, device=_DEV)[:count]
+
+    def at(*cols):
+        return torch.tensor(cols, dtype=torch.int64, device=_DEV)
+
+    none = at()
+    if pattern == "pos_newest":
+        return at(n - 1), none
+    if pattern == "pos_first":
+        return at(0), none
+    if pattern == "pos_16":
+        return rand(16), none
+    if pattern == "pos_k":
+        return rand(top_k), none
+    if pattern == "pos_gt_k":
+        return rand(top_k + top_k // 2), none
+    if pattern == "pos_head_run":
+        return torch.arange(top_k - 1, device=_DEV), none
+    if pattern == "neg_newest":
+        return none, at(n - 1)
+    if pattern == "neg_64":
+        return none, rand(64)
+    if pattern == "neg_most":  # columns 0 .. n - 2
+        return none, torch.randperm(n - 1, generator=gen, device=_DEV)[: n - top_k // 2]
+    if pattern == "neg_most_tail":
+        head = torch.randperm(n - 1, generator=gen, device=_DEV)[: n - top_k // 2 - 1]
+        return none, torch.cat([at(n - 1), head])
+    if pattern == "mixed":
+        perm = rand(top_k // 4 + 64)
+        neg = perm[top_k // 4 :]
+        return torch.cat([at(n - 1), perm[: top_k // 4]]), neg[neg != n - 1]
+    if pattern == "mixed_neg_most":
+        perm = rand(n - top_k // 2 + 16)
+        return perm[:16], perm[16:]
+    raise ValueError(pattern)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("pattern", _INF_PATTERNS)
+@pytest.mark.parametrize("rows,width,n_valid,top_k", _INF_SHAPES)
+def test_gvr2_inf_scores_every_family(rows, width, n_valid, top_k, pattern):
+    """Rows holding +inf and -inf among finite scores are exact on every family:
+    every output slot written, distinct in-row indices, and the selected values
+    equal torch.topk's as a multiset (ties at the K-th value may pick other
+    columns). The live length stays below the envelope and the columns past it
+    are poisoned, so an out-of-row read fails the value check."""
+    seed = rows * 7 + width + top_k + _INF_PATTERNS.index(pattern)
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    logits = torch.randn(rows, width, generator=gen, device=_DEV) * 2.0
+    logits[:, n_valid:] = 3e38
+    for r in range(rows):
+        pos, neg = _inf_columns(pattern, n_valid, top_k, gen)
+        logits[r, pos] = float("inf")
+        logits[r, neg] = float("-inf")
+    seq_lens = torch.full((rows,), n_valid, dtype=torch.int32, device=_DEV)
+    ref_vals = torch.topk(logits[:, :n_valid], top_k, dim=1).values
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    _check_complete_exact(out, logits, n_valid, ref_vals, -7)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "width", [4160, 32832, 131104], ids=["reg_width", "reg_clus_width", "serving_width"]
+)
+@pytest.mark.parametrize("rows", [1, 16, 64, 160])
+def test_gvr2_newest_block_posinf_varlen(rows, width):
+    """DeepSeek-V4.1 block top-k: each row's newest key (column n_r - 1) is +inf.
+    Ragged live lengths well below the envelope, short rows (n_r <= K) included,
+    at the tight register and reg_clus widths and the 1M-token serving width
+    (131,104 keys), across the batch bands."""
+    top_k = 2048
+    gen = torch.Generator(device=_DEV).manual_seed(rows * 131 + width)
+    fixed = [n for n in (4101, 4100, 32773, 2049, 2048, 7) if n <= width]
+    kv = torch.randint(1, width + 1, (rows,), generator=gen, device=_DEV).tolist()
+    kv[: len(fixed)] = fixed[:rows]
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(
+        kv, 1, 1, top_k, seed=rows, msl_c=width
+    )
+    for r, n in enumerate(n_r):
+        if n > 0:
+            logits[r, n - 1] = float("inf")
+    indices, _ = _run_gvr2(logits, seq_lens, top_k, None)
+    _check_varlen_rows(logits, indices, n_r, top_k)
+
+
 @requires_gvr2
 @pytest.mark.parametrize(
     "kv", [200, 256, 100000], ids=["in_range", "equal_width", "oversized"]
