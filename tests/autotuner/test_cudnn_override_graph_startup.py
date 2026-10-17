@@ -15,6 +15,14 @@ def test_cudnn_saved_winner_builds_one_plan_and_captures(tmp_path, monkeypatch, 
         or not gemm_base._is_cudnn_override_shape_available()
     ):
         pytest.skip("requires CUDA and cuDNN shape override support")
+    major, minor = torch.cuda.get_device_capability()
+    operation = {
+        "bf16": flashinfer.bmm_bf16,
+        "fp8": flashinfer.bmm_fp8,
+        "bf16_fp4": flashinfer.mm_bf16_fp4,
+    }[family]
+    if not operation.is_backend_supported("cudnn", major * 10 + minor):
+        pytest.skip(f"cuDNN {family} is unavailable on SM{major}{minor}")
     import cudnn
 
     torch.manual_seed(7)
@@ -25,8 +33,6 @@ def test_cudnn_saved_winner_builds_one_plan_and_captures(tmp_path, monkeypatch, 
     if family == "fp8":
         a, b = a.to(torch.float8_e4m3fn), b.to(torch.float8_e4m3fn)
     elif family == "bf16_fp4":
-        if torch.cuda.get_device_capability()[0] < 10:
-            pytest.skip("BF16-FP4 requires Blackwell or later")
         # Integers in [-2, 2] are exactly representable with this FP4 scaling.
         b = torch.randint(-2, 3, (1, 256, 256), device="cuda").bfloat16()
         global_scale = torch.full((1,), 1344.0, device="cuda")
