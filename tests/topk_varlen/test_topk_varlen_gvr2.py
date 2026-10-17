@@ -1880,6 +1880,263 @@ def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
 
 
 # ---------------------------------------------------------------------------
+# rows of at most top_k columns, on every family
+# ---------------------------------------------------------------------------
+
+# (rows, width, top_k, next_n, cr, family): launches planned for `width` columns
+# (a CUDA-graph capacity) on each engine family the decode launcher builds: the
+# register kernel (256 and 512 threads, several output positions per thread), the
+# clustered register kernel (8 and 2 ranks), clus (4 and 2 ranks), SPLIT main (18
+# and 37 CTAs per row; K = 2048: two positions per thread), and main with one CTA
+# per row at 1024 threads (with the register path compiled in, and below its
+# envelope gate), 512 and 256 threads.
+_SHORT_SHAPES = [
+    (4, 1024, 1024, 1, 1, "reg"),
+    (4, 2048, 2048, 2, 1, "reg"),
+    (8, 32768, 1024, 2, 4, "reg_clus"),
+    (64, 32768, 2048, 1, 1, "reg_clus"),
+    (32, 262144, 1024, 2, 4, "clus"),
+    (64, 262144, 512, 1, 1, "clus"),
+    (8, 262144, 1024, 1, 1, "main"),
+    (4, 1048576, 2048, 2, 1, "main"),
+    (128, 262144, 1024, 2, 4, "main"),
+    (128, 130944, 512, 1, 1, "main"),
+    (160, 262144, 1024, 1, 1, "main"),
+    (300, 65536, 2048, 2, 1, "main"),
+]
+
+
+def _short_kv(batch, top_k, next_n, cr, gen):
+    """Per-request kv lengths whose rows all have at most top_k columns: empty
+    requests, one token, a last row of exactly top_k and of top_k - 1 columns,
+    and random lengths below that."""
+    hi = top_k * cr + cr - 1  # the request's last row gets exactly top_k columns
+    kinds = [0, 1, hi, hi - cr, None]
+    return [
+        int(torch.randint(0, hi + 1, (1,), generator=gen))
+        if kinds[q % len(kinds)] is None
+        else kinds[q % len(kinds)]
+        for q in range(batch)
+    ]
+
+
+def _short_expected(n_r, top_k, next_n, pt=None, page_size=None):
+    """Rows of n <= top_k columns: columns 0..n-1 (paged: their KV slots
+    page_table[q, c // page_size] * page_size + c % page_size), then -1."""
+    rows = len(n_r)
+    col = torch.arange(top_k, device=_DEV)
+    exp = torch.full((rows, top_k), -1, dtype=torch.int64, device=_DEV)
+    for r, n in enumerate(n_r):
+        c = col[:n]
+        if pt is not None:
+            c = (
+                pt[r // next_n].to(torch.int64)[c // page_size] * page_size
+                + c % page_size
+            )
+        exp[r, :n] = c
+    return exp.to(torch.int32)
+
+
+def _short_case(rows, width, top_k, next_n, cr, page_size, seed):
+    gen = torch.Generator().manual_seed(seed)
+    kv = _short_kv(rows // next_n, top_k, next_n, cr, gen)
+    logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+        kv, next_n, cr, top_k, seed=seed, msl_c=width
+    )
+    assert max(n_r) <= top_k and min(n_r) == 0
+    kw = {}
+    pt = None
+    if page_size is not None:
+        # one distinct random physical page per (request, page)
+        gdev = torch.Generator(device=_DEV).manual_seed(seed)
+        pages = (width + page_size - 1) // page_size
+        pt = torch.stack(
+            [
+                torch.randperm(4 * pages + 7, generator=gdev, device=_DEV)[:pages]
+                for _ in range(rows // next_n)
+            ]
+        ).to(torch.int32)
+        kw = dict(page_table=pt, page_size=page_size)
+    return logits, seq_lens, pre_idx, n_r, pt, kw
+
+
+def _sorted_rows(t):
+    return torch.sort(t, dim=1).values
+
+
+@requires_gvr2
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+@pytest.mark.parametrize("rows,width,top_k,next_n,cr,family", _SHORT_SHAPES)
+def test_gvr2_short_rows_every_family(rows, width, top_k, next_n, cr, family, paged):
+    """Every row at most top_k columns (empty, 1, top_k - 1 and top_k columns
+    included), on every engine family: each row comes back as its columns
+    (paged: their KV slots) and -1 padding, hinted and hint-free (paged:
+    hint-free). The row's first CTA writes all top_k positions (the output
+    starts poisoned) while its other CTAs (SPLIT parts, cluster ranks) leave."""
+    page_size = 64 if paged else None
+    logits, seq_lens, pre_idx, n_r, pt, kw = _short_case(
+        rows, width, top_k, next_n, cr, page_size, seed=rows + top_k
+    )
+    exp = _short_expected(n_r, top_k, next_n, pt, page_size)
+    for hint_free in (True, False) if not paged else (True,):
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_gvr2(
+            logits,
+            seq_lens,
+            top_k,
+            None if hint_free else pre_idx,
+            next_n=next_n,
+            compress_ratio=cr,
+            out_indices=out,
+            **kw,
+        )
+        torch.cuda.synchronize()
+        _assert_family(
+            rows,
+            width,
+            top_k,
+            next_n,
+            cr,
+            family,
+            hint_free=hint_free,
+            page_shift=6 if paged else None,
+        )
+        assert torch.equal(_sorted_rows(out), _sorted_rows(exp))
+
+
+@requires_gvr2
+@pytest.mark.parametrize("page_size", [1, 128])
+@pytest.mark.parametrize(
+    "rows,width,top_k,next_n,cr,family",
+    [_SHORT_SHAPES[i] for i in (0, 4, 6, 8, 10)],
+    ids=["reg", "clus", "split", "cta1024", "cta512"],
+)
+def test_gvr2_short_rows_page_sizes(rows, width, top_k, next_n, cr, family, page_size):
+    """The paged short-row output with one column per page (every position its
+    own table entry) and with pages wider than a warp's positions."""
+    logits, seq_lens, _, n_r, pt, kw = _short_case(
+        rows, width, top_k, next_n, cr, page_size, seed=rows + page_size
+    )
+    out, _ = _run_gvr2(
+        logits, seq_lens, top_k, None, next_n=next_n, compress_ratio=cr, **kw
+    )
+    _assert_family(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        family,
+        hint_free=True,
+        page_shift=page_size.bit_length() - 1,
+    )
+    exp = _short_expected(n_r, top_k, next_n, pt, page_size)
+    assert torch.equal(_sorted_rows(out), _sorted_rows(exp))
+
+
+@requires_gvr2
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+@pytest.mark.parametrize(
+    "rows,width,top_k,next_n,cr,family",
+    # the register kernel at a width with room for rows longer than top_k
+    # (1024 threads, two positions per thread), then the other families
+    [(4, 8192, 2048, 2, 1, "reg")] + [_SHORT_SHAPES[i] for i in (2, 4, 7, 8, 9, 11)],
+    ids=[
+        "reg",
+        "regclus",
+        "clus",
+        "split",
+        "cta1024",
+        "cta1024_streaming",
+        "cta256",
+    ],
+)
+def test_gvr2_short_rows_graph_replay(rows, width, top_k, next_n, cr, family, paged):
+    """Capture with every row at most top_k columns, then rewrite the lengths in
+    place and replay: longer rows, empty rows, short rows again, and a mix. The
+    path is chosen per row on device, so the one captured launch must stay exact
+    in both directions (and a SPLIT row that left at the top must leave its
+    slab clean for the next long row)."""
+    page_size = 64 if paged else None
+    logits, seq_lens, _, n_r, pt, kw = _short_case(
+        rows, width, top_k, next_n, cr, page_size, seed=rows + 3
+    )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+
+    def call():
+        _run_gvr2(
+            logits,
+            seq_lens,
+            top_k,
+            None,
+            next_n=next_n,
+            compress_ratio=cr,
+            out_indices=out,
+            **kw,
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()  # compile + this stream's workspace slab, outside capture
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        call()
+    torch.cuda.synchronize()
+    _assert_family(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        family,
+        hint_free=True,
+        page_shift=6 if paged else None,
+    )
+
+    gen = torch.Generator().manual_seed(rows)
+    batch = rows // next_n
+    hi = width * cr
+
+    def rnd(lo, m):
+        return [int(v) for v in torch.randint(lo, hi + 1, (m,), generator=gen)]
+
+    steps = [
+        _short_kv(batch, top_k, next_n, cr, gen),  # as captured: every row short
+        rnd(top_k * cr + cr + next_n, batch),  # every row longer than top_k
+        [0] * batch,  # every row empty
+        _short_kv(batch, top_k, next_n, cr, gen),  # short again
+        # a mix: every other request ends on a row of exactly top_k columns
+        [kv if q % 2 else top_k * cr + cr - 1 for q, kv in enumerate(rnd(0, batch))],
+        _short_kv(batch, top_k, next_n, cr, gen),  # short after a mix
+    ]
+    gdev = torch.Generator(device=_DEV).manual_seed(rows)
+    for kv in steps:
+        seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        n_r = _row_valid_lens(kv, rows, next_n, cr, width)
+        logits.normal_(generator=gdev)
+        for r, n in enumerate(n_r):
+            logits[r, n:] = 3e38  # poison past each row
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = out
+        if paged:
+            # map the KV slots back to row-local columns through the inverse table
+            inv = torch.full(
+                (rows // next_n, int(pt.max()) + 1), -1, dtype=torch.int64, device=_DEV
+            )
+            q_ = torch.arange(rows // next_n, device=_DEV).unsqueeze(1)
+            inv[q_, pt.to(torch.int64)] = torch.arange(pt.shape[1], device=_DEV)
+            o64 = out.to(torch.int64)
+            req = (torch.arange(rows, device=_DEV) // next_n).unsqueeze(1)
+            col = inv[req, (o64 >> 6).clamp_min(0)] * 64 + (o64 & 63)
+            got = torch.where(out >= 0, col, o64).to(torch.int32)
+        _check_varlen_rows(logits, got, n_r, top_k)
+
+
+# ---------------------------------------------------------------------------
 # backend registration / guards / cross-backend
 # ---------------------------------------------------------------------------
 
