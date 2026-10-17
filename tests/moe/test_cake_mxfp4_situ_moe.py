@@ -280,11 +280,14 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
             ).stage,
         }
     else:
-        # The plain chain's fused routing launch resolves through the RoutingConfig closure (never a stage name).
+        # The plain chain's fused routing launch resolves through the RoutingConfig closure and the hybrid / mixed
+        # chains' dispatch launch through the DispatchConfig closure (``all_lists=False``: the plan-gated
+        # ``dispatch_wide_narrow_lists``); neither label is a stage name or a generated registry form.
         launch_forms = {
             launch.form
             for launch in decision.launch_plan
-            if launch.form != "kimi_k3_mxfp4_situ_routing"
+            if launch.form
+            not in ("kimi_k3_mxfp4_situ_routing", "kimi_k3_mxfp4_situ_dispatch")
         }
     lacking = sorted(launch_forms - native_forms - sibling_forms)
     mixed = sorted(launch_forms & sibling_forms)
@@ -661,16 +664,13 @@ def test_every_plan_selection_resolves_to_a_module():
         assert cfg["clear"] is clear, (T, cfg["clear"])
     with pytest.raises(KeyError, match="not in this package"):
         kernels.select_gemm2(192, 4, 7)
-    # The n192 2-CTA finalize exists under both scheduler rasters: the row-group-major form (the default
-    # selection) and the blocked chunk-major ``_cm4`` form the mixed192 rows launch at 8192 tokens.
-    plain = kernels.select_gemm2(192, 4, 1)
+    # The n192 2-CTA finalize ships only under the blocked chunk-major ``_cm4`` raster the mixed192 rows
+    # launch at 8192 tokens; the row-group-major form is never selected and is not generated.
     cm4 = kernels.select_gemm2(192, 4, 1, sched_chunk_major=4)
-    assert (
-        plain.stage == "gemm2_swapab_finalize_n192_2cta"
-        and cm4.stage == plain.stage + "_cm4"
-    )
-    assert plain.form["sched_chunk_major"] is False and plain.form["sched_m_block"] == 1
+    assert cm4.stage == "gemm2_swapab_finalize_n192_2cta_cm4"
     assert cm4.form["sched_chunk_major"] is True and cm4.form["sched_m_block"] == 4
+    with pytest.raises(KeyError, match="not in this package"):
+        kernels.select_gemm2(192, 4, 1)
     with pytest.raises(KeyError, match="not in this package"):
         kernels.select_gemm2(192, 4, 1, sched_chunk_major=2)
 
