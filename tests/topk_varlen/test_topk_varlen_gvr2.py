@@ -28,6 +28,8 @@ tie-interchangeable EXACT top-K:
 The route-dispatch fuzz tests are CPU-only (pure-Python host dispatch).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -519,10 +521,13 @@ def test_gvr2_workspace_override():
 # ---------------------------------------------------------------------------
 
 
-def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=None):
+def _assert_family(
+    rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=None, page_shift=None
+):
     """The varlen launcher must admit the same family the free route picks.
     ``n_env`` is the launch envelope in columns (default: the buffer width
-    ``msl_c``; a decode ``max_window_len`` bound sets it below that)."""
+    ``msl_c``; a decode ``max_window_len`` bound sets it below that);
+    ``page_shift`` is log2 of the page size of paged output (None: unpaged)."""
     key = (
         rows,
         msl_c,
@@ -531,7 +536,7 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=
         next_n,
         cr,
         hint_free,
-        None,  # page_shift: unpaged output
+        page_shift,
         _host._arch_token(),
         _host._sm_count(),
     )
@@ -939,6 +944,237 @@ def test_gvr2_decode_bound_validation():
         indices, _ = _run_gvr2(logits, seq_lens, 512, None, max_window_len=bound)
         _assert_family(4, 4096, 512, 1, 1, "reg", hint_free=True)
         _check_varlen_rows(logits, indices, [4096] * 4, 512)
+
+
+# ---------------------------------------------------------------------------
+# hard rows on the per-row branches of the capacity-sized launches
+# ---------------------------------------------------------------------------
+# Rows on both edges of the branches a capacity-sized launch takes per row:
+# rows at, below and beyond a decode bound. The scores drive the retry ladder
+# and the degenerate paths (tie floods, +inf floods and +inf in the sampled
+# head, whole -inf rows and rows with fewer than top_k finite scores,
+# denormals, ramps); paged output is mapped back through its injective page
+# table and checked like the unpaged output.
+
+_HARD_PATTERNS = [
+    "ties",
+    "two_values",
+    "posinf_k",
+    "posinf_lt_k",
+    "posinf_head",
+    "neginf_row",
+    "neginf_most",
+    "denormal",
+    "ramp_up",
+    "quantized4",
+]
+
+
+def _hard_logits(pattern, n_r, width, top_k, seed):
+    """``pattern`` scores in each row's live prefix, +3e38 poison past it."""
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    x = torch.randn(len(n_r), width, generator=gen, device=_DEV)
+    for r, n in enumerate(n_r):
+        row = x[r, :n]
+        pos = torch.randperm(n, generator=gen, device=_DEV)
+        if pattern == "ties":
+            row.fill_(1.5)
+        elif pattern == "two_values":
+            row.copy_((torch.rand(n, generator=gen, device=_DEV) < 0.3) * 3.0 - 1.0)
+        elif pattern == "posinf_k":  # the top-k is exactly the +inf set
+            row[pos[:top_k]] = float("inf")
+        elif pattern == "posinf_lt_k":
+            row[pos[: top_k // 4]] = float("inf")
+        elif pattern == "posinf_head":  # in the sample's and identity's first lines
+            row[:8] = float("inf")
+        elif pattern == "neginf_row":
+            row.fill_(float("-inf"))
+        elif pattern == "neginf_most":  # fewer than top_k finite scores
+            row[pos[top_k // 2 :]] = float("-inf")
+        elif pattern == "denormal":
+            row.mul_(1e-40)
+            row[: top_k // 2] = 1e-38
+        elif pattern == "ramp_up":  # the top-k is the row's last k columns
+            row.copy_(torch.arange(n, device=_DEV, dtype=torch.float32) / max(n, 1))
+        elif pattern == "quantized4":
+            lv = torch.tensor([-2.0, -0.5, 0.5, 2.0], device=_DEV)
+            row.copy_(lv[torch.randint(0, 4, (n,), generator=gen, device=_DEV)])
+        x[r, n:] = 3e38
+    return x
+
+
+def _injective_page_table(batch, width, page_size):
+    """Page table q -> q * pages + (p * mult) % pages (injective per request,
+    so paged output maps back to columns) and the inverse map."""
+    pages = (width + page_size - 1) // page_size
+    mult = next(m for m in (7, 5, 11, 13) if math.gcd(m, pages) == 1)
+    p = torch.arange(pages, device=_DEV, dtype=torch.int64)
+    base = torch.arange(batch, device=_DEV, dtype=torch.int64).unsqueeze(1) * pages
+    pt = (base + (p * mult) % pages).to(torch.int32).contiguous()
+
+    def unpage(out, next_n):
+        shift = page_size.bit_length() - 1
+        o = out.to(torch.int64)
+        req = (torch.arange(out.shape[0], device=_DEV) // next_n).unsqueeze(1)
+        page = ((o >> shift) - req * pages) * pow(mult, -1, pages) % pages
+        col = (page << shift) | (o & (page_size - 1))
+        return torch.where(out >= 0, col, o).to(torch.int32)
+
+    return pt, unpage
+
+
+def _run_hard(logits, kv, top_k, n_r, want, next_n=1, cr=1, page_size=None, **kw):
+    """One hint-free launch (paged when ``page_size`` is given): family pin,
+    then every row exact against its first ``n_r[r]`` columns."""
+    rows, width = logits.shape
+    extra = {}
+    unpage = None
+    if page_size is not None:
+        pt, unpage = _injective_page_table(rows // next_n, width, page_size)
+        extra = dict(page_table=pt, page_size=page_size)
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        None,
+        out_indices=out,
+        next_n=next_n,
+        compress_ratio=cr,
+        **extra,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    bound = kw.get("max_window_len")
+    _assert_family(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        want,
+        hint_free=True,
+        n_env=None if bound is None else min(bound // cr, width),
+        page_shift=None if page_size is None else page_size.bit_length() - 1,
+    )
+    _check_varlen_rows(
+        logits, out if unpage is None else unpage(out, next_n), n_r, top_k
+    )
+
+
+_BOUND_EDGE_CASES = [
+    # rows, width, bound (tokens), top_k, cr, next_n, family at the bound
+    (16, 1048576, 512, 512, 1, 1, "reg"),  # bound = top_k: every row is short
+    (16, 1048576, 513, 512, 1, 1, "reg"),  # bound = top_k + 1
+    (16, 262144, 16383, 512, 4, 1, "reg"),  # not a multiple of cr: 4095 columns
+    (16, 262144, 16386, 1024, 4, 2, "reg"),  # ... with next_n rows
+    (8, 1048576, 65536, 512, 1, 1, "reg_clus"),
+    (32, 1048576, 262144, 512, 1, 1, "clus"),  # one-chunk and longer rows
+    (48, 262144, 262147, 512, 4, 3, "clus"),  # 65536 columns, three rows per request
+    (128, 1048576, 131072, 512, 1, 1, "main"),  # one-wave slab, sampled band
+    (4, 1048576, 262144, 512, 1, 1, "main"),  # SPLIT slab
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("page_size", [None, 128], ids=["unpaged", "paged128"])
+@pytest.mark.parametrize("rows,width,bound,top_k,cr,next_n,family", _BOUND_EDGE_CASES)
+def test_gvr2_decode_bound_edges(
+    rows, width, bound, top_k, cr, next_n, family, page_size
+):
+    """Rows at, just below and beyond a decode bound in every family the
+    bound selects: requests within it rank in full, longer ones over their
+    first ``bound // cr`` columns (the documented truncation), never past the
+    buffer, unpaged and paged."""
+    nb = bound // cr
+    kv = [bound, bound - 1, bound + 1, 2 * bound, width * cr, bound - cr, 0, 1]
+    kv += [(top_k + 1) * cr + next_n - 1, top_k * cr, (2 * top_k + 1) * cr + next_n]
+    gen = torch.Generator().manual_seed(rows + bound)
+    while len(kv) < rows // next_n:
+        kv.append(int(torch.randint(0, bound + 1, (1,), generator=gen)))
+    kv = kv[: rows // next_n]
+    n_full = _row_valid_lens(kv, rows, next_n, cr, width)
+    logits = _hard_logits(
+        "two_values" if rows <= 16 else "ties", n_full, width, top_k, seed=bound
+    )
+    n_r = [min(n, nb) for n in n_full]
+    _run_hard(
+        logits,
+        kv,
+        top_k,
+        n_r,
+        family,
+        next_n=next_n,
+        cr=cr,
+        page_size=page_size,
+        max_window_len=bound,
+    )
+
+
+_REPLAY_BOTH_CASES = [
+    # rows, width, top_k, bound, page size, short / long live columns
+    (64, 1048576, 512, 16384, 128, (0, 512), (513, 16384)),  # 16K graph variant
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("capture", ["short", "long"])
+@pytest.mark.parametrize(
+    "rows,width,top_k,bound,page_size,short,long", _REPLAY_BOTH_CASES
+)
+def test_gvr2_graph_replay_both_directions(
+    rows, width, top_k, bound, page_size, short, long, capture
+):
+    """Paged output captured on short rows then replayed on long ones, and the
+    other way round, then back again and on a mix: the per-row branches come
+    from seq_lens at replay time, never from the capture."""
+    gen = torch.Generator().manual_seed(rows + width)
+
+    def draw(lo_hi):
+        return [
+            int(torch.randint(lo_hi[0], lo_hi[1] + 1, (1,), generator=gen))
+            for _ in range(rows)
+        ]
+
+    phases = {"short": draw(short), "long": draw(long)}
+    mixed = [
+        c if r % 3 else [0, top_k, top_k + 1][r % 9 // 3]
+        for r, c in enumerate(draw(long))
+    ]
+    order = (
+        ["long", "short", "mixed", "long"]
+        if capture == "short"
+        else ["short", "long", "mixed", "short"]
+    )
+    phases["mixed"] = mixed
+    pt, unpage = _injective_page_table(rows, width, page_size)
+    logits = torch.empty(rows, width, device=_DEV)
+    seq_lens = torch.tensor(phases[capture], dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out, page_table=pt, page_size=page_size)
+    if bound is not None:
+        kw["max_window_len"] = bound
+    logits.copy_(_hard_logits("two_values", phases[capture], width, top_k, seed=1))
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):  # eager warm-up on the capturing stream
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    for i, name in enumerate(order):
+        cols = phases[name]
+        seq_lens.copy_(torch.tensor(cols, dtype=torch.int32, device=_DEV))
+        logits.copy_(
+            _hard_logits(_HARD_PATTERNS[i % 3], cols, width, top_k, seed=i + 2)
+        )
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, unpage(out, 1), cols, top_k)
 
 
 # ---------------------------------------------------------------------------
