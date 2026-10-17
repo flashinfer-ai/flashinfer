@@ -70,6 +70,7 @@ struct CheckpointingSsuParams {
 
   // ── Index tensors ──
   void* __restrict__ state_batch_indices{nullptr};  // (batch,) optional
+  int64_t state_batch_indices_stride_batch{1};
 
   // ── Varlen (v20): packed inputs ──
   // When non-null, `x/dt/B/C/z/out` are laid out as

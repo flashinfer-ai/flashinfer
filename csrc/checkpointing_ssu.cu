@@ -353,7 +353,6 @@ void checkpointing_ssu(
     CHECK_DIM(1, sbi);
     FLASHINFER_CHECK(sbi.size(0) == batch, "state_batch_indices.size(0)=", sbi.size(0),
                      " must equal batch=", batch);
-    CHECK_CONTIGUOUS(sbi);
   }
 
   // ── Validate optional state_scale: (state_cache_size, nheads, dim) ──
@@ -505,8 +504,10 @@ void checkpointing_ssu(
     p.z_stride_token = z.value().stride(1);
   }
   if (dt_bias.has_value()) p.dt_bias = const_cast<void*>(dt_bias.value().data_ptr());
-  if (state_batch_indices.has_value())
+  if (state_batch_indices.has_value()) {
     p.state_batch_indices = const_cast<void*>(state_batch_indices.value().data_ptr());
+    p.state_batch_indices_stride_batch = state_batch_indices.value().stride(0);
+  }
   if (is_varlen) {
     p.cu_seqlens = const_cast<void*>(cu_seqlens.value().data_ptr());
   }
