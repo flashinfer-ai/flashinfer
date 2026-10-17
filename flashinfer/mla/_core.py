@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import logging
 import os
 from dataclasses import dataclass
 from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union, cast
@@ -54,6 +55,20 @@ from ._utils import (
     _check_mla_dense_page_table_shape,
     _check_mla_sparse_index_shape,
 )
+
+_logger = logging.getLogger(__name__)
+_logged_once: set[str] = set()
+
+
+def _log_once(level: int, message: str, *, key: Optional[str] = None) -> None:
+    """Log ``message`` at ``level`` once per process.
+
+    Deduplicated on ``key`` (default: the message itself), so a message that embeds varying
+    detail can still be emitted once by passing a stable key.
+    """
+    if (key or message) not in _logged_once:
+        _logged_once.add(key or message)
+        _logger.log(level, message)
 
 
 @dataclass(frozen=True)
@@ -2911,6 +2926,72 @@ def _cake_trtllm_mla_blackwell_supports(
     )
 
 
+def _cake_auto_selected_message() -> str:
+    from .cake_kimi_k3_mla import AUTO_DISABLE_ENV, AUTO_QUALIFIED_HEADS
+
+    return (
+        "trtllm_batch_decode_with_kv_cache_mla(backend='auto') selects the Cake Kimi-K3 FP8 "
+        "paged MLA decode programs for their qualified contract (SM100 / SM103, float8_e4m3fn "
+        "query and cache, kv_lora_rank 512 + qk_rope_head_dim 64, page size 64, "
+        f"{', '.join(str(h) for h in AUTO_QUALIFIED_HEADS)} heads, one query token per "
+        "request); set "
+        f"{AUTO_DISABLE_ENV}=1 to keep the previous dispatch"
+    )
+
+
+def _cake_kimi_k3_mla_auto_admits(
+    *, compute_capability: Tuple[int, int], query: torch.Tensor, **request
+) -> bool:
+    """Whether ``backend="auto"`` routes this call to the Cake Kimi-K3 FP8 paged MLA programs.
+
+    Admits and prepares: once the admission predicate accepts the call, the programs its plan
+    launches are built here, inside the guard, so the launch that follows cannot fail on a
+    toolchain that cannot target the device or on a broken build.  Never raises.  An ordinary
+    contract or availability miss is logged at DEBUG on each call; a build failure, or an
+    exception escaping the probe, admission check or build, is logged once (WARNING).  All keep
+    the previous dispatch.  The selection itself is logged once per process (INFO).
+    """
+    try:
+        from .cake_kimi_k3_mla import (
+            cake_kimi_k3_mla_auto_prepare,
+            cake_kimi_k3_mla_auto_reason,
+        )
+
+        sm_count = get_device_sm_count(query.device)
+        reason = cake_kimi_k3_mla_auto_reason(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            query=query,
+            **request,
+        )
+        if reason is None:
+            build_failure = cake_kimi_k3_mla_auto_prepare(
+                compute_capability=compute_capability,
+                sm_count=sm_count,
+                query=query,
+                max_seq_len=request["max_seq_len"],
+            )
+            if build_failure is not None:
+                _log_once(
+                    logging.WARNING,
+                    f"backend='auto': {build_failure}; keeping the previous MLA dispatch",
+                )
+                return False
+    except Exception as exc:
+        _log_once(
+            logging.WARNING,
+            "backend='auto': the Cake Kimi-K3 MLA admission check failed "
+            f"({type(exc).__name__}: {exc}); keeping the previous MLA dispatch",
+            key="cake-kimi-k3-mla-auto-admission-exception",
+        )
+        return False
+    if reason is not None:
+        _logger.debug("backend='auto' leaves the Cake Kimi-K3 MLA route: %s", reason)
+        return False
+    _log_once(logging.INFO, _cake_auto_selected_message())
+    return True
+
+
 def _validate_mla_dcp_args(
     *,
     query: torch.Tensor,
@@ -3492,8 +3573,10 @@ def _mla_with_kv_cache_impl(
     TRTLLM-GEN, CuteDSL, XQA, Cake, or SM120/SM121 sparse kernels.
 
     With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
-    when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
-    backend for ``sparse_mla_top_k > 0`` and XQA for dense decode.
+    when ``sparse_mla_top_k > 0`` and select the Cake Kimi-K3 FP8 paged MLA
+    decode programs for their qualified contract (see ``backend`` below).
+    SM120/SM121 devices use the packed sparse backend for
+    ``sparse_mla_top_k > 0`` and XQA for dense decode.
 
     Parameters
     ----------
@@ -3579,15 +3662,29 @@ def _mla_with_kv_cache_impl(
     enable_pdl : Optional[bool]
         Programmatic Dependent Launch toggle.  When ``None`` (default), auto-detects
         support from the query device.  Honoured by the ``trtllm-gen`` and ``xqa``
-        backends; ignored by ``cute-dsl``.
+        backends; ignored by ``cute-dsl``.  ``True`` excludes the Cake Kimi-K3 route
+        under ``backend="auto"``; ``None`` does not, and the Cake programs then run
+        without PDL (they have no PDL variant; previously the same call auto-enabled
+        PDL on trtllm-gen).  Pass ``enable_pdl=True`` or set
+        ``FLASHINFER_DISABLE_CAKE_AUTO=1`` to keep PDL.
     backend : str = "auto"
         Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
         ``"cake"``, ``"trtllm-gen"``, ``"cute-dsl"``, and
         ``"sparse"``.
         ``"cake"`` explicitly selects the source-level Blackwell semantic
         dispatcher. It covers its qualified BF16/FP8 dense, sparse, compact-Q,
-        sink, LSE, and caller-owned-output envelope and is never selected
-        automatically. ``"auto"``
+        sink, LSE, and caller-owned-output envelope and raises on a contract
+        miss. ``"auto"`` selects the Cake Kimi-K3 FP8 paged MLA decode for its
+        qualified contract: SM100/SM103, ``float8_e4m3fn`` query and latent
+        cache, ``kv_lora_rank=512`` + ``qk_rope_head_dim=64``, page size 64,
+        12 heads, one query token per request, shared paged-KV indices with
+        the aligned table width the previous dispatch requires, host-float
+        scales and none of sparse top-k, sinks, LSE, DCP, skip-softmax, FP16
+        softmax, ``enable_pdl=True`` or the multi-CTA counter; set
+        ``FLASHINFER_DISABLE_CAKE_AUTO=1`` to keep the previous dispatch. A
+        failing Cake probe, admission check or program build never raises
+        under ``"auto"``: the call keeps the previous dispatch. Otherwise
+        ``"auto"``
         chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
         ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
         SM120/SM121 dense decode uses ``"xqa"``.
@@ -3830,6 +3927,7 @@ def _mla_with_kv_cache_impl(
     )
 
     # Resolve architecture policy before applying backend-specific contracts.
+    cc: Optional[Tuple[int, int]] = None
     if resolved_backend == "auto":
         cc = get_compute_capability(query.device)
         if cc[0] == 12 and sparse_mla_top_k > 0:
@@ -3854,6 +3952,49 @@ def _mla_with_kv_cache_impl(
             "sparse_mla_top_k_lens is not supported by the SM120 sparse MLA "
             "backend; pass per-token active top-k lengths via seq_lens instead"
         )
+
+    # SM100 / SM103 ``auto``: the Cake Kimi-K3 FP8 paged MLA decode programs take their
+    # qualified contract (FP8 e4m3 query and cache, kv_lora_rank 512 + qk_rope_head_dim 64,
+    # page size 64, 12 heads, one query token per request); every other call keeps the
+    # previous dispatch.  Admission (a host-side predicate, then the guarded build of the
+    # programs the plan launches) never raises here, and it sees the caller's ``enable_pdl``
+    # before the TRT / CuTe block auto-detects PDL support.
+    if (
+        resolved_backend == "auto"
+        and cc is not None
+        and _cake_kimi_k3_mla_auto_admits(
+            compute_capability=cc,
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            workspace_buffer=workspace_buffer,
+            max_seq_len=max_seq_len,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=out,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            sparse_mla_top_k=sparse_mla_top_k,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            sinks=sinks,
+            return_lse=return_lse,
+            lse=lse,
+            enable_dcp=enable_dcp,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            use_fp16_softmax=use_fp16_softmax,
+            enable_pdl=enable_pdl,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        )
+    ):
+        resolved_backend = "cake"
+        # The trtllm-gen counter hint is best-effort under ``auto`` (unused whenever the tuner
+        # picks CuTe DSL); the Cake programs leave it unused as well, so it does not travel to
+        # the explicit-route checks below, which reject it for ``backend="cake"``.
+        multi_ctas_kv_counter_buffer = None
 
     # Resolve eligibility and fallback without constructing or launching runners.
     # TRT/CuTe share input normalization. Ragged eligibility precedes shape checks,
@@ -4294,12 +4435,13 @@ def _mla_with_kv_cache_impl(
             enable_pdl,
         )
     elif resolved_backend == "cake":
-        if _cake_trtllm_mla_blackwell_supports(
+        if backend == "cake" and _cake_trtllm_mla_blackwell_supports(
             query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, sparse_mla_top_k
         ):
-            # Two Cake MLA families answer to backend="cake": the TRT-LLM-style Blackwell decode
-            # programs for their generated dimension tuples, and the Kimi-K3 FP8 paged-cache route
-            # (below) for everything else in its contract.
+            # Two Cake MLA families answer to the explicit backend="cake": the TRT-LLM-style
+            # Blackwell decode programs for their generated dimension tuples, and the Kimi-K3 FP8
+            # paged-cache route (below) for everything else in its contract.  ``auto`` resolves to
+            # "cake" for the Kimi-K3 route only (``_cake_kimi_k3_mla_auto_admits``).
             from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
             return trtllm_mla_blackwell_decode(
@@ -4333,40 +4475,31 @@ def _mla_with_kv_cache_impl(
         # decode, packed variable-Q / MTP and incremental prefill; BF16 output, caller-owned
         # ``out``, current stream, CUDA-Graph replayable.  Unsupported here: sparse top-k,
         # sinks, LSE output, DCP, skip-softmax, FP16 softmax, PDL, NVFP4 / uint8 caches.
-        unsupported = []
-        if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
-            unsupported.append("sparse_mla_top_k")
-        if sinks is not None:
-            unsupported.append("sinks")
-        if return_lse or lse is not None:
-            unsupported.append("return_lse / lse")
-        if enable_dcp:
-            unsupported.append("enable_dcp")
-        if skip_softmax_threshold_scale_factor is not None:
-            unsupported.append("skip_softmax_threshold_scale_factor")
-        if use_fp16_softmax:
-            unsupported.append("use_fp16_softmax")
-        if enable_pdl:
-            unsupported.append("enable_pdl")
-        if multi_ctas_kv_counter_buffer is not None:
-            unsupported.append("multi_ctas_kv_counter_buffer")
-        if unsupported:
-            raise ValueError(
-                "backend='cake' does not support " + ", ".join(unsupported)
-            )
-        if seq_lens is None:
-            raise ValueError("backend='cake' requires seq_lens")
-        if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                "backend='cake' requires float8_e4m3fn query and kv_cache, got "
-                f"{query.dtype} and {kv_cache.dtype}"
-            )
-        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
-            raise ValueError(
-                "backend='cake' supports kv_lora_rank=512 and qk_rope_head_dim=64 only"
-            )
-        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
-            raise ValueError("backend='cake' takes host float bmm1_scale / bmm2_scale")
+        # One contract checker serves this strict route and the ``auto`` admission.
+        from .cake_kimi_k3_mla import cake_kimi_k3_mla_contract_reason
+
+        contract_miss = cake_kimi_k3_mla_contract_reason(
+            query=query,
+            kv_cache=kv_cache,
+            seq_lens=seq_lens,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sparse_mla_top_k=sparse_mla_top_k,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            sinks=sinks,
+            return_lse=return_lse,
+            lse=lse,
+            enable_dcp=enable_dcp,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            use_fp16_softmax=use_fp16_softmax,
+            enable_pdl=enable_pdl,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        )
+        if contract_miss is not None:
+            raise ValueError(f"backend='cake' {contract_miss}")
+        assert seq_lens is not None  # required by the contract checker
         if out is None:
             out = torch.empty(
                 (*query.shape[:-1], kv_lora_rank),

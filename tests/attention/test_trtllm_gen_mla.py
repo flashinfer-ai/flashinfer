@@ -1,5 +1,7 @@
 import inspect
+import logging
 import math
+import sys
 from types import SimpleNamespace
 import random
 
@@ -10,6 +12,7 @@ import torch.nn.functional as F
 import flashinfer
 from flashinfer.autotuner import autotune
 from flashinfer.mla import _core as core
+from flashinfer.mla import cake_kimi_k3_mla as cake_kimi
 from flashinfer.mla import (
     MLALayerDimensions,
     deepseek_mla_dimensions,
@@ -2507,8 +2510,14 @@ def test_functional_dispatch_cake_routes(functional_request, monkeypatch, family
         if family == "blackwell"
         else ("cake_kimi_k3_mla", "run_cake_kimi_k3_mla_fp8_paged_attention")
     )
+    namespace = {function: launch}
+    if family == "kimi":
+        # The strict route resolves its contract checker from the same module at call time.
+        namespace["cake_kimi_k3_mla_contract_reason"] = (
+            cake_kimi.cake_kimi_k3_mla_contract_reason
+        )
     monkeypatch.setitem(
-        sys.modules, f"flashinfer.mla.{module}", SimpleNamespace(**{function: launch})
+        sys.modules, f"flashinfer.mla.{module}", SimpleNamespace(**namespace)
     )
     result = core.trtllm_batch_decode_with_kv_cache_mla(**case)
     assert result is case["out"]
@@ -2531,6 +2540,379 @@ def test_functional_dispatch_cake_kimi_rejects_lse(functional_request, monkeypat
         core.trtllm_batch_decode_with_kv_cache_mla(
             **{**functional_request, "backend": "cake", "return_lse": True}
         )
+
+
+# ---------------------------------------------------------------------------
+# backend="auto" admission of the Cake Kimi-K3 FP8 paged MLA decode.  Dispatch-only tests on
+# CPU tensors: the device facts, the TRT / CuTe runners and the Cake launcher are patched, so
+# no kernel runs and no CUDA device is needed.
+# ---------------------------------------------------------------------------
+
+
+def _fp8_empty(*shape):
+    return torch.empty(*shape, dtype=torch.float8_e4m3fn)
+
+
+@pytest.fixture
+def cake_auto_request(monkeypatch):
+    """A qualified Kimi-K3 one-token decode request (12 heads, FP8, page 64) on CPU tensors."""
+    monkeypatch.delenv(cake_kimi.AUTO_DISABLE_ENV, raising=False)
+    monkeypatch.setattr(cake_kimi, "cake_kimi_k3_mla_is_available", lambda: True)
+    # The CPU dispatch tests never build programs: the prepare step is a no-op here.
+    monkeypatch.setattr(
+        cake_kimi, "cake_kimi_k3_mla_auto_prepare", lambda **kwargs: None
+    )
+    monkeypatch.setattr(cake_kimi, "_auto_build_failures", {})
+    return dict(
+        query=_fp8_empty(2, 1, 12, 576),
+        kv_cache=_fp8_empty(8, 64, 576),
+        workspace_buffer=torch.zeros(1 << 20, dtype=torch.uint8),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        seq_lens=torch.tensor([17, 200], dtype=torch.int32),
+        max_seq_len=256,
+        bmm1_scale=0.25,
+        bmm2_scale=1.0,
+        backend="auto",
+    )
+
+
+@pytest.fixture
+def cake_kimi_launch(monkeypatch):
+    """Replace the Kimi-K3 launcher with a recorder that fills ``out`` with 7."""
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append((args, kwargs))
+        out = args[4]
+        out.fill_(7)
+        return out
+
+    monkeypatch.setattr(cake_kimi, "run_cake_kimi_k3_mla_fp8_paged_attention", launch)
+    return calls
+
+
+@pytest.fixture
+def incumbent_dispatch(functional_dispatch, monkeypatch):
+    """``functional_dispatch`` without the CUDA-only pieces of the autotune route."""
+    monkeypatch.setattr(core, "_build_mla_decode_tuning_config", lambda **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.cute_dsl.attention.mla_dispatch",
+        SimpleNamespace(_resolve_impl=lambda **kwargs: "monolithic"),
+    )
+    return functional_dispatch
+
+
+def _core_records(caplog, level):
+    return [
+        r
+        for r in caplog.records
+        if r.name == "flashinfer.mla._core" and r.levelno == level
+    ]
+
+
+def _auto_reason(request, **overrides):
+    kwargs = dict(compute_capability=(10, 0), sm_count=148)
+    kwargs.update(
+        (key, value)
+        for key, value in request.items()
+        if key not in ("backend", "qk_nope_head_dim")
+    )
+    kwargs.update(overrides)
+    return cake_kimi.cake_kimi_k3_mla_auto_reason(**kwargs)
+
+
+def test_cake_kimi_k3_auto_reason_names_the_miss(cake_auto_request, monkeypatch):
+    request = cake_auto_request
+    assert _auto_reason(request) is None
+    assert (
+        _auto_reason(request, out=torch.empty(2, 1, 12, 512, dtype=torch.bfloat16))
+        is None
+    )
+    assert "heads" in _auto_reason(request, query=_fp8_empty(2, 1, 96, 576))
+    assert "query token" in _auto_reason(request, query=_fp8_empty(2, 2, 12, 576))
+    # The trtllm-gen counter hint is not a disqualifier under auto (it stays unused).
+    assert (
+        _auto_reason(
+            request, multi_ctas_kv_counter_buffer=torch.zeros(1024, dtype=torch.int32)
+        )
+        is None
+    )
+    assert "dense" in _auto_reason(
+        request,
+        query=_fp8_empty(2, 12, 576),
+        cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_q_len=1,
+    )
+    assert (
+        _auto_reason(request, compute_capability=(9, 0))
+        == "no generated programs for sm_90a"
+    )
+    assert (
+        _auto_reason(request, compute_capability=(12, 0))
+        == "no generated programs for sm_120a"
+    )
+    assert _auto_reason(request, sinks=[torch.zeros(12)]) == "does not support sinks"
+    assert _auto_reason(request, enable_pdl=True) == "does not support enable_pdl"
+    assert _auto_reason(request, enable_pdl=None) is None
+    assert "float8_e4m3fn" in _auto_reason(
+        request, query=torch.empty(2, 1, 12, 576, dtype=torch.bfloat16)
+    )
+    assert "pages of 64" in _auto_reason(request, kv_cache=_fp8_empty(16, 32, 576))
+    assert "seq_lens" in _auto_reason(request, seq_lens=torch.tensor([17, 200]))
+    assert "block_tables" in _auto_reason(
+        request, block_tables=torch.zeros(2, 4, dtype=torch.int32)[:, ::2]
+    )
+    assert "shared paged KV index layout" in _auto_reason(
+        request, uses_shared_paged_kv_idx=False
+    )
+    assert "multiple of 2" in _auto_reason(
+        request, block_tables=torch.zeros(2, 3, dtype=torch.int32)
+    )
+    assert "at least one request" in _auto_reason(
+        request,
+        query=_fp8_empty(0, 1, 12, 576),
+        block_tables=torch.zeros(0, 4, dtype=torch.int32),
+        seq_lens=torch.zeros(0, dtype=torch.int32),
+    )
+    assert "workspace_buffer" in _auto_reason(
+        request, workspace_buffer=torch.zeros(16, dtype=torch.uint8)
+    )
+    assert "out must be BF16" in _auto_reason(
+        request, out=torch.empty(2, 1, 12, 512, dtype=torch.float16)
+    )
+    assert "out rows must be dense" in _auto_reason(
+        request, out=torch.empty(2, 1, 12, 1024, dtype=torch.bfloat16)[..., :512]
+    )
+    monkeypatch.setenv(cake_kimi.AUTO_DISABLE_ENV, "1")
+    assert _auto_reason(request) == f"{cake_kimi.AUTO_DISABLE_ENV} is set"
+    monkeypatch.setenv(cake_kimi.AUTO_DISABLE_ENV, "0")
+    assert _auto_reason(request) is None
+    monkeypatch.setattr(cake_kimi, "cake_kimi_k3_mla_is_available", lambda: False)
+    assert "not available" in _auto_reason(request)
+
+
+def test_auto_selects_cake_kimi_k3_for_the_qualified_decode(
+    cake_auto_request, incumbent_dispatch, cake_kimi_launch, monkeypatch, caplog
+):
+    monkeypatch.setattr(core, "_logged_once", set())
+    caplog.set_level(logging.INFO, logger="flashinfer.mla._core")
+    out = core.trtllm_batch_decode_with_kv_cache_mla(**cake_auto_request)
+    assert len(cake_kimi_launch) == 1
+    assert not incumbent_dispatch.tuning and not incumbent_dispatch.runs
+    args, kwargs = cake_kimi_launch[0]
+    assert args[0] is cake_auto_request["query"]
+    assert args[1] is cake_auto_request["kv_cache"]
+    assert args[2] is cake_auto_request["block_tables"]
+    assert args[3] is cake_auto_request["seq_lens"]
+    assert out is args[4]
+    assert args[5] is cake_auto_request["workspace_buffer"]
+    assert out.dtype == torch.bfloat16 and tuple(out.shape) == (2, 1, 12, 512)
+    assert kwargs["bmm1_scale"] == 0.25 and kwargs["bmm2_scale"] == 1.0
+    assert kwargs["max_seq_len"] == 256 and kwargs["cum_seq_lens_q"] is None
+    torch.testing.assert_close(out, torch.full_like(out, 7))
+    # The selection is logged once per process: a second qualified call adds no record.
+    infos = _core_records(caplog, logging.INFO)
+    assert len(infos) == 1
+    assert infos[0].getMessage() == core._cake_auto_selected_message()
+    core.trtllm_batch_decode_with_kv_cache_mla(**cake_auto_request)
+    assert len(cake_kimi_launch) == 2
+    assert len(_core_records(caplog, logging.INFO)) == 1
+
+
+def test_auto_cake_selection_ignores_the_trtllm_gen_counter_hint(
+    cake_auto_request, incumbent_dispatch, cake_kimi_launch
+):
+    """A caller that passes the trtllm-gen ``multi_ctas_kv_counter_buffer`` under ``auto``
+    (vLLM does, whenever a trtllm-gen runner would be eligible) still gets the Cake programs;
+    the hint is not forwarded to them."""
+    counter = torch.zeros(1024, dtype=torch.int32)
+    out = core.trtllm_batch_decode_with_kv_cache_mla(
+        **cake_auto_request, multi_ctas_kv_counter_buffer=counter
+    )
+    assert len(cake_kimi_launch) == 1
+    assert not incumbent_dispatch.tuning and not incumbent_dispatch.runs
+    _, kwargs = cake_kimi_launch[0]
+    assert "multi_ctas_kv_counter_buffer" not in kwargs
+    torch.testing.assert_close(out, torch.full_like(out, 7))
+
+
+def test_auto_cake_selection_keeps_a_caller_owned_output(
+    cake_auto_request, incumbent_dispatch, cake_kimi_launch
+):
+    out = torch.empty(2, 1, 12, 512, dtype=torch.bfloat16)
+    result = core.trtllm_batch_decode_with_kv_cache_mla(**cake_auto_request, out=out)
+    assert result is out and len(cake_kimi_launch) == 1
+    assert not incumbent_dispatch.tuning
+    torch.testing.assert_close(out, torch.full_like(out, 7))
+
+
+def _failing_probe():
+    raise RuntimeError("probe failure")
+
+
+def _failing_prepare(**kwargs):
+    raise RuntimeError("prepare failure")
+
+
+_BUILD_FAILURE = (
+    "the generated programs could not be built for sm_100a (RuntimeError: test build)"
+)
+
+# Variants whose fallback is logged once at WARNING (the others are DEBUG-only misses).
+_EXPECTED_WARNING = {
+    "probe_raises": "admission check failed (RuntimeError: probe failure)",
+    "prepare_raises": "admission check failed (RuntimeError: prepare failure)",
+    "build_fails": _BUILD_FAILURE,
+}
+
+
+@pytest.mark.parametrize(
+    "variant,expected_candidates",
+    [
+        ("heads_96", ["cute-dsl"]),  # trtllm-gen rejects 64 < num_heads < 128
+        ("q_len_2", ["trtllm-gen", "cute-dsl"]),
+        ("kill_switch", ["trtllm-gen", "cute-dsl"]),
+        ("unavailable", ["trtllm-gen", "cute-dsl"]),
+        ("probe_raises", ["trtllm-gen", "cute-dsl"]),
+        ("build_fails", ["trtllm-gen", "cute-dsl"]),
+        ("prepare_raises", ["trtllm-gen", "cute-dsl"]),
+        ("page_32", ["trtllm-gen", "cute-dsl"]),
+        ("bf16", ["trtllm-gen", "cute-dsl"]),
+        ("sm_120", None),  # resolved to XQA by the architecture policy
+    ],
+)
+def test_auto_keeps_the_incumbent_outside_the_qualified_contract(
+    cake_auto_request,
+    incumbent_dispatch,
+    cake_kimi_launch,
+    monkeypatch,
+    caplog,
+    variant,
+    expected_candidates,
+):
+    monkeypatch.setattr(core, "_logged_once", set())
+    caplog.set_level(logging.WARNING, logger="flashinfer.mla._core")
+    case = cake_auto_request
+    if variant == "heads_96":
+        case["query"] = _fp8_empty(2, 1, 96, 576)
+    elif variant == "q_len_2":
+        case["query"] = _fp8_empty(2, 2, 12, 576)
+    elif variant == "kill_switch":
+        monkeypatch.setenv(cake_kimi.AUTO_DISABLE_ENV, "1")
+    elif variant == "unavailable":
+        monkeypatch.setattr(cake_kimi, "cake_kimi_k3_mla_is_available", lambda: False)
+    elif variant == "probe_raises":
+        # A broken probe must not surface under auto: it is logged once and the incumbent runs.
+        monkeypatch.setattr(cake_kimi, "cake_kimi_k3_mla_is_available", _failing_probe)
+    elif variant == "build_fails":
+        # A passing probe followed by a failed program build (a toolchain that cannot target
+        # the device, JIT disabled without a cached artifact, ...) keeps the incumbent.
+        monkeypatch.setattr(
+            cake_kimi, "cake_kimi_k3_mla_auto_prepare", lambda **kwargs: _BUILD_FAILURE
+        )
+    elif variant == "prepare_raises":
+        monkeypatch.setattr(
+            cake_kimi, "cake_kimi_k3_mla_auto_prepare", _failing_prepare
+        )
+    elif variant == "page_32":
+        case["kv_cache"] = _fp8_empty(16, 32, 576)
+    elif variant == "bf16":
+        case["query"] = torch.empty(2, 1, 12, 576, dtype=torch.bfloat16)
+        case["kv_cache"] = torch.empty(8, 64, 576, dtype=torch.bfloat16)
+    elif variant == "sm_120":
+        # SM120 dense decode resolves to XQA by the architecture policy before any Cake
+        # admission; the admission predicate must never be consulted there.
+        monkeypatch.setattr(core, "get_compute_capability", lambda device: (12, 0))
+        monkeypatch.setattr(core, "is_sm12x_supported", lambda device: True)
+        monkeypatch.setattr(
+            core,
+            "_cake_kimi_k3_mla_auto_admits",
+            lambda **kwargs: pytest.fail("auto must not consult Cake on SM120"),
+        )
+        xqa_calls = []
+        monkeypatch.setattr(
+            core,
+            "xqa_batch_decode_with_kv_cache_mla",
+            lambda *args: xqa_calls.append(args) or args[0],
+        )
+        core.trtllm_batch_decode_with_kv_cache_mla(**case)
+        assert len(xqa_calls) == 1 and not cake_kimi_launch
+        return
+    incumbent_dispatch.selected = expected_candidates[0]
+    out = core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    assert not cake_kimi_launch
+    assert [r.name for r in incumbent_dispatch.tuning[0]] == expected_candidates
+    runner, inputs, _ = incumbent_dispatch.runs[0]
+    assert runner.name == expected_candidates[0] and out is inputs[3]
+    torch.testing.assert_close(out, torch.full_like(out, runner.value))
+    expected_warning = _EXPECTED_WARNING.get(variant)
+    warnings = _core_records(caplog, logging.WARNING)
+    if expected_warning is None:
+        assert not warnings  # an ordinary miss is a DEBUG record, not a warning
+    else:
+        assert len(warnings) == 1 and expected_warning in warnings[0].getMessage()
+        # Second call: the message is deduplicated and the incumbent still runs.
+        core.trtllm_batch_decode_with_kv_cache_mla(**case)
+        assert not cake_kimi_launch and len(incumbent_dispatch.runs) == 2
+        assert len(_core_records(caplog, logging.WARNING)) == 1
+
+
+def test_auto_keeps_the_incumbent_layout_check_for_separate_kv_indices(
+    cake_auto_request, incumbent_dispatch, cake_kimi_launch
+):
+    """A 2-D table under uses_shared_paged_kv_idx=False raised before this route existed; it still does."""
+    with pytest.raises(ValueError, match="3D for separate paged KV layout"):
+        core.trtllm_batch_decode_with_kv_cache_mla(
+            **cake_auto_request, uses_shared_paged_kv_idx=False
+        )
+    assert not cake_kimi_launch and not incumbent_dispatch.runs
+
+
+def test_auto_keeps_the_incumbent_aligned_block_table_check(
+    cake_auto_request, incumbent_dispatch, cake_kimi_launch
+):
+    """An odd page-64 table width raised in the previous auto dispatch; auto does not admit it."""
+    cake_auto_request["block_tables"] = torch.zeros(2, 3, dtype=torch.int32)
+    with pytest.raises(ValueError, match=r"block_num % \(128 / block_size\) == 0"):
+        core.trtllm_batch_decode_with_kv_cache_mla(**cake_auto_request)
+    assert not cake_kimi_launch and not incumbent_dispatch.runs
+
+
+def test_cake_backend_stays_strict_on_a_contract_miss(
+    cake_auto_request, cake_kimi_launch, monkeypatch
+):
+    monkeypatch.setattr(
+        core, "_cake_trtllm_mla_blackwell_supports", lambda *args: False
+    )
+    case = {**cake_auto_request, "backend": "cake"}
+    case["query"] = torch.empty(2, 1, 12, 576, dtype=torch.bfloat16)
+    with pytest.raises(
+        ValueError, match="backend='cake' requires float8_e4m3fn query and kv_cache"
+    ):
+        core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    case = {**cake_auto_request, "backend": "cake", "sinks": [torch.zeros(12)]}
+    with pytest.raises(ValueError, match="backend='cake' does not support sinks"):
+        core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    assert not cake_kimi_launch
+
+
+def test_cake_backend_ignores_the_auto_qualification(
+    cake_auto_request, cake_kimi_launch, monkeypatch
+):
+    """Explicit backend="cake" keeps its full contract: 96 heads and the kill switch concern auto only."""
+    monkeypatch.setattr(
+        core, "_cake_trtllm_mla_blackwell_supports", lambda *args: False
+    )
+    monkeypatch.setenv(cake_kimi.AUTO_DISABLE_ENV, "1")
+    case = {**cake_auto_request, "backend": "cake"}
+    case["query"] = _fp8_empty(2, 1, 96, 576)
+    out = core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    assert len(cake_kimi_launch) == 1
+    assert tuple(out.shape) == (2, 1, 96, 512)
 
 
 @pytest.mark.parametrize(

@@ -353,7 +353,8 @@ def get_cake_kimi_k3_mla_kernel(key: str, *, arch: str) -> dict[str, Any]:
     return dict(record, name=name)
 
 
-def _csrc_dir() -> Path:
+def get_csrc_dir() -> Path:
+    """Directory holding the generated CAKE Kimi-K3 MLA CUDA sources (installed or checkout)."""
     installed = jit_env.FLASHINFER_CSRC_DIR / PACKAGE_DIR
     if installed.exists():
         return installed
@@ -393,7 +394,7 @@ def gen_cake_kimi_k3_mla_module(name: str, arch: str) -> JitSpec:
         )
     if arch not in _ARCH_NVCC_FLAGS:
         raise ValueError(f"unsupported CAKE Kimi-K3 MLA architecture: {arch}")
-    csrc_dir = _csrc_dir()
+    csrc_dir = get_csrc_dir()
     sources = [csrc_dir / Path(src).name for src in record["sources"]]
     missing = [path for path in sources if not path.is_file()]
     if missing:
@@ -431,5 +432,6 @@ __all__ = [
     "gen_cake_kimi_k3_mla_module",
     "get_cake_kimi_k3_mla_kernel",
     "get_cake_kimi_k3_mla_module",
+    "get_csrc_dir",
     "supported_arches",
 ]
