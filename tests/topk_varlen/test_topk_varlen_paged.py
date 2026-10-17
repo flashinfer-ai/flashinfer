@@ -273,6 +273,47 @@ def test_paged_main_cluster_rows(rows, ncols, top_k, page_size):
 
 
 @requires_gvr2
+@pytest.mark.parametrize(
+    "rows,ncols,top_k",
+    [(1, 262208, 1024), (4, 1048832, 512), (12, 262208, 512), (32, 1048640, 2048)],
+    ids=["split1-k1024", "split4-k512", "split12-k512", "split32-k2048"],
+)
+@pytest.mark.parametrize("page_size", [1, 64, 128], ids=lambda p: f"ps{p}")
+def test_paged_main_slab_rows(rows, ncols, top_k, page_size):
+    """Clustered SPLIT launches whose rows are longer than the cluster band: the
+    slab's last arrival maps its winners and its crossing-bin refinement through
+    the request's page-table row like the other paths."""
+    tpl, _, clus, _ = _host._main_engine(rows, ncols, ncols, top_k, True)
+    cap = clus["clus_cs"] * tpl[0] * 16
+    lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + page_size + 5)
+    lens = torch.randint(cap + 1, ncols + 1, (rows,), generator=gen, device=_DEV)
+    lens[0] = cap + 1
+    if rows >= 4:  # the envelope, a band row and a short one
+        lens[1], lens[2], lens[3] = ncols, cap, top_k
+    lens = lens.to(torch.int32)
+    pt = _page_table(rows, ncols, page_size, seed=47)
+    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    page_shift = page_size.bit_length() - 1
+    assert (
+        _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, page_shift)[0]
+        == "main"
+    )
+    for r in range(rows):  # the local output itself is the exact top-k
+        n = int(lens[r])
+        if n > top_k:
+            idx = loc[r].to(torch.int64)
+            assert (
+                int(idx.min()) >= 0
+                and int(idx.max()) < n
+                and idx.unique().numel() == top_k
+            )
+            ref = torch.topk(lg[r, :n], top_k).values.sort().values
+            assert torch.equal(lg[r, idx].sort().values, ref), f"row {r} inexact"
+    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+
+
+@requires_gvr2
 def test_paged_next_n_shares_the_request_table():
     """next_n rows per request all map through the request's page-table row."""
     batch, next_n, ncols, top_k = 12, 3, 8192, 1024
