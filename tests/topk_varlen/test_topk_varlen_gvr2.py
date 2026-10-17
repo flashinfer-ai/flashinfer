@@ -1174,6 +1174,64 @@ def test_gvr2_streaming_flood_neginf_rows(rows, width, top_k, lens, family):
     _run_hard(logits, n_r, top_k, n_r, family)
 
 
+_ONECTA_CASES = [
+    # rows, width, top_k, page size: one-CTA-per-row slabs off the big regime
+    # (aim 7k/4), at widths that compile the register path in (longer rows stream)
+    (160, 262144, 512, None),  # 512 threads, two CTAs per SM
+    (160, 262144, 1024, None),
+    (160, 163840, 2048, None),  # KPT 4
+    (300, 131072, 1024, None),  # 256 threads: no register path, every row streams
+    (160, 262144, 512, 64),  # paged: DSv4 page size
+    (300, 131072, 512, 128),  # paged: V4.1 page size
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,page_size,pattern", _with_patterns(_ONECTA_CASES)
+)
+def test_gvr2_onecta_streamed_rows(rows, width, top_k, page_size, pattern):
+    """One-CTA slab rows off the big regime under hard scores: rows just past the
+    register path, around the crossover of the 7k/4 aim with sqrt(6 n) (K = 512:
+    133,803 columns), multi-tile and full-width rows, and short rows."""
+    cols = [8193, 8195, 8199, 16385, 32771, 98304, 133802, 133804, 131075, width]
+    cols += [top_k, top_k + 1, 2 * top_k + 1, 0]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+
+
+_ONECTA_WAVE_CASES = [
+    # rows, width, top_k, page size: the one-wave 1024-thread slab (big regime,
+    # R = 1) at K >= 1024 (aim 7k/4), at widths that compile the register path in
+    (128, 262144, 1024, None),
+    # past the aim's crossover with sqrt(6 n): 535,210 columns
+    (80, 540672, 1024, None),
+    (64, 262144, 2048, None),  # K = 2048: the slab from 33 rows on (KPT 2)
+    (144, 163840, 2048, 64),  # paged: DSv4 page size
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,page_size,pattern", _with_patterns(_ONECTA_WAVE_CASES)
+)
+def test_gvr2_onecta_wave_slab_rows(rows, width, top_k, page_size, pattern):
+    """The one-wave 1024-thread slab at K >= 1024 aims at 7k/4 (the launch's tail
+    scalar) and ranks exactly under hard scores: rows just past the register path,
+    32K-column rows and a few columns more, multi-tile and full-width rows, rows
+    around the aim's crossover with sqrt(6 n) (K = 1024), and short rows."""
+    page_shift = None if page_size is None else page_size.bit_length() - 1
+    lc = _host._varlen_launcher(rows, width, top_k, width, 1, 1, True, page_shift)
+    assert lc[0] == "main" and lc[2][5] == 1, lc  # one CTA per row
+    assert lc[3][0] == (7 * top_k) // 4, lc[3]  # aim_base
+    cols = [16385, 16388, 32768, 32773, 65540, 131077, 535209, 535212, width]
+    cols += [top_k, top_k + 1, 2 * top_k + 1, 0]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+
+
 _BOUND_EDGE_CASES = [
     # rows, width, bound (tokens), top_k, cr, next_n, family at the bound
     (16, 1048576, 512, 512, 1, 1, "reg"),  # bound = top_k: every row is short
