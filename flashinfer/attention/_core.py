@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import math
-from typing import Literal, Optional, Tuple, Union, overload
+from typing import Any, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -37,13 +37,14 @@ from ..utils import (
     _unpack_paged_kv_cache,
     determine_attention_backend,
 )
+from ..decode import BatchDecodeWithPagedKVCacheWrapper
 from ..prefill import BatchPrefillWithPagedKVCacheWrapper
 from ..jit.attention.variants import attention_sink_decl
 from ..jit.attention.modules import (
     batch_prefill_bidirectional_ranges_jit_args,
     get_batch_prefill_bidirectional_ranges_spec,
 )
-from ..jit.utils import filename_safe_dtype_map
+from ..jit.utils import filename_safe_dtype_map, filename_safe_dtype_map_kv
 
 
 @functools.cache
@@ -412,43 +413,18 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         head_dim_vo: int = 128,
         window_left: int = -1,
     ) -> None:
-        # trtllm is separate code path
-        assert backend in ["fa2", "fa3", "auto"]
-        if backend == "auto":
-            # dispatch backend before init jit module
-            backend = determine_attention_backend(
-                float_workspace_buffer.device,
-                PosEncodingMode[pos_encoding_mode].value,
-                use_fp16_qk_reduction,  # use_fp16_qk_reduction
-                custom_mask_buf is not None,  # use_custom_mask
-                q_data_type,
-                kv_data_type,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-            )
-
-        jit_args = [
-            f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}_swa_{window_left >= 0}_{backend}",  # uri
-            q_data_type,  # dtype_q
-            kv_data_type,  # dtype_kv
-            q_data_type,  # dtype_o
-            torch.int32,  # idtype
-            head_dim_qk,  # hidden_dim_qk
-            head_dim_vo,  # hidden_dim_vo
-            ["sink"],  # additional_tensor_names
-            ["float"],  # additional_tensor_dtypes
-            ["sm_scale"],  # additional_scalar_names
-            ["double"],  # additional_scalar_dtypes
-            "AttentionSink",
-            attention_sink_decl[backend],
-        ]
-        jit_kwargs = {
-            "use_sliding_window": window_left >= 0,
-            "use_fp16_qk_reduction": use_fp16_qk_reduction,
-            "pos_encoding_mode": PosEncodingMode[pos_encoding_mode].value,
-            "paged_kv_stride_mode": ("independent" if backend == "fa2" else "runtime"),
-            "module_surface": "full",
-        }
+        backend, jit_args, jit_kwargs = self._sink_jit_args(
+            float_workspace_buffer.device,
+            backend,
+            q_data_type,
+            kv_data_type,
+            head_dim_qk,
+            head_dim_vo,
+            window_left,
+            pos_encoding_mode,
+            use_fp16_qk_reduction,
+            custom_mask_buf is not None,
+        )
 
         super().__init__(
             float_workspace_buffer=float_workspace_buffer,
@@ -464,6 +440,116 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             jit_args=jit_args,
             jit_kwargs=jit_kwargs,
         )
+
+    @staticmethod
+    def _sink_jit_args(
+        device: torch.device,
+        backend: str,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        window_left: int,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        use_custom_mask: bool = False,
+    ) -> Tuple[str, list, dict]:
+        # trtllm is separate code path
+        assert backend in ["fa2", "fa3", "auto"]
+        if backend == "auto":
+            # dispatch backend before init jit module
+            backend = determine_attention_backend(
+                device,
+                PosEncodingMode[pos_encoding_mode].value,
+                use_fp16_qk_reduction,  # use_fp16_qk_reduction
+                use_custom_mask,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+            )
+
+        tensor_names, tensor_dtypes = ["sink"], ["float"]
+        if kv_data_type == torch.uint8 and backend == "fa2":
+            # NVFP4 KV reads its block scales through these tensors.
+            tensor_names += ["maybe_k_cache_sf", "maybe_v_cache_sf"]
+            tensor_dtypes += ["uint8_t", "uint8_t"]
+        jit_args = [
+            f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}_{filename_safe_dtype_map_kv(kv_data_type)}_{head_dim_qk}_{head_dim_vo}_posenc_{PosEncodingMode[pos_encoding_mode].value}_f16qk_{use_fp16_qk_reduction}_swa_{window_left >= 0}_{backend}",  # uri
+            q_data_type,  # dtype_q
+            kv_data_type,  # dtype_kv
+            q_data_type,  # dtype_o
+            torch.int32,  # idtype
+            head_dim_qk,  # hidden_dim_qk
+            head_dim_vo,  # hidden_dim_vo
+            tensor_names,  # additional_tensor_names
+            tensor_dtypes,  # additional_tensor_dtypes
+            ["sm_scale"],  # additional_scalar_names
+            ["double"],  # additional_scalar_dtypes
+            "AttentionSink",
+            attention_sink_decl[backend],
+        ]
+        jit_kwargs = {
+            "use_sliding_window": window_left >= 0,
+            "use_fp16_qk_reduction": use_fp16_qk_reduction,
+            "pos_encoding_mode": PosEncodingMode[pos_encoding_mode].value,
+            "paged_kv_stride_mode": ("independent" if backend == "fa2" else "runtime"),
+            "module_surface": "full",
+        }
+        return backend, jit_args, jit_kwargs
+
+
+class BatchDecodeWithAttentionSinkWrapper(BatchDecodeWithPagedKVCacheWrapper):
+    r"""Decode counterpart of :class:`BatchAttentionWithAttentionSinkWrapper`.
+
+    It runs the same attention-sink kernel through the tensor-core decode path, so it is
+    planned and captured in CUDA graphs like :class:`BatchDecodeWithPagedKVCacheWrapper`,
+    which receives the remaining keyword arguments. Call
+    ``run(q, paged_kv_cache, sinks, sm_scale, ...)``.
+    """
+
+    # No @flashinfer_api here: parent class BatchDecodeWithPagedKVCacheWrapper
+    # already decorates __init__, so decorating again produces double log entries.
+    def __init__(
+        self,
+        float_workspace_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+        backend: str = "auto",
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
+        head_dim_qk: int = 128,
+        head_dim_vo: int = 128,
+        window_left: int = -1,
+        **kwargs: Any,
+    ) -> None:
+        backend, jit_args, jit_kwargs = (
+            BatchAttentionWithAttentionSinkWrapper._sink_jit_args(
+                float_workspace_buffer.device,
+                backend,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+                window_left,
+            )
+        )
+        super().__init__(
+            float_workspace_buffer,
+            kv_layout,
+            use_tensor_cores=True,
+            backend=backend,
+            jit_args=jit_args,
+            jit_kwargs=jit_kwargs,
+            **kwargs,
+        )
+
+    def plan(self, *args: Any, **kwargs: Any) -> None:
+        super().plan(*args, **kwargs)
+        if self._pos_encoding_mode != "NONE":
+            raise NotImplementedError(
+                "Attention-sink decode applies no position encoding; "
+                "pos_encoding_mode must be 'NONE'."
+            )
 
 
 # The parent's ``run`` carries ``@flashinfer_api(trace=gqa_paged_prefill_trace)``.
