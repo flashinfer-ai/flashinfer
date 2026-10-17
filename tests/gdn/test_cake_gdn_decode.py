@@ -830,7 +830,6 @@ def test_fp32_t1_route_rule_follows_the_state_head_count() -> None:
     assert cake_gdn.CAKE_GDN_FP32_T1_CTAS_PER_STATE == {
         "gdn_decode_pretranspose_splitv8": 8,
         "gdn_decode_pretranspose_splitv8_tilev32": 4,
-        "gdn_decode_pretranspose_splitv8_reg": 8,
         "gdn_decode_pretranspose_splitv8_reg_ost": 8,
     }
     rule = cake_gdn.cake_gdn_fp32_t1_route
