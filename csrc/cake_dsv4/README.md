@@ -91,14 +91,14 @@ tracker: flashinfer#4254):
   over one shared candidate gather);
 * **prefill** -- one translation unit per head count 16 .. 128,
   `cake_sparse_mla_dsv4_nvfp4_prefill_h<N>.cu`, with one kernel per (head tiles
-  x single / dual cache x one-item / persistent CTAs): a prefill CTA holds
+  x single / dual cache x cp.async ring depth): a prefill CTA holds
   `16 * head_tiles` heads of one token (1 tile always, 2 for head counts
   divisible by 32, 4 for head counts divisible by 64) and runs *all* of the
   token's 64-candidate chunks (at most 16, so `topk + extra_topk <= 1024`)
-  with a direct epilogue -- no split scratch, no merge launch. The persistent
-  form launches `min(items, SMs)` CTAs that walk the (token, head block) items
-  with a grid stride while the IO warps prefetch and quantize the next item's
-  Q.
+  with a direct epilogue -- no split scratch, no merge launch. The gather ring
+  holds two chunks; the one-tile instance also ships a three-stage form. The
+  launch runs one CTA per (token, head block) item, token-major or head
+  blocks first, and takes the query L2 policy as a kernel argument.
 
 Both share the TVM-FFI binding `cake_sparse_mla_dsv4_nvfp4_binding.cu`
 (entries `cake_sparse_mla_sm120_dsv4_nvfp4_decode` and
@@ -136,22 +136,37 @@ candidates always split) mirror the generating kernel module's launcher;
 `head_tiles` / `num_splits` on the low-level decode entry override them.
 `backend="auto"` keeps the hand-written SM120 kernels.
 
-For several query tokens the same entry points pick between the decode and
-the prefill kernel through
-`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel` (one token,
-head counts without a prefill instance, more than 16 chunks and candidate
-counts that are not multiples of 64 always decode; wide head counts (>= 64)
-decode up to 16 tokens, or up to 32 tokens with at most 128 candidates;
-narrower head counts decode up to 64 tokens with at least 512 candidates). The
-prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
-`(head_tiles, persistent)`: two tiles below 128 tokens for head counts >= 64
-that are divisible by 32, otherwise the largest instance (one tile for 16 / 32
-/ 48 heads), persistent CTAs once the one-item grid covers two waves of SMs.
-These thresholds are provisional until the paired decode / prefill sweeps on
-RTX PRO 6000 Blackwell and RTX 5090 land. The low-level entry
+At every token count the same entry points pick between the decode and the
+prefill kernel through
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`, keyed on
+`(num_tokens, num_heads, topk, extra_topk, num_sms)`: head counts without a
+prefill instance (8) and more than 16 chunks (over 1024 candidates) always
+decode; a partial 64-wide chunk is served by the prefill's masked tail. With
+`candidates = topk + extra_topk`, wide head counts (>= 64) decode up to 8
+tokens at 512 and more candidates and up to 16 below; narrower head counts
+decode up to 8 tokens on devices with >= 180 SMs (RTX PRO 6000 Blackwell:
+188) and up to 32 on smaller ones (RTX 5090: 170) at 512 and more candidates,
+and run the prefill at every token count below 512, one token included. The
+thresholds were measured by paired decode / prefill sweeps on both SKUs and
+live in `_PREFILL_POLICY` (`flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py`);
+the CPU tests in `tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py`
+pin them.
+
+The prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
+the `head_tiles` int: for head counts >= 64 that are divisible by 32, two
+tiles up to 96 tokens (128 tokens for 128 heads with 512 .. 639 candidates on
+the >= 180-SM die) and the largest instance above; every other head count
+takes its largest instance at every token count (two tiles for 32 heads, one
+for 16 / 48 / 80 / 112). Three companions fix the rest of the launch:
+`..._plan_prefill_stages` (cp.async ring depth: 3 for the one-tile instance
+from 8 chunks per token, except dual-cache lists below 16 chunks and 512
+tokens; 2 otherwise), `..._plan_prefill_q_evict_first` (L2 evict-first on the
+query loads from 512 tokens) and `..._plan_prefill_grid_head_blocks_first`
+(head blocks first for lists of at most 4 chunks and at most 65535 tokens,
+the CUDA grid.y limit). The low-level entry
 `flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_prefill` runs the prefill
-directly (caller-owned `output` / `out_lse`, `head_tiles` / `persistent`
-overrides, no scratch):
+directly (caller-owned `output` / `out_lse`, optional `head_tiles` override,
+no scratch) and returns the resolved plan:
 
 ```python
 from flashinfer.mla import cake_sparse_mla_sm120_dsv4_nvfp4_prefill
@@ -161,7 +176,9 @@ plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     topk_length=lengths, attn_sink=sink,
     extra_kv_cache=compressed_cache, extra_indices=extra_indices,
 )
-# plan == {"head_tiles": 4, "persistent": 1, "num_ctas": <SMs>} for 128 heads x 2048 tokens
+# 128 heads x 2048 tokens with 512 + 128 candidates (10 chunks):
+# plan == {"head_tiles": 4, "num_ctas": 4096, "num_stages": 2,
+#          "q_evict_first": True, "grid_head_blocks_first": False}
 ```
 
 ```bash
