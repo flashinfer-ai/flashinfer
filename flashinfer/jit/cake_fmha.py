@@ -248,7 +248,16 @@ def _resolve_decode_native_bf16_selector(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> dict[str, int] | None:
+    """Pick the registry member serving this route.
+
+    An exact-shape member (selector with ``BATCH_SIZE``) wins when one exists,
+    unless the caller wants the LSE output: the exact-shape kernels never write
+    ``LSE_ptr``, so ``return_lse=True`` is served by the generic member of the
+    same semantic flags, or by nothing when that member is absent.
+    """
+
     semantic_selector = _validate_decode_native_specialization(
         target,
         batch_size,
@@ -268,7 +277,8 @@ def _resolve_decode_native_bf16_selector(
         "NUM_KV_HEADS": num_kv_heads,
     }
     if (
-        _get_component_member("decode_native_bf16", exact_selector, required=False)
+        not return_lse
+        and _get_component_member("decode_native_bf16", exact_selector, required=False)
         is not None
     ):
         return dict(sorted(exact_selector.items()))
@@ -291,6 +301,7 @@ def _is_cake_fmha_decode_native_bf16_available(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> bool:
     """Return whether the registry contains this BF16 route."""
 
@@ -305,6 +316,7 @@ def _is_cake_fmha_decode_native_bf16_available(
             has_window=has_window,
             use_scale_ptr=use_scale_ptr,
             retain_kv_l2=retain_kv_l2,
+            return_lse=return_lse,
         )
         is not None
     )
@@ -1049,6 +1061,7 @@ def get_cake_fmha_decode_native_bf16_uri(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> str:
     selector = _validate_decode_native_specialization(
         target,
@@ -1061,12 +1074,38 @@ def get_cake_fmha_decode_native_bf16_uri(
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
     )
+    # The module name only changes when ``return_lse`` bypasses an exact-shape
+    # member; elsewhere the generic member serves both cases from one build.
+    lse_tag = ""
+    if return_lse and _resolve_decode_native_bf16_selector(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    ) != _resolve_decode_native_bf16_selector(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+        return_lse=True,
+    ):
+        lse_tag = "_lse"
     return (
         f"cake_fmha_decode_native_bf16_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_sink{selector['HAS_SINK']}_window{selector['HAS_WINDOW']}"
         f"_scale{selector['USE_SCALE_PTR']}_retain{selector['RETAIN_KV_L2']}"
-        f"_{CAKE_FMHA_JIT_TAG}"
+        f"{lse_tag}_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -1082,6 +1121,7 @@ def gen_cake_fmha_decode_native_bf16_module(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> JitSpec:
     """Build one authenticated decode-native BF16 specialization."""
 
@@ -1095,6 +1135,7 @@ def gen_cake_fmha_decode_native_bf16_module(
         has_window=has_window,
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
+        return_lse=return_lse,
     )
     if selector is None:
         raise RuntimeError(
@@ -1117,6 +1158,7 @@ def gen_cake_fmha_decode_native_bf16_module(
             has_window=has_window,
             use_scale_ptr=use_scale_ptr,
             retain_kv_l2=retain_kv_l2,
+            return_lse=return_lse,
         ),
         sources=list(sources),
         extra_cuda_cflags=[
@@ -1149,6 +1191,7 @@ def load_cake_fmha_decode_native_bf16_module(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ):
     module = gen_cake_fmha_decode_native_bf16_module(
         target,
@@ -1160,6 +1203,7 @@ def load_cake_fmha_decode_native_bf16_module(
         has_window=has_window,
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
+        return_lse=return_lse,
     ).build_and_load()
     logger.info("Loaded Cake FMHA decode-native BF16 module: %s", module)
     return module

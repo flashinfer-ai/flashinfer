@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 from pathlib import Path
@@ -248,17 +249,20 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
     for member in exact_members:
         selector = member["selector"]
         selected_batches.add(selector["BATCH_SIZE"])
-        spec = gen_cake_fmha_decode_native_bf16_module(
+        shape_args = (
             target,
             selector["BATCH_SIZE"],
             selector["Q_LEN"],
             selector["NUM_Q_HEADS"],
             selector["NUM_KV_HEADS"],
+        )
+        flag_kwargs = dict(
             has_sink=bool(selector["HAS_SINK"]),
             has_window=bool(selector["HAS_WINDOW"]),
             use_scale_ptr=bool(selector["USE_SCALE_PTR"]),
             retain_kv_l2=bool(selector["RETAIN_KV_L2"]),
         )
+        spec = gen_cake_fmha_decode_native_bf16_module(*shape_args, **flag_kwargs)
         assert Path(spec.sources[0]) == csrc_dir / member["sources"][manifest_arch]
         launch_override = member.get("launch_override") or {}
         if "by_arch" in launch_override:
@@ -283,6 +287,43 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
             retain_kv_l2=bool(selector["RETAIN_KV_L2"]),
         )
         assert cake_api.cake_fmha_route_is_optimized(route)
+
+        # Exact-shape members never write ``LSE_ptr``.  A caller-provided LSE
+        # output is served by the generic member with the same semantic flags
+        # (its own module name), or by no optimized route when that member is
+        # absent.
+        semantic_selector = {
+            key: value
+            for key, value in selector.items()
+            if key not in ("BATCH_SIZE", "Q_LEN", "NUM_Q_HEADS", "NUM_KV_HEADS")
+        }
+        generic_member = cake_jit._get_component_member(
+            "decode_native_bf16", semantic_selector, required=False
+        )
+        lse_route = dataclasses.replace(route, return_lse=True)
+        assert cake_api.cake_fmha_route_is_optimized(lse_route) == (
+            generic_member is not None
+        )
+        if generic_member is not None:
+            lse_spec = gen_cake_fmha_decode_native_bf16_module(
+                *shape_args, **flag_kwargs, return_lse=True
+            )
+            assert Path(lse_spec.sources[0]) == (
+                csrc_dir / generic_member["sources"][manifest_arch]
+            )
+            assert Path(lse_spec.sources[1]) == csrc_dir / component["binding_source"]
+            assert lse_spec.name == get_cake_fmha_decode_native_bf16_uri(
+                *shape_args, **flag_kwargs, return_lse=True
+            )
+            assert lse_spec.name != spec.name
+            assert lse_spec.name.replace("_lse_", "_", 1) == spec.name
+            assert lse_spec.extra_cuda_cflags == spec.extra_cuda_cflags
+        else:
+            assert selector["BATCH_SIZE"] == 256
+            with pytest.raises(RuntimeError, match="absent from the registry"):
+                gen_cake_fmha_decode_native_bf16_module(
+                    *shape_args, **flag_kwargs, return_lse=True
+                )
 
         if selector["BATCH_SIZE"] == 4:
             assert Path(spec.sources[1]).name == (
@@ -1090,11 +1131,33 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
         is None
     )
     valid_lse = torch.empty((2, 4), dtype=torch.float32)
-    assert (
-        cake_api.select_cake_fmha_decode_route(
-            query.device, **{**kwargs, "lse": valid_lse}
-        )
-        == route
+    lse_route = cake_api.select_cake_fmha_decode_route(
+        query.device, **{**kwargs, "lse": valid_lse}
+    )
+    assert lse_route == dataclasses.replace(route, return_lse=True)
+    assert cake_api.cake_fmha_route_is_optimized(lse_route)
+    # No exact-shape member exists here, so the LSE request shares the module.
+    assert get_cake_fmha_decode_native_bf16_uri(
+        "sm100a",
+        2,
+        1,
+        4,
+        2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=True,
+        retain_kv_l2=True,
+        return_lse=True,
+    ) == get_cake_fmha_decode_native_bf16_uri(
+        "sm100a",
+        2,
+        1,
+        4,
+        2,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=True,
+        retain_kv_l2=True,
     )
     for invalid_lse in (
         torch.empty((2, 4), dtype=torch.float16),
@@ -1119,6 +1182,98 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("max_seq_len", "retain_kv_l2", "device_scale"),
+    (
+        (1024, True, False),
+        (4096, False, False),
+        (4096, False, True),
+    ),
+)
+def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
+    monkeypatch, target, max_seq_len, retain_kv_l2, device_scale
+) -> None:
+    """A caller LSE at an exact b128 shape selects the generic member."""
+
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    batch_size = 128
+    num_q_heads = 32
+    query = torch.empty((batch_size, num_q_heads, 128), dtype=torch.bfloat16)
+    key = torch.empty((1, 4, 16, 128), dtype=torch.bfloat16)
+    kwargs = dict(
+        query=query,
+        key_cache=key,
+        value_cache=torch.empty_like(key),
+        out=torch.empty_like(query),
+        workspace_buffer=torch.empty(2 << 20, dtype=torch.uint8),
+        block_tables=torch.zeros((batch_size, 256), dtype=torch.int32),
+        seq_lens=torch.full((batch_size,), max_seq_len, dtype=torch.int32),
+        batch_size=batch_size,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        window_left=-1,
+        bmm1_scale=torch.ones(1, dtype=torch.float32) if device_scale else 1.0,
+        bmm2_scale=1.0,
+        o_scale=1.0,
+        sinks=None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+    route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    assert route == cake_api.CakeFmhaDecodeRoute(
+        target=target,
+        batch_size=batch_size,
+        q_len=1,
+        num_q_heads=num_q_heads,
+        num_kv_heads=4,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=device_scale,
+        retain_kv_l2=retain_kv_l2,
+    )
+    assert cake_api.cake_fmha_route_is_optimized(route)
+
+    caller_lse = torch.empty((batch_size, num_q_heads), dtype=torch.float32)
+    lse_route = cake_api.select_cake_fmha_decode_route(
+        query.device, **{**kwargs, "lse": caller_lse}
+    )
+    assert lse_route == dataclasses.replace(route, return_lse=True)
+    assert cake_api.cake_fmha_route_is_optimized(lse_route)
+
+    flag_kwargs = dict(
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=device_scale,
+        retain_kv_l2=retain_kv_l2,
+    )
+    spec = gen_cake_fmha_decode_native_bf16_module(
+        target, batch_size, 1, num_q_heads, 4, **flag_kwargs
+    )
+    lse_spec = gen_cake_fmha_decode_native_bf16_module(
+        target, batch_size, 1, num_q_heads, 4, **flag_kwargs, return_lse=True
+    )
+    generic_body = (
+        f"has_sink0_has_window0_retain_kv_l2{int(retain_kv_l2)}"
+        f"_use_scale_ptr{int(device_scale)}.cu"
+    )
+    assert Path(lse_spec.sources[0]).name == generic_body
+    assert Path(lse_spec.sources[1]).name == "cake_fmha_decode_native_bf16_binding.cu"
+    assert "-DBATCH_SIZE=128" in lse_spec.extra_cuda_cflags
+    assert lse_spec.extra_cuda_cflags == spec.extra_cuda_cflags
+    assert Path(spec.sources[0]).name.startswith("batch_size128_")
+    assert lse_spec.name != spec.name
+    assert lse_spec.name.replace("_lse_", "_", 1) == spec.name
 
 
 def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(
@@ -2674,6 +2829,187 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
     torch.testing.assert_close(
         reference.float(), independent.float(), rtol=1e-2, atol=1e-2
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize(
+    ("batch_size", "kv_len", "device_scale"),
+    (
+        # Exact b4 CGA member shape (RETAIN_KV_L2=1).
+        (4, 1024, False),
+        # Exact b128 RETAIN_KV_L2=1 member shape.
+        (128, 1024, False),
+        # Exact b128 RETAIN_KV_L2=0 USE_SCALE_PTR=0 member shape.
+        (128, 4096, False),
+        # Exact b128 RETAIN_KV_L2=0 USE_SCALE_PTR=1 member shape.
+        (128, 4096, True),
+    ),
+)
+def test_cake_decode_exact_shapes_return_lse_match_reference(
+    batch_size, kv_len, device_scale
+) -> None:
+    """``return_lse=True`` at the exact decode shapes writes a correct LSE."""
+
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+
+    torch.manual_seed(0)
+    num_q_heads = 32
+    num_kv_heads = 4
+    head_dim = 128
+    page_size = 16
+    pages_per_seq = kv_len // page_size
+    query = (
+        torch.randn(
+            (batch_size, num_q_heads, head_dim), dtype=torch.bfloat16, device=device
+        )
+        * 0.125
+    )
+    kv_cache = (
+        torch.randn(
+            (pages_per_seq, 2, num_kv_heads, page_size, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    block_tables = torch.arange(pages_per_seq, dtype=torch.int32, device=device).repeat(
+        batch_size, 1
+    )
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    scale = float(head_dim**-0.5)
+    bmm1_scale = (
+        torch.tensor(scale, dtype=torch.float32, device=device)
+        if device_scale
+        else scale
+    )
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    caller_lse = torch.empty(
+        (batch_size, num_q_heads), dtype=torch.float32, device=device
+    )
+
+    route_kwargs = dict(
+        query=query,
+        key_cache=kv_cache[:, 0],
+        value_cache=kv_cache[:, 1],
+        out=torch.empty_like(query),
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        batch_size=batch_size,
+        q_len=1,
+        max_seq_len=kv_len,
+        window_left=-1,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+        o_scale=1.0,
+        sinks=None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+    route = cake_api.select_cake_fmha_decode_route(device, **route_kwargs)
+    lse_route = cake_api.select_cake_fmha_decode_route(
+        device, **route_kwargs, lse=caller_lse
+    )
+    assert route is not None
+    assert route.component == "decode_native_bf16"
+    assert (route.retain_kv_l2, route.use_scale_ptr) == (kv_len <= 1152, device_scale)
+    assert lse_route == dataclasses.replace(route, return_lse=True)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert cake_api.cake_fmha_route_is_optimized(lse_route)
+    lse_spec = gen_cake_fmha_decode_native_bf16_module(
+        route.target,
+        batch_size,
+        1,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=device_scale,
+        retain_kv_l2=route.retain_kv_l2,
+        return_lse=True,
+    )
+    assert not Path(lse_spec.sources[0]).name.startswith("batch_size")
+
+    common = dict(
+        query=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=kv_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+        window_left=-1,
+        kv_layout="HND",
+        enable_pdl=False,
+        q_len_per_req=1,
+        uses_shared_paged_kv_idx=True,
+    )
+    actual, actual_lse = cake_api.cake_batch_decode_with_kv_cache(
+        workspace_buffer=workspace,
+        out=torch.empty_like(query),
+        lse=caller_lse,
+        return_lse=True,
+        **common,
+    )
+    assert actual_lse.data_ptr() == caller_lse.data_ptr()
+    plain = cake_api.cake_batch_decode_with_kv_cache(
+        workspace_buffer=torch.empty_like(workspace),
+        out=torch.empty_like(query),
+        **common,
+    )
+
+    reference_wrapper = decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        "HND",
+        use_tensor_cores=True,
+    )
+    reference_wrapper.plan(
+        torch.arange(
+            0,
+            (batch_size + 1) * pages_per_seq,
+            pages_per_seq,
+            dtype=torch.int32,
+            device=device,
+        ),
+        block_tables.reshape(-1),
+        torch.full((batch_size,), page_size, dtype=torch.int32, device=device),
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        kv_data_type=torch.bfloat16,
+        q_data_type=torch.bfloat16,
+        sm_scale=scale,
+    )
+    reference, reference_lse = reference_wrapper.run(query, kv_cache, return_lse=True)
+
+    # Independent FP32 definition: base-2 log-sum-exp of the scaled logits.
+    key = kv_cache[:, 0].permute(0, 2, 1, 3).reshape(kv_len, num_kv_heads, head_dim)
+    value = kv_cache[:, 1].permute(0, 2, 1, 3).reshape(kv_len, num_kv_heads, head_dim)
+    key = torch.repeat_interleave(key, num_q_heads // num_kv_heads, dim=1).contiguous()
+    value = torch.repeat_interleave(
+        value, num_q_heads // num_kv_heads, dim=1
+    ).contiguous()
+    logits = torch.einsum("bhd,khd->bhk", query.float(), key.float()) * scale
+    independent = torch.einsum(
+        "bhk,khd->bhd", torch.softmax(logits, dim=-1), value.float()
+    )
+    independent_lse = torch.logsumexp(logits, dim=-1) / math.log(2.0)
+
+    assert torch.isfinite(actual_lse).all()
+    torch.testing.assert_close(actual.float(), independent, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(plain.float(), independent, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(reference.float(), independent, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_lse, independent_lse, rtol=1e-3, atol=3e-3)
+    torch.testing.assert_close(actual_lse, reference_lse.float(), rtol=1e-3, atol=3e-3)
 
 
 @pytest.mark.skipif(
