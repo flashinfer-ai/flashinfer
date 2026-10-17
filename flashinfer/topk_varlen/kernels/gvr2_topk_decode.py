@@ -2014,15 +2014,17 @@ class GvrMainKernel:
                         aim = k
                     n4w = n >> cutlass.Int32(2)
                     # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
-                    # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
-                    # (k/big folded into the launch-constant sd_en flag).
+                    # small_dense = sd_en != 0 and max(2k, sd_en) < n <= SCAP
+                    # (the launch constant sd_en folds k, the regime and the
+                    # plan's break-even row length; 1 admits every row above 2k).
                     gate = cutlass.Int32(0)
                     if n > scap_c:
                         gate = cutlass.Int32(1)
                     if sd_en != cutlass.Int32(0):
                         if n <= scap_c:
                             if n > (k << cutlass.Int32(1)):
-                                gate = cutlass.Int32(1)
+                                if n > sd_en:
+                                    gate = cutlass.Int32(1)
                     if n4w < cutlass.Int32(4):
                         gate = cutlass.Int32(0)
                     if gate != cutlass.Int32(0):

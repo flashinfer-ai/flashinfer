@@ -193,6 +193,26 @@ def _big_regime(b: int, R: int, n4: int) -> bool:
     return b * R <= 148 and not (R == 1 and b >= 75 and n4 <= 16384)
 
 
+def _small_row_sample(k: int, big: bool, R: int, aim: int, hint_free: bool) -> int:
+    """The streaming slab's ``sd_en`` (varlen launcher): 0, or a row length; rows
+    of max(2k, sd_en) < n <= SCAP then take the pair sample too (rows above SCAP
+    always do).
+
+    Upstream: 1 for K > 1024 off the big regime. FlashInfer-local, hint-free
+    launches: unsampled, a hinted row thresholds at the minimum of the previous
+    step's top-k and keeps about k survivors, but a hint-free row thresholds at
+    the minimum of its own first k values and keeps nearly all n of them. A
+    launch sized for a capacity far above its rows (a CUDA graph at the serving
+    width) runs every row up to SCAP that way: 128 rows of 16K columns at 1M
+    capacity, K=512, 17.7 us unsampled vs 6.2 us sampled (B200). The sample
+    stages about ``aim`` survivors instead, so it pays once n clears that count
+    (at n <= aim it runs 3-7% slower). The SPLIT slab (R > 1) gets 0, as
+    upstream: every part of a row repeats the sample."""
+    if not hint_free:
+        return int(k > 1024 and not big)
+    return aim if R == 1 else 0
+
+
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
 
@@ -1099,7 +1119,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         else (64 if k >= 1024 else 32)
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
-    sd_en = 1 if (k > 1024 and not big) else 0
+    sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
     # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
     # num_rows > 15 would strand small batches in SPLIT-main without the
     # staged floor (a distribution-dependent tail regression); the kernel
