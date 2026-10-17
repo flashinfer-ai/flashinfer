@@ -137,6 +137,53 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "hidden_size",
+    [8192, 16384, 32768, 40960, 49152, 57344, 58112, 65536, 98304, 131072, 262144],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
+    """A cluster size that fits the cp.async budget must be the one chosen.
+
+    ``RMSNormKernel._compute_cluster_n`` sizes the shared-memory tile that
+    ``use_async_copy`` gates, and pass 2 reloads ``x`` from that tile.  When a
+    cluster size exists whose tile fits half the opt-in limit but a smaller one
+    is returned, ``cp.async`` stays off while the per-thread fragment is still
+    large, so the fragment has to survive the reduction barrier in registers and
+    spills to local memory once it exceeds the register file.
+    """
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
+
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    kernel = RMSNormKernel(cute_dtype, hidden_size)
+    if kernel.sm_version < 90:
+        pytest.skip("cluster reduction requires SM90+")
+
+    elem_size = cute_dtype.width // 8
+    optin = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    affordable = [
+        cluster_n
+        for cluster_n in (1, 2, 4, 8, 16)
+        if hidden_size % cluster_n == 0
+        and RMSNormKernel._estimate_smem_bytes(hidden_size, cluster_n, elem_size)
+        <= optin // 2
+    ]
+    if not affordable:
+        return  # too large for the occupancy target; the fallback path applies
+
+    assert kernel.cluster_n in affordable, (
+        f"cluster_n={kernel.cluster_n} for hidden_size={hidden_size} {dtype}: "
+        f"{affordable} satisfy the occupancy target, but cp.async is "
+        f"{'on' if kernel.use_async_copy else 'off'}"
+    )
+    assert kernel.use_async_copy
+
+
 @parametrize_product(
     {
         "batch_size": [1, 19, 99, 989],
