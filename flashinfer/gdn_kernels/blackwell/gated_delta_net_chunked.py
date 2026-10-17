@@ -4525,6 +4525,7 @@ class GatedDeltaNetChunkedKernel:
             )
             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
                 tTR_rKS[k] = tTR_rKS[k] * tGrCumprod[k]
+            cute.arch.fence_view_async_tmem_load()
             ks_handle.release()
             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
                 tRT_rV[k] = tRT_rV[k] - tTR_rKS[k].to(self.io_dtype)
@@ -4566,6 +4567,7 @@ class GatedDeltaNetChunkedKernel:
             tTR_rNv_inp[None, sub, 0].store(
                 tTR_rNv[None, sub, 0].load().to(self.io_dtype)
             )
+        cute.arch.fence_view_async_tmem_load()
         nv_handle.release()
 
         tTR_rDv = tTR_rNv
