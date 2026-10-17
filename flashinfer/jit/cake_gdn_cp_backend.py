@@ -1133,6 +1133,39 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "arches": ["sm_107a"],
     },
+    "cake_gdn_cp_7abe379f05e5269e9155": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_7abe379f05e5269e9155_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_7abe379f05e5269e9155_binding.cu",
+        ],
+        "kernel": "kernel_cake_gdn_cp_7abe379f05e5269e9155",
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "local_transfer"],
+            ["buffer", "local_state"],
+            ["buffer", "initial_state"],
+            ["buffer", "initial_state_workspace"],
+            ["buffer", "fixed_state"],
+            ["buffer", "output_state"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "chunk_len"],
+            ["parameter", "total_cp_chunks"],
+            ["parameter", "num_seqs"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [128, 1, 1],
+            "cluster": [1, 1, 1],
+            "dynamic_smem_bytes": 2048,
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "arches": ["sm_107a"],
+    },
     "cake_gdn_cp_7c18fb3d6e06a4d25a64": {
         "sources": [
             "gdn/gdn_cp/cake_gdn_cp_7c18fb3d6e06a4d25a64_kernel.cu",
@@ -2007,6 +2040,36 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "arches": ["sm_103a"],
     },
+    "cake_gdn_cp_ff1b109526253ca46c0c": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_ff1b109526253ca46c0c_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_ff1b109526253ca46c0c_binding.cu",
+        ],
+        "kernel": "kernel_cake_gdn_cp_ff1b109526253ca46c0c",
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "K"],
+            ["buffer", "beta"],
+            ["buffer", "t"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "num_k_heads"],
+            ["parameter", "num_sab_heads"],
+            ["parameter", "total_t_blocks"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [128, 1, 1],
+            "cluster": [1, 1, 1],
+            "dynamic_smem_bytes": 24960,
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "arches": ["sm_107a"],
+    },
 }
 KERNELS: dict[str, Any] = {
     "sm_100a": {
@@ -2098,7 +2161,7 @@ KERNELS: dict[str, Any] = {
         "normalized_final_state_bf16": "cake_gdn_cp_29c857ce26576248b1c8",
         "qk_norm": "cake_gdn_cp_bb7a8a4735606de585d8",
         "qk_norm_bf16": "cake_gdn_cp_173b7a01d35b79f84731",
-        "state_fixup_simt_row4": "cake_gdn_cp_4913bea45166d7c45234",
+        "state_fixup_simt_row4": "cake_gdn_cp_7abe379f05e5269e9155",
         "state_gather_bf16": "cake_gdn_cp_5b18710c217aae02ee0e",
         "state_gather_bf16_int64": "cake_gdn_cp_f3a9ede2eb4e48a3e107",
         "state_gather_fp16": "cake_gdn_cp_d4736ea62c7fb5df0e35",
@@ -2111,9 +2174,9 @@ KERNELS: dict[str, Any] = {
         "state_scatter_fp16_int64": "cake_gdn_cp_4e5f37aac06abc7b42a0",
         "state_scatter_fp32": "cake_gdn_cp_3df53d2d65fb731b7e09",
         "state_scatter_fp32_int64": "cake_gdn_cp_182ccae8c184a6945d27",
-        "t_precompute": "cake_gdn_cp_6a6a9d040a98ccea86c9",
+        "t_precompute": "cake_gdn_cp_ff1b109526253ca46c0c",
         "t_precompute_bf16": "cake_gdn_cp_0d2152b1fca65e744033",
-        "t_precompute_gb300_hv48_min6": "cake_gdn_cp_6a6a9d040a98ccea86c9",
+        "t_precompute_gb300_hv48_min6": "cake_gdn_cp_ff1b109526253ca46c0c",
     },
 }
 
