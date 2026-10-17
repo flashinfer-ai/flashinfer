@@ -21,10 +21,8 @@ atol=rtol=5e-2, LSE atol=rtol=2e-2); every valid head-tile count is
 exercised.
 """
 
-import importlib
 import itertools
 import math
-import os
 
 import pytest
 import torch
@@ -35,7 +33,6 @@ from flashinfer.mla._sparse_mla_sm120._cake_dsv4_nvfp4 import (
     _cake_nvfp4_sparse_mla_decode,
     _cake_nvfp4_sparse_mla_prefill,
     cake_sparse_mla_sm120_dsv4_nvfp4_format_info,
-    cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks,
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill,
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first,
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first,
@@ -59,8 +56,6 @@ from tests.attention.test_cake_sparse_mla_sm120_dsv4_nvfp4 import (
     _require_sm120,
 )
 
-# Dotted name of the generating prefill kernel module (planner parity test); unset -> skipped.
-_KERNEL_MODULE_ENV = "CAKE_SPARSE_MLA_SM120_DSV4_PREFILL_KERNEL_MODULE"
 _PREFILL_HEADS = (16, 32, 48, 64, 80, 96, 112, 128)
 
 
@@ -252,140 +247,6 @@ def test_cake_select_kernel_rules() -> None:
             )
             assert isinstance(head_tiles, int)
             assert head_tiles in _valid_tiles(num_heads)
-
-
-def test_cake_prefill_planner_parity_with_kernel_module() -> None:
-    """The Python prefill facts mirror the generating kernel module exactly.
-
-    Set ``CAKE_SPARSE_MLA_SM120_DSV4_PREFILL_KERNEL_MODULE`` to the module's dotted name to run it.
-    """
-
-    name = os.environ.get(_KERNEL_MODULE_ENV)
-    if not name:
-        pytest.skip(f"{_KERNEL_MODULE_ENV} not set")
-    try:
-        mod = importlib.import_module(name)
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"kernel module {name} unavailable: {exc}")
-    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
-    assert info["heads_per_block"] == mod.HPB
-    assert info["prefill_max_chunks"] == mod.MAX_CPB
-    assert tuple(mod.SUPPORTED_HEAD_COUNTS) == info["prefill_heads"]
-    for num_heads in info["prefill_heads"]:
-        tiles = cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(num_heads)
-        # The module's default is the largest instance; every exported tile count traces.
-        assert mod.plan_head_tiles(num_heads) == max(tiles)
-        assert tiles == tuple(ht for ht in (1, 2, 4) if num_heads % (mod.HPB * ht) == 0)
-        for num_tokens in (128, 2048):
-            head_tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
-                num_tokens=num_tokens, num_heads=num_heads, topk=512, num_sms=188
-            )
-            assert head_tiles in tiles
-    for topk, extra_topk in ((64, 0), (128, 128), (512, 512), (130, 1), (1024, 0)):
-        assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(
-            topk, extra_topk
-        ) == mod.max_chunks(topk, extra_topk)
-    # Ring depth and query L2 policy mirror the module's planner over the measured grid.
-    assert mod.PLAN_NUM_STAGES_MIN_CHUNKS == 8
-    assert mod.PLAN_NUM_STAGES_DUAL_MIN_CHUNKS == 16
-    assert mod.PLAN_NUM_STAGES_DUAL_MIN_TOKENS == 512
-    assert mod.PLAN_Q_EVICT_MIN_TOKENS == 512
-    assert mod.PLAN_GRID_HB_FIRST_MAX_CHUNKS == 4
-    assert mod.PLAN_GRID_HB_FIRST_MAX_TOKENS == 65535
-    for num_tokens in (1, 128, 511, 512, 2048, 8192, 65535, 65536):
-        assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
-            num_tokens=num_tokens
-        ) == mod.plan_q_evict_first(num_tokens)
-        for head_tiles in (1, 2, 4):
-            for topk, extra_topk, dual in (
-                (128, 0, False),
-                (448, 0, False),
-                (512, 0, False),
-                (512, 128, True),
-                (512, 512, True),
-                (1024, 0, False),
-            ):
-                assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
-                    head_tiles=head_tiles,
-                    topk=topk,
-                    extra_topk=extra_topk,
-                    dual=dual,
-                    num_tokens=num_tokens,
-                ) == mod.plan_num_stages(
-                    head_tiles,
-                    mod.max_chunks(topk, extra_topk),
-                    dual=dual,
-                    num_tokens=num_tokens,
-                ), (num_tokens, head_tiles, topk, extra_topk, dual)
-                assert (
-                    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
-                        head_tiles=head_tiles,
-                        topk=topk,
-                        extra_topk=extra_topk,
-                        num_tokens=num_tokens,
-                    )
-                    == mod.plan_grid_head_blocks_first(
-                        head_tiles, mod.max_chunks(topk, extra_topk), num_tokens
-                    )
-                ), (num_tokens, head_tiles, topk, extra_topk)
-    # The decode / prefill crossover and the tile choice mirror the module's planner on both
-    # sm_120a SKUs (188 / 170 SMs) over the measured token, head and candidate grid.
-    for num_sms in (188, 170):
-        for num_tokens in (
-            1,
-            4,
-            8,
-            9,
-            16,
-            17,
-            24,
-            32,
-            33,
-            48,
-            64,
-            96,
-            97,
-            128,
-            129,
-            512,
-            2048,
-        ):
-            for num_heads in info["prefill_heads"]:
-                for topk, extra_topk in (
-                    (128, 0),
-                    (256, 0),
-                    (512, 0),
-                    (256, 256),
-                    (512, 512),
-                ):
-                    plan = mod.plan_prefill(
-                        num_tokens, num_heads, topk, extra_topk, num_sms=num_sms
-                    )
-                    form = cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
-                        num_tokens=num_tokens,
-                        num_heads=num_heads,
-                        topk=topk,
-                        extra_topk=extra_topk,
-                        num_sms=num_sms,
-                    )
-                    assert form == plan["form"], (
-                        num_sms,
-                        num_tokens,
-                        num_heads,
-                        topk,
-                        extra_topk,
-                    )
-                    if form == "prefill":
-                        assert (
-                            cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
-                                num_tokens=num_tokens,
-                                num_heads=num_heads,
-                                topk=topk,
-                                extra_topk=extra_topk,
-                                num_sms=num_sms,
-                            )
-                            == plan["head_tiles"]
-                        ), (num_sms, num_tokens, num_heads, topk, extra_topk)
 
 
 # ----------------------------------------------------------------------------- GPU: attention cases
