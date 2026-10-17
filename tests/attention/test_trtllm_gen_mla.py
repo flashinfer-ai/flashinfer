@@ -1,6 +1,7 @@
 import inspect
 import math
 from types import SimpleNamespace
+from typing import Optional
 import random
 
 import pytest
@@ -1027,15 +1028,17 @@ def trtllm_mla_blackwell_reference(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     softmax_scale: float,
+    page_size: int = 32,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     kv_flat = kv_cache.reshape(-1, 576)
     outputs = []
     for batch_index in range(query.shape[0]):
         seq_len = int(seq_lens[batch_index].item())
-        pages = block_tables[batch_index, : (seq_len + 31) // 32]
+        pages = block_tables[batch_index, : (seq_len + page_size - 1) // page_size]
         indices = (
-            pages[:, None] * 32
-            + torch.arange(32, device=query.device, dtype=torch.int32)[None, :]
+            pages[:, None] * page_size
+            + torch.arange(page_size, device=query.device, dtype=torch.int32)[None, :]
         ).reshape(-1)[:seq_len]
         batch_outputs = []
         for query_index in range(query.shape[1]):
@@ -1051,7 +1054,12 @@ def trtllm_mla_blackwell_reference(
                 query[batch_index, query_index, :, 512:].float(),
                 kv[:, 512:].float(),
             )
-            probabilities = F.softmax(logits * softmax_scale, dim=-1)
+            logits = logits * softmax_scale
+            if sinks is not None:
+                # The sink is one extra logit per head that takes probability
+                # mass but contributes no value.
+                logits = torch.cat([logits, sinks.float()[:, None]], dim=-1)
+            probabilities = F.softmax(logits, dim=-1)[:, : kv.shape[0]]
             batch_outputs.append(
                 torch.einsum("hk,kd->hd", probabilities, kv[:, :512].float())
             )
@@ -2062,11 +2070,19 @@ def test_trtllm_mla_blackwell_page64_split_plan_is_size_based() -> None:
 
 
 @pytest.mark.parametrize(
-    "batch_size,q_len_per_request",
-    [(1, 4), (1, 8), (4, 2), (4, 4), (4, 8), (4, 16)],
+    "batch_size,q_len_per_request,page_size,enable_sink",
+    [
+        (1, 4, 32, False),
+        (1, 8, 32, False),
+        (4, 2, 32, False),
+        (4, 4, 32, False),
+        (4, 8, 32, False),
+        (4, 16, 32, False),
+        (1, 1, 64, True),
+    ],
 )
 def test_trtllm_mla_blackwell_bf16_dispatch(
-    batch_size: int, q_len_per_request: int
+    batch_size: int, q_len_per_request: int, page_size: int, enable_sink: bool
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
@@ -2075,20 +2091,27 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
 
     device = torch.device("cuda")
     torch.manual_seed(42)
-    page_size = 32
     max_seq_len = 1024
     pages_per_sequence = max_seq_len // page_size
+    # Inputs of magnitude 0.5 give a peaked softmax, so a score read from the
+    # wrong keys moves the output well past the tolerance; near-uniform
+    # probabilities from small inputs would hide it.
     query = (
-        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.05
+        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.5
     ).to(torch.bfloat16)
     kv_cache = (
         torch.randn(batch_size * pages_per_sequence, page_size, 576, device=device)
-        * 0.05
+        * 0.5
     ).to(torch.bfloat16)
     block_tables = torch.arange(
         batch_size * pages_per_sequence, dtype=torch.int32, device=device
     ).reshape(batch_size, pages_per_sequence)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    sinks = (
+        torch.randn(128, dtype=torch.float32, device=device) * 2.0
+        if enable_sink
+        else None
+    )
     workspace = torch.empty(1, dtype=torch.uint8, device=device)
     bmm1_scale = 1.0 / (192**0.5)
 
@@ -2104,10 +2127,11 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         max_seq_len=max_seq_len,
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
+        sinks=[sinks] if enable_sink else None,
         backend="cake",
     )
     reference = trtllm_mla_blackwell_reference(
-        query, kv_cache, block_tables, seq_lens, bmm1_scale
+        query, kv_cache, block_tables, seq_lens, bmm1_scale, page_size, sinks
     )
     assert output.shape == (batch_size, q_len_per_request, 128, 512)
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
