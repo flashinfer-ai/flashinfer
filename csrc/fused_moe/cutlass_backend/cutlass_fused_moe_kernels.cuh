@@ -929,6 +929,151 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
                      unpermuted_row_to_permuted_row, num_tokens);
 }
 
+// Alternative to blockExpertPrefixSumKernel + mergeExpertPrefixSumKernel for large inputs (see
+// useTileExpertSort). Those launch one CTA per (expert, token block), so every expert id is read
+// once per local expert. Here one CTA per token block marks, for all local experts at once, which
+// tokens of the block select each expert in a shared-memory bitmap. A token's rank within its
+// expert is the popcount of the lower bits, which is its position in token order, so the outputs
+// are identical to the three-kernel path. The count pass fills blocked_expert_counts for
+// globalExpertPrefixSum; the scatter pass recomputes the bitmap and writes the permutation.
+constexpr int kTileExpertSortMaxExpertsPerToken = 16;
+
+inline int64_t tileExpertSortWordsPerExpert(int64_t num_tokens_per_block) {
+  // One padding word per expert makes the row stride odd for num_tokens_per_block >= 64, so the
+  // per-expert scan (one thread per expert) is free of bank conflicts.
+  return num_tokens_per_block / 32 + 1;
+}
+
+inline bool useTileExpertSort(int64_t num_tokens, int64_t num_experts_per_node,
+                              int64_t num_experts_per_token, int64_t num_tokens_per_block) {
+  int64_t const smem_bytes = 2 * num_experts_per_node *
+                             tileExpertSortWordsPerExpert(num_tokens_per_block) *
+                             int64_t(sizeof(uint32_t));
+  bool const supported = num_tokens_per_block % 32 == 0 && num_tokens_per_block <= 1024 &&
+                         num_experts_per_token <= kTileExpertSortMaxExpertsPerToken &&
+                         smem_bytes <= 48 * 1024;
+  // The tile path runs one CTA per token block, so it only wins once the per-expert kernels'
+  // redundant reads outweigh that lower parallelism. Measured on H20, the crossover is at
+  // num_experts_per_node * num_tokens of about 2^18 to 2^19.
+  return supported && num_experts_per_node * num_tokens >= (int64_t{1} << 19);
+}
+
+template <bool kScatter>
+__global__ void tileExpertSortKernel(int const* token_selected_experts, int* blocked_expert_counts,
+                                     int const* blocked_expert_counts_cumsum,
+                                     int* permuted_token_selected_experts,
+                                     int* permuted_row_to_unpermuted_row,
+                                     int* unpermuted_row_to_permuted_row, int64_t const num_tokens,
+                                     int const num_experts_per_token,
+                                     int const num_experts_per_node, int const start_expert_id) {
+  extern __shared__ uint32_t tile_sort_smem[];
+  int const stride = blockDim.x / 32 + 1;
+  uint32_t* masks = tile_sort_smem;
+  uint32_t* prefix = tile_sort_smem + num_experts_per_node * stride;
+  int const block_id = blockIdx.x;
+  int const num_blocks_per_seq = gridDim.x;
+  int const lane = threadIdx.x % 32;
+  int const word = threadIdx.x / 32;
+  int64_t const token_id = int64_t(block_id) * blockDim.x + threadIdx.x;
+
+  for (int i = threadIdx.x; i < num_experts_per_node * stride; i += blockDim.x) {
+    masks[i] = 0;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  // Local expert per slot, or -1. A token counts once per expert, at its first slot, as in
+  // blockExpertPrefixSumKernel.
+  int local_expert[kTileExpertSortMaxExpertsPerToken];
+#pragma unroll
+  for (int i = 0; i < kTileExpertSortMaxExpertsPerToken; i++) {
+    local_expert[i] = -1;
+    if (i < num_experts_per_token && token_id < num_tokens) {
+      int const expert_id =
+          token_selected_experts[token_id * num_experts_per_token + i] - start_expert_id;
+      bool first = expert_id >= 0 && expert_id < num_experts_per_node;
+#pragma unroll
+      for (int j = 0; j < i; j++) {
+        first = first && local_expert[j] != expert_id;
+      }
+      local_expert[i] = first ? expert_id : -1;
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int i = 0; i < kTileExpertSortMaxExpertsPerToken; i++) {
+    if (local_expert[i] >= 0) {
+      atomicOr(&masks[local_expert[i] * stride + word], 1u << lane);
+    }
+  }
+  __syncthreads();
+
+  for (int expert = threadIdx.x; expert < num_experts_per_node; expert += blockDim.x) {
+    int running = 0;
+    for (int w = 0; w < stride - 1; w++) {
+      if constexpr (kScatter) {
+        prefix[expert * stride + w] = running;
+      }
+      running += __popc(masks[expert * stride + w]);
+    }
+    if constexpr (!kScatter) {
+      blocked_expert_counts[expert * num_blocks_per_seq + block_id] = running;
+    }
+  }
+
+  if constexpr (kScatter) {
+    __syncthreads();
+    uint32_t const lower_lanes = (1u << lane) - 1;
+#pragma unroll
+    for (int i = 0; i < kTileExpertSortMaxExpertsPerToken; i++) {
+      int const expert = local_expert[i];
+      if (expert >= 0) {
+        int const idx = expert * stride + word;
+        int const permuted_row =
+            blocked_expert_counts_cumsum[expert * num_blocks_per_seq + block_id] + prefix[idx] +
+            __popc(masks[idx] & lower_lanes);
+        int const unpermuted_row = int(i * num_tokens + token_id);
+        permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+        permuted_token_selected_experts[permuted_row] = expert;
+        unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+      }
+    }
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <bool kScatter>
+void tileExpertSort(int const* token_selected_experts, int* blocked_expert_counts,
+                    int const* blocked_expert_counts_cumsum, int* permuted_token_selected_experts,
+                    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+                    int64_t const num_tokens, int64_t const num_experts_per_node,
+                    int64_t const num_experts_per_token, int64_t const num_tokens_per_block,
+                    int64_t const num_blocks_per_seq, int const start_expert_id, bool enable_pdl,
+                    cudaStream_t stream) {
+  cudaLaunchConfig_t config;
+  config.gridDim = num_blocks_per_seq;
+  config.blockDim = num_tokens_per_block;
+  config.dynamicSmemBytes = (kScatter ? 2 : 1) * num_experts_per_node *
+                            tileExpertSortWordsPerExpert(num_tokens_per_block) * sizeof(uint32_t);
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaLaunchKernelEx(&config, tileExpertSortKernel<kScatter>, token_selected_experts,
+                     blocked_expert_counts, blocked_expert_counts_cumsum,
+                     permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+                     unpermuted_row_to_permuted_row, num_tokens, int(num_experts_per_token),
+                     int(num_experts_per_node), start_expert_id);
+}
+
 // threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of
 // token_selected_experts
 
@@ -969,6 +1114,25 @@ void threeStepBuildExpertMapsSortFirstToken(
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+
+  if (useTileExpertSort(num_tokens, num_experts_per_node, num_experts_per_token,
+                        num_tokens_per_block)) {
+    tileExpertSort<false>(token_selected_experts, blocked_expert_counts, nullptr, nullptr, nullptr,
+                          nullptr, num_tokens, num_experts_per_node, num_experts_per_token,
+                          num_tokens_per_block, num_blocks_per_seq, start_expert_id, enable_pdl,
+                          stream);
+    sync_check_cuda_error(stream);
+    globalExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
+                          expert_first_token_offset, num_experts_per_node, num_tokens_per_block,
+                          num_blocks_per_seq, enable_pdl, stream);
+    sync_check_cuda_error(stream);
+    tileExpertSort<true>(token_selected_experts, nullptr, blocked_expert_counts_cumsum,
+                         permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+                         unpermuted_row_to_permuted_row, num_tokens, num_experts_per_node,
+                         num_experts_per_token, num_tokens_per_block, num_blocks_per_seq,
+                         start_expert_id, enable_pdl, stream);
+    return;
+  }
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
                        num_tokens, num_experts_per_node, num_experts_per_token,
