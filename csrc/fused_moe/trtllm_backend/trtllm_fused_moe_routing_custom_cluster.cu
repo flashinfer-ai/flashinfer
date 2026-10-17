@@ -16,3 +16,15 @@
 
 #define FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL
 #include "trtllm_fused_moe_routing_custom.cuh"
+
+namespace moe::dev::routing::routingCustom {
+
+bool launchClusterKernelBlockDim256(Data const& data, void* stream) {
+  return launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
+}
+
+bool launchClusterKernelBlockDim512(Data const& data, void* stream) {
+  return launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+}
+
+}  // namespace moe::dev::routing::routingCustom
