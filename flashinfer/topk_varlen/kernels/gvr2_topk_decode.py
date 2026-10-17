@@ -257,6 +257,14 @@ def fmax_f32(a, b):
     return cute.arch.fmax(a, b)
 
 
+@dsl_user_op
+def fabs_f32(x, *, loc=None, ip=None):
+    """fabsf as math.absf (llvm.fabs), FlashInfer-local. ptxas folds it into a
+    compare's |x| operand, so `fabs_f32(v) != inf` is one FSETP; the sign-mask
+    spelling (_fabsf) costs a LOP3 per value on top."""
+    return cutlass.Float32(mlir_math.absf(x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
 # ---------------------------------------------------------------------------
 # ballot / popc / clz / ffs wrappers
 # ---------------------------------------------------------------------------
@@ -4271,11 +4279,13 @@ class GvrTopkRegKernel:
                 for t in cutlass.range_constexpr(KPT):
                     p = pvs[t]
                     if cutlass.Uint32(p) < cutlass.Uint32(n):
-                        uk = fkey(img_f[p])
-                        if uk < lmin:
-                            lmin = uk
-                        if uk > lmax:
-                            lmax = uk
+                        xi = img_f[p]
+                        if fabs_f32(xi) != cutlass.Float32(_POS_INF):  # finite bracket, see below
+                            uk = fkey(xi)
+                            if uk < lmin:
+                                lmin = uk
+                            if uk > lmax:
+                                lmax = uk
                 cute.arch.barrier()  # img dies
             elif cutlass.const_expr(self.use_bm):
                 nbw = (n + cutlass.Int32(31)) >> cutlass.Int32(5)
@@ -4303,15 +4313,18 @@ class GvrTopkRegKernel:
                         )
                     for cbit in cutlass.range_constexpr(4):
                         if (w & cutlass.Uint32(1 << cbit)) != cutlass.Uint32(0):
-                            lmn = fmin_f32(lmn, _val(frags, 4 * u + cbit))
-                            lmx = fmax_f32(lmx, _val(frags, 4 * u + cbit))
+                            v = _val(frags, 4 * u + cbit)
+                            if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
+                                lmn = fmin_f32(lmn, v)
+                                lmx = fmax_f32(lmx, v)
                 if tid < ntail:
                     wt = cutlass.Uint32(bm[tix >> cutlass.Int32(5)]) >> cutlass.Uint32(
                         tix & cutlass.Int32(31)
                     )
                     if (wt & cutlass.Uint32(1)) != cutlass.Uint32(0):
-                        lmn = fmin_f32(lmn, tval)
-                        lmx = fmax_f32(lmx, tval)
+                        if fabs_f32(tval) != cutlass.Float32(_POS_INF):
+                            lmn = fmin_f32(lmn, tval)
+                            lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)  # monotone
                 cute.arch.barrier()  # bm dies
@@ -4331,8 +4344,9 @@ class GvrTopkRegKernel:
                     if pos >= lead:
                         if pos < k + lead:
                             v = _val(frags, s)
-                            lmn = fmin_f32(lmn, v)
-                            lmx = fmax_f32(lmx, v)
+                            if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
+                                lmn = fmin_f32(lmn, v)
+                                lmx = fmax_f32(lmx, v)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
@@ -4344,12 +4358,13 @@ class GvrTopkRegKernel:
                     if cutlass.const_expr(self.prefill and s < 4):
                         okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
                     if okl != cutlass.Int32(0):
-                        if v > cutlass.Float32(_NEG_INF__reg):
+                        if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
                             lmn = fmin_f32(lmn, v)
                             lmx = fmax_f32(lmx, v)
                 if tid < ntail:
-                    lmn = fmin_f32(lmn, tval)
-                    lmx = fmax_f32(lmx, tval)
+                    if fabs_f32(tval) != cutlass.Float32(_POS_INF):
+                        lmn = fmin_f32(lmn, tval)
+                        lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             else:
@@ -4362,11 +4377,12 @@ class GvrTopkRegKernel:
                     xs.append(xv)
                 for t in cutlass.range_constexpr(KPT):
                     if cutlass.Uint32(pvs[t]) < cutlass.Uint32(n):
-                        uk = fkey(xs[t])
-                        if uk < lmin:
-                            lmin = uk
-                        if uk > lmax:
-                            lmax = uk
+                        if fabs_f32(xs[t]) != cutlass.Float32(_POS_INF):  # finite bracket
+                            uk = fkey(xs[t])
+                            if uk < lmin:
+                                lmin = uk
+                            if uk > lmax:
+                                lmax = uk
 
             # ---- block min/max in ONE barrier; publishes hist clear
             lmin = warp_min_u32(lmin)
@@ -4390,6 +4406,15 @@ class GvrTopkRegKernel:
             # and folds every value into bin 0, dropping the +inf; reject it
             # here (okc=0) and force the key-space escape below.
             # (upstream TensorRT-LLM PR #18625, ported verbatim.)
+            # FlashInfer-local: the bracket arms above fold only scores that
+            # are not +-inf, so an infinite score no longer makes the width
+            # infinite. Upstream sent every such row to the escape, which doubled
+            # this kernel on DeepSeek-V4.1 block top-k, whose newest key is
+            # always +inf (B200, K=2048, 4,101 keys, DEG rung: 7.6 vs 3.9 us).
+            # Infinite scores still rank exactly: the bin maps saturate +inf
+            # into the top bin and -inf into bin 0 (BRL) or below the histogram
+            # (non-BRL), and the escape tests below cover the crossings that
+            # this leaves to the histogram.
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
@@ -4501,6 +4526,22 @@ class GvrTopkRegKernel:
             # (upstream TensorRT-LLM PR #18625, ported verbatim.)
             if okc == cutlass.Int32(0):
                 esc = cutlass.Int32(1)
+            # FlashInfer-local, with the finite bracket (see the collapse guard):
+            # two crossings the float histogram cannot rank take the escape too.
+            # (a) BRL bin 0 is a trash bin: it counts everything under the
+            # bracket (-inf, fill lanes, scores below Tv) while the emit stages
+            # only its q >= 0 part, so a crossing there (fewer than k scores at
+            # or above Tv) would refine over unstaged slots.
+            # (b) The ballot emit (CUR off) sends q >= HIf above the crossing,
+            # and HIf is +inf when the crossing is the top bin, which the q of a
+            # +inf score (counted in the top bin) would pass.
+            if cutlass.const_expr(self.brl):
+                if Bv == cutlass.Int32(0):
+                    esc = cutlass.Int32(1)
+            if cutlass.const_expr(not self.cur):
+                if whole == cutlass.Int32(0):
+                    if Bv == cutlass.Int32(self.nbh - 1):
+                        esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
                     s_cnt[0] = cutlass.Int32(0)
