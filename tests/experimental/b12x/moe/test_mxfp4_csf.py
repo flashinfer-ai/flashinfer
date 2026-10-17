@@ -6,9 +6,19 @@ import pytest
 import torch
 
 from b12x.moe import fused_moe as moe
-from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation import PreparationSession, PreparedCall, detect_device
 from ..conftest import require_b12x
 from ..quantization.test_mxfp4_csf import fixture
+
+
+def _pin_expansion(plans, device):
+    """Compare identical compute geometries while exercising expanded scale scratch."""
+    native = plans[0]
+    config = native.contract.default_config(
+        native.query, detect_device(device).identity
+    )
+    config = replace(config, csf_inline_scales=False)
+    return [replace(plan, override=config) for plan in plans]
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 33, 128])
@@ -100,6 +110,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
         )
         for owner in experts
     ]
+    plans = _pin_expansion(plans, device)
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
@@ -338,6 +349,8 @@ def test_expanded_scales_match_native_under_poisoned_replay(
         )
         for i, owner in enumerate(arms)
     ]
+    if execution_override is None:
+        plans = _pin_expansion(plans, device)
     if after_plan is not None:
         after_plan()
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
@@ -437,6 +450,7 @@ def test_expansion_capacity_plan_reuses_its_launches_for_live_counts(
         )
         for owner in (native, expanded)
     ]
+    plans = _pin_expansion(plans, device)
     source = torch.randn(capacity, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(capacity)]
@@ -515,6 +529,7 @@ def test_prefill_expands_all_scales(tokens, monkeypatch):
         )
         for owner in (native, expanded)
     ]
+    plans = _pin_expansion(plans, device)
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]

@@ -74,6 +74,12 @@ the expert count times the tile height. Explicit overrides can still measure
 these kernels with larger batches. Compact MXFP4 W4A8 retains reconstructed
 K128 scale words across both K64 pipeline steps.
 
+Eligible compact N64 MXFP4 shards offer direct-route micro kernels through
+16 tokens and grouped M16 or M64 compute. M64 FC1 uses M32 arithmetic when a
+source tile has at most 32 live rows, while retaining its prepared M64 storage
+and launch capacity. Four-lane groups quantize each activated K32 block with
+the same BF16 boundary and MXFP8 scale calculation.
+
 Expansion reconstructs each selected expert's scales once per invocation.
 Inline reconstruction repeats for every compute tile that consumes those
 scales. Inline can reduce memory traffic when many experts are active and each

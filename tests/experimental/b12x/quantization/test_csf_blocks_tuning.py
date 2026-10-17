@@ -8,6 +8,7 @@ import torch
 from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane, upload_csf_block_payload
 from b12x._lib.quant.csf_blocks_tuning import (
     TUNING,
+    CsfExpansionConfig,
     CsfExpansionQuery,
     plan_csf_block_expansion,
 )
@@ -16,9 +17,19 @@ from ..conftest import require_b12x
 from .test_csf_blocks import planes_and_native
 
 
-@pytest.mark.parametrize("routes,count", [(5, 14), (65, 28), (129, 14)])
-def test_expansion_tuner_enumerates_kernel_parameters(routes, count):
-    geometry = (128, 4, 4, 4, 128, 4, 8, 0, 1)
+@pytest.mark.parametrize(
+    "routes,count,experts",
+    [
+        (5, 14, 8),
+        (65, 28, 8),
+        (129, 14, 8),
+        (96, 42, 384),
+        (384, 42, 384),
+        (385, 28, 384),
+    ],
+)
+def test_expansion_tuner_enumerates_kernel_parameters(routes, count, experts):
+    geometry = (128, 4, 4, 4, 128, 4, experts, 0, 1)
     query = CsfExpansionQuery(geometry, geometry, routes, "int32")
     eligible = TUNING.eligible_plan(query, None)
     configs = [config for _, config in eligible.candidates]
@@ -26,8 +37,12 @@ def test_expansion_tuner_enumerates_kernel_parameters(routes, count):
     assert {c.groups_per_task for c in configs} == {1, 2, 4, 8, 16, 32, 64}
     assert {c.shared_exceptions for c in configs} == {False, True}
     assert {c.bitmap_routes for c in configs} == (
-        {False, True} if count == 28 else {False}
+        {False, True} if count in (28, 42) else {False}
     )
+    assert {c.direct_routes for c in configs} == (
+        {False, True} if count == 42 else {False}
+    )
+    assert not any(c.bitmap_routes and c.direct_routes for c in configs)
     with pytest.raises(ValueError, match="four-bit"):
         TUNING.configure(
             replace(query, first=(128, 4, 2, 4, 128, 4, 8, 0, 1)), device=None
@@ -176,4 +191,58 @@ def test_layers_with_different_exception_payloads_share_tuning(tmp_path):
                 torch.testing.assert_close(
                     output.view(torch.uint8), expected, rtol=0, atol=0
                 )
+        graph.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("quantization", ["nvfp4", "mxfp4"])
+def test_direct_route_expansion_preserves_bytes_and_poisoned_graph(dtype, quantization):
+    device = require_b12x()
+    sources, native = planes_and_native(
+        128, 8, 128, dense=False, quantization=quantization
+    )
+    plane = Nvfp4CompactBlockPlane(upload_csf_block_payload(sources, device))
+    expected = native.to(device)
+    outputs = tuple(torch.empty_like(expected) for _ in range(2))
+    ids = torch.tensor([0, 3, 3, -1, 127] * 13, dtype=dtype, device=device)
+    plan = plan_csf_block_expansion(
+        plane,
+        plane,
+        routes=ids.numel(),
+        ids_dtype=dtype,
+        override=CsfExpansionConfig(direct_routes=True),
+    )
+    active = torch.empty(128, dtype=torch.int32, device=device)
+
+    def prepare(state):
+        binding = state.bind(ids=ids, out13=outputs[0], out2=outputs[1], scratch=active)
+        return PreparedCall(run=binding.run, owners=(active, binding))
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare((plan.request(name="direct-scales", prepare_call=prepare),))
+        binding = plan.prepared.state.bind(
+            ids=ids, out13=outputs[0], out2=outputs[1], scratch=active
+        )
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            binding.run()
+        for expert in (0, 127, -1):
+            ids.fill_(expert)
+            for output in outputs:
+                output.fill_(0xD3)
+            active.fill_(42)
+            allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            )
+            reference = torch.full_like(expected, 0xD3)
+            if expert >= 0:
+                reference[expert] = expected[expert]
+            for output in outputs:
+                torch.testing.assert_close(output, reference, rtol=0, atol=0)
         graph.reset()

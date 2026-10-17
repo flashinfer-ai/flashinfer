@@ -16,6 +16,7 @@ from b12x.preparation import (
     FrozenMapping,
     Knob,
     MemoryRequirements,
+    ParameterBinding,
     ParameterSpace,
     Plan,
     TuningContract,
@@ -38,6 +39,7 @@ class CsfExpansionConfig:
     groups_per_task: int = 8
     shared_exceptions: bool = True
     bitmap_routes: bool = False
+    direct_routes: bool = False
 
     @classmethod
     def from_config(cls, payload):
@@ -88,8 +90,13 @@ def _validate_config(query, config, device):
     if (
         type(config.shared_exceptions) is not bool
         or type(config.bitmap_routes) is not bool
+        or type(config.direct_routes) is not bool
     ):
         raise TypeError("CSF expansion switches must be boolean")
+    if config.direct_routes and not _uses_presence(query):
+        raise ValueError("Direct-route tuning requires a presence-routed capacity")
+    if config.direct_routes and config.bitmap_routes:
+        raise ValueError("Direct routes do not use an expert-presence bitmap")
     if config.bitmap_routes and not _uses_presence(query):
         raise ValueError("Expert-presence tuning requires a presence-routed capacity")
 
@@ -98,6 +105,9 @@ def _parameters(query, device):
     return ParameterSpace.create(
         TUNING.knobs,
         values={
+            "direct_routes": (False, True)
+            if _uses_presence(query) and query.routes <= query.first[6]
+            else (False,),
             "bitmap_routes": (False, True) if _uses_presence(query) else (False,),
         },
     )
@@ -105,8 +115,8 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="quantization.csf_block_expansion",
-    query_schema_version=7,
-    config_schema_version=1,
+    query_schema_version=8,
+    config_schema_version=2,
     query_fields=frozenset(CsfExpansionQuery.__dataclass_fields__),
     config_fields=frozenset(CsfExpansionConfig.__dataclass_fields__),
     encode_query=asdict,
@@ -120,7 +130,17 @@ TUNING = TuningContract(
     knobs=(
         Knob(name="groups_per_task", values=(1, 2, 4, 8, 16, 32, 64)),
         Knob(name="shared_exceptions", values=(False, True)),
-        Knob(name="bitmap_routes", values=(False, True)),
+        Knob(
+            name="direct_routes",
+            values=(False, True),
+            binding=ParameterBinding.RUNTIME,
+        ),
+        Knob(
+            name="bitmap_routes",
+            values=(False, True),
+            when=FrozenMapping({"direct_routes": False}),
+            otherwise=False,
+        ),
     ),
     parameters=_parameters,
 )
@@ -183,6 +203,7 @@ class _ExpansionState:
     routing: tuple
     device: torch.device
     bitmap_routes: bool
+    direct_routes: bool
 
     def decoder(self, scratch):
         active = scratch_tensor(
@@ -197,6 +218,7 @@ class _ExpansionState:
             self.routing,
             active[: self.first.num_experts],
             bitmap_routes=self.bitmap_routes,
+            direct_routes=self.direct_routes,
         )
 
     def bind(self, *, ids, out13, out2, scratch):
@@ -269,6 +291,7 @@ def plan_csf_block_expansion(
             routing,
             torch.device("cuda", device.ordinal),
             config.bitmap_routes,
+            config.direct_routes,
         )
 
     return Plan(

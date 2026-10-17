@@ -2273,6 +2273,7 @@ _MICRO_DYNAMIC_CUTOVER_PAIRS_DEFAULT = 64
 # Micro keeps the m tokens' activations resident in registers; 8 is the budget
 # ceiling. Micro is correct for any 1<=m<=8 (not just powers of two).
 _MICRO_MAX_TOKENS = 8
+_COMPACT_W4A8_MAX_TOKENS = 16
 # Prepared MXFP4 decode keeps the shared-input producer through M=8, while
 # pair-direct routing wins through M=4 for the common top-k=8 regime.
 _W4A8_DECODE_MAX_ROUTED_ROWS = 64
@@ -2619,7 +2620,7 @@ def _w4a8_mx_micro_supported(
         )
     if source_format == "fp4_e8m0_k32" and n % 128 == 64:
         return bool(
-            1 <= num_tokens <= _MICRO_MAX_TOKENS
+            1 <= num_tokens <= _COMPACT_W4A8_MAX_TOKENS
             and k % 256 == 0
             and activation == "silu"
             and 0 < num_topk <= 32
@@ -2887,7 +2888,7 @@ def _heuristic_moe_decode_config(
         )
         if compact_n64_pipeline:
             # Larger compact launches use the split-materialized M16 kernels.
-            # The direct compact micro path owns one through eight live tokens.
+            # The direct compact micro path owns one through sixteen live tokens.
             dynamic_tile_m = 16
             dynamic_route_mode = "grouped"
         else:
@@ -13865,8 +13866,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             launch_w4a8_compact_micro,
         )
 
-        route_output = launch_w4a8_compact_micro(
+        launch_w4a8_compact_micro(
             scratch=s.micro_intermediate,
+            output=scatter_output,
             _prepared_kernel=compact.kernels[topk_ids.dtype],
             _prepared_quantize=compact.quantize,
             max_active_clusters=plan.decode_config.max_active_clusters,
@@ -13885,18 +13887,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             num_topk=num_topk,
             swiglu_limit=swiglu_limit,
             fast_math=fast_math,
-        )
-        from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
-
-        _w4a16_topk_sum_launch_flat(
-            route_output,
-            scatter_output,
-            m,
-            num_topk,
-            k,
-            "bf16",
-            int(stream),
-            launcher=compact.topk_sum,
         )
         return scatter_output
 

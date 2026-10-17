@@ -738,6 +738,7 @@ class Nvfp4CsfDecoder:
     indexed_scales: tuple | None = None
     indexed_programs: tuple | None = None
     bitmap_routes: bool = False
+    direct_routes: bool = False
 
     @classmethod
     def prepare(cls, first, second, out13, out2, *, indexed_scales=None):
@@ -813,7 +814,7 @@ class Nvfp4CsfDecoder:
         mode = 0
         if ids.numel() >= 16 * self.first.num_experts:
             mode = 3
-        elif ids.numel() >= 64:
+        elif ids.numel() >= 64 and not self.direct_routes:
             mark_active_experts(
                 ids, self.active, self.routing_programs[int(ids.dtype == torch.int64)]
             )

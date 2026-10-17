@@ -267,15 +267,16 @@ class W4A8CompactMicroProjectionKernel:
                 k64_slice,
                 tid,
             )
-            self._stage_n64_sfb(
-                w13_sfb,
-                sfb_base,
-                expert,
-                projection,
-                output_tile,
-                k128_slice,
-                tid,
-            )
+            if k64_slice & Int32(1) == Int32(0):
+                self._stage_n64_sfb(
+                    w13_sfb,
+                    sfb_base,
+                    expert,
+                    projection,
+                    output_tile,
+                    k128_slice,
+                    tid,
+                )
         else:
             packed_tile = projection_tile // Int32(2)
             packed_half = projection_tile % Int32(2)
@@ -292,13 +293,14 @@ class W4A8CompactMicroProjectionKernel:
                 tid,
             )
             scale_word_base = packed_tile_index * Int64(256)
-            self._stage_sfb(
-                w13_sfb,
-                sfb_base,
-                scale_word_base,
-                packed_half,
-                tid,
-            )
+            if k64_slice & Int32(1) == Int32(0):
+                self._stage_sfb(
+                    w13_sfb,
+                    sfb_base,
+                    scale_word_base,
+                    packed_half,
+                    tid,
+                )
 
     @cute.jit
     def _run_task(
@@ -341,6 +343,8 @@ class W4A8CompactMicroProjectionKernel:
             acc[nt].fill(0.0)
         k64_slice = Int32(0)
         k64_tiles = Int32(self.k // 64)
+        b_scale_words = cute.make_rmem_tensor((4,), Uint32)
+        b_scale_words.fill(Uint32(0))
         while k64_slice < k64_tiles:
             stage_base = smem_base + (k64_slice & Int32(3)) * Int32(self.stage_bytes)
             b_base = stage_base + Int32(self.b_offset)
@@ -361,8 +365,13 @@ class W4A8CompactMicroProjectionKernel:
                 )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(3)
-            cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
+            if k64_slice & Int32(1) == Int32(0):
+                for nt in cutlass.range_constexpr(4):
+                    n8 = warp * Int32(4) + Int32(nt)
+                    b_scale_words[nt] = ld_shared_u32(
+                        sfb_base + ((n8 * Int32(8) + q) << Int32(2))
+                    )
             scale_shift = Uint32(k64_slice & Int32(1)) * Uint32(16)
             asc = ld_shared_u32(stage_base + Int32(self.sfa_offset)) >> scale_shift
             for kb in cutlass.range_constexpr(2):
@@ -383,11 +392,7 @@ class W4A8CompactMicroProjectionKernel:
                 b_words[3] = bw3
                 for nt in cutlass.range_constexpr(4):
                     b0, b1 = e2m1x8_to_qmma_e2m1x8(b_words[nt])
-                    n8 = warp * Int32(4) + Int32(nt)
-                    sfb = (
-                        ld_shared_u32(sfb_base + ((n8 * Int32(8) + q) << Int32(2)))
-                        >> scale_shift
-                    )
+                    sfb = b_scale_words[nt] >> scale_shift
                     fragment = acc[nt]
                     x0, x1, x2, x3 = mxfp8_mma_m16n8k32_f32_e2m1(
                         cutlass.Float32(0.0),
@@ -469,8 +474,8 @@ class W4A8CompactMicroProjectionKernel:
 
         storage = smem.allocate(Storage)
         while task < num_pairs * projection_tiles:
-            pair = task // projection_tiles
-            projection_tile = task % projection_tiles
+            pair = task % num_pairs
+            projection_tile = task // num_pairs
             expert = topk_ids[Int64(pair)].to(Int32)
             if expert >= Int32(0) and expert < Int32(alpha.shape[0]):
                 self._run_task(

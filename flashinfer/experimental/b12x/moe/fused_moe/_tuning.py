@@ -482,10 +482,13 @@ def validate_moe_decode_config(
         and query.source_format == "fp4_e8m0_k32"
         and query.intermediate_size % 128 == 64
         and config.backend == "dynamic"
-        and (config.dynamic_tile_m != 16 or config.dynamic_route_mode != "grouped")
+        and (
+            config.dynamic_tile_m not in {16, 64}
+            or config.dynamic_route_mode != "grouped"
+        )
     ):
         raise ValueError(
-            "compact N64 W4A8 dynamic execution requires grouped M16 routing"
+            "compact N64 W4A8 dynamic execution requires grouped M16 or M64 routing"
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
@@ -952,7 +955,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=33,
+    candidate_contract_version=34,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(

@@ -879,7 +879,6 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
 class _CompactLaunches:
     kernels: object
     quantize: object
-    topk_sum: object
 
 
 def _compact_launches(plan, caps):
@@ -898,7 +897,6 @@ def _compact_launches(plan, caps):
     from b12x.moe._shared.kernels.w4a8_compact_micro import (
         _compiled_direct_w4a8_compact,
     )
-    from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
 
     m = plan.max_rows // plan.num_topk
     ordinal = plan.device.index
@@ -929,19 +927,13 @@ def _compact_launches(plan, caps):
         )
         for dtype in (torch.int32, torch.int64)
     }
-    # Compact kernels already apply router weights to each route.
-    topk_sum = compile_w4a16_topk_sum(
-        m=m, topk=plan.num_topk, hidden_size=plan.k, apply_topk_weights=False
-    )
     return attach_programs(
         _CompactLaunches(
             MappingProxyType(kernels),
             quantize,
-            topk_sum,
         ),
         tuple(kernels.values()),
         quantize,
-        topk_sum,
     )
 
 
