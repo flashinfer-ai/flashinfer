@@ -4957,6 +4957,16 @@ class TestWorkspaceBucketing:
     bucketed on a power-of-two ladder (floor 128).
     """
 
+    @pytest.fixture(autouse=True)
+    def _clear_workspace_cache(self):
+        # _WORKSPACE_CACHE is process-global: start empty, and release the
+        # CUDA workspaces afterwards even if the test fails.
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        md._WORKSPACE_CACHE.clear()
+        yield
+        md._WORKSPACE_CACHE.clear()
+
     def test_bucket_ladder(self):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
             _bucket_workspace_rows,
@@ -4971,7 +4981,6 @@ class TestWorkspaceBucketing:
     def test_workspace_stable_within_bucket(self):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
-        md._WORKSPACE_CACHE.clear()
         device = torch.device("cuda")
         kwargs = dict(
             backend="static",
@@ -4998,7 +5007,6 @@ class TestWorkspaceBucketing:
     def test_dynamic_workspace_not_bucketed(self):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
-        md._WORKSPACE_CACHE.clear()
         kwargs = dict(
             backend="dynamic",
             state_E=8,
