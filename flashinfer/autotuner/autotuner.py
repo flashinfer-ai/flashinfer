@@ -316,7 +316,9 @@ def _collect_metadata() -> dict[str, str]:
 
         * ``flashinfer_version``  -- our own bucketing / ordering changes
         * ``cuda_version``        -- CUDA driver/runtime ABI
-        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN
+        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN,
+                                     and the cuBLASLt algorithm descriptors
+                                     the cuBLAS runners use as tactics
         * ``cudnn_version``       -- cuDNN **backend** version
         * ``cudnn_frontend_version`` -- cuDNN-frontend Python wrapper
                                         version (independent of backend);

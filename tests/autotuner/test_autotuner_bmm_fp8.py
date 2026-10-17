@@ -136,12 +136,10 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
 def test_autotuner_gemm_cross_bucket_m(backend):
     """Tune at one M bucket, then run inference at a non-bucket M.
 
-    The cuBLASLt algo list is enumerated at the *real* shape, so an integer
-    tactic tuned against a different (bucketed) M may be out of range at
-    runtime. cuDNN tactics are stable engine/knob descriptors and are resolved
-    against the runtime graph. Both paths must reuse the tuned bucket entry for
-    the non-bucket M (i.e. the workspace scratch size does not leak into the
-    cache key) and produce finite output.
+    Both backends' tactics are stable descriptors (cuBLASLt algorithms, cuDNN
+    engine/knobs) resolved against the runtime problem. Both paths must reuse
+    the tuned bucket entry for the non-bucket M (i.e. the workspace scratch
+    size does not leak into the cache key) and produce finite output.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     cc = compute_capability[0] * 10 + compute_capability[1]
@@ -174,8 +172,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     with autotune(tune_mode=True):
         bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
 
-    # 2) Run at a non-bucket M. Must not raise (out-of-range tactic is clamped)
-    #    and must produce finite output.
+    # 2) Run at a non-bucket M. Must not raise and must produce finite output.
     a8, b8, a_s, b_s = make(run_m)
     res = bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
     assert res.isfinite().all()
@@ -207,7 +204,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     if backend == "cudnn":
         _assert_engine_knob_tactic(tactic)
     else:
-        assert tactic >= 0
+        assert gemm_base._is_cublaslt_algo_tactic(tactic)
     assert stored_profile is not None
 
 
