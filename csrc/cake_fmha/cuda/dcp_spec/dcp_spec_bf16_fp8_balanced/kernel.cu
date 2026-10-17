@@ -1123,6 +1123,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(const __grid_constant__ CUtensorMap 
                         }
                         int lse_idx_r = (batch_s * q_len + j_r) * num_q_heads + q_head_r;
                         int narrow_r = 0;
+#if CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
+                        if (block_end_s == 3) {
+                            narrow_r = 1;
+                        }
+#endif  // CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
                         {
                             if (narrow_r == 0) {
                                 int _max_23 = ((f_r / 16) > (1) ? (f_r / 16) : (1));
@@ -2287,6 +2292,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(const __grid_constant__ CUtensorMap 
                         }
                         int lse_idx_r_1 = (batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1;
                         int narrow_r_1 = 0;
+#if CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
+                        if (block_end_c == 3) {
+                            narrow_r_1 = 1;
+                        }
+#endif  // CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
                         {
                             if (narrow_r_1 == 0) {
                                 int _max_33 = ((f_r_1 / 16) > (1) ? (f_r_1 / 16) : (1));
@@ -3371,6 +3381,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(const __grid_constant__ CUtensorMap 
                     if (nm_lane > 16) {
                         sh_f = 3;
                     }
+#if CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
+                    if (t_lane + (sp_lane * (unsigned int)items_per_chunk << 3) <= (unsigned int)num_ctas) {
+                        sh_f = 3;
+                    }
+#endif  // CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
                     if (dense_u == 1) {
                         if (nm_lane > 2) {
                             t_lane += sp_lane * (unsigned int)items_per_chunk << sh_f;
@@ -3504,6 +3519,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(const __grid_constant__ CUtensorMap 
                     sh_c = 2;
                 }
                 if (nmax_c > 16) {
+#if CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
+                    sh_c = 3;
+                }
+                if (tickets_c + (splits_c * (unsigned int)items_per_chunk << 3) <= (unsigned int)num_ctas) {
+#endif  // CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
                     sh_c = 3;
                 }
                 unsigned int one_c = 1;
@@ -3700,6 +3720,13 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(const __grid_constant__ CUtensorMap 
             }
             if (nmax_split > 16) {
                 reduce_shift = 3;
+#if CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
+            }
+            if (chunk_items + (n_split_requests * (unsigned int)items_per_chunk << 3) <= (unsigned int)num_ctas) {
+                if (n_split_requests > 0) {
+                    reduce_shift = 3;
+                }
+#endif  // CAKE_FMHA_DCP_EIGHT_SLICE_FOLD
             }
             unsigned int reduce_items = n_split_requests * (unsigned int)items_per_chunk << reduce_shift;
             unsigned int total_items = chunk_items + reduce_items;

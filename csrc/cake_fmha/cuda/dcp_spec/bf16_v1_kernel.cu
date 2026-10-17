@@ -94,12 +94,16 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 #ifndef CP_WORLD
 #error "CP_WORLD is a downstream specialization of this program; define it on the compile line"
 #endif
-#define RETAIN_KV_L2 0
+#define RETAIN_KV_L2 CAKE_FMHA_DCP_RETAIN_KV_L2
 
 extern "C" {
 
 __global__ __launch_bounds__(512) void
+#if RETAIN_KV_L2
+kernel_cake_cake_fmha_dcp_spec_a49e536424c875700ddf(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#else
 kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#endif  // RETAIN_KV_L2
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1387,7 +1391,15 @@ kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUte
                             for (int hg_la = 0; hg_la < 2; hg_la++) {
                                 int toff_la = hg_la * 16384 + pg_half_la * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(ldst_la + toff_la), "l"((&K)), "r"(0), "r"(0), "r"(hg_la), "r"(kv_head_idx_3), "r"(pg0_la),
+                                           "r"(kv_full_addr + (kv_stage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(ldst_la + toff_la, (&K), 0, 0, hg_la, kv_head_idx_3, pg0_la, kv_full_addr + (kv_stage_la) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1419,7 +1431,15 @@ kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUte
                             for (int hg_la_1 = 0; hg_la_1 < 2; hg_la_1++) {
                                 int vtoff_la = hg_la_1 * 16384 + pg_half_la_1 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(vdst_la + vtoff_la), "l"((&V)), "r"(0), "r"(0), "r"(hg_la_1), "r"(kv_head_idx_3), "r"(vpg0_la),
+                                           "r"(kv_full_addr + (stage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(vdst_la + vtoff_la, (&V), 0, 0, hg_la_1, kv_head_idx_3, vpg0_la, kv_full_addr + (stage_la) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1448,7 +1468,15 @@ kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUte
                                 for (int hg_la_2 = 0; hg_la_2 < 2; hg_la_2++) {
                                     int ntoff_la = hg_la_2 * 16384 + pg_half_la_2 * 2048;
                                     {
+#if RETAIN_KV_L2
+                                        asm volatile(
+                                            "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                            " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                            :: "r"(kdst_la + ntoff_la), "l"((&K)), "r"(0), "r"(0), "r"(hg_la_2), "r"(kv_head_idx_3), "r"(npg0_la),
+                                               "r"(kv_full_addr + (k_stage_la) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                         tma_5d_gmem2smem(kdst_la + ntoff_la, (&K), 0, 0, hg_la_2, kv_head_idx_3, npg0_la, kv_full_addr + (k_stage_la) * 8);
+#endif  // RETAIN_KV_L2
                                     }
                                 }
                             }
@@ -1522,7 +1550,15 @@ kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUte
                             for (int hg = 0; hg < 2; hg++) {
                                 int toff = hg * 16384 + pg_i * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(ldst + toff), "l"((&K)), "r"(0), "r"(0), "r"(hg), "r"(kv_head_idx_4), "r"(pg0),
+                                           "r"(kv_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(ldst + toff, (&K), 0, 0, hg, kv_head_idx_4, pg0, kv_full_addr + (kv_stage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1555,7 +1591,15 @@ kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUte
                             for (int hg_1 = 0; hg_1 < 2; hg_1++) {
                                 int vtoff = hg_1 * 16384 + pg_i_1 * 2048;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(vdst + vtoff), "l"((&V)), "r"(0), "r"(0), "r"(hg_1), "r"(kv_head_idx_4), "r"(vpg0),
+                                           "r"(kv_full_addr + (stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_5d_gmem2smem(vdst + vtoff, (&V), 0, 0, hg_1, kv_head_idx_4, vpg0, kv_full_addr + (stage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }
@@ -1585,7 +1629,15 @@ kernel_cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98(const __grid_constant__ CUte
                                 for (int hg_2 = 0; hg_2 < 2; hg_2++) {
                                     int ntoff = hg_2 * 16384 + pg_i_2 * 2048;
                                     {
+#if RETAIN_KV_L2
+                                        asm volatile(
+                                            "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                            " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                            :: "r"(kdst + ntoff), "l"((&K)), "r"(0), "r"(0), "r"(hg_2), "r"(kv_head_idx_4), "r"(npg0),
+                                               "r"(kv_full_addr + (k_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                         tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_2, kv_head_idx_4, npg0, kv_full_addr + (k_stage) * 8);
+#endif  // RETAIN_KV_L2
                                     }
                                 }
                             }

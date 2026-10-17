@@ -754,8 +754,8 @@
             "n_rows": 32
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
           }
         },
         {
@@ -767,8 +767,8 @@
             "n_rows": 64
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
           }
         },
         {
@@ -780,8 +780,8 @@
             "n_rows": 32
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
           }
         },
         {
@@ -793,8 +793,8 @@
             "n_rows": 64
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
           }
         }
       ],
@@ -1050,15 +1050,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=2"
       ],
       "family": "bf16_v4",
       "ffi_entry": "run",
       "instance": "split2",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_15a6b2e8ee623392850d_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_15a6b2e8ee623392850d_binding.cu"
+        "cuda/dcp_spec/bf16_v4_kernel.cu",
+        "cuda/dcp_spec/bf16_v4_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1163,15 +1164,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=103",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "splitn",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_2870e9f5407a58e718b3_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_2870e9f5407a58e718b3_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_103a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1277,15 +1280,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=2"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split2_retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_39177f8f6200207b079b_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_39177f8f6200207b079b_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1391,15 +1396,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split1_retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1505,15 +1512,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=2"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split2_retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_479b92ffbc9c6f529c12_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_479b92ffbc9c6f529c12_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1611,15 +1620,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "bf16_v4",
       "ffi_entry": "run",
       "instance": "splitn",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_5261ee95ed8b6d2d6189_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_5261ee95ed8b6d2d6189_binding.cu"
+        "cuda/dcp_spec/bf16_v4_kernel.cu",
+        "cuda/dcp_spec/bf16_v4_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1724,15 +1734,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=103",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "split1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_608a53a1b95e91265bfb_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_608a53a1b95e91265bfb_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_103a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1818,15 +1830,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0"
       ],
       "family": "bf16_v1",
       "ffi_entry": "run",
       "instance": "retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98_binding.cu"
+        "cuda/dcp_spec/bf16_v1_kernel.cu",
+        "cuda/dcp_spec/bf16_v1_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1911,15 +1924,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1"
       ],
       "family": "bf16_v1",
       "ffi_entry": "run",
       "instance": "retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a49e536424c875700ddf_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a49e536424c875700ddf_binding.cu"
+        "cuda/dcp_spec/bf16_v1_kernel.cu",
+        "cuda/dcp_spec/bf16_v1_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2023,15 +2037,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=100",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "split1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_ab8ae294a36d13f273e8_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_ab8ae294a36d13f273e8_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_100a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2136,15 +2152,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=100",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "splitn",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_100a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2250,15 +2268,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split1_retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_d7d4c8cc3dda810d204e_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_d7d4c8cc3dda810d204e_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2364,15 +2384,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "splitn_retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_dbf1678bdc76b4ff249f_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_dbf1678bdc76b4ff249f_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2478,15 +2500,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "splitn_retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_f6b426b8c862da0e2807_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_f6b426b8c862da0e2807_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",

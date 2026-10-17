@@ -124,15 +124,47 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 #ifndef NUM_SPLIT
 #error "NUM_SPLIT is a downstream specialization of this program; define it on the compile line"
 #endif
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 2
+#if NUM_SPLIT != 2
+#error "NUM_SPLIT is fixed to 2 by this program; the compile line must match"
+#endif
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 1
 #if NUM_SPLIT != 1
 #error "NUM_SPLIT is fixed to 1 by this program; the compile line must match"
 #endif
-#define RETAIN_KV_L2 0
+#else
+#if NUM_SPLIT < 3
+#error "NUM_SPLIT must be at least 3 for this program"
+#endif
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#define RETAIN_KV_L2 CAKE_FMHA_DCP_RETAIN_KV_L2
 
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
+#if RETAIN_KV_L2
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 2
+kernel_cake_cake_fmha_dcp_spec_479b92ffbc9c6f529c12(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 1
+kernel_cake_cake_fmha_dcp_spec_d7d4c8cc3dda810d204e(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#else
+kernel_cake_cake_fmha_dcp_spec_f6b426b8c862da0e2807(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 2
+kernel_cake_cake_fmha_dcp_spec_39177f8f6200207b079b(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 1
 kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#else
+kernel_cake_cake_fmha_dcp_spec_dbf1678bdc76b4ff249f(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // RETAIN_KV_L2
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -855,8 +887,18 @@ kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUte
                 if (warp_in_wg_c == 0 && group_ratio_rt > lane) {
                     int lse_q_head = kv_head_idx_1 * group_ratio_rt + lane;
                     {
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 2
+                        int partial_lse_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + lse_q_head) * NUM_SPLIT + split_idx_1;
+                        *(reinterpret_cast<float*>(partial_LSE_ptr + partial_lse_idx) + (0)) = owner_lse;
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 1
                         int lse_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + lse_q_head;
                         *(reinterpret_cast<float*>(LSE_ptr + lse_idx) + (0)) = owner_lse;
+#else
+                        int partial_lse_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + lse_q_head) * NUM_SPLIT + split_idx_1;
+                        *(reinterpret_cast<float*>(partial_LSE_ptr + partial_lse_idx) + (0)) = owner_lse;
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                     }
                 }
                 mbarrier_arrive(corr_empty_0_addr);
@@ -893,8 +935,18 @@ kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUte
                     if (group_ratio_rt > h_6) {
                         int q_head = kv_head_idx_1 * group_ratio_rt + h_6;
                         {
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 2
+                            int partial_o_idx = (((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head) * NUM_SPLIT + split_idx_1) * HEAD_DIM + d_idx;
+                            *(reinterpret_cast<__nv_bfloat16*>(partial_O_ptr + partial_o_idx) + (0)) = __float2bfloat16_rn(final_o);
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 1
                             int o_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head) * HEAD_DIM + d_idx;
                             *(reinterpret_cast<__nv_bfloat16*>(O_ptr + o_idx) + (0)) = __float2bfloat16_rn(final_o);
+#else
+                            int partial_o_idx = (((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head) * NUM_SPLIT + split_idx_1) * HEAD_DIM + d_idx;
+                            *(reinterpret_cast<__nv_bfloat16*>(partial_O_ptr + partial_o_idx) + (0)) = __float2bfloat16_rn(final_o);
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                         }
                     }
                 }
@@ -902,6 +954,255 @@ kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUte
                 mbarrier_arrive(o_empty_1_addr);
                 if (elect_sync()) {
                     mbarrier_arrive(stats_empty_addr);
+#if CAKE_FMHA_DCP_SPLIT_CLASS == 2
+                }
+                {
+                    int base_tile_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_KV_HEADS + kv_head_idx_1;
+                    __threadfence();
+                    asm volatile("barrier.sync 10, 128;" ::: "memory");
+                    if (d_idx == 0) {
+                        int _atomic_old_0 = atomicAdd(&split_completion[base_tile_idx], 1);
+                        int old_count = _atomic_old_0;
+                        split_reduce_flag[0] = ((old_count + 1 == NUM_SPLIT) ? 1 : 0);
+                    }
+                    asm volatile("barrier.sync 10, 128;" ::: "memory");
+                    if (split_reduce_flag[0] != 0) {
+                        __threadfence();
+                        if (d_idx < group_ratio_rt) {
+                            int reduce_q_head = kv_head_idx_1 * group_ratio_rt + d_idx;
+                            int reduce_stat_base = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head) * NUM_SPLIT;
+                            float merged_lse = -CAKE_INF;
+                            {
+                                float split_lse0 = partial_LSE_ptr[reduce_stat_base];
+                                float split_lse1 = partial_LSE_ptr[reduce_stat_base + 1];
+                                float _max_10 = max_noftz(split_lse0, split_lse1);
+                                float merged_max = _max_10;
+                                float weight0 = 0.0f;
+                                float weight1 = 0.0f;
+                                if (split_lse0 != -CAKE_INF) {
+                                    float _exp2_4 = approx_exp2(split_lse0 - merged_max);
+                                    weight0 = _exp2_4;
+                                }
+                                if (split_lse1 != -CAKE_INF) {
+                                    float _exp2_5 = approx_exp2(split_lse1 - merged_max);
+                                    weight1 = _exp2_5;
+                                }
+                                float weight_sum = weight0 + weight1;
+                                float _rcp_1 = approx_rcp(weight_sum);
+                                float inv_weight_sum = ((weight_sum > 0.0f) ? _rcp_1 : 0.0f);
+                                split_weight0[d_idx] = weight0 * inv_weight_sum;
+                                split_weight1[d_idx] = weight1 * inv_weight_sum;
+                                if (weight_sum > 0.0f) {
+                                    float _log2_1;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(weight_sum));
+                                    merged_lse = merged_max + _log2_1;
+                                }
+                                split_merged_lse[d_idx] = merged_lse;
+                            }
+                            int final_lse_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head;
+                            *(reinterpret_cast<float*>(LSE_ptr + final_lse_idx) + (0)) = merged_lse;
+                        }
+                        asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        int merge_head_in_group = warp_in_wg_c * 2 + lane / 16;
+                        int merge_d_base = lane % 16 * 8;
+                        if (merge_head_in_group < group_ratio_rt) {
+                            int reduce_q_head_1 = kv_head_idx_1 * group_ratio_rt + merge_head_in_group;
+                            int partial_o_base = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head_1) * NUM_SPLIT * HEAD_DIM + merge_d_base;
+                            int final_o_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head_1) * HEAD_DIM + merge_d_base;
+                            float split_o0[8];
+                            {
+                                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O_ptr + partial_o_base + 0);
+                                uint4 _vld_0[1];
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vld_0[_blk] = _vptr_0[_blk];
+                                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                                    #pragma unroll
+                                    for (int _pair = 0; _pair < 4; _pair++) {
+                                        asm volatile(
+                                            "{\n\t"
+                                            "shl.b32 %0, %2, 16;\n\t"
+                                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                                            "}\n"
+                                            : "=f"((&split_o0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&split_o0[0 + _blk * 8 + _pair * 2])[1])
+                                            : "r"(_vpairs_0[_pair]));
+                                    }
+                                }
+                            }
+                            {
+                                float _vec_load_0[8];
+                                {
+                                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(partial_O_ptr + (partial_o_base + HEAD_DIM) + 0);
+                                    uint4 _vld_1[1];
+                                    #pragma unroll
+                                    for (int _blk = 0; _blk < 1; _blk++) {
+                                        _vld_1[_blk] = _vptr_1[_blk];
+                                        uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+                                        #pragma unroll
+                                        for (int _pair = 0; _pair < 4; _pair++) {
+                                            asm volatile(
+                                                "{\n\t"
+                                                "shl.b32 %0, %2, 16;\n\t"
+                                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                                "}\n"
+                                                : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                                                : "r"(_vpairs_1[_pair]));
+                                        }
+                                    }
+                                }
+                                float reduce_weight0 = split_weight0[merge_head_in_group];
+                                float reduce_weight1 = split_weight1[merge_head_in_group];
+                                #pragma unroll
+                                for (int elem = 0; elem < 8; elem++) {
+                                    split_o0[elem] = split_o0[elem] * reduce_weight0 + _vec_load_0[elem] * reduce_weight1;
+                                }
+                            }
+                            {
+                                __nv_bfloat162 _pk[4];
+                                _pk[0] = __floats2bfloat162_rn(split_o0[0 + 0], split_o0[0 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(split_o0[0 + 2], split_o0[0 + 3]);
+                                _pk[2] = __floats2bfloat162_rn(split_o0[0 + 4], split_o0[0 + 5]);
+                                _pk[3] = __floats2bfloat162_rn(split_o0[0 + 6], split_o0[0 + 7]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + final_o_idx))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            }
+                        }
+                        if (d_idx == 0) {
+                            *(reinterpret_cast<int*>(split_completion + base_tile_idx) + (0)) = 0;
+                        }
+                    }
+#else
+#if CAKE_FMHA_DCP_SPLIT_CLASS != 1
+                }
+                {
+                    int base_tile_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_KV_HEADS + kv_head_idx_1;
+                    __threadfence();
+                    asm volatile("barrier.sync 10, 128;" ::: "memory");
+                    if (d_idx == 0) {
+                        int _atomic_old_0 = atomicAdd(&split_completion[base_tile_idx], 1);
+                        int old_count = _atomic_old_0;
+                        split_reduce_flag[0] = ((old_count + 1 == NUM_SPLIT) ? 1 : 0);
+                    }
+                    asm volatile("barrier.sync 10, 128;" ::: "memory");
+                    if (split_reduce_flag[0] != 0) {
+                        __threadfence();
+                        if (d_idx < group_ratio_rt) {
+                            int reduce_q_head = kv_head_idx_1 * group_ratio_rt + d_idx;
+                            int reduce_stat_base = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head) * NUM_SPLIT;
+                            float merged_lse = -CAKE_INF;
+                            {
+                                float merged_max = -CAKE_INF;
+                                #pragma unroll 2
+                                for (int reduce_split = 0; reduce_split < NUM_SPLIT; reduce_split++) {
+                                    float split_lse = partial_LSE_ptr[reduce_stat_base + reduce_split];
+                                    float _max_11 = max_noftz(merged_max, split_lse);
+                                    merged_max = _max_11;
+                                }
+                                float weight_sum = 0.0f;
+                                #pragma unroll 2
+                                for (int reduce_split_1 = 0; reduce_split_1 < NUM_SPLIT; reduce_split_1++) {
+                                    float split_lse_1 = partial_LSE_ptr[reduce_stat_base + reduce_split_1];
+                                    float split_weight = 0.0f;
+                                    if (split_lse_1 != -CAKE_INF) {
+                                        float _exp2_6 = approx_exp2(split_lse_1 - merged_max);
+                                        split_weight = _exp2_6;
+                                    }
+                                    split_weights[reduce_split_1 * TILE_Q + d_idx] = split_weight;
+                                    weight_sum = weight_sum + split_weight;
+                                }
+                                float _rcp_2 = approx_rcp(weight_sum);
+                                float inv_weight_sum = ((weight_sum > 0.0f) ? _rcp_2 : 0.0f);
+                                #pragma unroll 2
+                                for (int reduce_split_2 = 0; reduce_split_2 < NUM_SPLIT; reduce_split_2++) {
+                                    int weight_idx = reduce_split_2 * TILE_Q + d_idx;
+                                    split_weights[weight_idx] = split_weights[weight_idx] * inv_weight_sum;
+                                }
+                                if (weight_sum > 0.0f) {
+                                    float _log2_2;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(weight_sum));
+                                    merged_lse = merged_max + _log2_2;
+                                }
+                            }
+                            int final_lse_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head;
+                            *(reinterpret_cast<float*>(LSE_ptr + final_lse_idx) + (0)) = merged_lse;
+                        }
+                        asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        int merge_head_in_group = warp_in_wg_c * 2 + lane / 16;
+                        int merge_d_base = lane % 16 * 8;
+                        if (merge_head_in_group < group_ratio_rt) {
+                            int reduce_q_head_1 = kv_head_idx_1 * group_ratio_rt + merge_head_in_group;
+                            int partial_o_base = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head_1) * NUM_SPLIT * HEAD_DIM + merge_d_base;
+                            int final_o_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head_1) * HEAD_DIM + merge_d_base;
+                            float split_o0[8];
+                            {
+                                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O_ptr + partial_o_base + 0);
+                                uint4 _vld_0[1];
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vld_0[_blk] = _vptr_0[_blk];
+                                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                                    #pragma unroll
+                                    for (int _pair = 0; _pair < 4; _pair++) {
+                                        asm volatile(
+                                            "{\n\t"
+                                            "shl.b32 %0, %2, 16;\n\t"
+                                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                                            "}\n"
+                                            : "=f"((&split_o0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&split_o0[0 + _blk * 8 + _pair * 2])[1])
+                                            : "r"(_vpairs_0[_pair]));
+                                    }
+                                }
+                            }
+                            {
+                                float reduce_weight0 = split_weights[merge_head_in_group];
+                                #pragma unroll
+                                for (int elem = 0; elem < 8; elem++) {
+                                    split_o0[elem] = split_o0[elem] * reduce_weight0;
+                                }
+                                #pragma unroll 2
+                                for (int reduce_split_3 = 1; reduce_split_3 < NUM_SPLIT; reduce_split_3++) {
+                                    float _vec_load_1[8];
+                                    {
+                                        const uint4* _vptr_1 = reinterpret_cast<const uint4*>(partial_O_ptr + (partial_o_base + reduce_split_3 * HEAD_DIM) + 0);
+                                        uint4 _vld_1[1];
+                                        #pragma unroll
+                                        for (int _blk = 0; _blk < 1; _blk++) {
+                                            _vld_1[_blk] = _vptr_1[_blk];
+                                            uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+                                            #pragma unroll
+                                            for (int _pair = 0; _pair < 4; _pair++) {
+                                                asm volatile(
+                                                    "{\n\t"
+                                                    "shl.b32 %0, %2, 16;\n\t"
+                                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                                    "}\n"
+                                                    : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
+                                                    : "r"(_vpairs_1[_pair]));
+                                            }
+                                        }
+                                    }
+                                    float reduce_weight = split_weights[reduce_split_3 * TILE_Q + merge_head_in_group];
+                                    #pragma unroll
+                                    for (int elem_1 = 0; elem_1 < 8; elem_1++) {
+                                        float _fma_0 = __fmaf_rn(_vec_load_1[elem_1], reduce_weight, split_o0[elem_1]);
+                                        split_o0[elem_1] = _fma_0;
+                                    }
+                                }
+                            }
+                            {
+                                __nv_bfloat162 _pk[4];
+                                _pk[0] = __floats2bfloat162_rn(split_o0[0 + 0], split_o0[0 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(split_o0[0 + 2], split_o0[0 + 3]);
+                                _pk[2] = __floats2bfloat162_rn(split_o0[0 + 4], split_o0[0 + 5]);
+                                _pk[3] = __floats2bfloat162_rn(split_o0[0 + 6], split_o0[0 + 7]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + final_o_idx))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            }
+                        }
+                        if (d_idx == 0) {
+                            *(reinterpret_cast<int*>(split_completion + base_tile_idx) + (0)) = 0;
+                        }
+                    }
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                 }
             }
             mbarrier_arrive(tmem_dealloc_addr);
@@ -1389,7 +1690,15 @@ kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUte
                         for (int pg_i = 0; pg_i < 2; pg_i++) {
                             int toff = pg_i * PAGE_SIZE * HEAD_DIM;
                             {
+#if RETAIN_KV_L2
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(ldst + toff), "l"((&K)), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_k[pg_i]),
+                                       "r"(kv_full_addr + (kv_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                 tma_4d_gmem2smem(ldst + toff, (&K), 0, 0, kv_head_idx_3, pg_k[pg_i], kv_full_addr + (kv_stage) * 8);
+#endif  // RETAIN_KV_L2
                             }
                         }
                         kv_stage += 1;
@@ -1417,7 +1726,15 @@ kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUte
                         for (int pg_i_1 = 0; pg_i_1 < 2; pg_i_1++) {
                             int vtoff = pg_i_1 * PAGE_SIZE * HEAD_DIM;
                             {
+#if RETAIN_KV_L2
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(vdst + vtoff), "l"((&V)), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_v[pg_i_1]),
+                                       "r"(kv_full_addr + (stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                 tma_4d_gmem2smem(vdst + vtoff, (&V), 0, 0, kv_head_idx_3, pg_v[pg_i_1], kv_full_addr + (stage) * 8);
+#endif  // RETAIN_KV_L2
                             }
                         }
                         int next_ni = ni_1 + 2;
@@ -1442,7 +1759,15 @@ kernel_cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43(const __grid_constant__ CUte
                             for (int pg_i_2 = 0; pg_i_2 < 2; pg_i_2++) {
                                 int ntoff = pg_i_2 * PAGE_SIZE * HEAD_DIM;
                                 {
+#if RETAIN_KV_L2
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                        :: "r"(kdst + ntoff), "l"((&K)), "r"(0), "r"(0), "r"(kv_head_idx_3), "r"(pg_nk[pg_i_2]),
+                                           "r"(kv_full_addr + (k_stage) * 8), "l"(0x14F0000000000000ULL) : "memory");
+#else
                                     tma_4d_gmem2smem(kdst + ntoff, (&K), 0, 0, kv_head_idx_3, pg_nk[pg_i_2], kv_full_addr + (k_stage) * 8);
+#endif  // RETAIN_KV_L2
                                 }
                             }
                         }

@@ -120,15 +120,25 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 #ifndef NUM_SPLIT
 #error "NUM_SPLIT is a downstream specialization of this program; define it on the compile line"
 #endif
+#if CAKE_FMHA_DCP_SPLIT_CLASS
+#if NUM_SPLIT != 1
+#error "NUM_SPLIT is fixed to 1 by this program; the compile line must match"
+#endif
+#else
 #if NUM_SPLIT < 2
 #error "NUM_SPLIT must be at least 2 for this program"
 #endif
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
 #define RETAIN_KV_L2 0
 
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#if CAKE_FMHA_DCP_SPLIT_CLASS
+kernel_cake_cake_fmha_dcp_spec_608a53a1b95e91265bfb(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#else
+kernel_cake_cake_fmha_dcp_spec_2870e9f5407a58e718b3(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ split_completion, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ causal_seqlens_kv_global, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, float output_scale, int cp_rank, int num_q_heads, int num_kv_heads, int batch_size)
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -705,8 +715,13 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                 if (warp_in_wg_c == 0 && group_ratio_rt > lane) {
                     int lse_q_head = kv_head_idx_1 * group_ratio_rt + lane;
                     {
+#if CAKE_FMHA_DCP_SPLIT_CLASS
+                        int lse_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + lse_q_head;
+                        *(reinterpret_cast<float*>(LSE_ptr + lse_idx) + (0)) = owner_lse;
+#else
                         int partial_lse_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + lse_q_head) * NUM_SPLIT + split_idx_1;
                         *(reinterpret_cast<float*>(partial_LSE_ptr + partial_lse_idx) + (0)) = owner_lse;
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                     }
                 }
                 mbarrier_arrive(corr_empty_0_addr);
@@ -745,8 +760,13 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                         if (h_8 < group_ratio_rt) {
                             int q_head_2 = kv_head_idx_1 * group_ratio_rt + h_8;
                             {
+#if CAKE_FMHA_DCP_SPLIT_CLASS
+                                int o_idx = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head_2) * HEAD_DIM + d_idx;
+                                *(reinterpret_cast<__nv_bfloat16*>(O_ptr + o_idx) + (0)) = __float2bfloat16_rn(final_o_hi);
+#else
                                 int partial_o_idx = (((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head_2) * NUM_SPLIT + split_idx_1) * HEAD_DIM + d_idx;
                                 *(reinterpret_cast<__nv_bfloat16*>(partial_O_ptr + partial_o_idx) + (0)) = __float2bfloat16_rn(final_o_hi);
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                             }
                         }
                     }
@@ -777,8 +797,13 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                         if (h_9 < group_ratio_rt) {
                             int q_head_3 = kv_head_idx_1 * group_ratio_rt + h_9;
                             {
+#if CAKE_FMHA_DCP_SPLIT_CLASS
+                                int o_idx_1 = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head_3) * HEAD_DIM + HEAD_DIM_HALF + d_idx;
+                                *(reinterpret_cast<__nv_bfloat16*>(O_ptr + o_idx_1) + (0)) = __float2bfloat16_rn(final_o_lo);
+#else
                                 int partial_o_idx_1 = (((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + q_head_3) * NUM_SPLIT + split_idx_1) * HEAD_DIM + HEAD_DIM_HALF + d_idx;
                                 *(reinterpret_cast<__nv_bfloat16*>(partial_O_ptr + partial_o_idx_1) + (0)) = __float2bfloat16_rn(final_o_lo);
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                             }
                         }
                     }
@@ -787,6 +812,7 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                 mbarrier_arrive(o_empty_1_addr);
                 if (elect_sync()) {
                     mbarrier_arrive(stats_empty_addr);
+#if !CAKE_FMHA_DCP_SPLIT_CLASS
                 }
                 {
                     int base_tile_idx = (batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_KV_HEADS + kv_head_idx_1;
@@ -940,6 +966,7 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                             *(reinterpret_cast<int*>(split_completion + base_tile_idx) + (0)) = 0;
                         }
                     }
+#endif  // CAKE_FMHA_DCP_SPLIT_CLASS
                 }
             }
             mbarrier_arrive(tmem_dealloc_addr);
@@ -988,149 +1015,101 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                 mbarrier_wait(kv_full_addr, 0);
                 int _mma_a_lo_0 = make_warp_uniform((((smem_kv_hi_addr) >> 4) & 0x3FFF) + (0) * 1024);
                 int _mma_b_lo_0 = make_warp_uniform(((smem_q_hi_addr) >> 4) & 0x3FFF);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_tmem_s0), "r"(0));
+                {
+                    uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
+                    uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 0);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134479888, 1);
+                    }
+                }
                 int _mma_a_lo_1 = make_warp_uniform((((smem_kv_lo_addr) >> 4) & 0x3FFF) + (0) * 1024);
                 int _mma_b_lo_1 = make_warp_uniform(((smem_q_lo_addr) >> 4) & 0x3FFF);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_tmem_s0), "r"(1));
+                {
+                    uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
+                    uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134479888, 1);
+                    }
+                }
                 elect_commit(s_full_0_addr);
                 elect_commit(kv_empty_addr);
                 mbarrier_wait(kv_full_addr + 8, 0);
                 int _mma_a_lo_2 = make_warp_uniform((((smem_kv_hi_addr) >> 4) & 0x3FFF) + (1) * 1024);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_0), "r"(tmem_tmem_s1), "r"(0));
+                {
+                    uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
+                    uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134479888, 0);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134479888, 1);
+                    }
+                }
                 int _mma_a_lo_3 = make_warp_uniform((((smem_kv_lo_addr) >> 4) & 0x3FFF) + (1) * 1024);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_1), "r"(tmem_tmem_s1), "r"(1));
+                {
+                    uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
+                    uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134479888, 1);
+                    }
+                }
                 elect_commit(s_full_1_addr);
                 elect_commit(kv_empty_addr + 8);
                 #pragma unroll 1
@@ -1147,149 +1126,101 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_4 = make_warp_uniform(((((smem_v_hi_addr) >> 4) & 0x3FFF) | 0x4000000) + (s0) * 1024);
                     int _mma_b_lo_4 = make_warp_uniform((((smem_p0_addr) >> 4) & 0x3FFF) | 0x800000);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_tmem_o0_hi), "r"(((first_pv0) ? 0 : 1)));
+                    {
+                        uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_4);
+                        uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, ((first_pv0) ? 0 : 1));
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134512656, 1);
+                        }
+                    }
                     int _mma_a_lo_5 = make_warp_uniform(((((smem_v_lo_addr) >> 4) & 0x3FFF) | 0x4000000) + (s0) * 1024);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_5), "r"(_mma_b_lo_4), "r"(tmem_tmem_o0_lo), "r"(((first_pv0) ? 0 : 1)));
+                    {
+                        uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_5);
+                        uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134512656, ((first_pv0) ? 0 : 1));
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134512656, 1);
+                        }
+                    }
                     elect_commit2(kv_empty_addr + (s0) * 8, o_ready_0_addr);
                     mbarrier_wait(kv_full_addr + (s0_next) * 8, 0);
                     int _mma_a_lo_6 = make_warp_uniform((((smem_kv_hi_addr) >> 4) & 0x3FFF) + (s0_next) * 1024);
                     int _mma_b_lo_6 = make_warp_uniform(((smem_q_hi_addr) >> 4) & 0x3FFF);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"(tmem_tmem_s0), "r"(0));
+                    {
+                        uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_6);
+                        uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_6);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134479888, 0);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 134479888, 1);
+                        }
+                    }
                     int _mma_a_lo_7 = make_warp_uniform((((smem_kv_lo_addr) >> 4) & 0x3FFF) + (s0_next) * 1024);
                     int _mma_b_lo_7 = make_warp_uniform(((smem_q_lo_addr) >> 4) & 0x3FFF);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_7), "r"(tmem_tmem_s0), "r"(1));
+                    {
+                        uint64_t _mma_ss_a_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_7);
+                        uint64_t _mma_ss_b_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_7);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_7, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_7, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_7, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_7, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s0, _mma_ss_a_desc_7, _mma_ss_b_desc_7, 134479888, 1);
+                        }
+                    }
                     elect_commit(s_full_0_addr);
                     elect_commit(kv_empty_addr + (s0_next) * 8);
                     mbarrier_wait(o_empty_1_addr, _phase_o_empty_1_0);
@@ -1300,147 +1231,99 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_8 = make_warp_uniform(((((smem_v_hi_addr) >> 4) & 0x3FFF) | 0x4000000) + (s1) * 1024);
                     int _mma_b_lo_8 = make_warp_uniform((((smem_p1_addr) >> 4) & 0x3FFF) | 0x800000);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_8), "r"(tmem_tmem_o1_hi), "r"(((first_pv1) ? 0 : 1)));
+                    {
+                        uint64_t _mma_ss_a_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_8);
+                        uint64_t _mma_ss_b_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_8);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 134512656, ((first_pv1) ? 0 : 1));
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_8, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_8, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_8, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_8, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_8, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_8, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_8, _mma_ss_b_desc_8, 134512656, 1);
+                        }
+                    }
                     int _mma_a_lo_9 = make_warp_uniform(((((smem_v_lo_addr) >> 4) & 0x3FFF) | 0x4000000) + (s1) * 1024);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_8), "r"(tmem_tmem_o1_lo), "r"(((first_pv1) ? 0 : 1)));
+                    {
+                        uint64_t _mma_ss_a_desc_9 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_9);
+                        uint64_t _mma_ss_b_desc_9 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_8);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_9, _mma_ss_b_desc_9, 134512656, ((first_pv1) ? 0 : 1));
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_9, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_9, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_9, _mma_ss_b_desc_9, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_9, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_9, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_9, _mma_ss_b_desc_9, 134512656, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_9, 256U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_9, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_9, _mma_ss_b_desc_9, 134512656, 1);
+                        }
+                    }
                     elect_commit2(kv_empty_addr + (s1) * 8, o_ready_1_addr);
                     mbarrier_wait(kv_full_addr + (s1_next) * 8, 0);
                     int _mma_a_lo_10 = make_warp_uniform((((smem_kv_hi_addr) >> 4) & 0x3FFF) + (s1_next) * 1024);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_6), "r"(tmem_tmem_s1), "r"(0));
+                    {
+                        uint64_t _mma_ss_a_desc_10 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_10);
+                        uint64_t _mma_ss_b_desc_10 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_6);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_10, _mma_ss_b_desc_10, 134479888, 0);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_10, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_10, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_10, _mma_ss_b_desc_10, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_10, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_10, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_10, _mma_ss_b_desc_10, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_10, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_10, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_10, _mma_ss_b_desc_10, 134479888, 1);
+                        }
+                    }
                     int _mma_a_lo_11 = make_warp_uniform((((smem_kv_lo_addr) >> 4) & 0x3FFF) + (s1_next) * 1024);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134479888;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_11), "r"(_mma_b_lo_7), "r"(tmem_tmem_s1), "r"(1));
+                    {
+                        uint64_t _mma_ss_a_desc_11 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_11);
+                        uint64_t _mma_ss_b_desc_11 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_7);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_11, _mma_ss_b_desc_11, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_11, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_11, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_11, _mma_ss_b_desc_11, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_11, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_11, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_11, _mma_ss_b_desc_11, 134479888, 1);
+                        }
+                        incr_smem_desc_lo(_mma_ss_a_desc_11, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_11, 2U);
+                        if (elect_sync()) {
+                            tcgen05_mma_f8f6f4(tmem_tmem_s1, _mma_ss_a_desc_11, _mma_ss_b_desc_11, 134479888, 1);
+                        }
+                    }
                     elect_commit(s_full_1_addr);
                     elect_commit(kv_empty_addr + (s1_next) * 8);
                     inst0_stage = s0_next;
@@ -1458,75 +1341,51 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_a_lo_12 = make_warp_uniform(((((smem_v_hi_addr) >> 4) & 0x3FFF) | 0x4000000) + (s0_last) * 1024);
                 int _mma_b_lo_12 = make_warp_uniform((((smem_p0_addr) >> 4) & 0x3FFF) | 0x800000);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_12), "r"(_mma_b_lo_12), "r"(tmem_tmem_o0_hi), "r"(((first_pv0) ? 0 : 1)));
+                {
+                    uint64_t _mma_ss_a_desc_12 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_12);
+                    uint64_t _mma_ss_b_desc_12 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_12);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_12, _mma_ss_b_desc_12, 134512656, ((first_pv0) ? 0 : 1));
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_12, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_12, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_12, _mma_ss_b_desc_12, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_12, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_12, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_12, _mma_ss_b_desc_12, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_12, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_12, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_hi, _mma_ss_a_desc_12, _mma_ss_b_desc_12, 134512656, 1);
+                    }
+                }
                 int _mma_a_lo_13 = make_warp_uniform(((((smem_v_lo_addr) >> 4) & 0x3FFF) | 0x4000000) + (s0_last) * 1024);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_13), "r"(_mma_b_lo_12), "r"(tmem_tmem_o0_lo), "r"(((first_pv0) ? 0 : 1)));
+                {
+                    uint64_t _mma_ss_a_desc_13 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_13);
+                    uint64_t _mma_ss_b_desc_13 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_12);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_13, _mma_ss_b_desc_13, 134512656, ((first_pv0) ? 0 : 1));
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_13, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_13, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_13, _mma_ss_b_desc_13, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_13, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_13, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_13, _mma_ss_b_desc_13, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_13, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_13, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o0_lo, _mma_ss_a_desc_13, _mma_ss_b_desc_13, 134512656, 1);
+                    }
+                }
                 elect_commit2(kv_empty_addr + (s0_last) * 8, o_ready_0_addr);
                 mbarrier_wait(o_empty_1_addr, _phase_o_empty_1_0);
                 _phase_o_empty_1_0 ^= 1;
@@ -1536,75 +1395,51 @@ kernel_cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257(const __grid_constant__ CUte
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_a_lo_14 = make_warp_uniform(((((smem_v_hi_addr) >> 4) & 0x3FFF) | 0x4000000) + (s1_last) * 1024);
                 int _mma_b_lo_14 = make_warp_uniform((((smem_p1_addr) >> 4) & 0x3FFF) | 0x800000);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_14), "r"(_mma_b_lo_14), "r"(tmem_tmem_o1_hi), "r"(((first_pv1) ? 0 : 1)));
+                {
+                    uint64_t _mma_ss_a_desc_14 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_14);
+                    uint64_t _mma_ss_b_desc_14 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_14);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 134512656, ((first_pv1) ? 0 : 1));
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_14, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_14, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_14, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_14, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_14, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_14, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_hi, _mma_ss_a_desc_14, _mma_ss_b_desc_14, 134512656, 1);
+                    }
+                }
                 int _mma_a_lo_15 = make_warp_uniform(((((smem_v_lo_addr) >> 4) & 0x3FFF) | 0x4000000) + (s1_last) * 1024);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134512656;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 256;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_15), "r"(_mma_b_lo_14), "r"(tmem_tmem_o1_lo), "r"(((first_pv1) ? 0 : 1)));
+                {
+                    uint64_t _mma_ss_a_desc_15 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_15);
+                    uint64_t _mma_ss_b_desc_15 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_14);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_15, _mma_ss_b_desc_15, 134512656, ((first_pv1) ? 0 : 1));
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_15, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_15, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_15, _mma_ss_b_desc_15, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_15, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_15, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_15, _mma_ss_b_desc_15, 134512656, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_15, 256U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_15, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f8f6f4(tmem_tmem_o1_lo, _mma_ss_a_desc_15, _mma_ss_b_desc_15, 134512656, 1);
+                    }
+                }
                 elect_commit2(kv_empty_addr + (s1_last) * 8, o_ready_1_addr);
             }
             unsigned int _phase_tmem_dealloc_0 = 0;
