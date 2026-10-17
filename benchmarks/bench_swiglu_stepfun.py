@@ -246,7 +246,7 @@ def make_activations(args, tokens, backend, quant, hidden_states_scale_global=No
 
 
 # StepFun routes with Renormalize (top-k, then softmax over the selected experts):
-# the production StepFun path and tests/moe/test_cake_stepfun_fused_moe.py use it,
+# the production StepFun path and tests/experimental/test_cake_stepfun_moe_api.py use it,
 # the Cake full path serves it only (CakeStepFunRunner._check_support), and the
 # native trtllm runners accept it for every precision measured here. Both arms
 # share it so the pair compares the same routing semantics.

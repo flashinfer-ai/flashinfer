@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the build manifests of the Cake-exported packages (flashinfer-ai/flashinfer#6553).
 
-Seven packages ship generated CUDA sources under ``csrc/`` together with a build
+Eight packages ship generated CUDA sources under ``csrc/`` together with a build
 manifest ``build.json`` (schema ``cake-build/1``) -- the only record of what to
 compile -- and a byte-identical ``cake_build.py`` loader that loads the prebuilt
 library under ``aot/`` when present and otherwise JIT-builds the manifest entry
@@ -269,6 +269,12 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/dense_projection_gemm",
         "cake_jit.py",
         refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_stepfun_moe",
+        "flashinfer/experimental/cake_stepfun_moe",
+        "cake_jit.py",
+        refs_moe_grouped_gemm,
     ),
 )
 

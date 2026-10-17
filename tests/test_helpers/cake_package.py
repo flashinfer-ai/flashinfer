@@ -21,6 +21,7 @@ PACKAGES: dict[str, str] = {
     "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
     "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
+    "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",
 }
 
 
