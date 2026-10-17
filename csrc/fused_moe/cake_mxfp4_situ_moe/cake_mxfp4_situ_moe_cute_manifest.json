@@ -5671,10 +5671,10 @@
         "sha256": "d88e4987e71e51dcd69175ad6a994a18fa8603b093638c60e971c99892102455"
       },
       {
-        "bytes": 287921,
+        "bytes": 288629,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py",
-        "sha256": "0ad649cdee097f7bcce5b1684439b1a35af53887b9d8869ca7180c553b643937"
+        "sha256": "050d0623e6f8a51ab15a8a10104ac21dc44bbd6cccadada1537b1cebeede3685"
       },
       {
         "bytes": 454,
@@ -5683,10 +5683,10 @@
         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
       },
       {
-        "bytes": 68334,
+        "bytes": 73035,
         "kind": "integration",
         "path": "tests/moe/test_cake_mxfp4_situ_moe_cute.py",
-        "sha256": "1795ac89102c8234834ff706bcb05037c9f81e64d878d7c6d8658bc684356363"
+        "sha256": "39aa2005cddf136162470b2012a59594318f7d02ab29b0fff753c140a7e4ad78"
       }
     ],
     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",

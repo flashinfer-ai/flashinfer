@@ -4357,6 +4357,15 @@ class _GemmModule:
     cluster_split_grid = staticmethod(swapab_cluster_split_grid)
 
     @staticmethod
+    def pack_g1_geom(*, items_per_group: int, grid: int, split_form: bool) -> int:
+        """The plain chain's GEMM1 launch geometry packed for the finalize kernel's late-item first-box L2 prefetch
+        (decoded device-side as ``grid = g1_geom & 4095``, ``items_per_group = g1_geom >> 12 & 4095`` and
+        ``split_form = g1_geom >> 24 & 1``); 0 is the unknown geometry (nothing prefetched, same output)."""
+        if not (0 <= int(grid) <= 4095 and 0 <= int(items_per_group) <= 4095):
+            raise ValueError(f"g1_geom field out of range: grid={grid}, items_per_group={items_per_group}")
+        return int(grid) | (int(items_per_group) << 12) | (int(bool(split_form)) << 24)
+
+    @staticmethod
     def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
                     row_group_list: bool | None = None, sf_blocked: bool | None = None,
                     two_cta: bool | None = None) -> dict[str, object]:
