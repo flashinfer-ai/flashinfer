@@ -1549,6 +1549,103 @@ def test_gvr2_onecta_wave_slab_rows(rows, width, top_k, page_size, pattern):
     assert lc[3][0] == (7 * top_k) // 4, lc[3]  # aim_base
 
 
+def _r6(n):
+    """round(sqrt(6 n)), as the streaming ladders compute it."""
+    ri = math.isqrt(6 * n)
+    return ri + 1 if 6 * n - ri * ri > ri else ri
+
+
+def _sampled_runs(n, top_k, family, launcher, rows, cs):
+    """Where a streaming family samples a row of n columns, from its in-kernel
+    ladder: (start columns of the runs at the sample step and at its two
+    neighbours, which absorb the kernel's approximate reciprocals; the starts at
+    the step itself; run length; TGT). main reads runs of 8 adjacent values with
+    the launcher's ladder scalars, clus runs of 16 with its own (sfac 32, amin
+    3k, aim 2k while rows * CS fill at most one wave)."""
+    n4 = n >> 2
+    scap = launcher[2][3]
+    if family == "main":
+        aim_base, sfac, amin, _, tsh_en = launcher[3]
+        aim = max(aim_base, _r6(n))
+        if launcher[2][5] > 1:  # SPLIT parts
+            aim = max(aim, amin)
+            if tsh_en and n4 <= 32768:  # SPLIT rows of up to 131,075 columns
+                sfac *= 4
+        run, span = 8, max(n4 >> 1, 1)
+    else:
+        aim = 2 * top_k if rows * cs <= 148 else (3 * top_k) // 2
+        aim = max(aim, _r6(n), 3 * top_k)
+        sfac, run, span = 32, 16, max(n4 >> 2, 1)
+    aim = max(min(aim, scap >> 1), top_k)
+    sel = min(max(sfac * n // aim, 256), n >> 1)
+    ss2 = max(span // min(max(sel // run, 1), span), 1)
+    tgt = max(aim * (span // ss2) * run // n, 1)
+    grid = {
+        step: [run * j * step for j in range(span // step)]
+        for step in (ss2 - 1, ss2, ss2 + 1)
+        if step >= 1
+    }
+    starts = sorted({c for g in grid.values() for c in g if c < n})
+    return starts, grid[ss2], run, tgt
+
+
+def _run_columns(starts, run, n):
+    """Columns of the runs of ``run`` adjacent values at ``starts``, below n."""
+    base = torch.tensor(starts, device=_DEV).unsqueeze(1)
+    cols = (base + torch.arange(run, device=_DEV)).reshape(-1)
+    return cols[cols < n]
+
+
+def _hint_free_launcher(rows, width, top_k):
+    """The cached launcher of an unpaged hint-free decode launch (after a call)."""
+    key = (rows, width, top_k, width, 1, 1, True, None)
+    return _host._VARLEN_CACHE[key + (_host._arch_token(), _host._sm_count())]
+
+
+_MISS_CASES = [
+    # rows, width, top_k, family, page size
+    (160, 262144, 512, "main", None),  # one CTA per row, 512 threads
+    (160, 163840, 2048, "main", None),
+    (300, 131072, 1024, "main", None),  # one CTA per row, 256 threads
+    (128, 262144, 1024, "main", None),  # one CTA per row, 1024 threads
+    (4, 262144, 512, "main", None),  # SPLIT, R 32: dense-sample rows and plain ones
+    (32, 262144, 512, "clus", None),  # CS 4: solo and multi-chunk rows
+    (64, 262144, 1024, "clus", None),  # CS 2
+    (32, 262144, 1024, "clus", 64),  # paged
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,width,top_k,family,page_size", _MISS_CASES)
+def test_gvr2_sampled_rung_misses(rows, width, top_k, family, page_size):
+    """Rows whose sampled runs all land on planted high scores. The sample's
+    rank-TGT rung then sits far above the k-th score (about 3 TGT values reach
+    it) and so does the rank-2 TGT rung, so each streaming family walks its whole
+    retry ladder (rung, TSH rung, GMIN floor; SPLIT: its degenerate path), which
+    real rows now rarely reach. A self-check keeps the pattern honest if a ladder
+    changes."""
+    cols = [131075, 32771, 16389, 65543, 98307, width]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + width + top_k)
+    # build the launcher first (unpaged; the ladder does not depend on paging)
+    warm = torch.randn(rows, width, generator=gen, device=_DEV)
+    _run_gvr2(warm, seq_lens, top_k, None)
+    launcher = _hint_free_launcher(rows, width, top_k)
+    assert launcher[0] == family
+    cs = _host.route(rows, width, width, top_k, sms=_host._sm_count())["tpl"][4]
+    logits = torch.randn(rows, width, generator=gen, device=_DEV) * 0.1
+    for r, n in enumerate(n_r):
+        starts, central, run, tgt = _sampled_runs(n, top_k, family, launcher, rows, cs)
+        hi = _run_columns(starts, run, n)
+        logits[r, hi] = 4.0 + 100.0 * torch.rand(hi.numel(), generator=gen, device=_DEV)
+        logits[r, n:] = 3e38
+        # self-check at the sample step itself: its TGT-th value keeps < k values
+        rung = logits[r, _run_columns(central, run, n)].topk(tgt).values[-1]
+        assert int((logits[r, :n] >= rung).sum()) < top_k, f"row {r}: the rung keeps k"
+    _run_hard(logits, n_r, top_k, n_r, family, page_size=page_size)
+
+
 _BOUND_EDGE_CASES = [
     # rows, width, bound (tokens), top_k, cr, next_n, family at the bound
     (16, 1048576, 512, 512, 1, 1, "reg"),  # bound = top_k: every row is short
