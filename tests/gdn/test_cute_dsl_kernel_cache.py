@@ -170,6 +170,8 @@ PREFILL_BASELINE = {
     "state_dtype_str": "torch.float32",
     "HQ": 32,
     "HV": 16,
+    "head_size": 128,
+    "head_size_v": 128,
     "is_GQA": True,
     "use_initial_state": True,
     "store_final_state": True,

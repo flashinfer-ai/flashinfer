@@ -255,7 +255,7 @@ def blockwise_linear_attention(
 def delta_rule(
     q: torch.Tensor,  # [total_seq_len, num_qo_heads, head_size]
     k: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size]
-    v: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size]
+    v: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size_v]
     seq_lens: list[int],  # sequence length for each sequence
     *,
     alpha: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
@@ -271,6 +271,7 @@ def delta_rule(
     num_v_heads = v.size(1)
     num_sab_heads = max(num_q_heads, num_v_heads)
     head_size = k.size(2)
+    head_size_v = v.size(2)  # may be < head_size (rectangular state)
 
     if alpha is None:
         alpha = torch.ones(
@@ -284,9 +285,11 @@ def delta_rule(
     if num_q_heads > num_v_heads:  # GQA
         k = k.repeat_interleave(num_q_heads // num_k_heads, dim=1)
         v = v.repeat_interleave(num_q_heads // num_v_heads, dim=1)
+        num_qkv_heads = num_q_heads
     else:  # GVA
         q = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)
         k = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
+        num_qkv_heads = num_v_heads
 
     seq_offset = exclusive_cumsum(seq_lens)
     for seq_idx, seq_start in enumerate(seq_offset[:-1]):
@@ -302,7 +305,7 @@ def delta_rule(
         betas = beta[s]
 
         state_HKV = torch.zeros(
-            num_q_heads, head_size, head_size, dtype=state_dtype, device=q.device
+            num_qkv_heads, head_size, head_size_v, dtype=state_dtype, device=q.device
         )
         for i in range(seq_len):
             # var_DS where var is variable basename and DS is the dimensional semantics.
@@ -856,7 +859,7 @@ def to_logspace_Gamma_and_gamma(alpha_HS: torch.Tensor, epsilon=1e-10):
 def blockwise_delta_rule(
     q: torch.Tensor,  # [total_seq_len, num_qo_heads, head_size]
     k: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size]
-    v: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size]
+    v: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size_v]
     seq_lens: list[int],  # sequence length for each sequence
     alpha: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     beta: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
@@ -872,6 +875,10 @@ def blockwise_delta_rule(
     num_v_heads = v.size(1)
     num_sab_heads = max(num_q_heads, num_v_heads)
     head_size = q.size(2)
+    # Rectangular state: values (and hence the output) may be narrower than
+    # keys.  State is [H, K, V] here; the kernel stores it transposed as
+    # [H, V, K], so callers compare against `our_state.transpose(-1, -2)`.
+    head_size_v = v.size(2)
 
     if alpha is None:
         alpha = torch.ones(
@@ -892,14 +899,16 @@ def blockwise_delta_rule(
         k = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
 
     kv = torch.zeros(
-        (len(seq_lens), num_sab_heads, head_size, head_size),
+        (len(seq_lens), num_sab_heads, head_size, head_size_v),
         dtype=state_dtype,
         device=q.device,
     )
     if initial_state is not None:
         assert tuple(initial_state.shape) == tuple(kv.shape)
         kv.copy_(initial_state.to(state_dtype))
-    output = torch.zeros_like(q)
+    output = torch.zeros(
+        (total_seqlen, num_qkv_heads, head_size_v), dtype=q.dtype, device=q.device
+    )
 
     seq_offset = exclusive_cumsum(seq_lens)
     for seq_idx, seq_start in enumerate(seq_offset[:-1]):
@@ -928,7 +937,7 @@ def blockwise_delta_rule(
                     device=k.device,
                 )
                 v_SHV = torch.zeros(
-                    (block_size, num_qkv_heads, head_size),
+                    (block_size, num_qkv_heads, head_size_v),
                     dtype=v.dtype,
                     device=v.device,
                 )
