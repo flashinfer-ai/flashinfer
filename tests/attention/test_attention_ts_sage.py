@@ -534,14 +534,23 @@ def _anchor_headroom_log2(case: _SageCase) -> float:
     return 0.0
 
 
-def _fold(state, logits: torch.Tensor, values: torch.Tensor, headroom: float):
+def _fold(
+    state,
+    logits: torch.Tensor,
+    values: torch.Tensor,
+    headroom: float,
+    p_scale: float | None = None,
+):
     """Fold one set of columns into an online-softmax stream ``(anchor, sum, acc)``.
 
     The stream keeps its anchor while the columns raise the row maximum by at
     most ``headroom`` binades, as the kernel does. The row sum takes FP32
-    probabilities; the PV operand quantizes them to E4M3 at
-    ``E4M3_MAX * 2**-headroom`` times their ratio to the anchor.
+    probabilities; the PV operand quantizes them to E4M3 at ``p_scale`` times
+    their ratio to the anchor, by default ``E4M3_MAX * 2**-headroom``.
     """
+
+    if p_scale is None:
+        p_scale = E4M3_MAX * 2.0**-headroom
 
     if state is None:
         total = torch.zeros(logits.shape[:-1], device="cuda")
@@ -554,7 +563,7 @@ def _fold(state, logits: torch.Tensor, values: torch.Tensor, headroom: float):
         running_max.isfinite() & (lag_log2 <= headroom), running_max, new_max
     )
     anchor = torch.where(new_max.isfinite(), new_max, 0.0)
-    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * E4M3_MAX * 2.0**-headroom
+    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * p_scale
     correction = torch.exp(running_max - anchor)
     return (
         new_max,
@@ -692,19 +701,30 @@ def test_sage_matches_dequantized_reference(case: _SageCase) -> None:
     _check_case(case, *_random_inputs(case))
 
 
-def _reference_sage_scales(layout, case: _SageCase, params) -> torch.Tensor:
+def _q_row_tokens_and_heads(q_rows, rows: torch.Tensor):
+    """Map Q tile rows to (token within the tile, local Q head) in the section's order."""
+
+    if q_rows.heads_interleaved:
+        return rows // q_rows.heads_q_per_kv, rows % q_rows.heads_q_per_kv
+    return rows % q_rows.tokens_per_tile, rows // q_rows.tokens_per_tile
+
+
+def _reference_sage_scales(
+    layout, params, *, batch_size: int, num_kv_heads: int
+) -> torch.Tensor:
     """Build the prepared scales from the flat tensors as ``_SageScaleLayout`` describes them.
 
     Per sequence (batch entry and KV head): each K section's atoms in word
     order, a token past the section's length taking its last scale and
-    padding words zero; each Q tile's rows, a row past the tile's valid rows
-    repeating the last valid row's; then the ``sfV`` row and, with a mean,
-    the ``v_mean`` row.
+    padding words zero; each Q tile's rows in the section's row order, a row
+    past the sequence's end taking the last token's scale of its head; then
+    the ``sfV`` row and, with a mean, the ``v_mean`` row.
     """
 
-    batch, hkv = case.batch_size, case.num_kv_heads
+    batch, hkv = batch_size, num_kv_heads
     sequences = torch.zeros((batch, hkv, layout.sequence_words), device="cuda")
-    sources = (params.k_scale, params.k_summary_scale)[: len(layout.k_sections)]
+    sources = (params.k_scale, getattr(params, "k_summary_scale", None))
+    sources = sources[: len(layout.k_sections)]
     for section, scales in zip(layout.k_sections, sources, strict=True):
         atoms = torch.arange(section.atoms, device="cuda")[:, None]
         words = torch.arange(section.words_per_atom, device="cuda")
@@ -716,14 +736,13 @@ def _reference_sage_scales(layout, case: _SageCase, params) -> torch.Tensor:
         sequences[:, :, columns] = scales[:, slots[:, tokens]].permute(1, 0, 2, 3)
     q_rows = layout.q_rows
     tiles = torch.arange(q_rows.tiles, device="cuda")[:, None]
-    rows = torch.arange(q_rows.tile_size_q, device="cuda")
-    valid_rows = torch.tensor(
-        [q_rows.valid_rows(tile) for tile in range(q_rows.tiles)], device="cuda"
-    )[:, None]
-    rows = torch.minimum(rows, valid_rows - 1)
-    tokens = tiles * q_rows.tokens_per_tile + rows // q_rows.heads_q_per_kv
+    rows = torch.arange(q_rows.rows_per_tile, device="cuda")
+    tokens_in_tile, local_heads = _q_row_tokens_and_heads(q_rows, rows)
+    tokens = (tiles * q_rows.tokens_per_tile + tokens_in_tile).clamp(
+        max=q_rows.seq_len_q - 1
+    )
     kv_heads = torch.arange(hkv, device="cuda")[:, None, None]
-    heads = kv_heads * q_rows.heads_q_per_kv + rows % q_rows.heads_q_per_kv
+    heads = kv_heads * q_rows.heads_q_per_kv + local_heads
     slots = _scale_slots(batch, q_rows.seq_len_q, q_rows.q_block_size)
     q_words = params.q_scale[heads[None], slots[:, tokens][:, None]]
     v_rows = layout.v_rows
@@ -784,7 +803,9 @@ def test_prepared_sage_scales_match_flat_scales(case: _SageCase) -> None:
     state = wrapper._plan_state
     layout = state.sage_scales_layout
     assert layout.q_rows.tiles > 1
-    expected = _reference_sage_scales(layout, case, params)
+    expected = _reference_sage_scales(
+        layout, params, batch_size=case.batch_size, num_kv_heads=case.num_kv_heads
+    )
     assert state.sage_scales.shape == expected.shape
     assert torch.equal(state.sage_scales, expected)
 
