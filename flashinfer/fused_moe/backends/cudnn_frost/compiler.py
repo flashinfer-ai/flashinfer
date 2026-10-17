@@ -8,6 +8,7 @@ initializer in standard LLVM-dialect IR is replaced before exporting a new objec
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import functools
 import hashlib
 import json
@@ -18,12 +19,44 @@ import shlex
 import subprocess
 import tempfile
 import threading
+from typing import NamedTuple
 import warnings
 
 _ENV = "FLASHINFER_CUDNN_FROST_PTXAS"
 _FATBIN_MAGIC = b"\x50\xed\x55\xba"
 _ELF_MAGIC = b"\x7fELF"
 _EXPORT_LOCK = threading.RLock()
+
+
+class _CompilerSnapshot(NamedTuple):
+    identity: tuple[tuple[str, str], ...]
+    key: str
+
+
+_COMPILER_SCOPE: ContextVar[_CompilerSnapshot | None] = ContextVar(
+    "frost_compiler_scope", default=None
+)
+
+
+def capture_compiler_snapshot() -> _CompilerSnapshot:
+    """Freeze the selected assembler for a built engine until explicit refresh.
+
+    Source-runtime entry points keep checking their own compiler selection.
+    Only engine-owned preparation uses this snapshot instead of filesystem
+    inspection; cold compilation independently verifies the actual assembler.
+    """
+    identity = tuple(sorted(_read_compiler_identity().items()))
+    return _CompilerSnapshot(identity, _serialized_identity(identity))
+
+
+@contextmanager
+def use_compiler_snapshot(snapshot: _CompilerSnapshot):
+    """Run a cold engine preparation with its immutable compiler selection."""
+    token = _COMPILER_SCOPE.set(snapshot)
+    try:
+        yield
+    finally:
+        _COMPILER_SCOPE.reset(token)
 
 
 @functools.lru_cache(maxsize=16)
@@ -43,6 +76,13 @@ def _executable_identity(path: str, stat_key: tuple[int, ...]) -> tuple[str, str
 
 def compiler_identity() -> dict[str, str]:
     """Return the selected assembler's CPU-only, JSON-serializable identity."""
+    snapshot = _COMPILER_SCOPE.get()
+    if snapshot is not None:
+        return dict(snapshot.identity)
+    return _read_compiler_identity()
+
+
+def _read_compiler_identity() -> dict[str, str]:
     configured = os.environ.get(_ENV)
     if not configured:
         return {"backend": "bundled"}
@@ -61,10 +101,29 @@ def compiler_identity() -> dict[str, str]:
 
 def identity_key() -> str:
     """A stable cache component; the default compiler keeps its existing key."""
+    snapshot = _COMPILER_SCOPE.get()
+    if snapshot is not None:
+        return snapshot.key
     identity = compiler_identity()
-    if identity["backend"] == "bundled":
+    return _serialized_identity(tuple(sorted(identity.items())))
+
+
+@functools.lru_cache(maxsize=16)
+def _serialized_identity(identity: tuple[tuple[str, str], ...]) -> str:
+    values = dict(identity)
+    if values["backend"] == "bundled":
         return ""
-    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return json.dumps(values, sort_keys=True, separators=(",", ":"))
+
+
+def _fresh_compiler_identity() -> dict[str, str]:
+    # Compilation is a cold path that must detect changes during compilation,
+    # even when its caller is using an engine's fixed snapshot.
+    token = _COMPILER_SCOPE.set(None)
+    try:
+        return compiler_identity()
+    finally:
+        _COMPILER_SCOPE.reset(token)
 
 
 def require_moe_assembler() -> None:
@@ -72,7 +131,8 @@ def require_moe_assembler() -> None:
 
     External and bundled assemblers use the same release minimum. CUDA_HOME
     does not select the assembler; FLASHINFER_CUDNN_FROST_PTXAS does.
-    Check the actual selected stack on each admission, including cached runners.
+    Source runtimes inspect the selected stack directly. MoE engines validate
+    their fixed compiler snapshot when built or explicitly refreshed.
     """
     try:
         identity = compiler_identity()
@@ -186,10 +246,24 @@ class _ExternalCompiledKernel:
 def compile_module(module, arch: str, compiler_key: str):
     """Compile a frozen module, optionally assembling its unchanged PTX externally."""
     if not compiler_key:
-        return module.compile()
+        if _fresh_compiler_identity() != {"backend": "bundled"}:
+            raise RuntimeError(
+                "Frost assembler changed before compilation; refresh or rebuild "
+                "the MoE runner before preparing a new shape"
+            )
+        compiled = module.compile()
+        if _fresh_compiler_identity() != {"backend": "bundled"}:
+            raise RuntimeError(
+                "Frost assembler changed during compilation; refresh or rebuild "
+                "the MoE runner before preparing a new shape"
+            )
+        return compiled
     identity = json.loads(compiler_key)
-    if identity != compiler_identity():
-        raise RuntimeError("External Frost assembler changed before compilation")
+    if identity != _fresh_compiler_identity():
+        raise RuntimeError(
+            "External Frost assembler changed before compilation; refresh or "
+            "rebuild the MoE runner before preparing a new shape"
+        )
     options = getattr(module, "frost_compile_options", None)
     if not isinstance(options, str):
         raise RuntimeError(
@@ -236,8 +310,11 @@ def compile_module(module, arch: str, compiler_key: str):
                 f"External Frost PTXAS: {result.stderr.strip()}", stacklevel=2
             )
         cubin = cubin_path.read_bytes()
-        if identity != compiler_identity():
-            raise RuntimeError("External Frost assembler changed during compilation")
+        if identity != _fresh_compiler_identity():
+            raise RuntimeError(
+                "External Frost assembler changed during compilation; refresh or "
+                "rebuild the MoE runner before preparing a new shape"
+            )
         # Verify the IR contract now even when persistent export is unavailable.
         with _binary_initializer(compiled, cubin):
             pass

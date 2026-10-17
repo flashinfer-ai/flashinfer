@@ -31,7 +31,12 @@ from unittest import mock
 import pytest
 import torch
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.experimental.cake_dsa_indexer import cake_backend, cake_jit, cake_policy
+from flashinfer.experimental.cake_dsa_indexer import (
+    cake_backend,
+    cake_build,
+    cake_jit,
+    cake_policy,
+)
 from flashinfer.experimental.cake_dsa_indexer.cake_backend import (
     ABI_CONTRACT,
     CONTRACT_SCALARS,
@@ -296,13 +301,24 @@ def test_registry_records_are_well_formed():
                     or key in CONTRACT_SCALARS
                     or key in ("num_queries", "num_keys")
                 ), (role, arg)
-    root = cake_jit.__file__.rsplit("/", 1)[0] + "/csrc"
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>``
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(cake_jit.ARCHES) <= set(manifest["arch_flags"])
     for name, record in cake_jit.PROGRAMS.items():
         assert record["role"] in cake_jit.STAGES, name
         assert record["arches"] and set(record["arches"]) <= set(cake_jit.ARCHES), name
-        assert all(
-            os.path.isfile(os.path.join(root, src)) for src in record["sources"]
-        ), name
+        assert record["library"] == name
+        for arch in record["arches"]:
+            entry = libraries[f"{record['library']}_{arch}"]
+            assert entry["arch"] == arch, name
+            assert entry["sources"] and all(
+                os.path.isfile(os.path.join(package, src)) for src in entry["sources"]
+            ), name
+            assert len(entry["closure_sha256"]) == 64, name
         assert (
             len(record["launch"]["block"]) == 3
             and len(record["launch"]["cluster"]) == 3
@@ -1265,7 +1281,7 @@ def test_bind_program_orders_arguments_and_fails_closed(monkeypatch):
         "fake",
         {
             "role": "scan",
-            "sources": [],
+            "library": "fake",
             "arches": ["sm_100a"],
             "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
         },

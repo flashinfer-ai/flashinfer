@@ -392,6 +392,8 @@ class MegaMoEBf16SymmBuffer:
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     @property
     def kernel_combine_output(self) -> torch.Tensor:
@@ -402,6 +404,8 @@ class MegaMoEBf16SymmBuffer:
 
     def destroy(self) -> None:
         if not self._destroyed:
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._frontend.release()
             for root in self._sym_roots:
                 free_sym_tensor(root)
