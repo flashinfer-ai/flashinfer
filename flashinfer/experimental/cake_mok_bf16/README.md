@@ -131,6 +131,13 @@ package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The fused bindings
 which select the UMMA shared-memory descriptor address mask from
 `__CUDA_ARCH__`: 15 bits on SM107a, 14 bits otherwise) and the scheduler,
 communication and epilogue sources are shared by SM100a, SM103a and SM107a.
+Launchers of the same shape share one TU: the plain fused launcher also
+serves the `_clamped` kernel of its role, and `csrc/cake_mok_count_binding.cu`,
+`cake_mok_rows_binding.cu`, `cake_mok_pad_binding.cu`,
+`cake_mok_epilogue_2_binding.cu` and `cake_mok_epilogue_8_binding.cu` serve
+their kernel families; the entry's `nvcc_flags` name the kernel with
+`-DCAKE_MOK_KERNEL=<symbol>` (and the count/rows launch's dynamic shared
+memory with `-DCAKE_MOK_DYN_SMEM=<bytes>`).
 The MXFP8 fused kernels have target-specific schedules: SM100a/SM103a (512 tensor-memory
 columns) use 256 x 256 routed tiles with a six-stage operand ring, and SM107a
 (576 columns) uses 256 x 512 tiles that compute and save gate and up in one
