@@ -24,7 +24,9 @@ limitations under the License.
 # Gemma RMSNorm; bfloat16, NVFP4 or MXFP8 output; the quantised outputs in two
 # receive-poll variants; eps and the weight bias are compiled in).  Every
 # program is compiled for the device it runs on (sm_100a / sm_103a / sm_107a)
-# with the exact flag set below and without fast math.
+# with the exact flag set below and without fast math; a program whose device
+# code differs between those architectures keeps the difference under
+# ``__CUDA_ARCH__`` guards inside its one source file.
 
 from __future__ import annotations
 

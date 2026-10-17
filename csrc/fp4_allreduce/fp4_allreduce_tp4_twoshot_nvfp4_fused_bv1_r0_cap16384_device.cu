@@ -5478,7 +5478,11 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
             unsigned int prev_rows = ctl[1];
             unsigned int prev_algo = ctl[2];
             unsigned int pbuf = (call_1 + 2) % 3;
+#if __CUDA_ARCH__ == 1000
+            int* self_i32 = reinterpret_cast<int*>(workspace[0]);
+#else
             uint8_t* self_u8_1 = reinterpret_cast<uint8_t*>(workspace[0]);
+#endif
             int g32_1 = (int)num_bids;
             if (rows / g32_1 <= 8) {
                 asm volatile("barrier.sync 7, 352;" ::: "memory");
@@ -5486,51 +5490,115 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
             if (prev_algo == 2) {
                 long long bid64_1 = (long long)bid;
                 long long g64_1 = (long long)num_bids;
+#if __CUDA_ARCH__ == 1000
+                long long lane64 = (long long)lane_0;
+#endif
                 long long pr64 = (long long)prev_rows;
                 long long pro64 = (pr64 + 3) / 4;
                 long long pb64 = (long long)pbuf;
                 long long rs_base_1 = pb64 * 113770496;
                 long long ag_base_1 = rs_base_1 + 56885248;
+#if __CUDA_ARCH__ == 1000
+                unsigned int sv4[4];
+                unsigned int ss4[4];
+                unsigned int sr4[4];
+                sv4[0] = sv;
+                ss4[0] = ss;
+                sr4[0] = sr;
+                sv4[1] = sv;
+                ss4[1] = ss;
+                sr4[1] = sr;
+                sv4[2] = sv;
+                ss4[2] = ss;
+                sr4[2] = sr;
+                sv4[3] = sv;
+                ss4[3] = ss;
+                sr4[3] = sr;
+#else
                 int jbase = 0;
+#endif
                 long long u = pro64 * 3072 / 16;
+#if __CUDA_ARCH__ == 1000
+                long long lo = u * bid64_1 / g64_1;
+                long long hi = u * (bid64_1 + 1) / g64_1;
+                long long b64 = (long long)(int)rs_base_1;
+                long long g0 = lo + lane64;
+#else
                 long long lo = u * bid64_1 / g64_1 * 16;
                 long long hi = u * (bid64_1 + 1) / g64_1 * 16;
                 int npages = (int)((hi - lo + 4095) / 4096);
                 int i0_1 = lane_0 - jbase & 31;
                 long long pg = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_3 = g0; g_3 < hi; g_3 += 32) {
+                    long long widx = b64 + 16 * g_3 >> 2;
+#else
                 for (int i_2 = i0_1; i_2 < npages; i_2 += 32) {
                     long long o = lo + (long long)i_2 * 4096;
                     long long rem = hi - o;
                     unsigned int nb = (unsigned int)(((rem >= pg) ? pg : rem));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx)) = _iv4;
+#else
                         void* _cpbulk_dst_0 = reinterpret_cast<void*>(self_u8_1 + ((long long)(int)rs_base_1 + o));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_0), "r"(pat_addr), "r"((uint32_t)(nb))
                             : "memory");
+#endif
                     }
                 }
+#if !(__CUDA_ARCH__ == 1000)
                 jbase = jbase + npages;
+#endif
                 long long u_0 = pro64 * 384 / 16;
+#if __CUDA_ARCH__ == 1000
+                long long lo_1 = u_0 * bid64_1 / g64_1;
+                long long hi_2 = u_0 * (bid64_1 + 1) / g64_1;
+                long long b64_3 = (long long)((int)rs_base_1 + 50331648);
+                long long g0_4 = lo_1 + lane64;
+#else
                 long long lo_1 = u_0 * bid64_1 / g64_1 * 16;
                 long long hi_2 = u_0 * (bid64_1 + 1) / g64_1 * 16;
                 int npages_3 = (int)((hi_2 - lo_1 + 4095) / 4096);
                 int i0_4 = lane_0 - jbase & 31;
                 long long pg_5 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_4 = g0_4; g_4 < hi_2; g_4 += 32) {
+                    long long widx_1 = b64_3 + 16 * g_4 >> 2;
+#else
                 for (int i_3 = i0_4; i_3 < npages_3; i_3 += 32) {
                     long long o_1 = lo_1 + (long long)i_3 * 4096;
                     long long rem_1 = hi_2 - o_1;
                     unsigned int nb_1 = (unsigned int)(((rem_1 >= pg_5) ? pg_5 : rem_1));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_1)) = _iv4;
+#else
                         void* _cpbulk_dst_1 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648) + o_1));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_1), "r"(pat_addr + 4096), "r"((uint32_t)(nb_1))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_5 = pro64 * 16 / 16;
+                long long lo_6 = u_5 * bid64_1 / g64_1;
+                long long hi_7 = u_5 * (bid64_1 + 1) / g64_1;
+                long long b64_8 = (long long)((int)rs_base_1 + 56623104);
+                long long g0_9 = lo_6 + lane64;
+#else
                 jbase = jbase + npages_3;
                 long long u_6 = pro64 * 16 / 16;
                 long long lo_7 = u_6 * bid64_1 / g64_1 * 16;
@@ -5538,19 +5606,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_9 = (int)((hi_8 - lo_7 + 4095) / 4096);
                 int i0_10 = lane_0 - jbase & 31;
                 long long pg_11 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_5 = g0_9; g_5 < hi_7; g_5 += 32) {
+                    long long widx_2 = b64_8 + 16 * g_5 >> 2;
+#else
                 for (int i_4 = i0_10; i_4 < npages_9; i_4 += 32) {
                     long long o_2 = lo_7 + (long long)i_4 * 4096;
                     long long rem_2 = hi_8 - o_2;
                     unsigned int nb_2 = (unsigned int)(((rem_2 >= pg_11) ? pg_11 : rem_2));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_2)) = _iv4;
+#else
                         void* _cpbulk_dst_2 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104) + o_2));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_2), "r"(pat_addr + 8192), "r"((uint32_t)(nb_2))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_10 = pro64 * 3072 / 16;
+                long long lo_11 = u_10 * bid64_1 / g64_1;
+                long long hi_12 = u_10 * (bid64_1 + 1) / g64_1;
+                long long b64_13 = (long long)((int)rs_base_1 + 12582912);
+                long long g0_14 = lo_11 + lane64;
+#else
                 jbase = jbase + npages_9;
                 long long u_12 = pro64 * 3072 / 16;
                 long long lo_13 = u_12 * bid64_1 / g64_1 * 16;
@@ -5558,19 +5644,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_15 = (int)((hi_14 - lo_13 + 4095) / 4096);
                 int i0_16 = lane_0 - jbase & 31;
                 long long pg_17 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_6 = g0_14; g_6 < hi_12; g_6 += 32) {
+                    long long widx_3 = b64_13 + 16 * g_6 >> 2;
+#else
                 for (int i_5 = i0_16; i_5 < npages_15; i_5 += 32) {
                     long long o_3 = lo_13 + (long long)i_5 * 4096;
                     long long rem_3 = hi_14 - o_3;
                     unsigned int nb_3 = (unsigned int)(((rem_3 >= pg_17) ? pg_17 : rem_3));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_3)) = _iv4;
+#else
                         void* _cpbulk_dst_3 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 12582912) + o_3));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_3), "r"(pat_addr), "r"((uint32_t)(nb_3))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_15 = pro64 * 384 / 16;
+                long long lo_16 = u_15 * bid64_1 / g64_1;
+                long long hi_17 = u_15 * (bid64_1 + 1) / g64_1;
+                long long b64_18 = (long long)((int)rs_base_1 + 50331648 + 1572864);
+                long long g0_19 = lo_16 + lane64;
+#else
                 jbase = jbase + npages_15;
                 long long u_18 = pro64 * 384 / 16;
                 long long lo_19 = u_18 * bid64_1 / g64_1 * 16;
@@ -5578,19 +5682,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_21 = (int)((hi_20 - lo_19 + 4095) / 4096);
                 int i0_22 = lane_0 - jbase & 31;
                 long long pg_23 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_7 = g0_19; g_7 < hi_17; g_7 += 32) {
+                    long long widx_4 = b64_18 + 16 * g_7 >> 2;
+#else
                 for (int i_6 = i0_22; i_6 < npages_21; i_6 += 32) {
                     long long o_4 = lo_19 + (long long)i_6 * 4096;
                     long long rem_4 = hi_20 - o_4;
                     unsigned int nb_4 = (unsigned int)(((rem_4 >= pg_23) ? pg_23 : rem_4));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_4)) = _iv4;
+#else
                         void* _cpbulk_dst_4 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648 + 1572864) + o_4));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_4), "r"(pat_addr + 4096), "r"((uint32_t)(nb_4))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_20 = pro64 * 16 / 16;
+                long long lo_21 = u_20 * bid64_1 / g64_1;
+                long long hi_22 = u_20 * (bid64_1 + 1) / g64_1;
+                long long b64_23 = (long long)((int)rs_base_1 + 56623104 + 65536);
+                long long g0_24 = lo_21 + lane64;
+#else
                 jbase = jbase + npages_21;
                 long long u_24 = pro64 * 16 / 16;
                 long long lo_25 = u_24 * bid64_1 / g64_1 * 16;
@@ -5598,19 +5720,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_27 = (int)((hi_26 - lo_25 + 4095) / 4096);
                 int i0_28 = lane_0 - jbase & 31;
                 long long pg_29 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_8 = g0_24; g_8 < hi_22; g_8 += 32) {
+                    long long widx_5 = b64_23 + 16 * g_8 >> 2;
+#else
                 for (int i_7 = i0_28; i_7 < npages_27; i_7 += 32) {
                     long long o_5 = lo_25 + (long long)i_7 * 4096;
                     long long rem_5 = hi_26 - o_5;
                     unsigned int nb_5 = (unsigned int)(((rem_5 >= pg_29) ? pg_29 : rem_5));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_5)) = _iv4;
+#else
                         void* _cpbulk_dst_5 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104 + 65536) + o_5));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_5), "r"(pat_addr + 8192), "r"((uint32_t)(nb_5))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_25 = pro64 * 3072 / 16;
+                long long lo_26 = u_25 * bid64_1 / g64_1;
+                long long hi_27 = u_25 * (bid64_1 + 1) / g64_1;
+                long long b64_28 = (long long)((int)rs_base_1 + 25165824);
+                long long g0_29 = lo_26 + lane64;
+#else
                 jbase = jbase + npages_27;
                 long long u_30 = pro64 * 3072 / 16;
                 long long lo_31 = u_30 * bid64_1 / g64_1 * 16;
@@ -5618,19 +5758,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_33 = (int)((hi_32 - lo_31 + 4095) / 4096);
                 int i0_34 = lane_0 - jbase & 31;
                 long long pg_35 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_9 = g0_29; g_9 < hi_27; g_9 += 32) {
+                    long long widx_6 = b64_28 + 16 * g_9 >> 2;
+#else
                 for (int i_8 = i0_34; i_8 < npages_33; i_8 += 32) {
                     long long o_6 = lo_31 + (long long)i_8 * 4096;
                     long long rem_6 = hi_32 - o_6;
                     unsigned int nb_6 = (unsigned int)(((rem_6 >= pg_35) ? pg_35 : rem_6));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_6)) = _iv4;
+#else
                         void* _cpbulk_dst_6 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 25165824) + o_6));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_6), "r"(pat_addr), "r"((uint32_t)(nb_6))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_30 = pro64 * 384 / 16;
+                long long lo_31 = u_30 * bid64_1 / g64_1;
+                long long hi_32 = u_30 * (bid64_1 + 1) / g64_1;
+                long long b64_33 = (long long)((int)rs_base_1 + 50331648 + 3145728);
+                long long g0_34 = lo_31 + lane64;
+#else
                 jbase = jbase + npages_33;
                 long long u_36 = pro64 * 384 / 16;
                 long long lo_37 = u_36 * bid64_1 / g64_1 * 16;
@@ -5638,19 +5796,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_39 = (int)((hi_38 - lo_37 + 4095) / 4096);
                 int i0_40 = lane_0 - jbase & 31;
                 long long pg_41 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_10 = g0_34; g_10 < hi_32; g_10 += 32) {
+                    long long widx_7 = b64_33 + 16 * g_10 >> 2;
+#else
                 for (int i_9 = i0_40; i_9 < npages_39; i_9 += 32) {
                     long long o_7 = lo_37 + (long long)i_9 * 4096;
                     long long rem_7 = hi_38 - o_7;
                     unsigned int nb_7 = (unsigned int)(((rem_7 >= pg_41) ? pg_41 : rem_7));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_7)) = _iv4;
+#else
                         void* _cpbulk_dst_7 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648 + 3145728) + o_7));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_7), "r"(pat_addr + 4096), "r"((uint32_t)(nb_7))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_35 = pro64 * 16 / 16;
+                long long lo_36 = u_35 * bid64_1 / g64_1;
+                long long hi_37 = u_35 * (bid64_1 + 1) / g64_1;
+                long long b64_38 = (long long)((int)rs_base_1 + 56623104 + 131072);
+                long long g0_39 = lo_36 + lane64;
+#else
                 jbase = jbase + npages_39;
                 long long u_42 = pro64 * 16 / 16;
                 long long lo_43 = u_42 * bid64_1 / g64_1 * 16;
@@ -5658,19 +5834,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_45 = (int)((hi_44 - lo_43 + 4095) / 4096);
                 int i0_46 = lane_0 - jbase & 31;
                 long long pg_47 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_11 = g0_39; g_11 < hi_37; g_11 += 32) {
+                    long long widx_8 = b64_38 + 16 * g_11 >> 2;
+#else
                 for (int i_10 = i0_46; i_10 < npages_45; i_10 += 32) {
                     long long o_8 = lo_43 + (long long)i_10 * 4096;
                     long long rem_8 = hi_44 - o_8;
                     unsigned int nb_8 = (unsigned int)(((rem_8 >= pg_47) ? pg_47 : rem_8));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_8)) = _iv4;
+#else
                         void* _cpbulk_dst_8 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104 + 131072) + o_8));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_8), "r"(pat_addr + 8192), "r"((uint32_t)(nb_8))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_40 = pro64 * 3072 / 16;
+                long long lo_41 = u_40 * bid64_1 / g64_1;
+                long long hi_42 = u_40 * (bid64_1 + 1) / g64_1;
+                long long b64_43 = (long long)((int)rs_base_1 + 37748736);
+                long long g0_44 = lo_41 + lane64;
+#else
                 jbase = jbase + npages_45;
                 long long u_48 = pro64 * 3072 / 16;
                 long long lo_49 = u_48 * bid64_1 / g64_1 * 16;
@@ -5678,19 +5872,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_51 = (int)((hi_50 - lo_49 + 4095) / 4096);
                 int i0_52 = lane_0 - jbase & 31;
                 long long pg_53 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_12 = g0_44; g_12 < hi_42; g_12 += 32) {
+                    long long widx_9 = b64_43 + 16 * g_12 >> 2;
+#else
                 for (int i_11 = i0_52; i_11 < npages_51; i_11 += 32) {
                     long long o_9 = lo_49 + (long long)i_11 * 4096;
                     long long rem_9 = hi_50 - o_9;
                     unsigned int nb_9 = (unsigned int)(((rem_9 >= pg_53) ? pg_53 : rem_9));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_9)) = _iv4;
+#else
                         void* _cpbulk_dst_9 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 37748736) + o_9));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_9), "r"(pat_addr), "r"((uint32_t)(nb_9))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_45 = pro64 * 384 / 16;
+                long long lo_46 = u_45 * bid64_1 / g64_1;
+                long long hi_47 = u_45 * (bid64_1 + 1) / g64_1;
+                long long b64_48 = (long long)((int)rs_base_1 + 50331648 + 4718592);
+                long long g0_49 = lo_46 + lane64;
+#else
                 jbase = jbase + npages_51;
                 long long u_54 = pro64 * 384 / 16;
                 long long lo_55 = u_54 * bid64_1 / g64_1 * 16;
@@ -5698,19 +5910,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_57 = (int)((hi_56 - lo_55 + 4095) / 4096);
                 int i0_58 = lane_0 - jbase & 31;
                 long long pg_59 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_13 = g0_49; g_13 < hi_47; g_13 += 32) {
+                    long long widx_10 = b64_48 + 16 * g_13 >> 2;
+#else
                 for (int i_12 = i0_58; i_12 < npages_57; i_12 += 32) {
                     long long o_10 = lo_55 + (long long)i_12 * 4096;
                     long long rem_10 = hi_56 - o_10;
                     unsigned int nb_10 = (unsigned int)(((rem_10 >= pg_59) ? pg_59 : rem_10));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_10)) = _iv4;
+#else
                         void* _cpbulk_dst_10 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 50331648 + 4718592) + o_10));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_10), "r"(pat_addr + 4096), "r"((uint32_t)(nb_10))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_50 = pro64 * 16 / 16;
+                long long lo_51 = u_50 * bid64_1 / g64_1;
+                long long hi_52 = u_50 * (bid64_1 + 1) / g64_1;
+                long long b64_53 = (long long)((int)rs_base_1 + 56623104 + 196608);
+                long long g0_54 = lo_51 + lane64;
+#else
                 jbase = jbase + npages_57;
                 long long u_60 = pro64 * 16 / 16;
                 long long lo_61 = u_60 * bid64_1 / g64_1 * 16;
@@ -5718,19 +5948,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_63 = (int)((hi_62 - lo_61 + 4095) / 4096);
                 int i0_64 = lane_0 - jbase & 31;
                 long long pg_65 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_14 = g0_54; g_14 < hi_52; g_14 += 32) {
+                    long long widx_11 = b64_53 + 16 * g_14 >> 2;
+#else
                 for (int i_13 = i0_64; i_13 < npages_63; i_13 += 32) {
                     long long o_11 = lo_61 + (long long)i_13 * 4096;
                     long long rem_11 = hi_62 - o_11;
                     unsigned int nb_11 = (unsigned int)(((rem_11 >= pg_65) ? pg_65 : rem_11));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_11)) = _iv4;
+#else
                         void* _cpbulk_dst_11 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)rs_base_1 + 56623104 + 196608) + o_11));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_11), "r"(pat_addr + 8192), "r"((uint32_t)(nb_11))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_55 = pro64 * 3072 / 16;
+                long long lo_56 = u_55 * bid64_1 / g64_1;
+                long long hi_57 = u_55 * (bid64_1 + 1) / g64_1;
+                long long b64_58 = (long long)((int)ag_base_1 + 12582912);
+                long long g0_59 = lo_56 + lane64;
+#else
                 jbase = jbase + npages_63;
                 long long u_66 = pro64 * 3072 / 16;
                 long long lo_67 = u_66 * bid64_1 / g64_1 * 16;
@@ -5738,19 +5986,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_69 = (int)((hi_68 - lo_67 + 4095) / 4096);
                 int i0_70 = lane_0 - jbase & 31;
                 long long pg_71 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_15 = g0_59; g_15 < hi_57; g_15 += 32) {
+                    long long widx_12 = b64_58 + 16 * g_15 >> 2;
+#else
                 for (int i_14 = i0_70; i_14 < npages_69; i_14 += 32) {
                     long long o_12 = lo_67 + (long long)i_14 * 4096;
                     long long rem_12 = hi_68 - o_12;
                     unsigned int nb_12 = (unsigned int)(((rem_12 >= pg_71) ? pg_71 : rem_12));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_12)) = _iv4;
+#else
                         void* _cpbulk_dst_12 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 12582912) + o_12));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_12), "r"(pat_addr), "r"((uint32_t)(nb_12))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_60 = pro64 * 384 / 16;
+                long long lo_61 = u_60 * bid64_1 / g64_1;
+                long long hi_62 = u_60 * (bid64_1 + 1) / g64_1;
+                long long b64_63 = (long long)((int)ag_base_1 + 50331648 + 1572864);
+                long long g0_64 = lo_61 + lane64;
+#else
                 jbase = jbase + npages_69;
                 long long u_72 = pro64 * 384 / 16;
                 long long lo_73 = u_72 * bid64_1 / g64_1 * 16;
@@ -5758,19 +6024,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_75 = (int)((hi_74 - lo_73 + 4095) / 4096);
                 int i0_76 = lane_0 - jbase & 31;
                 long long pg_77 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_16 = g0_64; g_16 < hi_62; g_16 += 32) {
+                    long long widx_13 = b64_63 + 16 * g_16 >> 2;
+#else
                 for (int i_15 = i0_76; i_15 < npages_75; i_15 += 32) {
                     long long o_13 = lo_73 + (long long)i_15 * 4096;
                     long long rem_13 = hi_74 - o_13;
                     unsigned int nb_13 = (unsigned int)(((rem_13 >= pg_77) ? pg_77 : rem_13));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_13)) = _iv4;
+#else
                         void* _cpbulk_dst_13 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 50331648 + 1572864) + o_13));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_13), "r"(pat_addr + 4096), "r"((uint32_t)(nb_13))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_65 = pro64 * 16 / 16;
+                long long lo_66 = u_65 * bid64_1 / g64_1;
+                long long hi_67 = u_65 * (bid64_1 + 1) / g64_1;
+                long long b64_68 = (long long)((int)ag_base_1 + 56623104 + 65536);
+                long long g0_69 = lo_66 + lane64;
+#else
                 jbase = jbase + npages_75;
                 long long u_78 = pro64 * 16 / 16;
                 long long lo_79 = u_78 * bid64_1 / g64_1 * 16;
@@ -5778,19 +6062,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_81 = (int)((hi_80 - lo_79 + 4095) / 4096);
                 int i0_82 = lane_0 - jbase & 31;
                 long long pg_83 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_17 = g0_69; g_17 < hi_67; g_17 += 32) {
+                    long long widx_14 = b64_68 + 16 * g_17 >> 2;
+#else
                 for (int i_16 = i0_82; i_16 < npages_81; i_16 += 32) {
                     long long o_14 = lo_79 + (long long)i_16 * 4096;
                     long long rem_14 = hi_80 - o_14;
                     unsigned int nb_14 = (unsigned int)(((rem_14 >= pg_83) ? pg_83 : rem_14));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_14)) = _iv4;
+#else
                         void* _cpbulk_dst_14 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 56623104 + 65536) + o_14));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_14), "r"(pat_addr + 8192), "r"((uint32_t)(nb_14))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_70 = pro64 * 3072 / 16;
+                long long lo_71 = u_70 * bid64_1 / g64_1;
+                long long hi_72 = u_70 * (bid64_1 + 1) / g64_1;
+                long long b64_73 = (long long)((int)ag_base_1 + 25165824);
+                long long g0_74 = lo_71 + lane64;
+#else
                 jbase = jbase + npages_81;
                 long long u_84 = pro64 * 3072 / 16;
                 long long lo_85 = u_84 * bid64_1 / g64_1 * 16;
@@ -5798,19 +6100,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_87 = (int)((hi_86 - lo_85 + 4095) / 4096);
                 int i0_88 = lane_0 - jbase & 31;
                 long long pg_89 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_18 = g0_74; g_18 < hi_72; g_18 += 32) {
+                    long long widx_15 = b64_73 + 16 * g_18 >> 2;
+#else
                 for (int i_17 = i0_88; i_17 < npages_87; i_17 += 32) {
                     long long o_15 = lo_85 + (long long)i_17 * 4096;
                     long long rem_15 = hi_86 - o_15;
                     unsigned int nb_15 = (unsigned int)(((rem_15 >= pg_89) ? pg_89 : rem_15));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_15)) = _iv4;
+#else
                         void* _cpbulk_dst_15 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 25165824) + o_15));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_15), "r"(pat_addr), "r"((uint32_t)(nb_15))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_75 = pro64 * 384 / 16;
+                long long lo_76 = u_75 * bid64_1 / g64_1;
+                long long hi_77 = u_75 * (bid64_1 + 1) / g64_1;
+                long long b64_78 = (long long)((int)ag_base_1 + 50331648 + 3145728);
+                long long g0_79 = lo_76 + lane64;
+#else
                 jbase = jbase + npages_87;
                 long long u_90 = pro64 * 384 / 16;
                 long long lo_91 = u_90 * bid64_1 / g64_1 * 16;
@@ -5818,19 +6138,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_93 = (int)((hi_92 - lo_91 + 4095) / 4096);
                 int i0_94 = lane_0 - jbase & 31;
                 long long pg_95 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_19 = g0_79; g_19 < hi_77; g_19 += 32) {
+                    long long widx_16 = b64_78 + 16 * g_19 >> 2;
+#else
                 for (int i_18 = i0_94; i_18 < npages_93; i_18 += 32) {
                     long long o_16 = lo_91 + (long long)i_18 * 4096;
                     long long rem_16 = hi_92 - o_16;
                     unsigned int nb_16 = (unsigned int)(((rem_16 >= pg_95) ? pg_95 : rem_16));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_16)) = _iv4;
+#else
                         void* _cpbulk_dst_16 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 50331648 + 3145728) + o_16));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_16), "r"(pat_addr + 4096), "r"((uint32_t)(nb_16))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_80 = pro64 * 16 / 16;
+                long long lo_81 = u_80 * bid64_1 / g64_1;
+                long long hi_82 = u_80 * (bid64_1 + 1) / g64_1;
+                long long b64_83 = (long long)((int)ag_base_1 + 56623104 + 131072);
+                long long g0_84 = lo_81 + lane64;
+#else
                 jbase = jbase + npages_93;
                 long long u_96 = pro64 * 16 / 16;
                 long long lo_97 = u_96 * bid64_1 / g64_1 * 16;
@@ -5838,19 +6176,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_99 = (int)((hi_98 - lo_97 + 4095) / 4096);
                 int i0_100 = lane_0 - jbase & 31;
                 long long pg_101 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_20 = g0_84; g_20 < hi_82; g_20 += 32) {
+                    long long widx_17 = b64_83 + 16 * g_20 >> 2;
+#else
                 for (int i_19 = i0_100; i_19 < npages_99; i_19 += 32) {
                     long long o_17 = lo_97 + (long long)i_19 * 4096;
                     long long rem_17 = hi_98 - o_17;
                     unsigned int nb_17 = (unsigned int)(((rem_17 >= pg_101) ? pg_101 : rem_17));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_17)) = _iv4;
+#else
                         void* _cpbulk_dst_17 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 56623104 + 131072) + o_17));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_17), "r"(pat_addr + 8192), "r"((uint32_t)(nb_17))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_85 = pro64 * 3072 / 16;
+                long long lo_86 = u_85 * bid64_1 / g64_1;
+                long long hi_87 = u_85 * (bid64_1 + 1) / g64_1;
+                long long b64_88 = (long long)((int)ag_base_1 + 37748736);
+                long long g0_89 = lo_86 + lane64;
+#else
                 jbase = jbase + npages_99;
                 long long u_102 = pro64 * 3072 / 16;
                 long long lo_103 = u_102 * bid64_1 / g64_1 * 16;
@@ -5858,19 +6214,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_105 = (int)((hi_104 - lo_103 + 4095) / 4096);
                 int i0_106 = lane_0 - jbase & 31;
                 long long pg_107 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_21 = g0_89; g_21 < hi_87; g_21 += 32) {
+                    long long widx_18 = b64_88 + 16 * g_21 >> 2;
+#else
                 for (int i_20 = i0_106; i_20 < npages_105; i_20 += 32) {
                     long long o_18 = lo_103 + (long long)i_20 * 4096;
                     long long rem_18 = hi_104 - o_18;
                     unsigned int nb_18 = (unsigned int)(((rem_18 >= pg_107) ? pg_107 : rem_18));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sv4[0 + 0], sv4[0 + 1], sv4[0 + 2], sv4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_18)) = _iv4;
+#else
                         void* _cpbulk_dst_18 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 37748736) + o_18));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_18), "r"(pat_addr), "r"((uint32_t)(nb_18))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_90 = pro64 * 384 / 16;
+                long long lo_91 = u_90 * bid64_1 / g64_1;
+                long long hi_92 = u_90 * (bid64_1 + 1) / g64_1;
+                long long b64_93 = (long long)((int)ag_base_1 + 50331648 + 4718592);
+                long long g0_94 = lo_91 + lane64;
+#else
                 jbase = jbase + npages_105;
                 long long u_108 = pro64 * 384 / 16;
                 long long lo_109 = u_108 * bid64_1 / g64_1 * 16;
@@ -5878,19 +6252,37 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_111 = (int)((hi_110 - lo_109 + 4095) / 4096);
                 int i0_112 = lane_0 - jbase & 31;
                 long long pg_113 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_22 = g0_94; g_22 < hi_92; g_22 += 32) {
+                    long long widx_19 = b64_93 + 16 * g_22 >> 2;
+#else
                 for (int i_21 = i0_112; i_21 < npages_111; i_21 += 32) {
                     long long o_19 = lo_109 + (long long)i_21 * 4096;
                     long long rem_19 = hi_110 - o_19;
                     unsigned int nb_19 = (unsigned int)(((rem_19 >= pg_113) ? pg_113 : rem_19));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(ss4[0 + 0], ss4[0 + 1], ss4[0 + 2], ss4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_19)) = _iv4;
+#else
                         void* _cpbulk_dst_19 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 50331648 + 4718592) + o_19));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_19), "r"(pat_addr + 4096), "r"((uint32_t)(nb_19))
                             : "memory");
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1000
+                long long u_95 = pro64 * 16 / 16;
+                long long lo_96 = u_95 * bid64_1 / g64_1;
+                long long hi_97 = u_95 * (bid64_1 + 1) / g64_1;
+                long long b64_98 = (long long)((int)ag_base_1 + 56623104 + 196608);
+                long long g0_99 = lo_96 + lane64;
+#else
                 jbase = jbase + npages_111;
                 long long u_114 = pro64 * 16 / 16;
                 long long lo_115 = u_114 * bid64_1 / g64_1 * 16;
@@ -5898,22 +6290,35 @@ kernel_fp4_allreduce_tp4_twoshot_nvfp4_fused_bv1_r0_cap16384(uint8_t* __restrict
                 int npages_117 = (int)((hi_116 - lo_115 + 4095) / 4096);
                 int i0_118 = lane_0 - jbase & 31;
                 long long pg_119 = 4096;
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                for (long long g_23 = g0_99; g_23 < hi_97; g_23 += 32) {
+                    long long widx_20 = b64_98 + 16 * g_23 >> 2;
+#else
                 for (int i_22 = i0_118; i_22 < npages_117; i_22 += 32) {
                     long long o_20 = lo_115 + (long long)i_22 * 4096;
                     long long rem_20 = hi_116 - o_20;
                     unsigned int nb_20 = (unsigned int)(((rem_20 >= pg_119) ? pg_119 : rem_20));
+#endif
                     {
+#if __CUDA_ARCH__ == 1000
+                        int4 _iv4 = make_int4(sr4[0 + 0], sr4[0 + 1], sr4[0 + 2], sr4[0 + 3]);
+                        *reinterpret_cast<int4*>(self_i32 + (widx_20)) = _iv4;
+#else
                         void* _cpbulk_dst_20 = reinterpret_cast<void*>(self_u8_1 + ((long long)((int)ag_base_1 + 56623104 + 196608) + o_20));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_20), "r"(pat_addr + 8192), "r"((uint32_t)(nb_20))
                             : "memory");
+#endif
                     }
                 }
+#if !(__CUDA_ARCH__ == 1000)
                 jbase = jbase + npages_117;
                 asm volatile("cp.async.bulk.commit_group;");
                 asm volatile("cp.async.bulk.wait_group 0;");
+#endif
             }
             asm volatile("barrier.sync 6, 352;" ::: "memory");
         }
