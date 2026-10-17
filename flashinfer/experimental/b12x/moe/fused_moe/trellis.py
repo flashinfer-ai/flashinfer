@@ -170,7 +170,7 @@ def _effective_input_scales(
         if gains.ndim == 0:
             gains = gains.reshape(1, 1)
         elif gains.ndim == 1:
-            gains = gains.reshape(gain_experts, 1)
+            gains = gains.reshape(gain_experts, -1)
         effective = vectors * gains.unsqueeze(-1)
 
     if int(effective.shape[0]) not in (1, num_experts):
