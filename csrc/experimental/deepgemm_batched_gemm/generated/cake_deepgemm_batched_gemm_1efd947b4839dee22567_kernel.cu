@@ -17,38 +17,8 @@
 // Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
 // DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt in this directory.
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_deepgemm_batched_gemm_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
@@ -74,166 +44,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SFB_STRIDE 512
 #define SMEM_TOTAL 201984
 #define THREADS 256
-
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_mxf8_bs(
-    int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
-    int sfa_taddr, int sfb_taddr, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale"
-        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
-           "r"(enable_input_d));
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];\n\t"
-        "}\n"
-        :: "r"(mbar_addr));
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
-    const int SBO = 128;
-    return (uint64_t)(uint32_t)lo
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
-
-
-__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(
-    int taddr, uint64_t s_desc) {
-    asm volatile(
-        "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-        :: "r"(taddr), "l"(s_desc));
-}
-
-
-
-__device__ __forceinline__ void tma_3d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_store_3d(
-    const void *tmap, int x, int y, int z, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2, %3}], [%4];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(smem_addr) : "memory");
-}
-
-
-
-__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
-          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
-        : "r"(tmem_addr));
-}
-
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_deepgemm_batched_gemm_ed2c9a5f2dfe74719dc3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, unsigned int* __restrict__ SFD, unsigned int M, unsigned int grid_m, unsigned long long sfd_stride, float alpha)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+kernel_cake_deepgemm_batched_gemm_1efd947b4839dee22567(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, unsigned int* __restrict__ SFD, unsigned int M, unsigned int grid_m, unsigned long long sfd_stride, float alpha)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -261,16 +77,16 @@ kernel_cake_deepgemm_batched_gemm_ed2c9a5f2dfe74719dc3(const __grid_constant__ C
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* cd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
-    const int cd_addr = smem + 0;
-    uint8_t* a = reinterpret_cast<uint8_t*>(smem_raw + 32768);
-    const int a_addr = smem + 32768;
-    uint8_t* b = reinterpret_cast<uint8_t*>(smem_raw + 114688);
-    const int b_addr = smem + 114688;
-    unsigned int* sfa = reinterpret_cast<unsigned int*>(smem_raw + 196608);
-    const int sfa_addr = smem + 196608;
-    unsigned int* sfb = reinterpret_cast<unsigned int*>(smem_raw + 199168);
-    const int sfb_addr = smem + 199168;
+    __nv_bfloat16* cd = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_CD_OFF);
+    const int cd_addr = smem + SMEM_CD_OFF;
+    uint8_t* a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_OFF);
+    const int a_addr = smem + SMEM_A_OFF;
+    uint8_t* b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_OFF);
+    const int b_addr = smem + SMEM_B_OFF;
+    unsigned int* sfa = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFA_OFF);
+    const int sfa_addr = smem + SMEM_SFA_OFF;
+    unsigned int* sfb = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFB_OFF);
+    const int sfb_addr = smem + SMEM_SFB_OFF;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFA))) : "memory"); }
