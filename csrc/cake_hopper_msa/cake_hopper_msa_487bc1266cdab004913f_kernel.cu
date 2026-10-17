@@ -71,7 +71,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
+kernel_cake_hopper_msa_487bc1266cdab004913f(unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles, int total_q, int num_heads, int num_chunks, int fb, int fe)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -131,6 +131,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
             lim = 0;
         }
     }
+    int lim_fe = lim - fe;
     if (w == 0) {
         limc[c] = lim;
     }
@@ -308,7 +309,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key = __as_u32(sc_6) & 4294966784u | (unsigned int)t0_5;
         {
             int f = 0;
-            if ((t0_5 < fb || t0_5 >= lim - fe) && lim > t0_5) {
+            if ((t0_5 < fb || lim_fe <= t0_5) && lim > t0_5) {
                 f = 1;
             }
             if (f != 0) {
@@ -326,7 +327,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_9 = __as_u32(sc_8) & 4294966784u | (unsigned int)(t0_5 + 1);
         {
             int f_1 = 0;
-            if ((t0_5 + 1 < fb || t0_5 + 1 >= lim - fe) && lim > t0_5 + 1) {
+            if ((t0_5 + 1 < fb || lim_fe <= t0_5 + 1) && lim > t0_5 + 1) {
                 f_1 = 1;
             }
             if (f_1 != 0) {
@@ -344,7 +345,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_12 = __as_u32(sc_11) & 4294966784u | (unsigned int)(t0_5 + 2);
         {
             int f_2 = 0;
-            if ((t0_5 + 2 < fb || t0_5 + 2 >= lim - fe) && lim > t0_5 + 2) {
+            if ((t0_5 + 2 < fb || lim_fe <= t0_5 + 2) && lim > t0_5 + 2) {
                 f_2 = 1;
             }
             if (f_2 != 0) {
@@ -362,7 +363,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_15 = __as_u32(sc_14) & 4294966784u | (unsigned int)(t0_5 + 3);
         {
             int f_3 = 0;
-            if ((t0_5 + 3 < fb || t0_5 + 3 >= lim - fe) && lim > t0_5 + 3) {
+            if ((t0_5 + 3 < fb || lim_fe <= t0_5 + 3) && lim > t0_5 + 3) {
                 f_3 = 1;
             }
             if (f_3 != 0) {
@@ -380,7 +381,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_18 = __as_u32(sc_17) & 4294966784u | (unsigned int)(t0_5 + 4);
         {
             int f_4 = 0;
-            if ((t0_5 + 4 < fb || t0_5 + 4 >= lim - fe) && lim > t0_5 + 4) {
+            if ((t0_5 + 4 < fb || lim_fe <= t0_5 + 4) && lim > t0_5 + 4) {
                 f_4 = 1;
             }
             if (f_4 != 0) {
@@ -398,7 +399,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_21 = __as_u32(sc_20) & 4294966784u | (unsigned int)(t0_5 + 5);
         {
             int f_5 = 0;
-            if ((t0_5 + 5 < fb || t0_5 + 5 >= lim - fe) && lim > t0_5 + 5) {
+            if ((t0_5 + 5 < fb || lim_fe <= t0_5 + 5) && lim > t0_5 + 5) {
                 f_5 = 1;
             }
             if (f_5 != 0) {
@@ -416,7 +417,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_24 = __as_u32(sc_23) & 4294966784u | (unsigned int)(t0_5 + 6);
         {
             int f_6 = 0;
-            if ((t0_5 + 6 < fb || t0_5 + 6 >= lim - fe) && lim > t0_5 + 6) {
+            if ((t0_5 + 6 < fb || lim_fe <= t0_5 + 6) && lim > t0_5 + 6) {
                 f_6 = 1;
             }
             if (f_6 != 0) {
@@ -434,7 +435,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_27 = __as_u32(sc_26) & 4294966784u | (unsigned int)(t0_5 + 7);
         {
             int f_7 = 0;
-            if ((t0_5 + 7 < fb || t0_5 + 7 >= lim - fe) && lim > t0_5 + 7) {
+            if ((t0_5 + 7 < fb || lim_fe <= t0_5 + 7) && lim > t0_5 + 7) {
                 f_7 = 1;
             }
             if (f_7 != 0) {
@@ -452,7 +453,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_30 = __as_u32(sc_29) & 4294966784u | (unsigned int)(t0_5 + 8);
         {
             int f_8 = 0;
-            if ((t0_5 + 8 < fb || t0_5 + 8 >= lim - fe) && lim > t0_5 + 8) {
+            if ((t0_5 + 8 < fb || lim_fe <= t0_5 + 8) && lim > t0_5 + 8) {
                 f_8 = 1;
             }
             if (f_8 != 0) {
@@ -470,7 +471,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_33 = __as_u32(sc_32) & 4294966784u | (unsigned int)(t0_5 + 9);
         {
             int f_9 = 0;
-            if ((t0_5 + 9 < fb || t0_5 + 9 >= lim - fe) && lim > t0_5 + 9) {
+            if ((t0_5 + 9 < fb || lim_fe <= t0_5 + 9) && lim > t0_5 + 9) {
                 f_9 = 1;
             }
             if (f_9 != 0) {
@@ -488,7 +489,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_36 = __as_u32(sc_35) & 4294966784u | (unsigned int)(t0_5 + 10);
         {
             int f_10 = 0;
-            if ((t0_5 + 10 < fb || t0_5 + 10 >= lim - fe) && lim > t0_5 + 10) {
+            if ((t0_5 + 10 < fb || lim_fe <= t0_5 + 10) && lim > t0_5 + 10) {
                 f_10 = 1;
             }
             if (f_10 != 0) {
@@ -506,7 +507,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_39 = __as_u32(sc_38) & 4294966784u | (unsigned int)(t0_5 + 11);
         {
             int f_11 = 0;
-            if ((t0_5 + 11 < fb || t0_5 + 11 >= lim - fe) && lim > t0_5 + 11) {
+            if ((t0_5 + 11 < fb || lim_fe <= t0_5 + 11) && lim > t0_5 + 11) {
                 f_11 = 1;
             }
             if (f_11 != 0) {
@@ -524,7 +525,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_42 = __as_u32(sc_41) & 4294966784u | (unsigned int)(t0_5 + 12);
         {
             int f_12 = 0;
-            if ((t0_5 + 12 < fb || t0_5 + 12 >= lim - fe) && lim > t0_5 + 12) {
+            if ((t0_5 + 12 < fb || lim_fe <= t0_5 + 12) && lim > t0_5 + 12) {
                 f_12 = 1;
             }
             if (f_12 != 0) {
@@ -542,7 +543,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_45 = __as_u32(sc_44) & 4294966784u | (unsigned int)(t0_5 + 13);
         {
             int f_13 = 0;
-            if ((t0_5 + 13 < fb || t0_5 + 13 >= lim - fe) && lim > t0_5 + 13) {
+            if ((t0_5 + 13 < fb || lim_fe <= t0_5 + 13) && lim > t0_5 + 13) {
                 f_13 = 1;
             }
             if (f_13 != 0) {
@@ -560,7 +561,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_48 = __as_u32(sc_47) & 4294966784u | (unsigned int)(t0_5 + 14);
         {
             int f_14 = 0;
-            if ((t0_5 + 14 < fb || t0_5 + 14 >= lim - fe) && lim > t0_5 + 14) {
+            if ((t0_5 + 14 < fb || lim_fe <= t0_5 + 14) && lim > t0_5 + 14) {
                 f_14 = 1;
             }
             if (f_14 != 0) {
@@ -578,7 +579,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
         unsigned int key_51 = __as_u32(sc_50) & 4294966784u | (unsigned int)(t0_5 + 15);
         {
             int f_15 = 0;
-            if ((t0_5 + 15 < fb || t0_5 + 15 >= lim - fe) && lim > t0_5 + 15) {
+            if ((t0_5 + 15 < fb || lim_fe <= t0_5 + 15) && lim > t0_5 + 15) {
                 f_15 = 1;
             }
             if (f_15 != 0) {
@@ -2003,6 +2004,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
             unsigned int qf7 = qc;
             float qff = __uint_as_float(qf7);
             int limv = limc[fc7];
+            int limv_fe = limv - fe;
             long long cbase2 = (long long)head * (long long)tiles * nq64 + (long long)(blockIdx.x + fc7);
             int lane_1 = tid_1 & 31;
             unsigned int bb[16];
@@ -2360,7 +2362,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8 = 536870912 | lowb8 << 9 | (unsigned int)t4_4_16;
                 }
                 int f2 = 0;
-                if ((t4_4_16 < fb || t4_4_16 >= limv - fe) && t4_4_16 < limv) {
+                if ((t4_4_16 < fb || t4_4_16 >= limv_fe) && t4_4_16 < limv) {
                     f2 = 1;
                 }
                 if (f2 != 0) {
@@ -2400,7 +2402,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_1 = 536870912 | lowb8_1 << 9 | (unsigned int)t4_4_17;
                 }
                 int f2_1 = 0;
-                if ((t4_4_17 < fb || t4_4_17 >= limv - fe) && t4_4_17 < limv) {
+                if ((t4_4_17 < fb || t4_4_17 >= limv_fe) && t4_4_17 < limv) {
                     f2_1 = 1;
                 }
                 if (f2_1 != 0) {
@@ -2440,7 +2442,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_2 = 536870912 | lowb8_2 << 9 | (unsigned int)t4_4_18;
                 }
                 int f2_2 = 0;
-                if ((t4_4_18 < fb || t4_4_18 >= limv - fe) && t4_4_18 < limv) {
+                if ((t4_4_18 < fb || t4_4_18 >= limv_fe) && t4_4_18 < limv) {
                     f2_2 = 1;
                 }
                 if (f2_2 != 0) {
@@ -2480,7 +2482,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_3 = 536870912 | lowb8_3 << 9 | (unsigned int)t4_4_19;
                 }
                 int f2_3 = 0;
-                if ((t4_4_19 < fb || t4_4_19 >= limv - fe) && t4_4_19 < limv) {
+                if ((t4_4_19 < fb || t4_4_19 >= limv_fe) && t4_4_19 < limv) {
                     f2_3 = 1;
                 }
                 if (f2_3 != 0) {
@@ -2520,7 +2522,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_4 = 536870912 | lowb8_4 << 9 | (unsigned int)t4_4_20;
                 }
                 int f2_4 = 0;
-                if ((t4_4_20 < fb || t4_4_20 >= limv - fe) && t4_4_20 < limv) {
+                if ((t4_4_20 < fb || t4_4_20 >= limv_fe) && t4_4_20 < limv) {
                     f2_4 = 1;
                 }
                 if (f2_4 != 0) {
@@ -2560,7 +2562,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_5 = 536870912 | lowb8_5 << 9 | (unsigned int)t4_4_21;
                 }
                 int f2_5 = 0;
-                if ((t4_4_21 < fb || t4_4_21 >= limv - fe) && t4_4_21 < limv) {
+                if ((t4_4_21 < fb || t4_4_21 >= limv_fe) && t4_4_21 < limv) {
                     f2_5 = 1;
                 }
                 if (f2_5 != 0) {
@@ -2600,7 +2602,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_6 = 536870912 | lowb8_6 << 9 | (unsigned int)t4_4_22;
                 }
                 int f2_6 = 0;
-                if ((t4_4_22 < fb || t4_4_22 >= limv - fe) && t4_4_22 < limv) {
+                if ((t4_4_22 < fb || t4_4_22 >= limv_fe) && t4_4_22 < limv) {
                     f2_6 = 1;
                 }
                 if (f2_6 != 0) {
@@ -2640,7 +2642,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_7 = 536870912 | lowb8_7 << 9 | (unsigned int)t4_4_23;
                 }
                 int f2_7 = 0;
-                if ((t4_4_23 < fb || t4_4_23 >= limv - fe) && t4_4_23 < limv) {
+                if ((t4_4_23 < fb || t4_4_23 >= limv_fe) && t4_4_23 < limv) {
                     f2_7 = 1;
                 }
                 if (f2_7 != 0) {
@@ -2680,7 +2682,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_8 = 536870912 | lowb8_8 << 9 | (unsigned int)t4_4_24;
                 }
                 int f2_8 = 0;
-                if ((t4_4_24 < fb || t4_4_24 >= limv - fe) && t4_4_24 < limv) {
+                if ((t4_4_24 < fb || t4_4_24 >= limv_fe) && t4_4_24 < limv) {
                     f2_8 = 1;
                 }
                 if (f2_8 != 0) {
@@ -2720,7 +2722,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_9 = 536870912 | lowb8_9 << 9 | (unsigned int)t4_4_25;
                 }
                 int f2_9 = 0;
-                if ((t4_4_25 < fb || t4_4_25 >= limv - fe) && t4_4_25 < limv) {
+                if ((t4_4_25 < fb || t4_4_25 >= limv_fe) && t4_4_25 < limv) {
                     f2_9 = 1;
                 }
                 if (f2_9 != 0) {
@@ -2760,7 +2762,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_10 = 536870912 | lowb8_10 << 9 | (unsigned int)t4_4_26;
                 }
                 int f2_10 = 0;
-                if ((t4_4_26 < fb || t4_4_26 >= limv - fe) && t4_4_26 < limv) {
+                if ((t4_4_26 < fb || t4_4_26 >= limv_fe) && t4_4_26 < limv) {
                     f2_10 = 1;
                 }
                 if (f2_10 != 0) {
@@ -2800,7 +2802,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_11 = 536870912 | lowb8_11 << 9 | (unsigned int)t4_4_27;
                 }
                 int f2_11 = 0;
-                if ((t4_4_27 < fb || t4_4_27 >= limv - fe) && t4_4_27 < limv) {
+                if ((t4_4_27 < fb || t4_4_27 >= limv_fe) && t4_4_27 < limv) {
                     f2_11 = 1;
                 }
                 if (f2_11 != 0) {
@@ -2840,7 +2842,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_12 = 536870912 | lowb8_12 << 9 | (unsigned int)t4_4_28;
                 }
                 int f2_12 = 0;
-                if ((t4_4_28 < fb || t4_4_28 >= limv - fe) && t4_4_28 < limv) {
+                if ((t4_4_28 < fb || t4_4_28 >= limv_fe) && t4_4_28 < limv) {
                     f2_12 = 1;
                 }
                 if (f2_12 != 0) {
@@ -2880,7 +2882,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_13 = 536870912 | lowb8_13 << 9 | (unsigned int)t4_4_29;
                 }
                 int f2_13 = 0;
-                if ((t4_4_29 < fb || t4_4_29 >= limv - fe) && t4_4_29 < limv) {
+                if ((t4_4_29 < fb || t4_4_29 >= limv_fe) && t4_4_29 < limv) {
                     f2_13 = 1;
                 }
                 if (f2_13 != 0) {
@@ -2920,7 +2922,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_14 = 536870912 | lowb8_14 << 9 | (unsigned int)t4_4_30;
                 }
                 int f2_14 = 0;
-                if ((t4_4_30 < fb || t4_4_30 >= limv - fe) && t4_4_30 < limv) {
+                if ((t4_4_30 < fb || t4_4_30 >= limv_fe) && t4_4_30 < limv) {
                     f2_14 = 1;
                 }
                 if (f2_14 != 0) {
@@ -2960,7 +2962,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     key8_15 = 536870912 | lowb8_15 << 9 | (unsigned int)t4_4_31;
                 }
                 int f2_15 = 0;
-                if ((t4_4_31 < fb || t4_4_31 >= limv - fe) && t4_4_31 < limv) {
+                if ((t4_4_31 < fb || t4_4_31 >= limv_fe) && t4_4_31 < limv) {
                     f2_15 = 1;
                 }
                 if (f2_15 != 0) {
@@ -3276,7 +3278,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u = __as_u32(sc_8_1);
                     unsigned int cls = u & 4294966784u;
                     int f_16 = 0;
-                    if ((t0_7 < fb || t0_7 >= lim - fe) && lim > t0_7) {
+                    if ((t0_7 < fb || lim_fe <= t0_7) && lim > t0_7) {
                         f_16 = 1;
                     }
                     if (f_16 != 0) {
@@ -3301,7 +3303,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_11 = __as_u32(sc_10_1);
                     unsigned int cls_12 = u_11 & 4294966784u;
                     int f_13_1 = 0;
-                    if ((t0_7 + 1 < fb || t0_7 + 1 >= lim - fe) && lim > t0_7 + 1) {
+                    if ((t0_7 + 1 < fb || lim_fe <= t0_7 + 1) && lim > t0_7 + 1) {
                         f_13_1 = 1;
                     }
                     if (f_13_1 != 0) {
@@ -3326,7 +3328,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_17 = __as_u32(sc_16_1);
                     unsigned int cls_18 = u_17 & 4294966784u;
                     int f_19 = 0;
-                    if ((t0_7 + 2 < fb || t0_7 + 2 >= lim - fe) && lim > t0_7 + 2) {
+                    if ((t0_7 + 2 < fb || lim_fe <= t0_7 + 2) && lim > t0_7 + 2) {
                         f_19 = 1;
                     }
                     if (f_19 != 0) {
@@ -3351,7 +3353,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_23 = __as_u32(sc_22_1);
                     unsigned int cls_24 = u_23 & 4294966784u;
                     int f_25 = 0;
-                    if ((t0_7 + 3 < fb || t0_7 + 3 >= lim - fe) && lim > t0_7 + 3) {
+                    if ((t0_7 + 3 < fb || lim_fe <= t0_7 + 3) && lim > t0_7 + 3) {
                         f_25 = 1;
                     }
                     if (f_25 != 0) {
@@ -3376,7 +3378,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_29 = __as_u32(sc_28_1);
                     unsigned int cls_30 = u_29 & 4294966784u;
                     int f_31 = 0;
-                    if ((t0_7 + 4 < fb || t0_7 + 4 >= lim - fe) && lim > t0_7 + 4) {
+                    if ((t0_7 + 4 < fb || lim_fe <= t0_7 + 4) && lim > t0_7 + 4) {
                         f_31 = 1;
                     }
                     if (f_31 != 0) {
@@ -3401,7 +3403,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_35 = __as_u32(sc_34_1);
                     unsigned int cls_36 = u_35 & 4294966784u;
                     int f_37 = 0;
-                    if ((t0_7 + 5 < fb || t0_7 + 5 >= lim - fe) && lim > t0_7 + 5) {
+                    if ((t0_7 + 5 < fb || lim_fe <= t0_7 + 5) && lim > t0_7 + 5) {
                         f_37 = 1;
                     }
                     if (f_37 != 0) {
@@ -3426,7 +3428,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_41 = __as_u32(sc_40_1);
                     unsigned int cls_42 = u_41 & 4294966784u;
                     int f_43 = 0;
-                    if ((t0_7 + 6 < fb || t0_7 + 6 >= lim - fe) && lim > t0_7 + 6) {
+                    if ((t0_7 + 6 < fb || lim_fe <= t0_7 + 6) && lim > t0_7 + 6) {
                         f_43 = 1;
                     }
                     if (f_43 != 0) {
@@ -3451,7 +3453,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_47 = __as_u32(sc_46_1);
                     unsigned int cls_48 = u_47 & 4294966784u;
                     int f_49 = 0;
-                    if ((t0_7 + 7 < fb || t0_7 + 7 >= lim - fe) && lim > t0_7 + 7) {
+                    if ((t0_7 + 7 < fb || lim_fe <= t0_7 + 7) && lim > t0_7 + 7) {
                         f_49 = 1;
                     }
                     if (f_49 != 0) {
@@ -3476,7 +3478,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_53 = __as_u32(sc_52);
                     unsigned int cls_54 = u_53 & 4294966784u;
                     int f_55 = 0;
-                    if ((t0_7 + 8 < fb || t0_7 + 8 >= lim - fe) && lim > t0_7 + 8) {
+                    if ((t0_7 + 8 < fb || lim_fe <= t0_7 + 8) && lim > t0_7 + 8) {
                         f_55 = 1;
                     }
                     if (f_55 != 0) {
@@ -3501,7 +3503,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_59 = __as_u32(sc_58);
                     unsigned int cls_60 = u_59 & 4294966784u;
                     int f_61 = 0;
-                    if ((t0_7 + 9 < fb || t0_7 + 9 >= lim - fe) && lim > t0_7 + 9) {
+                    if ((t0_7 + 9 < fb || lim_fe <= t0_7 + 9) && lim > t0_7 + 9) {
                         f_61 = 1;
                     }
                     if (f_61 != 0) {
@@ -3526,7 +3528,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_65 = __as_u32(sc_64);
                     unsigned int cls_66 = u_65 & 4294966784u;
                     int f_67 = 0;
-                    if ((t0_7 + 10 < fb || t0_7 + 10 >= lim - fe) && lim > t0_7 + 10) {
+                    if ((t0_7 + 10 < fb || lim_fe <= t0_7 + 10) && lim > t0_7 + 10) {
                         f_67 = 1;
                     }
                     if (f_67 != 0) {
@@ -3551,7 +3553,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_71 = __as_u32(sc_70);
                     unsigned int cls_72 = u_71 & 4294966784u;
                     int f_73 = 0;
-                    if ((t0_7 + 11 < fb || t0_7 + 11 >= lim - fe) && lim > t0_7 + 11) {
+                    if ((t0_7 + 11 < fb || lim_fe <= t0_7 + 11) && lim > t0_7 + 11) {
                         f_73 = 1;
                     }
                     if (f_73 != 0) {
@@ -3576,7 +3578,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_77 = __as_u32(sc_76);
                     unsigned int cls_78 = u_77 & 4294966784u;
                     int f_79 = 0;
-                    if ((t0_7 + 12 < fb || t0_7 + 12 >= lim - fe) && lim > t0_7 + 12) {
+                    if ((t0_7 + 12 < fb || lim_fe <= t0_7 + 12) && lim > t0_7 + 12) {
                         f_79 = 1;
                     }
                     if (f_79 != 0) {
@@ -3601,7 +3603,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_83 = __as_u32(sc_82);
                     unsigned int cls_84 = u_83 & 4294966784u;
                     int f_85 = 0;
-                    if ((t0_7 + 13 < fb || t0_7 + 13 >= lim - fe) && lim > t0_7 + 13) {
+                    if ((t0_7 + 13 < fb || lim_fe <= t0_7 + 13) && lim > t0_7 + 13) {
                         f_85 = 1;
                     }
                     if (f_85 != 0) {
@@ -3626,7 +3628,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_89 = __as_u32(sc_88);
                     unsigned int cls_90 = u_89 & 4294966784u;
                     int f_91 = 0;
-                    if ((t0_7 + 14 < fb || t0_7 + 14 >= lim - fe) && lim > t0_7 + 14) {
+                    if ((t0_7 + 14 < fb || lim_fe <= t0_7 + 14) && lim > t0_7 + 14) {
                         f_91 = 1;
                     }
                     if (f_91 != 0) {
@@ -3651,7 +3653,7 @@ kernel_cake_hopper_msa_f79990ff9491edd0fb17(unsigned int* __restrict__ S, int* _
                     unsigned int u_95 = __as_u32(sc_94);
                     unsigned int cls_96 = u_95 & 4294966784u;
                     int f_97 = 0;
-                    if ((t0_7 + 15 < fb || t0_7 + 15 >= lim - fe) && lim > t0_7 + 15) {
+                    if ((t0_7 + 15 < fb || lim_fe <= t0_7 + 15) && lim > t0_7 + 15) {
                         f_97 = 1;
                     }
                     if (f_97 != 0) {
