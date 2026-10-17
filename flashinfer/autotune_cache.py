@@ -340,6 +340,17 @@ class ManagedAutotuneCache:
             self._missing.add(file_key)
             return None
 
+    def discard(self, file_key: str) -> None:
+        """Forget an entry before collective re-profiling (best-effort)."""
+        self._hits.pop(file_key, None)
+        self._missing.add(file_key)
+        try:
+            self._entry_path(file_key).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(
+                f"[Autotuner]: Failed to remove managed cache entry {file_key}: {e}"
+            )
+
     def publish(
         self,
         file_key: str,
@@ -558,6 +569,7 @@ def autotune_v2_reload() -> None:
     tuner = AutoTuner.get()
     with tuner._lock:
         tuner.profiling_cache.clear()
+        tuner._ranked_tactics_cache.clear()
         tuner._winner_partitions.clear()
         tuner._profiling_cache_policies.clear()
         tuner._managed_decoded.clear()

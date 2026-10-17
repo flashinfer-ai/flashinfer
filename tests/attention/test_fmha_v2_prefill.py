@@ -11,6 +11,10 @@ from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_p
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported
 
+
+# H100 CI peak GPU memory: 34.7 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
 _WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _workspace_buffer: Optional[torch.Tensor] = None
 

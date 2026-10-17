@@ -514,8 +514,13 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
 {
+    // TMA descriptors are __grid_constant__ parameters (captured by value in
+    // CUDA graphs); the kernel addresses them through the param space.
+    CakeFmhaTensorMap const* Q = &Q_tmap;
+    CakeFmhaTensorMap const* K = &K_tmap;
+    CakeFmhaTensorMap const* V = &V_tmap;
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -543,11 +548,6 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(Q)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(K)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(V)) : "memory");
-    }
     __syncthreads();
 
 
@@ -731,10 +731,6 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
                     float _exp2_0 = approx_exp2(softmax_scale_log2 * (row_max - new_max));
                     acc_scale = _exp2_0;
                 }
-                if (quarter == 0) {
-                    smem_scale[sm_stage * 64 + my_col] = acc_scale;
-                }
-                mbarrier_arrive(corr_scale_addr);
                 float safe_max = ((new_max == -CAKE_FMHA_INF) ? 0.0f : new_max);
                 float p_vals[16];
                 float lsum = 0.0f;
@@ -749,6 +745,14 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
                 row_max = new_max;
                 mbarrier_wait(p_empty_addr, _phase_p_empty_0);
                 _phase_p_empty_0 ^= 1;
+                // Publish the rescale factor only after PV(n-1) retired: PV(n-1)
+                // needs the correction warps' p_full arrival for n-1, so softmax can
+                // never complete two corr_scale phases ahead of a correction wait
+                // (mbarrier parity would alias and deadlock the CTA).
+                if (quarter == 0) {
+                    smem_scale[sm_stage * 64 + my_col] = acc_scale;
+                }
+                mbarrier_arrive(corr_scale_addr);
                 int k_run = 0;
                 unsigned int regs_p[4];
                 #pragma unroll

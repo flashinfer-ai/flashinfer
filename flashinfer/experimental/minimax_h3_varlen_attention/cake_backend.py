@@ -79,6 +79,32 @@ Two program families share this package:
   one the plan needs with that program's parameter set
   (:func:`nvfp4_attention_stage`).
 
+The BF16 route also carries several programs per architecture (round 13 of
+the Cake kernel): three retraces of one Weave body with identical outputs --
+``attention`` (the static persistent schedule), ``attention_dyn`` (the dynamic
+whole-unit ticket scheduler: the first wave stays static, then the leader
+CTA's load warp draws the cluster's next unit from a per-plan ticket counter
+one unit ahead of its use; units are handed out in the LPT slot order, so
+only a unit's cluster changes) and, on ``BF16_SREAD_ARCHES`` (sm_100a) only,
+``attention_sread`` (the stage-0 cross-stage read wait issued before every P
+store, no per-block guard on the publish tail).
+:func:`build_bf16_segment_plan` decides from the plan numbers alone
+(``plan.dyn_sched``: at least ``BF16_DYN_SCHED_MIN_WAVES`` waves and
+``BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS`` stage-weighted K/V blocks in every
+cluster's static share, then at least ``BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER``
+units per cluster or a static cluster imbalance above the cheapest unit;
+``plan.sread_unified`` is its complement) and
+:func:`prepare_minimax_h3_varlen_attention` binds that one program
+(``runner.attention_stage``, ``route_metadata["attention_variant"]``).  Every
+BF16 ``unit_table`` carries one more zero record after the ``num_clusters``
+prefetch padding: word 0 is the ticket counter, which the kernel resets at
+the end of every launch, so a cached plan needs no host memset.  The
+``attention_dyn`` program also uses word 6 of padding record ``c`` as
+cluster ``c``'s ticket mailbox and leaves the terminal ticket there, so
+the padding of a launched plan is launch state, not zeros.  Launches of
+one plan are stream-ordered (the plan cache keys the stream); never launch
+one cached plan concurrently from two streams.
+
 See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 """
 
@@ -94,6 +120,7 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    BF16_SREAD_ARCHES,
     MODULES,
     STAGES,
     load_cake_minimax_h3_varlen_attention_module,
@@ -150,6 +177,25 @@ BF16_Q_SPLIT_MIN_GAIN = 0.005
 # next unit).
 UNIT_WORDS = 8
 COMBINE_WORDS = 4
+# Per-plan BF16 program dispatch (mirrors the Cake production planner's
+# ``dyn_sched_for_records`` / ``sread_unified_for_plan``, round 13): a plan
+# binds the dynamic whole-unit ticket scheduler (``attention_dyn``) when it
+# has at least ``BF16_DYN_SCHED_MIN_WAVES`` waves and every cluster's static
+# share is at least ``BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS`` stage-weighted K/V
+# blocks (a two-stage unit counts its blocks twice) and then either the
+# fullest cluster runs at least ``BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER`` units
+# or the static LPT order is provably not makespan-optimal (its cluster
+# imbalance ``W_max - W_min`` exceeds the cheapest unit's weight).  The ticket
+# chain costs a fixed ~2.5 us at a cluster's first unit, so one-wave plans and
+# plans of many small units keep the static schedule.  Every other plan
+# records ``sread_unified`` and binds ``attention_sread`` on
+# ``BF16_SREAD_ARCHES`` (``cake_jit``).
+BF16_DYN_SCHED_MIN_WAVES = 2
+BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS = 8192
+BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER = 64
+# Rows of one CTA's Q stage: a unit with at most this many valid rows from its
+# first row runs a single stage (the kernel's record decode, ``two_stages``).
+CTA_Q_ROWS = CLUSTER_Q_ROWS // 2
 PARTIAL_ROWS = CLUSTER_Q_ROWS  # FP16 rows per partial slot (one cluster's Q rows)
 MAX_KV_SPLITS = 8
 MAX_KV_BLOCKS = 1 << 16
@@ -358,7 +404,14 @@ class BF16SegmentPlan:
     two reserved words -- in slot order: unit ``u`` of the table runs on
     cluster ``u % num_clusters`` as its ``u // num_clusters``-th unit (see
     :func:`assign_unit_slots`), followed by ``num_clusters`` zero records (the
-    kernel's one-unit-ahead record prefetch).  ``total_tiles`` counts scheduled
+    kernel's one-unit-ahead record prefetch; the ``attention_dyn`` program uses
+    word 6 of padding record ``c`` as cluster ``c``'s ticket mailbox and leaves
+    the terminal ticket there) and one more zero record whose word 0 is the
+    dynamic scheduler's ticket counter (reset by the kernel at the end of
+    every launch).  ``dyn_sched`` / ``sread_unified`` record which
+    attention program the plan binds (``BF16_DYN_SCHED_MIN_WAVES`` and
+    below; ``sread_unified`` applies on ``BF16_SREAD_ARCHES`` only, see
+    :func:`bf16_attention_stage`).  ``total_tiles`` counts scheduled
     units (K/V ranges and Q-split halves included; ``num_q_split_units`` counts
     the halved units); ``combine_table`` holds ``COMBINE_WORDS`` int32
     per split (segment, head, cluster) unit and ``partial_O`` / ``partial_ML``
@@ -381,6 +434,8 @@ class BF16SegmentPlan:
     num_combine_units: int
     max_kv_splits: int
     num_q_split_units: int
+    dyn_sched: bool
+    sread_unified: bool
 
 
 @functools.cache
@@ -606,6 +661,64 @@ def bf16_choose_q_splits(
     return flags
 
 
+def bf16_unit_weights(table: Sequence[int]) -> list[int]:
+    """Per-slot stage-weighted K/V blocks of a unit table (a two-stage unit counts its blocks twice).
+
+    Mirrors the Cake planner's ``unit_weights``: ``two_stages`` is the kernel's record decode
+    (``q_half == 0`` and more than ``CTA_Q_ROWS`` valid rows from the unit's first row).
+    """
+    weights: list[int] = []
+    for slot in range(len(table) // UNIT_WORDS):
+        words = table[slot * UNIT_WORDS : (slot + 1) * UNIT_WORDS]
+        seg_len, c, kv_blocks, q_half = (
+            words[1],
+            words[2] & 0xFFFF,
+            words[3] & 0xFFFF,
+            words[5],
+        )
+        unit_row0 = c * CLUSTER_Q_ROWS + (q_half >> 1) * CTA_Q_ROWS
+        two_stages = q_half == 0 and seg_len - unit_row0 > CTA_Q_ROWS
+        weights.append(kv_blocks * (2 if two_stages else 1))
+    return weights
+
+
+def bf16_cluster_work(table: Sequence[int], num_clusters: int) -> list[int]:
+    """Per-cluster work of the static slot order (slot ``k * G + i`` is unit ``k`` of cluster ``i``)."""
+    G = max(1, int(num_clusters))
+    work = [0] * G
+    for slot, weight in enumerate(bf16_unit_weights(table)):
+        work[slot % G] += weight
+    return work
+
+
+def bf16_dyn_sched(table: Sequence[int], total_tiles: int, num_clusters: int) -> bool:
+    """Whether a plan binds the dynamic whole-unit ticket scheduler (mirrors ``dyn_sched_for_records``).
+
+    ``table`` holds the ``total_tiles`` scheduled unit records (no padding records).
+    """
+    total_tiles, num_clusters = int(total_tiles), int(num_clusters)
+    if num_clusters <= 0 or total_tiles < BF16_DYN_SCHED_MIN_WAVES * num_clusters:
+        return False
+    weights = bf16_unit_weights(table)
+    work = [0] * num_clusters
+    for slot, weight in enumerate(weights):
+        work[slot % num_clusters] += weight
+    if min(work) < BF16_DYN_SCHED_MIN_CLUSTER_BLOCKS:
+        return False
+    if -(-total_tiles // num_clusters) >= BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER:
+        return True
+    return max(work) - min(work) > min(weights)
+
+
+def bf16_attention_stage(plan: "BF16SegmentPlan", arch: str) -> str:
+    """The attention program ``plan`` binds on ``arch``: ``attention_dyn``, ``attention_sread`` or ``attention``."""
+    if plan.dyn_sched:
+        return "attention_dyn"
+    if plan.sread_unified and arch in BF16_SREAD_ARCHES:
+        return "attention_sread"
+    return "attention"
+
+
 def build_bf16_segment_plan(
     cu_seqlens: Union[torch.Tensor, Sequence[int]],
     device: torch.device,
@@ -724,6 +837,8 @@ def build_bf16_segment_plan(
             )
         )
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
+    # Per-plan program dispatch from the scheduled records (see ``bf16_dyn_sched``).
+    dyn_sched = bf16_dyn_sched(table, total_tiles, num_clusters)
     return BF16SegmentPlan(
         cu_seqlens=bounds,
         num_heads=num_heads,
@@ -733,10 +848,14 @@ def build_bf16_segment_plan(
         num_clusters=num_clusters,
         seg_begin=_table(begins, device),
         seg_len=_table(lens, device),
-        # ``num_clusters`` zero records of padding: every kernel role prefetches
-        # the record of its next unit (``tile_idx + num_clusters``).
+        # ``num_clusters`` zero records of padding (every kernel role prefetches
+        # the record of its next unit, ``tile_idx + num_clusters``; the
+        # ``attention_dyn`` program keeps cluster ``c``'s ticket mailbox in word 6
+        # of padding record ``c``) and one more zero record whose word 0 is the
+        # dynamic scheduler's ticket counter (reset by the kernel at the end of
+        # every launch).
         unit_table=torch.tensor(
-            (table or [0] * UNIT_WORDS) + [0] * (UNIT_WORDS * num_clusters),
+            (table or [0] * UNIT_WORDS) + [0] * (UNIT_WORDS * (num_clusters + 1)),
             dtype=torch.int32,
             device=device,
         ),
@@ -749,6 +868,9 @@ def build_bf16_segment_plan(
         num_combine_units=len(combine) // COMBINE_WORDS,
         max_kv_splits=max(split_of, default=1),
         num_q_split_units=num_q_split_units,
+        dyn_sched=dyn_sched,
+        # Recorded arch-independently; the launcher applies ``BF16_SREAD_ARCHES``.
+        sread_unified=not dyn_sched,
     )
 
 
@@ -775,6 +897,9 @@ def cached_bf16_segment_plan(
     The key includes the current CUDA stream: launches of one plan are
     stream-ordered on their stream (a K/V-split plan's partial workspace is
     rewritten by every launch) and concurrent streams never share a plan.
+    The dynamic scheduler's ticket counter (word 0 of the plan's last
+    ``unit_table`` record) is rewritten by every launch as well and left at
+    zero by the kernel, so a cached plan needs no host reset.
     """
     index = _device_index(device)
     q_split = bool(BF16_Q_SPLIT_PLAN) if q_split is None else bool(q_split)
@@ -1336,6 +1461,7 @@ class MiniMaxH3VarlenAttentionRunner:
     arch: str
     plan: BF16SegmentPlan
     main_kwargs: dict
+    attention_stage: str
     out: torch.Tensor
     _entry: Optional[Callable[..., Any]]
     _arguments: tuple
@@ -1371,6 +1497,10 @@ class MiniMaxH3VarlenAttentionRunner:
             kv_split_units=self.plan.num_combine_units,
             max_kv_splits=self.plan.max_kv_splits,
             q_split_units=self.plan.num_q_split_units,
+            attention_variant=self.attention_stage,
+            dyn_sched=bool(self.plan.dyn_sched),
+            sread_unified=bool(self.plan.sread_unified)
+            and self.arch in BF16_SREAD_ARCHES,
         )
 
 
@@ -1537,12 +1667,18 @@ def prepare_minimax_h3_varlen_attention(
         grid=(2 * int(plan.num_clusters), 1, 1),
     )
     assert tuple(main_kwargs) == BF16_ATTENTION_KWARGS
+    attention_stage = bf16_attention_stage(plan, arch)
     entry: Optional[Callable[..., Any]] = None
     arguments: tuple = ()
     combine_entry: Optional[Callable[..., Any]] = None
     combine_arguments: tuple = ()
     if total_tiles > 0:
-        entry, arguments = _bind_stage(route["modules"]["attention"], arch, main_kwargs)
+        # Per-plan program dispatch: the plan's ``dyn_sched`` / ``sread_unified``
+        # flags and the arch filter select one of the route's BF16 attention
+        # programs (``bf16_attention_stage``).
+        entry, arguments = _bind_stage(
+            route["modules"][attention_stage], arch, main_kwargs
+        )
         if plan.num_combine_units > 0:
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
@@ -1563,6 +1699,7 @@ def prepare_minimax_h3_varlen_attention(
         arch,
         plan,
         main_kwargs,
+        attention_stage,
         out,
         entry,
         arguments,

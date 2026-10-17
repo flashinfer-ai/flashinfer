@@ -254,6 +254,30 @@ Use `--kernel-variant genphase` with the offline tuner. Its candidates and
 cache entries are separate from the generic inference kernel. A cache miss
 uses the fixed GenPhase cluster and bulk-store settings.
 
+GenPhase also accepts `mma_tiler_mnk=(256, 64, 128)` for MXFP8 E4M3
+activations and weights, or mixed MXFP4 weights with MXFP8 activations.
+The default candidate menu includes this tile with cluster `(4, 1)` and
+one FC2 TMA stage. MXFP8 E4M3 also admits an explicitly selected `(2, 1)`
+cluster; mixed MXFP4/MXFP8 requires `(4, 1)`. NVFP4 activations do not
+support this N64 tile. N64 is a tile dimension, not the number of live tokens.
+Gather4 issuance follows the live rows in each tile, including partially
+filled tiles, while retaining matching barrier transaction counts.
+
+For N64 with `world_size > 1`, use `schedule_policy=("grouped", None)`.
+Multirank phase-interleave is rejected before allocation or compilation after
+an EP2 liveness failure. `is_valid_sm107` applies this same restriction when
+filtering the candidate menu for a concrete configuration. EP1 phase-interleave
+remains admitted; the N128/N256 schedule rules are unchanged.
+
+Retune to compare the additional candidates for your workload. The default
+kernel family remains `inference`; these candidates do not automatically
+select GenPhase for existing callers.
+
+Both families mask invalid route slots during separate BF16 top-k reduction,
+so their production launch can omit clearing the combine payload first.
+This internal optimization applies without a caller API change. Quantized
+combine and in-kernel top-k reduction retain their existing clearing paths.
+
 ## Quantized combine selection
 
 Set `combine_dtype="nvfp4"` or `combine_dtype="mxfp8"` on a Rubin backend

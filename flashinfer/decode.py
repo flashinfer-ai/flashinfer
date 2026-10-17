@@ -1012,7 +1012,7 @@ def single_decode_with_kv_cache(
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode attention with KV Cache for single request, return attention output.
+    r"""Decode attention with a KV cache for a single request and return the attention output.
 
     Parameters
     ----------
@@ -1192,8 +1192,8 @@ def single_decode_with_kv_cache(
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
-    r"""Wrapper class for decode attention with paged kv-cache (first proposed in
-    `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
+    r"""Wrapper class for decode attention with a paged KV cache (first proposed in
+    `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -1275,7 +1275,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors. The buffer must be
             16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
@@ -2824,7 +2824,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
         enable_pdl : bool
-            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         window_left : Optional[int]
             Per-call sliding-window bound. Must either be ``None`` (default,
@@ -3099,6 +3099,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
+        trtllm_gen_bmm2_scale: Optional[Union[float, torch.Tensor]] = None
+
         if self._uses_cudnn:
             if kv_cache_sf is not None:
                 raise NotImplementedError(
@@ -3193,6 +3195,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     sinks=sinks,
                 )
         elif self.use_tensor_cores:
+            # trtllm-gen applies v_scale in-kernel as its bmm2 scale.
+            if (
+                self._backend == "trtllm-gen"
+                and self._jit_module is None
+                and v_scale is not None
+            ):
+                if isinstance(v_scale, (int, float)):
+                    trtllm_gen_bmm2_scale = float(v_scale)
+                elif (
+                    isinstance(v_scale, torch.Tensor)
+                    and v_scale.dtype == torch.float32
+                    and v_scale.numel() == 1
+                    and v_scale.device == q.device
+                ):
+                    trtllm_gen_bmm2_scale = v_scale
             run_args = [self._float_workspace_buffer]
             if self._backend == "trtllm-gen":
                 assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
@@ -3242,6 +3259,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     fp8_scale_q = args[0]
                     fp8_scale_k = args[1]
                     fp8_scale_v = args[2]
+                if self._backend == "trtllm-gen":
+                    fp8_scale_v = trtllm_gen_bmm2_scale
                 run_args += [
                     None,  # packed_custom_mask
                     None,  # mask_indptr_buf
@@ -3355,7 +3374,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module.run(*run_args)
 
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-        if v_scale is not None and not is_float_one:
+        if v_scale is not None and not is_float_one and trtllm_gen_bmm2_scale is None:
             # TODO(Zihao): fused into kernel
             if is_float8(out):
                 out = (out.to(torch.float32) * v_scale).to(out.dtype)
@@ -3398,8 +3417,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
 
 class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWrapper):
-    r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first
-    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
+    r"""CUDAGraph-compatible wrapper class for decode attention with a paged KV cache (first
+    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
 
     Note that this wrapper may not be as efficient as :class:`BatchDecodeWithPagedKVCacheWrapper`
     because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
@@ -3677,7 +3696,7 @@ def get_trtllm_gen_decode_module(*args):
             kv_lens_buffer,
             max_kv_len,
             sm_scale,
-            1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+            scale_v if scale_v is not None else 1.0,  # bmm2 scale
             workspace_size,
             window_left,
             enable_pdl,
@@ -3807,7 +3826,7 @@ def trtllm_batch_decode_with_kv_cache(
 
         **Contiguity requirements (trtllm-gen backend):**
 
-        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
+        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint.
         - The head and batch/page dims can have arbitrary strides.
 
     workspace_buffer : torch.Tensor
@@ -3834,8 +3853,8 @@ def trtllm_batch_decode_with_kv_cache(
         max sequence length for kv_cache
 
     bmm1_scale : Union[float, torch.Tensor]
-        fused scale for bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        Fused scale for bmm1 input.
+        When using the trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
 
     bmm1_scale_log2 : Optional[torch.Tensor] = None
         Optional precomputed log2-form bmm1 scale for ``trtllm-gen``. When provided,
@@ -3874,7 +3893,7 @@ def trtllm_batch_decode_with_kv_cache(
         data copy overhead. Use ``HND`` for better performance.
 
     enable_pdl : Optional[bool] = None
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
         When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
 
     backend : str = "auto"
@@ -4704,7 +4723,7 @@ def xqa_batch_decode_with_kv_cache(
         The layout of the kv cache. Can be either ``NHD`` or ``HND``. Defaults to ``NHD``.
 
     enable_pdl : bool
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
         Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
 
     q_len_per_req : Optional[int] = 1
@@ -4719,7 +4738,7 @@ def xqa_batch_decode_with_kv_cache(
         draft-block attention mask for xqa speculative decoding.
 
     kv_cache_sf : Optional[torch.Tensor] = None
-        KV cache scaling factors. Must provide when NVFP4 KV cache is used.
+        KV cache scaling factors. Must be provided when an NVFP4 KV cache is used.
 
     q_cu_seq_lens : Optional[torch.Tensor] = None
         cumulative draft lengths [batch_size + 1] (int32, on device) enabling
