@@ -23,61 +23,61 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.experimental.dense_projection_gemm import (
-    cake_backend,
-    cake_build,
-    cake_jit,
-)
-from flashinfer.experimental.dense_projection_gemm.cake_backend import (
-    ARCH_RULE_DEFAULTS,
-    BLOCK_K,
-    BLOCK_N_CHOICES,
-    CONVENIENCE_CACHE_SIZE,
-    CTA_GROUP,
-    CTA_ROWS_CHOICES,
-    EPI_WARPS,
-    ROUTER_SPLITS,
-    ROW_RULES,
-    SK_DUMMY_BASE,
-    SK_MIN_ITERS,
-    SMEM_OPT_IN,
-    arch_for,
-    bind_launch,
-    convenience_key,
-    default_block_n,
-    default_group_m,
-    default_hints,
-    default_hints_cgrp,
-    b_stage_bytes,
-    box_rows_of,
-    default_stages,
-    device_l2_bytes,
-    epi_cols,
-    epi_mode,
-    epi_slots,
-    generated_program_available,
-    instance_key,
-    instance_symbol,
-    sk_exact_plan,
-    sk_sync_plan,
-    operand_view,
-    plan_dense_projection_gemm,
-    plan_router_fp32_gemm,
-    prepare_dense_projection_gemm,
-    prepare_projection_wgrad,
-    prepare_router_fp32_gemm,
-    router_layout_class,
-    row_rule,
-    sk_parts_plan,
-    smem_limit_for,
-    split_fp32_to_bf16x3_,
-    stream_k_plan,
-    swap_small_m,
-    wave_working_set,
-    wave_working_set_cgrp,
-    wgrad_swapped,
-    wgrad_views,
-)
+from tests.test_helpers.cake_package import cake_package
+
+# Backend suite: the package is named once, through ``cake_package``; nothing else
+# of flashinfer is imported here.
+cake_backend = cake_package("dense_projection_gemm", "cake_backend")
+cake_build = cake_package("dense_projection_gemm", "cake_build")
+cake_jit = cake_package("dense_projection_gemm", "cake_jit")
+ARCH_RULE_DEFAULTS = cake_backend.ARCH_RULE_DEFAULTS
+BLOCK_K = cake_backend.BLOCK_K
+BLOCK_N_CHOICES = cake_backend.BLOCK_N_CHOICES
+CONVENIENCE_CACHE_SIZE = cake_backend.CONVENIENCE_CACHE_SIZE
+CTA_GROUP = cake_backend.CTA_GROUP
+CTA_ROWS_CHOICES = cake_backend.CTA_ROWS_CHOICES
+EPI_WARPS = cake_backend.EPI_WARPS
+ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
+ROW_RULES = cake_backend.ROW_RULES
+SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
+SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
+SMEM_OPT_IN = cake_backend.SMEM_OPT_IN
+arch_for = cake_backend.arch_for
+bind_launch = cake_backend.bind_launch
+convenience_key = cake_backend.convenience_key
+default_block_n = cake_backend.default_block_n
+default_group_m = cake_backend.default_group_m
+default_hints = cake_backend.default_hints
+default_hints_cgrp = cake_backend.default_hints_cgrp
+b_stage_bytes = cake_backend.b_stage_bytes
+box_rows_of = cake_backend.box_rows_of
+default_stages = cake_backend.default_stages
+device_l2_bytes = cake_backend.device_l2_bytes
+epi_cols = cake_backend.epi_cols
+epi_mode = cake_backend.epi_mode
+epi_slots = cake_backend.epi_slots
+generated_program_available = cake_backend.generated_program_available
+instance_key = cake_backend.instance_key
+instance_symbol = cake_backend.instance_symbol
+sk_exact_plan = cake_backend.sk_exact_plan
+sk_sync_plan = cake_backend.sk_sync_plan
+operand_view = cake_backend.operand_view
+plan_dense_projection_gemm = cake_backend.plan_dense_projection_gemm
+plan_router_fp32_gemm = cake_backend.plan_router_fp32_gemm
+prepare_dense_projection_gemm = cake_backend.prepare_dense_projection_gemm
+prepare_projection_wgrad = cake_backend.prepare_projection_wgrad
+prepare_router_fp32_gemm = cake_backend.prepare_router_fp32_gemm
+router_layout_class = cake_backend.router_layout_class
+row_rule = cake_backend.row_rule
+sk_parts_plan = cake_backend.sk_parts_plan
+smem_limit_for = cake_backend.smem_limit_for
+split_fp32_to_bf16x3_ = cake_backend.split_fp32_to_bf16x3_
+stream_k_plan = cake_backend.stream_k_plan
+swap_small_m = cake_backend.swap_small_m
+wave_working_set = cake_backend.wave_working_set
+wave_working_set_cgrp = cake_backend.wave_working_set_cgrp
+wgrad_swapped = cake_backend.wgrad_swapped
+wgrad_views = cake_backend.wgrad_views
 
 # Accuracy gates against the FP64 reference of the exact BF16 operands.
 # BF16 output: elementwise |out - ref| <= atol + rtol * |ref|, zero violations.
