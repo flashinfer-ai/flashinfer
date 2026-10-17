@@ -3666,7 +3666,10 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
 
 
-def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
+@pytest.mark.parametrize("num_tokens", [64, 1024])
+def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(
+    cache_permute_indices, num_tokens
+):
     """DeepSeekFp8 MoE applies the SwiGLU OA params in its unfused activation kernel.
 
     Unlike MxFp8 there is no fused FC1 epilogue here: the activation kernel reads the
@@ -3683,7 +3686,6 @@ def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
 
-    num_tokens = 64
     hidden_size = 512
     intermediate_size = 512
     routing_config = {

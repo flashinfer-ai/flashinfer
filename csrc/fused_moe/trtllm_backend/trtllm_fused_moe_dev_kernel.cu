@@ -20,6 +20,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -375,6 +376,93 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// One warp per (token, k, 128-channel scale block); each lane owns 4 consecutive channels and
+// loads/stores them as one 32-bit word. Same per-element expressions as activationDeepSeekKernel.
+template <typename KernelParams>
+__global__ void activationDeepSeekVectorKernel(KernelParams params) {
+  using Type = typename KernelParams::Type;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+  }
+#endif
+  float constexpr E4m3MaxVal{448.f};
+  int const lane = threadIdx.x & 31;
+  int const numBlocks = params.innerDim / 2 / 128;
+  int64_t const warpId = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int64_t const numWarps = (int64_t)params.numTokens * params.topK * numBlocks;
+  if (warpId >= numWarps) {
+    return;
+  }
+  int const blk = (int)(warpId % numBlocks);
+  int const expandedIdx = (int)(warpId / numBlocks);
+  int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+  if (permutedIdx == -1) {
+    return;
+  }
+  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+  int const hiddenIdx = blk * 128 + lane * 4;
+  float const scale1 =
+      params.inDqSfsPtr[(int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * blk];
+  float const scale2 =
+      params.inDqSfsPtr[(int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (blk + numBlocks)];
+  int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+  uint32_t const raw1 = *reinterpret_cast<uint32_t const*>(params.inPtr + baseIdx);
+  uint32_t const raw2 =
+      *reinterpret_cast<uint32_t const*>(params.inPtr + baseIdx + params.innerDim / 2);
+  // Keep the expert lookup outside the four-channel loop while matching gatedSilu's arithmetic.
+  bool const plain = params.gatedActAlphaPtr == nullptr && params.gatedActBetaPtr == nullptr &&
+                     params.gatedActClampLimitPtr == nullptr;
+  bool const clamp = params.gatedActClampLimitPtr != nullptr;
+  float limit = 0.0f, alpha = 1.0f, beta = 0.0f;
+  if (!plain) {
+    int32_t const localExpertIdx = params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim];
+    if (clamp) {
+      limit = params.gatedActClampLimitPtr[localExpertIdx];
+    }
+    alpha = params.gatedActAlphaPtr != nullptr ? params.gatedActAlphaPtr[localExpertIdx] : 1.0f;
+    beta = params.gatedActBetaPtr != nullptr ? params.gatedActBetaPtr[localExpertIdx] : 0.0f;
+  }
+  float outArr[4];
+  float aMax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float const d1 = static_cast<float>(Type::bitcast((raw1 >> (8 * i)) & 0xff));
+    float const d2 = static_cast<float>(Type::bitcast((raw2 >> (8 * i)) & 0xff));
+    float xLinear = scale1 * d1;
+    float xGlu = scale2 * d2;
+    float out;
+    if (plain) {
+      out = silu(xGlu) * xLinear;
+    } else {
+      if (clamp) {
+        xGlu = fminf(xGlu, limit);
+        xLinear = fmaxf(fminf(xLinear, limit), -limit);
+      }
+      float const act = xGlu / (1.0f + expf(-alpha * xGlu));
+      out = act * (xLinear + beta);
+    }
+    outArr[i] = out;
+    aMax = fmaxf(aMax, fabsf(out));
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, o));
+  }
+  float const scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+  if (lane == 0) {
+    params.outDqSfsPtr[(int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * blk] = scaleOut;
+  }
+  uint32_t packed = 0;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    packed |= (uint32_t)(static_cast<Type>(outArr[i] / scaleOut).storage) << (8 * i);
+  }
+  *reinterpret_cast<uint32_t*>(params.outPtr + (int64_t)permutedIdx * (params.innerDim / 2) +
+                               hiddenIdx) = packed;
+}
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -383,6 +471,19 @@ void run(Data const& data, void* stream) {
     return;
   }
 
+  if (data.mUseDeepSeekFp8 && data.mDtypeElt == tg::Dtype::E4m3 && data.innerDim % 256 == 0 &&
+      data.numTokens >= 1024) {
+    bool const vectorAligned =
+        (reinterpret_cast<std::uintptr_t>(data.inPtr) % alignof(uint32_t) == 0) &&
+        (reinterpret_cast<std::uintptr_t>(data.outPtr) % alignof(uint32_t) == 0);
+    if (vectorAligned) {
+      int64_t const numWarps = (int64_t)data.numTokens * data.topK * (data.innerDim / 256);
+      int const numThreads = 256;
+      int const numBlocks = (int)((numWarps * 32 + numThreads - 1) / numThreads);
+      LAUNCH_ACTIVATION(data, activationDeepSeekVectorKernel, 1, numBlocks, numThreads, 0, stream);
+      return;
+    }
+  }
   if (data.mUseDeepSeekFp8) {
     constexpr int NUM_ELTS_PER_LOAD = 1;
     constexpr int NUM_ELTS_PER_SF = 128;
