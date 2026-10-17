@@ -91,7 +91,7 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
-#define PAGE_SIZE 16
+#define PAGE_SIZE CAKE_FMHA_PAGE_SIZE
 #ifndef BATCH_SIZE
 #define BATCH_SIZE 4
 #endif
@@ -2673,11 +2673,13 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&pg_k[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k[(0) + 3]))
                             : "r"(pg_k_base));
+#if PAGE_SIZE != 32
                         {
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&pg_k[4])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k[(4) + 3]))
                                 : "r"(pg_k_base + 16));
                         }
+#endif  // PAGE_SIZE
                         #pragma unroll
                         for (int pg_i = 0; pg_i < 8; pg_i++) {
                             int pg0 = pg_k[pg_i / (PAGE_SIZE / 16)];
@@ -2706,11 +2708,13 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[(0) + 3]))
                                 : "r"(pg_nk_base));
+#if PAGE_SIZE != 32
                             {
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[4])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk[(4) + 3]))
                                     : "r"(pg_nk_base + 16));
                             }
+#endif  // PAGE_SIZE
                             #pragma unroll
                             for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
                                 int npg0 = pg_nk[pg_i_1 / (PAGE_SIZE / 16)];
@@ -2725,11 +2729,13 @@ kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&pg_v[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 3]))
                             : "r"(pg_v_base));
+#if PAGE_SIZE != 32
                         {
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&pg_v[4])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(4) + 3]))
                                 : "r"(pg_v_base + 16));
                         }
+#endif  // PAGE_SIZE
                         int pg_group_done = ((ni_1 % 4 == 3) ? 1 : 0);
                         pg_group_done = pg_group_done | ((ni_1 + 1 == cta_n_blocks_3) ? 1 : 0);
                         if (pg_group_done != 0) {

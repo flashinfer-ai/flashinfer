@@ -140,7 +140,7 @@ __device__ __forceinline__ uint32_t cake_fmha_qmul4_portable(
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
-#define PAGE_SIZE 16
+#define PAGE_SIZE CAKE_FMHA_PAGE_SIZE
 #ifndef BATCH_SIZE
 #define BATCH_SIZE 4
 #endif
@@ -2340,11 +2340,13 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&pg_l[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_l[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_l[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_l[(0) + 3]))
                                 : "r"(task_pg_base_l));
+#if PAGE_SIZE != 32
                             {
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&pg_l[4])), "=r"(*reinterpret_cast<uint32_t*>(&pg_l[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_l[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_l[(4) + 3]))
                                     : "r"(task_pg_base_l + 16));
                             }
+#endif  // PAGE_SIZE
                             int task_dst_l = round_dst_l + task_i_l * 17408;
                             if (task_is_v_l == 1) {
                                 #pragma unroll

@@ -4701,8 +4701,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_bf16q/page_size16.cu",
-            "sm_103a": "cuda/decode_quant_bf16q/page_size16.cu"
+            "sm_100a": "cuda/decode_quant_bf16q/default.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/default.cu"
           }
         },
         {
@@ -4710,8 +4710,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_bf16q/page_size32.cu",
-            "sm_103a": "cuda/decode_quant_bf16q/page_size32.cu"
+            "sm_100a": "cuda/decode_quant_bf16q/default.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/default.cu"
           }
         }
       ],
@@ -4840,8 +4840,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size16.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size16.cu"
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/default.cu"
           }
         },
         {
@@ -4850,8 +4850,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size32.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size32.cu"
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/default.cu"
           }
         }
       ],
@@ -5038,8 +5038,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_nvfp4/page_size16.cu",
-            "sm_103a": "cuda/decode_quant_nvfp4/page_size16.cu"
+            "sm_100a": "cuda/decode_quant_nvfp4/default.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/default.cu"
           }
         },
         {
@@ -5047,8 +5047,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_nvfp4/page_size32.cu",
-            "sm_103a": "cuda/decode_quant_nvfp4/page_size32.cu"
+            "sm_100a": "cuda/decode_quant_nvfp4/default.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/default.cu"
           }
         }
       ],

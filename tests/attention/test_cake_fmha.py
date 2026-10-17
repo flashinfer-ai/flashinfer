@@ -313,6 +313,54 @@ def test_cake_fmha_generic_members_share_one_folded_source(
 
 
 @pytest.mark.parametrize(
+    ("component", "sources"),
+    (
+        (
+            "decode_quant_bf16q",
+            {
+                "sm_100a": "cuda/decode_quant_bf16q/default.cu",
+                "sm_103a": "cuda/decode_quant_bf16q/default.cu",
+            },
+        ),
+        (
+            "decode_quant_nvfp4",
+            {
+                "sm_100a": "cuda/decode_quant_nvfp4/default.cu",
+                "sm_103a": "cuda/decode_quant_nvfp4/default.cu",
+            },
+        ),
+        (
+            "decode_quant_fp8",
+            {
+                "sm_100a": "cuda/decode_quant_fp8/sm_100a/default.cu",
+                "sm_103a": "cuda/decode_quant_fp8/sm_103a/default.cu",
+            },
+        ),
+    ),
+)
+def test_cake_fmha_decode_quant_members_share_one_folded_source(
+    component, sources
+) -> None:
+    """The page-size members compile one source whose PAGE_SIZE is a loader define."""
+
+    members = get_cake_fmha_manifest()["components"][component]["source_family"]
+    assert sorted(member["selector"]["PAGE_SIZE"] for member in members) == [16, 32]
+    for arch, source in sources.items():
+        assert {member["sources"][arch] for member in members} == {source}
+    for source in sorted(set(sources.values())):
+        text = (get_cake_fmha_csrc_dir() / source).read_text(encoding="utf-8")
+        defines = [
+            line for line in text.splitlines() if line.startswith("#define PAGE_SIZE ")
+        ]
+        assert defines == ["#define PAGE_SIZE CAKE_FMHA_PAGE_SIZE"]
+        guards = [
+            line for line in text.splitlines() if line.startswith("#if PAGE_SIZE")
+        ]
+        assert guards
+        assert len(guards) == text.count("#endif  // PAGE_SIZE\n")
+
+
+@pytest.mark.parametrize(
     ("target", "manifest_arch"),
     (("sm100a", "sm_100a"), ("sm103a", "sm_103a")),
 )
@@ -702,7 +750,7 @@ def test_cake_fmha_decode_quant_bf16q_jit_selects_one_manifest_member(
         32,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "page_size32.cu",
+        "default.cu",
         "cake_fmha_decode_quant_bf16q_binding.cu",
         "cake_fmha_decode_quant_bf16q_jit_binding.cu",
     }
@@ -737,12 +785,15 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
         full_blocks=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "full_blocks1_page_size32.cu",
-        "cake_fmha_decode_quant_fp8_binding.cu",
         "default.cu",
+        "cake_fmha_decode_quant_fp8_binding.cu",
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
+    assert any(
+        str(source).endswith("cuda/decode_quant_fp8/sm_103a/default.cu")
+        for source in spec.sources
+    )
     assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
     assert "-DNUM_Q_HEADS=16" in spec.extra_cuda_cflags
     assert "-DNUM_KV_HEADS=2" in spec.extra_cuda_cflags
@@ -760,12 +811,15 @@ def test_cake_fmha_decode_quant_nvfp4_jit_selects_main_and_reducer(
     spec = gen_cake_fmha_decode_quant_nvfp4_module("sm103a", 2, 1, 4, 2, 32)
     assert spec.name == get_cake_fmha_decode_quant_nvfp4_uri("sm103a", 2, 1, 4, 2, 32)
     assert {Path(source).name for source in spec.sources} == {
-        "page_size32.cu",
-        "cake_fmha_decode_quant_nvfp4_binding.cu",
         "default.cu",
+        "cake_fmha_decode_quant_nvfp4_binding.cu",
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
+    assert any(
+        str(source).endswith("cuda/decode_quant_nvfp4/default.cu")
+        for source in spec.sources
+    )
     assert not any("native_qmul4" in str(source) for source in spec.sources)
     assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
     assert "-DNUM_Q_HEADS=4" in spec.extra_cuda_cflags
