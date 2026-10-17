@@ -4994,7 +4994,7 @@ class TestWorkspaceBucketing:
         # Crossing the bucket boundary is allowed to reallocate (bounded,
         # O(log) times), never once per new high-water mark.
         ws_big = md._get_cached_workspace(routed_rows=129, **kwargs)
-        assert ws_big.max_rows >= 256
+        assert ws_big.max_rows == 256
         ws_big2 = md._get_cached_workspace(routed_rows=200, **kwargs)
         assert ws_big2 is ws_big
 
