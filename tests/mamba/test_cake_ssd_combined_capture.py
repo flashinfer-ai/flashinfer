@@ -128,7 +128,8 @@ def _inputs(
     """One Cake SSDCombined call on the current device -- bf16 x/B/C/z/D,
     f32 dt/A/dt_bias, softplus with a finite clamp, bf16 initial states --
     batched or packed varlen on the ``cu_seqlens`` form (``form``: or the
-    seq_idx triple with the caller's trusted ``seq_chunk_cumsum``).  Returns
+    seq_idx triple with the caller's trusted ``seq_chunk_cumsum``, or the
+    triple deriving its table, ``triple_derived``).  Returns
     the constructor kwargs, the positional tensors and the keyword arguments."""
 
     torch.manual_seed(seed)
@@ -171,6 +172,11 @@ def _inputs(
     )
     if varlen and form == "triple_cumsum":
         arguments.update(_triple_arguments(lengths))
+    elif varlen and form == "triple_derived":
+        # The triple without a caller table: the runner derives it.
+        arguments.update(_triple_arguments(lengths))
+        del arguments["seq_chunk_cumsum"]
+        arguments["num_seqs"] = len(lengths)
     elif varlen:
         cu = [0]
         for length in lengths:
@@ -223,7 +229,8 @@ def _replay_matches(graph, out, final, expected_out, expected_final, repeats=3):
 
 @requires_blackwell
 @pytest.mark.parametrize(
-    "form", ("batched", "cu_seqlens", "triple_cumsum", "chunk_parallel")
+    "form",
+    ("batched", "cu_seqlens", "triple_cumsum", "triple_derived", "chunk_parallel"),
 )
 def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     """``prepare`` then capture ``run`` with static inputs and ``out``: the
@@ -233,8 +240,12 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     batched bf16-state form, for a packed-varlen ``cu_seqlens`` shape, for
     the seq_idx triple with the caller's trusted ``seq_chunk_cumsum`` (the
     fused single-launch program of the trusted-table route: ``prepare`` and the
-    captured ``run`` resolve the same program from the same arguments) and
-    for the chunk-parallel program forced through the override.
+    captured ``run`` resolve the same program from the same arguments), for
+    the seq_idx triple deriving a runner-owned table (the capability's
+    program: ``exactmeta`` on SM100, two launches; ``exactone`` on SM103, one
+    launch whose CTA prologue derives the table into the workspace scratch
+    the graph replays against) and for the chunk-parallel program forced
+    through the override.
 
     Chunk-parallel caveat: that program needs every CTA of its grid (one
     per SM) co-resident for its grid barrier, and the barrier words are
@@ -247,7 +258,8 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
         constructor, tensors, arguments = _inputs(batch=2, seqlen=1024)
     else:
         constructor, tensors, arguments = _inputs(
-            varlen=form in ("cu_seqlens", "triple_cumsum"), form=form
+            varlen=form in ("cu_seqlens", "triple_cumsum", "triple_derived"),
+            form=form,
         )
     runner = SSDCombined(**constructor, backend="cake")
     cake = runner._cake_runner
@@ -257,14 +269,25 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
 
     assert isinstance(prepared, PreparedSSDCombined)
     assert not cake.is_captured(prepared)
-    family = "chunkpar" if form == "chunk_parallel" else "exactfused"
-    mode = "varlen" if form in ("cu_seqlens", "triple_cumsum") else "batched"
+    if form == "chunk_parallel":
+        family = "chunkpar"
+    elif form == "triple_derived":
+        family = (
+            "exactmeta" if torch.cuda.get_device_capability() == (10, 0) else "exactone"
+        )
+    else:
+        family = "exactfused"
+    mode = "batched" if form in ("batched", "chunk_parallel") else "varlen"
     assert prepared.program_name == f"{family}_bf16_{mode}"
-    if family == "exactfused":
-        # The fused program is prepared only as a single launch.
+    if family in ("exactfused", "exactone"):
+        # The fused program is prepared only as a single launch (the
+        # one-launch program always is).
         assert prepared.preprocess_grid == (0, 1, 1)
+    elif family == "exactmeta":
+        assert prepared.preprocess_grid[0] >= 1
     assert prepared.workspace_key.caller_cumsum == (form == "triple_cumsum")
     assert prepared.workspace_key.from_cu_seqlens == (form == "cu_seqlens")
+    assert prepared.workspace_key.publish_table is False
     assert cake.last_program_name is None  # prepare launched nothing
     # The override was read once by prepare; the prepared shape must never
     # consult it again (an invalid value would make a read raise).
@@ -637,7 +660,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert prepared.program_name == "exactfused_bf16_varlen"
     assert prepared.preprocess_grid == (0, 1, 1)
     assert prepared.workspace_key == module._WorkspaceKey(
-        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, True, "never"
+        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, True, False, "never"
     )
     assert loads == [("exactfused_bf16_varlen", arch)]
     assert runner._workspaces.get(prepared.workspace_key).prepared
@@ -686,7 +709,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert launch["main"]["seq_chunk_cumsum"] is table
     assert (
         module._WorkspaceKey(
-            None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, "never"
+            None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, True, "never"
         )
         in runner._workspaces
     )
@@ -731,8 +754,9 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
     key and launch grids for every packed-varlen form on both capabilities:
     the ``cu_seqlens`` form and the trusted-table triple form (the fused
     program, one launch), and the triple form deriving its table with int32
-    or int64 ``seq_idx`` (``exactmeta`` on SM100, the two-kernel program on
-    SM103; the table published ahead of the main kernel)."""
+    or int64 ``seq_idx`` (``exactmeta`` on SM100, the table published ahead
+    of the main kernel; ``exactone`` on SM103, one launch with the table
+    derived in the main kernel's prologue)."""
 
     module = _module()
     seq_idx_dtype = torch.int64 if form == "triple_i64" else torch.int32
@@ -767,15 +791,13 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
     family = module._PROGRAMS[prepared.program_name].family
     if form in ("cu_seqlens", "trusted"):
         assert family == "exactfused" and prepared.preprocess_grid == (0, 1, 1)
-    else:
-        assert family == (
-            "exactmeta"
-            if arch == "sm_100a"
-            else module.two_kernel_family(
-                mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
-            )
-        ), (arch, form, prepared.program_name)
+    elif arch == "sm_100a":
+        assert family == "exactmeta", (arch, form, prepared.program_name)
         assert prepared.preprocess_grid[0] >= 1
+    else:
+        assert family == "exactone", (arch, form, prepared.program_name)
+        assert prepared.preprocess_grid == (0, 1, 1)
+    assert prepared.workspace_key.publish_table is False
     assert loads == [(prepared.program_name, arch)]
 
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "invalid-after-prepare")
@@ -785,6 +807,15 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
     assert name == runner.last_program_name == prepared.program_name
     assert launch["preprocess_grid"] == prepared.preprocess_grid
     assert launch["main_grid"] == prepared.grid
+    if family == "exactone":
+        # One table row per CTA of the prepared grid, int32.
+        scratch = launch["main"]["seq_chunk_cumsum"]
+        assert scratch.numel() == prepared.grid[0] * (num_seqs + 1)
+        assert launch["main"]["metadata_from_cu_seqlens"] == (
+            module._TABLE_IN_KERNEL_I64
+            if form == "triple_i64"
+            else module._TABLE_IN_KERNEL_I32
+        )
     assert loads == [(prepared.program_name, arch)]  # no new load
     assert runner._allocations_in_last_run == 0
     assert len(runner._workspaces) == 1
@@ -838,7 +869,7 @@ def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
     assert prepared == module.PreparedSSDCombined(
         program_name="chunkpar_bf16_batched",
         workspace_key=module._WorkspaceKey(
-            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, "always"
+            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, False, "always"
         ),
         grid=(16, 1, 1),
         preprocess_grid=(2, 1, 1),

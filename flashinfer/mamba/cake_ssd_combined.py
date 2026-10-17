@@ -105,7 +105,11 @@ class _Program:
     metadata), ``exactmeta`` (the same fused scan behind the light
     packed-varlen metadata kernel, which publishes ``seq_chunk_cumsum`` from
     the seq_idx triple in place of the full preprocess: the triple form
-    without a trusted caller table, two launches), ``exactpre`` (the same persistent scan reading the delta /
+    without a trusted caller table on SM100, two launches), ``exactone`` (the
+    SM103 render of the fused scan whose CTA prologue derives that table
+    itself into its private row of the ``seq_chunk_cumsum`` scratch: the
+    same form on SM103, one launch, the stage skipped with a grid of 0),
+    ``exactpre`` (the same persistent scan reading the delta /
     cumsum its preprocess wrote to the HBM workspace: the start two-launch
     form, same main arguments, with the round-6 state update), ``exact`` (the
     start two-launch program retained byte for byte for one-chunk items, see
@@ -141,13 +145,15 @@ class _Program:
 # Generated-source identities, ``generated/device/<module>.cu``: the Cake
 # kernel symbol followed by the export's module identity hash.  This block is
 # the single place the Cake export refreshes; every program binding below
-# derives from it.  Six kernel families ship, each x {bf16, f16, f32 state}
-# x {batched, varlen} (``exactmeta`` varlen only), plus the preprocess shared
-# by the two-launch programs and the light packed-varlen metadata kernel: the
-# fused exact scan (``exactfused_*``: delta / cumsum computed in-CTA,
-# one launch), the same fused scan behind the metadata kernel
-# (``exactmeta_*``: the seq_idx triple form deriving ``seq_chunk_cumsum``,
-# two launches), the two-kernel exact scan (``exactpre_*``: the start pre+scan
+# derives from it.  Seven kernel families ship, each x {bf16, f16, f32 state}
+# x {batched, varlen} (``exactmeta`` and ``exactone`` varlen only), plus the
+# preprocess shared by the two-launch programs and the light packed-varlen
+# metadata kernel: the fused exact scan (``exactfused_*``: delta / cumsum
+# computed in-CTA, one launch), the same fused scan behind the metadata kernel
+# (``exactmeta_*``: the seq_idx triple form deriving ``seq_chunk_cumsum`` on
+# SM100, two launches), the SM103 fused scan deriving that table in its CTA
+# prologue (``exactone_*``: the same form on SM103, one launch), the
+# two-kernel exact scan (``exactpre_*``: the start pre+scan
 # form with the round-6 single-rounding state update, which the fused route
 # keeps for saturated / long-item calls, see :func:`fused_selected`), the
 # START two-kernel exact scan (``exact_*``: the
@@ -248,6 +254,20 @@ _EXACTMETA_MODULES = {
     "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_214d4b30cc",
     "exactmeta_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_0d7e43d838",
 }
+# The one-launch fused varlen programs (``exactone_*``): the exact scan's fused
+# varlen entries as SM103 renders them -- the main kernel's CTA prologue
+# derives the sequence table of the seq_idx triple form itself, so no stage
+# runs ahead of it -- with their own device sources (the ``exactfused_*``
+# varlen programs keep the SM100 render) behind the fused host template.
+# Refreshed by the Cake export; seed identities until it fills them.
+_EXACTONE_MODULES = {
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a000000001",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a000000002",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_a000000003",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_a000000004",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_a000000005",
+    "exactone_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_a000000006",
+}
 
 _SEGMENT_PREPROCESS = _Kernel(
     _SEGMENT_PREPROCESS_MODULE,
@@ -291,6 +311,11 @@ _CHUNKPAR3_SMEM_BYTES = 232448
 # keeps the prefix control placement); refreshed by the Cake export with the
 # ``exactfused_*_noring`` table entries.
 _EXACTFUSED_NORING_SMEM_BYTES = 232192
+# Main dynamic SMEM of the one-launch fused varlen programs (``exactone_*``)
+# and their ``_noring`` variants; refreshed by the Cake export with the
+# ``exactone_*`` table entries (the SM103 render's literals).
+_EXACTONE_SMEM_BYTES = 232320
+_EXACTONE_NORING_SMEM_BYTES = 232192
 # Main dynamic SMEM of the retained start programs (``exact_*`` and
 # ``exact_*_noring``): literals of the round-5 files, not refreshed.
 _EXACT_SMEM_BYTES = 231808
@@ -426,6 +451,17 @@ _MAIN_ARGS = (
 # bind them (only the fused program reads them); the chunk-parallel
 # signature has none of them.
 _FUSED_ONLY_MAIN_ARGS = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_status")
+# ``metadata_from_cu_seqlens`` of the fused main kernel names its sequence-table
+# source: the published / caller ``seq_chunk_cumsum`` vector (every program
+# but the two below; the two-kernel and chunk-parallel programs pass 0), the
+# ``cu_seqlens`` closed form derived per item (``exactfused`` in the cu_seqlens
+# form), or -- the ``exactone`` programs only -- the table the CTA prologue
+# derives from the int32 / int64 seq_idx triple into its private row of the
+# ``seq_chunk_cumsum`` scratch.
+_TABLE_PUBLISHED = 0
+_TABLE_CU_SEQLENS = 1
+_TABLE_IN_KERNEL_I32 = 2
+_TABLE_IN_KERNEL_I64 = 3
 # The retained start two-kernel program (``exact_*``) predates the three
 # fused-only inputs: its launcher binds the 41 arguments before them.
 _MAIN_ARGS_START = _MAIN_ARGS[: len(_MAIN_ARGS) - len(_FUSED_ONLY_MAIN_ARGS)]
@@ -542,6 +578,7 @@ _FAMILY_HOST = {
     "exact": (_HOST_TEMPLATE, _MAIN_ARGS_START, _EXACT_SMEM_BYTES),
     "exactfused": (_EXACTFUSED_HOST_TEMPLATE, _MAIN_ARGS, _EXACTFUSED_SMEM_BYTES),
     "exactmeta": (_EXACTMETA_HOST_TEMPLATE, _MAIN_ARGS, _EXACTFUSED_SMEM_BYTES),
+    "exactone": (_EXACTFUSED_HOST_TEMPLATE, _MAIN_ARGS, _EXACTONE_SMEM_BYTES),
     "chunkpar": (_CHUNKPAR_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR, _CHUNKPAR_SMEM_BYTES),
     "exactpre": (_EXACTPRE_HOST_TEMPLATE, _MAIN_ARGS, _EXACTPRE_SMEM_BYTES),
     "chunkpar3": (
@@ -564,6 +601,7 @@ _VARIANT_SMEM_BYTES = {
     ("exact", "noring"): _EXACT_NORING_SMEM_BYTES,
     ("exactfused", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactmeta", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
+    ("exactone", "noring"): _EXACTONE_NORING_SMEM_BYTES,
     ("exactpre", "noring"): _EXACTPRE_NORING_SMEM_BYTES,
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
 }
@@ -616,6 +654,7 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTPRE_MODULES.items(),
         *_CHUNKPAR3_MODULES.items(),
         *_EXACTMETA_MODULES.items(),
+        *_EXACTONE_MODULES.items(),
     )
 }
 
@@ -940,13 +979,16 @@ class _WorkspaceKey(NamedTuple):
     """Identity of a per-call-shape workspace.  The family override is part
     of it because it selects the program and therefore the values the
     workspace binds; the device index because the buffers live on it.
-    ``from_cu_seqlens`` and ``caller_cumsum`` are the two packed-varlen
-    metadata facts the exact-scan route reads (``_materialize_workspace``):
-    the ``cu_seqlens`` form, and the ``seq_idx`` triple form with a caller
-    ``seq_chunk_cumsum`` the preprocess does not rewrite
-    (``update_seq_chunk_cumsum=False``), where the fused program is one
-    launch; both are derived from the call's arguments alone, so ``prepare``
-    and ``run`` of the same call resolve the same key."""
+    ``from_cu_seqlens``, ``caller_cumsum`` and ``publish_table`` are the three
+    packed-varlen metadata facts the exact-scan route reads
+    (``_materialize_workspace``): the ``cu_seqlens`` form; the ``seq_idx``
+    triple form with a caller ``seq_chunk_cumsum`` the preprocess does not
+    rewrite (``update_seq_chunk_cumsum=False``), where the fused program is
+    one launch; and the triple form publishing the table into the caller's
+    buffer (``update_seq_chunk_cumsum=True``), which needs a publishing stage
+    (the one-launch ``exactone`` program keeps its table private).  All three
+    are derived from the call's arguments alone, so ``prepare`` and ``run``
+    of the same call resolve the same key."""
 
     device_index: Optional[int]
     batch: int
@@ -957,12 +999,13 @@ class _WorkspaceKey(NamedTuple):
     state_dtype: torch.dtype
     from_cu_seqlens: bool
     caller_cumsum: bool
+    publish_table: bool
     chunk_parallel_mode: str
 
 
 # ``_WorkspaceKey`` without the family override: what ``prepare`` freezes the
 # override for.
-_ShapeKey = Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool, bool]
+_ShapeKey = Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool, bool, bool]
 
 
 @dataclass(frozen=True)
@@ -1292,9 +1335,11 @@ def fused_selected(
     with a caller ``seq_chunk_cumsum`` the preprocess does not rewrite take
     ``exactfused_*`` (preprocess grid 0, one launch); the triple form
     deriving the table takes ``exactmeta_*`` on SM100 (the light metadata
-    kernel then the same fused main kernel, two launches) and keeps the
-    two-kernel program on SM103 (``_materialize_workspace`` decides per
-    compute capability)."""
+    kernel then the same fused main kernel, two launches) and ``exactone_*``
+    on SM103 (the fused main kernel derives the table in its CTA prologue,
+    one launch) unless the table is published into the caller's buffer,
+    which keeps the two-kernel program on SM103 (``_materialize_workspace``
+    decides per compute capability)."""
 
     items = int(num_sequences) * int(nheads)
     if not mode_varlen:
@@ -1769,15 +1814,19 @@ class CakeSSDCombined:
     run the ``exactfused_*`` program with its preprocess stage skipped (grid
     0), one kernel; the triple form without one (the table is published,
     runner-owned or into the caller's buffer with
-    ``update_seq_chunk_cumsum=True``) runs the ``exactmeta_*`` program: the
-    light packed-varlen metadata kernel publishes the table, then the same
-    fused main kernel runs (two launches, no dt preprocess).  A caller buffer
-    for the ``cu_seqlens``-derived vector brings the fused program's full
-    preprocess back to publish it (two launches).
+    ``update_seq_chunk_cumsum=True``) runs the program of the device's
+    compute capability: on SM100 ``exactmeta_*`` -- the light packed-varlen
+    metadata kernel publishes the table, then the same fused main kernel runs
+    (two launches, no dt preprocess); on SM103 ``exactone_*`` -- the fused
+    main kernel derives its private table in a CTA prologue (one launch) --
+    where the table is runner-owned, and the two-kernel program where the
+    caller's buffer must receive it.  A caller buffer for the
+    ``cu_seqlens``-derived vector brings the fused program's full preprocess
+    back to publish it (two launches).
 
-    Six kernel families serve every call and are selected per call.  The
-    fused exact scan (``exactfused_*`` programs, and ``exactmeta_*`` behind
-    the metadata kernel) runs one persistent CTA per
+    Seven kernel families serve every call and are selected per call.  The
+    fused exact scan (``exactfused_*`` programs, ``exactmeta_*`` behind the
+    metadata kernel and the SM103 ``exactone_*`` render) runs one persistent CTA per
     (sequence, head) item over its chunks in order and computes delta /
     cumsum in-CTA; the two-kernel exact scan (``exactpre_*``) is the same
     persistent scan reading the delta / cumsum its preprocess wrote to the
@@ -1875,8 +1924,8 @@ class CakeSSDCombined:
     """
 
     #: Program of the most recent :meth:`run` (``exactfused_*``,
-    #: ``exactmeta_*``, ``exactpre_*``, ``exact_*``, ``chunkpar_*`` or
-    #: ``chunkpar3_*``);
+    #: ``exactmeta_*``, ``exactone_*``, ``exactpre_*``, ``exact_*``,
+    #: ``chunkpar_*`` or ``chunkpar3_*``);
     #: ``None`` before the first call.
     last_program_name: Optional[str] = None
     #: Uncaptured per-shape workspaces a runner keeps (least recently used
@@ -2129,23 +2178,29 @@ class CakeSSDCombined:
         # triple form with a caller ``seq_chunk_cumsum`` the preprocess does
         # not rewrite (the kernel reads the caller's tables,
         # ``key.caller_cumsum``) run ``exactfused`` as one launch (preprocess
-        # grid 0).  The triple form without one needs ``seq_chunk_cumsum``
-        # published first, and which program publishes it is decided per
-        # compute capability, each measured on its own architecture: on SM100
+        # grid 0).  The triple form without one needs its sequence table
+        # first, and which program provides it is decided per compute
+        # capability, each measured on its own architecture: on SM100
         # ``exactmeta`` runs the light packed-varlen metadata kernel (one
         # thread per segment, no dt work) ahead of the same fused main kernel
         # (the stage drops from 4.1-4.7 us to 2.4-2.9 us; the fused main
         # kernel costs 0.7-0.9 us more than the two-kernel main kernel); on
         # SM103 the host interval between two launches hides any lighter
-        # stage, so that form keeps the two-kernel program there (the full
-        # preprocess, then the two-kernel main kernel).
+        # stage, so ``exactone`` runs the SM103 render of the fused main
+        # kernel, whose CTA prologue derives a private table from the triple
+        # (one launch, no stage) -- unless the caller's buffer must receive
+        # the table (``key.publish_table``), which only a publishing stage
+        # writes: that form keeps the two-kernel program on SM103.
         derives_table = (
             self.has_varlen and not key.from_cu_seqlens and not key.caller_cumsum
         )
         light_stage = derives_table and tuple(capability) == (10, 0)
+        one_launch = (
+            derives_table and not key.publish_table and tuple(capability) == (10, 3)
+        )
         fused = (
             not chunk_parallel
-            and (not derives_table or light_stage)
+            and (not derives_table or light_stage or one_launch)
             and fused_selected(
                 nheads=self.nheads,
                 num_sequences=num_sequences,
@@ -2189,18 +2244,26 @@ class CakeSSDCombined:
                 state_dtype=self.state_dtype,
             )
         )
+        if chunk_parallel:
+            program_family = family
+        elif fused:
+            program_family = (
+                "exactmeta"
+                if light_stage
+                else "exactone"
+                if one_launch
+                else "exactfused"
+            )
+        else:
+            program_family = two_kernel_family(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                # packed varlen: x is [1, total tokens, nheads, 64]
+                seqlen=batch * seqlen if self.has_varlen else seqlen,
+            )
         workspace: dict[str, Any] = {
             "program": _program_name(
-                family
-                if chunk_parallel
-                else ("exactmeta" if light_stage else "exactfused")
-                if fused
-                else two_kernel_family(
-                    mode_varlen=self.has_varlen,
-                    num_sequences=num_sequences,
-                    # packed varlen: x is [1, total tokens, nheads, 64]
-                    seqlen=batch * seqlen if self.has_varlen else seqlen,
-                ),
+                program_family,
                 self.state_dtype,
                 self.has_varlen,
                 variant,
@@ -2247,9 +2310,18 @@ class CakeSSDCombined:
             # The runner-owned ``seq_chunk_cumsum`` the preprocess fills when
             # the caller supplies no vector (both packed-varlen forms).  Per
             # shape rather than per sequence count so that a captured graph's
-            # vector is never replaced by a call of another shape.
+            # vector is never replaced by a call of another shape.  The
+            # one-launch ``exactone`` program owns one row per CTA instead:
+            # its prologue derives this CTA's private table into row
+            # ``blockIdx.x`` of a ``grid x (num_sequences + 1)`` scratch
+            # (``_persistent_grid_size``, the main kernel's launch grid).
+            table_rows = 1
+            if program_family == "exactone":
+                table_rows = _persistent_grid_size(
+                    total_work=num_sequences * self.nheads, sm_count=sm_count
+                )
             workspace["seq_chunk_cumsum"] = torch.empty(
-                num_sequences + 1, dtype=torch.int32, device=device
+                table_rows * (num_sequences + 1), dtype=torch.int32, device=device
             )
         if key.from_cu_seqlens:
             # cu_seqlens form: the preprocess publishes the derived
@@ -2668,6 +2740,15 @@ class CakeSSDCombined:
             and seq_chunk_cumsum is not None
             and not update_seq_chunk_cumsum
         )
+        # seq_idx triple form publishing the table into the caller's buffer:
+        # a publishing stage must write it, so the one-launch program (whose
+        # table stays private to each CTA) is not an option for this shape.
+        publish_table = (
+            mode_varlen
+            and not from_cu_seqlens
+            and seq_chunk_cumsum is not None
+            and bool(update_seq_chunk_cumsum)
+        )
 
         nchunks = -(-seqlen // _CHUNK_SIZE)
         if not mode_varlen:
@@ -2837,6 +2918,7 @@ class CakeSSDCombined:
             self.state_dtype,
             from_cu_seqlens,
             caller_cumsum,
+            publish_table,
         )
         if preparing:
             mode = _chunk_parallel_mode()
@@ -2973,7 +3055,10 @@ class CakeSSDCombined:
                 else workspace["seq_chunk_cumsum"]
             )
         elif seq_chunk_cumsum is None:
-            write_seq_chunk_cumsum = True
+            # The runner's vector: the stage publishes it -- except for the
+            # one-launch program, whose main kernel derives its per-CTA rows
+            # of this scratch itself (nothing is published).
+            write_seq_chunk_cumsum = program.family != "exactone"
             cumsum_arg = workspace["seq_chunk_cumsum"]
         else:
             write_seq_chunk_cumsum = bool(update_seq_chunk_cumsum)
@@ -3077,6 +3162,19 @@ class CakeSSDCombined:
             grid = _persistent_grid_size(
                 total_work=num_sequences * self.nheads, sm_count=sm_count
             )
+        if program.family == "exactone":
+            # One launch: no stage runs (grid 0).  The main kernel's CTA
+            # prologue derives this CTA's sequence table from the seq_idx
+            # triple into row ``blockIdx.x`` of the runner's scratch (the
+            # workspace sized it ``grid x (num_sequences + 1)`` for this
+            # shape) and flags an invalid id in the status word exactly as
+            # the publishing stages do.
+            preprocess_grid = (0, 1, 1)
+            assert cumsum_arg.numel() == grid * (num_sequences + 1), (
+                cumsum_arg.numel(),
+                grid,
+                num_sequences,
+            )
 
         d_arg = D if D is not None else self._dummy(x.device, torch.bfloat16)
         if D is not None and D.ndim == 2 and not self.d_has_hdim:
@@ -3163,8 +3261,12 @@ class CakeSSDCombined:
             # status word.  The two-kernel and chunk-parallel programs read
             # the tables their preprocess published.
             "cu_seqlens": cu_seqlens_arg,
-            "metadata_from_cu_seqlens": int(
-                program.family == "exactfused" and from_cu_seqlens
+            "metadata_from_cu_seqlens": (
+                (_TABLE_IN_KERNEL_I64 if seq_idx_int64 else _TABLE_IN_KERNEL_I32)
+                if program.family == "exactone"
+                else _TABLE_CU_SEQLENS
+                if program.family == "exactfused" and from_cu_seqlens
+                else _TABLE_PUBLISHED
             ),
             "preprocess_status": preprocess_status,
         }
