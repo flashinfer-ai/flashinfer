@@ -1038,7 +1038,9 @@ def test_decode_resolver_routes_the_bf16_wide_body_per_architecture(arch) -> Non
     # unrolled `wide128_vpre` schedule, B200 / B300 keep the shipped body.  The
     # route id (flavour + grid tile) is the same on every architecture, and the
     # T=1 band rows keep the shipped wide body everywhere.
-    assert cake_gdn.CAKE_GDN_BF16_WIDE_ARCH_BODIES == {"sm_107a": "wide128_vpre_xchg"}  # R26 lane P2 P2-W1-WIDE
+    assert cake_gdn.CAKE_GDN_BF16_WIDE_ARCH_BODIES == {
+        "sm_107a": "wide128_vpre_xchg"
+    }  # R26 lane P2 P2-W1-WIDE
     body = "wide128_vpre_xchg" if arch == "sm_107a" else "wide128"
     rows = [
         # (overrides, expected route id)
@@ -1493,12 +1495,14 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
 ) -> None:
     """Cake rule mirror (``gate_stream_flat_default``, exporter ``_prefill_plan``): the full-DV stateful bodies take
     their ``_gatestream_full`` twin on every architecture when a CTA owns at least two work tiles under the grid rule
-    and the mean sequence length is at most 512 tokens; every other key stays on its base."""
+    and the mean sequence length is at most 512 tokens; every other key stays on its base.  On sm_107a the seq twin
+    rule applies on top: the gate-stream twin's own ``_sm107a_i64meta`` twin (no sm_107a record is a base body)."""
     base = "flashinfer_blackwell_gdn_prefill_initial"
     key = _HQ16_HV32_BF16_STATEFUL_32X256
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         twin, specs, route = _requested_prefill_source(monkeypatch, arch=arch, **key)
-        assert twin == f"{base}_gatestream_full", arch
+        seq_twin = "_sm107a_i64meta" if arch == "sm_107a" else ""
+        assert twin == f"{base}_gatestream_full{seq_twin}", arch
         assert route == "flashinfer.gdn_prefill.noncp.full_dv"
         assert (
             specs["NUM_O_HEADS_LOG2"] == 5
@@ -1620,13 +1624,80 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
         assert twin.variant_name.startswith(
             "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full"
         ), twin
-    # CC 10.7 ships the TP4 base record too: its sm_107a view is the shared body the other
-    # architectures already use, so the record lists sm_107a and the resolver runs the same
-    # base record there (no gatestream twin exists for any architecture).
-    seven = _prefill(arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape)
+    # CC 10.7 runs the TP4 key through its `i64meta` twin record (the sm_107a default body:
+    # the same schedule reading int32 or int64 metadata directly); the base record lists the
+    # other architectures only.  No gatestream twin exists for the key on any architecture.
+    seven = _prefill(
+        arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape
+    )
     assert seven.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
-    assert seven.variant_name == base.variant_name, (seven, base)
-    assert "sm_107a" in cake_gdn._kernel_record(seven.variant_name)["architectures"]
+    assert seven.variant_name != base.variant_name, (seven, base)
+    assert seven.metadata_i64 is True and base.metadata_i64 is False
+    seven_record = cake_gdn._kernel_record(seven.variant_name)
+    assert seven_record["source_schedule"].endswith(
+        ":flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta"
+    )
+    assert seven_record["architectures"] == ["sm_107a"]
+    assert seven_record["specializations"] == record["specializations"]
+    assert "sm_107a" not in cake_gdn._kernel_record(base.variant_name)["architectures"]
+
+
+def test_prefill_resolver_runs_an_i64_metadata_twin_for_every_key_on_sm_107a() -> None:
+    """P1-I64META: on CC 10.7 every non-CP prefill key resolves to an sm_107a-only twin record that
+    declares ``metadata_i64`` (the routed vec2 bodies and the ``i64meta`` default alike); on the
+    other architectures the resolved record never declares it."""
+    keys = (
+        # full-DV ``_initial`` TP4 key (64 x 256 tokens, Hq4/Hv16): the ``i64meta`` default body
+        dict(
+            io_dtype="bfloat16",
+            num_seqs=64,
+            total_seq_len=64 * 256,
+            max_seq_len=256,
+            num_q_heads=4,
+            num_k_heads=4,
+            num_v_heads=16,
+            gates_present=True,
+        ),
+        # dvsplit fp16-I/O fp32-state Hq2/Hv8 (the ``_prefill`` default): the routed ``l7_vec2`` body
+        dict(),
+        # dvsplit bf16-state Hq2/Hv8: the routed ``l7b_vec2lp`` body (sm_100a runs its late-input twin)
+        dict(io_dtype="bfloat16", state_dtype="bfloat16"),
+        # the single-chunk stateless record (Hq4/Hv8, 64 tokens): the ``i64meta`` default body
+        dict(
+            io_dtype="bfloat16",
+            num_q_heads=4,
+            num_k_heads=4,
+            num_v_heads=8,
+            max_seq_len=64,
+            total_seq_len=64,
+            use_initial_state=False,
+            store_final_state=False,
+        ),
+    )
+    for key in keys:
+        seven = _prefill(arch="sm_107a", **key)
+        record = cake_gdn._kernel_record(seven.variant_name)
+        assert seven.metadata_i64 is True, (key, seven)
+        assert record.get("metadata_i64") is True and record["architectures"] == [
+            "sm_107a"
+        ], (key, record)
+        assert "_sm107a_" in record["source_schedule"], (key, record)
+        for arch in ("sm_100a", "sm_103a"):
+            other = _prefill(arch=arch, **key)
+            assert other.metadata_i64 is False, (key, other)
+            assert "metadata_i64" not in cake_gdn._kernel_record(other.variant_name), (
+                key,
+                other,
+            )
+    # Every sm_107a non-CP prefill record of the manifest is a twin with the field; no base record lists sm_107a.
+    for record in cake_gdn._manifest()["variants"]:
+        if record["domain"] != "prefill":
+            continue
+        twin = "_sm107a_" in record["source_schedule"]
+        assert ("sm_107a" in record["architectures"]) == twin, record["name"]
+        assert record.get("metadata_i64", False) is twin, record["name"]
+        if twin:
+            assert record["architectures"] == ["sm_107a"], record["name"]
 
 
 def test_prefill_schedule_attr_pins_the_gatestream_twin_names() -> None:

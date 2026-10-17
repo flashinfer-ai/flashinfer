@@ -16,7 +16,7 @@
 
 The route reads nothing back from the device: these tests pin the host-side
 contract -- the ``cu_seqlens_cpu`` validation, the single host-known grid rule,
-the int32 metadata path and the public forwarding of ``max_seqlen`` /
+the int32 / int64 metadata path and the public forwarding of ``max_seqlen`` /
 ``cu_seqlens_cpu`` -- without a GPU.  The GPU behaviour (zero-sync proof, CUDA
 Graph capture and replay, chunked state carry) lives in
 ``test_cake_gdn_prefill_gpu.py``.
@@ -163,6 +163,23 @@ def test_int32_metadata_is_passed_through_and_int64_is_cast_per_call() -> None:
         "_cake_gdn_prefill_seq_lens",
     ):
         assert not hasattr(gdn_prefill, name), name
+
+
+def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> None:
+    launch = gdn_prefill._cake_gdn_prefill_launch_metadata
+    i32 = torch.tensor([0, 64, 128], dtype=torch.int32)
+    i64 = torch.tensor([0, 64, 128], dtype=torch.int64)
+    # A ``metadata_i64`` record reads either width in place: no copy, no cast.
+    assert launch(i32, metadata_i64=True) is i32
+    assert launch(i64, metadata_i64=True) is i64
+    # Every other record takes int32: pass-through for int32, a cast for int64.
+    assert launch(i32, metadata_i64=False) is i32
+    cast = launch(i64, metadata_i64=False)
+    assert cast.dtype == torch.int32
+    assert torch.equal(cast, i32)
+    # The route carries the contract and defaults to the int32-only ABI.
+    assert cake_gdn.CakeGDNRoute._fields == ("route_id", "variant_name", "metadata_i64")
+    assert cake_gdn.CakeGDNRoute("prefill.dvsplit", "variant").metadata_i64 is False
 
 
 def _public_dispatch_inputs() -> tuple[torch.Tensor, ...]:

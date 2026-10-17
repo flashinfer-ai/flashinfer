@@ -55,6 +55,10 @@ class CakeGDNUnsupportedError(NotImplementedError):
 class CakeGDNRoute(NamedTuple):
     route_id: str
     variant_name: str
+    # The record reads int32 or int64 ``cu_seqlens`` / ``state_indices`` / ``checkpoint_cu_starts``
+    # directly (manifest field ``metadata_i64``: every sm_107a non-CP prefill record); the host
+    # passes the caller's buffers without a per-call cast.  False on every other record.
+    metadata_i64: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -424,8 +428,13 @@ def _serves_arch(record: dict[str, Any], arch: CakeGDNArch) -> bool:
 # load, the final-state store and the checkpoint stores; every arithmetic operation keeps its
 # operands, order and rounding, so the output is bitwise identical to the shipped body).  An
 # indexed-state plan (`USE_STATE_INDICES`) traces its own `_indexed` schedule, keyed as such.
-# Mirrors `PREFILL_SEQ_ARCH_BODIES` in loom.examples.weave.flashinfer_blackwell_gdn_prefill
-# (the Cake tree cross-checks this copy).
+# Every other shipped schedule runs the `i64meta` body on sm_107a (the per-architecture default,
+# `CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES`): the same kernel reading int32 or int64 launch metadata
+# directly, so the host passes the caller's `cu_seqlens` / `state_indices` /
+# `checkpoint_cu_starts` without a per-call cast; every sm_107a twin (the routed bodies too)
+# carries that contract (record field `metadata_i64`).  No sm_107a record is a base body.
+# Mirrors `PREFILL_SEQ_ARCH_BODIES` / `PREFILL_SEQ_DEFAULT_BODIES` in
+# loom.examples.weave.flashinfer_blackwell_gdn_prefill (the Cake tree cross-checks this copy).
 _SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
     # fp32-state dvsplit schedules: 8-byte fp32 state I/O
     "l7_vec2": (
@@ -452,6 +461,9 @@ CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
     for body, suffixes in _SM107A_SEQ_TWINS.items()
     for suffix in suffixes
 }
+# The body of every shipped schedule the table above does not route, per architecture
+# (absent = the shipped schedule itself).
+CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES: dict[str, str] = {"sm_107a": "i64meta"}
 
 
 def cake_gdn_prefill_seq_schedule(
@@ -460,10 +472,14 @@ def cake_gdn_prefill_seq_schedule(
     """The sequential prefill schedule `arch` runs for the shipped `schedule_attr`.
 
     The shipped schedule itself, or its per-architecture twin
-    (`<schedule>_sm107a_<body>`, a record of its own in the manifest).
+    (`<schedule>_sm107a_<body>`, a record of its own in the manifest): the body
+    `CAKE_GDN_PREFILL_SEQ_ARCH_BODIES` routes, else the architecture's default
+    body (`CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES`; on sm_107a every schedule is a twin).
     """
     symbol = f"{schedule_attr}_indexed" if use_state_indices else schedule_attr
-    body = CAKE_GDN_PREFILL_SEQ_ARCH_BODIES.get((arch, symbol), "base")
+    body = CAKE_GDN_PREFILL_SEQ_ARCH_BODIES.get(
+        (arch, symbol), CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES.get(arch, "base")
+    )
     return schedule_attr if body == "base" else f"{schedule_attr}_sm107a_{body}"
 
 
@@ -752,10 +768,22 @@ def select_cake_gdn_prefill_variant(
             gate_stream_full=gate_stream_full,
         )
 
-    schedule_attr = _schedule_attr(gate_stream_full=gate_stream_full)
+    # The sm_107a sequential twin of the resolved schedule (`cake_gdn_prefill_seq_schedule`): a
+    # record of its own, applied to the schedule the base rule settles on -- including the
+    # gate-stream twin, whose `_sm107a_i64meta` record is the one that exists on sm_107a (the
+    # gate-stream base record lists the other architectures only), so the gate-stream
+    # fallback below probes the twin-resolved name.
+    def _seq_schedule_attr(*, gate_stream_full: bool) -> str:
+        return cake_gdn_prefill_seq_schedule(
+            arch,
+            _schedule_attr(gate_stream_full=gate_stream_full),
+            use_state_indices=use_state_indices,
+        )
+
+    schedule_attr = _seq_schedule_attr(gate_stream_full=gate_stream_full)
     if (
         gate_stream_full
-        and schedule_attr.endswith("_gatestream_full")
+        and "_gatestream_full" in schedule_attr
         and not _has_variant(
             arch=arch,
             domain="prefill",
@@ -769,14 +797,7 @@ def select_cake_gdn_prefill_variant(
         # base record, exactly as the route did before the twin existed; only a missing base
         # fails closed below.
         gate_stream_full = False
-        schedule_attr = _schedule_attr(gate_stream_full=False)
-    # The sm_107a sequential twin of the resolved schedule (`CAKE_GDN_PREFILL_SEQ_ARCH_BODIES`):
-    # a record of its own, selected after the gate-stream fallback so the twin shadows exactly
-    # the schedule the base rule settled on (the routed keys are DV-split; the gate-stream
-    # twins are full-DV, so the two rules never meet).
-    schedule_attr = cake_gdn_prefill_seq_schedule(
-        arch, schedule_attr, use_state_indices=use_state_indices
-    )
+        schedule_attr = _seq_schedule_attr(gate_stream_full=False)
     record = _variant_for(
         arch=arch,
         domain="prefill",
@@ -790,7 +811,9 @@ def select_cake_gdn_prefill_variant(
     else:
         route = "flashinfer.gdn_prefill.noncp"
     return CakeGDNRoute(
-        f"{route}.{'dvsplit' if dvsplit else 'full_dv'}", record["name"]
+        f"{route}.{'dvsplit' if dvsplit else 'full_dv'}",
+        record["name"],
+        bool(record.get("metadata_i64", False)),
     )
 
 
@@ -831,18 +854,25 @@ def cake_gdn_prefill_geometries(
     # The base template of the contract: every performance twin the resolver
     # may substitute on ``arch`` (sm_100a late state input, sm_103a role
     # rebalance, gate-stream full) is exported for exactly the geometry
-    # triples of its base record, so the base records enumerate the contract.
-    schedule_attr = _prefill_schedule_attr(
-        dvsplit=dvsplit,
-        use_initial_state=use_initial_state,
-        io_dtype=io_dtype,
-        state_dtype=state_dtype,
-        single_chunk=False,
-        gatepipe4=False,
-        fullgrid_vhold=False,
-        sm100a_state_inp_late=False,
-        sm103a_role_rebalanced=False,
-        gate_stream_full=False,
+    # triples of its base record, so the base records enumerate the contract
+    # -- except on an architecture whose sequential rule replaces the base by
+    # a per-architecture twin record (sm_107a, `cake_gdn_prefill_seq_schedule`:
+    # the base record does not list it); there the twin records enumerate it.
+    schedule_attr = cake_gdn_prefill_seq_schedule(
+        arch,
+        _prefill_schedule_attr(
+            dvsplit=dvsplit,
+            use_initial_state=use_initial_state,
+            io_dtype=io_dtype,
+            state_dtype=state_dtype,
+            single_chunk=False,
+            gatepipe4=False,
+            fullgrid_vhold=False,
+            sm100a_state_inp_late=False,
+            sm103a_role_rebalanced=False,
+            gate_stream_full=False,
+        ),
+        use_state_indices=False,
     )
     expected_source = f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
     fixed: dict[str, int] = {
@@ -1079,7 +1109,9 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` in
 # loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
-CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = 37  # CAKE-1096 R26 lane P2 (P2-K37): 35 -> 37; see the Cake launcher
+CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = (
+    37  # CAKE-1096 R26 lane P2 (P2-K37): 35 -> 37; see the Cake launcher
+)
 CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES: dict[str, str] = {
     "small": "gdn_decode_nontranspose_fp32_t1_small",
     "large": "gdn_decode_nontranspose_fp32_t1",
