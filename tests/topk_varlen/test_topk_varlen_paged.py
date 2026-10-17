@@ -363,6 +363,45 @@ def test_paged_cluster_rows_far_below_envelope(rows):
     assert _same_rows(out, _expected(loc, pt, 1, page_size))
 
 
+@requires_gvr2
+@pytest.mark.parametrize("rows", [32, 64], ids=lambda r: f"r{r}")
+@pytest.mark.parametrize("page_size", [1, 64, 128], ids=lambda p: f"ps{p}")
+def test_paged_cluster_register_rows(rows, page_size):
+    """Cluster-family launches whose rows mostly fit the in-kernel register path
+    (rank 0 ranks them with the register family's body): that body stages its
+    own page-table slice, sized from its capacity (none at page size 1), and must
+    map through the request's row like the streaming path."""
+    ncols, top_k = 131072, 512
+    cap = 1024 * 4 * _host._CLUS_REG_VPT
+    assert (
+        _host._varlen_launcher(
+            rows, ncols, top_k, ncols, 1, 1, True, page_size.bit_length() - 1
+        )[0]
+        == "clus"
+    )
+    lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + page_size)
+    lens = torch.randint(top_k + 1, cap + 1, (rows,), generator=gen, device=_DEV)
+    # k + 1, the capacity's edges, a short row, a streaming row
+    edges = [top_k + 1, cap, cap + 1, top_k, ncols]
+    lens[: len(edges)] = torch.tensor(edges, device=_DEV)
+    lens = lens.to(torch.int32)
+    pt = _page_table(rows, ncols, page_size, seed=41)
+    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    for r in range(rows):  # the local output itself is the exact top-k
+        n = int(lens[r])
+        if n > top_k:
+            idx = loc[r].to(torch.int64)
+            assert (
+                int(idx.min()) >= 0
+                and int(idx.max()) < n
+                and idx.unique().numel() == top_k
+            )
+            ref = torch.topk(lg[r, :n], top_k).values.sort().values
+            assert torch.equal(lg[r, idx].sort().values, ref), f"row {r} inexact"
+    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+
+
 def test_paged_api_validation():
     rows, ncols, k = 8, 4096, 512
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
