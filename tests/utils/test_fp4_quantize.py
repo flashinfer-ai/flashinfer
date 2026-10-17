@@ -1888,18 +1888,16 @@ def test_nvfp4_quantize_fp8_backend_parity(
     )
 
 
-# FP8 input with m >= 1024 takes the TMA kernel only when n is a multiple of its
-# 1024-column chunk; odd multiples of 512 must fall back to the non-TMA kernel.
+# FP8 input takes the TMA kernel only with m >= 1024, at least 32 MiB of input,
+# and n a multiple of its 1024-column chunk; the other shapes guard that routing.
 NVFP4_FP8_TMA_SHAPES = [
-    (1024, 512),
-    (1024, 1024),
-    (1024, 1536),
-    (4096, 512),
-    (4096, 1536),
-    (4096, 2048),
-    (1100, 1024),  # m not a multiple of 128
-    (1025, 1024),  # last row tile holds a single row
-    (1024, 3072),  # odd number of column chunks
+    (1024, 1024),  # below the size threshold
+    (1024, 32768),
+    (4096, 8192),
+    (4096, 8704),  # odd multiple of 512
+    (1100, 32768),  # m not a multiple of 128
+    (1025, 32768),  # last row tile holds a single row
+    (1024, 33792),  # odd number of column chunks
 ]
 NON_TMA_ROWS = 512
 
@@ -1943,7 +1941,8 @@ def test_nvfp4_quantize_fp8_tma_matches_non_tma(
     )
 
 
-@pytest.mark.parametrize("batch_shape", [(3, 1024, 1024), (2, 1100, 2048)])
+# Each batch alone is below the size threshold; the whole input is not.
+@pytest.mark.parametrize("batch_shape", [(3, 1024, 11264), (2, 1100, 16384)])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_batched_quantize_fp8_tma_matches_non_tma(
