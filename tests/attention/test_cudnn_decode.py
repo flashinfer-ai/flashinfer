@@ -1840,7 +1840,8 @@ def test_auto_backend_cuda_graph_resolution_is_frozen(monkeypatch):
 
 
 @requires_cudnn_graph
-def test_auto_backend_fast_plan_reevaluates_per_plan(monkeypatch):
+@pytest.mark.parametrize("host_metadata", [False, True])
+def test_auto_backend_fast_plan_reevaluates_per_plan(monkeypatch, host_metadata):
     """fast_decode_plan applies the per-plan auto rule too: an auto wrapper
     that first resolved to fa2 (one row) moves to cudnn when a later plan
     enters the envelope (four rows), leaves it again (two rows: 16 per CTA)
@@ -1857,9 +1858,9 @@ def test_auto_backend_fast_plan_reevaluates_per_plan(monkeypatch):
         )
         flashinfer.fast_decode_plan(
             wrapper,
-            indptr,
-            indices,
-            last,
+            indptr.cpu() if host_metadata else indptr,
+            indices.cpu() if host_metadata else indices,
+            last.cpu() if host_metadata else last,
             64,
             8,
             128,

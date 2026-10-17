@@ -282,6 +282,51 @@ def test_batch_decode_with_paged_kv_cache(
     )
 
 
+@pytest.mark.parametrize("name", ["indptr", "indices", "last_page_len"])
+@pytest.mark.parametrize("bad_device", ["cpu", "cuda:1"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_fast_decode_plan_rejects_wrong_device(name, bad_device, use_cuda_graph):
+    if bad_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    metadata = {
+        "indptr": torch.tensor([0, 1], dtype=torch.int32, device="cuda:0"),
+        "indices": torch.tensor([0], dtype=torch.int32, device="cuda:0"),
+        "last_page_len": torch.tensor([16], dtype=torch.int32, device="cuda:0"),
+    }
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(32 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"),
+        use_cuda_graph=use_cuda_graph,
+        paged_kv_indptr_buffer=metadata["indptr"],
+        paged_kv_indices_buffer=metadata["indices"],
+        paged_kv_last_page_len_buffer=metadata["last_page_len"],
+        backend="fa2",
+    )
+    wrapper.plan(
+        **metadata,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=16,
+        q_data_type=torch.float16,
+    )
+    invalid = dict(metadata)
+    invalid[name] = invalid[name].to(bad_device)
+    with pytest.raises(
+        ValueError, match=f"Invalid device of {name}: expected cuda:0, got {bad_device}"
+    ):
+        flashinfer.fast_decode_plan(
+            wrapper,
+            **invalid,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=16,
+            q_data_type=torch.float16,
+        )
+    for key, tensor in metadata.items():
+        assert getattr(wrapper, f"_paged_kv_{key}_buf") is tensor
+
+
 global_override_indptr_cpu = None
 MAX_BATCH_SIZE = 128
 
@@ -391,6 +436,9 @@ def test_batch_decode_with_paged_kv_cache_with_fast_plan(
         non_blocking=True,
         global_override_indptr_cpu=global_override_indptr_cpu,
     )
+    assert wrapper._paged_kv_indptr_buf is kv_indptr
+    assert wrapper._paged_kv_indices_buf is kv_indices
+    assert wrapper._paged_kv_last_page_len_buf is kv_last_page_len
     if return_lse:
         o, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
