@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.gemm import w8a16_fp8_gemm
+from flashinfer.gemm import w8a16_fp8_gemm, w8a16_fp8_gemm_workspace_bytes
 from flashinfer.utils import get_compute_capability
 
 
@@ -101,6 +101,65 @@ def test_w8a16_fp8_gemm_3d_and_out():
     assert ret is out
     ref = act.float().reshape(-1, 256) @ (w_fp8.float() * scale).T
     torch.testing.assert_close(out.float().reshape(-1, 512), ref, atol=5e-2, rtol=2e-2)
+    # A non-contiguous out would be silently replaced by a copy: rejected instead.
+    with pytest.raises(ValueError, match="contiguous"):
+        w8a16_fp8_gemm(
+            act,
+            w_fp8,
+            scale,
+            out=torch.empty(2, 512, 33, device=dev, dtype=torch.bfloat16).transpose(
+                1, 2
+            ),
+        )
+    with pytest.raises(ValueError, match="out must be"):
+        w8a16_fp8_gemm(
+            act,
+            w_fp8,
+            scale,
+            out=torch.empty(66, 512, device=dev, dtype=torch.bfloat16),
+        )
+
+
+def test_w8a16_fp8_gemm_caller_workspace():
+    """A caller-owned workspace (any dtype, oversized) gives the same result as the
+    allocated one; an undersized one is rejected before launch.  The split-K variant
+    is forced so the call needs a workspace on both architectures."""
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    major = get_compute_capability(dev)[0]
+    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}.get(major)
+    if algo is None:
+        pytest.skip("w8a16_fp8_gemm needs Hopper or Blackwell")
+    m, n, k = 256, 1024, 5120
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    assert need > 0
+    assert (
+        w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) == need
+    )  # pure in its inputs
+    ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    ws = torch.full(
+        (need + 1000,), 0x7F, dtype=torch.uint8, device=dev
+    )  # garbage, oversized
+    out = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, workspace=ws)
+    assert torch.equal(out, ref)
+    ws16 = torch.empty((need // 2 + 8,), dtype=torch.bfloat16, device=dev)
+    assert torch.equal(
+        w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, workspace=ws16), ref
+    )
+    with pytest.raises(ValueError, match="workspace too small"):
+        w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, workspace=ws[: need - 4])
+    # A single-pass shape ignores the buffer entirely (0 bytes needed).
+    plain = {9: "128x256", 10: "2sm256x128"}[major]
+    assert w8a16_fp8_gemm_workspace_bytes(4096, 4096, 5120, dev, plain) == 0
+    tiny = torch.empty(1, dtype=torch.uint8, device=dev)
+    big_act = torch.randn(4096, k, device=dev, dtype=torch.bfloat16)
+    w2, s2 = _quantize(torch.randn(4096, k, device=dev) * 0.02)
+    assert torch.equal(
+        w8a16_fp8_gemm(big_act, w2, s2, algo=plain, workspace=tiny),
+        w8a16_fp8_gemm(big_act, w2, s2, algo=plain),
+    )
 
 
 def test_w8a16_fp8_gemm_rejects_bad_inputs():

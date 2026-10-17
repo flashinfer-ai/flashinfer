@@ -83,6 +83,28 @@ def _workspace_bytes(m: int, n: int, k: int, device_index: int, algo: int) -> in
     )
 
 
+def w8a16_fp8_gemm_workspace_bytes(
+    m: int,
+    n: int,
+    k: int,
+    device: Optional[torch.device] = None,
+    algo: Optional[str] = None,
+) -> int:
+    """Workspace bytes :func:`w8a16_fp8_gemm` needs for an ``[M, K] x [N, K]`` problem.
+
+    ``0`` when the launcher's choice for this shape runs in a single pass;
+    otherwise the fp32 partials plus CUTLASS scratch of the split-K (or
+    stream-K) decomposition it would pick.  ``m`` is the flattened row count
+    (the product of ``act``'s leading dimensions).  The answer depends on the
+    device (SM count) and on ``algo`` exactly as the launch does, so size the
+    buffer with the arguments you will call with; a caller serving several
+    shapes from one buffer takes the maximum over them.
+    """
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _workspace_bytes(m, n, k, device.index or 0, _algo_code(algo, device))
+
+
 # Blackwell kernel variants selectable through ``algo``.  The codes are the
 # W8A16Sm100Tile enum values in include/flashinfer/gemm/w8a16_fp8_gemm_sm100.cuh.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
@@ -141,6 +163,7 @@ def w8a16_fp8_gemm(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     algo: Optional[str] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""bf16 / fp16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
 
@@ -172,8 +195,16 @@ def w8a16_fp8_gemm(
     bias: Optional[torch.Tensor]
         Optional bias, shape ``(N,)``, same dtype as ``act``.
     out: Optional[torch.Tensor]
-        Optional output, shape ``(..., N)``, same dtype as ``act``.  Allocated
-        when omitted.
+        Optional output, shape ``(..., N)`` (``act``'s leading dimensions),
+        same dtype as ``act``, contiguous.  Allocated when omitted.
+    workspace: Optional[torch.Tensor]
+        Optional scratch for the split-K / stream-K decompositions, on
+        ``act``'s device, contiguous, any dtype; at least
+        :func:`w8a16_fp8_gemm_workspace_bytes` bytes for this call's shape and
+        ``algo``.  Allocated per call when omitted (through the caching
+        allocator, so the cost is a few microseconds of host time).  A caller
+        that wants a fixed memory budget sizes one buffer once and passes it to
+        every call.
 
     Notes
     -----
@@ -183,7 +214,8 @@ def w8a16_fp8_gemm(
     ``weight`` / ``out`` 16-byte aligned; anything else is rejected with a
     ValueError before launch.  On Hopper the launcher picks a CUTLASS tile and
     decomposition (plain, stream-K or split-K) from a cost model; split-K runs
-    go through an fp32 workspace that this function allocates.  On Blackwell it
+    go through an fp32 workspace (``workspace``, or one this function
+    allocates).  On Blackwell it
     picks one of the 2SM tiles from the same kind of model.
     algo: Optional[str]
         Pins one kernel variant instead of the launcher's choice (benchmarking):
@@ -222,21 +254,40 @@ def w8a16_fp8_gemm(
 
     lead_shape = act.shape[:-1]
     act2d = act.reshape(-1, k)
+    out_shape = tuple(lead_shape) + (n,)
     if out is None:
-        out = torch.empty(*lead_shape, n, dtype=act.dtype, device=act.device)
-    elif out.dtype != act.dtype or out.shape[-1] != n:
+        out = torch.empty(out_shape, dtype=act.dtype, device=act.device)
+    elif out.dtype != act.dtype or tuple(out.shape) != out_shape:
         raise ValueError(
-            f"out must be {tuple(lead_shape) + (n,)} in {act.dtype}, "
-            f"got {tuple(out.shape)} in {out.dtype}"
+            f"out must be {out_shape} in {act.dtype}, got {tuple(out.shape)} in {out.dtype}"
         )
-    out2d = out.reshape(-1, n)
+    elif not out.is_contiguous():
+        # reshape() would hand the kernel a contiguous copy and the caller's
+        # buffer would never see the result.
+        raise ValueError("out must be contiguous")
+    out2d = out.view(-1, n)
     # Under-filled grids run split-K through an fp32 workspace; the kernel
     # decides, this only sizes the buffer (0 bytes = single pass).
     ws_bytes = _workspace_bytes(act2d.shape[0], n, k, act.device.index or 0, algo_code)
-    workspace = (
-        torch.empty(ws_bytes // 4, dtype=torch.float32, device=act.device)
-        if ws_bytes > 0
-        else None
-    )
-    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, workspace, algo_code)
+    if ws_bytes == 0:
+        ws = None
+    elif workspace is None:
+        ws = torch.empty(ws_bytes // 4, dtype=torch.float32, device=act.device)
+    else:
+        have = workspace.numel() * workspace.element_size()
+        if workspace.device != act.device or not workspace.is_contiguous():
+            raise ValueError("workspace must be a contiguous tensor on act's device")
+        if have < ws_bytes:
+            raise ValueError(
+                f"workspace too small: {have} bytes, this call needs {ws_bytes} "
+                "(see w8a16_fp8_gemm_workspace_bytes)"
+            )
+        # The launchers take fp32; any dtype is accepted here and reinterpreted
+        # (a whole number of 4-byte words, then exactly the bytes this call needs).
+        ws = workspace.view(-1)
+        if ws.dtype != torch.float32:
+            words = have // 4
+            ws = ws[: words * 4 // ws.element_size()].view(torch.float32)
+        ws = ws[: ws_bytes // 4]
+    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, ws, algo_code)
     return out
