@@ -340,7 +340,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
       encode_func(&tensor_map, data_type, rank, global_address, gmem_dim, stride_in_bytes, smem_dim,
                   elem_strides, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
                   CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Failed to encode TMA tensor map");
   return tensor_map;
 }
@@ -526,10 +526,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (m >= 1024 && n % TmaKernelTraits<T>::TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE,
@@ -564,10 +562,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 #endif
   {
     // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (m >= 1024 && n % TmaKernelTraits<T>::TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, recipe.use4Over6, inverse_scale,
