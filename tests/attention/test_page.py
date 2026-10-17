@@ -1160,3 +1160,107 @@ def test_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():
 
     assert torch.equal(k_cache, ref_k), "K cache mismatch after graph replay"
     assert torch.equal(v_cache, ref_v), "V cache mismatch after graph replay"
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_append_paged_kv_cache_with_slot_mapping_strided_append(
+    kv_layout, dtype, slot_dtype
+):
+    """Append tensors with non-contiguous row and head strides but contiguous
+    final (head_dim) dimension, verifying stride-aware kernel reads them
+    correctly."""
+    torch.manual_seed(42)
+    nnz_kv = 32
+    num_kv_heads = 8
+    head_dim = 128
+    page_size = 16
+    max_num_pages = 16
+
+    # Build oversized contiguous buffer, then slice with stride > 1 on rows and
+    # heads so that the resulting view is non-contiguous in those dims but the
+    # final head_dim stays contiguous (stride == 1 element).
+    row_stride = 3
+    head_stride = 2
+    row_capacity = row_stride * nnz_kv
+    head_capacity = head_stride * num_kv_heads
+
+    k_buf = torch.randn(
+        row_capacity, head_capacity, head_dim, device="cuda:0", dtype=dtype
+    )
+    v_buf = torch.randn_like(k_buf)
+
+    k_append = k_buf[::row_stride, ::head_stride, :]
+    v_append = v_buf[::row_stride, ::head_stride, :]
+
+    assert k_append.shape == (nnz_kv, num_kv_heads, head_dim)
+    # Stride along row is row_stride * head_capacity * head_dim elements,
+    # stride along head is head_stride * head_dim elements, final dim == 1.
+    assert k_append.stride()[-1] == 1
+    assert not k_append.is_contiguous()
+
+    if kv_layout == "NHD":
+        cache_shape = (max_num_pages, page_size, num_kv_heads, head_dim)
+    else:
+        cache_shape = (max_num_pages, num_kv_heads, page_size, head_dim)
+
+    k_cache = torch.zeros(cache_shape, dtype=dtype, device="cuda:0")
+    v_cache = torch.zeros(cache_shape, dtype=dtype, device="cuda:0")
+
+    slot_mapping = torch.randperm(
+        max_num_pages * page_size, device="cuda:0", dtype=slot_dtype
+    )[:nnz_kv]
+    slot_mapping[5] = -1  # one negative slot to skip
+
+    flashinfer.append_paged_kv_cache_with_slot_mapping(
+        k_append, v_append, slot_mapping, (k_cache, v_cache), kv_layout=kv_layout
+    )
+
+    ref_k, ref_v = _scatter_reference(
+        torch.zeros_like(k_cache),
+        torch.zeros_like(v_cache),
+        k_append,
+        v_append,
+        slot_mapping,
+        page_size,
+        kv_layout,
+    )
+
+    assert torch.equal(k_cache, ref_k), "K cache mismatch with strided append"
+    assert torch.equal(v_cache, ref_v), "V cache mismatch with strided append"
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_append_paged_kv_cache_with_slot_mapping_empty_slot_mapping(
+    kv_layout, slot_dtype
+):
+    """Empty slot mapping (nnz == 0) must be a no-op across layouts and dtypes."""
+    num_kv_heads = 4
+    head_dim = 64
+    page_size = 8
+    max_num_pages = 4
+    dtype = torch.float16
+
+    if kv_layout == "NHD":
+        cache_shape = (max_num_pages, page_size, num_kv_heads, head_dim)
+    else:
+        cache_shape = (max_num_pages, num_kv_heads, page_size, head_dim)
+
+    k_cache = torch.full(cache_shape, 3.14, dtype=dtype, device="cuda:0")
+    v_cache = torch.full(cache_shape, -2.71, dtype=dtype, device="cuda:0")
+    k_before = k_cache.clone()
+    v_before = v_cache.clone()
+
+    k_append = torch.empty(0, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
+    v_append = torch.empty(0, num_kv_heads, head_dim, device="cuda:0", dtype=dtype)
+    slot_mapping = torch.empty(0, dtype=slot_dtype, device="cuda:0")
+
+    flashinfer.append_paged_kv_cache_with_slot_mapping(
+        k_append, v_append, slot_mapping, (k_cache, v_cache), kv_layout=kv_layout
+    )
+
+    torch.cuda.synchronize()
+    assert torch.equal(k_cache, k_before), "K cache changed on empty slot_mapping"
+    assert torch.equal(v_cache, v_before), "V cache changed on empty slot_mapping"

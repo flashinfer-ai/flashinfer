@@ -1082,9 +1082,10 @@ def append_paged_kv_cache_with_slot_mapping(
 
     This variant is intended for runtimes that already assign each token to a
     flat cache slot. ``slot_mapping[i]`` is interpreted as
-    ``page_id * page_size + entry_idx``. Negative slots are padding and are
-    ignored. ``append_key`` and ``append_value`` may contain additional padded
-    rows; only ``num_valid_tokens`` rows are written.
+    ``page_id * page_size + entry_idx``. Negative slots and slots at or beyond
+    ``max_num_pages * page_size`` are silently ignored. ``append_key`` and
+    ``append_value`` may contain additional padded rows; only the first
+    ``num_valid_tokens`` rows (default ``slot_mapping.shape[0]``) are written.
 
     Parameters
     ----------
@@ -1097,7 +1098,8 @@ def append_paged_kv_cache_with_slot_mapping(
         ``append_key``.
     slot_mapping : torch.Tensor
         Flat cache slot for each row to write, shape ``[nnz]`` with dtype
-        ``torch.int32`` or ``torch.int64``. Negative entries are ignored.
+        ``torch.int32`` or ``torch.int64``. Negative entries and entries at or
+        beyond ``max_num_pages * page_size`` are silently ignored.
     paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         Caller-owned FP16/BF16 K/V cache. For tuple input, each tensor has
         shape ``[max_num_pages, page_size, num_kv_heads, head_dim]`` when
