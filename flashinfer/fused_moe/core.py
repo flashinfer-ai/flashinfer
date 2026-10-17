@@ -2210,7 +2210,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_bf16_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(hidden_size),
             **runner_kwargs,
         )
 
@@ -2486,7 +2486,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_fp8_per_tensor_scale_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(hidden_size),
             **runner_kwargs,
         )
 
@@ -2731,7 +2731,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_fp8_per_tensor_scale_routed_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(hidden_size),
             **runner_kwargs,
         )
 
@@ -2982,7 +2982,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_fp8_per_channel_scale_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(hidden_size),
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_per_channel_weight_scale=gemm1_per_channel_weight_scale,
@@ -3283,7 +3283,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_fp8_block_scale_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(output_width),
             **runner_kwargs,
         )
         _nfse = num_fused_shared_experts if num_fused_shared_experts is not None else 0
@@ -3676,7 +3676,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_fp4_block_scale_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(output_width),
             **runner_kwargs,
         )
 
@@ -4039,7 +4039,7 @@ def _build_trtllm_moe_namespace(module):
             "flashinfer::trtllm_mxint4_block_scale_moe",
             [moe_runner],
             tuning_config,
-            moe_inputs.to_list(),
+            moe_inputs.to_tuning_list(output_width),
             **runner_kwargs,
         )
 
