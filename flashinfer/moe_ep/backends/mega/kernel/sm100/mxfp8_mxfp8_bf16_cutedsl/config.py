@@ -28,7 +28,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fast_math: bool = True
     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
     enable_in_kernel_fc2_reduce: bool = False
-    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
+    # GenPhase: None resolves the cache or geometry heuristic; dictionaries
+    # constrain tile/cluster/schedule_policy; "auto" tunes at collective warmup.
+    # Inference tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
     # "auto" -> online autotune at the first forward: collectively time the
@@ -38,6 +40,11 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # Opt-in decoding pipeline. Existing callers keep the legacy inference
     # path, including its knob cache and online autotuner.
     kernel_variant: Literal["inference", "genphase"] = "inference"
-    # GenPhase only: None selects N128/CGA4. N64 admits CGA2 or CGA4.
+    # GenPhase only: None selects cached knobs or geometry-based heuristics.
+    # Explicit fields constrain the heuristic and automatic candidate sweep.
     mma_tiler_mnk: tuple[int, int, int] | None = None
     cluster_shape_mn: tuple[int, int] | None = None
+    # GenPhase only: None uses the geometry-based scheduling heuristic. An explicit
+    # ("grouped", None) preserves the kernel's original launch-cluster hint;
+    # ("grouped", positive_int) overrides it for offline tuning.
+    schedule_policy: tuple[str, int | None] | None = None

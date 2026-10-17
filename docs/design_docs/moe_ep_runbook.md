@@ -631,8 +631,7 @@ backend = MegaConfig(
         top_k=6,
         gate_up_clamp=10.0,
         kernel_variant="genphase",
-        mma_tiler_mnk=(256, 64, 128),
-        cluster_shape_mn=(2, 1),
+        knobs=None,  # cached winner, otherwise geometry-based heuristics
     ),
     quantize_input=True,
     preprocess_weights=True,
@@ -644,10 +643,64 @@ output = layer.forward(tensors)
 
 GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
 capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
-intermediate size must be a multiple of 64. Leaving both geometry fields unset
-selects N128/CGA4; N64 supports CGA2 or CGA4. Pipeline selection happens at
-construction and does not change with the live token count. GenPhase rejects
-legacy `knobs` (including online `"auto"`) and in-kernel FC2 reduction.
+intermediate size must be a multiple of 64. N128 supports CGA4; N64 supports
+CGA2 or CGA4. In-kernel FC2 reduction remains unsupported.
+
+With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
+host-side estimate based on EP size, expert count, top-k, intermediate width,
+SM count and the planned live-token bucket (capacity when no bucket is known).
+The estimate favors N64 for sparse expert batches and CGA2 when estimated FC1
+work underfills a CGA4 wave; the grouped hint starts at four resident-cluster
+waves. This is a starting estimate that assumes spread routing. Skew and masked
+routes can favor other candidates. No device routing readback occurs during
+selection, and a prepared workspace keeps its configuration for replay.
+
+Set `knobs="auto"` to collectively tune on the first `layer.warmup(tensors)`.
+All EP ranks must enter warmup together before CUDA graph capture. The sweep
+checks a sampled Torch oracle before and after timing warm CUDA graphs, selects
+by median of per-sample maximum-rank duration, and caches the winner. It covers
+the three admitted geometries and original/two/four/eight-wave grouped hints.
+The timed scope is dispatch + FC1/FC2 + reduction; input staging and weight
+preparation are outside it. Tuning creates temporary workspaces and compiles
+candidates; subsequent forward calls reuse the chosen configuration. Tuning
+preserves input/output pointers, and auto workspaces are excluded from pooling.
+
+For serving, tune offline and use `knobs=None` when constructing layers:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
+  --arch sm100 --dtype mxfp8_e4m3 --kernel-variant genphase \
+  --hidden 4096 --intermediate 1024 --num-experts 256 --topk 8 \
+  --max-tokens 1024 --live-tokens 65
+```
+
+Prepare the matching profile before capture on every EP rank. For the bucket
+above, construct a layer with `knobs=None` and use its handle explicitly:
+
+```python
+workspace = layer.create_workspace(1024, live_tokens=65)
+layer.warmup(tensors, workspace=workspace)
+output = layer.forward(tensors, workspace=workspace)
+```
+
+Repeat for representative live-token buckets; use `--skew` for skewed routing.
+`layer.live_token_buckets(1024)` lists the cached buckets. Calls without a
+workspace handle use the layer's default capacity profile; they do not select
+a live-token profile from the incoming batch automatically.
+`FLASHINFER_MOE_EP_KNOB_CACHE` controls the cache path (`off` disables it).
+Entries require matching GPU/SM count, CUDA/Torch/DSL compiler stack, compiler
+options, implementation
+revision, operation attributes, EP geometry, capacity and live-token bucket.
+Distribute the same cache to every EP rank. Construction checks that ranks
+agree on the selected configuration before allocating collective storage.
+A warmup result is also available through `layer.get_tuned_knobs()`.
+
+Explicit `mma_tiler_mnk`, `cluster_shape_mn`, and `schedule_policy` fields or
+a GenPhase `knobs` dictionary constrain both heuristics and the tuning sweep.
+Conflicting explicit fields are rejected. `schedule_policy=("grouped", None)`
+retains the original grouped hint; a positive integer supplies a fixed hint.
+Legacy inference knob names are not accepted by GenPhase. The low-level
+`Sm100GenphaseMoeConfig` keeps its explicit N128/CGA4 defaults.
 
 `quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
 `False` accepts E4M3 activations and per-32 typed E8M0 scales in
