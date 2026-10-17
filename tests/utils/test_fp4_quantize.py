@@ -1860,6 +1860,7 @@ NVFP4_FP8_TMA_SHAPES = [
     (4096, 512),
     (4096, 1536),
     (4096, 2048),
+    (1100, 1024),  # m not a multiple of 128
 ]
 NON_TMA_ROWS = 512
 
@@ -1900,6 +1901,43 @@ def test_nvfp4_quantize_fp8_tma_matches_non_tma(
     )
     torch.testing.assert_close(
         scale.flatten().view(torch.uint8), scale_ref.view(torch.uint8), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("batch_shape", [(3, 1024, 1024), (2, 1100, 2048)])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_batched_quantize_fp8_tma_matches_non_tma(
+    batch_shape: tuple[int, int, int],
+    device: str,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    b, m, n = batch_shape
+    x_fp8 = torch.randn(batch_shape).to(torch.float8_e4m3fn)
+    tensor_amax = torch.abs(x_fp8.float()).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant, scale = nvfp4_batched_quantize(x_fp8, global_scale)
+
+    blocks = [
+        nvfp4_batched_quantize(
+            x_fp8[:, i : i + NON_TMA_ROWS].contiguous(), global_scale
+        )
+        for i in range(0, m, NON_TMA_ROWS)
+    ]
+    quant_ref = torch.cat([q for q, _ in blocks], dim=1)
+    scale_ref = torch.cat([s.view(b, -1) for _, s in blocks], dim=1)
+
+    torch.testing.assert_close(
+        quant.view(torch.uint8), quant_ref.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        scale.view(b, -1).view(torch.uint8), scale_ref.view(torch.uint8), rtol=0, atol=0
     )
 
 
