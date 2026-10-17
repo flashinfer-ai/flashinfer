@@ -2005,8 +2005,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Raises
         ------
         NotImplementedError
-            If the resolved backend cannot bound its workspace. Callers must
-            fall back to their own default allocation in that case.
+            If the resolved backend cannot bound its workspace, including when
+            ``backend="auto"`` would plan any batch within the bounds on cuDNN.
+            Callers must fall back to their own default allocation in that case.
         """
         if max_batch_size < 0 or max_num_pages_per_request < 0:
             raise ValueError("workspace_size_upper_bound bounds must be non-negative")
@@ -2024,7 +2025,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
 
         backend = self._backend
-        if backend in ("cute-dsl", "trtllm-gen"):
+        # plan() takes cuDNN when the auto rule picks it, and that depends on the
+        # batch size, so every batch within the bound is asked; a caller-owned
+        # block table is the case the rule admits most.
+        if any(
+            self._auto_prefers_cudnn(
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                head_dim,
+                num_qo_heads,
+                num_kv_heads,
+                batch_size,
+                page_size,
+                pos_encoding_mode,
+                window_left,
+                logits_soft_cap,
+                q_len_per_req,
+                user_block_tables=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+            )
+            for batch_size in range(1, max_batch_size + 1)
+        ):
+            backend = "cudnn"
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
             raise NotImplementedError(
                 "workspace_size_upper_bound is not available for decode backend "
                 f"{backend!r}"

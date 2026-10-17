@@ -41,11 +41,14 @@ def _bare_decode_wrapper(backend="auto", use_tensor_cores=True):
     cls = decode_module.BatchDecodeWithPagedKVCacheWrapper
     wrapper = cls.__new__(cls)
     wrapper._backend = backend
+    wrapper._requested_backend = backend
     wrapper._jit_module = None
     wrapper.device = torch.device("cpu")
     wrapper._use_tensor_cores = use_tensor_cores
     wrapper._use_cuda_graph = False
     wrapper._float_workspace_buffer = torch.empty(1, dtype=torch.uint8)
+    # The cuDNN rule reads the device's compute capability; this one is the CPU.
+    wrapper._auto_prefers_cudnn = lambda *args, **kwargs: False
     return wrapper
 
 
@@ -219,6 +222,31 @@ def test_decode_tensor_core_bound_refuses_fa3_without_an_entry_point(monkeypatch
             page_size=16,
             q_data_type=torch.float8_e4m3fn,
             kv_data_type=torch.float8_e4m3fn,
+        )
+
+
+@pytest.mark.parametrize(
+    "backend,max_batch_size,refused",
+    [("cudnn", 4, True), ("auto", 64, True), ("auto", 8, False)],
+)
+def test_decode_bound_refuses_any_batch_auto_plans_on_cudnn(
+    monkeypatch, backend, max_batch_size, refused
+):
+    """cuDNN takes a band of batch sizes, so the bound asks every batch in range."""
+    monkeypatch.setattr(
+        decode_module, "get_batch_prefill_module", lambda *a, **k: _ModuleWithBound()
+    )
+    wrapper = _bare_decode_wrapper(backend)
+    wrapper._auto_prefers_cudnn = lambda *args, **kwargs: args[6] == 16
+    shape = dict(num_qo_heads=32, num_kv_heads=8, head_dim=256, page_size=16)
+    if refused:
+        with pytest.raises(NotImplementedError, match="cudnn"):
+            wrapper.workspace_size_upper_bound(
+                max_batch_size=max_batch_size, max_num_pages_per_request=8, **shape
+            )
+    else:
+        wrapper.workspace_size_upper_bound(
+            max_batch_size=max_batch_size, max_num_pages_per_request=8, **shape
         )
 
 
