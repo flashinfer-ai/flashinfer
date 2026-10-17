@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 
 from ..delta_rule_dsl.alpha import AlphaProcessor
@@ -20,6 +21,9 @@ from ..delta_rule_dsl.varlen_helper import (
 
 class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
     """Compute local CP transfer/state while keeping both recurrences in TMEM."""
+
+    bytes_per_tensormap = 128
+    num_tensormaps = 2
 
     def __init__(
         self,
@@ -163,6 +167,8 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         is_transfer: bool,
         cta_coord,
         cta_layout,
+        tensormap_manager,
+        tensormap_ptr,
     ):
         handle = tensor_pipeline.acquire_and_advance()
         sTensor_stage = sTensor[None, None, handle.index]
@@ -185,8 +191,39 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             cute.group_modes(sTensor_stage, 0, 2),
             cute.group_modes(gTensor, 0, 2),
         )
-        cute.copy(tma_atom, tTgT, tTsT, tma_bar_ptr=handle.barrier)
+        if cutlass.const_expr(is_transfer):
+            cute.copy(tma_atom, tTgT, tTsT, tma_bar_ptr=handle.barrier)
+        else:
+            if blk == 0:
+                tensormap_manager.fence_tensormap_update(tensormap_ptr)
+            cute.copy(
+                tma_atom,
+                tTgT,
+                tTsT,
+                tma_bar_ptr=handle.barrier,
+                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                    tensormap_ptr, cute.AddressSpace.generic
+                ),
+            )
         return tensor_pipeline
+
+    @cute.jit
+    def initialize_tensormap_workspace(self, workspace, grid_dim):
+        return cute.make_tensor(
+            workspace.iterator,
+            cute.make_layout(
+                (
+                    grid_dim[0] * grid_dim[1] * grid_dim[2],
+                    self.num_tensormaps,
+                    self.bytes_per_tensormap,
+                ),
+                stride=(
+                    self.num_tensormaps * self.bytes_per_tensormap,
+                    self.bytes_per_tensormap,
+                    1,
+                ),
+            ),
+        )
 
     @cute.jit
     def run_load_alpha_role_sm100(
@@ -933,6 +970,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         total_cp_chunks: cutlass.Int32,
         max_cp_chunks_per_seq: cutlass.Int32,
         num_seqs: cutlass.Int32,
+        g_tensormap_workspace: cute.Tensor,
         stream,
     ):
         def make_mma(mnk, source_a, a_major, b_major):
@@ -1079,10 +1117,13 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             tma_tensor_v,
             tma_atom_t,
             tma_tensor_t,
+            g_k,
+            g_v,
             g_alpha,
             g_transfer_t,
             g_state_t,
             g_cu_seqlens,
+            g_tensormap_workspace,
             k_layout,
             k_trans_layout,
             v_layout,
@@ -1124,10 +1165,13 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tma_tensor_v,
         tma_atom_t,
         tma_tensor_t,
+        g_k,
+        g_v,
         g_alpha,
         g_transfer_t,
         g_state_t,
         g_cu_seqlens,
+        g_tensormap_workspace,
         k_layout,
         k_trans_layout,
         v_layout,
@@ -1162,6 +1206,25 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         t_blocks_per_cp_chunk = cute.ceil_div(chunk_len, self.BLK)
         t_block_start = varlen_chunk_idx(
             seq_idx, seq_start, chunk_idx_in_seq * t_blocks_per_cp_chunk, self.BLK
+        )
+
+        grid_dim = cute.arch.grid_dim()
+        cta_linear_idx = (
+            cute.arch.block_idx()[2] * grid_dim[1] * grid_dim[0]
+            + seq_idx * grid_dim[0]
+            + bx
+        )
+        tensormap_manager = TensorMapManager(
+            TensorMapUpdateMode.GMEM, self.bytes_per_tensormap
+        )
+        g_tensormap_workspace = self.initialize_tensormap_workspace(
+            g_tensormap_workspace, grid_dim
+        )
+        tensormap_k_ptr = tensormap_manager.get_tensormap_ptr(
+            g_tensormap_workspace[(cta_linear_idx, 0, None)].iterator
+        )
+        tensormap_v_ptr = tensormap_manager.get_tensormap_ptr(
+            g_tensormap_workspace[(cta_linear_idx, 1, None)].iterator
         )
 
         allocator = utils.SmemAllocator()
@@ -1459,6 +1522,37 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             )
         elif is_valid_chunk and warp_idx == self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+            tensormap_manager.init_tensormap_from_atom(
+                tma_atom_k, tensormap_k_ptr, self.tma_warp_id
+            )
+            tensormap_manager.init_tensormap_from_atom(
+                tma_atom_v, tensormap_v_ptr, self.tma_warp_id
+            )
+            tensormap_manager.fence_tensormap_initialization()
+
+            # Bound K/V by the logical end read from device cu_seqlens.  The
+            # physical tensors may contain collective padding after seq_end.
+            bounded_k = cute.make_tensor(
+                g_k.iterator,
+                cute.make_layout(
+                    (g_k.shape[0], seq_end, g_k.shape[2]),
+                    stride=(g_k.stride[0], g_k.stride[1], g_k.stride[2]),
+                ),
+            )
+            bounded_v = cute.make_tensor(
+                g_v.iterator,
+                cute.make_layout(
+                    (g_v.shape[0], seq_end, g_v.shape[2]),
+                    stride=(g_v.stride[0], g_v.stride[1], g_v.stride[2]),
+                ),
+            )
+            tensormap_manager.update_tensormap(
+                (bounded_k, bounded_v),
+                (tma_atom_k, tma_atom_v),
+                (tensormap_k_ptr, tensormap_v_ptr),
+                self.tma_warp_id,
+                (None, None),
+            )
             for blk in cutlass.range(num_blocks, unroll=1):
                 load_k_producer = self.load_tensor_block_tma_sm100(
                     tma_atom_k,
@@ -1472,6 +1566,8 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     False,
                     tensor_cta_coord,
                     tensor_cta_layout,
+                    tensormap_manager,
+                    tensormap_k_ptr,
                 )
                 load_v_producer = self.load_tensor_block_tma_sm100(
                     tma_atom_v,
@@ -1485,6 +1581,8 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     False,
                     tensor_cta_coord,
                     tensor_cta_layout,
+                    tensormap_manager,
+                    tensormap_v_ptr,
                 )
                 load_t_producer = self.load_tensor_block_tma_sm100(
                     tma_atom_t,
@@ -1498,6 +1596,8 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                     True,
                     tensor_cta_coord,
                     tensor_cta_layout,
+                    tensormap_manager,
+                    tensormap_k_ptr,
                 )
         elif is_valid_chunk and warp_idx == self.alpha_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
