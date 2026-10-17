@@ -31,9 +31,12 @@ kernel. ``backend="rubin"`` forces it (any batch size, Rubin only) and
 uGPU localization: Rubin is built from two dies, each with its own SMs and
 memory. Allocate the state pool with :func:`ugpu_state_pool` (layout
 ``[pool_size, HV, 2, V // 2, K]``, half ``t`` of every state in die ``t``'s
-memory) and every T=1 call on Rubin runs half ``t`` on die ``t``'s SMs, so no
+memory) and a T=1 call on Rubin runs half ``t`` on die ``t``'s SMs, so no
 state byte crosses the die-to-die link, whatever the batch order or slot
-indices. Results are bitwise equal to the one-launch kernel.
+indices. Results are bitwise equal to the one-launch kernel. This targets
+CUDA-graph captured decode (make one eager call before capture, which creates
+the per-die green contexts); eager calls with ``B * HV < 8192`` are host-bound
+and run the two halves back to back on the current stream.
 
 .. autosummary::
     :toctree: ../generated

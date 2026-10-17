@@ -67,7 +67,7 @@ try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import (
         gated_delta_rule_t1_rubin as gdn_decode_bf16_state_t1_rubin,
     )
-except ImportError:
+except (ImportError, RuntimeError):
     gdn_decode_bf16_state_t1_rubin = None
 
 

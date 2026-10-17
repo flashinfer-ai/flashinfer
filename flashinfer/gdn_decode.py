@@ -94,7 +94,10 @@ except (ImportError, RuntimeError):
 
 @functools.cache
 def _ugpu_streams(device_index: int):
-    """One green-context stream per locality domain (cached: create it before CUDA graph capture)."""
+    """One green-context stream per locality domain of ``device_index`` and its SM count.
+
+    Cached; the first uGPU call creates them, so make one eager call before CUDA graph capture.
+    """
     from .green_ctx import split_device_green_ctx_by_locality_domain
 
     streams, resources = split_device_green_ctx_by_locality_domain(
@@ -103,6 +106,14 @@ def _ugpu_streams(device_index: int):
     return streams, [int(r.sm.smCount) for r in resources]
 
 
+# Eager calls below this many (batch x value-head) states are host-bound: the per-die fork / join
+# costs more host time than the die-local traffic saves, so they run the two halves back to back
+# on the current stream (each over the whole GPU). Under CUDA graph capture the per-die streams
+# are always used: replay has no host cost.
+_UGPU_EAGER_MIN_STATES = 8192
+
+
+@flashinfer_api
 def ugpu_state_pool(
     pool_size: int,
     num_v_heads: int,
@@ -115,9 +126,14 @@ def ugpu_state_pool(
     (``V = K = head_size``): element ``[s, h, t, r, k]`` is element ``[s, h, t * V // 2 + r,
     k]`` of the usual ``[pool_size, HV, V, K]`` pool. Half ``t`` of every state lives in
     locality domain (die) ``t``'s memory. Pass it as ``initial_state`` to
-    :func:`gated_delta_rule_decode_pretranspose`: on Rubin every T=1 call then runs half
-    ``t`` of every state on die ``t``'s SMs, so no state byte crosses the die-to-die link,
-    whatever the batch order and slot indices.
+    :func:`gated_delta_rule_decode_pretranspose`: on Rubin a T=1 call then runs half ``t`` of
+    every state on die ``t``'s SMs, so no state byte crosses the die-to-die link, whatever the
+    batch order and slot indices. That is for CUDA-graph captured decode (make one eager call
+    before capture); eager calls with ``B * HV < 8192`` are host-bound and run both halves
+    back to back on the current stream.
+
+    The pool comes from :func:`flashinfer.green_ctx.empty_per_locality_domain`, outside
+    PyTorch's caching allocator.
 
     Args:
         pool_size: Number of state slots.
@@ -141,31 +157,48 @@ def _run_rubin_t1_ugpu(
     """uGPU localization: half t of every state (pool[:, :, t]) on locality domain t's SMs,
     as two launches of the Rubin T=1 kernel forked from and joined back to the current stream.
     Each launch is the same kernel on V/2 value rows (rows are independent), so the result is
-    bitwise equal to one launch over the full pool."""
+    bitwise equal to one launch over the full pool. Small eager calls run the two launches
+    back to back on the current stream instead (see ``_UGPU_EAGER_MIN_STATES``)."""
     half = v.shape[3] // 2
-    streams, sm_counts = _ugpu_streams(v.device.index)
-    main = torch.cuda.current_stream(v.device)
-    fork = torch.cuda.Event()
-    fork.record(main)
-    joins = []
-    for domain in range(2):
-        cols = slice(domain * half, (domain + 1) * half)
-        stream = streams[domain]
-        stream.wait_event(fork)
-        with torch.cuda.stream(stream):
+    # int32 slot indices once for both launches
+    for name in ("initial_state_indices", "output_state_indices"):
+        if kw.get(name) is not None and kw[name].dtype != torch.int32:
+            kw[name] = kw[name].to(torch.int32)
+    with torch.cuda.device(v.device):  # streams and events of v's device
+        streams, sm_counts = _ugpu_streams(v.device.index)
+        if (
+            v.shape[0] * v.shape[2] < _UGPU_EAGER_MIN_STATES
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            for domain in range(2):
+                _gated_delta_rule_t1_rubin(
+                    initial_state_source=pool.select(2, domain),
+                    v=v.narrow(3, domain * half, half),
+                    output=output.narrow(3, domain * half, half),
+                    **kw,
+                )
+            return output
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        joins = []
+        for domain in range(2):
+            stream = streams[domain]
+            stream.wait_event(fork)
             _gated_delta_rule_t1_rubin(
-                initial_state_source=pool[:, :, domain],
-                v=v[..., cols],
-                output=output[..., cols],
+                initial_state_source=pool.select(2, domain),
+                v=v.narrow(3, domain * half, half),
+                output=output.narrow(3, domain * half, half),
                 # L2 prefetch distance for this domain's share of the SMs
                 pf_dist=sm_counts[domain] * 25 // 3,
+                stream=stream,
                 **kw,
             )
-        done = torch.cuda.Event()
-        done.record(stream)
-        joins.append(done)
-    for done in joins:
-        main.wait_event(done)
+            done = torch.cuda.Event()
+            done.record(stream)
+            joins.append(done)
+        for done in joins:
+            main.wait_event(done)
     return output
 
 
@@ -717,8 +750,11 @@ def gated_delta_rule_decode_pretranspose(
       On SM107 (Rubin), T=1 with ``B * HV >= 512`` uses the Rubin-tuned
       kernel (``gdn_kernels/gdn_decode_bf16_state_rubin.py``) under
       ``backend="auto"``. With a pool from :func:`ugpu_state_pool` every
-      T=1 call on Rubin is uGPU-localized (two per-die launches on
-      green-context streams, CUDA-graph capturable after one eager call).
+      T=1 call on Rubin runs each half of every state on its own die (two
+      per-die launches on green-context streams). This targets CUDA-graph
+      captured decode (capturable after one eager call); eager calls with
+      ``B * HV < 8192`` are host-bound and run the two halves back to back
+      on the current stream instead.
     - Pool+indices (``initial_state`` / ``initial_state_indices``) are
       supported on both the bf16 fast path (K=V=128) and the float32 legacy
       path (T=1).  Both paths support ``-1`` padding indices (see
