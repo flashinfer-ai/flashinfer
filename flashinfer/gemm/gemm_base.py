@@ -2146,6 +2146,15 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
+# Keep dense-weight arenas specific to CuTe-DSL: cuDNN also accepts gapped
+# strides and must retain the caller's tensors during profiling.
+_BF16_GEMM_CUTE_DSL_TUNING_CONFIG = replace(
+    _BF16_GEMM_SM100_TUNING_CONFIG,
+    profiling_repeat=32,
+    profile_arena_input_indices=(1,),  # b
+)
+
+
 def _tinygemm_bf16_gemm_runner():
     module = get_tinygemm2_module()
 
@@ -2619,7 +2628,9 @@ def bf16_gemm_sm100(
     runner, tactic = tuner.choose_one(
         "bf16_gemm",
         runners,
-        _BF16_GEMM_SM100_TUNING_CONFIG,
+        _BF16_GEMM_CUTE_DSL_TUNING_CONFIG
+        if runner_names == ["cute-dsl"]
+        else _BF16_GEMM_SM100_TUNING_CONFIG,
         inputs,
     )
 

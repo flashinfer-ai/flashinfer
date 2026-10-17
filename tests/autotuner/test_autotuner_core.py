@@ -1529,6 +1529,55 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
     assert allocations == [(8192, inputs[0].device)]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cold_l2_graph_replay_times_arena_chain(monkeypatch):
+    launched = []
+
+    class AddRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            launched.append(inputs[0].data_ptr())
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    tuner = AutoTuner(warmup=1, repeat=2)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4096
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+    weight = torch.randn(32, 64, device="cuda").T
+    inputs = [weight, torch.empty(64, 32, device="cuda")]
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        use_cold_l2_graph_replay=True,
+        profiling_repeat=8,
+        profile_arena_input_indices=(0,),
+    )
+
+    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+    for batch in batches:
+        assert batch[0].stride() == weight.stride()
+        torch.testing.assert_close(batch[0], weight)
+
+    latency = tuner._profile_single_kernel(
+        AddRunner(valid_tactics=(0,)),
+        inputs,
+        0,
+        config,
+        input_tensor_batches=batches,
+    )
+
+    assert latency >= 0
+    # One warmup launch, then the graph captures one launch per scheduled
+    # batch, cycling distinct arena lanes.
+    assert launched[1:] == [batch[0].data_ptr() for batch in batches]
+    assert len(set(launched[1:])) > 1
+
+
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_cold_l2_batches_preserve_strides_alignment_and_aliases(
     monkeypatch, use_cuda_graph

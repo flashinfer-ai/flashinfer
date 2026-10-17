@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
+from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
@@ -142,6 +143,26 @@ def test_mm_bf16(
             input.float(), mat2.float(), bias.float() if bias is not None else None
         ).to(res_dtype)
         torch.testing.assert_close(out, fp32_reference, rtol=2e-2, atol=5e-2)
+
+
+def test_mm_bf16_cudnn_autotune_padded_weight(monkeypatch):
+    if not torch.cuda.is_available() or not CUDNN_AVAILABLE:
+        pytest.skip("requires CUDA and cuDNN")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not mm_bf16.is_backend_supported("cudnn", major * 10 + minor):
+        pytest.skip("cuDNN BF16 GEMM is not supported on this GPU")
+
+    # A fresh tuner ensures the padded weight reaches profile preparation.
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    torch.manual_seed(42)
+    a = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(256, 640, device="cuda", dtype=torch.bfloat16)[:, :512].T
+    reference = a @ b
+    assert not b.T.is_contiguous()
+    for enable_tuning in (False, True):
+        with autotune(enable_tuning, tuning_buckets=[16]):
+            out = mm_bf16(a, b, backend="cudnn")
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
 
 def test_mm_bf16_cutile_rejects_bias_and_pdl():
