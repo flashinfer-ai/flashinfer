@@ -698,6 +698,33 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         )
 
 
+# The autotuner's tactic list leaves out split-K configs whose un-split grid already has a CTA
+# for every SM (MoE::Runner::getValidConfigIndices), which drops most of them from the sweep above.
+# At these single-token shapes the grid stays small, so the tactic list keeps the split-K configs
+# the sweep would otherwise miss: MxFP4 FC1 and FC2 (K = 512 and 3072), and NvFP4 FC2.
+@pytest.mark.parametrize(
+    "quant_mode,hidden_size,intermediate_size",
+    [
+        ("MxFP4xMxFP8", 2048, 512),
+        ("MxFP4xMxFP8", 2048, 3072),
+        ("NvFP4xNvFP4", 2048, 3072),
+    ],
+)
+def test_trtllm_fp4_routed_moe_split_k_tactics_correctness(
+    quant_mode: Fp4QuantMode,
+    hidden_size: int,
+    intermediate_size: int,
+):
+    test_trtllm_fp4_routed_moe_all_tactics_correctness(
+        num_tokens=1,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=6,
+        num_experts=256,
+        quant_mode=quant_mode,
+    )
+
+
 # ----------------------------------------------------------------------------
 # FP8 routed MoE sweep.
 # ----------------------------------------------------------------------------
