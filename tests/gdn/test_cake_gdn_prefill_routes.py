@@ -1,4 +1,11 @@
-"""Route table of the Cake GDN non-CP prefill resolver: the sm_107a sequential twins."""
+"""Route table of the Cake GDN non-CP prefill resolver: the sm_107a sequential twins.
+
+Every sm_107a non-CP prefill record is a twin of a shipped schedule: the explicit table
+(``CAKE_GDN_PREFILL_SEQ_ARCH_BODIES``) routes the DV-split state-I/O bodies, and the
+architecture default (``CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES``: ``i64meta``) covers every
+other key.  Each twin record lists sm_107a only, carries ``metadata_i64`` (its kernel
+reads int32 or int64 launch metadata directly) and its base record no longer lists sm_107a.
+"""
 
 import json
 
@@ -8,6 +15,7 @@ from flashinfer.jit import cake_gdn
 
 PREFIX = "flashinfer.cake_gdn.generated.prefill:"
 TABLE = cake_gdn.CAKE_GDN_PREFILL_SEQ_ARCH_BODIES
+DEFAULT = cake_gdn.CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES
 ROUTED = sorted(
     {
         schedule.removesuffix("_indexed")
@@ -15,6 +23,12 @@ ROUTED = sorted(
         if arch == "sm_107a"
     }
 )
+
+
+def test_sm107a_default_body_is_the_int64_metadata_twin():
+    assert DEFAULT == {"sm_107a": "i64meta"}
+    assert all(arch == "sm_107a" for (arch, _schedule) in TABLE)
+    assert "i64meta" not in TABLE.values()
 
 
 @pytest.mark.parametrize("schedule", ROUTED)
@@ -25,14 +39,12 @@ def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
         "sm_107a", schedule, use_state_indices=False
     )
     assert twin == f"{schedule}_sm107a_{body}"
-    indexed_body = TABLE.get(("sm_107a", f"{schedule}_indexed"), "base")
+    # An indexed-state plan without an explicit entry takes the architecture default.
+    indexed_body = TABLE.get(("sm_107a", f"{schedule}_indexed"), DEFAULT["sm_107a"])
     indexed = cake_gdn.cake_gdn_prefill_seq_schedule(
         "sm_107a", schedule, use_state_indices=True
     )
-    expected = (
-        schedule if indexed_body == "base" else f"{schedule}_sm107a_{indexed_body}"
-    )
-    assert indexed == expected
+    assert indexed == f"{schedule}_sm107a_{indexed_body}"
     for arch in ("sm_100a", "sm_103a"):
         for use_state_indices in (False, True):
             shipped = cake_gdn.cake_gdn_prefill_seq_schedule(
@@ -41,34 +53,84 @@ def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
             assert shipped == schedule
 
 
-def test_every_shipped_sm107a_record_of_a_routed_schedule_has_its_twin_record():
-    variants = cake_gdn._manifest()["variants"]
-    by_source: dict = {}
-    for record in variants:
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        "flashinfer_blackwell_gdn_prefill",
+        "flashinfer_blackwell_gdn_prefill_initial",
+        "flashinfer_blackwell_gdn_prefill_initial_bf16state",
+        "flashinfer_blackwell_gdn_prefill_initial_gatestream_full",
+        "flashinfer_blackwell_gdn_prefill_dvsplit_single_chunk",
+        "flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state",
+    ),
+)
+def test_sm107a_routes_every_other_schedule_to_its_int64_metadata_twin(schedule):
+    assert ("sm_107a", schedule) not in TABLE
+    for use_state_indices in (False, True):
+        twin = cake_gdn.cake_gdn_prefill_seq_schedule(
+            "sm_107a", schedule, use_state_indices=use_state_indices
+        )
+        assert twin == f"{schedule}_sm107a_i64meta"
+        for arch in ("sm_100a", "sm_103a"):
+            assert (
+                cake_gdn.cake_gdn_prefill_seq_schedule(
+                    arch, schedule, use_state_indices=use_state_indices
+                )
+                == schedule
+            )
+
+
+def _prefill_records_by_key():
+    by_key: dict = {}
+    for record in cake_gdn._manifest()["variants"]:
+        if record["domain"] != "prefill":
+            continue
         key = (
             record["source_schedule"],
             json.dumps(record["specializations"], sort_keys=True),
         )
-        by_source.setdefault(key, []).append(record)
+        by_key.setdefault(key, []).append(record)
+    return by_key
+
+
+def test_every_shipped_sm107a_record_is_a_twin_with_int64_metadata():
+    twins = 0
+    for records in _prefill_records_by_key().values():
+        for record in records:
+            schedule = record["source_schedule"].removeprefix(PREFIX)
+            is_twin = "_sm107a_" in schedule
+            assert ("sm_107a" in record["architectures"]) is is_twin, record["name"]
+            assert bool(record.get("metadata_i64", False)) is is_twin, record["name"]
+            if is_twin:
+                assert record["architectures"] == ["sm_107a"], record["name"]
+                twins += 1
+    assert twins > 0
+
+
+def test_every_shipped_base_record_the_rule_routes_has_its_sm107a_twin_record():
+    by_key = _prefill_records_by_key()
     checked = 0
-    for record in variants:
-        if record["domain"] != "prefill" or "sm_107a" not in record["architectures"]:
+    for (source, spec_json), records in by_key.items():
+        schedule = source.removeprefix(PREFIX)
+        if "_sm107a_" in schedule:
             continue
-        schedule = record["source_schedule"].removeprefix(PREFIX)
-        if schedule not in ROUTED:
-            continue
-        twin = cake_gdn.cake_gdn_prefill_seq_schedule(
-            "sm_107a",
-            schedule,
-            use_state_indices=bool(record["specializations"]["USE_STATE_INDICES"]),
-        )
-        if twin == schedule:
-            continue
-        key = (PREFIX + twin, json.dumps(record["specializations"], sort_keys=True))
-        assert key in by_source, f"no sm_107a twin record for {record['name']}"
-        (twin_record,) = by_source[key]
-        assert twin_record["architectures"] == ["sm_107a"]
-        assert twin_record["threads"] == record["threads"]
-        assert twin_record["tma_abi"] == record["tma_abi"] == "grid_constant"
-        checked += 1
+        for record in records:
+            twin = cake_gdn.cake_gdn_prefill_seq_schedule(
+                "sm_107a",
+                schedule,
+                use_state_indices=bool(record["specializations"]["USE_STATE_INDICES"]),
+            )
+            assert twin != schedule
+            twin_records = by_key.get((PREFIX + twin, spec_json))
+            if twin_records is None:
+                # A base key no sm_107a record ever served (a record exported for a subset of
+                # the architectures); the resolver fails closed on sm_107a for it.
+                assert "sm_107a" not in record["architectures"], record["name"]
+                continue
+            (twin_record,) = twin_records
+            assert twin_record["architectures"] == ["sm_107a"]
+            assert twin_record["metadata_i64"] is True
+            assert twin_record["threads"] == record["threads"]
+            assert twin_record["tma_abi"] == record["tma_abi"] == "grid_constant"
+            checked += 1
     assert checked > 0
