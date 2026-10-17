@@ -38,7 +38,7 @@ binding each under ``csrc/cake_quant_lora_gemm``, compiled once per exact target
   tile (256 token rows per CTA), SM103 only; the host's per-problem rule picks it on the longest
   large-K runs (at least 20 waves of 512 x 256 tiles, K >= 32768) of the SM103 device.
 * ``fp8_sm90`` / ``fp8_sm90_hint`` -- FP8 E4M3 base, SM90 (persistent, cluster pairs); the
-  host's per-problem rule picks the second program (TMA L2 policies, raster group 4) on
+  host's per-problem rule picks the second program (TMA L2 policies, raster group 1) on
   long runs of large-K panels and the first one everywhere else (see
   :mod:`flashinfer.gemm.cake_quant_lora_gemm`).
 
@@ -426,7 +426,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "default_template": "fp8_sm90",
             "gated_template": "fp8_sm90_hint",
             "default_group_m": 8,
-            "gated_group_m": 4,
+            "gated_group_m": 1,
             "panel_budget_bytes": 50331648,
             "max_k": 32768,
             "waves_min": 192,
@@ -476,14 +476,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "adapter_states": ["none", "raw"],
         "block_n": 192,
         "cluster_m": 2,
-        "group_m": 4,
+        "group_m": 1,
         "rules": {"m_min": 1, "n_multiple": 8, "k_multiple": 16, "max_mn": 4294967296},
         "dispatch": {
             "rule_id": "sm90_fp8_lora_dispatch_v0",
             "default_template": "fp8_sm90",
             "gated_template": "fp8_sm90_hint",
             "default_group_m": 8,
-            "gated_group_m": 4,
+            "gated_group_m": 1,
             "panel_budget_bytes": 50331648,
             "max_k": 32768,
             "waves_min": 192,
