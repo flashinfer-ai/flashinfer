@@ -44,6 +44,7 @@ from .fp4_common import (
     get_sm_version,
     # PTX intrinsics
     st_global_u64,
+    ld_global_v4_u32,
     get_ptr_as_int64,
     rcp_approx_ftz,
     fmin_f32,
@@ -124,13 +125,28 @@ class RMSNormFP4QuantKernel:
 
         # Compute thread configuration
         self.threads_per_row = self._compute_threads_per_row(self.H_per_cta)
+        if (
+            self.sm_version == 120
+            and not is_fp16
+            and block_size == 16
+            and self.cluster_n == 1
+        ):
+            if H == 4096:
+                self.threads_per_row = 128
         self.num_threads = self._compute_num_threads(self.H_per_cta)
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
 
         # Vectorization parameters
         elem_bytes = dtype.width // 8
-        self.vec_size = COPY_BITS // 8 // elem_bytes
+        self.reuse_row = (
+            self.sm_version == 120
+            and not is_fp16
+            and block_size == 16
+            and self.cluster_n == 1
+            and H % 16 == 0
+        )
+        self.vec_size = 16 if self.reuse_row else COPY_BITS // 8 // elem_bytes
         self.num_vec_blocks = max(
             1,
             (self.H_per_cta // self.vec_size + self.threads_per_row - 1)
@@ -256,7 +272,7 @@ class RMSNormFP4QuantKernel:
         # mbarrier (for cluster mode)
         mbar_bytes = 8 if self.cluster_n > 1 else 0
 
-        return tile_bytes + reduction_bytes + mbar_bytes
+        return (0 if self.reuse_row else tile_bytes) + reduction_bytes + mbar_bytes
 
     @cute.jit
     def __call__(
@@ -360,11 +376,12 @@ class RMSNormFP4QuantKernel:
         smem = cutlass.utils.SmemAllocator()
 
         # Shared memory tile for input (for sum-of-squares)
-        sX = smem.allocate_tensor(
-            mX.element_type,
-            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
-            byte_alignment=16,
-        )
+        if cutlass.const_expr(not self.reuse_row):
+            sX = smem.allocate_tensor(
+                mX.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
 
         # Reduction buffer (with cluster support)
         if cutlass.const_expr(cluster_n == 1):
@@ -426,7 +443,8 @@ class RMSNormFP4QuantKernel:
 
         # Partition tensors
         tXgX = thr_copy_X.partition_S(gX)
-        tXsX = thr_copy_X.partition_D(sX)
+        if cutlass.const_expr(not self.reuse_row):
+            tXsX = thr_copy_X.partition_D(sX)
         tXcX = thr_copy_X.partition_S(cX)
 
         # Register fragments
@@ -443,16 +461,21 @@ class RMSNormFP4QuantKernel:
         # ==================================================================
         # Phase 1: Async copy global → shared (for sum-of-squares)
         # ==================================================================
-        if row_in_bounds:
-            cute.copy(copy_atom_load_async, tXgX, tXsX, pred=tXpX)
-
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-
-        # ==================================================================
-        # Phase 2: Compute sum of squares with cluster reduction
-        # ==================================================================
-        cute.autovec_copy(tXsX, tXrX)
+        if cutlass.const_expr(self.reuse_row):
+            tXrX.fill(0)
+            direct_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                mX.element_type,
+                num_bits_per_copy=COPY_BITS,
+            )
+            if row_in_bounds:
+                cute.copy(direct_atom, tXgX, tXrX, pred=tXpX)
+        else:
+            if row_in_bounds:
+                cute.copy(copy_atom_load_async, tXgX, tXsX, pred=tXpX)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
         # Sum of squares
@@ -479,8 +502,10 @@ class RMSNormFP4QuantKernel:
         if cutlass.const_expr(cluster_n > 1):
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
-        else:
+        elif cutlass.const_expr(not self.reuse_row):
             cute.arch.barrier()
+        # The register-reuse path has no further shared-memory writes or reuse;
+        # row_reduce already synchronizes the cross-warp partial sums.
 
         # ==================================================================
         # Phase 3: RMSNorm + Quantize with Vectorized Global Loads
@@ -494,7 +519,7 @@ class RMSNormFP4QuantKernel:
                 num_sf_blocks_per_row + threads_per_row - 1
             ) // threads_per_row
 
-            for sf_iter in range(num_sf_per_thread):
+            for sf_iter in cutlass.range_constexpr(num_sf_per_thread):
                 sf_idx = lane_in_row + sf_iter * threads_per_row
 
                 if sf_idx < num_sf_blocks_per_row:
@@ -506,9 +531,23 @@ class RMSNormFP4QuantKernel:
 
                     if cutlass.const_expr(block_size == 16):
                         # Load 16 elements as 8 half2 pairs
-                        x_h2, w_h2 = load_8_half2(
-                            mX, mW, actual_row_idx, block_start, H
-                        )
+                        if cutlass.const_expr(self.reuse_row):
+                            flat_x = cute.make_tensor(
+                                tXrX.iterator, cute.make_layout(cute.size(tXrX))
+                            )
+                            packed_x = cute.recast_tensor(flat_x, cutlass.Uint32)
+                            x_h2 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+                            w_h2 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+                            for pair in cutlass.range_constexpr(8):
+                                x_h2[pair] = packed_x[sf_iter * 8 + pair]
+                            wp0 = get_ptr_as_int64(mW, block_start)
+                            wp1 = get_ptr_as_int64(mW, block_start + Int32(8))
+                            w_h2[0], w_h2[1], w_h2[2], w_h2[3] = ld_global_v4_u32(wp0)
+                            w_h2[4], w_h2[5], w_h2[6], w_h2[7] = ld_global_v4_u32(wp1)
+                        else:
+                            x_h2, w_h2 = load_8_half2(
+                                mX, mW, actual_row_idx, block_start, H
+                            )
 
                         # Multiply x * w and compute max_abs
                         if cutlass.const_expr(is_fp16):
