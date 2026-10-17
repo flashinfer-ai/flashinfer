@@ -21,7 +21,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_topk_select_trace
-from ..utils import is_sm12x_supported
+from ..utils import is_sm12x_supported, is_sm90a_supported
 from ._blackwell_sm100 import blackwell_msa_topk_select, is_blackwell_msa_device
 
 
@@ -192,9 +192,10 @@ def msa_topk_select(
             force_begin_blocks=force_begin_blocks,
             force_end_blocks=force_end_blocks,
         )
-    if not is_sm12x_supported(max_score.device):
+    sm90 = is_sm90a_supported(max_score.device)
+    if not (sm90 or is_sm12x_supported(max_score.device)):
         raise RuntimeError(
-            "msa_topk_select requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_topk_select requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
 
     if max_score.dtype != torch.float32:
@@ -286,6 +287,18 @@ def msa_topk_select(
             )
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
+
+    if sm90:
+        from ._sm90_dispatch import topk_select_sm90
+
+        return topk_select_sm90(
+            max_score,
+            topk,
+            output,
+            num_valid_pages=num_valid_pages,
+            force_begin_blocks=force_begin_blocks,
+            force_end_blocks=force_end_blocks,
+        )
 
     from .cute_dsl.topk_select_chunked_sm12x import (
         _CHUNK_BLOCKS,

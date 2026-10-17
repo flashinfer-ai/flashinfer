@@ -25,7 +25,7 @@ from ..trace.templates.msa import (
     msa_proxy_score_fp4_trace,
     msa_proxy_score_trace,
 )
-from ..utils import get_device_sm_count, is_sm12x_supported
+from ..utils import get_device_sm_count, is_sm12x_supported, is_sm90a_supported
 from ._common import _BLK_KV
 
 # NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.
@@ -140,6 +140,7 @@ class _ProxySplitKRunner(TunableRunner):
     ):
         # call_fn(inputs, num_splits) -> output; lets one runner serve both the
         # bf16 and (longer-signature) fp4 proxy invocations.
+        """Wrap the compiled proxy-score call for the autotuner."""
         self._call = call_fn
         self._msq = int(max_seqlen_q)
         self._mkt = int(max_k_tiles)
@@ -151,11 +152,13 @@ class _ProxySplitKRunner(TunableRunner):
         self._reduce = bool(reduce_heads)
 
     def __hash__(self):
+        """Hash by type: tactics differ by cache-key extras, not by instance."""
         return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile):
         # Powers of two up to ~4 SM-waves, capped by max_k_tiles; always include
         # the closed-form heuristic so a tuned op is never worse than eager.
+        """Split-K tactics worth timing on this device."""
         num_sms = get_device_sm_count(self._device)
         cap = min(self._mkt, max(1, -(-4 * num_sms // max(self._base, 1))))
         cands = {s for s in (1, 2, 4, 8, 16, 32) if s <= cap}
@@ -165,11 +168,13 @@ class _ProxySplitKRunner(TunableRunner):
     def get_cache_key_extras(self, inputs):
         # max_seqlen_q / max_k_tiles are varlen-derived (not in any tensor shape),
         # so they must key the cache; causal/paged/reduce flip the work pattern.
+        """Fields that must match for a cached tactic to apply."""
         return (self._causal, self._paged, self._reduce, self._msq, self._mkt)
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         # tactic == -1 falls back to the closed-form heuristic, so eager
         # (un-tuned) behavior is unchanged.
+        """Run one tactic, or only prepare its workspace."""
         ns = (
             tactic
             if tactic >= 0
@@ -190,6 +195,7 @@ def _proxy_tuned_key(
 ):
     # base_ctas folds in batch/heads/max_seqlen_q, so this matches the autotuner's
     # own cache granularity (shape + get_cache_key_extras) closely enough to gate on.
+    """Autotuner cache key for this op."""
     return (
         op_name,
         bool(causal),
@@ -256,6 +262,7 @@ def _run_proxy_autotuned(
 def _proxy_dummies(device_index: int):
     # Signature fillers for paths that never read them; cached so repeat decode
     # calls do not launch fill kernels.
+    """Dummy inputs used to warm the autotuner on a device."""
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),
@@ -278,6 +285,7 @@ def msa_proxy_score(
     output: Optional[torch.Tensor] = None,
     reduce_heads: bool = False,
     q_offset=None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
     """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
     logits.
@@ -289,6 +297,22 @@ def msa_proxy_score(
     entirely above the causal limit, yield ``-inf``.
 
     There is no softmax and no V: this is MSA pipeline stage 1.
+
+    ``use_fp32_acc`` (on by default) keeps the SM90 prefill score accumulator
+    in fp32 rather than fp16. The logits are unscaled dot products of two fp8 e4m3 operands, so a
+    single product reaches 448*448 = 200704 and a 128-term row runs far past
+    the 65504 fp16 ceiling; nothing clamps the partial sums, so a row that
+    overflows becomes ``inf`` and outranks every real block. Measured on SM90:
+    inputs of magnitude 64 leave 32 of 4096 scores finite and drop top-k
+    overlap against an fp32 reference to 0.26, which is what choosing blocks
+    at random looks like. Turning it off is faster but unsafe above
+    magnitude ~22. It costs about 1.3x (8.5 vs 6.7 us at 512 query
+    tokens, 14.9 vs 11.4 us at 4096), which is one extra scheduling wave: the
+    fp32 accumulator needs 159 registers/thread, so the launch drops to one
+    block per SM. Folding a power-of-two scale into whatever produces ``q``
+    keeps the logits in range for free -- ranking is invariant under a positive
+    scale -- but that has to happen upstream, since this path receives ``q``
+    already quantised.
 
     Single-token decode uses a dim-parallel scalar schedule that streams
     index-K straight to registers. Short multi-token decode (MTP) uses a
@@ -367,8 +391,11 @@ def msa_proxy_score(
         _q_offset_tensor,
     )
 
-    if not is_sm12x_supported(q.device):
-        raise RuntimeError("msa_proxy_score requires SM120 or SM121 and CUDA >= 12.8")
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
+        raise RuntimeError(
+            "msa_proxy_score requires SM90, SM120 or SM121 and CUDA >= 12.8"
+        )
     q_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float16) and not q_fp8:
         raise ValueError(f"q must be bf16, fp16, or fp8 e4m3, got {q.dtype}")
@@ -429,6 +456,47 @@ def msa_proxy_score(
         per_head = torch.empty(per_head_shape, dtype=torch.float32, device=dev)
     else:
         per_head = output
+
+    if sm90:
+        if not paged:
+            raise NotImplementedError("SM90 proxy-score requires the paged KV layout")
+        if not causal:
+            # The SM90 proxy kernels always apply the causal mask; accepting
+            # causal=False would silently return masked scores the caller did not
+            # ask for.
+            raise NotImplementedError("SM90 proxy-score is causal-only")
+        from ._sm90_dispatch import proxy_score_sm90
+
+        # An int q_offset applies to every sequence; materialize it rather than
+        # dropping it, which would silently align the mask at 0.
+        if isinstance(q_offset, torch.Tensor):
+            sm90_q_offset = q_offset
+        elif q_offset is None:
+            sm90_q_offset = None
+        else:
+            sm90_q_offset = torch.full(
+                (batch_size,), int(q_offset), dtype=torch.int32, device=dev
+            )
+
+        proxy_score_sm90(
+            q,
+            k,
+            cu_seqlens_q,
+            pt_dev,
+            k_len_or_cu,
+            per_head,
+            max_seqlen_q=max_seqlen_q,
+            batch_size=batch_size,
+            kv_fp8=kv_fp8,
+            q_offset=sm90_q_offset,
+            use_fp32_acc=use_fp32_acc,
+        )
+        if not reduce_heads:
+            return per_head
+        if output is None:
+            output = torch.empty(final_shape, dtype=torch.float32, device=dev)
+        torch.amax(per_head, dim=0, keepdim=True, out=output)
+        return output
 
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
