@@ -38,23 +38,31 @@ All-Gather Matmul
 
 ``all_gather_matmul`` keeps its architecture-based default routing when
 ``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
-the Cake fused backend for contiguous bfloat16 or float16 inputs with
-``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
-memory backend, and a two-, four- or eight-rank NCCL process group. The local
-input may be an ordinary contiguous CUDA tensor because Cake uses internal
-symmetric scratch and flags for remote access and synchronization. Unsupported
-explicit Cake requests raise instead of silently falling back. One generated
-source per kernel serves both architectures; the JIT loader compiles it with
-the exact flag set of the device it runs on.
+the Cake fused backend for bfloat16 or float16 operands with ``K=8192``: a
+contiguous ``[M, 8192]`` input with any positive ``M``, a ``[8192, N]`` weight
+with ``N`` a positive multiple of 256 that is either contiguous or the
+transposed view of a contiguous ``[N, 8192]`` parameter (each layout has its
+own generated kernel; no copy is made), the process's torch symmetric-memory
+backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend
+never selects one itself), and a two-, four- or eight-rank NCCL process group.
+The local input may be an ordinary contiguous CUDA tensor because Cake uses
+internal symmetric scratch and flags for remote access and synchronization;
+the scratch of a group grows to the largest ``M`` seen, and that growth is the
+only collective after the first call. Unsupported explicit Cake requests raise
+instead of silently falling back. One generated source per kernel serves both
+architectures; the JIT loader compiles it with the exact flag set of the
+device it runs on.
 
-``prepare_all_gather_matmul`` prepares the packed-QKV route for bfloat16,
-contiguous ``[M, 8192]`` inputs and a contiguous ``[8192, 1280]`` weight on
-eight-rank groups (SM100 or SM103) or a ``[8192, 2560]`` weight on four-rank
-groups (SM103), where ``M`` is a positive multiple of 128. It binds the weight
-and process group once and returns a callable that accepts a contiguous input
-with the same shape, dtype, and device. Both ``backend="auto"`` and
-``backend="cake"`` select this prepared route. Unsupported configurations raise
-during preparation instead of falling back.
+``prepare_all_gather_matmul`` binds the weight, the process group and a row
+capacity ``max_rows`` (default: the rows of the sample input) once, sizing the
+symmetric scratch in that single collective, and returns a callable that
+accepts any contiguous input with the same dtype, device and ``K`` and at
+most ``max_rows`` rows. Both ``backend="auto"`` and ``backend="cake"`` select
+this prepared Cake route; the same operand rules as the one-shot Cake route
+apply. The returned launcher is CUDA-graph capturable: a captured call
+allocates nothing but its output, and a call that would need a larger scratch
+raises inside capture instead of running a collective. Unsupported
+configurations raise during preparation instead of falling back.
 
 .. autosummary::
     :toctree: ../generated
@@ -492,6 +500,48 @@ ordinary path unless separately implemented and measured.
 
 .. autofunction:: merge_ulysses_output_head_chunk
 
+Fused QKV Projection + Norm + RoPE + Head Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`QkvNormRopeExchangeOverlap` fuses the attention front end of a
+sequence-parallel (Ulysses) layer into one prepared session: the BF16 QKV
+projection, per-head RMSNorm of Q and K (one ``[D]`` scale each), interleaved
+RoPE from a per-token ``[rows, D]`` cos/sin table, and the head exchange.  The
+Cake backend (``backend="nvlink"``; SM90, SM100 and SM103, single-node NVLink
+groups of 2, 4 or 8 ranks, ``head_dim=128``, BF16) stores every destination's
+head band straight from the GEMM epilogue into that rank's symmetric receive
+slot and publishes per-chunk readiness words, so the exchange overlaps the
+projection instead of following it; a one-CTA wait kernel on a consumer stream
+acquires the words and the caller's stream joins it.  The outputs are views of
+the current receive slot (``layout="bshd"``: ``(q, k, v)`` each
+``[B, S_global, H_local, D]``; ``layout="fused"``: one
+``[B, S_global, H_local, 3 * D]`` payload) and stay valid until the slot is
+reused ``num_slots`` calls later; pass ``out=`` for an owned copy.
+
+The session is prepared eagerly (symmetric slots, readiness pad, barrier
+flags, JIT programs, the tile plan of ``max_tokens`` rows) and a prepared call
+is CUDA-graph capturable: a captured call allocates nothing, runs no
+collective, publishes a sentinel epoch and clears its readiness words with a
+stream memset after the wait kernel, and replays interleave with eager calls.
+A call with more rows than ``max_tokens``, or with a row count first seen
+inside a capture, raises instead of allocating.  ``backend="auto"`` selects
+the Cake path when :func:`resolve_ulysses_backend` verifies the NVLink mesh and
+the device is a supported architecture, and otherwise the NCCL path (cuBLAS
+projection, :func:`flashinfer.norm.rmsnorm`, RoPE, then
+:meth:`UlyssesCommunicator.scatter_qkv_head_chunk`), which is not graph
+capturable (``graph_capturable`` reports ``False``).
+
+.. autosummary::
+    :toctree: ../generated
+
+    QkvNormRopeExchangeOverlap
+
+.. autoclass:: QkvNormRopeExchangeOverlap
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
 Topology Probing and Backend Selection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -554,11 +604,11 @@ MNNVL A2A (Throughput Backend)
 -------------------------------
 
 These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
-``MoeAlltoAll`` is deprecated in favor of
-:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and
-:class:`flashinfer.moe_ep.CakeAlltoAll` for ``backend="cake"``),
-which expose the dispatch/combine interface shared by all expert-parallel
-communication backends; its implementation will move into those classes.
+For the dispatch/combine interface shared by all expert-parallel communication
+backends, use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`, which runs
+newer one-sided kernels (CFT counted writes, up to 256 ranks), or
+:class:`flashinfer.moe_ep.CakeAlltoAll`, which runs these ops with
+``backend="cake"``.
 
 .. currentmodule:: flashinfer.comm
 
@@ -572,35 +622,23 @@ communication backends; its implementation will move into those classes.
     moe_a2a_get_workspace_size_per_rank
     moe_a2a_wrap_payload_tensor_in_workspace
 
-.. autoclass:: MoeAlltoAll
-    :members:
-    :inherited-members:
-    :show-inheritance:
-
-    .. automethod:: __init__
-
-``MoeAlltoAll`` preserves its CUDA virtual addresses across process
-checkpoint/restore.  After quiescing all work, call ``checkpoint_prepare`` to
-release the non-checkpointable physical MNNVL handles.  Then call
-``checkpoint_restore`` with a fresh communication backend before replaying a
-captured CUDA graph:
+``NVLinkOneSidedAlltoAll`` and ``CakeAlltoAll`` preserve their workspace's CUDA
+virtual addresses across process checkpoint/restore.  After quiescing all work,
+call ``checkpoint_prepare`` to release the non-checkpointable physical MNNVL
+handles, and for ``NVLinkOneSidedAlltoAll`` its CFT logical endpoints.  Then
+call ``checkpoint_restore`` with a fresh communication backend before replaying
+a captured CUDA graph:
 
 .. code-block:: python
 
-    moe_alltoall.checkpoint_prepare()
-    moe_alltoall.checkpoint_restore(comm_backend)
+    communication.checkpoint_prepare()
+    communication.checkpoint_restore(comm_backend)
 
 Both methods are collective.  Every rank must call them in the same order, and
 ``comm_backend`` must reproduce the original rank and world size.
 Repeated calls are no-ops after the workspace reaches the requested state.
 If an exception occurs after physical handle unmapping or remapping begins,
 do not retry or reuse the workspace; restart the affected rank.
-
-.. autosummary::
-    :toctree: ../generated
-
-    MoeAlltoAll.checkpoint_prepare
-    MoeAlltoAll.checkpoint_restore
 
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------
@@ -628,6 +666,47 @@ the MNNVL workspace accepted by ``decode_cp_a2a_alltoall``.
     decode_cp_a2a_lse_reduce_workspace_size
     decode_cp_a2a_lse_reduce_create_workspace
     decode_cp_a2a_lse_reduce
+
+TP MoE Finalize + RMSNorm
+-------------------------
+
+Tensor-parallel MoE finalize fused with the all-reduce and per-expert RMSNorm,
+over an NVLink multicast workspace (hidden size 4096, top-k 8). Initialize the
+process-wide workspace collectively with ``init_tp_moe_finalize_rmsnorm`` before
+the first call.
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    init_tp_moe_finalize_rmsnorm
+    supports_tp_moe_finalize_rmsnorm
+    tp_moe_finalize_rmsnorm
+
+MNNVL CuTe DSL Fused Collectives
+--------------------------------
+
+.. currentmodule:: flashinfer.comm.mnnvl_cutedsl_moe_finalize
+
+.. autosummary::
+    :toctree: ../generated
+
+    MNNVLCuteDSLMoEFinalizeAllReduceWorkspace
+    supports_moe_finalize_rmsnorm_allreduce
+    moe_finalize_rmsnorm_allreduce
+
+.. currentmodule:: flashinfer.comm.mnnvl_cutedsl_ag
+
+.. autosummary::
+    :toctree: ../generated
+
+    MNNVLCuteDSLAllGatherDualNormWorkspace
+    supports_all_gather_gated_residual_next_rmsnorm
+    all_gather_gated_residual_next_rmsnorm
+    MNNVLCuteDSLAllGatherNormQuantWorkspace
+    supports_all_gather_rmsnorm_fp4_quantize
+    all_gather_rmsnorm_fp4_quantize
 
 Mixed Communication
 -------------------

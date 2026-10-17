@@ -565,7 +565,7 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
 
     b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cute-dsl")
     major, minor = get_compute_capability(device)
-    if major * 10 + minor in (100, 103):
+    if major * 10 + minor in (100, 103, 107):
         assert b_p.dtype == torch.uint8
         assert b_p.shape == b_fp4.shape
         assert sf_p.data_ptr() == b_sf.data_ptr()

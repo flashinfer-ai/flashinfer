@@ -460,6 +460,20 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
+        "flashinfer::block_scale_interleave_sm100_out", mutates_args=("out",)
+    )
+    def block_scale_interleave_sm100_out(
+        unswizzled_sf: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        module.block_scale_interleave_sm100(unswizzled_sf, out)
+
+    @register_fake_op("flashinfer::block_scale_interleave_sm100_out")
+    def _fake_block_scale_interleave_sm100_out(
+        unswizzled_sf: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        pass
+
+    @register_custom_op(
         "flashinfer::fp4_batched_quantize_sm100",
         mutates_args=("",),
     )
@@ -928,6 +942,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
         block_scale_interleave_sm100=block_scale_interleave_sm100,
+        block_scale_interleave_sm100_out=block_scale_interleave_sm100_out,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
@@ -1353,7 +1368,9 @@ def _fp4_quantize_cute_dsl(
 
 
 @flashinfer_api
-def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
+def block_scale_interleave(
+    unswizzled_sf: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     r"""Swizzle a block-scale tensor for FP4 layouts.
 
     Reorders an unswizzled FP4 block-scale tensor to optimize memory access
@@ -1364,6 +1381,10 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     ----------
     unswizzled_sf : torch.Tensor
         Input scale-factor tensor with dtype ``uint8`` or ``bfloat16``.
+    out : Optional[torch.Tensor]
+        Preallocated contiguous, flat swizzled output on the input device,
+        with the same dtype and padded size. Reusing it preserves its address
+        across CUDA Graph captures and replay.
 
     Returns
     -------
@@ -1380,6 +1401,8 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     ------
     AssertionError
         If the input dtype is not ``uint8`` or ``bfloat16``.
+    ValueError
+        If ``out`` has an incompatible device, dtype, size, or layout.
     """
     # TODO(shuw): check input dtype is uint8
     assert (
@@ -1388,6 +1411,27 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
 
     major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"
+
+    if out is not None:
+        num_experts = unswizzled_sf.shape[0] if unswizzled_sf.ndim == 3 else 1
+        size = num_experts * _compute_swizzled_layout_sf_size(
+            unswizzled_sf.shape[-2], unswizzled_sf.shape[-1], 128
+        )
+        if (
+            out.device != unswizzled_sf.device
+            or out.dtype != unswizzled_sf.dtype
+            or out.shape != (size,)
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "block_scale_interleave out must be a contiguous flat tensor "
+                f"of shape ({size},), dtype {unswizzled_sf.dtype}, "
+                f"on {unswizzled_sf.device}"
+            )
+        get_fp4_quantization_module(device_arch).block_scale_interleave_sm100_out(
+            unswizzled_sf, out
+        )
+        return out
 
     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
         unswizzled_sf,

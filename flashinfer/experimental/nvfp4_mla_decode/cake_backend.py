@@ -57,7 +57,7 @@ ROWS_PER_CTA = (
     ROWS_PER_TILE // CLUSTER_PAIR
 )  # query rows per CTA (row split of a tile across the pair)
 REDUCE_HEADS_PER_CTA = (
-    8  # combine kernel: one warp per head, eight heads per 256-thread CTA
+    16  # combine kernel: two heads per warp, sixteen heads per 256-thread CTA
 )
 LOG2E = 1.4426950408889634
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -68,6 +68,12 @@ FLAG_SEED_SINK = 1  # split 0 folds the attention sink into the online softmax
 FLAG_DIRECT_OUT = 2  # single-split (request, row tile): the CTA writes O / LSE directly
 MAX_SPLITS = 64  # split-KV combine kernel capacity per row
 MIN_TILES_PER_UNIT = 8  # balanced schedule: minimum pipeline tiles per cluster
+# Model cost of one extra piece (item boundary) inside a unit, in pipeline-tile
+# periods: the softmax warps pay the previous item's epilogue and the pipeline
+# refill at every boundary (~2.5 tile periods on both architectures). The
+# balanced partition equalises ``tiles + BOUNDARY_COST_TILES * (pieces - 1)``
+# per unit instead of tiles. Must match the Cake host plan.
+BOUNDARY_COST_TILES = 2.5
 BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length on
 WORKSPACE_ALIGNMENT = 256
 
@@ -315,13 +321,76 @@ def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_
     )
 
 
+def _greedy_unit_bounds(seq_lens, total, max_cost, max_units, boundary_cost):
+    """Left-to-right units of model cost <= ``max_cost`` (each takes >= 1 tile); None if more than ``max_units`` are needed."""
+    bounds = []
+    pos = 0
+    seq_idx = 0
+    seq_pos = 0
+    while pos < total:
+        if len(bounds) == max_units:
+            return None
+        lo = pos
+        cost = 0.0
+        pieces = 0
+        while pos < total:
+            while seq_pos + seq_lens[seq_idx] <= pos:
+                seq_pos += seq_lens[seq_idx]
+                seq_idx += 1
+            avail = seq_pos + seq_lens[seq_idx] - pos
+            piece_cost = boundary_cost if pieces else 0.0
+            room = int(math.floor(max_cost - cost - piece_cost + 1e-9))
+            if pieces == 0:
+                room = max(room, 1)  # progress: a unit takes at least one tile
+            if room <= 0:
+                break
+            take = min(avail, room)
+            cost += piece_cost + take
+            pieces += 1
+            pos += take
+            if take < avail:
+                break  # the unit is full inside this sequence
+        bounds.append((lo, pos))
+    return bounds
+
+
+def cost_balanced_unit_bounds(seq_lens, num_units, boundary_cost=BOUNDARY_COST_TILES):
+    """Contiguous unit ranges over the concatenated sequences minimising the maximum model cost.
+
+    Binary search on the per-unit cost bound; the greedy left-to-right fill is
+    optimal for a monotone cost, and the smallest bound that fits in
+    ``num_units`` units is returned. ``boundary_cost = 0`` reproduces an
+    equal-tiles partition up to the greedy tie-breaking.
+    """
+    total = sum(seq_lens)
+    if total <= 0 or num_units <= 0:
+        raise ValueError("cost_balanced_unit_bounds needs work and at least one unit")
+    lo_c = total / num_units
+    hi_c = float(total) + boundary_cost * len(seq_lens)
+    best = _greedy_unit_bounds(seq_lens, total, hi_c, num_units, boundary_cost)
+    assert best is not None
+    for _ in range(64):
+        if hi_c - lo_c <= 1.0 / 64:
+            break
+        mid = (lo_c + hi_c) / 2
+        trial = _greedy_unit_bounds(seq_lens, total, mid, num_units, boundary_cost)
+        if trial is None:
+            lo_c = mid
+        else:
+            hi_c = mid
+            best = trial
+    return best
+
+
 def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     """Balanced contiguous partition of the concatenated (row tile, page) work.
 
-    Unit ``u`` of ``U`` receives positions ``[floor(u*W/U), floor((u+1)*W/U))``
-    of the request-major page sequence. Wherever a unit boundary cuts a
-    sequence the sequence becomes two splits; both rows of a piece share
-    ``[start, end)`` and the split index.
+    The request-major tile sequence is cut into at most ``num_units``
+    contiguous ranges of equal model cost ``tiles + BOUNDARY_COST_TILES *
+    (pieces - 1)`` (``cost_balanced_unit_bounds``; fewer units when the optimum
+    does not need them all). Wherever a unit boundary cuts a sequence the
+    sequence becomes two splits; both rows of a piece share ``[start, end)``
+    and the split index.
     """
     m_tiles = _m_tiles(q_len, num_heads)
     sequences = []  # (request, m_tile, tiles)
@@ -336,12 +405,12 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     longest = max(seq[2] for seq in sequences)
     while num_units > 1 and math.ceil(longest / (total / num_units)) + 1 > MAX_SPLITS:
         num_units //= 2
+    bounds = cost_balanced_unit_bounds([seq[2] for seq in sequences], num_units)
+    num_units = len(bounds)
     pieces: list = [[] for _ in sequences]  # (unit, start, end)
     seq_idx = 0
     seq_pos = 0
-    for u in range(num_units):
-        lo = (u * total) // num_units
-        hi = ((u + 1) * total) // num_units
+    for u, (lo, hi) in enumerate(bounds):
         pos = lo
         while pos < hi:
             while seq_pos + sequences[seq_idx][2] <= pos:

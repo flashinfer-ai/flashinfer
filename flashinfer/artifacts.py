@@ -142,7 +142,7 @@ class ArtifactPath:
     # publish carries the Blackwell (sm100f/sm103a) and Rubin (sm107a) cubins.
     TRTLLM_GEN_FMHA: str = "2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "4e73ccb74f333ecfebeac52abf3ebe1fa2dd34b3/batched_gemm-b738138-6923fec/"
+        "35cb99413a3ebce2e87a03fc04196e528e22c8d5/batched_gemm-fdba669-7e3d0a6/"
     )
     TRTLLM_GEN_GEMM: str = (
         "7b1fc253cd6237950e76310873f4acf4d97a3904/gemm-b738138-25754e6/"
@@ -170,7 +170,7 @@ class CheckSumHash:
         "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
     )
     TRTLLM_GEN_BMM: str = (
-        "8190fcb70b7661bf11cc5247b98d7fc55153386f969175c196a9e29d5801c7a1"
+        "66b467a012dcefadbb56c993796397d81d2768a70b3dcd6235fe9e125b07971f"
     )
     DEEPGEMM: str = "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
     TRTLLM_GEN_GEMM: str = (

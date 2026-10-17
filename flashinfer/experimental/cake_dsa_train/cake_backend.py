@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -103,23 +102,34 @@ TMA_ADDRESS_ALIGN = 16  # bytes: the descriptor's global address
 # between passes (dq_mode 1 store, 2 load-add-store, 3 load-add and BF16
 # output) -- ``dq`` stays bitwise deterministic; the dK/dV reductions are
 # unchanged (a pass only selects which keys a tile carries).  The pass count
-# follows the policy the record carries (``key_pass_policy``): P = ceil(S *
-# key_bytes / l2_budget_bytes), the FP32 accumulator slice one pass touches
-# fitting the L2, when P > 1 AND the whole row runs as one launch
-# (num_queries <= the token chunk the workspace budget allows); otherwise the
-# single-pass stage.  Passes run over the whole row only (grid = num_queries
-# per pass; no token chunking), so the workspace grows by num_queries *
-# (147,456 + 4 * topk + 4) bytes.  The passes split the whole key row ``[0, S)``
-# into equal ranges, which matches an index row whose keys spread over the
-# whole row (one document); in a packed multi-segment row every token's keys
-# lie inside its own segment, so whole-row ranges leave most passes empty for
-# most tokens while the per-pass fixed cost is still paid.  The policy
-# therefore applies to one-segment rows only: ``num_segments > 1`` (the varlen
-# entry passes ``len(cu_seqlens_k) - 1``, host metadata, no device sync) plans
-# one pass unless ``key_passes`` overrides.  The formula's count is taken only
-# up to ``max_passes`` (4): beyond it the per-pass FP32 dQ-partial round trip
-# and pipeline fill outweigh the L2 benefit (B200, 4k queries: five and six
-# passes lose 7-15 % against one), so such rows run the single-pass stage.
+# follows the policy the record carries (``key_pass_policy``, evaluated by
+# ``KeyPassPolicy``): the L2 formula P = ceil(S * key_bytes / l2_budget_bytes)
+# (the FP32 accumulator slice one pass touches fits the L2), the token chunk =
+# the largest multiple of ``token_chunk_multiple`` whose pass scratch (147,456
+# + 4 * topk + 4 B per token) fits ``workspace_budget_bytes`` (4224 tokens at
+# top-k 2048), and the rule of the device's architecture from the paired sweeps
+# of the second optimisation round (``rules[arch]``: ``tail_rows``,
+# ``fixed_passes``, ``min_kv``, ``tail_min_kv``, ``tail_cap``): passes apply to
+# a one-segment key row when P > 1 and the row is one chunk (``T <= chunk``) or
+# -- with ``tail_rows`` -- ``2 T <= S``; one-chunk rows below ``min_kv`` keys
+# and the other tail rows below ``tail_min_kv`` keys stay single-pass; the
+# count is ``fixed_passes`` when set, else P, capped at ``tail_cap`` for tail
+# rows that are not one chunk.  The tokens of a multi-pass backward run in
+# chunks of ``chunk`` tokens, every chunk through every pass in order (grid =
+# the chunk's tokens, ``token_base`` = its first token), exactly as the Cake
+# launcher, so the workspace grows by min(T, chunk) * (147,456 + 4 * topk + 4)
+# bytes.  The passes split the whole key row ``[0, S)`` into equal ranges,
+# which matches an index row whose keys spread over the whole row (one
+# document); in a packed multi-segment row every token's keys lie inside its
+# own segment, so whole-row ranges leave most passes empty for most tokens
+# while the per-pass fixed cost is still paid.  The policy therefore applies
+# to one-segment rows only: ``num_segments > 1`` (the varlen entry passes
+# ``len(cu_seqlens_k) - 1``, host metadata, no device sync) plans one pass
+# unless ``key_passes`` overrides.  A record without ``rules`` (the first
+# release) takes the R1 rule everywhere: one-chunk rows, the formula, no tail
+# rows.  A count above ``max_passes`` (4) runs the single-pass stage: beyond it
+# the per-pass FP32 dQ-partial round trip and pipeline fill outweigh the L2
+# benefit (B200, 4k queries: five and six passes lose 7-15 % against one).
 KEY_PASS_STAGES = ("bwd_compact", "bwd_main_pass")
 DQ_PARTIAL_BYTES_PER_TOKEN = (
     NUM_HEADS * D_QK * 4
@@ -131,6 +141,16 @@ KEY_PASS_POLICY_FIELDS = (
     "token_chunk_multiple",
     "max_passes",
 )
+# The per-target rule fields of ``key_pass_policy["rules"][arch]`` (absent in
+# first-release records: the R1 rule).
+KEY_PASS_RULE_FIELDS = (
+    "tail_rows",
+    "fixed_passes",
+    "min_kv",
+    "tail_min_kv",
+    "tail_cap",
+)
+_R1_RULE: dict[str, int] = dict.fromkeys(KEY_PASS_RULE_FIELDS, 0)
 
 
 @dataclass(frozen=True)
@@ -144,6 +164,8 @@ class KeyPassPolicy:
         int  # the token chunk is a multiple of this and at least this (128)
     )
     max_passes: int  # the formula's count is taken only up to this many passes, else one pass (4)
+    # the per-target rules: ((arch, (tail_rows, fixed_passes, min_kv, tail_min_kv, tail_cap)), ...)
+    rules: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> Optional["KeyPassPolicy"]:
@@ -158,7 +180,31 @@ class KeyPassPolicy:
             raise ValueError(
                 f"registry record: key_pass_policy needs positive values, got {raw}"
             )
-        return cls(**values)
+        rules = []
+        for arch, rule in (raw.get("rules") or {}).items():
+            if not isinstance(rule, dict) or set(rule) != set(KEY_PASS_RULE_FIELDS):
+                raise ValueError(
+                    f"registry record: key_pass_policy.rules[{arch!r}] must map exactly "
+                    f"{KEY_PASS_RULE_FIELDS}, got {rule!r}"
+                )
+            for name in KEY_PASS_RULE_FIELDS:
+                value = rule[name]
+                if isinstance(value, bool) or int(value) != value or int(value) < 0:
+                    raise ValueError(
+                        f"registry record: key_pass_policy.rules[{arch!r}].{name} must be "
+                        f"a non-negative integer, got {value!r}"
+                    )
+            rules.append(
+                (str(arch), tuple(int(rule[name]) for name in KEY_PASS_RULE_FIELDS))
+            )
+        return cls(**values, rules=tuple(rules))
+
+    def rule_for(self, arch: Optional[str]) -> dict[str, int]:
+        """The rule of ``arch`` (an architecture without one, or ``None``: the R1 rule)."""
+        for name, fields in self.rules:
+            if name == arch:
+                return dict(zip(KEY_PASS_RULE_FIELDS, fields, strict=True))
+        return dict(_R1_RULE)
 
     def formula_passes(self, num_kv: int) -> int:
         return max(1, -(-int(num_kv) * self.key_bytes // self.l2_budget_bytes))
@@ -169,21 +215,48 @@ class KeyPassPolicy:
         m = self.token_chunk_multiple
         return max(m, (self.workspace_budget_bytes // per_token) // m * m)
 
+    def token_chunks(self, num_queries: int, topk: int) -> tuple[tuple[int, int], ...]:
+        """``(token_base, num_tokens)`` of every token chunk of a multi-pass backward, in launch order."""
+        T, chunk = int(num_queries), self.token_chunk(topk)
+        return tuple((base, min(chunk, T - base)) for base in range(0, T, chunk))
+
     def passes(
-        self, num_queries: int, num_kv: int, topk: int, *, num_segments: int = 1
+        self,
+        num_queries: int,
+        num_kv: int,
+        topk: int,
+        *,
+        num_segments: int = 1,
+        arch: Optional[str] = None,
     ) -> int:
-        """Passes of a binding: the formula when the key row is one segment, the
-        whole row is one launch and the formula gives more than one but at most
-        ``max_passes`` (beyond it the per-pass dQ-partial round trip and pipeline
-        fill outweigh the L2 benefit: one pass); else 1."""
+        """Passes of a binding under the rule of ``arch`` (see the comment above
+        ``KEY_PASS_STAGES``): 1 for a multi-segment key row, a formula of 1, a
+        row that is neither one chunk nor (with ``tail_rows``) ``2 T <= S``, or
+        fewer keys than the row's floor (``min_kv`` for a one-chunk row,
+        ``tail_min_kv`` for a tail row of more than one chunk); else
+        ``fixed_passes`` or the formula, capped at ``tail_cap`` for a tail row
+        of more than one chunk; a count above ``max_passes`` (beyond it the
+        per-pass dQ-partial round trip and pipeline fill outweigh the L2
+        benefit) is one pass."""
         if int(num_segments) < 1:
             raise ValueError(f"num_segments must be >= 1, got {num_segments}")
         if int(num_segments) > 1:
             return 1
-        formula = self.formula_passes(num_kv)
-        if formula == 1 or formula > self.max_passes:
+        T, S = int(num_queries), int(num_kv)
+        formula = self.formula_passes(S)
+        if formula == 1:
             return 1
-        return formula if int(num_queries) <= self.token_chunk(topk) else 1
+        rule = self.rule_for(arch)
+        one_chunk = self.token_chunk(topk) >= T
+        tail = bool(rule["tail_rows"]) and 2 * T <= S
+        if not (one_chunk or tail):
+            return 1
+        if (rule["min_kv"] if one_chunk else rule["tail_min_kv"]) > S:
+            return 1
+        passes = rule["fixed_passes"] or formula
+        if tail and not one_chunk and rule["tail_cap"]:
+            passes = min(passes, rule["tail_cap"])
+        return passes if passes <= self.max_passes else 1
 
 
 def plan_key_passes(
@@ -195,6 +268,7 @@ def plan_key_passes(
     key_passes: Optional[int] = None,
     *,
     num_segments: int = 1,
+    arch: Optional[str] = None,
 ) -> int:
     """Number of key-range passes of one backward binding.
 
@@ -203,7 +277,8 @@ def plan_key_passes(
     without a ``key_pass_policy`` never takes the pass path by default.
     ``num_segments`` is the packed segment count of the key row (see the
     comment above ``KEY_PASS_STAGES``): the policy plans one pass for more
-    than one segment.
+    than one segment.  ``arch`` selects the record's per-target rule (``None``:
+    the R1 rule).
     """
     multi_pass = all(stage in stages for stage in KEY_PASS_STAGES)
     if key_passes is not None:
@@ -227,7 +302,25 @@ def plan_key_passes(
     policy = KeyPassPolicy.from_record(record)
     if policy is None:
         return 1
-    return policy.passes(num_queries, num_kv, topk, num_segments=num_segments)
+    return policy.passes(
+        num_queries, num_kv, topk, num_segments=num_segments, arch=arch
+    )
+
+
+def _record_token_chunk(record: dict[str, Any], topk: int) -> Optional[int]:
+    """Tokens per launch chunk of a multi-pass backward under the record's policy (``None``: no policy, the whole row)."""
+    policy = KeyPassPolicy.from_record(record)
+    return None if policy is None else policy.token_chunk(topk)
+
+
+def _pass_token_chunks(
+    record: dict[str, Any], num_queries: int, topk: int
+) -> tuple[tuple[int, int], ...]:
+    """``(token_base, num_tokens)`` of the token chunks a multi-pass backward runs (one whole-row chunk without a policy)."""
+    policy = KeyPassPolicy.from_record(record)
+    if policy is None:
+        return ((0, int(num_queries)),)
+    return policy.token_chunks(num_queries, topk)
 
 
 def key_pass_ranges(num_kv: int, passes: int) -> tuple[tuple[int, int], ...]:
@@ -253,13 +346,12 @@ def key_pass_dq_mode(index: int, passes: int) -> int:
 # with many keys per query token pay back (B200: S / T >= 16 -> 0.5..4 % faster
 # backward, S = T -> 3.7 % slower), so the host takes it by the size rule the
 # record carries (``dkv_direct``: ``min_keys_per_query``; direct iff
-# S >= min_keys_per_query * T) whenever the caller passes ``dkv_acc``;
-# ``FLASHINFER_CAKE_DSA_DKV_DIRECT=1|0`` forces or disables it (``auto`` = the
-# rule).  Without the natural stages every ``dkv_acc`` call takes the cast's
-# accumulate path.  Both paths add the same FP32 contributions into the same
-# rows (another summation order).
+# S >= min_keys_per_query * T) whenever the caller passes ``dkv_acc``; the
+# ``dkv_direct`` keyword of the entry points forces (``True``) or disables
+# (``False``) it (``None``, the default, = the rule).  Without the natural
+# stages every ``dkv_acc`` call takes the cast's accumulate path.  Both paths
+# add the same FP32 contributions into the same rows (another summation order).
 DIRECT_STAGES = ("bwd_main_natural", "bwd_main_pass_natural")
-DKV_DIRECT_ENV = "FLASHINFER_CAKE_DSA_DKV_DIRECT"
 DKV_DIRECT_POLICY_FIELDS = ("min_keys_per_query",)
 
 
@@ -286,15 +378,6 @@ class DkvDirectPolicy:
 
     def wants(self, num_queries: int, num_kv: int) -> bool:
         return int(num_kv) >= self.min_keys_per_query * int(num_queries)
-
-
-def dkv_direct_mode() -> str:
-    """``FLASHINFER_CAKE_DSA_DKV_DIRECT``: ``auto`` (default: the record's size rule), ``1`` (direct whenever the
-    program registers the natural stages) or ``0`` (never: the cast's accumulate path)."""
-    mode = os.environ.get(DKV_DIRECT_ENV, "auto").strip() or "auto"
-    if mode not in ("auto", "0", "1"):
-        raise ValueError(f"{DKV_DIRECT_ENV} must be auto, 0 or 1, got {mode!r}")
-    return mode
 
 
 def record_direct_stages(record: dict[str, Any], stages: tuple[str, ...]) -> bool:
@@ -329,15 +412,19 @@ def plan_dkv_direct(
     num_kv: int,
     *,
     accumulate: bool,
+    dkv_direct: Optional[bool] = None,
 ) -> bool:
     """Does this backward binding add ``dkv_acc`` directly from the main stage?  Only with ``dkv_acc``
-    (``accumulate``), a program registering the natural stages, and the size rule or the forced mode."""
+    (``accumulate``) and a program registering the natural stages; then ``dkv_direct`` decides: ``None`` (the
+    default) applies the record's size rule, ``True`` takes the direct path, ``False`` the cast's accumulate path.
+    Any other value raises ``ValueError``."""
+    if dkv_direct is not None and not isinstance(dkv_direct, bool):
+        raise ValueError(f"dkv_direct must be None, True or False, got {dkv_direct!r}")
     if not accumulate or not record_direct_stages(record, stages):
         return False
-    mode = dkv_direct_mode()
-    if mode == "0":
-        return False
-    return mode == "1" or DkvDirectPolicy.from_record(record).wants(num_queries, num_kv)
+    if dkv_direct is None:
+        return DkvDirectPolicy.from_record(record).wants(num_queries, num_kv)
+    return dkv_direct
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +624,11 @@ def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> 
 
 
 def _check_dkv_acc(
-    dkv_acc: torch.Tensor, dkv_dst_map: Optional[torch.Tensor], num_kv: int
+    dkv_acc: torch.Tensor,
+    dkv_dst_map: Optional[torch.Tensor],
+    num_kv: int,
+    *,
+    check_dst_map: bool = False,
 ) -> tuple[torch.Tensor, int]:
     """Validate the caller's packed FP32 dK/dV accumulator and its optional destination-row map.
 
@@ -546,9 +637,9 @@ def _check_dkv_acc(
     of 4 (16-byte vectors), 16-byte-aligned base; without a map at least ``num_kv`` rows.  ``dkv_dst_map``: ``None``
     (identity) or a contiguous int32 ``[num_kv]`` tensor on the device of ``dkv_acc`` -- the destination row of every
     source key row, values in ``[0, S_dst)``, duplicates allowed.  The kernel does not range-check the map (a value
-    outside ``[0, S_dst)`` would add into memory outside ``dkv_acc``); the caller owns that invariant.  Setting the
-    environment variable ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` validates the values on every call (a device
-    synchronization) and raises ``ValueError`` on a violation.  Returns ``(operand, row_stride)``: the raw-pointer
+    outside ``[0, S_dst)`` would add into memory outside ``dkv_acc``); the caller owns that invariant.
+    ``check_dst_map=True`` (default ``False``) validates the values here (a device synchronization) and raises
+    ``ValueError`` on a violation.  Returns ``(operand, row_stride)``: the raw-pointer
     operand of ``bwd_cast`` (``dkv_acc`` itself when contiguous, else a flat stride-1 alias from its first element over
     ``(S_dst - 1) * row_stride + cols`` elements -- the FFI boundary takes contiguous tensors only, and the kernel
     addresses ``row * row_stride + col``) and the row stride.  Device placement is checked by the callers, so this
@@ -587,7 +678,7 @@ def _check_dkv_acc(
         raise ValueError(
             f"dkv_dst_map must be a contiguous int32 [S] tensor (S = {num_kv}) on the device of dkv_acc"
         )
-    elif os.environ.get("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", "0") not in ("", "0"):
+    elif check_dst_map:
         num_rows = int(dkv_acc.shape[0])
         if bool(((dkv_dst_map < 0) | (dkv_dst_map >= num_rows)).any().item()):
             raise ValueError(
@@ -617,6 +708,7 @@ def workspace_layout(
     backward: bool = True,
     key_passes: int = 1,
     dkv_direct: bool = False,
+    token_chunk: Optional[int] = None,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region plus ``"total"``.
 
@@ -624,9 +716,10 @@ def workspace_layout(
     passes none; ``delta`` and the FP32 dK/dV accumulators exist for the
     backward (a direct binding, ``dkv_direct``, adds into the caller's
     ``dkv_acc`` and has no accumulators).  A backward with more than one
-    key-range pass adds the FP32 dQ
-    partials (``num_queries`` x 147,456 B), the compacted keys of one pass
-    (``num_queries`` x ``topk`` int32) and their per-token counts.
+    key-range pass adds the FP32 dQ partials (147,456 B per token), the
+    compacted keys of one pass (``topk`` int32 per token) and the per-token
+    counts for the tokens of one launch chunk: ``min(num_queries,
+    token_chunk)`` rows (the whole row without a ``token_chunk``).
     """
     sizes = [("topk_length", num_queries * 4)]
     if backward:
@@ -637,10 +730,15 @@ def workspace_layout(
                 ("dk_rope_acc", num_kv * D_ROPE * 4),
             ]
         if int(key_passes) > 1:
+            rows = (
+                int(num_queries)
+                if token_chunk is None
+                else min(int(num_queries), int(token_chunk))
+            )
             sizes += [
-                ("dq_partial", num_queries * DQ_PARTIAL_BYTES_PER_TOKEN),
-                ("key_scratch", num_queries * int(topk) * 4),
-                ("pass_counts", num_queries * 4),
+                ("dq_partial", rows * DQ_PARTIAL_BYTES_PER_TOKEN),
+                ("key_scratch", rows * int(topk) * 4),
+                ("pass_counts", rows * 4),
             ]
     layout: dict = {}
     offset = 0
@@ -661,18 +759,28 @@ def dsa_train_workspace_size(
     key_passes: Optional[int] = None,
     num_segments: int = 1,
     dkv_acc: bool = False,
+    dkv_direct: Optional[bool] = None,
 ) -> int:
     """Workspace bytes :func:`prepare_dsa_train` needs for ``(T, S, topk)`` on ``device``.
 
     ``key_passes`` / ``num_segments`` as in :func:`prepare_dsa_train`
     (``None`` = the record's policy; the packed segment count of the key row);
     ``dkv_acc`` = the binding will accumulate into a caller-provided ``dkv_acc``
-    (a direct binding needs no FP32 accumulators; see :func:`plan_dkv_direct`).
+    (a direct binding needs no FP32 accumulators; see :func:`plan_dkv_direct`),
+    with ``dkv_direct`` as in :func:`prepare_dsa_train` (``None``, the default,
+    = the record's size rule; ``True`` / ``False`` force / disable the direct
+    path).
     """
     _, record = record_for(device)
+    arch = arch_for(device)
     stages = cake_jit.registered_stages()
     direct = bool(backward) and plan_dkv_direct(
-        record, stages, num_queries, num_kv, accumulate=bool(dkv_acc)
+        record,
+        stages,
+        num_queries,
+        num_kv,
+        accumulate=bool(dkv_acc),
+        dkv_direct=dkv_direct,
     )
     passes = (
         plan_key_passes(
@@ -683,6 +791,7 @@ def dsa_train_workspace_size(
             topk,
             key_passes,
             num_segments=num_segments,
+            arch=arch,
         )
         if backward
         else 1
@@ -695,6 +804,7 @@ def dsa_train_workspace_size(
             backward=backward,
             key_passes=passes,
             dkv_direct=direct,
+            token_chunk=_record_token_chunk(record, topk),
         )["total"]
     )
 
@@ -955,13 +1065,22 @@ class _Plan:
     scalars: dict = field(repr=False)
     # Launch values that follow from the geometry alone (every stage selects from them).
     constants: dict[str, Any] = field(repr=False)
-    # ``(pass_lo, pass_hi, dq_mode)`` overrides of every key-range pass (empty for one pass).
-    pass_overrides: tuple[dict[str, int], ...]
-    entries: dict[str, _StageEntry] = field(repr=False)
+    # ``(pass_lo, pass_hi, dq_mode, token_base, num_tokens)`` overrides of every
+    # (token chunk, key-range pass) of a multi-pass backward (empty for one pass).
+    pass_overrides: tuple[tuple[dict[str, int], ...], ...]
+    # stage name -> entry; the pass stages of a multi-pass backward are keyed ``(stage, chunk index)``
+    entries: dict[Any, _StageEntry] = field(repr=False)
     backward_order: tuple
 
     def launch_keys(self) -> tuple:
         return tuple(FORWARD_STAGES) + self.backward_order
+
+    @property
+    def pass_rows(self) -> int:
+        """Token rows of the pass scratch regions (one launch chunk; 0 without passes)."""
+        if "dq_partial" not in self.layout:
+            return 0
+        return self.layout["dq_partial"][1] // DQ_PARTIAL_BYTES_PER_TOKEN
 
 
 def _geometry(t: Optional[torch.Tensor]) -> Optional[tuple]:
@@ -1012,8 +1131,11 @@ def _plan(
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
     derive_topk_length: bool = False,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: bool = False,
 ) -> _Plan:
-    """Validate one geometry and resolve its plan (no allocation, no launch)."""
+    """Validate one geometry and resolve its plan (no allocation, no launch).  ``dkv_direct`` / ``check_dst_map``
+    as in :func:`prepare_dsa_train`."""
     if derive_topk_length and topk_length is None:
         raise ValueError(
             "derive_topk_length=True needs a topk_length [T] int32 tensor for the forward to fill"
@@ -1038,7 +1160,9 @@ def _plan(
             raise ValueError(
                 "dkv_acc accumulates in place: no dkv_latent / dk_rope output tensors are written with it"
             )
-        _, dst_row_stride = _check_dkv_acc(dkv_acc, dkv_dst_map, num_kv)
+        _, dst_row_stride = _check_dkv_acc(
+            dkv_acc, dkv_dst_map, num_kv, check_dst_map=check_dst_map
+        )
     elif dkv_dst_map is not None:
         raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
     device = q_latent.device
@@ -1056,9 +1180,14 @@ def _plan(
             f"(registered: {stages}); forward-only use is available"
         )
     # direct accumulation: the natural-layout main stage adds into dkv_acc when the record registers it and its
-    # size rule (or the forced mode) selects it; otherwise the cast's accumulate path
+    # size rule (or the caller's ``dkv_direct``) selects it; otherwise the cast's accumulate path
     direct = bool(backward) and plan_dkv_direct(
-        record, stages, num_queries, num_kv, accumulate=accumulate
+        record,
+        stages,
+        num_queries,
+        num_kv,
+        accumulate=accumulate,
+        dkv_direct=dkv_direct,
     )
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
@@ -1071,6 +1200,7 @@ def _plan(
             topk,
             key_passes,
             num_segments=num_segments,
+            arch=arch,
         )
         if backward
         else 1
@@ -1105,6 +1235,7 @@ def _plan(
         backward=backward,
         key_passes=passes,
         dkv_direct=direct,
+        token_chunk=_record_token_chunk(record, topk),
     )
     has_topk_length = topk_length is not None
     # the forward derives the row lengths into the vector when the caller gives none (or asks for it); the backward
@@ -1148,19 +1279,33 @@ def _plan(
         **_main_accumulator_constants(direct, dst_row_stride, dkv_dst_map is not None),
         token_base=0,  # one CTA per token, token = blockIdx.x
         token_step=1,
-        num_tokens=T,  # bwd_compact: the whole row per pass
+        num_tokens=T,  # bwd_compact: the whole row; a multi-pass backward overrides it per token chunk
     )
-    pass_overrides: tuple[dict[str, int], ...] = ()
+    # per (token chunk, key-range pass) overrides of a multi-pass backward: the key range, ``dq_mode``,
+    # the chunk's first token and its token count
+    pass_overrides: tuple[tuple[dict[str, int], ...], ...] = ()
+    token_chunks: tuple[tuple[int, int], ...] = ()
     if backward and passes == 1:
         # The single-pass kernel never reads the pass operands; it receives, like its
         # production launcher, the whole key range and dq_mode 0.
         constants.update(pass_lo=0, pass_hi=S, dq_mode=0)
     elif backward:
+        token_chunks = _pass_token_chunks(record, num_queries, topk)
+        ranges = key_pass_ranges(num_kv, passes)
         pass_overrides = tuple(
-            dict(pass_lo=lo, pass_hi=hi, dq_mode=key_pass_dq_mode(index, passes))
-            for index, (lo, hi) in enumerate(key_pass_ranges(num_kv, passes))
+            tuple(
+                dict(
+                    pass_lo=lo,
+                    pass_hi=hi,
+                    dq_mode=key_pass_dq_mode(index, passes),
+                    token_base=int(base),
+                    num_tokens=int(num_tokens),
+                )
+                for index, (lo, hi) in enumerate(ranges)
+            )
+            for base, num_tokens in token_chunks
         )
-    entries = {"fwd": _stage_entry("fwd", arch, scalars)}
+    entries: dict[Any, _StageEntry] = {"fwd": _stage_entry("fwd", arch, scalars)}
     backward_order: list = []
     if backward:
         # the natural-layout variants of the main stage replace the permuted ones on a direct binding
@@ -1175,10 +1320,18 @@ def _plan(
             entries[main_stage] = _stage_entry(main_stage, arch, scalars)
             backward_order.append(main_stage)
         else:
-            for stage in pass_stages:
-                entries[stage] = _stage_entry(stage, arch, scalars)
-            for index in range(passes):
-                backward_order += [(stage, index) for stage in pass_stages]
+            # token chunks in order, every chunk through every pass (the Cake launcher's loop);
+            # the grid rules (``num_queries`` / ``num_queries/W``) take the chunk's token count
+            for chunk_index, (_base, num_tokens) in enumerate(token_chunks):
+                chunk_scalars = dict(scalars, num_queries=int(num_tokens))
+                for stage in pass_stages:
+                    entries[(stage, chunk_index)] = _stage_entry(
+                        stage, arch, chunk_scalars
+                    )
+                for index in range(passes):
+                    backward_order += [
+                        (stage, chunk_index, index) for stage in pass_stages
+                    ]
         # a direct binding's gradients are complete after the main stage: no cast
         if not direct:
             entries["bwd_cast"] = _stage_entry("bwd_cast", arch, scalars)
@@ -1261,9 +1414,11 @@ def _launches(plan: _Plan, values: dict[str, Any]) -> dict[Any, _Launch]:
     for key in plan.launch_keys():
         stage, stage_values = key, values
         if isinstance(key, tuple):
-            stage, index = key
-            stage_values = dict(values, **plan.pass_overrides[index])
-        e = plan.entries[stage]
+            stage, chunk, index = key
+            stage_values = dict(values, **plan.pass_overrides[chunk][index])
+            e = plan.entries[(stage, chunk)]
+        else:
+            e = plan.entries[stage]
         launches[key] = _Launch(stage, e.launcher, e.run, stage_values, e.grid)
     return launches
 
@@ -1281,16 +1436,17 @@ def _scratch(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
             flat, layout, "dk_rope_acc", torch.float32, (S, D_ROPE)
         )
     if plan.key_passes > 1:
+        rows = plan.pass_rows  # the tokens of one launch chunk
         t.update(
             dq_partial=_carve(
                 flat,
                 layout,
                 "dq_partial",
                 torch.float32,
-                (T, DQ_PARTIAL_BYTES_PER_TOKEN // 4),
+                (rows, DQ_PARTIAL_BYTES_PER_TOKEN // 4),
             ),
-            key_scratch=_carve(flat, layout, "key_scratch", torch.int32, (T, topk)),
-            pass_counts=_carve(flat, layout, "pass_counts", torch.int32, (T,)),
+            key_scratch=_carve(flat, layout, "key_scratch", torch.int32, (rows, topk)),
+            pass_counts=_carve(flat, layout, "pass_counts", torch.int32, (rows,)),
         )
     return t
 
@@ -1315,11 +1471,11 @@ class DSATrainRunner:
     freely.
 
     ``launches`` is keyed by stage name; the launches of a multi-pass backward
-    are keyed ``(stage, pass index)`` and ``backward_order`` lists every
-    backward launch key in launch order (``bwd_delta``, then per pass
-    ``bwd_compact`` and ``bwd_main_pass`` -- or the single ``bwd_main`` --,
-    then ``bwd_cast``; a direct binding, ``dkv_direct``, launches the
-    natural-layout variants of the main stage and no cast).
+    are keyed ``(stage, chunk index, pass index)`` and ``backward_order`` lists
+    every backward launch key in launch order (``bwd_delta``, then per token
+    chunk and per pass ``bwd_compact`` and ``bwd_main_pass`` -- or the single
+    ``bwd_main`` --, then ``bwd_cast``; a direct binding, ``dkv_direct``,
+    launches the natural-layout variants of the main stage and no cast).
     """
 
     module_name: str
@@ -1424,6 +1580,8 @@ def prepare_dsa_train(
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
     derive_topk_length: bool = False,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: bool = False,
     backend: str = "cake",
 ) -> DSATrainRunner:
     """Validate one binding and prepare its launches.
@@ -1444,7 +1602,13 @@ def prepare_dsa_train(
     registering the natural-layout main stages accumulates directly from the
     main stage when the record's size rule selects it (:func:`plan_dkv_direct`:
     no FP32 accumulators, no cast launch); otherwise the cast adds the
-    gradients.
+    gradients.  ``dkv_direct`` overrides that rule: ``None`` (default) applies
+    it, ``True`` takes the direct path whenever the program registers the
+    natural stages, ``False`` always takes the cast's accumulate path.
+    ``check_dst_map=True`` (default ``False``) validates the values of
+    ``dkv_dst_map`` (every destination row in ``[0, S_dst)``) while the binding
+    is prepared, at the cost of one device synchronization; the kernel does not
+    range-check the map.
 
     Row lengths: with ``topk_length`` the kernels use the caller's lengths.
     Without it the forward kernel derives them itself (last valid slot + 1 per
@@ -1485,6 +1649,8 @@ def prepare_dsa_train(
         dkv_dst_map=dkv_dst_map,
         num_segments=num_segments,
         derive_topk_length=derive_topk_length,
+        dkv_direct=dkv_direct,
+        check_dst_map=check_dst_map,
     )
     device = q_latent.device
     layout = plan.layout
@@ -1620,24 +1786,19 @@ def _dkv_outputs(
 # problem-sized storage: only the full-length ``topk_length`` vector it
 # materializes when the caller passes none (4 bytes per query row).  Outputs
 # and the backward scratch come from the caching allocator per call, so a
-# call never shares storage with another call that is still in flight.
+# call never shares storage with another call that is still in flight.  The
+# cache keeps ``BINDING_CACHE_DEFAULT_CAPACITY`` entries unless
+# ``BINDING_CACHE.configure(capacity=...)`` resizes it.
 BINDING_CACHE_DEFAULT_CAPACITY = 64
-BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY"
 
 
-def binding_cache_capacity() -> int:
-    """Capacity of :data:`BINDING_CACHE`: ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY``
-    when set, else :data:`BINDING_CACHE_DEFAULT_CAPACITY`."""
-    raw = os.environ.get(BINDING_CACHE_CAPACITY_ENV)
-    if raw is None or not raw.strip():
+def _binding_cache_capacity(capacity: Optional[int]) -> int:
+    """``capacity`` as a positive integer; ``None`` is :data:`BINDING_CACHE_DEFAULT_CAPACITY`."""
+    if capacity is None:
         return BINDING_CACHE_DEFAULT_CAPACITY
-    try:
-        capacity = int(raw)
-    except ValueError:
-        capacity = 0
-    if capacity < 1:
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
         raise ValueError(
-            f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}"
+            f"binding cache capacity must be a positive integer, got {capacity!r}"
         )
     return capacity
 
@@ -1685,13 +1846,14 @@ def backward_binding_key(
     num_segments: int = 1,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    dkv_direct: Optional[bool] = None,
 ) -> tuple:
     """Cache key of a backward plan: the forward key's inputs plus the saved forward
     outputs, ``dout``, the ``dkv_fp32`` option, the ``key_passes`` override, the
     segment count the pass policy saw and the geometry of the packed accumulator /
     destination map (``None`` when absent; their row stride and presence are baked
-    into the accumulating launch) and, with ``dkv_acc``, the direct-accumulation
-    mode (:func:`dkv_direct_mode`)."""
+    into the accumulating launch) and, with ``dkv_acc``, the ``dkv_direct`` option
+    (``None`` / ``True`` / ``False``; see :func:`plan_dkv_direct`)."""
     return (
         "bwd",
         _geometry(q_latent),
@@ -1710,7 +1872,7 @@ def backward_binding_key(
         int(num_segments),
         _geometry(dkv_acc),
         _geometry(dkv_dst_map),
-        None if dkv_acc is None else dkv_direct_mode(),
+        None if dkv_acc is None else dkv_direct,
     )
 
 
@@ -1728,10 +1890,12 @@ class _Binding:
         with _ffi_stream_context(plan.device_index):
             for key in keys:
                 if isinstance(key, tuple):
-                    stage, index = key
-                    e = plan.entries[stage]
+                    stage, chunk, index = key
+                    e = plan.entries[(stage, chunk)]
                     e.launcher(
-                        e.run, dict(values, **plan.pass_overrides[index]), e.grid
+                        e.run,
+                        dict(values, **plan.pass_overrides[chunk][index]),
+                        e.grid,
                     )
                 else:
                     e = plan.entries[key]
@@ -1770,6 +1934,7 @@ class _Binding:
         topk_length,
         dkv_acc=None,
         dkv_dst_map=None,
+        check_dst_map=False,
     ):
         plan = self.plan
         T, S, device = plan.num_queries, plan.num_kv, q_latent.device
@@ -1801,16 +1966,22 @@ class _Binding:
             )
             t["dk_rope_acc"] = _alloc((S, D_ROPE), torch.float32, device, zero=True)
         if plan.key_passes > 1:
-            t["dq_partial"] = fresh((T, DQ_PARTIAL_BYTES_PER_TOKEN // 4), torch.float32)
-            t["key_scratch"] = fresh((T, plan.topk), torch.int32)
-            t["pass_counts"] = fresh((T,), torch.int32)
+            rows = plan.pass_rows  # the tokens of one launch chunk
+            t["dq_partial"] = fresh(
+                (rows, DQ_PARTIAL_BYTES_PER_TOKEN // 4), torch.float32
+            )
+            t["key_scratch"] = fresh((rows, plan.topk), torch.int32)
+            t["pass_counts"] = fresh((rows,), torch.int32)
         if plan.accumulate_dkv:
             if dkv_acc is None:
                 raise RuntimeError(
                     "this binding accumulates the dK/dV gradients into dkv_acc and the call provides none"
                 )
-            # the same key implies the validated shape / stride / dtype; the flat alias is rebuilt per call
-            t["dkv_acc"], _row_stride = _check_dkv_acc(dkv_acc, dkv_dst_map, S)
+            # the same key implies the validated shape / stride / dtype; the flat alias is rebuilt per call (and
+            # the map's values are checked per call when the caller asks for it)
+            t["dkv_acc"], _row_stride = _check_dkv_acc(
+                dkv_acc, dkv_dst_map, S, check_dst_map=check_dst_map
+            )
             if dkv_dst_map is not None:
                 t["dkv_dst_map"] = dkv_dst_map
         t.update(_dkv_outputs(plan, t, None, None, fresh))
@@ -1823,12 +1994,24 @@ class _Binding:
 
 
 class _BindingCache:
-    """Bounded, lock-protected LRU of :class:`_Binding` by call key."""
+    """Bounded, lock-protected LRU of :class:`_Binding` by call key.
+
+    ``capacity`` (``None`` = :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64) bounds the entries; :meth:`configure`
+    changes it on a live cache.
+    """
 
     def __init__(self, capacity: Optional[int] = None):
-        self.capacity = binding_cache_capacity() if capacity is None else int(capacity)
+        self.capacity = _binding_cache_capacity(capacity)
         self._lock = threading.Lock()
         self._entries: "OrderedDict[tuple, _Binding]" = OrderedDict()
+
+    def configure(self, *, capacity: Optional[int] = None) -> None:
+        """Set the capacity (``None`` = :data:`BINDING_CACHE_DEFAULT_CAPACITY`); entries beyond it are evicted,
+        least recently used first."""
+        with self._lock:
+            self.capacity = _binding_cache_capacity(capacity)
+            while len(self._entries) > self.capacity:
+                self._entries.popitem(last=False)
 
     def get(self, key: tuple) -> Optional[_Binding]:
         with self._lock:
@@ -1924,6 +2107,7 @@ def _empty_backward(
     dkv_fp32: bool,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    check_dst_map: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Gradients of a call without query rows: empty ``dq``, zero ``dkv`` in the requested dtype (``None`` with
     ``dkv_acc``: nothing to accumulate); nothing launched."""
@@ -1944,7 +2128,8 @@ def _empty_backward(
     dq_latent = _alloc((0, NUM_HEADS, D_LATENT), torch.bfloat16, device)
     dq_rope = _alloc((0, NUM_HEADS, D_ROPE), torch.bfloat16, device)
     if dkv_acc is not None:
-        _check_dkv_acc(dkv_acc, dkv_dst_map, num_kv)  # nothing to accumulate
+        # nothing to accumulate; the buffer and the map are validated all the same
+        _check_dkv_acc(dkv_acc, dkv_dst_map, num_kv, check_dst_map=check_dst_map)
         return dq_latent, dq_rope, None, None
     dtype = torch.float32 if dkv_fp32 else torch.bfloat16
     return (
@@ -2031,6 +2216,8 @@ def backward(
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``.
 
@@ -2043,10 +2230,14 @@ def backward(
     receives the dK/dV gradients in place instead -- latent columns ``0:512``,
     rope ``512:576`` of row ``dkv_dst_map[s]`` (optional int32 ``[S]``, identity
     by default, repeated rows sum); the caller owns zeroing and the result is
-    ``(dq_latent, dq_rope, None, None)`` (see :func:`prepare_dsa_train`).  A
-    strided ``dout`` is copied once (the delta stage reads it densely); a call
-    without query rows returns empty ``dq`` and zero ``dkv`` gradients without
-    launching.
+    ``(dq_latent, dq_rope, None, None)`` (see :func:`prepare_dsa_train`).
+    ``dkv_direct`` (default ``None`` = the record's size rule, ``True`` / ``False`` =
+    force / disable the direct path of a ``dkv_acc`` binding) and
+    ``check_dst_map`` (default ``False``; ``True`` validates the values of
+    ``dkv_dst_map`` on every call, one device synchronization) as in
+    :func:`prepare_dsa_train`.  A strided ``dout`` is copied once (the delta
+    stage reads it densely); a call without query rows returns empty ``dq`` and
+    zero ``dkv`` gradients without launching.
     """
     if dkv_acc is not None and dkv_fp32:
         raise ValueError(
@@ -2071,6 +2262,7 @@ def backward(
             dkv_fp32,
             dkv_acc,
             dkv_dst_map,
+            check_dst_map,
         )
     scale = default_softmax_scale() if softmax_scale is None else float(softmax_scale)
     key = backward_binding_key(
@@ -2090,6 +2282,7 @@ def backward(
         num_segments,
         dkv_acc,
         dkv_dst_map,
+        dkv_direct,
     )
     binding = _binding(
         key,
@@ -2109,6 +2302,8 @@ def backward(
             dkv_acc=dkv_acc,
             dkv_dst_map=dkv_dst_map,
             num_segments=num_segments,
+            dkv_direct=dkv_direct,
+            check_dst_map=check_dst_map,
         ),
     )
     return binding.backward(
@@ -2124,6 +2319,7 @@ def backward(
         topk_length,
         dkv_acc,
         dkv_dst_map,
+        check_dst_map,
     )
 
 
@@ -2131,7 +2327,9 @@ class DSASparseAttentionFunction(torch.autograd.Function):
     """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward.
 
     ``dkv_acc`` / ``dkv_dst_map`` (see :func:`backward`): the backward accumulates the dK/dV gradients into the
-    caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``.
+    caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``.  ``dkv_direct`` (default
+    ``None``: the record's size rule; ``True`` / ``False`` force / disable the direct path) and ``check_dst_map``
+    (default ``False``; ``True`` validates the map's values in the backward) are handed to :func:`backward`.
     """
 
     @staticmethod
@@ -2149,6 +2347,8 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         dkv_dst_map=None,
         num_segments=1,
         derive_topk_length=False,
+        dkv_direct=None,
+        check_dst_map=False,
     ):
         out, lse, o_lo = forward(
             q_latent,
@@ -2171,6 +2371,8 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         # saved tensor's version check would reject that mutation when the graph is retained for another backward.
         ctx.dkv_acc = dkv_acc
         ctx.dkv_dst_map = dkv_dst_map
+        ctx.dkv_direct = dkv_direct
+        ctx.check_dst_map = check_dst_map
         saved = [q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo]
         saved.append(topk_length if topk_length is not None else indices.new_empty(0))
         ctx.save_for_backward(*saved)
@@ -2183,7 +2385,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
                 "gradients through lse are not supported; only out is differentiable"
             )
         if dout is None:  # out unused downstream
-            return (None,) * 12
+            return (None,) * 14
         q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
             ctx.saved_tensors
         )
@@ -2203,9 +2405,11 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             dkv_acc=ctx.dkv_acc,
             dkv_dst_map=ctx.dkv_dst_map,
             num_segments=ctx.num_segments,
+            dkv_direct=ctx.dkv_direct,
+            check_dst_map=ctx.check_dst_map,
         )
-        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the eight other inputs
-        return (dq_latent, dq_rope, dkv_latent, dk_rope) + (None,) * 8
+        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the ten other inputs
+        return (dq_latent, dq_rope, dkv_latent, dk_rope) + (None,) * 10
 
 
 def dsa_sparse_attention(
@@ -2222,6 +2426,8 @@ def dsa_sparse_attention(
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: bool = False,
 ):
     """Autograd entry of the flat form (see :mod:`flashinfer.dsa_sparse_attention`).
 
@@ -2232,7 +2438,12 @@ def dsa_sparse_attention(
     FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
     rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
     key row, default identity) are handed to the backward; with ``dkv_acc``
-    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``num_segments``
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``dkv_direct``
+    (default ``None``: the record's size rule; ``True`` / ``False`` force /
+    disable the direct accumulation of a ``dkv_acc`` binding) and
+    ``check_dst_map`` (default ``False``; ``True`` validates the values of
+    ``dkv_dst_map`` in the backward, one device synchronization) are handed to
+    the backward as well (see :func:`backward`).  ``num_segments``
     is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
     a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
     backward's whole-row key-range passes apply to one-segment rows only.
@@ -2264,6 +2475,8 @@ def dsa_sparse_attention(
         dkv_dst_map,
         int(num_segments),
         derive,
+        dkv_direct,
+        check_dst_map,
     )
     return (out, lse) if return_lse else out
 
@@ -2286,6 +2499,8 @@ def dsa_sparse_attention_varlen(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: bool = False,
 ):
     """Packed multi-document form: per-document key indices are offset by
     ``cu_seqlens_k`` on device (this glue counts in the step time), then the flat
@@ -2297,7 +2512,8 @@ def dsa_sparse_attention_varlen(
     first release).  Without an explicit ``topk_length`` the per-row lengths
     come out of the same glue pass (no separate derivation).
     ``max_seqlen_q/k`` are accepted for signature parity and not used on the
-    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`.
+    host.  ``dkv_acc`` / ``dkv_dst_map`` / ``dkv_direct`` (default ``None``) /
+    ``check_dst_map`` (default ``False``) as in :func:`dsa_sparse_attention`.
     The segment count ``len(cu_seqlens_k) - 1`` (host metadata, no device
     sync) is passed on as ``num_segments``: with more than one segment the
     backward plans the single-pass stage unless ``key_passes`` overrides."""
@@ -2328,4 +2544,6 @@ def dsa_sparse_attention_varlen(
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
         num_segments=int(cu_seqlens_k.numel()) - 1,
+        dkv_direct=dkv_direct,
+        check_dst_map=check_dst_map,
     )

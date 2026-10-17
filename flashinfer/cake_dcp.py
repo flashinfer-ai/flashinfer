@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from .jit.cake_dcp import DcpSpecTarget
 
 from .utils import (
     _check_workspace_buffer_alignment,
@@ -144,6 +147,35 @@ def _split_workspace_views(
     return partial_o, partial_lse, split_completion
 
 
+def _static_split_instance(num_split: int) -> str:
+    """Registry instance of the static split-KV programs: ``split1`` (one launch, FP8 only),
+    ``split2`` (straight-line two-way merge) or ``splitn`` (``NUM_SPLIT`` >= 3 on the compile line)."""
+
+    if num_split == 1:
+        return "split1"
+    return "split2" if num_split == 2 else "splitn"
+
+
+def _static_constants(
+    q_len: int,
+    cp_world: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_split: Optional[int] = None,
+) -> dict[str, int]:
+    """Compile-line constants of one static DCP program (``NUM_SPLIT`` only for the split-KV families)."""
+
+    constants = {
+        "Q_LEN": int(q_len),
+        "CP_WORLD": int(cp_world),
+        "NUM_Q_HEADS": int(num_q_heads),
+        "NUM_KV_HEADS": int(num_kv_heads),
+    }
+    if num_split is not None:
+        constants["NUM_SPLIT"] = int(num_split)
+    return constants
+
+
 def _select_num_split(
     *,
     logical_tiles: int,
@@ -257,15 +289,40 @@ DCP_BALANCED_BF16_LONG_TILE_BLOCKS = 16
 DCP_BALANCED_FP8_MIN_Q_LEN = 3
 DCP_BALANCED_FP8_MAX_Q_LEN = 8
 DCP_BALANCED_FP8_MIN_ITEMS = 160
-DCP_BALANCED_FP8_LONG_TILE_BLOCKS = 24
-# At exactly two static waves the balanced kernel's fixed cost is not yet
-# amortised on sm_100a (prod_b8_s4096_q4_cp4: 320 items, static 5-9 % faster
-# in nine B200 samples) while the same rows win on sm_103a.
-DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS = {"sm_100a": 384, "sm_103a": 160}
+# Round-5 programs, long-tile floor per architecture: the round-3 fit of 24
+# left the 17- and 22-block one-wave rows static.  The 22-block row
+# (b1/S32768 cp4) wins on both parts (1.15 GB300 / 1.11 B200 vs the static
+# route); the 17-block rows win on sm_103a (b1/S24576 cp4 1.055, cp1 b1/S8192
+# 1.053) and are a tie band on sm_100a (0.98 / 0.99), so sm_103a admits 17
+# blocks and sm_100a keeps that class static (floor 18, inside the unmeasured
+# window (17, 22]).  The scalar is the default for unmeasured targets.
+DCP_BALANCED_FP8_LONG_TILE_BLOCKS = 18
+DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH = {"sm_100a": 18, "sm_103a": 17}
+# Two-wave floor per architecture.  Round 3 fitted sm_100a to 384 items (the
+# 320-item two-wave row prod_b8_s4096_q4_cp4 ran static 5-9 % faster on B200);
+# the round-5 bodies win that row on both parts (1.29 GB300 / 1.17 B200), so
+# both floors sit at the family's items floor.  The per-architecture form is
+# kept: it is the manifest's and the Cake dispatcher's contract.
+DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS = {"sm_100a": 160, "sm_103a": 160}
 DCP_BALANCED_D256_MIN_Q_LEN = 1
 DCP_BALANCED_D256_MAX_Q_LEN = 8
 DCP_BALANCED_D256_MIN_ITEMS = 160
 DCP_BALANCED_D256_LONG_TILE_BLOCKS = 96
+# One-wave row-tile regime of the D256 family (round 5): the static D256 route
+# streams a request's KV once per speculative row (one Q16 tile per (request,
+# row)), the balanced row tile of up to four rows streams it once per tile, so
+# one static wave at q_len >= 3 re-reads every request's KV 2.5-4x and the
+# balanced program wins once the static tile streams 22 or more blocks per
+# CTA (round-5 band probe, static / forced balanced, GB300 | B200: q4 b12 at
+# 22 blocks 1.11 | 1.14, b16 1.22 | 1.28, b32 1.42 | 1.43; q3 b16 at 22
+# blocks 1.07 | 1.06; q5 / q8 1.45-1.79).  Below 22 blocks the plan + fold are
+# not amortised (q4 b8 at 16 blocks 1.00 | 1.04 tie band, b4 / b1 0.80 /
+# 0.90); q_len 1 reads KV once on both routes (0.89-0.97) and q_len 2 gains
+# at most 4-6 % (16 blocks: 0.91-0.94), both stay static.  Per-architecture
+# floor (the parts agree); the scalar is the default for unmeasured targets.
+DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN = 3
+DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS = 22
+DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH = {"sm_100a": 22, "sm_103a": 22}
 _DCP_BALANCED_Q_LEN_RANGE = {
     "bf16_p16": (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN),
     "fp8_p64": (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN),
@@ -355,6 +412,40 @@ def dcp_balanced_n_rows(kind: str, q_len: int) -> int:
     return 32 if rows_per_tile * _DCP_BALANCED_GROUP[kind] <= 32 else 64
 
 
+def dcp_balanced_program(
+    kind: str, *, batch_size: int, num_kv_heads: int, sm_count: int
+) -> Optional[int]:
+    """The traced program a balanced family's launch runs, or ``None`` for a one-program family.
+
+    The E4M3 head_dim-128 family ships its program with and without the
+    idle-CTA eight-slice fold of split tiles.  That fold needs chunk tickets
+    plus eight reduce tickets per split tile within the grid (one persistent
+    CTA per multiprocessor), and every (request, KV head) pair is at least one
+    chunk ticket, so a launch with ``batch_size * num_kv_heads >= sm_count``
+    can never take it and runs the program without that fold body (identical
+    plan and fold order).  Mirrors the manifest's ``program_variants`` rule from
+    host metadata only.
+    """
+
+    _check_dcp_balanced_kind(kind)
+    from .jit.cake_dcp import dcp_balanced_program_variants
+
+    variants = dcp_balanced_program_variants(_DCP_BALANCED_FAMILY[kind])
+    if variants is None:
+        return None
+    if variants.get("items_lower_bound") != "batch_size * num_kv_heads":
+        raise RuntimeError(
+            f"unsupported balanced DCP program rule for {kind}: "
+            f"{variants.get('items_lower_bound')!r}"
+        )
+    if int(sm_count) <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    if int(batch_size) <= 0 or int(num_kv_heads) <= 0:
+        raise ValueError("batch_size and num_kv_heads must be positive")
+    below_grid = int(batch_size) * int(num_kv_heads) < int(sm_count)
+    return int(variants["below_grid"] if below_grid else variants["at_or_above_grid"])
+
+
 def dcp_balanced_items_bound(
     *, batch_size: int, num_kv_heads: int, max_local_seq_len: int
 ) -> int:
@@ -439,13 +530,17 @@ def dcp_balanced_band(
 
     ``balanced`` requires the kernel's contract (head_dim and query heads per
     KV head of the family, its q_len range, at most ``DCP_BALANCED_MAX_REQUESTS``
-    requests) and one of the two measured regimes: the static route needs a
+    requests) and one of the measured regimes: the static route needs a
     second wave of tiles and the chunk-pair work bound reaches the items floor
     (times the row tiles per request on D256), or one static wave streams the
-    long-tile block count or more per CTA.  On the FP8 D128 family a row at
-    exactly two static waves must reach the ``arch``'s two-wave items floor.
-    ``arch`` is the compile target's architecture key (``sm_100a`` /
-    ``sm_103a``); other keys take the family's items floor.
+    long-tile block count or more per CTA (per ``arch`` on the FP8 D128
+    family), or (D256 only) one static wave whose speculative rows share a
+    balanced row tile (``q_len >= DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN``)
+    streams the ``arch``'s one-wave long-tile block count or more per CTA.  On
+    the FP8 D128 family a row at exactly two static waves must reach the
+    ``arch``'s two-wave items floor.  ``arch`` is the compile target's
+    architecture key (``sm_100a`` / ``sm_103a``); other keys take the scalar
+    defaults.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -483,9 +578,23 @@ def dcp_balanced_band(
         return decide("static", "q_len")
     if batch_size > DCP_BALANCED_MAX_REQUESTS:
         return decide("static", "batch")
-    if blocks_per_cta >= _DCP_BALANCED_LONG_TILE_BLOCKS[kind]:
+    long_tile_blocks = _DCP_BALANCED_LONG_TILE_BLOCKS[kind]
+    if kind == "fp8_p64":
+        long_tile_blocks = DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH.get(
+            arch, long_tile_blocks
+        )
+    if blocks_per_cta >= long_tile_blocks:
         return decide("balanced", "long_tile")
     if waves < 2:
+        if (
+            kind == "fp8_p64_d256"
+            and q_len >= DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN
+            and blocks_per_cta
+            >= DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH.get(
+                arch, DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS
+            )
+        ):
+            return decide("balanced", "one_wave_row_tiles")
         return decide("static", "one_wave")
     if items < _DCP_BALANCED_MIN_ITEMS[kind]:
         return decide("static", "items")
@@ -596,6 +705,9 @@ def _run_dcp_spec_balanced(
         _DCP_BALANCED_FAMILY[kind],
         target,
         dcp_balanced_n_rows(kind, q_len_per_req),
+        dcp_balanced_program(
+            kind, batch_size=batch_size, num_kv_heads=num_kv_heads, sm_count=sm_count
+        ),
     )
     if kind == "bf16_p16":
         if float(bmm2_scale) != 1.0:
@@ -648,7 +760,7 @@ def _is_cuda_version_at_least(version: str) -> bool:
     return is_cuda_version_at_least(version)
 
 
-def _select_target(device: torch.device) -> str:
+def _select_target(device: torch.device) -> DcpSpecTarget:
     capability = get_compute_capability(device)
     if capability not in ((10, 0), (10, 3), (10, 7)):
         raise RuntimeError(
@@ -665,7 +777,7 @@ def _select_target(device: torch.device) -> str:
             "DCP speculative FMHA on compute capability 10.0 requires CUDA "
             "12.8 or newer"
         )
-    target = "sm103a" if capability == (10, 3) else "sm100f"
+    target: DcpSpecTarget = "sm103a" if capability == (10, 3) else "sm100f"
     if _is_cuda_version_at_least("12.9"):
         return target
     raise RuntimeError(
@@ -943,10 +1055,7 @@ def run_dcp_spec_decode(
             # static specialization below serves the row exactly as before.
 
     if profile.startswith("fp8_p64"):
-        from .jit.cake_dcp import (
-            load_dcp_spec_fp8_d256_module,
-            load_dcp_spec_fp8_module,
-        )
+        from .jit.cake_dcp import load_dcp_spec_static_module
 
         local_blocks = max(1, (max_local_seq_len + _BLOCK_N - 1) // _BLOCK_N)
         num_split = _select_fp8_num_split(
@@ -958,28 +1067,25 @@ def run_dcp_spec_decode(
         )
         head_dim = query.shape[-1]
         if head_dim == _D256_HEAD_DIM:
-            module = load_dcp_spec_fp8_d256_module(
+            module = load_dcp_spec_static_module(
+                "fp8_d256",
+                "split1" if num_split == 1 else "splitn",
                 target,
-                batch_size,
-                q_len_per_req,
-                num_qo_heads,
-                num_kv_heads,
-                cp_world,
-                num_split,
+                _static_constants(
+                    q_len_per_req, cp_world, num_qo_heads, num_kv_heads, num_split
+                ),
             )
         else:
             retain_kv_l2 = int(
                 cp_world > 1 and local_blocks <= _FP8_RETAIN_KV_L2_MAX_BLOCKS
             )
-            module = load_dcp_spec_fp8_module(
+            module = load_dcp_spec_static_module(
+                "fp8_d128",
+                f"{_static_split_instance(num_split)}_retain{retain_kv_l2}",
                 target,
-                batch_size,
-                q_len_per_req,
-                num_qo_heads,
-                num_kv_heads,
-                cp_world,
-                num_split,
-                retain_kv_l2,
+                _static_constants(
+                    q_len_per_req, cp_world, num_qo_heads, num_kv_heads, num_split
+                ),
             )
         if num_split == 1:
             partial_o = out
@@ -1033,19 +1139,15 @@ def run_dcp_spec_decode(
         sm_count=sm_count,
         local_blocks=local_blocks,
     )
-    from .jit.cake_dcp import load_dcp_spec_module
+    from .jit.cake_dcp import load_dcp_spec_static_module
 
     if num_split == 1:
         retain_kv_l2 = int(local_blocks <= _RETAIN_KV_L2_MAX_BLOCKS)
-        module = load_dcp_spec_module(
-            "v1",
+        module = load_dcp_spec_static_module(
+            "bf16_v1",
+            f"retain{retain_kv_l2}",
             target,
-            batch_size,
-            q_len_per_req,
-            num_qo_heads,
-            num_kv_heads,
-            cp_world,
-            retain_kv_l2,
+            _static_constants(q_len_per_req, cp_world, num_qo_heads, num_kv_heads),
         )
         grid = min(sm_count, logical_tiles)
         module.run(
@@ -1081,15 +1183,13 @@ def run_dcp_spec_decode(
         num_split=num_split,
     )
 
-    module = load_dcp_spec_module(
-        "v4",
+    module = load_dcp_spec_static_module(
+        "bf16_v4",
+        _static_split_instance(num_split),
         target,
-        batch_size,
-        q_len_per_req,
-        num_qo_heads,
-        num_kv_heads,
-        cp_world,
-        num_split,
+        _static_constants(
+            q_len_per_req, cp_world, num_qo_heads, num_kv_heads, num_split
+        ),
     )
     grid = min(sm_count, logical_tiles * num_split)
     module.run(
@@ -1120,6 +1220,7 @@ __all__ = [
     "DcpBalancedBand",
     "dcp_balanced_band",
     "dcp_balanced_n_rows",
+    "dcp_balanced_program",
     "dcp_balanced_route",
     "dcp_static_shape",
     "get_dcp_spec_balanced_counter_bytes",

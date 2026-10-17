@@ -11,7 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared expert-route metadata kernels for Q0-to-route implementations."""
+"""Shared expert-route metadata kernels for Q0-to-route implementations.
+
+A negative expert id marks an unrouted (token, slot) pair: vLLM writes -1 into
+the CUDA-graph padding rows of ``topk_ids`` and leaves their weights as-is.
+These kernels give such pairs no routed row: they are left out of the expert
+counts and ``offsets``, write nothing to ``token_map``/``token_weights``, and get
+``dst_rows``/``scale_dst_rows`` = -1 so the Q0 scatter skips them.  The grouped
+GEMMs only touch rows inside ``offsets``, so an unrouted pair contributes
+nothing and a token whose slots are all unrouted finalizes to exact zeros.
+Ids >= num_experts remain a caller error.
+"""
 
 from __future__ import annotations
 
@@ -40,8 +50,8 @@ def count_routes_kernel(
 ):
     pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
     valid = pair_idx < total_pairs
-    expert = tl.load(topk_ids + pair_idx, mask=valid, other=0)
-    tl.atomic_add(counts + expert, 1, mask=valid, sem="relaxed")
+    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
+    tl.atomic_add(counts + expert, 1, mask=expert >= 0, sem="relaxed")
 
 
 @triton.jit
@@ -81,20 +91,24 @@ def route_assign_kernel(
     offs = tl.arange(0, block_n)
     pair_idx = pid * block_n + offs
     valid = pair_idx < total_pairs
-    expert = tl.load(topk_ids + pair_idx, mask=valid, other=0)
-    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=valid, sem="relaxed")
+    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
+    # Unrouted (negative id) pairs take no row; see the module docstring.
+    routed = expert >= 0
+    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=routed, sem="relaxed")
     token_idx = pair_idx // top_k
-    expert_begin = tl.load(offsets + expert, mask=valid, other=0)
+    expert_begin = tl.load(offsets + expert, mask=routed, other=0)
     scale_begin = (expert_begin + expert * (scale_align - 1)) & -scale_align
-    tl.store(token_map + routed_row, token_idx, mask=valid)
+    tl.store(token_map + routed_row, token_idx, mask=routed)
     tl.store(
         token_weights + routed_row,
-        tl.load(topk_weights + pair_idx, mask=valid, other=0.0),
-        mask=valid,
+        tl.load(topk_weights + pair_idx, mask=routed, other=0.0),
+        mask=routed,
     )
-    tl.store(dst_rows + pair_idx, routed_row, mask=valid)
+    tl.store(dst_rows + pair_idx, tl.where(routed, routed_row, -1), mask=valid)
     tl.store(
-        scale_dst_rows + pair_idx, scale_begin + routed_row - expert_begin, mask=valid
+        scale_dst_rows + pair_idx,
+        tl.where(routed, scale_begin + routed_row - expert_begin, -1),
+        mask=valid,
     )
 
 
@@ -120,31 +134,38 @@ def route_assign_decode_kernel(
 ):
     pid = tl.program_id(0)
     offs = tl.arange(0, block_n)
-    valid = offs < total_pairs
-    experts = tl.load(topk_ids + offs, mask=valid, other=num_experts)
+    # Unrouted (negative id) pairs take no row; see the module docstring.
+    experts = tl.load(topk_ids + offs, mask=offs < total_pairs, other=-1)
+    routed = experts >= 0
     flat = pid * block_n + offs
     k_block = flat // padded_rows
     scale_row = flat - k_block * padded_rows
     tl.store(
         scale_out + k_block * s_som + scale_row * s_sok, 0, mask=flat < total_scale
     )
-    expert_prefix = tl.sum(tl.where(valid & (experts < pid), 1, 0), 0)
+    expert_prefix = tl.sum(tl.where(routed & (experts < pid), 1, 0), 0)
     tl.store(offsets + pid, expert_prefix, mask=pid < num_experts)
-    tl.store(offsets + num_experts, total_pairs, mask=pid == 0)
-    pair_expert = tl.load(topk_ids + pid, mask=pid < total_pairs, other=0)
-    expert_begin = tl.sum(tl.where(valid & (experts < pair_expert), 1, 0), 0)
-    rank = tl.sum(tl.where(valid & (experts == pair_expert) & (offs < pid), 1, 0), 0)
+    tl.store(offsets + num_experts, tl.sum(tl.where(routed, 1, 0), 0), mask=pid == 0)
+    is_pair = pid < total_pairs
+    pair_expert = tl.load(topk_ids + pid, mask=is_pair, other=-1)
+    pair_routed = pair_expert >= 0
+    expert_begin = tl.sum(tl.where(routed & (experts < pair_expert), 1, 0), 0)
+    rank = tl.sum(tl.where(routed & (experts == pair_expert) & (offs < pid), 1, 0), 0)
     routed_row = expert_begin + rank
     scale_begin = (expert_begin + pair_expert * (scale_align - 1)) & -scale_align
     token_idx = pid // top_k
-    tl.store(token_map + routed_row, token_idx, mask=pid < total_pairs)
+    tl.store(token_map + routed_row, token_idx, mask=pair_routed)
     tl.store(
         token_weights + routed_row,
-        tl.load(topk_weights + pid, mask=pid < total_pairs, other=0.0),
-        mask=pid < total_pairs,
+        tl.load(topk_weights + pid, mask=pair_routed, other=0.0),
+        mask=pair_routed,
     )
-    tl.store(dst_rows + pid, routed_row, mask=pid < total_pairs)
-    tl.store(scale_dst_rows + pid, scale_begin + rank, mask=pid < total_pairs)
+    tl.store(dst_rows + pid, tl.where(pair_routed, routed_row, -1), mask=is_pair)
+    tl.store(
+        scale_dst_rows + pid,
+        tl.where(pair_routed, scale_begin + rank, -1),
+        mask=is_pair,
+    )
 
 
 @triton.jit

@@ -240,7 +240,44 @@ device-side aborts):
 Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
 process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
-`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).  The BF16 pull-style
+twin (`sm90_bf16_bf16_bf16_pull_cutedsl`) shares both targets, and its token
+sweep has its own bench script,
+`benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py`
+(same CLI minus the FP8-only axes; see that tree's `TUNING.md`).
+
+The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
+Cake-generated parametric persistent kernel per deployment, JIT-compiled from
+`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
+for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
+multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. Sixteen ranks over two hosts run
+the same modules under a two-node torchrun (`--nnodes 2 --nproc_per_node 8`,
+`NCCL_GIN_ENABLE=1`); cross-host pairs use GIN, the transport table may keep LSA
+inside each host. Each EP-rank pair moves dispatch payloads and expert results over
+GIN (default `transport_table="all_gin"`) or LSA (load/store over NVLink / PCIe peer
+mappings; the copier instances reserve one copier CTA per LSA destination of a rank).
+To pick the table per deployment offline, run
+`torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8
+--hidden H --intermediate I --num-experts E --topk K --max-tokens <capacities>
+[--shared-expert]` once and configure `transport_table="tuned"`: the workspace looks
+the winner up in `FLASHINFER_MOE_EP_KNOB_CACHE` (keyed by GPU, geometry, variant,
+capacity and the gathered peer topology; all-GIN on a miss). Latency:
+`benchmarks/moe_ep/backends/mega/kernel/sm120/bench_moe_ep_sm120_w4a8_cake_mega.py`.
+Serving frameworks that know the largest per-rank token count of a call should pass it
+as the invocation's token bucket (`layer.stage_inputs(t, compile_tokens_per_rank=bucket)`
+then `layer.compute_staged(output=...)`, the same value on every rank): the call then skips
+the backend's per-call `[rows, expert histogram]` all-gather and its host read-back, and it
+can be captured into a CUDA graph -- one graph per bucket, after one eager call of the layer on
+that workspace; every rank replays the same bucket sequence in the same order (see "CUDA
+graphs" in the kernel package README).
+A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
+makes the call fail on every rank with `CUDA error: unspecified launch failure`
+(device `trap`) instead of hanging; restart the processes (see the wait-deadline
+paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
+this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
+the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
 
 The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
 payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
@@ -265,7 +302,30 @@ tail (bit-identical output) for A/B checks, and peers may mix the two. Small
 dedup rounds (`T <= 128`, `T * top_k <= 1024`) dispatch through one cooperative
 kernel (count + reserve + store_publish); `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
 selects the vendored dispatch kernels, which larger rounds and non-dedup pipes
-always use. The wire format is the vendored one in every combination.
+always use. The dispatch wire format is the vendored one in every combination.
+
+The combine wire (expert rank -> token owner) is selected by
+`combine_wire` on the config (`None` reads
+`FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE`, default `prereduced`) and must be
+the same on every EP rank (checked with an allgather at init; a mixed pipe
+raises on every rank). `prereduced`: the expert rank pre-reduces all routes
+of a token that landed on it in fp32 (`fmaf` in ascending route order), rounds
+once to bf16 and sends ONE row per (token, source rank) into the owner's
+top-k inbox (slot = the group's smallest route index); the owner sums the
+<= ep_size rows in ascending source-rank order in fp32 and rounds once.
+`prereduced_hilo`: as `prereduced`, but a source rank holding >= 2 routes of a
+token sends its fp32 partial as two bf16 rows (hi, and the residual `p - hi`
+in the slot of its second-smallest route index) so no group partial is rounded
+to bf16; single-route groups are `bf16(w * y)` exactly as the per-route wire.
+`per_route`: one `bf16(fp32(y_k) * w_k)` row per route, summed over k by the
+owner (the original wire, kept for A/B comparison; the only wire that also
+runs the vendored three-kernel tail). Both wires are deterministic (fixed
+reduction order, no floating-point atomics; repeated calls and CUDA-graph
+replay are bitwise identical) but not bitwise identical to each other: the
+pre-reduced wire rounds each element twice instead of top_k + 1 times. The
+section tests run every routing pattern under both wires, including the
+pre-reduce-specific cases (all K routes of a token on one remote rank, all on
+the local rank) and the wire-mismatch rejection.
 
 ### SM107 (Rubin) mega tests
 
@@ -552,6 +612,63 @@ prefill chunks), per-role offline knob caches.
 
 ---
 
+## Blackwell GenPhase decoding (explicit opt-in)
+
+The existing SM100 MXFP8 config can select the independently owned GenPhase
+pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
+the legacy weight layout, workspace pool keys, knob cache and autotuner.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+backend = MegaConfig(
+    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=6,
+        gate_up_clamp=10.0,
+        kernel_variant="genphase",
+        mma_tiler_mnk=(256, 64, 128),
+        cluster_shape_mn=(2, 1),
+    ),
+    quantize_input=True,
+    preprocess_weights=True,
+)
+layer = MoEEpLayer(bootstrap, fleet_params, weights, backend=backend)
+layer.warmup(tensors)  # collective on every EP rank, before CUDA graph capture
+output = layer.forward(tensors)
+```
+
+GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
+capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
+intermediate size must be a multiple of 64. Leaving both geometry fields unset
+selects N128/CGA4; N64 supports CGA2 or CGA4. Pipeline selection happens at
+construction and does not change with the live token count. GenPhase rejects
+legacy `knobs` (including online `"auto"`) and in-kernel FC2 reduction.
+
+`quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
+`False` accepts E4M3 activations and per-32 typed E8M0 scales in
+`MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with
+`-1` for masked slots, unique valid IDs per token and finite valid scores.
+As on the legacy SM100 path, callers provide valid routing; the backend checks
+metadata without scanning routing values on every forward.
+
+With `preprocess_weights=True`, canonical BF16 weights or canonical
+prequantized E4M3 weights plus E8M0 scales are converted to GenPhase's
+16-row gate/up stripes and physical K-major layout. Weight scales may use
+typed `torch.float8_e8m0fnu` or raw `torch.uint8` storage. The exported
+`preprocess_mxfp8_cutedsl_mega_weights(..., kernel_variant="genphase")` helper produces
+the same payload for `preprocess_weights=False` callers. Legacy transformed
+weights cannot be reused. GenPhase workspace pooling is isolated by pipeline
+and resolved configuration. Rubin source and frontend are independent.
+
+Native layer coverage is in the existing
+`test_moe_ep_mxfp8_cutedsl_mega_multirank.py::test_blackwell_genphase_layer_graph_and_weight_formats`
+test, runnable with `torchrun --nproc_per_node=<1|2|4> -m pytest`.
+
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
@@ -560,7 +677,7 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
 - `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo)
+  and BF16 (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer

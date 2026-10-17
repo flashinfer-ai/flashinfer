@@ -8,6 +8,10 @@ command on the baseline and candidate checkouts in separate processes:
     python benchmarks/bench_cudnn_wrapper_host.py --kind decode --batch 64 --kv 1024 --output decode.json
     python benchmarks/bench_cudnn_wrapper_host.py --kind ragged --batch 16 --q 512 --kv 512 --output ragged.json
 
+For ragged planning, compare --replan --ragged-indptr gpu against
+--replan --ragged-indptr gpu_with_cpu_mirrors with otherwise identical arguments.
+Both bind the same kind of GPU prefixes; only the host readback differs.
+
 Each result includes sampled independent math checks and one-ULP CUDA
 graph replay after poisoning the output. Host enqueue excludes synchronization,
 first-call compilation and output allocation; these are component measurements.
@@ -61,11 +65,19 @@ def main():
     p.add_argument("--backends", nargs="+", default=["cudnn"])
     p.add_argument("--output", required=True)
     p.add_argument(
+        "--ragged-indptr",
+        choices=["cpu", "gpu", "gpu_with_cpu_mirrors"],
+        default="cpu",
+        help="compare GPU prefix readback with optional existing CPU mirrors",
+    )
+    p.add_argument(
         "--replan",
         action="store_true",
         help="also measure run after each plan and complete plan+run",
     )
     a = p.parse_args()
+    if a.kind != "ragged" and a.ragged_indptr != "cpu":
+        p.error("--ragged-indptr applies only to --kind ragged")
     torch.manual_seed(42)
     b, sq, sk, h, hk, d, page = a.batch, a.q, a.kv, 32, 8, 128, 16
     pages = (sk + page - 1) // page
@@ -84,6 +96,13 @@ def main():
     indices = tables.flatten()
     last = torch.full((b,), sk - (pages - 1) * page, dtype=torch.int32)
     qo = torch.arange(b + 1, dtype=torch.int32) * sq
+    kv = torch.arange(b + 1, dtype=torch.int32) * sk
+    qo_plan, kv_plan = (qo, kv) if a.ragged_indptr == "cpu" else (qo.cuda(), kv.cuda())
+    host_indptr = (
+        dict(qo_indptr_cpu=qo, kv_indptr_cpu=kv)
+        if a.ragged_indptr == "gpu_with_cpu_mirrors"
+        else {}
+    )
     if a.kind == "ragged":
         k_ragged = (
             cache_nhd[tables.long(), 0]
@@ -155,14 +174,15 @@ def main():
                     ws, "NHD", backend=backend
                 )
                 plan = lambda: w.plan(
-                    qo,
-                    torch.arange(b + 1, dtype=torch.int32) * sk,
+                    qo_plan,
+                    kv_plan,
                     h,
                     hk,
                     d,
                     causal=True,
                     q_data_type=q.dtype,
                     kv_data_type=q.dtype,
+                    **host_indptr,
                 )
             plan()
             row["plan_cpu_us"] = (time.perf_counter_ns() - t0) / 1e3
@@ -204,9 +224,12 @@ def main():
             row["host_enqueue_us"] = statistics.median(host)
             row["host_enqueue_samples_us"] = host
             if a.replan:
-                after_plan, complete = [], []
+                after_plan, complete, plans = [], [], []
                 for _ in range(100):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter_ns()
                     plan()
+                    plans.append((time.perf_counter_ns() - t0) / 1e3)
                     torch.cuda.synchronize()
                     t0 = time.perf_counter_ns()
                     run()
@@ -217,6 +240,8 @@ def main():
                     run()
                     complete.append((time.perf_counter_ns() - t0) / 1e3)
                 torch.cuda.synchronize()
+                row["plan_host_us"] = statistics.median(plans)
+                row["plan_host_samples_us"] = plans
                 row["run_after_plan_us"] = statistics.median(after_plan)
                 row["plan_run_host_us"] = statistics.median(complete)
                 row["run_after_plan_samples_us"] = after_plan

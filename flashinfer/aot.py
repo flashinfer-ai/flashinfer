@@ -101,6 +101,7 @@ from .jit.cake_kda_packed_t1 import (
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
@@ -183,10 +184,16 @@ from .jit.mla import (
 from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
     gen_cake_sparse_mla_sm120_dsv4_nvfp4_module,
 )
+from .jit.cake_dsv4_nvfp4_rope_insert import (
+    cake_dsv4_nvfp4_rope_insert_available,
+    gen_cake_dsv4_nvfp4_rope_insert_module,
+)
 from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_available,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
+from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
+from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -208,6 +215,10 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
+from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+    cake_sm120_megamoe_available,
+    gen_cake_sm120_megamoe_aot_modules,
+)
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -673,6 +684,18 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
+    # Fused MLA context K/V pack (attention side, not MoE), two backends behind
+    # concat_mla_kv_quant_fp8: the Cake programs, one build per (exact target,
+    # head group) ...
+    if has_sm100a_exact:
+        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
+    # ... and the specialized kernel (auto's pick for 12 local heads), one
+    # module, pre-built for the same exact Blackwell targets as the Cake
+    # programs (other targets JIT it on first use).
+    if has_sm100a_exact or has_sm103a_exact:
+        jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -746,10 +769,10 @@ def gen_all_modules(
                 )
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
-    # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
+    # SM100a module for every frozen body. CUDA 12.9+ builds the 21-body
     # family portfolio once for both CC 10.0 and CC 10.3. GB300 additionally
-    # retains only the two exact-SM103a direct-T1 modules whose family-target
-    # latency regressed in the measured A/B.
+    # retains exact-SM103a modules for the two precomputed direct-T1 variants
+    # and four Kimi-Linear direct-T1 variants.
     if has_flash_kda_decode_sm100a_legacy:
         jit_specs.extend(
             gen_flash_kda_decode_module(variant, "sm100a")
@@ -828,6 +851,7 @@ def gen_all_modules(
             ("sm90a", "sm90a_exact"),
             ("sm100a", "sm100a_exact"),
             ("sm103a", "sm103a_exact"),
+            ("sm107a", "sm107a_exact"),
         ):
             if sm_capabilities.get(cake_bgmv_flag, False):
                 jit_specs.extend(
@@ -844,6 +868,22 @@ def gen_all_modules(
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
+        # For cuDNN grouped_mm unified MoE API
+        if any(
+            (
+                has_sm80,
+                has_sm90,
+                has_sm100,
+                has_sm100f,
+                has_sm103,
+                has_sm107,
+                has_sm110,
+                has_sm120,
+                has_sm120f,
+                has_sm121,
+            )
+        ):
+            jit_specs.append(gen_moe_utils_module())
         if has_cake_megamoe_topk_reduce_sm100a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
@@ -896,7 +936,6 @@ def gen_all_modules(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
-            jit_specs.append(gen_moe_utils_module())
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:
@@ -915,6 +954,9 @@ def gen_all_modules(
         if sm_capabilities.get("sm103a_exact", False):
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
         if has_sm107:
+            jit_specs.extend(
+                gen_cudnn_frost_moe_module(dtype) for dtype in FROST_DTYPES
+            )
             jit_specs.append(gen_fp4_quantization_sm107_module())
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
@@ -925,7 +967,15 @@ def gen_all_modules(
             if not has_sm100:
                 jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         if has_sm120:
+            jit_specs.extend(
+                gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
+            )
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
+            # the binding and the default DeepSeek-V4-Flash device instances.  Both need
+            # the NCCL 2.30.7 Device API (headers + library) at build time.
+            if cake_sm120_megamoe_available():
+                jit_specs.extend(gen_cake_sm120_megamoe_aot_modules())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:
@@ -947,6 +997,7 @@ def gen_all_modules(
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
+            gen_moe_ep_nvlink_one_sided_module,
             gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
@@ -988,6 +1039,10 @@ def gen_all_modules(
             jit_specs.append(gen_moe_alltoall_module("sm100a"))
         if has_sm103a_exact:
             jit_specs.append(gen_moe_alltoall_module("sm103a"))
+        # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
+        # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
+        if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:
+            jit_specs.append(gen_moe_ep_nvlink_one_sided_module())
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is
@@ -1155,6 +1210,10 @@ def gen_all_modules(
         jit_specs.append(gen_sparse_mla_sm120_module())
         # Cake DSv4 NVFP4 sparse-MLA decode + prefill (backend="cake" on SM120/SM121).
         jit_specs.append(gen_cake_sparse_mla_sm120_dsv4_nvfp4_module())
+        # Cake DSv4 NVFP4 cache writers (fused GPT-J RoPE + quantize + paged insert
+        # for the backend="cake" / kv_cache_format="nvfp4" route); present once exported.
+        if cake_dsv4_nvfp4_rope_insert_available():
+            jit_specs.append(gen_cake_dsv4_nvfp4_rope_insert_module())
         # Cake DSv4.1 mixed-cache sparse-MLA decode (backend="cake",
         # kv_cache_format="fp8_dsv41_fp4_ca"); present once the family is exported.
         if cake_sparse_mla_sm120_dsv41_mixed_available():
@@ -1351,6 +1410,7 @@ def detect_sm_capabilities():
         (10, "0f"),
         (10, "3a"),
         (10, "3f"),
+        (10, "7a"),
     }
     flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
@@ -1439,6 +1499,8 @@ def detect_sm_capabilities():
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.9"),
+        "sm107a_exact": (10, "7a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("13.0"),
         "sm107": has_sm("compute_107", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),

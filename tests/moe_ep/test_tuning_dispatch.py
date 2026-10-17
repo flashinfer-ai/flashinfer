@@ -69,18 +69,51 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
         ["--arch", "sm107", "--dtype", "sm90_fp8_e4m3"],
         ["--arch", "sm100", "--dtype", "sm90_fp8_e5m2"],
         ["--arch", "sm90", "--dtype", "nvfp4"],
-        ["--arch", "sm107", "--combine-dtype", "nvfp4"],
-        ["--arch", "sm107", "--combine-dtype", "mxfp8"],
+        ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "nvfp4"],
+        ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "mxfp8"],
         ["--arch", "sm100", "--activation", "situ"],
         ["--arch", "sm100", "--situ-beta", "1.0"],
         ["--arch", "sm100", "--fc1-alpha", "0.5"],
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
+        ["--arch", "sm107", "--no-do-finalize"],
+        ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
+        ["--arch", "sm107", "--no-apply-topk-in-fc1"],
+        ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
+        ["--arch", "sm100", "--no-apply-topk-in-fc1", "--allow-nondeterministic"],
+        ["--arch", "sm100", "--no-do-finalize", "--combine-dtype", "nvfp4"],
     ],
 )
 def test_unsupported_tuner_options_fail_before_import(options, dispatched, capsys):
     assert tune.main([*_GEOMETRY, *options]) == 2
     assert dispatched == []
     assert capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "options,do_finalize",
+    [([], True), (["--do-finalize"], True), (["--no-do-finalize"], False)],
+)
+def test_finalization_and_routing_options_reach_nvfp4_tuner(
+    monkeypatch, options, do_finalize
+):
+    received = []
+    monkeypatch.setattr(
+        tune.importlib,
+        "import_module",
+        lambda *args: SimpleNamespace(run_tuning=lambda args: received.append(args)),
+    )
+    tune.main(
+        [
+            *_GEOMETRY,
+            "--arch",
+            "sm100",
+            *options,
+            "--no-apply-topk-in-fc1",
+        ]
+    )
+    (args,) = received
+    assert args.do_finalize == do_finalize
+    assert not args.apply_topk_in_fc1
 
 
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
@@ -142,3 +175,50 @@ def test_invalid_tuning_scalar_identifies_argument(field):
 def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
     assert tune.main([*_GEOMETRY, "--arch", arch, "--dtype", "mxfp4_mxfp8"]) == 2
     assert capsys.readouterr().err
+
+
+def test_genphase_reaches_sm107_tuner(dispatched):
+    assert (
+        tune.main([*_GEOMETRY, "--arch", "sm107", "--kernel-variant", "genphase"]) == 17
+    )
+    assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("arch", ["sm90", "sm100"])
+def test_genphase_rejects_other_architectures(arch, dispatched):
+    dtype = "sm90_fp8_e4m3" if arch == "sm90" else "nvfp4"
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                arch,
+                "--dtype",
+                dtype,
+                "--kernel-variant",
+                "genphase",
+            ]
+        )
+        == 2
+    )
+    assert not dispatched
+
+
+@pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("combine_dtype", ["nvfp4", "mxfp8"])
+def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched):
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm107",
+                "--dtype",
+                dtype,
+                "--combine-dtype",
+                combine_dtype,
+            ]
+        )
+        == 17
+    )
+    assert len(dispatched) == 1

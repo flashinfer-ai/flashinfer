@@ -14,44 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import contextlib
-import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.dsa_sparse_attention import (
-    dsa_sparse_attention,
-    dsa_sparse_attention_varlen,
-)
-from flashinfer.experimental.cake_dsa_train import cake_backend, cake_jit, cake_launch
-from flashinfer.experimental.cake_dsa_train.cake_backend import (
-    D_LATENT,
-    D_QK,
-    D_ROPE,
-    DQ_PARTIAL_BYTES_PER_TOKEN,
-    KEY_PASS_STAGES,
-    NUM_HEADS,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    WORKSPACE_ALIGN,
-    KeyPassPolicy,
-    backward_binding_key,
-    default_softmax_scale,
-    forward_binding_key,
-    dsa_train_workspace_size,
-    generated_program_available,
-    key_pass_dq_mode,
-    key_pass_ranges,
-    offset_gather_kv_indices,
-    derive_topk_length,
-    plan_key_passes,
-    prepare_dsa_train,
-    record_for,
-    validate_dsa_train_inputs,
-    workspace_layout,
-)
 from tests.test_helpers.cake_dsa_train_reference import (
     calibrate_beta,
     globalize_gather_indices_loop,
@@ -60,6 +28,39 @@ from tests.test_helpers.cake_dsa_train_reference import (
     rel_l2,
     rel_l2_rows,
 )
+from tests.test_helpers.cake_package import cake_package
+
+# The backend suite names its package once, through the shared alias helper, and imports nothing else from
+# flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the
+# ``PACKAGES`` entry at its own package.  The flashinfer public entry points and the environment variables the
+# flashinfer wrapper resolves into the package's keyword switches are covered by ``test_cake_dsa_train_api.py``.
+cake_backend = cake_package("cake_dsa_train", "cake_backend")
+cake_build = cake_package("cake_dsa_train", "cake_build")
+cake_jit = cake_package("cake_dsa_train", "cake_jit")
+cake_launch = cake_package("cake_dsa_train", "cake_launch")
+D_LATENT = cake_backend.D_LATENT
+D_QK = cake_backend.D_QK
+D_ROPE = cake_backend.D_ROPE
+DQ_PARTIAL_BYTES_PER_TOKEN = cake_backend.DQ_PARTIAL_BYTES_PER_TOKEN
+KEY_PASS_STAGES = cake_backend.KEY_PASS_STAGES
+NUM_HEADS = cake_backend.NUM_HEADS
+SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
+WORKSPACE_ALIGN = cake_backend.WORKSPACE_ALIGN
+KeyPassPolicy = cake_backend.KeyPassPolicy
+backward_binding_key = cake_backend.backward_binding_key
+default_softmax_scale = cake_backend.default_softmax_scale
+forward_binding_key = cake_backend.forward_binding_key
+dsa_train_workspace_size = cake_backend.dsa_train_workspace_size
+generated_program_available = cake_backend.generated_program_available
+key_pass_dq_mode = cake_backend.key_pass_dq_mode
+key_pass_ranges = cake_backend.key_pass_ranges
+offset_gather_kv_indices = cake_backend.offset_gather_kv_indices
+derive_topk_length = cake_backend.derive_topk_length
+plan_key_passes = cake_backend.plan_key_passes
+prepare_dsa_train = cake_backend.prepare_dsa_train
+record_for = cake_backend.record_for
+validate_dsa_train_inputs = cake_backend.validate_dsa_train_inputs
+workspace_layout = cake_backend.workspace_layout
 
 # Accuracy gates (relative L2 vs the chunked FP64 reference of the same BF16
 # inputs): the reference FA sparse-MLA numbers times 1.05.
@@ -97,24 +98,9 @@ def _require_program(*, backward: bool = False):
         )
 
 
-@contextlib.contextmanager
-def _quiet_experimental():
-    # The experimental banner fires once per process; the API's opt-in is
-    # exercised by test_public_api_is_marked_experimental.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        yield
-
-
 # ---------------------------------------------------------------------------
 # Host layer (CPU)
 # ---------------------------------------------------------------------------
-
-
-def test_public_api_is_marked_experimental():
-    assert dsa_sparse_attention.is_experimental is True
-    assert dsa_sparse_attention_varlen.is_experimental is True
-    assert "SM100" in dsa_sparse_attention.__doc__
 
 
 @pytest.mark.parametrize("backward", [False, True])
@@ -191,6 +177,138 @@ _DIRECT_STAGES = (
     "bwd_cast",
 )
 _DIRECT_POLICY = dict(min_keys_per_query=4)
+
+# The per-target rules of the registered programs (second optimisation round, lever H3): the record's
+# ``key_pass_policy`` carries them under ``rules``; a record without them (first release) is the R1 rule
+# = _RULES["sm_100a"] on every architecture.
+_RULES = {
+    "sm_100a": dict(tail_rows=0, fixed_passes=0, min_kv=0, tail_min_kv=0, tail_cap=0),
+    "sm_103a": dict(
+        tail_rows=1, fixed_passes=0, min_kv=0, tail_min_kv=131072, tail_cap=3
+    ),
+    "sm_107a": dict(
+        tail_rows=1, fixed_passes=2, min_kv=131072, tail_min_kv=131072, tail_cap=0
+    ),
+}
+
+
+def _rule_passes(
+    record: dict, num_queries: int, num_kv: int, topk: int = 2048, arch=None
+) -> int:
+    """The pass count the record's rule for ``arch`` gives a one-segment row (the test's own evaluation)."""
+    policy = KeyPassPolicy.from_record(record)
+    rule = policy.rule_for(arch)
+    formula = policy.formula_passes(num_kv)
+    if formula == 1:
+        return 1
+    one_chunk = num_queries <= policy.token_chunk(topk)
+    tail = bool(rule["tail_rows"]) and 2 * num_queries <= num_kv
+    if not (one_chunk or tail):
+        return 1
+    if num_kv < (rule["min_kv"] if one_chunk else rule["tail_min_kv"]):
+        return 1
+    passes = rule["fixed_passes"] or formula
+    if tail and not one_chunk and rule["tail_cap"]:
+        passes = min(passes, rule["tail_cap"])
+    return passes if passes <= policy.max_passes else 1
+
+
+def test_key_pass_policy_per_target_rules():
+    record = {"key_pass_policy": dict(_POLICY, rules=_RULES)}
+    policy = KeyPassPolicy.from_record(record)
+    # a first-release record (no rules) and an unknown architecture take the R1 rule
+    legacy = KeyPassPolicy.from_record({"key_pass_policy": dict(_POLICY)})
+    assert legacy.rule_for("sm_103a") == _RULES["sm_100a"]
+    assert policy.rule_for(None) == _RULES["sm_100a"]
+    assert policy.rule_for("sm_90a") == _RULES["sm_100a"]
+    assert policy.rule_for("sm_107a") == _RULES["sm_107a"]
+    # the rule fields are non-negative integers, exactly the five
+    for name in ("tail_cap", "tail_min_kv"):
+        for bad in (-1, True, 1.5):
+            rules = dict(_RULES, sm_103a=dict(_RULES["sm_103a"], **{name: bad}))
+            with pytest.raises(ValueError, match=name):
+                KeyPassPolicy.from_record(
+                    {"key_pass_policy": dict(_POLICY, rules=rules)}
+                )
+    with pytest.raises(ValueError, match="rules"):
+        KeyPassPolicy.from_record(
+            {
+                "key_pass_policy": dict(
+                    _POLICY, rules=dict(_RULES, sm_100a={"tail_rows": 0})
+                )
+            }
+        )
+    rows = {
+        # (T, S): (sm_100a, sm_103a, sm_107a)
+        (4096, 65536): (
+            2,
+            2,
+            1,
+        ),  # cptail_4k_65536: R200 runs 65-68k-key rows single-pass
+        (2123, 67923): (2, 2, 1),  # tail_2123x67923
+        (4096, 131072): (3, 3, 2),  # cptail_4k_131072: fixed two passes on R200
+        (4224, 131072): (3, 3, 2),
+        (4225, 131072): (
+            1,
+            3,
+            2,
+        ),  # more than one chunk: a 2 T <= S row on sm_103a / sm_107a
+        (32768, 65536): (
+            1,
+            1,
+            1,
+        ),  # spread_32k_65536: a 65536-key tail row stays single-pass everywhere
+        (4225, 65536): (1, 1, 1),  # more than one chunk below the tail floors
+        (32768, 131072): (1, 3, 2),  # spread_32k_131072
+        (32768, 196608): (1, 3, 2),  # formula 5, capped at 3 on sm_103a
+        (32768, 262144): (1, 3, 2),  # packed_N1
+        (65536, 131072): (1, 3, 2),  # exactly 2 T == S
+        (65537, 131072): (1, 1, 1),  # 2 T > S and more than one chunk
+        (131072, 131072): (1, 1, 1),  # a causal single document never qualifies
+        (4096, 4096): (1, 1, 1),
+        (4096, 45511): (1, 1, 1),
+        (4096, 45512): (2, 2, 1),
+        (4096, 180224): (4, 4, 2),  # the largest capped count
+        # formula 5: above max_passes on the formula targets (one pass); sm_107a's two passes are under it
+        (4096, 225280): (1, 1, 2),
+        (4096, 268757): (1, 1, 2),
+    }
+    for (T, S), want in rows.items():
+        got = tuple(policy.passes(T, S, 2048, arch=a) for a in _RULES)
+        assert got == want, (T, S, got, want)
+        assert tuple(_rule_passes(record, T, S, arch=a) for a in _RULES) == want
+        assert (
+            tuple(
+                plan_key_passes(record, _ALL_STAGES, T, S, 2048, arch=a) for a in _RULES
+            )
+            == want
+        )
+    # a multi-segment row plans one pass under every rule
+    for a in _RULES:
+        assert policy.passes(4096, 131072, 2048, num_segments=2, arch=a) == 1
+    # token chunks of a multi-pass backward (the Cake launcher's loop)
+    assert policy.token_chunks(4096, 2048) == ((0, 4096),)
+    assert policy.token_chunks(4224, 2048) == ((0, 4224),)
+    assert policy.token_chunks(8448, 2048) == ((0, 4224), (4224, 4224))
+    assert policy.token_chunks(32768, 2048) == tuple(
+        (b, min(4224, 32768 - b)) for b in range(0, 32768, 4224)
+    )
+    assert policy.token_chunks(32768, 2048)[-1] == (29568, 3200)
+
+
+def test_workspace_layout_token_chunk():
+    T, S, topk = 8448, 131072, 2048
+    whole = workspace_layout(T, S, topk, key_passes=3)
+    chunked = workspace_layout(T, S, topk, key_passes=3, token_chunk=4224)
+    assert whole["dq_partial"][1] == T * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert chunked["dq_partial"][1] == 4224 * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert chunked["key_scratch"][1] == 4224 * topk * 4
+    assert chunked["pass_counts"][1] == 4224 * 4
+    # a chunk larger than the row changes nothing
+    assert workspace_layout(T, S, topk, key_passes=3, token_chunk=10000) == whole
+    assert workspace_layout(
+        T, S, topk, key_passes=1, token_chunk=128
+    ) == workspace_layout(T, S, topk, key_passes=1)
 
 
 def test_key_pass_policy_rule():
@@ -271,42 +389,35 @@ def test_plan_key_passes_override_and_policy():
         plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048, key_passes=2)
 
 
-def test_plan_dkv_direct_rule_and_env(monkeypatch):
-    """Direct accumulation needs dkv_acc, the natural stages and the record's size rule (or the forced mode)."""
+def test_plan_dkv_direct_rule_and_env():
+    """Direct accumulation needs dkv_acc, the natural stages and the record's size rule -- or the ``dkv_direct``
+    keyword (``True`` / ``False``) that overrides the rule; ``None`` (the default) is the rule and any other value
+    is rejected."""
     record = {"dkv_direct": dict(_DIRECT_POLICY), "key_pass_policy": dict(_POLICY)}
-    monkeypatch.delenv(cake_backend.DKV_DIRECT_ENV, raising=False)
+    plan = cake_backend.plan_dkv_direct
     assert cake_backend.record_direct_stages(record, _DIRECT_STAGES)
     assert not cake_backend.record_direct_stages(record, _ALL_STAGES)
-    assert cake_backend.plan_dkv_direct(
-        record, _DIRECT_STAGES, 1000, 4000, accumulate=True
+    assert plan(record, _DIRECT_STAGES, 1000, 4000, accumulate=True)
+    assert not plan(record, _DIRECT_STAGES, 1000, 3999, accumulate=True)
+    assert not plan(record, _DIRECT_STAGES, 1000, 4000, accumulate=False)
+    assert not plan(record, _ALL_STAGES, 1000, 4000, accumulate=True)
+    # dkv_direct=None is the rule
+    assert plan(record, _DIRECT_STAGES, 1000, 4000, accumulate=True, dkv_direct=None)
+    assert not plan(
+        record, _DIRECT_STAGES, 1000, 3999, accumulate=True, dkv_direct=None
     )
-    assert not cake_backend.plan_dkv_direct(
-        record, _DIRECT_STAGES, 1000, 3999, accumulate=True
+    # dkv_direct=False: never the direct path
+    assert not plan(
+        record, _DIRECT_STAGES, 1000, 4000, accumulate=True, dkv_direct=False
     )
-    assert not cake_backend.plan_dkv_direct(
-        record, _DIRECT_STAGES, 1000, 4000, accumulate=False
-    )
-    assert not cake_backend.plan_dkv_direct(
-        record, _ALL_STAGES, 1000, 4000, accumulate=True
-    )
-    monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, "0")
-    assert cake_backend.dkv_direct_mode() == "0"
-    assert not cake_backend.plan_dkv_direct(
-        record, _DIRECT_STAGES, 1000, 4000, accumulate=True
-    )
-    monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, "1")
-    assert cake_backend.plan_dkv_direct(
-        record, _DIRECT_STAGES, 1000, 1, accumulate=True
-    )
-    assert not cake_backend.plan_dkv_direct(
-        record, _ALL_STAGES, 1000, 1, accumulate=True
-    )
-    monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, "maybe")
-    with pytest.raises(ValueError, match="FLASHINFER_CAKE_DSA_DKV_DIRECT"):
-        cake_backend.plan_dkv_direct(
-            record, _DIRECT_STAGES, 1000, 4000, accumulate=True
-        )
-    monkeypatch.delenv(cake_backend.DKV_DIRECT_ENV)
+    # dkv_direct=True: the direct path whenever the stages are registered and dkv_acc is given
+    assert plan(record, _DIRECT_STAGES, 1000, 1, accumulate=True, dkv_direct=True)
+    assert not plan(record, _ALL_STAGES, 1000, 1, accumulate=True, dkv_direct=True)
+    assert not plan(record, _DIRECT_STAGES, 1000, 1, accumulate=False, dkv_direct=True)
+    # anything but None / True / False is rejected (the former environment strings included)
+    for bad in ("auto", "0", "1", 0, 1):
+        with pytest.raises(ValueError, match="dkv_direct must be None, True or False"):
+            plan(record, _DIRECT_STAGES, 1000, 4000, accumulate=True, dkv_direct=bad)
     # malformed records fail closed
     with pytest.raises(ValueError, match="bwd_main stage"):
         cake_backend.record_direct_stages(
@@ -443,7 +554,12 @@ def _host_inputs(total_q=8, total_k=16, topk=5):
 def test_registry_record_is_well_formed():
     record = cake_jit.record()
     assert cake_jit.STAGES[0] == "fwd" and cake_jit.PROGRAM == "cake_dsa_h64_train"
-    assert set(record["arches"]) <= set(cake_jit.ARCH_NVCC_FLAGS)
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>`` per stage
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(record["arches"]) <= set(manifest["arch_flags"])
     stages = cake_jit.registered_stages()
     assert stages[0] == "fwd" and tuple(record["stages"]) == stages
     if any(stage in stages for stage in KEY_PASS_STAGES):
@@ -480,10 +596,19 @@ def test_registry_record_is_well_formed():
         } <= set(cake_launch.STAGE_ARGS["bwd_main_natural"])
     for stage in stages:
         physical = record[stage]
-        assert len(physical["sources"]) == 2
-        assert all(s.startswith("cake_dsa_h64_train/") for s in physical["sources"])
-        assert all(physical["module"] in s for s in physical["sources"])
-        assert len(physical["closure_sha256"]) == 64 and physical["ffi_entry"]
+        assert physical["library"] == physical["module"] and physical["ffi_entry"]
+        for arch in record["arches"]:
+            entry = libraries[f"{physical['library']}_{arch}"]
+            assert entry["arch"] == arch and entry["entry"] == physical["ffi_entry"]
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_dsa_h64_train/") for s in entry["sources"]
+            )
+            assert all(physical["module"] in s for s in entry["sources"])
+            assert all(
+                (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
+            )
+            assert len(entry["closure_sha256"]) == 64
         launch = physical["launch"]
         assert len(launch["cluster"]) == 3 and all(
             int(c) >= 1 for c in launch["cluster"]
@@ -571,24 +696,30 @@ def test_binding_cache_is_least_recently_used_and_bounded_by_capacity():
     assert len(cache) == 0
 
 
-def test_binding_cache_capacity_from_environment(monkeypatch):
-    env = cake_backend.BINDING_CACHE_CAPACITY_ENV
-    monkeypatch.delenv(env, raising=False)
+def test_binding_cache_capacity_from_environment():
+    """The cache takes its capacity from the constructor or from ``configure`` (``None`` = the default of 64, a
+    positive integer otherwise); the backend reads no environment variable -- the flashinfer wrapper maps its
+    capacity variable onto ``configure`` (covered by the public-API suite)."""
     default = cake_backend.BINDING_CACHE_DEFAULT_CAPACITY
     assert cake_backend._BindingCache().capacity == default == 64
+    assert cake_backend._BindingCache(capacity=None).capacity == default
     assert cake_backend.BINDING_CACHE.capacity >= 1
-    monkeypatch.setenv(env, "5")
-    assert cake_backend.binding_cache_capacity() == 5
-    assert cake_backend._BindingCache().capacity == 5
-    assert (
-        cake_backend._BindingCache(capacity=3).capacity == 3
-    )  # an explicit capacity wins
-    monkeypatch.setenv(env, " ")
-    assert cake_backend._BindingCache().capacity == default
-    for bad in ("0", "-1", "many", "2.5"):
-        monkeypatch.setenv(env, bad)
+    assert cake_backend._BindingCache(capacity=3).capacity == 3
+    cache = cake_backend._BindingCache(capacity=4)
+    for tag in "abcd":
+        cache.put(("fwd", tag), tag)
+    cache.configure(capacity=2)  # shrinking evicts the least recently used entries
+    assert cache.capacity == 2 and list(cache._entries) == [("fwd", "c"), ("fwd", "d")]
+    cache.configure(capacity=5)
+    assert cache.capacity == 5 and len(cache) == 2
+    cache.configure()
+    assert cache.capacity == default and len(cache) == 2
+    for bad in (0, -1, "5", 2.5, True):
         with pytest.raises(ValueError, match="positive integer"):
-            cake_backend._BindingCache()
+            cake_backend._BindingCache(capacity=bad)
+        with pytest.raises(ValueError, match="positive integer"):
+            cache.configure(capacity=bad)
+    assert cache.capacity == default  # a rejected value leaves the cache as it was
 
 
 def test_validate_accepts_packed_views():
@@ -711,60 +842,6 @@ def test_validate_zero_length_inputs():
     # the prepared runner (explicit path) names the condition before anything is allocated or bound
     with pytest.raises(ValueError, match="T == 0"):
         prepare_dsa_train(ql, qr, kl, kr, idx, backward=False)
-
-
-def test_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
-    """``T == 0``: the eager entry points and the autograd path return empty outputs and zero
-    gradients without consulting the registry, loading a module, binding or launching."""
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("a call without query rows must neither bind nor launch")
-
-    monkeypatch.setattr(cake_backend, "prepare_dsa_train", refuse)
-    monkeypatch.setattr(cake_jit, "load_cake_dsa_train_module", refuse)
-    monkeypatch.setattr(cake_backend, "record_for", refuse)
-    q, kv, idx = _host_inputs(total_q=0, total_k=16, topk=5)
-    ql, qr, kl, kr = (
-        q[..., :D_LATENT],
-        q[..., D_LATENT:],
-        kv[:, :D_LATENT],
-        kv[:, D_LATENT:],
-    )
-    out, lse, o_lo = cake_backend.forward(ql, qr, kl, kr, idx)
-    assert tuple(out.shape) == (0, NUM_HEADS, D_LATENT) and out.dtype == torch.bfloat16
-    assert tuple(lse.shape) == (0, NUM_HEADS) and lse.dtype == torch.float32
-    assert tuple(o_lo.shape) == tuple(out.shape) and o_lo.dtype == torch.bfloat16
-    dout = torch.zeros(0, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
-    grads = cake_backend.backward(ql, qr, kl, kr, idx, out, o_lo, lse, dout)
-    assert [tuple(g.shape) for g in grads] == [
-        (0, NUM_HEADS, D_LATENT),
-        (0, NUM_HEADS, D_ROPE),
-        (16, D_LATENT),
-        (16, D_ROPE),
-    ]
-    assert all(g.dtype == torch.bfloat16 for g in grads)
-    assert torch.all(grads[2] == 0) and torch.all(grads[3] == 0)
-    f32 = cake_backend.backward(
-        ql, qr, kl, kr, idx, out, o_lo, lse, dout, dkv_fp32=True
-    )
-    assert f32[2].dtype == f32[3].dtype == torch.float32
-    assert tuple(f32[2].shape) == (16, D_LATENT) and torch.all(f32[2] == 0)
-    # the shape / dtype checks still apply to an empty call
-    with pytest.raises(ValueError, match="int32"):
-        cake_backend.forward(ql, qr, kl, kr, idx.long())
-    with pytest.raises(ValueError, match="S > 0"):
-        cake_backend.forward(ql, qr, kl[:0], kr[:0], idx)
-    with pytest.raises(ValueError, match="lse"):
-        cake_backend.backward(ql, qr, kl, kr, idx, out, o_lo, lse[:, :8], dout)
-    # the autograd path
-    leaves = [t.detach().clone().requires_grad_() for t in (ql, qr, kl, kr)]
-    with _quiet_experimental():
-        out_pub, lse_pub = dsa_sparse_attention(*leaves, idx, return_lse=True)
-    assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
-    assert tuple(lse_pub.shape) == (0, NUM_HEADS)
-    g = torch.autograd.grad(out_pub, leaves, dout)
-    assert [tuple(t.shape) for t in g] == [tuple(leaf.shape) for leaf in leaves]
-    assert torch.all(g[2] == 0) and torch.all(g[3] == 0)
 
 
 def test_validate_accepts_strided_indices_and_wide_head_strides():
@@ -964,33 +1041,6 @@ def test_forward_deterministic():
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
     if a[2] is not None:
         assert torch.equal(a[2], b[2])
-
-
-def test_varlen_multi_document_matches_flat_and_reference():
-    _require_program()
-    inp = make_inputs([64, 200, 120], [128, 200, 384], seed=SEED + 4, topk=128)
-    out_flat, lse_flat, _ = cake_backend.forward(
-        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
-    )
-    with _quiet_experimental():
-        out_var, lse_var = dsa_sparse_attention_varlen(
-            inp.q_latent,
-            inp.q_rope,
-            inp.kv_latent,
-            inp.k_rope,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
-    torch.cuda.synchronize()
-    assert torch.equal(out_flat, out_var) and torch.equal(lse_flat, lse_var)
-    ref = reference_fp64(
-        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
-    )
-    _check_forward(inp, out_var, lse_var, ref)
 
 
 def test_runner_launches_without_allocation():
@@ -1313,7 +1363,7 @@ def test_backward_forced_key_passes_masked_matches_reference_and_is_deterministi
     assert runner.key_passes == 3
     expected_order = ["bwd_delta"]
     for index in range(3):
-        expected_order += [(stage, index) for stage in KEY_PASS_STAGES]
+        expected_order += [(stage, 0, index) for stage in KEY_PASS_STAGES]
     if "bwd_cast" in runner.launches:
         expected_order.append("bwd_cast")
     assert list(runner.backward_order) == expected_order
@@ -1345,64 +1395,37 @@ def test_backward_forced_key_passes_masked_matches_reference_and_is_deterministi
     assert max(rel_l2(a[2], single[2]), rel_l2(a[3], single[3])) < 1e-2
 
 
-def test_backward_whole_row_policy_two_passes_through_public_entry():
-    """The registered policy takes two passes at T = 4096 x S = 65,536 (top-k 2048), through
-    the public entry, against the canonical gates; the 4k x 4k and 32k-token rows stay single-pass."""
-    record, stages = _require_key_pass_program()
+def test_backward_forced_passes_over_two_token_chunks():
+    """Two forced passes over a row of 4352 tokens (one full chunk of 4224 and one of 128): the
+    launches run chunk by chunk through every pass, the pass scratch holds one chunk, dq is
+    bitwise across two calls and agrees with the single pass and the reference."""
+    record, _stages = _require_key_pass_program()
     device = torch.device("cuda")
-    assert plan_key_passes(record, stages, 4096, 65536, 2048) == 2
-    assert plan_key_passes(record, stages, 4096, 131072, 2048) == 3
-    assert plan_key_passes(record, stages, 4096, 4096, 2048) == 1
-    assert plan_key_passes(record, stages, 32768, 131072, 2048) == 1
-    policy_size = dsa_train_workspace_size(4096, 65536, 2048, device)
-    single_size = dsa_train_workspace_size(4096, 65536, 2048, device, key_passes=1)
-    assert policy_size - single_size >= 4096 * (
-        DQ_PARTIAL_BYTES_PER_TOKEN + 4 * 2048 + 4
-    )
-    assert policy_size == dsa_train_workspace_size(
-        4096, 65536, 2048, device, key_passes=2
-    )
-    inp = make_inputs([4096], [65536], seed=SEED + 17, topk=2048)
-    leaves = [
-        t.detach().clone().requires_grad_()
-        for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    ]
-    with _quiet_experimental():
-        out = dsa_sparse_attention(*leaves, inp.idx_global)
-    grads = torch.autograd.grad(out, leaves, inp.dout)
-    torch.cuda.synchronize()
-    # the policy plans two passes for this row: per pass the compaction and the pass kernel
-    runner = prepare_dsa_train(
-        inp.q_latent,
-        inp.q_rope,
-        inp.kv_latent,
-        inp.k_rope,
-        inp.idx_global,
-        dout=inp.dout,
-        backward=True,
-    )
+    chunk = KeyPassPolicy.from_record(record).token_chunk(2048)
+    assert chunk == 4224
+    inp = make_inputs([chunk + 128], [65536], seed=SEED + 18, topk=2048)
+    fwd_args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    out, lse, o_lo = cake_backend.forward(*fwd_args)
+    runner = prepare_dsa_train(*fwd_args, dout=inp.dout, backward=True, key_passes=2)
     assert runner.key_passes == 2
     assert [k for k in runner.backward_order if isinstance(k, tuple)] == [
-        ("bwd_compact", 0),
-        ("bwd_main_pass", 0),
-        ("bwd_compact", 1),
-        ("bwd_main_pass", 1),
+        (stage, c, p) for c in range(2) for p in range(2) for stage in KEY_PASS_STAGES
     ]
+    assert runner.layout["dq_partial"][1] == chunk * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert runner.layout["key_scratch"][1] == chunk * 2048 * 4
+    assert (
+        dsa_train_workspace_size(chunk + 128, 65536, 2048, device, key_passes=2)
+        == runner.layout["total"]
+    )
     del runner
-    # repeating the step with the same binding is bitwise for the forward and dq
-    fwd_args = tuple(t.detach() for t in leaves) + (inp.idx_global,)
-    o1, l1, olo1 = cake_backend.forward(*fwd_args)
-    g1 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout)
-    g2 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout)
-    o2, l2, olo2 = cake_backend.forward(*fwd_args)
+    args = fwd_args + (out, o_lo, lse, inp.dout)
+    a = cake_backend.backward(*args, key_passes=2)
+    b = cake_backend.backward(*args, key_passes=2)
+    single = cake_backend.backward(*args, key_passes=1)
     torch.cuda.synchronize()
-    assert torch.equal(g1[0], g2[0]) and torch.equal(g1[1], g2[1])
-    assert torch.equal(g1[0], grads[0]) and torch.equal(o2, out.detach())
-    with _quiet_experimental():
-        out_single = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=1)
-    single = torch.autograd.grad(out_single, leaves, inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out.detach(), out_single.detach())  # the forward is untouched
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    assert rel_l2(a[0], single[0]) < 1e-3 and rel_l2(a[1], single[1]) < 1e-3
+    assert max(rel_l2(a[2], single[2]), rel_l2(a[3], single[3])) < 1e-2
     ref = reference_fp64(
         inp.q_latent,
         inp.q_rope,
@@ -1411,48 +1434,7 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
         inp.idx_global,
         dout=inp.dout,
     )
-    _check_backward(grads, ref, canonical=True)
-    _check_backward(single, ref, canonical=True)
-    assert rel_l2(grads[0], single[0]) < 1e-3 and rel_l2(grads[1], single[1]) < 1e-3
-    assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
-
-
-def test_public_entry_derives_row_lengths_and_matches_full_rows():
-    """Without ``topk_length`` the public entry derives the per-row length (last valid slot + 1) and the kernels skip
-    the trailing invalid blocks: on documents shorter than top-k (most slots ``-1``) the forward / backward equal the
-    explicit full-length call bitwise (out, lse, dq) and within the FP32 reduction spread (dkv), and match the
-    reference."""
-    _require_program(backward=True)
-    inp = make_inputs([200, 96, 300], [200, 96, 4096], seed=SEED + 752, topk=256)
-    S = inp.kv_latent.shape[0]
-    derived = derive_topk_length(inp.idx_global, S)
-    assert torch.equal(
-        derived, inp.topk_length
-    )  # the generator's rows are valid-first: last valid + 1 == count
-    assert int(derived.max()) <= 256 and int((derived < 256).sum()) > 0
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    leaves_a = [t.detach().clone().requires_grad_() for t in args]
-    leaves_b = [t.detach().clone().requires_grad_() for t in args]
-    full = torch.full(
-        (inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device
-    )
-    with _quiet_experimental():
-        out_a, lse_a = dsa_sparse_attention(*leaves_a, inp.idx_global, return_lse=True)
-        out_b, lse_b = dsa_sparse_attention(
-            *leaves_b, inp.idx_global, topk_length=full, return_lse=True
-        )
-    grads_a = torch.autograd.grad(out_a, leaves_a, inp.dout)
-    grads_b = torch.autograd.grad(out_b, leaves_b, inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out_a.detach(), out_b.detach()) and torch.equal(lse_a, lse_b)
-    assert torch.equal(grads_a[0], grads_b[0]) and torch.equal(grads_a[1], grads_b[1])
-    # dkv: fp32 atomics summed in a different key-block order round to bf16 differently on a few elements
-    # (the cross-path spread used throughout this file); both paths must also meet the reference gates
-    assert max(rel_l2(grads_a[2], grads_b[2]), rel_l2(grads_a[3], grads_b[3])) < 1e-3
-    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
-    _check_forward(inp, out_a, lse_a, ref)
-    _check_backward(grads_a, ref)
-    _check_backward(grads_b, ref)
+    _check_backward(a, ref, canonical=True)
 
 
 def test_forward_derives_row_lengths_in_kernel_and_binding_key_covers_it():
@@ -1518,59 +1500,6 @@ def test_forward_derives_row_lengths_in_kernel_and_binding_key_covers_it():
         prepare_dsa_train(*args, derive_topk_length=True, backward=False)
 
 
-def test_varlen_multi_segment_row_plans_single_pass():
-    """A packed two-segment key row whose total length triggers the whole-row formula (2 x 23,000 keys >
-    45,511) plans the single-pass stage through the varlen entry (``num_segments = len(cu_seqlens_k) - 1``:
-    whole-row ranges do not match segment-confined index rows), while the flat call on the same global
-    indices plans two whole-row passes; the forward is untouched, both backwards agree (dq differs in the
-    FP32 summation order only) and match the FP64 reference."""
-    record, stages = _require_key_pass_program()
-    device = torch.device("cuda")
-    assert plan_key_passes(record, stages, 256, 46000, 128) == 2
-    assert plan_key_passes(record, stages, 256, 46000, 128, num_segments=2) == 1
-    assert dsa_train_workspace_size(
-        256, 46000, 128, device, num_segments=2
-    ) == dsa_train_workspace_size(256, 46000, 128, device, key_passes=1)
-    inp = make_inputs([128, 128], [23000, 23000], seed=SEED + 751, topk=128)
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    leaves = [t.detach().clone().requires_grad_() for t in args]
-    flat_leaves = [t.detach().clone().requires_grad_() for t in args]
-    cache = cake_backend.BINDING_CACHE
-    cache.clear()
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
-    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
-    torch.cuda.synchronize()
-    remembered = [b.plan for b in cache._entries.values() if b.plan.backward]
-    assert [plan.key_passes for plan in remembered] == [1]
-    assert not any(isinstance(k, tuple) for k in remembered[0].backward_order)
-    with _quiet_experimental():
-        out_f, lse_f = dsa_sparse_attention(
-            *flat_leaves, inp.idx_global, return_lse=True
-        )
-    grads_f = torch.autograd.grad(out_f, flat_leaves, inp.dout)
-    torch.cuda.synchronize()
-    # the segment count is part of the plan key: the flat call plans anew and takes the two passes
-    assert sorted(
-        b.plan.key_passes for b in cache._entries.values() if b.plan.backward
-    ) == [1, 2]
-    assert torch.equal(out_v.detach(), out_f.detach()) and torch.equal(lse_v, lse_f)
-    for a, b in zip(grads_v, grads_f, strict=True):
-        assert rel_l2(a, b) < 1e-3
-    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
-    _check_forward(inp, out_v, lse_v, ref)
-    _check_backward(grads_v, ref)
-    _check_backward(grads_f, ref)
-
-
 def _indices_view_inside_storage(indices: torch.Tensor, offset: int) -> torch.Tensor:
     """A contiguous copy of ``indices`` that starts ``offset`` elements inside a larger buffer."""
     n = indices.numel()
@@ -1579,40 +1508,6 @@ def _indices_view_inside_storage(indices: torch.Tensor, offset: int) -> torch.Te
     view.copy_(indices)
     assert view.is_contiguous() and view.storage_offset() == offset
     return view
-
-
-@pytest.mark.parametrize("offset", [1, 8, 13])
-def test_indices_view_inside_a_storage_matches_the_plain_tensor(offset):
-    """A contiguous ``indices`` view that starts inside its storage (a slice of a larger buffer)
-    reaches the kernels as the nearest vector-aligned base plus the element offset, so their
-    aligned index-tile loads (gated on the offset) stay valid: forward, backward and the autograd
-    path agree with the plain tensor (bitwise where the kernels are deterministic)."""
-    _require_program(backward=True)
-    inp = make_inputs([256], [512], seed=SEED + 18, topk=128)
-    view = _indices_view_inside_storage(inp.idx_global, offset)
-    base, element_offset = cake_backend._pointer_operand(view)
-    assert element_offset == offset % 8
-    assert base.data_ptr() == view.data_ptr() - 4 * element_offset
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    plain = cake_backend.forward(*args, inp.idx_global)
-    got = cake_backend.forward(*args, view)
-    torch.cuda.synchronize()
-    for a, b in zip(plain, got, strict=True):
-        assert torch.equal(a, b)
-    out, lse, o_lo = plain
-    g_plain = cake_backend.backward(*args, inp.idx_global, out, o_lo, lse, inp.dout)
-    g_view = cake_backend.backward(*args, view, out, o_lo, lse, inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(g_plain[0], g_view[0]) and torch.equal(g_plain[1], g_view[1])
-    assert max(rel_l2(g_plain[2], g_view[2]), rel_l2(g_plain[3], g_view[3])) < 1e-3
-    leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out_pub, lse_pub = dsa_sparse_attention(*leaves, view, return_lse=True)
-    grads = torch.autograd.grad(out_pub, leaves, inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out_pub, out) and torch.equal(lse_pub, lse)
-    assert torch.equal(grads[0], g_plain[0]) and torch.equal(grads[1], g_plain[1])
-    assert max(rel_l2(grads[2], g_plain[2]), rel_l2(grads[3], g_plain[3])) < 1e-3
 
 
 @pytest.mark.parametrize("offset", [1, 4, 8, 13])
@@ -1634,44 +1529,6 @@ def test_key_pass_compaction_accepts_an_indices_view_inside_a_storage(offset):
     assert max(rel_l2(plain[2], got[2]), rel_l2(plain[3], got[3])) < 1e-3
     ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
     _check_backward(got, ref)
-
-
-def test_autograd_function_matches_explicit_backward():
-    _require_program(backward=True)
-    inp = make_inputs([256], [512], seed=SEED + 10, topk=128)
-    leaves = [
-        t.detach().clone().requires_grad_()
-        for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    ]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention(*leaves, inp.idx_global, return_lse=True)
-    grads = torch.autograd.grad(out, leaves, inp.dout)
-    o2, l2, o_lo = cake_backend.forward(
-        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
-    )
-    explicit = cake_backend.backward(
-        inp.q_latent,
-        inp.q_rope,
-        inp.kv_latent,
-        inp.k_rope,
-        inp.idx_global,
-        o2,
-        o_lo,
-        l2,
-        inp.dout,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(out, o2) and torch.equal(lse, l2)
-    assert torch.equal(grads[0], explicit[0]) and torch.equal(grads[1], explicit[1])
-    ref = reference_fp64(
-        inp.q_latent,
-        inp.q_rope,
-        inp.kv_latent,
-        inp.k_rope,
-        inp.idx_global,
-        dout=inp.dout,
-    )
-    _check_backward(grads, ref)
 
 
 def test_backward_dkv_fp32_returns_natural_layout_gradients():
@@ -1788,98 +1645,12 @@ def test_indices_column_slice_matches_the_plain_tensor(pad):
     assert max(rel_l2(g_plain[2], g_view[2]), rel_l2(g_plain[3], g_view[3])) < 1e-3
 
 
-def test_autograd_lse_gradient_is_rejected_and_unused_out_gives_no_grad():
-    _require_program(backward=True)
-    inp = make_inputs([128], [256], seed=SEED + 15, topk=64)
-    leaves = [
-        t.detach().clone().requires_grad_()
-        for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    ]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention(*leaves, inp.idx_global, return_lse=True)
-    # only out is differentiable: a gradient arriving through lse fails loudly instead of being dropped
-    with pytest.raises(NotImplementedError, match="lse"):
-        torch.autograd.grad(lse.sum(), leaves)
-    g = torch.autograd.grad(out, leaves, inp.dout)
-    torch.cuda.synchronize()
-    assert all(
-        t is not None and t.shape == leaf.shape
-        for t, leaf in zip(g, leaves, strict=True)
-    )
-
-
 # --- Packed / strided trainer layouts and causal varlen offsetting (flashinfer-ai/flashinfer#5675) ---
 # Packed / strided trainer layouts and the causal tail-of-prefix varlen rule (flashinfer-ai/flashinfer#5675).  The
 # kernels take the head / token strides of the query operands and the key row stride from the tensors (TMA descriptors
 # encoded from the view; k_rope as storage alias + element offset + row stride), so a view changes descriptor fields
 # only: out, lse, o_lo and dQ must be bitwise identical to the contiguous path; dK / dV are FP32 reductions whose order
 # is not fixed (FP32 tolerance).
-
-
-def _q_rope_as_q256_slice(q_rope):
-    """``q_rope`` as the ``192:256`` channel slice of a ``[T, 64, 256]`` pre-absorption query: head stride 256, token
-    stride 16384, storage offset 192 elements (384 B); the other channels are noise the kernels must not read."""
-    gen = torch.Generator(device=q_rope.device).manual_seed(756)
-    q256 = torch.randn(
-        q_rope.shape[0], NUM_HEADS, 256, device=q_rope.device, generator=gen
-    ).to(torch.bfloat16)
-    q256[:, :, 192:256].copy_(q_rope)
-    view = q256[:, :, 192:256]
-    assert view.stride() == (16384, 256, 1) and view.storage_offset() == 192
-    assert view.data_ptr() == q256.data_ptr() + 384 and view.data_ptr() % 16 == 0
-    return q256, view
-
-
-def _kv_as_packed_row(kv_latent, k_rope, row_stride):
-    """``kv_latent`` / ``k_rope`` as the ``0:512`` / ``512:576`` column slices of a packed ``[S, row_stride]`` row
-    (576 = latent + rope; 704 = with a frozen 128-channel indexer key stored alongside)."""
-    gen = torch.Generator(device=kv_latent.device).manual_seed(row_stride)
-    kv = torch.randn(
-        kv_latent.shape[0], row_stride, device=kv_latent.device, generator=gen
-    ).to(torch.bfloat16)
-    kv[:, :D_LATENT].copy_(kv_latent)
-    kv[:, D_LATENT:D_QK].copy_(k_rope)
-    lat, rope = kv[:, :D_LATENT], kv[:, D_LATENT:D_QK]
-    assert lat.stride() == (row_stride, 1) and rope.stride() == (row_stride, 1)
-    assert rope.storage_offset() == D_LATENT
-    return kv, lat, rope
-
-
-def _forward_backward(q_latent, q_rope, kv_latent, k_rope, indices, dout):
-    out, lse, o_lo = cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, indices)
-    grads = cake_backend.backward(
-        q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout
-    )
-    torch.cuda.synchronize()
-    return (out, lse, o_lo), grads
-
-
-def _assert_same_step(got, ref):
-    """out / lse / o_lo / dq bitwise; dK / dV within the FP32 reduction spread."""
-    for a, b in zip(got[0], ref[0], strict=True):
-        assert torch.equal(a, b)
-    assert torch.equal(got[1][0], ref[1][0]) and torch.equal(got[1][1], ref[1][1])
-    assert max(rel_l2(got[1][2], ref[1][2]), rel_l2(got[1][3], ref[1][3])) < 1e-3
-
-
-def _non_causal_local_indices(inp, gen, *, masked_docs=()):
-    """Distinct uniform picks over the whole document (deliberately including keys after the query), 10 % of the
-    slots ``-1`` anywhere, and every slot ``-1`` for the documents in ``masked_docs``."""
-    local = torch.empty_like(inp.idx_local)
-    cu_q = inp.cu_seqlens_q.tolist()
-    topk = inp.topk
-    for d, (lq, lk) in enumerate(zip(inp.seq_q, inp.seq_k, strict=True)):
-        picks = torch.rand(
-            lq, max(lk, topk), device=local.device, generator=gen
-        ).argsort(dim=-1)[:, :topk]
-        rows = torch.where(picks < lk, picks, torch.full_like(picks, -1)).to(
-            torch.int32
-        )
-        if d in masked_docs:
-            rows.fill_(-1)
-        local[cu_q[d] : cu_q[d + 1]] = rows
-    drop = torch.rand(local.shape, device=local.device, generator=gen) < 0.1
-    return torch.where(drop, torch.full_like(local, -1), local)
 
 
 # Host layer
@@ -2117,230 +1888,48 @@ def test_validate_rejects_unsupported_strides(mutate, match):
 # Device tests
 
 
-def test_forward_backward_strided_q_rope_256_bitwise():
-    """``q_rope`` as the ``192:256`` channel slice of a ``[T, 64, 256]`` query (head stride 256, token stride 16384,
-    384 B storage offset) with a contiguous ``q_latent``: forward and backward equal the contiguous path bitwise (the
-    TMA descriptor takes the view's strides; the computation order is unchanged), dK / dV within the FP32 reduction
-    spread; the view is consumed in place, the remembered binding serves it, and the autograd path puts the rope
-    gradient into channels 192:256 of the [T, 64, 256] leaf."""
-    _require_program(backward=True)
-    inp = make_inputs([160, 96], [160, 320], seed=SEED + 756, topk=96)
-    q256, q_rope = _q_rope_as_q256_slice(inp.q_rope)
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    ref = _forward_backward(*args, inp.idx_global, inp.dout)
-    got = _forward_backward(
-        inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout
-    )
-    _assert_same_step(got, ref)
-    assert q_rope.data_ptr() == q256.data_ptr() + 384 and q_rope.stride() == (
-        16384,
-        256,
-        1,
-    )
-    again = cake_backend.forward(
-        inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
-    )
-    torch.cuda.synchronize()
-    for a, b in zip(again, got[0], strict=True):
-        assert torch.equal(a, b)
-    leaf = q256.detach().clone().requires_grad_()
-    with _quiet_experimental():
-        out = dsa_sparse_attention(
-            inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global
-        )
-    (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out, ref[0][0]) and torch.equal(grad[:, :, 192:256], ref[1][1])
-    assert torch.all(grad[:, :, :192] == 0)
-
-
-def test_kv_row_stride_704_bitwise():
-    """``kv_latent = kv[:, :512]`` / ``k_rope = kv[:, 512:576]`` of a packed ``[S, 704]`` row (indexer key alongside)
-    and of a ``[S, 576]`` row: forward and backward equal the contiguous path and each other bitwise (gather
-    descriptor / rope pointer stride only); the ``[S, 704]`` autograd leaf gets its gradient in columns 0:576 only."""
-    _require_program(backward=True)
-    inp = make_inputs([128, 128], [128, 384], seed=SEED + 757, topk=96)
-    ref = _forward_backward(
-        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout
-    )
-    got = {}
-    for row_stride in (576, 704):
-        kv, lat, rope = _kv_as_packed_row(inp.kv_latent, inp.k_rope, row_stride)
-        got[row_stride] = _forward_backward(
-            inp.q_latent, inp.q_rope, lat, rope, inp.idx_global, inp.dout
-        )
-        _assert_same_step(got[row_stride], ref)
-    _assert_same_step(got[704], got[576])
-    leaf = kv.detach().clone().requires_grad_()  # the [S, 704] buffer
-    with _quiet_experimental():
-        out = dsa_sparse_attention(
-            inp.q_latent,
-            inp.q_rope,
-            leaf[:, :D_LATENT],
-            leaf[:, D_LATENT:D_QK],
-            inp.idx_global,
-        )
-    (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out, ref[0][0]) and torch.all(grad[:, D_QK:] == 0)
-    assert (
-        max(
-            rel_l2(grad[:, :D_LATENT], ref[1][2]),
-            rel_l2(grad[:, D_LATENT:D_QK], ref[1][3]),
-        )
-        < 1e-3
-    )
-
-
-def test_dkv_dst_map_value_check_is_opt_in(monkeypatch):
-    """``_check_dkv_acc`` validates dtype / shape / contiguity / device of ``dkv_dst_map`` but not its values
-    (the kernel does not range-check the map); with ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` an out-of-range
-    destination row raises ``ValueError`` and an in-range map passes."""
+def test_dkv_dst_map_value_check_is_opt_in():
+    """``_check_dkv_acc`` validates dtype / shape / contiguity / device of ``dkv_dst_map`` but not its values by
+    default (the kernel does not range-check the map); with ``check_dst_map=True`` an out-of-range destination row
+    raises ``ValueError`` and an in-range map passes.  The eager backward threads the keyword to that check (a call
+    without query rows runs it on host tensors without launching)."""
+    check = cake_backend._check_dkv_acc
     dkv_acc = torch.zeros(4, D_QK, dtype=torch.float32)
     good = torch.tensor([3, 0, 3], dtype=torch.int32)
     bad = torch.tensor([0, 4, 1], dtype=torch.int32)  # 4 == S_dst is outside [0, S_dst)
-    monkeypatch.delenv("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", raising=False)
     for dst_map in (good, bad):
-        operand, row_stride = cake_backend._check_dkv_acc(dkv_acc, dst_map, num_kv=3)
+        operand, row_stride = check(dkv_acc, dst_map, num_kv=3)
         assert operand is dkv_acc and row_stride == D_QK
-    monkeypatch.setenv("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", "1")
-    assert cake_backend._check_dkv_acc(dkv_acc, good, num_kv=3)[1] == D_QK
+        assert check(dkv_acc, dst_map, num_kv=3, check_dst_map=False)[1] == D_QK
+    assert check(dkv_acc, good, num_kv=3, check_dst_map=True)[1] == D_QK
     with pytest.raises(ValueError, match=r"dkv_dst_map values must lie in \[0, 4\)"):
-        cake_backend._check_dkv_acc(dkv_acc, bad, num_kv=3)
+        check(dkv_acc, bad, num_kv=3, check_dst_map=True)
     with pytest.raises(ValueError, match="dkv_dst_map values must lie in"):
-        cake_backend._check_dkv_acc(
-            dkv_acc, torch.tensor([-1, 0, 0], dtype=torch.int32), num_kv=3
+        check(
+            dkv_acc,
+            torch.tensor([-1, 0, 0], dtype=torch.int32),
+            num_kv=3,
+            check_dst_map=True,
         )
-
-
-def test_varlen_causal_tail_of_prefix_matches_reference():
-    """Query segments that are the tail of their key prefix (seqlen_q < seqlen_k) with gather indices that
-    deliberately select keys beyond the causal bound ``(seqlen_k - seqlen_q) + local_q``: the varlen entry masks
-    exactly those slots (loop reference of the rule; the FP64 reference sees the same set), a zero-query segment
-    contributes no rows, and a segment whose every slot is ``-1`` gives ``out = 0``, ``lse = -inf``, ``dq = 0`` and
-    exact zeros in dK / dV for its keys."""
-    _require_program(backward=True)
-    seq_q, seq_k = (
-        [40, 48, 0, 56, 32],
-        [40, 200, 64, 320, 96],
-    )  # full, tail, keys only, tail, tail (all -1)
-    inp = make_inputs(seq_q, seq_k, seed=SEED + 758, topk=64)
-    gen = torch.Generator(device="cuda").manual_seed(1)
-    local = _non_causal_local_indices(inp, gen, masked_docs=(4,))
-    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
-    expected = globalize_gather_indices_loop(local, cu_q, cu_k, causal=True).cuda()
-    assert torch.equal(
-        offset_gather_kv_indices(local, cu_q, cu_k, causal=True), expected
+    q, kv, idx = _host_inputs(total_q=0, total_k=3, topk=5)
+    out = torch.zeros(0, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    args = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+        idx,
+        out,
+        out,
+        torch.zeros(0, NUM_HEADS),
+        out,
     )
-    loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
-    assert torch.equal(
-        loose, globalize_gather_indices_loop(local, cu_q, cu_k, causal=False).cuda()
-    )
-    assert ((expected == -1) & (loose != -1)).any(), (
-        "the case must select keys beyond the causal bound"
-    )
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    (out, lse, _), grads = _forward_backward(*args, expected, inp.dout)
-    leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves,
-            local,
-            cu_q,
-            cu_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            causal=True,
-            return_lse=True,
+    grads = cake_backend.backward(*args, dkv_acc=dkv_acc, dkv_dst_map=bad)
+    assert grads[2] is None and grads[3] is None  # unchecked by default
+    with pytest.raises(ValueError, match="dkv_dst_map values must lie in"):
+        cake_backend.backward(
+            *args, dkv_acc=dkv_acc, dkv_dst_map=bad, check_dst_map=True
         )
-    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
-    assert torch.equal(grads_v[0], grads[0]) and torch.equal(grads_v[1], grads[1])
-    assert max(rel_l2(grads_v[2], grads[2]), rel_l2(grads_v[3], grads[3])) < 1e-3
-    ref = reference_fp64(*args, expected, dout=inp.dout)
-    _check_forward(inp, out_v, lse_v, ref)
-    _check_backward(grads_v, ref)
-    masked = slice(int(cu_q[-2]), int(cu_q[-1]))
-    assert torch.all(lse_v[masked] == float("-inf")) and torch.all(out_v[masked] == 0)
-    assert torch.all(grads_v[0][masked] == 0) and torch.all(grads_v[1][masked] == 0)
-    assert torch.all(grads_v[2][int(cu_k[-2]) :] == 0) and torch.all(
-        grads_v[3][int(cu_k[-2]) :] == 0
-    )
-    with _quiet_experimental():
-        out_nc = dsa_sparse_attention_varlen(*args, local, cu_q, cu_k, causal=False)
-    torch.cuda.synchronize()
-    assert not torch.equal(out_nc, out_v), (
-        "without the causal term the same picks attend keys after the query"
-    )
-
-
-def test_varlen_segment_with_every_slot_masked_gives_zero_outputs():
-    """A packed segment whose gather rows are all ``-1``: ``out = 0``, ``lse = -inf``, ``dq = 0`` for its rows and
-    exact zeros in dK / dV for its keys; the other segment's row-local results are those of the flat call."""
-    _require_program(backward=True)
-    inp = make_inputs([64, 48], [64, 160], seed=SEED + 759, topk=64)
-    local = inp.idx_local.clone()
-    local[64:] = -1
-    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
-    glob = offset_gather_kv_indices(local, cu_q, cu_k)
-    assert torch.all(glob[64:] == -1) and torch.equal(glob[:64], inp.idx_global[:64])
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out, lse = dsa_sparse_attention_varlen(
-            *leaves, local, cu_q, cu_k, return_lse=True
-        )
-    grads = torch.autograd.grad(out, leaves, inp.dout)
-    (out_flat, lse_flat, _), grads_flat = _forward_backward(
-        *args, inp.idx_global, inp.dout
-    )
-    torch.cuda.synchronize()
-    assert torch.all(lse[64:] == float("-inf")) and torch.all(out[64:] == 0)
-    assert torch.all(grads[0][64:] == 0) and torch.all(grads[1][64:] == 0)
-    assert torch.all(grads[2][64:] == 0) and torch.all(grads[3][64:] == 0)
-    assert torch.equal(out[:64], out_flat[:64]) and torch.equal(lse[:64], lse_flat[:64])
-    assert torch.equal(grads[0][:64], grads_flat[0][:64]) and torch.equal(
-        grads[1][:64], grads_flat[1][:64]
-    )
-    ref = reference_fp64(*args, glob, dout=inp.dout)
-    _check_forward(inp, out, lse, ref)
-    _check_backward(grads, ref)
-
-
-def test_varlen_packed_glm_structure_small():
-    """Scaled-down GLM-5.2 packed batch: 8 segments alternating a full document and the tail of a ~32x longer key
-    prefix, top-k 128, through the varlen entry -- equals the flat call on the generator's global indices (bitwise
-    for out / lse / dq) and the FP64 reference; the generator's causal picks are left untouched by the rule."""
-    _require_program(backward=True)
-    seq_q = [177, 175, 212, 211, 212, 211, 212, 211]
-    seq_k = [177, 5684, 212, 6792, 212, 6792, 212, 6792]
-    inp = make_inputs(seq_q, seq_k, seed=SEED + 760, topk=128)
-    assert torch.equal(
-        offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k),
-        inp.idx_global,
-    )
-    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
-    (out, lse, _), grads = _forward_backward(*args, inp.idx_global, inp.dout)
-    leaves = [t.detach().clone().requires_grad_() for t in args]
-    with _quiet_experimental():
-        out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves,
-            inp.idx_local,
-            inp.cu_seqlens_q,
-            inp.cu_seqlens_k,
-            inp.max_seqlen_q,
-            inp.max_seqlen_k,
-            return_lse=True,
-        )
-    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
-    torch.cuda.synchronize()
-    assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
-    assert torch.equal(grads_v[0], grads[0]) and torch.equal(grads_v[1], grads[1])
-    assert max(rel_l2(grads_v[2], grads[2]), rel_l2(grads_v[3], grads[3])) < 1e-3
-    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
-    _check_forward(inp, out_v, lse_v, ref)
-    _check_backward(grads_v, ref)
 
 
 # --- end of the packed / strided layout block ---
@@ -2447,6 +2036,14 @@ def test_backward_binding_key_covers_dkv_acc_and_map():
     )  # another row layout of the same storage
     dst_map = torch.zeros(S, dtype=torch.int32)
     assert with_acc != backward_binding_key(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+    # with dkv_acc the dkv_direct option is part of the key (None = the rule, True, False); without it, inert
+    assert with_acc == backward_binding_key(*args, dkv_acc=acc, dkv_direct=None)
+    keys = {
+        backward_binding_key(*args, dkv_acc=acc, dkv_direct=mode)
+        for mode in (None, True, False)
+    }
+    assert len(keys) == 3
+    assert plain == backward_binding_key(*args, dkv_direct=True)
 
 
 def test_bound_values_serve_the_accumulating_cast_operands():
@@ -2596,11 +2193,12 @@ def _require_direct_program():
     return record, stages
 
 
-def test_backward_dkv_acc_direct_and_cast_paths_agree(monkeypatch):
+def test_backward_dkv_acc_direct_and_cast_paths_agree():
     """With dkv_acc and S >= 4 T the natural-layout main stage adds into the caller's rows itself (no accumulators, no
-    cast); forced through the cast path (FLASHINFER_CAKE_DSA_DKV_DIRECT=0) the same rows receive the same gradients
-    (another FP32 summation order), dq is bitwise the same and untouched rows / columns stay untouched -- through a
-    duplicating destination map into a [S_dst, 704] buffer, on the prepared runner and the eager entry."""
+    cast); forced through the cast path (``dkv_direct=False``) the same rows receive the same gradients (another FP32
+    summation order), dq is bitwise the same and untouched rows / columns stay untouched -- through a duplicating
+    destination map into a [S_dst, 704] buffer, on the prepared runner and the eager entry; ``dkv_direct=None`` (the
+    default) takes the rule, and the in-range map passes the opt-in value check."""
     record, stages = _require_direct_program()
     inp = make_inputs(
         [256], [2048], seed=SEED + 24, topk=128
@@ -2615,8 +2213,7 @@ def test_backward_dkv_acc_direct_and_cast_paths_agree(monkeypatch):
     expect = pre.clone()
     expect[:S_dst, :D_QK].index_add_(0, dst_map.long(), nat)
     results = {}
-    for mode in ("1", "0", "auto"):
-        monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, mode)
+    for mode in (True, False, None):
         acc = pre.clone()
         runner = prepare_dsa_train(
             *args[:5],
@@ -2624,8 +2221,10 @@ def test_backward_dkv_acc_direct_and_cast_paths_agree(monkeypatch):
             backward=True,
             dkv_acc=acc[:S_dst],
             dkv_dst_map=dst_map,
+            dkv_direct=mode,
+            check_dst_map=True,
         )
-        assert runner.dkv_direct == (mode != "0")
+        assert runner.dkv_direct == (mode is not False)
         if runner.dkv_direct:
             assert (
                 "bwd_main_natural" in runner.launches
@@ -2647,7 +2246,7 @@ def test_backward_dkv_acc_direct_and_cast_paths_agree(monkeypatch):
         )
         acc = pre.clone()
         aq_l, aq_r, none_l, none_r = cake_backend.backward(
-            *args, dkv_acc=acc[:S_dst], dkv_dst_map=dst_map
+            *args, dkv_acc=acc[:S_dst], dkv_dst_map=dst_map, dkv_direct=mode
         )
         torch.cuda.synchronize()
         assert none_l is None and none_r is None
@@ -2659,15 +2258,20 @@ def test_backward_dkv_acc_direct_and_cast_paths_agree(monkeypatch):
             acc[S_dst:], pre[S_dst:]
         )
         results[mode] = acc[:S_dst, :D_QK].clone()
-    torch.testing.assert_close(results["1"], results["0"], rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(results["auto"], results["1"], rtol=1e-4, atol=1e-4)
-    monkeypatch.delenv(cake_backend.DKV_DIRECT_ENV)
-    # the workspace of a direct binding has no FP32 accumulators
+    torch.testing.assert_close(results[True], results[False], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(results[None], results[True], rtol=1e-4, atol=1e-4)
+    # the workspace of a direct binding has no FP32 accumulators; dkv_direct sizes it the same way
     T, device = inp.total_q, torch.device("cuda")
     plain = dsa_train_workspace_size(T, S, 128, device)
+    direct_size = dsa_train_workspace_size(T, S, 128, device, dkv_acc=True)
+    assert plain - direct_size >= S * D_QK * 4
     assert (
-        plain - dsa_train_workspace_size(T, S, 128, device, dkv_acc=True)
-        >= S * D_QK * 4
+        dsa_train_workspace_size(T, S, 128, device, dkv_acc=True, dkv_direct=False)
+        == plain
+    )
+    assert (
+        dsa_train_workspace_size(T, S, 128, device, dkv_acc=True, dkv_direct=True)
+        == direct_size
     )
     # S < 4 T keeps the cast path by the rule
     assert not cake_backend.plan_dkv_direct(record, stages, 1000, 3999, accumulate=True)
