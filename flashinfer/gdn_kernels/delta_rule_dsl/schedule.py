@@ -19,6 +19,15 @@ class WorkDesc:
     # update by mainloop
     tile_idx: cutlass.Int32
 
+    # Which slice of the value dimension this block owns, when the state's V
+    # rows are split across blocks. Zero, and the only value, when a block owns
+    # the whole state -- which is every kernel here but the sm_80 one.
+    v_slice_idx: cutlass.Int32 = 0
+
+    def v_row_offset(self, d_v: cutlass.Constexpr):
+        """First V row this block owns, in elements."""
+        return self.v_slice_idx * cutlass.Int32(d_v)
+
     def is_valid(self, num_seqs: cutlass.Int32):
         return self.seq_idx >= cutlass.Int32(0) and self.seq_idx < num_seqs
 
