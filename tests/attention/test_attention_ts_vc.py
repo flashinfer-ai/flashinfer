@@ -372,7 +372,6 @@ def _relative_error(out: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 @_REQUIRES_CONTEXT_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
 def test_vc_attention_matches_dequantized_reference(case: _VCCase):
     out, reference, exact = _run_case(case)
@@ -386,7 +385,6 @@ def test_vc_attention_matches_dequantized_reference(case: _VCCase):
 
 
 @_REQUIRES_CONTEXT_GPU
-@pytest.mark.arch_blackwell
 def test_vc_mean_step():
     """A constant tile mean shifts every output by exactly that constant. A plan
     with demean off equals the means plan fed zero tile means and differs from a
@@ -634,7 +632,6 @@ def test_vc_hadamard_is_orthonormal_and_qk_invariant():
 
 
 @_REQUIRES_CONTEXT_GPU
-@pytest.mark.arch_blackwell
 def test_vc_preprocessor_step_schedule():
     """First 25% of steps: grouping + demeaning (refreshed every 4 steps); afterwards demeaning
     is off and the permutation the window left behind is kept (paper Section 3.4)."""
