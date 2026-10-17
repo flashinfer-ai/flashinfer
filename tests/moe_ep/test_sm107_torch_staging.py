@@ -169,6 +169,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     )
     ws = object.__new__(Sm107BlockScaledSymmBuffer)
     ws.config = cfg
+    # The dummy kernel retains launch-side clearing of invalid combine slots.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws.device = torch.device("cuda", torch.cuda.current_device())
     ws._destroyed = False
     ws._launch_key = None

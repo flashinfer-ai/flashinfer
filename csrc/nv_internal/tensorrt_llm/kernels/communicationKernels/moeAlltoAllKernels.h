@@ -253,6 +253,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 
+// True when combine and output block quantization run as one launch, so the caller must not
+// allocate the BF16/FP16 accumulation_data intermediate. The trtllm backend always returns false.
+bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params);
+
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)
 // recv_counters: [ep_size] (int32), number of valid tokens per source

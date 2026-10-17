@@ -58,6 +58,7 @@ test_input_validation         — 1-D logits / non-int32 seq_lens rejected
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 try:
     import flashinfer
@@ -200,17 +201,19 @@ def _radix_ctas(N, dtype, batch_size):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
-        (torch.float32, 2048),
-    ],
+@parametrize_product(
+    {
+        "dtype,top_k": [
+            (torch.bfloat16, 512),
+            (torch.bfloat16, 1024),
+            (torch.float16, 1024),
+            (torch.float32, 2048),
+        ],
+        "N": [4096, 32768],
+        "batch_size": [1, 32],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("N", [4096, 32768])
-@pytest.mark.parametrize("batch_size", [1, 32])
 def test_basic_decode(dtype, top_k, N, batch_size):
     """top_k_varlen with pre_idx: works on Blackwell (GVR) and any GPU (radix)."""
     if not torch.cuda.is_available():
@@ -237,8 +240,13 @@ def test_basic_decode(dtype, top_k, N, batch_size):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float16, torch.float32],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_return_values(dtype, top_k):
     """Returned values must equal logits[row, indices]."""
     N, batch_size = 8192, 4
@@ -265,9 +273,14 @@ def test_return_values(dtype, top_k):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
-@pytest.mark.parametrize("batch_size", [2, 16])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float32],
+        "top_k": [512, 1024],
+        "batch_size": [2, 16],
+    },
+    regular=pairwise_product_cases,
+)
 def test_next_n(dtype, top_k, batch_size):
     """next_n=2: two rows share one pre_idx / seq_len entry."""
     next_n, N = 2, 8192
@@ -292,8 +305,13 @@ def test_next_n(dtype, top_k, batch_size):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_compress_ratio(dtype, top_k):
     """compress_ratio=4: seq_lens in uncompressed-token space."""
     compress_ratio, N, batch_size = 4, 4096, 8
@@ -437,8 +455,13 @@ def test_skip_check_auto_backend():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float16, torch.float32],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_cutlass_return_values(dtype, top_k):
     """radix_cutlass backend: returned values must equal logits[row, indices]."""
     N, batch_size = 8192, 4
@@ -465,9 +488,14 @@ def test_radix_cutlass_return_values(dtype, top_k):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
-@pytest.mark.parametrize("batch_size", [2, 16])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float32],
+        "top_k": [512, 1024],
+        "batch_size": [2, 16],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_cutlass_next_n(dtype, top_k, batch_size):
     """radix_cutlass backend: next_n=2 — two rows share one seq_len entry."""
     next_n, N = 2, 8192
@@ -485,8 +513,13 @@ def test_radix_cutlass_next_n(dtype, top_k, batch_size):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_cutlass_compress_ratio(dtype, top_k):
     """radix_cutlass backend: compress_ratio=4 — seq_lens in uncompressed-token space."""
     compress_ratio, N, batch_size = 4, 4096, 8
@@ -795,16 +828,18 @@ def test_auto_gvr_knobs_shape_aware():
 
 
 @requires_blackwell
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
-        (torch.float32, 2048),
-    ],
+@parametrize_product(
+    {
+        "dtype,top_k": [
+            (torch.bfloat16, 512),
+            (torch.bfloat16, 1024),
+            (torch.float16, 1024),
+            (torch.float32, 2048),
+        ],
+        "batch_size": [1, 8],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("batch_size", [1, 8])
 def test_radix_basic(dtype, top_k, batch_size):
     """radix (CuTe DSL) single-CTA correctness across dtype/K/batch."""
     N = 8192  # < max_chunk for all dtypes -> single-CTA
@@ -846,9 +881,77 @@ def test_radix_multi_cta_regime(dtype, top_k, N, batch_size):
     _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+def test_multi_cta_row_states_not_shared_across_streams(backend):
+    """Concurrent multi-CTA varlen calls keep row-state scratch disjoint."""
+    device = torch.device("cuda")
+    if backend == "radix":
+        major, minor = get_compute_capability(device)
+        if not (
+            flashinfer.top_k_varlen.is_backend_supported("radix", major * 10 + minor)
+            and is_cute_dsl_available()
+        ):
+            pytest.skip("radix backend requires Blackwell+ CuTe DSL")
+
+    dtype, top_k, N = torch.float32, 512, 65536
+    if backend == "radix":
+        assert _radix_ctas(N, dtype, 1) > 1
+    seq_lens = torch.full((1,), N, dtype=torch.int32, device=device)
+    base = torch.arange(N, dtype=dtype, device=device)
+    logits_a = base.unsqueeze(0).contiguous()
+    logits_b = (-base).unsqueeze(0).contiguous()
+
+    def run(logits):
+        return flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            top_k,
+            backend=backend,
+            return_values=True,
+        )
+
+    # Warm JIT and references on the default stream before concurrent launches.
+    ref_a = run(logits_a)
+    ref_b = run(logits_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    outs_a, outs_b = [], []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(run(logits_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(run(logits_b))
+    torch.cuda.synchronize()
+
+    def assert_matches(actual, expected):
+        actual_i, actual_v = actual
+        expected_i, expected_v = expected
+        actual_order = actual_i.argsort(dim=-1)
+        expected_order = expected_i.argsort(dim=-1)
+        actual_i = torch.gather(actual_i, 1, actual_order)
+        actual_v = torch.gather(actual_v, 1, actual_order)
+        expected_i = torch.gather(expected_i, 1, expected_order)
+        expected_v = torch.gather(expected_v, 1, expected_order)
+        assert torch.equal(actual_i, expected_i)
+        torch.testing.assert_close(actual_v, expected_v)
+
+    for out in outs_a:
+        assert_matches(out, ref_a)
+    for out in outs_b:
+        assert_matches(out, ref_b)
+
+
 @requires_blackwell
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k", [512, 1024])
+@parametrize_product(
+    {
+        "dtype": [torch.bfloat16, torch.float32],
+        "top_k": [512, 1024],
+    },
+    regular=pairwise_product_cases,
+)
 def test_radix_next_n(dtype, top_k):
     """radix backend: next_n=2 (two rows share one seq_len entry)."""
     next_n, N, batch_size = 2, 8192, 8
@@ -1331,7 +1434,9 @@ def test_backend_heuristic_priority():
             if hinted
             else None
         )
-        return _top_k_varlen_heuristic(suitable, logits, seq_lens, top_k, pre_idx)
+        return _top_k_varlen_heuristic(
+            suitable, logits, seq_lens, top_k, pre_idx=pre_idx
+        )
 
     assert order_k(all5, 16, 32768, 512, False)[0] == "gvr_2"
     assert order_k(all5, 1, 4096, 1024, False)[0] == "gvr_2"

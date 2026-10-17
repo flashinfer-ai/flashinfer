@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     nvfp4_global_decode_scale_te,
@@ -132,6 +133,33 @@ def unswizzle_sf(
     sf_unswizzle = sf_unswizzle.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
     sf_unswizzle_sliced = sf_unswizzle[:row, : (col // scaling_vector_size)]
     return sf_unswizzle_sliced.contiguous()
+
+
+@pytest.mark.parametrize("shape", [(17, 5), (128, 4), (2, 129, 7)])
+@torch.inference_mode()
+def test_block_scale_interleave_out_graph(shape):
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("requires FP4 block-scale interleave support")
+    source = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
+    reference = block_scale_interleave(source)
+    output = torch.empty_like(reference)
+    assert block_scale_interleave(source, out=output) is output
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        block_scale_interleave(source, out=output)
+    for _ in range(3):
+        source.random_(0, 256)
+        output.fill_(0)
+        graph.replay()
+        expected = block_scale_interleave(source)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="contiguous flat tensor"):
+        block_scale_interleave(source, out=output[:-1])
+    with pytest.raises(ValueError, match="contiguous flat tensor"):
+        block_scale_interleave(source, out=output.view(1, -1))
+    with pytest.raises(ValueError, match="contiguous flat tensor"):
+        block_scale_interleave(source, out=output.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("backend", FP4_BACKENDS)
@@ -714,6 +742,13 @@ NVFP4_TE_REFERENCE_CONFIGS = [
         err_use_fast_math=True,
     ),
 ]
+
+
+def _nvfp4_te_reference_case_id(case) -> str:
+    config = case[5]
+    return "nvfp4" if config is None else config.id
+
+
 NVFP4_DEFAULT_4OVER6_CONFIGS = [
     None,
     NVFP44Over6TestConfig(
@@ -825,18 +860,20 @@ def set_nvfp4_quant_env():
             os.environ[name] = value
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("shape", NVFP4_SHAPES)
-@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
-@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
-@pytest.mark.parametrize("per_token_activation", [False, True])
-@pytest.mark.parametrize(
-    "nvfp4_4over6_config",
-    NVFP4_TE_REFERENCE_CONFIGS,
-    ids=lambda config: "nvfp4" if config is None else config.id,
+@parametrize_product(
+    {
+        "dtype": DTYPES,
+        "shape": NVFP4_SHAPES,
+        "sf_layout": NVFP4_SF_LAYOUTS,
+        "init_data": ["random", "boundary", "zeros", "maxes"],
+        "per_token_activation": [False, True],
+        "nvfp4_4over6_config": NVFP4_TE_REFERENCE_CONFIGS,
+        "backend": NVFP4_BACKENDS,
+        "device": CUDA_DEVICES,
+    },
+    regular=pairwise_product_cases,
+    ids=_nvfp4_te_reference_case_id,
 )
-@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_te_reference(
     backend: str,

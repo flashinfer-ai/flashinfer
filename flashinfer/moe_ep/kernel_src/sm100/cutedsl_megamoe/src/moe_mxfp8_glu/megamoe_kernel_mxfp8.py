@@ -449,6 +449,9 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                 16,
             ),
         ]
+        # Bound CTA0's scan to decode capacities; prefill keeps full-grid routing.
+        if self.max_tokens_per_rank <= 1024:
+            specs.append(_RegionSpec("dispatch_route_extent", cutlass.Int32, (2,), 16))
         if self.token_back_enabled:
             specs.append(
                 _RegionSpec(
@@ -996,6 +999,10 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             grid_sync_counter=grid_sync_counter,
             local_zero_prefix=local_zero_prefix,
             shared_zero_prefix=shared_zero_prefix,
+            dispatch_route_extent=(
+                self._view_local(local_workspace, "dispatch_route_extent")
+                if cutlass.const_expr(self.max_tokens_per_rank <= 1024) else None
+            ),
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
             world_size=self.world_size,
             local_rank=peer_rank_ptr_mapper_host.rank_idx,
@@ -1048,12 +1055,18 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                 self.num_topk,
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
+                num_experts=self.num_total_experts,
             )(
                 combine_target,
                 combine_sf,
                 output_activation,
                 score,
                 stream,
+                topk_indices=(
+                    topk_idx
+                    if cutlass.const_expr(not self.combine_format.is_quantized)
+                    else None
+                ),
             )
 
     # =========================================================================

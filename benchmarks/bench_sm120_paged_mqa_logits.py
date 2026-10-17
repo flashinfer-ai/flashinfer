@@ -15,7 +15,10 @@
 
 Sweeps decode points on the current SM120a device and reports the CUPTI kernel
 time of one ``plan.run()`` (cold L2; both kernels of the sequence) with the
-effective fused-KV stream rate and the MMA rate.
+effective fused-KV stream rate and the MMA rate.  The printed route carries the
+Q-atom variant the batch selected (``...:n5:a5``); the default batch sweep
+(8, 64, 128) reaches every shipped variant, including the 64-head next_n 5/6
+two-atom schedule that starts at batch 128.
 
 Examples:
     python benchmarks/bench_sm120_paged_mqa_logits.py
@@ -69,8 +72,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--heads", nargs="+", type=int, default=[32, 64])
     parser.add_argument("--page-kv", nargs="+", type=int, default=[128, 64])
-    parser.add_argument("--next-n", nargs="+", type=int, default=[1, 2, 4])
-    parser.add_argument("--batch", nargs="+", type=int, default=[8, 64])
+    parser.add_argument("--next-n", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
+    parser.add_argument("--batch", nargs="+", type=int, default=[8, 64, 128])
     parser.add_argument("--context", nargs="+", type=int, default=[4096, 16384])
     parser.add_argument("--repeat-ms", type=int, default=200)
     args = parser.parse_args()
@@ -91,6 +94,10 @@ def main():
                 if not sm120_paged_mqa.route_available(heads, page_kv, next_n):
                     continue
                 for batch in args.batch:
+                    if not sm120_paged_mqa.route_available(
+                        heads, page_kv, next_n, batch
+                    ):
+                        continue
                     for context in args.context:
                         operands = make_inputs(
                             heads, page_kv, next_n, batch, context, device

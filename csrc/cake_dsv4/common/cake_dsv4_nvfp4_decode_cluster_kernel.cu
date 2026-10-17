@@ -103,8 +103,8 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_out, __nv_bfloat16* __restrict__ q_rows, uint8_t* __restrict__ main_cache, uint8_t* __restrict__ extra_cache, int* __restrict__ main_indices, int* __restrict__ extra_indices, int* __restrict__ main_lengths, int* __restrict__ extra_lengths, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_head_tiles, int num_splits, int num_main_tiles, int tiles_per_split, int total_tiles, int main_width, int extra_width, int main_index_stride, int extra_index_stride, int has_main_lengths, int has_extra_lengths, int main_page_shift, int extra_page_shift, long long main_page_stride, long long extra_page_stride, int has_sinks, float lse_partial_scale, float lse_scale)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_dsv4_nvfp4_572e282d4df344038ffc(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_out, __nv_bfloat16* __restrict__ q_rows, uint8_t* __restrict__ main_cache, uint8_t* __restrict__ extra_cache, int* __restrict__ main_indices, int* __restrict__ extra_indices, int* __restrict__ main_lengths, int* __restrict__ extra_lengths, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_head_tiles, int num_splits, int num_main_tiles, int tiles_per_split, int total_tiles, int main_width, int extra_width, int main_index_stride, int extra_index_stride, int has_main_lengths, int has_extra_lengths, int main_page_shift, int extra_page_shift, long long main_page_stride, long long extra_page_stride, int has_sinks, float lse_partial_scale, float lse_scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -153,52 +153,52 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    uint8_t* smem_qf4 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_qf4_addr = smem + 1024;
-    uint8_t* smem_qsf = reinterpret_cast<uint8_t*>(smem_raw + 33792);
-    const int smem_qsf_addr = smem + 33792;
-    unsigned int* smem_qsf32 = reinterpret_cast<unsigned int*>(smem_raw + 33792);
-    const int smem_qsf32_addr = smem + 33792;
-    __nv_bfloat16* smem_qrope = reinterpret_cast<__nv_bfloat16*>(smem_raw + 37888);
-    const int smem_qrope_addr = smem + 37888;
-    __nv_bfloat16* smem_qstage = reinterpret_cast<__nv_bfloat16*>(smem_raw + 107520);
-    const int smem_qstage_addr = smem + 107520;
-    uint8_t* smem_v5 = reinterpret_cast<uint8_t*>(smem_raw + 54272);
-    const int smem_v5_addr = smem + 54272;
-    uint8_t* smem_v6 = reinterpret_cast<uint8_t*>(smem_raw + 87040);
-    const int smem_v6_addr = smem + 87040;
-    unsigned int* smem_v7 = reinterpret_cast<unsigned int*>(smem_raw + 87040);
-    const int smem_v7_addr = smem + 87040;
-    __nv_bfloat16* smem_v8 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 91136);
-    const int smem_v8_addr = smem + 91136;
-    uint8_t* smem_v9 = reinterpret_cast<uint8_t*>(smem_raw + 91136);
-    const int smem_v9_addr = smem + 91136;
-    uint8_t* smem_v10 = reinterpret_cast<uint8_t*>(smem_raw + 173056);
-    const int smem_v10_addr = smem + 173056;
-    uint8_t* smem_v11 = reinterpret_cast<uint8_t*>(smem_raw + 205824);
-    const int smem_v11_addr = smem + 205824;
-    unsigned int* smem_v12 = reinterpret_cast<unsigned int*>(smem_raw + 205824);
-    const int smem_v12_addr = smem + 205824;
-    __nv_bfloat16* smem_v13 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 209920);
-    const int smem_v13_addr = smem + 209920;
-    uint8_t* smem_v14 = reinterpret_cast<uint8_t*>(smem_raw + 209920);
-    const int smem_v14_addr = smem + 209920;
-    unsigned int* smem_kzone32 = reinterpret_cast<unsigned int*>(smem_raw + 54272);
-    const int smem_kzone32_addr = smem + 54272;
-    uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + 107520);
-    const int smem_v_addr = smem + 107520;
-    uint8_t* smem_ones = reinterpret_cast<uint8_t*>(smem_raw + 226304);
-    const int smem_ones_addr = smem + 226304;
-    unsigned int* smem_ones32 = reinterpret_cast<unsigned int*>(smem_raw + 226304);
-    const int smem_ones32_addr = smem + 226304;
-    unsigned int* smem_mask = reinterpret_cast<unsigned int*>(smem_raw + 228864);
-    const int smem_mask_addr = smem + 228864;
-    int* smem_tok = reinterpret_cast<int*>(smem_raw + 228352);
-    const int smem_tok_addr = smem + 228352;
-    float* smem_pmax = reinterpret_cast<float*>(smem_raw + 228928);
-    const int smem_pmax_addr = smem + 228928;
-    float* smem_psum = reinterpret_cast<float*>(smem_raw + 230464);
-    const int smem_psum_addr = smem + 230464;
+    uint8_t* smem_qf4 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QF4_OFF);
+    const int smem_qf4_addr = smem + SMEM_SMEM_QF4_OFF;
+    uint8_t* smem_qsf = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QSF_OFF);
+    const int smem_qsf_addr = smem + SMEM_SMEM_QSF_OFF;
+    unsigned int* smem_qsf32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_QSF32_OFF);
+    const int smem_qsf32_addr = smem + SMEM_SMEM_QSF32_OFF;
+    __nv_bfloat16* smem_qrope = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QROPE_OFF);
+    const int smem_qrope_addr = smem + SMEM_SMEM_QROPE_OFF;
+    __nv_bfloat16* smem_qstage = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QSTAGE_OFF);
+    const int smem_qstage_addr = smem + SMEM_SMEM_QSTAGE_OFF;
+    uint8_t* smem_v5 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V5_OFF);
+    const int smem_v5_addr = smem + SMEM_SMEM_V5_OFF;
+    uint8_t* smem_v6 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V6_OFF);
+    const int smem_v6_addr = smem + SMEM_SMEM_V6_OFF;
+    unsigned int* smem_v7 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_V7_OFF);
+    const int smem_v7_addr = smem + SMEM_SMEM_V7_OFF;
+    __nv_bfloat16* smem_v8 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_V8_OFF);
+    const int smem_v8_addr = smem + SMEM_SMEM_V8_OFF;
+    uint8_t* smem_v9 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V9_OFF);
+    const int smem_v9_addr = smem + SMEM_SMEM_V9_OFF;
+    uint8_t* smem_v10 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V10_OFF);
+    const int smem_v10_addr = smem + SMEM_SMEM_V10_OFF;
+    uint8_t* smem_v11 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V11_OFF);
+    const int smem_v11_addr = smem + SMEM_SMEM_V11_OFF;
+    unsigned int* smem_v12 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_V12_OFF);
+    const int smem_v12_addr = smem + SMEM_SMEM_V12_OFF;
+    __nv_bfloat16* smem_v13 = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_V13_OFF);
+    const int smem_v13_addr = smem + SMEM_SMEM_V13_OFF;
+    uint8_t* smem_v14 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V14_OFF);
+    const int smem_v14_addr = smem + SMEM_SMEM_V14_OFF;
+    unsigned int* smem_kzone32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_KZONE32_OFF);
+    const int smem_kzone32_addr = smem + SMEM_SMEM_KZONE32_OFF;
+    uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V_OFF);
+    const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
+    uint8_t* smem_ones = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_ONES_OFF);
+    const int smem_ones_addr = smem + SMEM_SMEM_ONES_OFF;
+    unsigned int* smem_ones32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_ONES32_OFF);
+    const int smem_ones32_addr = smem + SMEM_SMEM_ONES32_OFF;
+    unsigned int* smem_mask = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_MASK_OFF);
+    const int smem_mask_addr = smem + SMEM_SMEM_MASK_OFF;
+    int* smem_tok = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TOK_OFF);
+    const int smem_tok_addr = smem + SMEM_SMEM_TOK_OFF;
+    float* smem_pmax = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_PMAX_OFF);
+    const int smem_pmax_addr = smem + SMEM_SMEM_PMAX_OFF;
+    float* smem_psum = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_PSUM_OFF);
+    const int smem_psum_addr = smem + SMEM_SMEM_PSUM_OFF;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_out))) : "memory");
 
@@ -883,16 +883,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                     unsigned int scale = sf_word_1 >> (unsigned int)(8 * ((c & 1) * 2)) & 255;
                     unsigned int v8[4];
                     {
-                        v8[0] = cake_dsv4_qmul4_portable<5>(raw[0], scale);
+                        v8[0] = cake_dsv4_qmul4<5>(raw[0], scale);
                     }
                     {
-                        v8[1] = cake_dsv4_qmul4_portable<6>(raw[0], scale);
+                        v8[1] = cake_dsv4_qmul4<6>(raw[0], scale);
                     }
                     {
-                        v8[2] = cake_dsv4_qmul4_portable<5>(raw[1], scale);
+                        v8[2] = cake_dsv4_qmul4<5>(raw[1], scale);
                     }
                     {
-                        v8[3] = cake_dsv4_qmul4_portable<6>(raw[1], scale);
+                        v8[3] = cake_dsv4_qmul4<6>(raw[1], scale);
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                         "r"(vbase + (c - vrank8) / 4 * 16384 + (row * 128 + (2 * c % 8 * 16 ^ row % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8[0])), "r"(*reinterpret_cast<uint32_t*>(&v8[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8[(0) + 3])));
@@ -900,16 +900,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                     unsigned int scale_1 = sf_word_1 >> (unsigned int)(8 * ((c & 1) * 2 + 1)) & 255;
                     unsigned int v8_2[4];
                     {
-                        v8_2[0] = cake_dsv4_qmul4_portable<5>(raw[2], scale_1);
+                        v8_2[0] = cake_dsv4_qmul4<5>(raw[2], scale_1);
                     }
                     {
-                        v8_2[1] = cake_dsv4_qmul4_portable<6>(raw[2], scale_1);
+                        v8_2[1] = cake_dsv4_qmul4<6>(raw[2], scale_1);
                     }
                     {
-                        v8_2[2] = cake_dsv4_qmul4_portable<5>(raw[3], scale_1);
+                        v8_2[2] = cake_dsv4_qmul4<5>(raw[3], scale_1);
                     }
                     {
-                        v8_2[3] = cake_dsv4_qmul4_portable<6>(raw[3], scale_1);
+                        v8_2[3] = cake_dsv4_qmul4<6>(raw[3], scale_1);
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                         "r"(vbase + (c - vrank8) / 4 * 16384 + (row * 128 + ((2 * c + 1) % 8 * 16 ^ row % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_2[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_2[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_2[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_2[(0) + 3])));
@@ -1655,16 +1655,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                             unsigned int scale_2 = sf_word_2 >> (unsigned int)(8 * ((c_3 & 1) * 2)) & 255;
                             unsigned int v8_1[4];
                             {
-                                v8_1[0] = cake_dsv4_qmul4_portable<5>(raw_1[0], scale_2);
+                                v8_1[0] = cake_dsv4_qmul4<5>(raw_1[0], scale_2);
                             }
                             {
-                                v8_1[1] = cake_dsv4_qmul4_portable<6>(raw_1[0], scale_2);
+                                v8_1[1] = cake_dsv4_qmul4<6>(raw_1[0], scale_2);
                             }
                             {
-                                v8_1[2] = cake_dsv4_qmul4_portable<5>(raw_1[1], scale_2);
+                                v8_1[2] = cake_dsv4_qmul4<5>(raw_1[1], scale_2);
                             }
                             {
-                                v8_1[3] = cake_dsv4_qmul4_portable<6>(raw_1[1], scale_2);
+                                v8_1[3] = cake_dsv4_qmul4<6>(raw_1[1], scale_2);
                             }
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                                 "r"(vbase + (c_3 - vrank8_7) / 4 * 16384 + (row * 128 + (2 * c_3 % 8 * 16 ^ row % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_1[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_1[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_1[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_1[(0) + 3])));
@@ -1672,16 +1672,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                             unsigned int scale_1_1 = sf_word_2 >> (unsigned int)(8 * ((c_3 & 1) * 2 + 1)) & 255;
                             unsigned int v8_2_1[4];
                             {
-                                v8_2_1[0] = cake_dsv4_qmul4_portable<5>(raw_1[2], scale_1_1);
+                                v8_2_1[0] = cake_dsv4_qmul4<5>(raw_1[2], scale_1_1);
                             }
                             {
-                                v8_2_1[1] = cake_dsv4_qmul4_portable<6>(raw_1[2], scale_1_1);
+                                v8_2_1[1] = cake_dsv4_qmul4<6>(raw_1[2], scale_1_1);
                             }
                             {
-                                v8_2_1[2] = cake_dsv4_qmul4_portable<5>(raw_1[3], scale_1_1);
+                                v8_2_1[2] = cake_dsv4_qmul4<5>(raw_1[3], scale_1_1);
                             }
                             {
-                                v8_2_1[3] = cake_dsv4_qmul4_portable<6>(raw_1[3], scale_1_1);
+                                v8_2_1[3] = cake_dsv4_qmul4<6>(raw_1[3], scale_1_1);
                             }
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                                 "r"(vbase + (c_3 - vrank8_7) / 4 * 16384 + (row * 128 + ((2 * c_3 + 1) % 8 * 16 ^ row % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_2_1[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_1[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_1[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_1[(0) + 3])));
@@ -2567,16 +2567,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                     unsigned int scale_3 = sf_word_4 >> (unsigned int)(8 * ((c_6 & 1) * 2)) & 255;
                     unsigned int v8_3[4];
                     {
-                        v8_3[0] = cake_dsv4_qmul4_portable<5>(raw_2[0], scale_3);
+                        v8_3[0] = cake_dsv4_qmul4<5>(raw_2[0], scale_3);
                     }
                     {
-                        v8_3[1] = cake_dsv4_qmul4_portable<6>(raw_2[0], scale_3);
+                        v8_3[1] = cake_dsv4_qmul4<6>(raw_2[0], scale_3);
                     }
                     {
-                        v8_3[2] = cake_dsv4_qmul4_portable<5>(raw_2[1], scale_3);
+                        v8_3[2] = cake_dsv4_qmul4<5>(raw_2[1], scale_3);
                     }
                     {
-                        v8_3[3] = cake_dsv4_qmul4_portable<6>(raw_2[1], scale_3);
+                        v8_3[3] = cake_dsv4_qmul4<6>(raw_2[1], scale_3);
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                         "r"(vbase_1 + (c_6 - vrank8_1) / 4 * 16384 + (row_1 * 128 + (2 * c_6 % 8 * 16 ^ row_1 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_3[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_3[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_3[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_3[(0) + 3])));
@@ -2584,16 +2584,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                     unsigned int scale_1_2 = sf_word_4 >> (unsigned int)(8 * ((c_6 & 1) * 2 + 1)) & 255;
                     unsigned int v8_2_2[4];
                     {
-                        v8_2_2[0] = cake_dsv4_qmul4_portable<5>(raw_2[2], scale_1_2);
+                        v8_2_2[0] = cake_dsv4_qmul4<5>(raw_2[2], scale_1_2);
                     }
                     {
-                        v8_2_2[1] = cake_dsv4_qmul4_portable<6>(raw_2[2], scale_1_2);
+                        v8_2_2[1] = cake_dsv4_qmul4<6>(raw_2[2], scale_1_2);
                     }
                     {
-                        v8_2_2[2] = cake_dsv4_qmul4_portable<5>(raw_2[3], scale_1_2);
+                        v8_2_2[2] = cake_dsv4_qmul4<5>(raw_2[3], scale_1_2);
                     }
                     {
-                        v8_2_2[3] = cake_dsv4_qmul4_portable<6>(raw_2[3], scale_1_2);
+                        v8_2_2[3] = cake_dsv4_qmul4<6>(raw_2[3], scale_1_2);
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                         "r"(vbase_1 + (c_6 - vrank8_1) / 4 * 16384 + (row_1 * 128 + ((2 * c_6 + 1) % 8 * 16 ^ row_1 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_2_2[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_2[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_2[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_2[(0) + 3])));
@@ -3382,16 +3382,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                             unsigned int scale_4 = sf_word_5 >> (unsigned int)(8 * ((c_9 & 1) * 2)) & 255;
                             unsigned int v8_4[4];
                             {
-                                v8_4[0] = cake_dsv4_qmul4_portable<5>(raw_3[0], scale_4);
+                                v8_4[0] = cake_dsv4_qmul4<5>(raw_3[0], scale_4);
                             }
                             {
-                                v8_4[1] = cake_dsv4_qmul4_portable<6>(raw_3[0], scale_4);
+                                v8_4[1] = cake_dsv4_qmul4<6>(raw_3[0], scale_4);
                             }
                             {
-                                v8_4[2] = cake_dsv4_qmul4_portable<5>(raw_3[1], scale_4);
+                                v8_4[2] = cake_dsv4_qmul4<5>(raw_3[1], scale_4);
                             }
                             {
-                                v8_4[3] = cake_dsv4_qmul4_portable<6>(raw_3[1], scale_4);
+                                v8_4[3] = cake_dsv4_qmul4<6>(raw_3[1], scale_4);
                             }
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                                 "r"(vbase_1 + (c_9 - vrank8_7_1) / 4 * 16384 + (row_1 * 128 + (2 * c_9 % 8 * 16 ^ row_1 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_4[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_4[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_4[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_4[(0) + 3])));
@@ -3399,16 +3399,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                             unsigned int scale_1_3 = sf_word_5 >> (unsigned int)(8 * ((c_9 & 1) * 2 + 1)) & 255;
                             unsigned int v8_2_3[4];
                             {
-                                v8_2_3[0] = cake_dsv4_qmul4_portable<5>(raw_3[2], scale_1_3);
+                                v8_2_3[0] = cake_dsv4_qmul4<5>(raw_3[2], scale_1_3);
                             }
                             {
-                                v8_2_3[1] = cake_dsv4_qmul4_portable<6>(raw_3[2], scale_1_3);
+                                v8_2_3[1] = cake_dsv4_qmul4<6>(raw_3[2], scale_1_3);
                             }
                             {
-                                v8_2_3[2] = cake_dsv4_qmul4_portable<5>(raw_3[3], scale_1_3);
+                                v8_2_3[2] = cake_dsv4_qmul4<5>(raw_3[3], scale_1_3);
                             }
                             {
-                                v8_2_3[3] = cake_dsv4_qmul4_portable<6>(raw_3[3], scale_1_3);
+                                v8_2_3[3] = cake_dsv4_qmul4<6>(raw_3[3], scale_1_3);
                             }
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                                 "r"(vbase_1 + (c_9 - vrank8_7_1) / 4 * 16384 + (row_1 * 128 + ((2 * c_9 + 1) % 8 * 16 ^ row_1 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_2_3[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_3[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_3[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_3[(0) + 3])));
@@ -4263,16 +4263,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                     unsigned int scale_5 = sf_word_7 >> (unsigned int)(8 * ((c_12 & 1) * 2)) & 255;
                     unsigned int v8_5[4];
                     {
-                        v8_5[0] = cake_dsv4_qmul4_portable<5>(raw_4[0], scale_5);
+                        v8_5[0] = cake_dsv4_qmul4<5>(raw_4[0], scale_5);
                     }
                     {
-                        v8_5[1] = cake_dsv4_qmul4_portable<6>(raw_4[0], scale_5);
+                        v8_5[1] = cake_dsv4_qmul4<6>(raw_4[0], scale_5);
                     }
                     {
-                        v8_5[2] = cake_dsv4_qmul4_portable<5>(raw_4[1], scale_5);
+                        v8_5[2] = cake_dsv4_qmul4<5>(raw_4[1], scale_5);
                     }
                     {
-                        v8_5[3] = cake_dsv4_qmul4_portable<6>(raw_4[1], scale_5);
+                        v8_5[3] = cake_dsv4_qmul4<6>(raw_4[1], scale_5);
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                         "r"(vbase_2 + (c_12 - vrank8_2) / 4 * 16384 + (row_2 * 128 + (2 * c_12 % 8 * 16 ^ row_2 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_5[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_5[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_5[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_5[(0) + 3])));
@@ -4280,16 +4280,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                     unsigned int scale_1_4 = sf_word_7 >> (unsigned int)(8 * ((c_12 & 1) * 2 + 1)) & 255;
                     unsigned int v8_2_4[4];
                     {
-                        v8_2_4[0] = cake_dsv4_qmul4_portable<5>(raw_4[2], scale_1_4);
+                        v8_2_4[0] = cake_dsv4_qmul4<5>(raw_4[2], scale_1_4);
                     }
                     {
-                        v8_2_4[1] = cake_dsv4_qmul4_portable<6>(raw_4[2], scale_1_4);
+                        v8_2_4[1] = cake_dsv4_qmul4<6>(raw_4[2], scale_1_4);
                     }
                     {
-                        v8_2_4[2] = cake_dsv4_qmul4_portable<5>(raw_4[3], scale_1_4);
+                        v8_2_4[2] = cake_dsv4_qmul4<5>(raw_4[3], scale_1_4);
                     }
                     {
-                        v8_2_4[3] = cake_dsv4_qmul4_portable<6>(raw_4[3], scale_1_4);
+                        v8_2_4[3] = cake_dsv4_qmul4<6>(raw_4[3], scale_1_4);
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                         "r"(vbase_2 + (c_12 - vrank8_2) / 4 * 16384 + (row_2 * 128 + ((2 * c_12 + 1) % 8 * 16 ^ row_2 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_2_4[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_4[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_4[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_4[(0) + 3])));
@@ -4867,16 +4867,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                             unsigned int scale_6 = sf_word_8 >> (unsigned int)(8 * ((c_14 & 1) * 2)) & 255;
                             unsigned int v8_6[4];
                             {
-                                v8_6[0] = cake_dsv4_qmul4_portable<5>(raw_5[0], scale_6);
+                                v8_6[0] = cake_dsv4_qmul4<5>(raw_5[0], scale_6);
                             }
                             {
-                                v8_6[1] = cake_dsv4_qmul4_portable<6>(raw_5[0], scale_6);
+                                v8_6[1] = cake_dsv4_qmul4<6>(raw_5[0], scale_6);
                             }
                             {
-                                v8_6[2] = cake_dsv4_qmul4_portable<5>(raw_5[1], scale_6);
+                                v8_6[2] = cake_dsv4_qmul4<5>(raw_5[1], scale_6);
                             }
                             {
-                                v8_6[3] = cake_dsv4_qmul4_portable<6>(raw_5[1], scale_6);
+                                v8_6[3] = cake_dsv4_qmul4<6>(raw_5[1], scale_6);
                             }
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                                 "r"(vbase_2 + (c_14 - vrank8_7_2) / 4 * 16384 + (row_2 * 128 + (2 * c_14 % 8 * 16 ^ row_2 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_6[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_6[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_6[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_6[(0) + 3])));
@@ -4884,16 +4884,16 @@ kernel_cake_dsv4_nvfp4_0fc858522745282a7f38(const __grid_constant__ CUtensorMap 
                             unsigned int scale_1_5 = sf_word_8 >> (unsigned int)(8 * ((c_14 & 1) * 2 + 1)) & 255;
                             unsigned int v8_2_5[4];
                             {
-                                v8_2_5[0] = cake_dsv4_qmul4_portable<5>(raw_5[2], scale_1_5);
+                                v8_2_5[0] = cake_dsv4_qmul4<5>(raw_5[2], scale_1_5);
                             }
                             {
-                                v8_2_5[1] = cake_dsv4_qmul4_portable<6>(raw_5[2], scale_1_5);
+                                v8_2_5[1] = cake_dsv4_qmul4<6>(raw_5[2], scale_1_5);
                             }
                             {
-                                v8_2_5[2] = cake_dsv4_qmul4_portable<5>(raw_5[3], scale_1_5);
+                                v8_2_5[2] = cake_dsv4_qmul4<5>(raw_5[3], scale_1_5);
                             }
                             {
-                                v8_2_5[3] = cake_dsv4_qmul4_portable<6>(raw_5[3], scale_1_5);
+                                v8_2_5[3] = cake_dsv4_qmul4<6>(raw_5[3], scale_1_5);
                             }
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                                 "r"(vbase_2 + (c_14 - vrank8_7_2) / 4 * 16384 + (row_2 * 128 + ((2 * c_14 + 1) % 8 * 16 ^ row_2 % 8 * 16))), "r"(*reinterpret_cast<uint32_t*>(&v8_2_5[0])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_5[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_5[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&v8_2_5[(0) + 3])));

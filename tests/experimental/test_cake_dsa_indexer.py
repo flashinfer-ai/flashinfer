@@ -26,11 +26,17 @@ import contextlib
 import os
 import warnings
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.experimental.cake_dsa_indexer import cake_backend, cake_jit, cake_policy
+from flashinfer.experimental.cake_dsa_indexer import (
+    cake_backend,
+    cake_build,
+    cake_jit,
+    cake_policy,
+)
 from flashinfer.experimental.cake_dsa_indexer.cake_backend import (
     ABI_CONTRACT,
     CONTRACT_SCALARS,
@@ -64,6 +70,7 @@ from flashinfer.experimental.cake_dsa_indexer.cake_policy import (
     stage_slug,
 )
 
+from tests.test_helpers import cake_dsa_indexer_program_levers as levers
 from tests.test_helpers import cake_dsa_indexer_reference as ref
 
 FULL = os.environ.get("FLASHINFER_CAKE_DSA_INDEXER_FULL", "0") not in (
@@ -294,13 +301,24 @@ def test_registry_records_are_well_formed():
                     or key in CONTRACT_SCALARS
                     or key in ("num_queries", "num_keys")
                 ), (role, arg)
-    root = cake_jit.__file__.rsplit("/", 1)[0] + "/csrc"
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>``
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(cake_jit.ARCHES) <= set(manifest["arch_flags"])
     for name, record in cake_jit.PROGRAMS.items():
         assert record["role"] in cake_jit.STAGES, name
         assert record["arches"] and set(record["arches"]) <= set(cake_jit.ARCHES), name
-        assert all(
-            os.path.isfile(os.path.join(root, src)) for src in record["sources"]
-        ), name
+        assert record["library"] == name
+        for arch in record["arches"]:
+            entry = libraries[f"{record['library']}_{arch}"]
+            assert entry["arch"] == arch, name
+            assert entry["sources"] and all(
+                os.path.isfile(os.path.join(package, src)) for src in entry["sources"]
+            ), name
+            assert len(entry["closure_sha256"]) == 64, name
         assert (
             len(record["launch"]["block"]) == 3
             and len(record["launch"]["cluster"]) == 3
@@ -360,7 +378,12 @@ def test_registry_records_are_well_formed():
             assert stage_slug(key).isidentifier(), key
             if key.startswith("scan:pair_"):
                 assert record["launch"]["cluster"] == [2, 1, 1], (arch, key)
-        assert set(cake_jit.PROGRAM_LEVERS[arch]) == set(scan_keys), arch
+        assert set(levers.PROGRAM_LEVERS[arch]) == set(scan_keys), arch
+        fields = {frozenset(record) for record in levers.PROGRAM_LEVERS[arch].values()}
+        assert len(fields) == 1, arch  # one lever record shape per architecture
+        assert {"kind", "block_q", "tile_unroll", "snake", "sample_fit"} <= next(
+            iter(fields)
+        ), arch
         for top_k in (1, 256, 1024, 2048, 4096):
             assert finalize_key(policy.finalize_threads_for(top_k)) in keys, (
                 arch,
@@ -1258,7 +1281,7 @@ def test_bind_program_orders_arguments_and_fails_closed(monkeypatch):
         "fake",
         {
             "role": "scan",
-            "sources": [],
+            "library": "fake",
             "arches": ["sm_100a"],
             "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
         },
@@ -2159,3 +2182,60 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             2048, True, False, False, False
         )  # a form of the bulk program
         assert not on.finalize_rank_persistent_for(2048, False, False, False, False)
+
+
+def test_device_facts_are_queried_once_per_device(monkeypatch):
+    """Compute capability and SM count are process-immutable: one ``get_device_properties`` per device index, the
+    index-less device forms still resolve the current device on every call, and a CPU device is still refused."""
+    _require_program()
+    index = torch.cuda.current_device()
+    device = torch.device("cuda", index)
+    capability = tuple(torch.cuda.get_device_capability(device))
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    monkeypatch.setattr(cake_backend, "_DEVICE_FACTS", {})
+    properties = mock.Mock(wraps=torch.cuda.get_device_properties)
+    capabilities = mock.Mock(wraps=torch.cuda.get_device_capability)
+    current = mock.Mock(wraps=torch.cuda.current_device)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capabilities)
+    monkeypatch.setattr(torch.cuda, "current_device", current)
+    for dev in (device, torch.device("cuda"), None, index, f"cuda:{index}"):
+        for _ in range(3):
+            assert arch_for(dev) == SUPPORTED_COMPUTE_CAPABILITIES[capability]
+            plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, device=dev)
+            assert plan.grid == sms
+            assert (
+                dsa_indexer_workspace_size(1024, 4096, 1, top_k=256, device=dev)
+                == plan.workspace_bytes
+            )
+    assert properties.call_count == 1 and capabilities.call_count == 0
+    assert {index: (capability, sms)} == cake_backend._DEVICE_FACTS
+    # the index-less forms resolve the current device per call
+    assert current.call_count >= 6
+    with pytest.raises(ValueError, match="cuda device"):
+        arch_for(torch.device("cpu"))
+
+
+def test_prepared_calls_perform_no_device_queries_after_warm_up(monkeypatch):
+    """After the first call on a device the eager and the prepared paths run without a device-property query."""
+    _require_program()
+    inputs = ref.make_random_inputs(
+        [200, 300], [200, 2500], top_k=128, seed=70, device="cuda"
+    )
+    expected = _run(inputs)
+    boom = mock.Mock(side_effect=AssertionError("device query on the hot path"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", boom)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", boom)
+    again = _run(inputs)
+    runner = prepare_dsa_indexer_topk(
+        inputs.q,
+        inputs.k,
+        inputs.w,
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        **inputs.kwargs(),
+    )
+    captured = runner()
+    torch.cuda.synchronize()
+    assert boom.call_count == 0
+    assert ref.same_bits(again, expected) and ref.same_bits(captured, expected)

@@ -14,8 +14,6 @@ from tests.attention.test_batch_decode_kernels import (
 if not is_cuda_tile_available():
     pytest.skip("cuda.tile not available", allow_module_level=True)
 
-pytestmark = pytest.mark.solo
-
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])

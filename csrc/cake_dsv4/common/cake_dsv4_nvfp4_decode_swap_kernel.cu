@@ -30,6 +30,7 @@
 #define SMEM_SMEM_QSF32_STAGE_BYTES 4096
 #define SMEM_SMEM_QSF32_STRIDE 4096
 #define SMEM_SMEM_QROPE_OFF 37888
+#define SMEM_SMEM_QSTAGE_OFF (16384 * (4 / O_CHUNKS) + 107520)
 #define SMEM_SMEM_OSTAGE_OFF 54272
 #define SMEM_SMEM_OSTAGE_STAGE_BYTES 16384
 #define SMEM_SMEM_OSTAGE_STRIDE 16384
@@ -48,30 +49,41 @@
 #define SMEM_SMEM_V_OFF 107520
 #define SMEM_SMEM_V_STAGE_BYTES 16384
 #define SMEM_SMEM_V_STRIDE 16384
+#define SMEM_SMEM_SFS_OFF (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 111616))
 #define SMEM_SMEM_SFS_STAGE_BYTES 4096
 #define SMEM_SMEM_SFS_STRIDE 4096
+#define SMEM_SMEM_P_OFF (16384 * (4 / O_CHUNKS) + 107520)
 #define SMEM_SMEM_P_STAGE_BYTES 16384
 #define SMEM_SMEM_P_STRIDE 16384
+#define SMEM_SMEM_RCPTAB_OFF (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 115712))
 #define SMEM_SMEM_RCPTAB_STAGE_BYTES 64
 #define SMEM_SMEM_RCPTAB_STRIDE 64
+#define SMEM_SMEM_MASK_OFF (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 117760))
 #define SMEM_SMEM_MASK_STAGE_BYTES 16
 #define SMEM_SMEM_MASK_STRIDE 16
+#define SMEM_SMEM_TOK_OFF (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 117792))
 #define SMEM_SMEM_TOK_STAGE_BYTES 512
 #define SMEM_SMEM_TOK_STRIDE 512
+#define SMEM_SMEM_ROWOFF_OFF (840 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816))
 #define SMEM_SMEM_ROWOFF_STAGE_BYTES 2048
 #define SMEM_SMEM_ROWOFF_STRIDE 2048
+#define SMEM_SMEM_SFS32_OFF (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 111616))
 #define SMEM_SMEM_SFS32_STAGE_BYTES 4096
 #define SMEM_SMEM_SFS32_STRIDE 4096
+#define SMEM_SMEM_PMAX_OFF (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816))
+#define SMEM_SMEM_PSUM_OFF (792 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816))
+#define SMEM_SMEM_RSUM_OFF (816 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816))
 #define SMEM_SMEM_QF4B_OFF 1024
 #define SMEM_SMEM_QF4B_STRIDE 16384
 #define SMEM_SMEM_QROPE_B_OFF 37888
+#define SMEM_SMEM_PB_OFF (16384 * (4 / O_CHUNKS) + 107520)
 #define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 namespace cake::dsv4_nvfp4 {
 
 template <int TILE_N, int O_CHUNKS>
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_out, __nv_bfloat16* __restrict__ q_rows, uint8_t* __restrict__ main_cache, uint8_t* __restrict__ extra_cache, int* __restrict__ main_indices, int* __restrict__ extra_indices, int* __restrict__ main_lengths, int* __restrict__ extra_lengths, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ lse_out, int num_heads, int num_head_tiles, int num_splits, int num_main_tiles, int main_width, int extra_width, int main_index_stride, int extra_index_stride, int has_main_lengths, int has_extra_lengths, int main_page_shift, int extra_page_shift, long long main_page_stride, long long extra_page_stride, int has_sinks, float lse_partial_scale, float lse_scale)
 {
     const int tid = threadIdx.x;
@@ -100,54 +112,54 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
     const int num_bids = gridDim.x;
     const int cta_rank = 0;
     // Kernel setup ops
-    uint8_t* smem_qf4 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_qf4_addr = smem + 1024;
-    uint8_t* smem_qsf = reinterpret_cast<uint8_t*>(smem_raw + 33792);
-    const int smem_qsf_addr = smem + 33792;
-    unsigned int* smem_qsf32 = reinterpret_cast<unsigned int*>(smem_raw + 33792);
-    const int smem_qsf32_addr = smem + 33792;
-    __nv_bfloat16* smem_qrope = reinterpret_cast<__nv_bfloat16*>(smem_raw + 37888);
-    const int smem_qrope_addr = smem + 37888;
-    __nv_bfloat16* smem_qstage = reinterpret_cast<__nv_bfloat16*>(smem_raw + (16384 * (4 / O_CHUNKS) + 107520));
-    const int smem_qstage_addr = smem + (16384 * (4 / O_CHUNKS) + 107520);
-    __nv_bfloat16* smem_ostage = reinterpret_cast<__nv_bfloat16*>(smem_raw + 54272);
-    const int smem_ostage_addr = smem + 54272;
-    uint8_t* smem_kf4 = reinterpret_cast<uint8_t*>(smem_raw + 54272);
-    const int smem_kf4_addr = smem + 54272;
-    uint8_t* smem_ksf = reinterpret_cast<uint8_t*>(smem_raw + 87040);
-    const int smem_ksf_addr = smem + 87040;
-    unsigned int* smem_ksf32 = reinterpret_cast<unsigned int*>(smem_raw + 87040);
-    const int smem_ksf32_addr = smem + 87040;
-    __nv_bfloat16* smem_krope = reinterpret_cast<__nv_bfloat16*>(smem_raw + 91136);
-    const int smem_krope_addr = smem + 91136;
-    uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + 107520);
-    const int smem_v_addr = smem + 107520;
-    uint8_t* smem_sfs = reinterpret_cast<uint8_t*>(smem_raw + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 111616)));
-    const int smem_sfs_addr = smem + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 111616));
-    uint8_t* smem_p = reinterpret_cast<uint8_t*>(smem_raw + (16384 * (4 / O_CHUNKS) + 107520));
-    const int smem_p_addr = smem + (16384 * (4 / O_CHUNKS) + 107520);
-    unsigned int* smem_rcptab = reinterpret_cast<unsigned int*>(smem_raw + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 115712)));
-    const int smem_rcptab_addr = smem + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 115712));
-    unsigned int* smem_mask = reinterpret_cast<unsigned int*>(smem_raw + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 117760)));
-    const int smem_mask_addr = smem + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 117760));
-    int* smem_tok = reinterpret_cast<int*>(smem_raw + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 117792)));
-    const int smem_tok_addr = smem + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 117792));
-    unsigned int* smem_rowoff = reinterpret_cast<unsigned int*>(smem_raw + (840 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816)));
-    const int smem_rowoff_addr = smem + (840 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816));
-    unsigned int* smem_sfs32 = reinterpret_cast<unsigned int*>(smem_raw + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 111616)));
-    const int smem_sfs32_addr = smem + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 111616));
-    float* smem_pmax = reinterpret_cast<float*>(smem_raw + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816)));
-    const int smem_pmax_addr = smem + (768 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816));
-    float* smem_psum = reinterpret_cast<float*>(smem_raw + (792 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816)));
-    const int smem_psum_addr = smem + (792 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816));
-    float* smem_rsum = reinterpret_cast<float*>(smem_raw + (816 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816)));
-    const int smem_rsum_addr = smem + (816 * TILE_N + (16384 * (4 / O_CHUNKS) + 118816));
-    uint8_t* smem_qf4b = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_qf4b_addr = smem + 1024;
-    __nv_bfloat16* smem_qrope_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 37888);
-    const int smem_qrope_b_addr = smem + 37888;
-    uint8_t* smem_pb = reinterpret_cast<uint8_t*>(smem_raw + (16384 * (4 / O_CHUNKS) + 107520));
-    const int smem_pb_addr = smem + (16384 * (4 / O_CHUNKS) + 107520);
+    uint8_t* smem_qf4 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QF4_OFF);
+    const int smem_qf4_addr = smem + SMEM_SMEM_QF4_OFF;
+    uint8_t* smem_qsf = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QSF_OFF);
+    const int smem_qsf_addr = smem + SMEM_SMEM_QSF_OFF;
+    unsigned int* smem_qsf32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_QSF32_OFF);
+    const int smem_qsf32_addr = smem + SMEM_SMEM_QSF32_OFF;
+    __nv_bfloat16* smem_qrope = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QROPE_OFF);
+    const int smem_qrope_addr = smem + SMEM_SMEM_QROPE_OFF;
+    __nv_bfloat16* smem_qstage = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QSTAGE_OFF);
+    const int smem_qstage_addr = smem + SMEM_SMEM_QSTAGE_OFF;
+    __nv_bfloat16* smem_ostage = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_OSTAGE_OFF);
+    const int smem_ostage_addr = smem + SMEM_SMEM_OSTAGE_OFF;
+    uint8_t* smem_kf4 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KF4_OFF);
+    const int smem_kf4_addr = smem + SMEM_SMEM_KF4_OFF;
+    uint8_t* smem_ksf = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KSF_OFF);
+    const int smem_ksf_addr = smem + SMEM_SMEM_KSF_OFF;
+    unsigned int* smem_ksf32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_KSF32_OFF);
+    const int smem_ksf32_addr = smem + SMEM_SMEM_KSF32_OFF;
+    __nv_bfloat16* smem_krope = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_KROPE_OFF);
+    const int smem_krope_addr = smem + SMEM_SMEM_KROPE_OFF;
+    uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V_OFF);
+    const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
+    uint8_t* smem_sfs = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFS_OFF);
+    const int smem_sfs_addr = smem + SMEM_SMEM_SFS_OFF;
+    uint8_t* smem_p = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_P_OFF);
+    const int smem_p_addr = smem + SMEM_SMEM_P_OFF;
+    unsigned int* smem_rcptab = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_RCPTAB_OFF);
+    const int smem_rcptab_addr = smem + SMEM_SMEM_RCPTAB_OFF;
+    unsigned int* smem_mask = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_MASK_OFF);
+    const int smem_mask_addr = smem + SMEM_SMEM_MASK_OFF;
+    int* smem_tok = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_TOK_OFF);
+    const int smem_tok_addr = smem + SMEM_SMEM_TOK_OFF;
+    unsigned int* smem_rowoff = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_ROWOFF_OFF);
+    const int smem_rowoff_addr = smem + SMEM_SMEM_ROWOFF_OFF;
+    unsigned int* smem_sfs32 = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_SFS32_OFF);
+    const int smem_sfs32_addr = smem + SMEM_SMEM_SFS32_OFF;
+    float* smem_pmax = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_PMAX_OFF);
+    const int smem_pmax_addr = smem + SMEM_SMEM_PMAX_OFF;
+    float* smem_psum = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_PSUM_OFF);
+    const int smem_psum_addr = smem + SMEM_SMEM_PSUM_OFF;
+    float* smem_rsum = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_RSUM_OFF);
+    const int smem_rsum_addr = smem + SMEM_SMEM_RSUM_OFF;
+    uint8_t* smem_qf4b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_QF4B_OFF);
+    const int smem_qf4b_addr = smem + SMEM_SMEM_QF4B_OFF;
+    __nv_bfloat16* smem_qrope_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QROPE_B_OFF);
+    const int smem_qrope_b_addr = smem + SMEM_SMEM_QROPE_B_OFF;
+    uint8_t* smem_pb = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_PB_OFF);
+    const int smem_pb_addr = smem + SMEM_SMEM_PB_OFF;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_out))) : "memory");
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, ((4 / O_CHUNKS) + 9) barriers)
@@ -717,16 +729,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                     unsigned int sfw32 = smem_sfs32[row * 32 + vblock >> 2];
                     unsigned int scale = sfw32 >> (unsigned int)(8 * (vblock & 3)) & 255;
                     {
-                        v8[0] = cake_dsv4_qmul4_portable<5>(kraw[0], scale);
+                        v8[0] = cake_dsv4_qmul4<5>(kraw[0], scale);
                     }
                     {
-                        v8[1] = cake_dsv4_qmul4_portable<6>(kraw[0], scale);
+                        v8[1] = cake_dsv4_qmul4<6>(kraw[0], scale);
                     }
                     {
-                        v8[2] = cake_dsv4_qmul4_portable<5>(kraw[1], scale);
+                        v8[2] = cake_dsv4_qmul4<5>(kraw[1], scale);
                     }
                     {
-                        v8[3] = cake_dsv4_qmul4_portable<6>(kraw[1], scale);
+                        v8[3] = cake_dsv4_qmul4<6>(kraw[1], scale);
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -743,16 +755,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                     unsigned int sfw32_1 = smem_sfs32[row * 32 + vblock_0 >> 2];
                     unsigned int scale_1 = sfw32_1 >> (unsigned int)(8 * (vblock_0 & 3)) & 255;
                     {
-                        v8_1[0] = cake_dsv4_qmul4_portable<5>(kraw_1[0], scale_1);
+                        v8_1[0] = cake_dsv4_qmul4<5>(kraw_1[0], scale_1);
                     }
                     {
-                        v8_1[1] = cake_dsv4_qmul4_portable<6>(kraw_1[0], scale_1);
+                        v8_1[1] = cake_dsv4_qmul4<6>(kraw_1[0], scale_1);
                     }
                     {
-                        v8_1[2] = cake_dsv4_qmul4_portable<5>(kraw_1[1], scale_1);
+                        v8_1[2] = cake_dsv4_qmul4<5>(kraw_1[1], scale_1);
                     }
                     {
-                        v8_1[3] = cake_dsv4_qmul4_portable<6>(kraw_1[1], scale_1);
+                        v8_1[3] = cake_dsv4_qmul4<6>(kraw_1[1], scale_1);
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -769,16 +781,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                     unsigned int sfw32_2 = smem_sfs32[row * 32 + vblock_2 >> 2];
                     unsigned int scale_2 = sfw32_2 >> (unsigned int)(8 * (vblock_2 & 3)) & 255;
                     {
-                        v8_3[0] = cake_dsv4_qmul4_portable<5>(kraw_2[0], scale_2);
+                        v8_3[0] = cake_dsv4_qmul4<5>(kraw_2[0], scale_2);
                     }
                     {
-                        v8_3[1] = cake_dsv4_qmul4_portable<6>(kraw_2[0], scale_2);
+                        v8_3[1] = cake_dsv4_qmul4<6>(kraw_2[0], scale_2);
                     }
                     {
-                        v8_3[2] = cake_dsv4_qmul4_portable<5>(kraw_2[1], scale_2);
+                        v8_3[2] = cake_dsv4_qmul4<5>(kraw_2[1], scale_2);
                     }
                     {
-                        v8_3[3] = cake_dsv4_qmul4_portable<6>(kraw_2[1], scale_2);
+                        v8_3[3] = cake_dsv4_qmul4<6>(kraw_2[1], scale_2);
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -796,16 +808,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_3 = smem_sfs32[row * 32 + vblock_4 >> 2];
                         unsigned int scale_3 = sfw32_3 >> (unsigned int)(8 * (vblock_4 & 3)) & 255;
                         {
-                            v8_5[0] = cake_dsv4_qmul4_portable<5>(kraw_3[0], scale_3);
+                            v8_5[0] = cake_dsv4_qmul4<5>(kraw_3[0], scale_3);
                         }
                         {
-                            v8_5[1] = cake_dsv4_qmul4_portable<6>(kraw_3[0], scale_3);
+                            v8_5[1] = cake_dsv4_qmul4<6>(kraw_3[0], scale_3);
                         }
                         {
-                            v8_5[2] = cake_dsv4_qmul4_portable<5>(kraw_3[1], scale_3);
+                            v8_5[2] = cake_dsv4_qmul4<5>(kraw_3[1], scale_3);
                         }
                         {
-                            v8_5[3] = cake_dsv4_qmul4_portable<6>(kraw_3[1], scale_3);
+                            v8_5[3] = cake_dsv4_qmul4<6>(kraw_3[1], scale_3);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -822,16 +834,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_4 = smem_sfs32[row * 32 + vblock_6 >> 2];
                         unsigned int scale_4 = sfw32_4 >> (unsigned int)(8 * (vblock_6 & 3)) & 255;
                         {
-                            v8_7[0] = cake_dsv4_qmul4_portable<5>(kraw_4[0], scale_4);
+                            v8_7[0] = cake_dsv4_qmul4<5>(kraw_4[0], scale_4);
                         }
                         {
-                            v8_7[1] = cake_dsv4_qmul4_portable<6>(kraw_4[0], scale_4);
+                            v8_7[1] = cake_dsv4_qmul4<6>(kraw_4[0], scale_4);
                         }
                         {
-                            v8_7[2] = cake_dsv4_qmul4_portable<5>(kraw_4[1], scale_4);
+                            v8_7[2] = cake_dsv4_qmul4<5>(kraw_4[1], scale_4);
                         }
                         {
-                            v8_7[3] = cake_dsv4_qmul4_portable<6>(kraw_4[1], scale_4);
+                            v8_7[3] = cake_dsv4_qmul4<6>(kraw_4[1], scale_4);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -848,16 +860,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_5 = smem_sfs32[row * 32 + vblock_8 >> 2];
                         unsigned int scale_5 = sfw32_5 >> (unsigned int)(8 * (vblock_8 & 3)) & 255;
                         {
-                            v8_9[0] = cake_dsv4_qmul4_portable<5>(kraw_5[0], scale_5);
+                            v8_9[0] = cake_dsv4_qmul4<5>(kraw_5[0], scale_5);
                         }
                         {
-                            v8_9[1] = cake_dsv4_qmul4_portable<6>(kraw_5[0], scale_5);
+                            v8_9[1] = cake_dsv4_qmul4<6>(kraw_5[0], scale_5);
                         }
                         {
-                            v8_9[2] = cake_dsv4_qmul4_portable<5>(kraw_5[1], scale_5);
+                            v8_9[2] = cake_dsv4_qmul4<5>(kraw_5[1], scale_5);
                         }
                         {
-                            v8_9[3] = cake_dsv4_qmul4_portable<6>(kraw_5[1], scale_5);
+                            v8_9[3] = cake_dsv4_qmul4<6>(kraw_5[1], scale_5);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -874,16 +886,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_6 = smem_sfs32[row * 32 + vblock_10 >> 2];
                         unsigned int scale_6 = sfw32_6 >> (unsigned int)(8 * (vblock_10 & 3)) & 255;
                         {
-                            v8_11[0] = cake_dsv4_qmul4_portable<5>(kraw_6[0], scale_6);
+                            v8_11[0] = cake_dsv4_qmul4<5>(kraw_6[0], scale_6);
                         }
                         {
-                            v8_11[1] = cake_dsv4_qmul4_portable<6>(kraw_6[0], scale_6);
+                            v8_11[1] = cake_dsv4_qmul4<6>(kraw_6[0], scale_6);
                         }
                         {
-                            v8_11[2] = cake_dsv4_qmul4_portable<5>(kraw_6[1], scale_6);
+                            v8_11[2] = cake_dsv4_qmul4<5>(kraw_6[1], scale_6);
                         }
                         {
-                            v8_11[3] = cake_dsv4_qmul4_portable<6>(kraw_6[1], scale_6);
+                            v8_11[3] = cake_dsv4_qmul4<6>(kraw_6[1], scale_6);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -900,16 +912,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_7 = smem_sfs32[row * 32 + vblock_12 >> 2];
                         unsigned int scale_7 = sfw32_7 >> (unsigned int)(8 * (vblock_12 & 3)) & 255;
                         {
-                            v8_13[0] = cake_dsv4_qmul4_portable<5>(kraw_7[0], scale_7);
+                            v8_13[0] = cake_dsv4_qmul4<5>(kraw_7[0], scale_7);
                         }
                         {
-                            v8_13[1] = cake_dsv4_qmul4_portable<6>(kraw_7[0], scale_7);
+                            v8_13[1] = cake_dsv4_qmul4<6>(kraw_7[0], scale_7);
                         }
                         {
-                            v8_13[2] = cake_dsv4_qmul4_portable<5>(kraw_7[1], scale_7);
+                            v8_13[2] = cake_dsv4_qmul4<5>(kraw_7[1], scale_7);
                         }
                         {
-                            v8_13[3] = cake_dsv4_qmul4_portable<6>(kraw_7[1], scale_7);
+                            v8_13[3] = cake_dsv4_qmul4<6>(kraw_7[1], scale_7);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -926,16 +938,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_8 = smem_sfs32[row * 32 + vblock_14 >> 2];
                         unsigned int scale_8 = sfw32_8 >> (unsigned int)(8 * (vblock_14 & 3)) & 255;
                         {
-                            v8_15[0] = cake_dsv4_qmul4_portable<5>(kraw_8[0], scale_8);
+                            v8_15[0] = cake_dsv4_qmul4<5>(kraw_8[0], scale_8);
                         }
                         {
-                            v8_15[1] = cake_dsv4_qmul4_portable<6>(kraw_8[0], scale_8);
+                            v8_15[1] = cake_dsv4_qmul4<6>(kraw_8[0], scale_8);
                         }
                         {
-                            v8_15[2] = cake_dsv4_qmul4_portable<5>(kraw_8[1], scale_8);
+                            v8_15[2] = cake_dsv4_qmul4<5>(kraw_8[1], scale_8);
                         }
                         {
-                            v8_15[3] = cake_dsv4_qmul4_portable<6>(kraw_8[1], scale_8);
+                            v8_15[3] = cake_dsv4_qmul4<6>(kraw_8[1], scale_8);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -952,16 +964,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_9 = smem_sfs32[row * 32 + vblock_16 >> 2];
                         unsigned int scale_9 = sfw32_9 >> (unsigned int)(8 * (vblock_16 & 3)) & 255;
                         {
-                            v8_17[0] = cake_dsv4_qmul4_portable<5>(kraw_9[0], scale_9);
+                            v8_17[0] = cake_dsv4_qmul4<5>(kraw_9[0], scale_9);
                         }
                         {
-                            v8_17[1] = cake_dsv4_qmul4_portable<6>(kraw_9[0], scale_9);
+                            v8_17[1] = cake_dsv4_qmul4<6>(kraw_9[0], scale_9);
                         }
                         {
-                            v8_17[2] = cake_dsv4_qmul4_portable<5>(kraw_9[1], scale_9);
+                            v8_17[2] = cake_dsv4_qmul4<5>(kraw_9[1], scale_9);
                         }
                         {
-                            v8_17[3] = cake_dsv4_qmul4_portable<6>(kraw_9[1], scale_9);
+                            v8_17[3] = cake_dsv4_qmul4<6>(kraw_9[1], scale_9);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -978,16 +990,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_10 = smem_sfs32[row * 32 + vblock_18 >> 2];
                         unsigned int scale_10 = sfw32_10 >> (unsigned int)(8 * (vblock_18 & 3)) & 255;
                         {
-                            v8_19[0] = cake_dsv4_qmul4_portable<5>(kraw_10[0], scale_10);
+                            v8_19[0] = cake_dsv4_qmul4<5>(kraw_10[0], scale_10);
                         }
                         {
-                            v8_19[1] = cake_dsv4_qmul4_portable<6>(kraw_10[0], scale_10);
+                            v8_19[1] = cake_dsv4_qmul4<6>(kraw_10[0], scale_10);
                         }
                         {
-                            v8_19[2] = cake_dsv4_qmul4_portable<5>(kraw_10[1], scale_10);
+                            v8_19[2] = cake_dsv4_qmul4<5>(kraw_10[1], scale_10);
                         }
                         {
-                            v8_19[3] = cake_dsv4_qmul4_portable<6>(kraw_10[1], scale_10);
+                            v8_19[3] = cake_dsv4_qmul4<6>(kraw_10[1], scale_10);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -1005,16 +1017,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_3 = smem_sfs32[row * 32 + vblock_4 >> 2];
                         unsigned int scale_3 = sfw32_3 >> (unsigned int)(8 * (vblock_4 & 3)) & 255;
                         {
-                            v8_5[0] = cake_dsv4_qmul4_portable<5>(kraw_3[0], scale_3);
+                            v8_5[0] = cake_dsv4_qmul4<5>(kraw_3[0], scale_3);
                         }
                         {
-                            v8_5[1] = cake_dsv4_qmul4_portable<6>(kraw_3[0], scale_3);
+                            v8_5[1] = cake_dsv4_qmul4<6>(kraw_3[0], scale_3);
                         }
                         {
-                            v8_5[2] = cake_dsv4_qmul4_portable<5>(kraw_3[1], scale_3);
+                            v8_5[2] = cake_dsv4_qmul4<5>(kraw_3[1], scale_3);
                         }
                         {
-                            v8_5[3] = cake_dsv4_qmul4_portable<6>(kraw_3[1], scale_3);
+                            v8_5[3] = cake_dsv4_qmul4<6>(kraw_3[1], scale_3);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -1031,16 +1043,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_4 = smem_sfs32[row * 32 + vblock_6 >> 2];
                         unsigned int scale_4 = sfw32_4 >> (unsigned int)(8 * (vblock_6 & 3)) & 255;
                         {
-                            v8_7[0] = cake_dsv4_qmul4_portable<5>(kraw_4[0], scale_4);
+                            v8_7[0] = cake_dsv4_qmul4<5>(kraw_4[0], scale_4);
                         }
                         {
-                            v8_7[1] = cake_dsv4_qmul4_portable<6>(kraw_4[0], scale_4);
+                            v8_7[1] = cake_dsv4_qmul4<6>(kraw_4[0], scale_4);
                         }
                         {
-                            v8_7[2] = cake_dsv4_qmul4_portable<5>(kraw_4[1], scale_4);
+                            v8_7[2] = cake_dsv4_qmul4<5>(kraw_4[1], scale_4);
                         }
                         {
-                            v8_7[3] = cake_dsv4_qmul4_portable<6>(kraw_4[1], scale_4);
+                            v8_7[3] = cake_dsv4_qmul4<6>(kraw_4[1], scale_4);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -1057,16 +1069,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_5 = smem_sfs32[row * 32 + vblock_8 >> 2];
                         unsigned int scale_5 = sfw32_5 >> (unsigned int)(8 * (vblock_8 & 3)) & 255;
                         {
-                            v8_9[0] = cake_dsv4_qmul4_portable<5>(kraw_5[0], scale_5);
+                            v8_9[0] = cake_dsv4_qmul4<5>(kraw_5[0], scale_5);
                         }
                         {
-                            v8_9[1] = cake_dsv4_qmul4_portable<6>(kraw_5[0], scale_5);
+                            v8_9[1] = cake_dsv4_qmul4<6>(kraw_5[0], scale_5);
                         }
                         {
-                            v8_9[2] = cake_dsv4_qmul4_portable<5>(kraw_5[1], scale_5);
+                            v8_9[2] = cake_dsv4_qmul4<5>(kraw_5[1], scale_5);
                         }
                         {
-                            v8_9[3] = cake_dsv4_qmul4_portable<6>(kraw_5[1], scale_5);
+                            v8_9[3] = cake_dsv4_qmul4<6>(kraw_5[1], scale_5);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3544,16 +3556,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_11 = smem_sfs32[row_1 * 32 + vblock_1 >> 2];
                         unsigned int scale_11 = sfw32_11 >> (unsigned int)(8 * (vblock_1 & 3)) & 255;
                         {
-                            v8_2[0] = cake_dsv4_qmul4_portable<5>(kraw_11[0], scale_11);
+                            v8_2[0] = cake_dsv4_qmul4<5>(kraw_11[0], scale_11);
                         }
                         {
-                            v8_2[1] = cake_dsv4_qmul4_portable<6>(kraw_11[0], scale_11);
+                            v8_2[1] = cake_dsv4_qmul4<6>(kraw_11[0], scale_11);
                         }
                         {
-                            v8_2[2] = cake_dsv4_qmul4_portable<5>(kraw_11[1], scale_11);
+                            v8_2[2] = cake_dsv4_qmul4<5>(kraw_11[1], scale_11);
                         }
                         {
-                            v8_2[3] = cake_dsv4_qmul4_portable<6>(kraw_11[1], scale_11);
+                            v8_2[3] = cake_dsv4_qmul4<6>(kraw_11[1], scale_11);
                         }
                     } else if constexpr (O_CHUNKS == 2) {
                         int vchunk_6 = vblock_1 >> 1;
@@ -3565,16 +3577,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_6 = smem_sfs32[row_1 * 32 + vblock_1 >> 2];
                         unsigned int scale_6 = sfw32_6 >> (unsigned int)(8 * (vblock_1 & 3)) & 255;
                         {
-                            v8_2[0] = cake_dsv4_qmul4_portable<5>(kraw_6[0], scale_6);
+                            v8_2[0] = cake_dsv4_qmul4<5>(kraw_6[0], scale_6);
                         }
                         {
-                            v8_2[1] = cake_dsv4_qmul4_portable<6>(kraw_6[0], scale_6);
+                            v8_2[1] = cake_dsv4_qmul4<6>(kraw_6[0], scale_6);
                         }
                         {
-                            v8_2[2] = cake_dsv4_qmul4_portable<5>(kraw_6[1], scale_6);
+                            v8_2[2] = cake_dsv4_qmul4<5>(kraw_6[1], scale_6);
                         }
                         {
-                            v8_2[3] = cake_dsv4_qmul4_portable<6>(kraw_6[1], scale_6);
+                            v8_2[3] = cake_dsv4_qmul4<6>(kraw_6[1], scale_6);
                         }
                     } else {
                         int vchunk_3 = vblock_1 >> 1;
@@ -3586,16 +3598,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_3 = smem_sfs32[row_1 * 32 + vblock_1 >> 2];
                         unsigned int scale_3 = sfw32_3 >> (unsigned int)(8 * (vblock_1 & 3)) & 255;
                         {
-                            v8_2[0] = cake_dsv4_qmul4_portable<5>(kraw_3[0], scale_3);
+                            v8_2[0] = cake_dsv4_qmul4<5>(kraw_3[0], scale_3);
                         }
                         {
-                            v8_2[1] = cake_dsv4_qmul4_portable<6>(kraw_3[0], scale_3);
+                            v8_2[1] = cake_dsv4_qmul4<6>(kraw_3[0], scale_3);
                         }
                         {
-                            v8_2[2] = cake_dsv4_qmul4_portable<5>(kraw_3[1], scale_3);
+                            v8_2[2] = cake_dsv4_qmul4<5>(kraw_3[1], scale_3);
                         }
                         {
-                            v8_2[3] = cake_dsv4_qmul4_portable<6>(kraw_3[1], scale_3);
+                            v8_2[3] = cake_dsv4_qmul4<6>(kraw_3[1], scale_3);
                         }
                     }
                 }
@@ -3622,16 +3634,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_12 = smem_sfs32[row_1 * 32 + vblock_0_1 >> 2];
                         unsigned int scale_12 = sfw32_12 >> (unsigned int)(8 * (vblock_0_1 & 3)) & 255;
                         {
-                            v8_1_1[0] = cake_dsv4_qmul4_portable<5>(kraw_12[0], scale_12);
+                            v8_1_1[0] = cake_dsv4_qmul4<5>(kraw_12[0], scale_12);
                         }
                         {
-                            v8_1_1[1] = cake_dsv4_qmul4_portable<6>(kraw_12[0], scale_12);
+                            v8_1_1[1] = cake_dsv4_qmul4<6>(kraw_12[0], scale_12);
                         }
                         {
-                            v8_1_1[2] = cake_dsv4_qmul4_portable<5>(kraw_12[1], scale_12);
+                            v8_1_1[2] = cake_dsv4_qmul4<5>(kraw_12[1], scale_12);
                         }
                         {
-                            v8_1_1[3] = cake_dsv4_qmul4_portable<6>(kraw_12[1], scale_12);
+                            v8_1_1[3] = cake_dsv4_qmul4<6>(kraw_12[1], scale_12);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3647,16 +3659,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_7 = smem_sfs32[row_1 * 32 + vblock_0_1 >> 2];
                         unsigned int scale_7 = sfw32_7 >> (unsigned int)(8 * (vblock_0_1 & 3)) & 255;
                         {
-                            v8_1_1[0] = cake_dsv4_qmul4_portable<5>(kraw_7[0], scale_7);
+                            v8_1_1[0] = cake_dsv4_qmul4<5>(kraw_7[0], scale_7);
                         }
                         {
-                            v8_1_1[1] = cake_dsv4_qmul4_portable<6>(kraw_7[0], scale_7);
+                            v8_1_1[1] = cake_dsv4_qmul4<6>(kraw_7[0], scale_7);
                         }
                         {
-                            v8_1_1[2] = cake_dsv4_qmul4_portable<5>(kraw_7[1], scale_7);
+                            v8_1_1[2] = cake_dsv4_qmul4<5>(kraw_7[1], scale_7);
                         }
                         {
-                            v8_1_1[3] = cake_dsv4_qmul4_portable<6>(kraw_7[1], scale_7);
+                            v8_1_1[3] = cake_dsv4_qmul4<6>(kraw_7[1], scale_7);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3672,16 +3684,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_4 = smem_sfs32[row_1 * 32 + vblock_0_1 >> 2];
                         unsigned int scale_4 = sfw32_4 >> (unsigned int)(8 * (vblock_0_1 & 3)) & 255;
                         {
-                            v8_1_1[0] = cake_dsv4_qmul4_portable<5>(kraw_4[0], scale_4);
+                            v8_1_1[0] = cake_dsv4_qmul4<5>(kraw_4[0], scale_4);
                         }
                         {
-                            v8_1_1[1] = cake_dsv4_qmul4_portable<6>(kraw_4[0], scale_4);
+                            v8_1_1[1] = cake_dsv4_qmul4<6>(kraw_4[0], scale_4);
                         }
                         {
-                            v8_1_1[2] = cake_dsv4_qmul4_portable<5>(kraw_4[1], scale_4);
+                            v8_1_1[2] = cake_dsv4_qmul4<5>(kraw_4[1], scale_4);
                         }
                         {
-                            v8_1_1[3] = cake_dsv4_qmul4_portable<6>(kraw_4[1], scale_4);
+                            v8_1_1[3] = cake_dsv4_qmul4<6>(kraw_4[1], scale_4);
                         }
                     } else {
                         int rblock = vblock_0_1 - 28;
@@ -3774,16 +3786,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_13 = smem_sfs32[row_1 * 32 + vblock_2_1 >> 2];
                         unsigned int scale_13 = sfw32_13 >> (unsigned int)(8 * (vblock_2_1 & 3)) & 255;
                         {
-                            v8_3_1[0] = cake_dsv4_qmul4_portable<5>(kraw_13[0], scale_13);
+                            v8_3_1[0] = cake_dsv4_qmul4<5>(kraw_13[0], scale_13);
                         }
                         {
-                            v8_3_1[1] = cake_dsv4_qmul4_portable<6>(kraw_13[0], scale_13);
+                            v8_3_1[1] = cake_dsv4_qmul4<6>(kraw_13[0], scale_13);
                         }
                         {
-                            v8_3_1[2] = cake_dsv4_qmul4_portable<5>(kraw_13[1], scale_13);
+                            v8_3_1[2] = cake_dsv4_qmul4<5>(kraw_13[1], scale_13);
                         }
                         {
-                            v8_3_1[3] = cake_dsv4_qmul4_portable<6>(kraw_13[1], scale_13);
+                            v8_3_1[3] = cake_dsv4_qmul4<6>(kraw_13[1], scale_13);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3800,16 +3812,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_14 = smem_sfs32[row_1 * 32 + vblock_4_1 >> 2];
                         unsigned int scale_14 = sfw32_14 >> (unsigned int)(8 * (vblock_4_1 & 3)) & 255;
                         {
-                            v8_5_1[0] = cake_dsv4_qmul4_portable<5>(kraw_14[0], scale_14);
+                            v8_5_1[0] = cake_dsv4_qmul4<5>(kraw_14[0], scale_14);
                         }
                         {
-                            v8_5_1[1] = cake_dsv4_qmul4_portable<6>(kraw_14[0], scale_14);
+                            v8_5_1[1] = cake_dsv4_qmul4<6>(kraw_14[0], scale_14);
                         }
                         {
-                            v8_5_1[2] = cake_dsv4_qmul4_portable<5>(kraw_14[1], scale_14);
+                            v8_5_1[2] = cake_dsv4_qmul4<5>(kraw_14[1], scale_14);
                         }
                         {
-                            v8_5_1[3] = cake_dsv4_qmul4_portable<6>(kraw_14[1], scale_14);
+                            v8_5_1[3] = cake_dsv4_qmul4<6>(kraw_14[1], scale_14);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3826,16 +3838,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_15 = smem_sfs32[row_1 * 32 + vblock_6_1 >> 2];
                         unsigned int scale_15 = sfw32_15 >> (unsigned int)(8 * (vblock_6_1 & 3)) & 255;
                         {
-                            v8_7_1[0] = cake_dsv4_qmul4_portable<5>(kraw_15[0], scale_15);
+                            v8_7_1[0] = cake_dsv4_qmul4<5>(kraw_15[0], scale_15);
                         }
                         {
-                            v8_7_1[1] = cake_dsv4_qmul4_portable<6>(kraw_15[0], scale_15);
+                            v8_7_1[1] = cake_dsv4_qmul4<6>(kraw_15[0], scale_15);
                         }
                         {
-                            v8_7_1[2] = cake_dsv4_qmul4_portable<5>(kraw_15[1], scale_15);
+                            v8_7_1[2] = cake_dsv4_qmul4<5>(kraw_15[1], scale_15);
                         }
                         {
-                            v8_7_1[3] = cake_dsv4_qmul4_portable<6>(kraw_15[1], scale_15);
+                            v8_7_1[3] = cake_dsv4_qmul4<6>(kraw_15[1], scale_15);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3852,16 +3864,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_16 = smem_sfs32[row_1 * 32 + vblock_8_1 >> 2];
                         unsigned int scale_16 = sfw32_16 >> (unsigned int)(8 * (vblock_8_1 & 3)) & 255;
                         {
-                            v8_9_1[0] = cake_dsv4_qmul4_portable<5>(kraw_16[0], scale_16);
+                            v8_9_1[0] = cake_dsv4_qmul4<5>(kraw_16[0], scale_16);
                         }
                         {
-                            v8_9_1[1] = cake_dsv4_qmul4_portable<6>(kraw_16[0], scale_16);
+                            v8_9_1[1] = cake_dsv4_qmul4<6>(kraw_16[0], scale_16);
                         }
                         {
-                            v8_9_1[2] = cake_dsv4_qmul4_portable<5>(kraw_16[1], scale_16);
+                            v8_9_1[2] = cake_dsv4_qmul4<5>(kraw_16[1], scale_16);
                         }
                         {
-                            v8_9_1[3] = cake_dsv4_qmul4_portable<6>(kraw_16[1], scale_16);
+                            v8_9_1[3] = cake_dsv4_qmul4<6>(kraw_16[1], scale_16);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3878,16 +3890,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_17 = smem_sfs32[row_1 * 32 + vblock_10_1 >> 2];
                         unsigned int scale_17 = sfw32_17 >> (unsigned int)(8 * (vblock_10_1 & 3)) & 255;
                         {
-                            v8_11_1[0] = cake_dsv4_qmul4_portable<5>(kraw_17[0], scale_17);
+                            v8_11_1[0] = cake_dsv4_qmul4<5>(kraw_17[0], scale_17);
                         }
                         {
-                            v8_11_1[1] = cake_dsv4_qmul4_portable<6>(kraw_17[0], scale_17);
+                            v8_11_1[1] = cake_dsv4_qmul4<6>(kraw_17[0], scale_17);
                         }
                         {
-                            v8_11_1[2] = cake_dsv4_qmul4_portable<5>(kraw_17[1], scale_17);
+                            v8_11_1[2] = cake_dsv4_qmul4<5>(kraw_17[1], scale_17);
                         }
                         {
-                            v8_11_1[3] = cake_dsv4_qmul4_portable<6>(kraw_17[1], scale_17);
+                            v8_11_1[3] = cake_dsv4_qmul4<6>(kraw_17[1], scale_17);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3904,16 +3916,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_18 = smem_sfs32[row_1 * 32 + vblock_12_1 >> 2];
                         unsigned int scale_18 = sfw32_18 >> (unsigned int)(8 * (vblock_12_1 & 3)) & 255;
                         {
-                            v8_13_1[0] = cake_dsv4_qmul4_portable<5>(kraw_18[0], scale_18);
+                            v8_13_1[0] = cake_dsv4_qmul4<5>(kraw_18[0], scale_18);
                         }
                         {
-                            v8_13_1[1] = cake_dsv4_qmul4_portable<6>(kraw_18[0], scale_18);
+                            v8_13_1[1] = cake_dsv4_qmul4<6>(kraw_18[0], scale_18);
                         }
                         {
-                            v8_13_1[2] = cake_dsv4_qmul4_portable<5>(kraw_18[1], scale_18);
+                            v8_13_1[2] = cake_dsv4_qmul4<5>(kraw_18[1], scale_18);
                         }
                         {
-                            v8_13_1[3] = cake_dsv4_qmul4_portable<6>(kraw_18[1], scale_18);
+                            v8_13_1[3] = cake_dsv4_qmul4<6>(kraw_18[1], scale_18);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3930,16 +3942,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_19 = smem_sfs32[row_1 * 32 + vblock_14_1 >> 2];
                         unsigned int scale_19 = sfw32_19 >> (unsigned int)(8 * (vblock_14_1 & 3)) & 255;
                         {
-                            v8_15_1[0] = cake_dsv4_qmul4_portable<5>(kraw_19[0], scale_19);
+                            v8_15_1[0] = cake_dsv4_qmul4<5>(kraw_19[0], scale_19);
                         }
                         {
-                            v8_15_1[1] = cake_dsv4_qmul4_portable<6>(kraw_19[0], scale_19);
+                            v8_15_1[1] = cake_dsv4_qmul4<6>(kraw_19[0], scale_19);
                         }
                         {
-                            v8_15_1[2] = cake_dsv4_qmul4_portable<5>(kraw_19[1], scale_19);
+                            v8_15_1[2] = cake_dsv4_qmul4<5>(kraw_19[1], scale_19);
                         }
                         {
-                            v8_15_1[3] = cake_dsv4_qmul4_portable<6>(kraw_19[1], scale_19);
+                            v8_15_1[3] = cake_dsv4_qmul4<6>(kraw_19[1], scale_19);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3956,16 +3968,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_20 = smem_sfs32[row_1 * 32 + vblock_16_1 >> 2];
                         unsigned int scale_20 = sfw32_20 >> (unsigned int)(8 * (vblock_16_1 & 3)) & 255;
                         {
-                            v8_17_1[0] = cake_dsv4_qmul4_portable<5>(kraw_20[0], scale_20);
+                            v8_17_1[0] = cake_dsv4_qmul4<5>(kraw_20[0], scale_20);
                         }
                         {
-                            v8_17_1[1] = cake_dsv4_qmul4_portable<6>(kraw_20[0], scale_20);
+                            v8_17_1[1] = cake_dsv4_qmul4<6>(kraw_20[0], scale_20);
                         }
                         {
-                            v8_17_1[2] = cake_dsv4_qmul4_portable<5>(kraw_20[1], scale_20);
+                            v8_17_1[2] = cake_dsv4_qmul4<5>(kraw_20[1], scale_20);
                         }
                         {
-                            v8_17_1[3] = cake_dsv4_qmul4_portable<6>(kraw_20[1], scale_20);
+                            v8_17_1[3] = cake_dsv4_qmul4<6>(kraw_20[1], scale_20);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -3982,16 +3994,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_21 = smem_sfs32[row_1 * 32 + vblock_18_1 >> 2];
                         unsigned int scale_21 = sfw32_21 >> (unsigned int)(8 * (vblock_18_1 & 3)) & 255;
                         {
-                            v8_19_1[0] = cake_dsv4_qmul4_portable<5>(kraw_21[0], scale_21);
+                            v8_19_1[0] = cake_dsv4_qmul4<5>(kraw_21[0], scale_21);
                         }
                         {
-                            v8_19_1[1] = cake_dsv4_qmul4_portable<6>(kraw_21[0], scale_21);
+                            v8_19_1[1] = cake_dsv4_qmul4<6>(kraw_21[0], scale_21);
                         }
                         {
-                            v8_19_1[2] = cake_dsv4_qmul4_portable<5>(kraw_21[1], scale_21);
+                            v8_19_1[2] = cake_dsv4_qmul4<5>(kraw_21[1], scale_21);
                         }
                         {
-                            v8_19_1[3] = cake_dsv4_qmul4_portable<6>(kraw_21[1], scale_21);
+                            v8_19_1[3] = cake_dsv4_qmul4<6>(kraw_21[1], scale_21);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -4007,16 +4019,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_8 = smem_sfs32[row_1 * 32 + vblock_2_1 >> 2];
                         unsigned int scale_8 = sfw32_8 >> (unsigned int)(8 * (vblock_2_1 & 3)) & 255;
                         {
-                            v8_3_1[0] = cake_dsv4_qmul4_portable<5>(kraw_8[0], scale_8);
+                            v8_3_1[0] = cake_dsv4_qmul4<5>(kraw_8[0], scale_8);
                         }
                         {
-                            v8_3_1[1] = cake_dsv4_qmul4_portable<6>(kraw_8[0], scale_8);
+                            v8_3_1[1] = cake_dsv4_qmul4<6>(kraw_8[0], scale_8);
                         }
                         {
-                            v8_3_1[2] = cake_dsv4_qmul4_portable<5>(kraw_8[1], scale_8);
+                            v8_3_1[2] = cake_dsv4_qmul4<5>(kraw_8[1], scale_8);
                         }
                         {
-                            v8_3_1[3] = cake_dsv4_qmul4_portable<6>(kraw_8[1], scale_8);
+                            v8_3_1[3] = cake_dsv4_qmul4<6>(kraw_8[1], scale_8);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -4033,16 +4045,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_9 = smem_sfs32[row_1 * 32 + vblock_4_1 >> 2];
                         unsigned int scale_9 = sfw32_9 >> (unsigned int)(8 * (vblock_4_1 & 3)) & 255;
                         {
-                            v8_5_1[0] = cake_dsv4_qmul4_portable<5>(kraw_9[0], scale_9);
+                            v8_5_1[0] = cake_dsv4_qmul4<5>(kraw_9[0], scale_9);
                         }
                         {
-                            v8_5_1[1] = cake_dsv4_qmul4_portable<6>(kraw_9[0], scale_9);
+                            v8_5_1[1] = cake_dsv4_qmul4<6>(kraw_9[0], scale_9);
                         }
                         {
-                            v8_5_1[2] = cake_dsv4_qmul4_portable<5>(kraw_9[1], scale_9);
+                            v8_5_1[2] = cake_dsv4_qmul4<5>(kraw_9[1], scale_9);
                         }
                         {
-                            v8_5_1[3] = cake_dsv4_qmul4_portable<6>(kraw_9[1], scale_9);
+                            v8_5_1[3] = cake_dsv4_qmul4<6>(kraw_9[1], scale_9);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -4059,16 +4071,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_10 = smem_sfs32[row_1 * 32 + vblock_6_1 >> 2];
                         unsigned int scale_10 = sfw32_10 >> (unsigned int)(8 * (vblock_6_1 & 3)) & 255;
                         {
-                            v8_7_1[0] = cake_dsv4_qmul4_portable<5>(kraw_10[0], scale_10);
+                            v8_7_1[0] = cake_dsv4_qmul4<5>(kraw_10[0], scale_10);
                         }
                         {
-                            v8_7_1[1] = cake_dsv4_qmul4_portable<6>(kraw_10[0], scale_10);
+                            v8_7_1[1] = cake_dsv4_qmul4<6>(kraw_10[0], scale_10);
                         }
                         {
-                            v8_7_1[2] = cake_dsv4_qmul4_portable<5>(kraw_10[1], scale_10);
+                            v8_7_1[2] = cake_dsv4_qmul4<5>(kraw_10[1], scale_10);
                         }
                         {
-                            v8_7_1[3] = cake_dsv4_qmul4_portable<6>(kraw_10[1], scale_10);
+                            v8_7_1[3] = cake_dsv4_qmul4<6>(kraw_10[1], scale_10);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -4084,16 +4096,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_5 = smem_sfs32[row_1 * 32 + vblock_2_1 >> 2];
                         unsigned int scale_5 = sfw32_5 >> (unsigned int)(8 * (vblock_2_1 & 3)) & 255;
                         {
-                            v8_3_1[0] = cake_dsv4_qmul4_portable<5>(kraw_5[0], scale_5);
+                            v8_3_1[0] = cake_dsv4_qmul4<5>(kraw_5[0], scale_5);
                         }
                         {
-                            v8_3_1[1] = cake_dsv4_qmul4_portable<6>(kraw_5[0], scale_5);
+                            v8_3_1[1] = cake_dsv4_qmul4<6>(kraw_5[0], scale_5);
                         }
                         {
-                            v8_3_1[2] = cake_dsv4_qmul4_portable<5>(kraw_5[1], scale_5);
+                            v8_3_1[2] = cake_dsv4_qmul4<5>(kraw_5[1], scale_5);
                         }
                         {
-                            v8_3_1[3] = cake_dsv4_qmul4_portable<6>(kraw_5[1], scale_5);
+                            v8_3_1[3] = cake_dsv4_qmul4<6>(kraw_5[1], scale_5);
                         }
                     } else {
                         int rblock_1 = vblock_2_1 - 28;
@@ -5901,16 +5913,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_22 = smem_sfs32[row_2 * 32 + vblock_3 >> 2];
                         unsigned int scale_22 = sfw32_22 >> (unsigned int)(8 * (vblock_3 & 3)) & 255;
                         {
-                            v8_4[0] = cake_dsv4_qmul4_portable<5>(kraw_22[0], scale_22);
+                            v8_4[0] = cake_dsv4_qmul4<5>(kraw_22[0], scale_22);
                         }
                         {
-                            v8_4[1] = cake_dsv4_qmul4_portable<6>(kraw_22[0], scale_22);
+                            v8_4[1] = cake_dsv4_qmul4<6>(kraw_22[0], scale_22);
                         }
                         {
-                            v8_4[2] = cake_dsv4_qmul4_portable<5>(kraw_22[1], scale_22);
+                            v8_4[2] = cake_dsv4_qmul4<5>(kraw_22[1], scale_22);
                         }
                         {
-                            v8_4[3] = cake_dsv4_qmul4_portable<6>(kraw_22[1], scale_22);
+                            v8_4[3] = cake_dsv4_qmul4<6>(kraw_22[1], scale_22);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -5926,16 +5938,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_11 = smem_sfs32[row_2 * 32 + vblock_3 >> 2];
                         unsigned int scale_11 = sfw32_11 >> (unsigned int)(8 * (vblock_3 & 3)) & 255;
                         {
-                            v8_4[0] = cake_dsv4_qmul4_portable<5>(kraw_11[0], scale_11);
+                            v8_4[0] = cake_dsv4_qmul4<5>(kraw_11[0], scale_11);
                         }
                         {
-                            v8_4[1] = cake_dsv4_qmul4_portable<6>(kraw_11[0], scale_11);
+                            v8_4[1] = cake_dsv4_qmul4<6>(kraw_11[0], scale_11);
                         }
                         {
-                            v8_4[2] = cake_dsv4_qmul4_portable<5>(kraw_11[1], scale_11);
+                            v8_4[2] = cake_dsv4_qmul4<5>(kraw_11[1], scale_11);
                         }
                         {
-                            v8_4[3] = cake_dsv4_qmul4_portable<6>(kraw_11[1], scale_11);
+                            v8_4[3] = cake_dsv4_qmul4<6>(kraw_11[1], scale_11);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -5951,16 +5963,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_6 = smem_sfs32[row_2 * 32 + vblock_3 >> 2];
                         unsigned int scale_6 = sfw32_6 >> (unsigned int)(8 * (vblock_3 & 3)) & 255;
                         {
-                            v8_4[0] = cake_dsv4_qmul4_portable<5>(kraw_6[0], scale_6);
+                            v8_4[0] = cake_dsv4_qmul4<5>(kraw_6[0], scale_6);
                         }
                         {
-                            v8_4[1] = cake_dsv4_qmul4_portable<6>(kraw_6[0], scale_6);
+                            v8_4[1] = cake_dsv4_qmul4<6>(kraw_6[0], scale_6);
                         }
                         {
-                            v8_4[2] = cake_dsv4_qmul4_portable<5>(kraw_6[1], scale_6);
+                            v8_4[2] = cake_dsv4_qmul4<5>(kraw_6[1], scale_6);
                         }
                         {
-                            v8_4[3] = cake_dsv4_qmul4_portable<6>(kraw_6[1], scale_6);
+                            v8_4[3] = cake_dsv4_qmul4<6>(kraw_6[1], scale_6);
                         }
                     } else {
                         int rblock_2 = vblock_3 - 28;
@@ -6053,16 +6065,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_23 = smem_sfs32[row_2 * 32 + vblock_0_2 >> 2];
                         unsigned int scale_23 = sfw32_23 >> (unsigned int)(8 * (vblock_0_2 & 3)) & 255;
                         {
-                            v8_1_2[0] = cake_dsv4_qmul4_portable<5>(kraw_23[0], scale_23);
+                            v8_1_2[0] = cake_dsv4_qmul4<5>(kraw_23[0], scale_23);
                         }
                         {
-                            v8_1_2[1] = cake_dsv4_qmul4_portable<6>(kraw_23[0], scale_23);
+                            v8_1_2[1] = cake_dsv4_qmul4<6>(kraw_23[0], scale_23);
                         }
                         {
-                            v8_1_2[2] = cake_dsv4_qmul4_portable<5>(kraw_23[1], scale_23);
+                            v8_1_2[2] = cake_dsv4_qmul4<5>(kraw_23[1], scale_23);
                         }
                         {
-                            v8_1_2[3] = cake_dsv4_qmul4_portable<6>(kraw_23[1], scale_23);
+                            v8_1_2[3] = cake_dsv4_qmul4<6>(kraw_23[1], scale_23);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -6079,16 +6091,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_24 = smem_sfs32[row_2 * 32 + vblock_2_2 >> 2];
                         unsigned int scale_24 = sfw32_24 >> (unsigned int)(8 * (vblock_2_2 & 3)) & 255;
                         {
-                            v8_3_2[0] = cake_dsv4_qmul4_portable<5>(kraw_24[0], scale_24);
+                            v8_3_2[0] = cake_dsv4_qmul4<5>(kraw_24[0], scale_24);
                         }
                         {
-                            v8_3_2[1] = cake_dsv4_qmul4_portable<6>(kraw_24[0], scale_24);
+                            v8_3_2[1] = cake_dsv4_qmul4<6>(kraw_24[0], scale_24);
                         }
                         {
-                            v8_3_2[2] = cake_dsv4_qmul4_portable<5>(kraw_24[1], scale_24);
+                            v8_3_2[2] = cake_dsv4_qmul4<5>(kraw_24[1], scale_24);
                         }
                         {
-                            v8_3_2[3] = cake_dsv4_qmul4_portable<6>(kraw_24[1], scale_24);
+                            v8_3_2[3] = cake_dsv4_qmul4<6>(kraw_24[1], scale_24);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -6105,16 +6117,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_25 = smem_sfs32[row_2 * 32 + vblock_4_2 >> 2];
                         unsigned int scale_25 = sfw32_25 >> (unsigned int)(8 * (vblock_4_2 & 3)) & 255;
                         {
-                            v8_5_2[0] = cake_dsv4_qmul4_portable<5>(kraw_25[0], scale_25);
+                            v8_5_2[0] = cake_dsv4_qmul4<5>(kraw_25[0], scale_25);
                         }
                         {
-                            v8_5_2[1] = cake_dsv4_qmul4_portable<6>(kraw_25[0], scale_25);
+                            v8_5_2[1] = cake_dsv4_qmul4<6>(kraw_25[0], scale_25);
                         }
                         {
-                            v8_5_2[2] = cake_dsv4_qmul4_portable<5>(kraw_25[1], scale_25);
+                            v8_5_2[2] = cake_dsv4_qmul4<5>(kraw_25[1], scale_25);
                         }
                         {
-                            v8_5_2[3] = cake_dsv4_qmul4_portable<6>(kraw_25[1], scale_25);
+                            v8_5_2[3] = cake_dsv4_qmul4<6>(kraw_25[1], scale_25);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -6131,16 +6143,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_26 = smem_sfs32[row_2 * 32 + vblock_6_2 >> 2];
                         unsigned int scale_26 = sfw32_26 >> (unsigned int)(8 * (vblock_6_2 & 3)) & 255;
                         {
-                            v8_7_2[0] = cake_dsv4_qmul4_portable<5>(kraw_26[0], scale_26);
+                            v8_7_2[0] = cake_dsv4_qmul4<5>(kraw_26[0], scale_26);
                         }
                         {
-                            v8_7_2[1] = cake_dsv4_qmul4_portable<6>(kraw_26[0], scale_26);
+                            v8_7_2[1] = cake_dsv4_qmul4<6>(kraw_26[0], scale_26);
                         }
                         {
-                            v8_7_2[2] = cake_dsv4_qmul4_portable<5>(kraw_26[1], scale_26);
+                            v8_7_2[2] = cake_dsv4_qmul4<5>(kraw_26[1], scale_26);
                         }
                         {
-                            v8_7_2[3] = cake_dsv4_qmul4_portable<6>(kraw_26[1], scale_26);
+                            v8_7_2[3] = cake_dsv4_qmul4<6>(kraw_26[1], scale_26);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -6157,16 +6169,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_27 = smem_sfs32[row_2 * 32 + vblock_8_2 >> 2];
                         unsigned int scale_27 = sfw32_27 >> (unsigned int)(8 * (vblock_8_2 & 3)) & 255;
                         {
-                            v8_9_2[0] = cake_dsv4_qmul4_portable<5>(kraw_27[0], scale_27);
+                            v8_9_2[0] = cake_dsv4_qmul4<5>(kraw_27[0], scale_27);
                         }
                         {
-                            v8_9_2[1] = cake_dsv4_qmul4_portable<6>(kraw_27[0], scale_27);
+                            v8_9_2[1] = cake_dsv4_qmul4<6>(kraw_27[0], scale_27);
                         }
                         {
-                            v8_9_2[2] = cake_dsv4_qmul4_portable<5>(kraw_27[1], scale_27);
+                            v8_9_2[2] = cake_dsv4_qmul4<5>(kraw_27[1], scale_27);
                         }
                         {
-                            v8_9_2[3] = cake_dsv4_qmul4_portable<6>(kraw_27[1], scale_27);
+                            v8_9_2[3] = cake_dsv4_qmul4<6>(kraw_27[1], scale_27);
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
@@ -6498,16 +6510,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_12 = smem_sfs32[row_2 * 32 + vblock_0_2 >> 2];
                         unsigned int scale_12 = sfw32_12 >> (unsigned int)(8 * (vblock_0_2 & 3)) & 255;
                         {
-                            v8_1_2[0] = cake_dsv4_qmul4_portable<5>(kraw_12[0], scale_12);
+                            v8_1_2[0] = cake_dsv4_qmul4<5>(kraw_12[0], scale_12);
                         }
                         {
-                            v8_1_2[1] = cake_dsv4_qmul4_portable<6>(kraw_12[0], scale_12);
+                            v8_1_2[1] = cake_dsv4_qmul4<6>(kraw_12[0], scale_12);
                         }
                         {
-                            v8_1_2[2] = cake_dsv4_qmul4_portable<5>(kraw_12[1], scale_12);
+                            v8_1_2[2] = cake_dsv4_qmul4<5>(kraw_12[1], scale_12);
                         }
                         {
-                            v8_1_2[3] = cake_dsv4_qmul4_portable<6>(kraw_12[1], scale_12);
+                            v8_1_2[3] = cake_dsv4_qmul4<6>(kraw_12[1], scale_12);
                         }
                     } else {
                         int rblock = vblock_0_2 - 28;
@@ -6598,16 +6610,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_13 = smem_sfs32[row_2 * 32 + vblock_2_2 >> 2];
                         unsigned int scale_13 = sfw32_13 >> (unsigned int)(8 * (vblock_2_2 & 3)) & 255;
                         {
-                            v8_3_2[0] = cake_dsv4_qmul4_portable<5>(kraw_13[0], scale_13);
+                            v8_3_2[0] = cake_dsv4_qmul4<5>(kraw_13[0], scale_13);
                         }
                         {
-                            v8_3_2[1] = cake_dsv4_qmul4_portable<6>(kraw_13[0], scale_13);
+                            v8_3_2[1] = cake_dsv4_qmul4<6>(kraw_13[0], scale_13);
                         }
                         {
-                            v8_3_2[2] = cake_dsv4_qmul4_portable<5>(kraw_13[1], scale_13);
+                            v8_3_2[2] = cake_dsv4_qmul4<5>(kraw_13[1], scale_13);
                         }
                         {
-                            v8_3_2[3] = cake_dsv4_qmul4_portable<6>(kraw_13[1], scale_13);
+                            v8_3_2[3] = cake_dsv4_qmul4<6>(kraw_13[1], scale_13);
                         }
                     } else {
                         int rblock_1 = vblock_2_2 - 28;
@@ -6698,16 +6710,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_14 = smem_sfs32[row_2 * 32 + vblock_4_2 >> 2];
                         unsigned int scale_14 = sfw32_14 >> (unsigned int)(8 * (vblock_4_2 & 3)) & 255;
                         {
-                            v8_5_2[0] = cake_dsv4_qmul4_portable<5>(kraw_14[0], scale_14);
+                            v8_5_2[0] = cake_dsv4_qmul4<5>(kraw_14[0], scale_14);
                         }
                         {
-                            v8_5_2[1] = cake_dsv4_qmul4_portable<6>(kraw_14[0], scale_14);
+                            v8_5_2[1] = cake_dsv4_qmul4<6>(kraw_14[0], scale_14);
                         }
                         {
-                            v8_5_2[2] = cake_dsv4_qmul4_portable<5>(kraw_14[1], scale_14);
+                            v8_5_2[2] = cake_dsv4_qmul4<5>(kraw_14[1], scale_14);
                         }
                         {
-                            v8_5_2[3] = cake_dsv4_qmul4_portable<6>(kraw_14[1], scale_14);
+                            v8_5_2[3] = cake_dsv4_qmul4<6>(kraw_14[1], scale_14);
                         }
                     } else {
                         int rblock_2 = vblock_4_2 - 28;
@@ -6798,16 +6810,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_15 = smem_sfs32[row_2 * 32 + vblock_6_2 >> 2];
                         unsigned int scale_15 = sfw32_15 >> (unsigned int)(8 * (vblock_6_2 & 3)) & 255;
                         {
-                            v8_7_2[0] = cake_dsv4_qmul4_portable<5>(kraw_15[0], scale_15);
+                            v8_7_2[0] = cake_dsv4_qmul4<5>(kraw_15[0], scale_15);
                         }
                         {
-                            v8_7_2[1] = cake_dsv4_qmul4_portable<6>(kraw_15[0], scale_15);
+                            v8_7_2[1] = cake_dsv4_qmul4<6>(kraw_15[0], scale_15);
                         }
                         {
-                            v8_7_2[2] = cake_dsv4_qmul4_portable<5>(kraw_15[1], scale_15);
+                            v8_7_2[2] = cake_dsv4_qmul4<5>(kraw_15[1], scale_15);
                         }
                         {
-                            v8_7_2[3] = cake_dsv4_qmul4_portable<6>(kraw_15[1], scale_15);
+                            v8_7_2[3] = cake_dsv4_qmul4<6>(kraw_15[1], scale_15);
                         }
                     } else {
                         int rblock_3 = vblock_6_2 - 28;
@@ -6897,16 +6909,16 @@ decode_swap(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int sfw32_7 = smem_sfs32[row_2 * 32 + vblock_0_2 >> 2];
                         unsigned int scale_7 = sfw32_7 >> (unsigned int)(8 * (vblock_0_2 & 3)) & 255;
                         {
-                            v8_1_2[0] = cake_dsv4_qmul4_portable<5>(kraw_7[0], scale_7);
+                            v8_1_2[0] = cake_dsv4_qmul4<5>(kraw_7[0], scale_7);
                         }
                         {
-                            v8_1_2[1] = cake_dsv4_qmul4_portable<6>(kraw_7[0], scale_7);
+                            v8_1_2[1] = cake_dsv4_qmul4<6>(kraw_7[0], scale_7);
                         }
                         {
-                            v8_1_2[2] = cake_dsv4_qmul4_portable<5>(kraw_7[1], scale_7);
+                            v8_1_2[2] = cake_dsv4_qmul4<5>(kraw_7[1], scale_7);
                         }
                         {
-                            v8_1_2[3] = cake_dsv4_qmul4_portable<6>(kraw_7[1], scale_7);
+                            v8_1_2[3] = cake_dsv4_qmul4<6>(kraw_7[1], scale_7);
                         }
                     } else {
                         int rblock_3 = vblock_0_2 - 28;

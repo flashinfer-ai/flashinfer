@@ -9,8 +9,10 @@ flashinfer-ai/flashinfer#5676.
 Both the API and the backend are experimental: no compatibility guarantee.
 SM107 (Rubin) is the primary target of the request, SM100 (B200 / GB200) the
 comparison architecture, SM103 (B300 / GB300) the third target.  The feature
-is JIT-only and does not participate in automatic backend selection,
-autotuning or trace-apply.
+does not participate in automatic backend selection, autotuning or
+trace-apply; its libraries are loaded prebuilt from `aot/` when the package
+ships them and JIT-built by FlashInfer from `build.json` otherwise (see
+"Layout of this package").
 
 ## Public entry points (`flashinfer/dsa_indexer.py`)
 
@@ -142,7 +144,8 @@ by the CUB block radix sort or -- where the policy's `finalize_rank_for`
 names a bitmap window for the call -- by the prefix-popcount rank scatter
 program of that window; grid = `T`).  The scan exists in several physical programs and the host picks
 one per call from host-known integers only -- `T`, `Tkv`, `S`, `ratio`,
-`top_k`, the optional `max_seqlen_k` bound and the SM count; no tensor is read -- through the registry's
+`top_k`, the optional `max_seqlen_k` bound and the SM count (the device's compute capability and SM count
+are read once per device index and reused); no tensor is read -- through the registry's
 per-architecture `POLICY` record (`cake_policy.DispatchPolicy`,
 `cake_backend.plan_dsa_indexer_topk`).  The estimate behind most rules is the
 mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
@@ -188,18 +191,38 @@ that writes the registry verifies the record against them before it is frozen.
 ## Layout of this package
 
 * `cake_jit.py` -- registry written by the generated-program export: one
-  record per program (`PROGRAMS`: role, sources, architectures, launch
-  geometry), the program of every dispatch key per architecture
-  (`PROGRAM_KEYS`), the per-architecture dispatch policy (`POLICY`), the
-  argument plan and compile flags per role, and the JIT specs (one library per
-  program and architecture, compiled with the exact architecture flags).
+  record per program (`PROGRAMS`: role, the architecture-free `library` stem,
+  architectures, launch geometry), the program of every dispatch key per
+  architecture (`PROGRAM_KEYS`), the per-architecture dispatch policy
+  (`POLICY`), the argument plan per role, and the loader glue
+  (`library_name(program, arch)` = the `build.json` entry `<library>_<arch>`,
+  `load_program(program, arch)` through `cake_build.load_library`,
+  `specs_for_arch(arch)` for JIT warm-up).
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  FlashInfer package and this package's build manifest (schema `cake-build/1`),
+  the only record of what the package compiles: one entry per program and
+  architecture with its package-relative sources, nvcc flags, closure digest,
+  per-source SHA-256 and `aot/<name>.so` path, plus the common nvcc / link
+  flags, the `tvm-ffi` requirement and the CCCL revision the finalize programs
+  (CUB block radix sort) were compiled against.  `cake_build.load_library(name)`
+  loads the prebuilt library when `aot/` holds it (checked against the
+  builder's `aot/build_info.json` and the library's own `build_cuda_version()`)
+  and otherwise JIT-builds the entry through FlashInfer from the same sources
+  and flags; the prebuilt path never imports `flashinfer`.
+* `csrc/cake_ffi_checks.h` -- the tvm-ffi / DLPack include set, the named
+  tensor-argument checks and `cake_ffi_build_cuda_version()` the generated
+  launchers use; the package compiles without FlashInfer's `csrc/`.
 * `cake_policy.py` -- the dependency-free dispatch policy (program choice,
   capacity, check period, finalize program, workspace bound).
 * `cake_backend.py` -- validation, planning, argument binding, the prepared
   runner and the eager entry point.
 * `csrc/cake_dsa_indexer_topk/` -- generated kernel and binding translation
-  units, one source per program for every architecture (`.clang-format`
-  disables formatting: the sources are identity-checked by the export).
+  units, one source per program for every architecture, with the shared device
+  preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
+  `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
+  functions are content-addressed files under `csrc/cake_device_helpers/`
+  (`csrc/.clang-format` disables formatting: the sources are identity-checked by
+  the export).
 
 ## Tests and benchmark
 
