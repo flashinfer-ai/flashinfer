@@ -51,5 +51,6 @@ void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_i
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()),
       static_cast<int32_t*>(input_indptr.data_ptr()),
       static_cast<int32_t*>(output_indptr.data_ptr()), batch_size,
-      bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream);
+      bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream,
+      x.numel());
 }
