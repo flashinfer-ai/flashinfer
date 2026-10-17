@@ -56,6 +56,12 @@ C source and call `roce_enable_ring` before exchanging blobs. The returned
 `native_description()` records `ring`; private mailbox addresses are exchanged
 fresh at startup rather than restored from a CUDA graph.
 
+Collective generations range from 1 through 2,147,483,647. The proxy fails
+with `RoCE sequence space exhausted` before dispatching a larger generation;
+recreate every rank's runtime to reset the sequence. The bound preserves the
+meaning of zero-initialized chunk-ready words and the healthy error sentinel.
+It applies to the direct and ring transports without changing proxy ABI 9.
+
 ## Runnable checks
 
 The transport validator uses real libibverbs registrations and RDMA writes,
@@ -90,18 +96,56 @@ and checks changed BF16 inputs over repeated graph replay. It skips without a
 2..16-rank torchrun launch. Use the existing explicit `hca_names` and `gid_index`
 constructor arguments if the machine's automatic discovery is insufficient.
 
+The protocol and generation-limit tests use the same launch, with these pytest
+targets:
+
+```sh
+torchrun --nnodes=N --nproc-per-node=1 --node-rank=R \
+  --master-addr=RANK_ZERO_HOST --master-port=29650 \
+  -m pytest -x tests/experimental/b12x/comm/test_roce_protocol_gpu.py \
+  tests/experimental/b12x/comm/test_roce_sequence_exhaustion_gpu.py
+```
+
+The protocol tests alternate 2, 8, 4, and 16 MiB reductions within one captured
+graph, change inputs between replays, mix variable-length gathers with both
+reduction paths, and delay individual proxies. Both direct and ring transports
+must preserve every operation's payload. The generation-limit tests initialize
+stopped proxies through a test-only C wrapper: a two-shot graph completes at
+generation 2,147,483,647, then the next replay must report sequence exhaustion
+without advancing the epoch or posting another transfer.
+
 ## Validation limits
 
-CPU-driven RDMA validation passed on four DGX Sparks through a switch: four
-ranks with 240 mixed operations per rank and driver skew, seven ranks with 90,
-eight ranks with 120 and skew, and sixteen ranks with 30. Larger worlds placed
-multiple native processes on each of the four physical hosts. Every byte
-matched, each ring rank connected only its two neighbors, and every rank
-forwarded traffic. The ordinary four-rank mesh also passed 60 mixed operations
-per rank with zero relays.
+Validation used four physical DGX Sparks through a switch, with two RoCE rails
+per host and non-neighbor queue pairs absent in ring mode:
 
-Those checks validate transport progress and buffer lifetimes on the switched
-fabric. GPU graph replay, floating-point reduction correctness on the ring,
-failure injection, actual switchless cabling, and model serving remain to be
-qualified. CPU relays add overhead; these tests make no throughput, latency,
-or physical ring performance claim.
+| Check | Configuration | Result |
+| --- | --- | --- |
+| GPU collective and failure checks | Two ranks, sequence-limited proxy | 110 passed and one capacity-related skip per rank |
+| GPU collective and failure checks | Four ranks, proxy and CuTe source at revision `c46a0b5` | 105 collective cases plus four protocol cases passed, with one capacity-related skip per rank |
+| CPU-driven RDMA ring | Four ranks, sequence-limited proxy | 120 mixed operations per rank, with driver skew; every byte matched |
+| CPU-driven RDMA ring | Six logical ranks on three hosts, sequence-limited proxy | 90 mixed operations per rank, with driver skew; every byte matched |
+
+Revision `c46a0b5` also passed CPU-driven ring checks with four ranks and 240
+operations per rank, seven ranks with 90, eight ranks with 120, and sixteen
+ranks with 30. Larger worlds used multiple processes on each of the four hosts.
+All payloads matched; its four-rank mesh passed 60 operations per rank.
+
+The GPU checks cover changed-input graph replay, BF16 reductions, changing
+variable-length counts, temporary proxy pauses, stopped-proxy timeouts, invalid
+counts, and fail-stop handling. The ABI 9 proxy and CuTe source at revision
+`c46a0b5`, including the two-shot `pipe_done` wait, passed four-rank graph replay.
+The sequence-limited proxy passed generation-boundary GPU checks with two ranks
+in both direct and ring modes, plus four- and six-rank CPU transport checks.
+Every rank in those native ring checks forwarded traffic and connected only its
+two neighbors.
+
+A separate four-rank GPU negative control removed only the two-shot
+`pipe_done` wait. Its changing-shard ring graph produced corrupt output; the
+matching graph passed with the wait present. The wait therefore remains part
+of the send-buffer lifetime contract.
+
+Actual switchless cabling, full-model ring serving, and ring performance remain
+unqualified. These finite tests do not establish progress under every possible
+failure or scheduling pattern. CPU relays add overhead; throughput and latency
+depend on the topology and workload.

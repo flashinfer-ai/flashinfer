@@ -621,9 +621,11 @@ static int reserve(roce_ctx_t* c, int h, int p) {
 
 // Each original sender has a private mailbox per rail at every relay. It
 // admits one packet per rail until an end-to-end ack returns. Different
-// senders never hold each other's mailbox credit, so a cycle of active senders
-// cannot deadlock. A packet's remaining shortest-path distance decreases at
-// every hop. Its header and payload remain live until the downstream ack.
+// senders never hold each other's mailbox credit. Credit waits still progress
+// incoming relay work and shared-QP completions; ACK posting relies on the
+// queue slack left by reserve. A packet's remaining shortest-path distance
+// decreases at every hop. Its header and payload remain live until the
+// downstream ack.
 static int ring_complete(roce_ctx_t* c, int origin, int rail) {
   ring_descriptor_t* d = &c->ring->inbox[origin][rail].descriptor;
   int previous = (int)d->previous;
@@ -1136,6 +1138,15 @@ static void* proxy_main(void* arg) {
   const struct timespec nap = {0, 20000};
   while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
     uint32_t seq = __atomic_load_n(&ctrl[CTRL_SEQ], __ATOMIC_ACQUIRE);
+    // Dormant chunk-ready words remain zero. Signed ready/sequence comparisons
+    // cease to distinguish them after INT32_MAX, and wrapping to zero would
+    // also collide with the unpoisoned error sentinel. Fail before dispatch.
+    if (seq > INT32_MAX) {
+      snprintf(c->err, sizeof(c->err),
+               "RoCE sequence space exhausted at %u; recreate the transport", seq);
+      atomic_store(&c->failed, 1);
+      return NULL;
+    }
     if (seq == c->last_seq) {
       idle++;
       if (idle % 64 == 0) {

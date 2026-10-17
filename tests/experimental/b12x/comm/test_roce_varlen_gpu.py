@@ -66,7 +66,7 @@ def _prepare(spin_limit: int | None = None, **kwargs) -> _Prepared:
             device=device,
             max_size=1 << 20,
             max_gather_bytes=1 << 20,
-            pipe_bytes=8 << 20,
+            pipe_bytes=kwargs.pop("pipe_bytes", 8 << 20),
             max_varlen_bytes=CAPACITY,
             varlen_chunk_bytes=CHUNK,
             **kwargs,
