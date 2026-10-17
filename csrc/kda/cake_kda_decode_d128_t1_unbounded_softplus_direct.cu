@@ -40,14 +40,29 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_KDA_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 32
+#define THREADS CAKE_KDA_DECODE_LAUNCH_THREADS
 
 #include <math_constants.h>
 
 extern "C" {
 
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
 __global__ __launch_bounds__(32) void
 kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#if CAKE_KDA_DECODE_WARPS_PER_CTA == 2
+__global__ __launch_bounds__(64) void
+kernel_flashinfer_recurrent_kda_t1_unbounded_softplus_warp2(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
+#else
+__global__ __launch_bounds__(32) void
+kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
+#endif  // CAKE_KDA_DECODE_WARPS_PER_CTA
+#else
+__global__ __launch_bounds__(32) void
+kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -58,9 +73,25 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
     int work = blockIdx.x;
+    int value_tile = work % 16;
+    int hv = work / 16;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#if CAKE_KDA_DECODE_WARPS_PER_CTA == 2
+    int work = blockIdx.x * 2 + warp;
+#else
+    int work = blockIdx.x;
+#endif  // CAKE_KDA_DECODE_WARPS_PER_CTA
     int value_tile = work % 8;
     int hv = work / 8;
+#else
+    int work = blockIdx.x;
+    int value_tile = work % 4;
+    int hv = work / 4;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     int n = blockIdx.y;
     int query_head = hv / head_ratio;
     int lane_0 = lane;
@@ -83,7 +114,15 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
         initial_slot = 0;
     }
     bool active = raw_slot >= 0 && has_token;
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
+    int tile_row_base = value_tile * 8;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
     int tile_row_base = value_tile * 16;
+#else
+    int tile_row_base = value_tile * 32;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     int elem_start = lane_0 * 4;
     int q_base_narrow = token_pos * q_stride_token + query_head * 128 + elem_start;
     int k_base_narrow = token_pos * k_stride_token + query_head * 128 + elem_start;
@@ -224,7 +263,15 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     int output_head_base = (token_pos * HV + hv) * 128;
     bool state_aligned = 1;
     #pragma unroll 1
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
+    for (int row_block = 0; row_block < 1; row_block++) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
     for (int row_block = 0; row_block < 2; row_block++) {
+#else
+    for (int row_block = 0; row_block < 4; row_block++) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         #pragma unroll
         for (int row_local = 0; row_local < 4; row_local++) {
             int value_row = tile_row_base + v_lane + 2 * (row_block * 4 + row_local);

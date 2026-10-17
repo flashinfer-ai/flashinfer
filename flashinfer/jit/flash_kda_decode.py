@@ -145,6 +145,25 @@ FLASH_KDA_DECODE_VARIANT_METADATA: dict[
     "d128_t6_precomputed_gram_split8": _variant_metadata(6, 0, 8, True),
 }
 
+# One frozen body per token-count template. The rendered binding defines
+# CAKE_KDA_DECODE_VALUE_SPLIT before it includes the body, which selects the
+# split-specific constants from it; the T=3 template has a single split.
+FLASH_KDA_DECODE_BODY_FILES: dict[int, str] = {
+    1: "flashkda_decode_d128_t1_precomputed_direct.cu",
+    2: "flashkda_decode_d128_t2_precomputed.cu",
+    3: "flashkda_decode_d128_t3_lower_bound_split4.cu",
+    4: "flashkda_decode_d128_t4_precomputed.cu",
+    5: "flashkda_decode_d128_t5_precomputed_gram.cu",
+    6: "flashkda_decode_d128_t6_precomputed_gram.cu",
+}
+
+
+def get_flash_kda_decode_body_file(variant: FlashKDADecodeVariant) -> str:
+    """Return the frozen body source shared by one token-count template."""
+
+    metadata = FLASH_KDA_DECODE_VARIANT_METADATA[variant]
+    return FLASH_KDA_DECODE_BODY_FILES[metadata.tokens]
+
 
 def get_flash_kda_decode_uri(
     variant: FlashKDADecodeVariant, target: FlashKDADecodeTarget
@@ -163,19 +182,17 @@ def get_flash_kda_decode_uri(
     return f"flash_kda_decode_{variant}_{target}"
 
 
-def _get_binding_cu(
-    variant: FlashKDADecodeVariant,
-    metadata: FlashKDADecodeVariantMetadata,
-) -> str:
-    """Render the shared KDA decode binding translation unit for one body.
+def _get_binding_cu(metadata: FlashKDADecodeVariantMetadata) -> str:
+    """Render the shared KDA decode binding translation unit for one schedule.
 
     The precomputed and lower-bound bodies share the ``cake_kda_decode``
     binding family with the unbounded-softplus route; their ``run`` entry
     therefore also takes the ``beta_is_logit`` scalar, which must be zero.
     """
 
+    body_file = FLASH_KDA_DECODE_BODY_FILES[metadata.tokens]
     defines: list[tuple[str, str | int]] = [
-        ("CAKE_KDA_DECODE_BODY_FILE", f'"flashkda_decode_{variant}.cu"'),
+        ("CAKE_KDA_DECODE_BODY_FILE", f'"{body_file}"'),
         ("CAKE_KDA_DECODE_HEAD_DIM", metadata.head_dim),
         ("CAKE_KDA_DECODE_TOKENS", metadata.tokens),
         ("CAKE_KDA_DECODE_GATE_KIND", metadata.gate_kind),
@@ -201,7 +218,7 @@ def gen_flash_kda_decode_module(
     """
 
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / f"flashkda_decode_{variant}.cu"
+    body = csrc_dir / get_flash_kda_decode_body_file(variant)
     if not body.exists():
         raise FileNotFoundError(f"frozen FlashKDA decode body source not found: {body}")
     binding_header = csrc_dir / "cake_kda_decode_binding.cuh"
@@ -213,7 +230,7 @@ def gen_flash_kda_decode_module(
     metadata = FLASH_KDA_DECODE_VARIANT_METADATA[variant]
     uri = get_flash_kda_decode_uri(variant, target)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_kda_decode_binding.cu"
-    write_if_different(binding, _get_binding_cu(variant, metadata))
+    write_if_different(binding, _get_binding_cu(metadata))
 
     spec = gen_kda_jit_spec(
         name=uri,
@@ -251,6 +268,7 @@ def get_flash_kda_decode_module(
 
 
 __all__ = [
+    "FLASH_KDA_DECODE_BODY_FILES",
     "FLASH_KDA_DECODE_DIRECT_VARIANTS",
     "FLASH_KDA_DECODE_VARIANT_METADATA",
     "FLASH_KDA_DECODE_VARIANTS",
@@ -258,6 +276,7 @@ __all__ = [
     "FlashKDADecodeVariant",
     "FlashKDADecodeVariantMetadata",
     "gen_flash_kda_decode_module",
+    "get_flash_kda_decode_body_file",
     "get_flash_kda_decode_module",
     "get_flash_kda_decode_uri",
     "load_flash_kda_decode_module",

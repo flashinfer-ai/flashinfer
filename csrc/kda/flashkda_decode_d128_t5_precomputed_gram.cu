@@ -41,48 +41,216 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SSTATE0_OFF 0
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SSTATE0_STAGE_BYTES 2048
+#define SMEM_SSTATE0_STRIDE 2048
+#define SMEM_SSTATE1_OFF 2048
+#define SMEM_SSTATE1_STAGE_BYTES 2048
+#define SMEM_SSTATE1_STRIDE 2048
+#define SMEM_SVEC_OFF 4096
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SSTATE0_STAGE_BYTES 4096
 #define SMEM_SSTATE0_STRIDE 4096
 #define SMEM_SSTATE1_OFF 4096
 #define SMEM_SSTATE1_STAGE_BYTES 4096
 #define SMEM_SSTATE1_STRIDE 4096
 #define SMEM_SVEC_OFF 8192
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SSTATE0_STAGE_BYTES 8192
+#define SMEM_SSTATE0_STRIDE 8192
+#define SMEM_SSTATE1_OFF 8192
+#define SMEM_SSTATE1_STAGE_BYTES 8192
+#define SMEM_SSTATE1_STRIDE 8192
+#define SMEM_SVEC_OFF 16384
+#else
+#define SMEM_SSTATE0_STAGE_BYTES 16384
+#define SMEM_SSTATE0_STRIDE 16384
+#define SMEM_SSTATE1_OFF 16384
+#define SMEM_SSTATE1_STAGE_BYTES 16384
+#define SMEM_SSTATE1_STRIDE 16384
+#define SMEM_SVEC_OFF 32768
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SVEC_STAGE_BYTES 4096
 #define SMEM_SVEC_STRIDE 4096
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SK_OFF 8192
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SK_OFF 12288
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SK_OFF 20480
+#else
+#define SMEM_SK_OFF 36864
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SK_STAGE_BYTES 2560
 #define SMEM_SK_STRIDE 2560
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SD_OFF 10752
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SD_OFF 14848
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SD_OFF 23040
+#else
+#define SMEM_SD_OFF 39424
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SD_STAGE_BYTES 2560
 #define SMEM_SD_STRIDE 2560
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SBETA_OFF 13312
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SBETA_OFF 17408
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SBETA_OFF 25600
+#else
+#define SMEM_SBETA_OFF 41984
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SBETA_STAGE_BYTES 20
 #define SMEM_SBETA_STRIDE 20
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SSLOT_OFF 13332
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SSLOT_OFF 17428
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SSLOT_OFF 25620
+#else
+#define SMEM_SSLOT_OFF 42004
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SSLOT_STAGE_BYTES 20
 #define SMEM_SSLOT_STRIDE 20
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_STOKEN_OFF 13352
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_STOKEN_OFF 17448
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_STOKEN_OFF 25640
+#else
+#define SMEM_STOKEN_OFF 42024
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_STOKEN_STAGE_BYTES 20
 #define SMEM_STOKEN_STRIDE 20
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SINIT_OFF 13372
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SINIT_OFF 17468
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SINIT_OFF 25660
+#else
+#define SMEM_SINIT_OFF 42044
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SINIT_STAGE_BYTES 4
 #define SMEM_SINIT_STRIDE 4
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SL_OFF 13388
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SL_OFF 17484
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SL_OFF 25676
+#else
+#define SMEM_SL_OFF 42060
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SL_STAGE_BYTES 100
 #define SMEM_SL_STRIDE 100
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SR_OFF 13488
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SR_OFF 17584
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SR_OFF 25776
+#else
+#define SMEM_SR_OFF 42160
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SR_STAGE_BYTES 100
 #define SMEM_SR_STRIDE 100
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SU_OFF 13588
+#define SMEM_SU_STAGE_BYTES 320
+#define SMEM_SU_STRIDE 320
+#define SMEM_SGRAMA0_OFF 13952
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SU_OFF 17684
 #define SMEM_SU_STAGE_BYTES 640
 #define SMEM_SU_STRIDE 640
 #define SMEM_SGRAMA0_OFF 18432
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SU_OFF 25876
+#define SMEM_SU_STAGE_BYTES 1280
+#define SMEM_SU_STRIDE 1280
+#define SMEM_SGRAMA0_OFF 27264
+#else
+#define SMEM_SU_OFF 42260
+#define SMEM_SU_STAGE_BYTES 2560
+#define SMEM_SU_STRIDE 2560
+#define SMEM_SGRAMA0_OFF 44928
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SGRAMA0_STAGE_BYTES 2048
 #define SMEM_SGRAMA0_STRIDE 2048
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_SGRAMA1_OFF 16000
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_SGRAMA1_OFF 20480
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_SGRAMA1_OFF 29312
+#else
+#define SMEM_SGRAMA1_OFF 46976
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define SMEM_SGRAMA1_STAGE_BYTES 2048
 #define SMEM_SGRAMA1_STRIDE 2048
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+#define SMEM_TOTAL 18048
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
 #define SMEM_TOTAL 22528
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+#define SMEM_TOTAL 31360
+#else
+#define SMEM_TOTAL 49024
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 #define THREADS 256
 #define GATE_KIND 0
 #define DIRECT_PREFIX_CHECKPOINT 0
@@ -109,6 +277,35 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
     // Kernel setup ops
     __nv_bfloat16* sState0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int sState0_addr = smem + 0;
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    __nv_bfloat16* sState1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
+    const int sState1_addr = smem + 2048;
+    __nv_bfloat16* sVec = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
+    const int sVec_addr = smem + 4096;
+    float* sK = reinterpret_cast<float*>(smem_raw + 8192);
+    const int sK_addr = smem + 8192;
+    float* sD = reinterpret_cast<float*>(smem_raw + 10752);
+    const int sD_addr = smem + 10752;
+    float* sBeta = reinterpret_cast<float*>(smem_raw + 13312);
+    const int sBeta_addr = smem + 13312;
+    int* sSlot = reinterpret_cast<int*>(smem_raw + 13332);
+    const int sSlot_addr = smem + 13332;
+    int* sToken = reinterpret_cast<int*>(smem_raw + 13352);
+    const int sToken_addr = smem + 13352;
+    int* sInit = reinterpret_cast<int*>(smem_raw + 13372);
+    const int sInit_addr = smem + 13372;
+    float* sL = reinterpret_cast<float*>(smem_raw + 13388);
+    const int sL_addr = smem + 13388;
+    float* sR = reinterpret_cast<float*>(smem_raw + 13488);
+    const int sR_addr = smem + 13488;
+    float* sU = reinterpret_cast<float*>(smem_raw + 13588);
+    const int sU_addr = smem + 13588;
+    __nv_bfloat16* sGramA0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 13952);
+    const int sGramA0_addr = smem + 13952;
+    __nv_bfloat16* sGramA1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16000);
+    const int sGramA1_addr = smem + 16000;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     __nv_bfloat16* sState1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
     const int sState1_addr = smem + 4096;
     __nv_bfloat16* sVec = reinterpret_cast<__nv_bfloat16*>(smem_raw + 8192);
@@ -135,11 +332,84 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
     const int sGramA0_addr = smem + 18432;
     __nv_bfloat16* sGramA1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 20480);
     const int sGramA1_addr = smem + 20480;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    __nv_bfloat16* sState1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 8192);
+    const int sState1_addr = smem + 8192;
+    __nv_bfloat16* sVec = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
+    const int sVec_addr = smem + 16384;
+    float* sK = reinterpret_cast<float*>(smem_raw + 20480);
+    const int sK_addr = smem + 20480;
+    float* sD = reinterpret_cast<float*>(smem_raw + 23040);
+    const int sD_addr = smem + 23040;
+    float* sBeta = reinterpret_cast<float*>(smem_raw + 25600);
+    const int sBeta_addr = smem + 25600;
+    int* sSlot = reinterpret_cast<int*>(smem_raw + 25620);
+    const int sSlot_addr = smem + 25620;
+    int* sToken = reinterpret_cast<int*>(smem_raw + 25640);
+    const int sToken_addr = smem + 25640;
+    int* sInit = reinterpret_cast<int*>(smem_raw + 25660);
+    const int sInit_addr = smem + 25660;
+    float* sL = reinterpret_cast<float*>(smem_raw + 25676);
+    const int sL_addr = smem + 25676;
+    float* sR = reinterpret_cast<float*>(smem_raw + 25776);
+    const int sR_addr = smem + 25776;
+    float* sU = reinterpret_cast<float*>(smem_raw + 25876);
+    const int sU_addr = smem + 25876;
+    __nv_bfloat16* sGramA0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 27264);
+    const int sGramA0_addr = smem + 27264;
+    __nv_bfloat16* sGramA1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 29312);
+    const int sGramA1_addr = smem + 29312;
+#else
+    __nv_bfloat16* sState1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
+    const int sState1_addr = smem + 16384;
+    __nv_bfloat16* sVec = reinterpret_cast<__nv_bfloat16*>(smem_raw + 32768);
+    const int sVec_addr = smem + 32768;
+    float* sK = reinterpret_cast<float*>(smem_raw + 36864);
+    const int sK_addr = smem + 36864;
+    float* sD = reinterpret_cast<float*>(smem_raw + 39424);
+    const int sD_addr = smem + 39424;
+    float* sBeta = reinterpret_cast<float*>(smem_raw + 41984);
+    const int sBeta_addr = smem + 41984;
+    int* sSlot = reinterpret_cast<int*>(smem_raw + 42004);
+    const int sSlot_addr = smem + 42004;
+    int* sToken = reinterpret_cast<int*>(smem_raw + 42024);
+    const int sToken_addr = smem + 42024;
+    int* sInit = reinterpret_cast<int*>(smem_raw + 42044);
+    const int sInit_addr = smem + 42044;
+    float* sL = reinterpret_cast<float*>(smem_raw + 42060);
+    const int sL_addr = smem + 42060;
+    float* sR = reinterpret_cast<float*>(smem_raw + 42160);
+    const int sR_addr = smem + 42160;
+    float* sU = reinterpret_cast<float*>(smem_raw + 42260);
+    const int sU_addr = smem + 42260;
+    __nv_bfloat16* sGramA0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 44928);
+    const int sGramA0_addr = smem + 44928;
+    __nv_bfloat16* sGramA1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 46976);
+    const int sGramA1_addr = smem + 46976;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
 
     // === Task calls (dependency order) ===
     int work = blockIdx.x;
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    int value_tile = work & 7;
+    int hv = work / 8;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     int value_tile = work & 3;
     int hv = work / 4;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    int value_tile = work & 1;
+    int hv = work / 2;
+#else
+    int value_tile = work & 0;
+    int hv = work;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     int n = blockIdx.y;
     int query_head = hv / head_ratio;
     int token_base = cu_seqlens[n];
@@ -154,14 +424,31 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
     int lane_group = tid - group * 16;
     const int k_per_lane = 8;
     int k_start = lane_group * k_per_lane;
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    int tile_row_base = value_tile * 16;
+    int owned_row_base = group * 2;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     int tile_row_base = value_tile * 32;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    int tile_row_base = value_tile * 64;
+#else
+    int tile_row_base = value_tile * 128;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     int owned_row_base = group * 8;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     float r_q[4];
     float r_k[4];
     float r_d[4];
     float ratio_scan[4];
     float r_state[8];
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    float hist[16];
+#else
     float hist[64];
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     unsigned int state_pack[4];
     unsigned int state_frag[4];
     unsigned int vec_frag[4];
@@ -301,45 +588,143 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
                     }
                 }
                 {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+                    __nv_bfloat16 _bval_972216480 = __float2bfloat16_rn(prefix * r_k[i_3]);
+                    uint16_t _bits_972216480 = *(uint16_t*)&_bval_972216480;
+                    uint32_t _addr_972216480 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + token * 2 ^ (k_idx_1 * 32 + token * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972216480), "h"(_bits_972216480) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
                     __nv_bfloat16 _bval_972006272 = __float2bfloat16_rn(prefix * r_k[i_3]);
                     uint16_t _bits_972006272 = *(uint16_t*)&_bval_972006272;
                     uint32_t _addr_972006272 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + token * 2 ^ (k_idx_1 * 32 + token * 2 >> 7 & 7) << 4)));
                     asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972006272), "h"(_bits_972006272) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+                    __nv_bfloat16 _bval_969908064 = __float2bfloat16_rn(prefix * r_k[i_3]);
+                    uint16_t _bits_969908064 = *(uint16_t*)&_bval_969908064;
+                    uint32_t _addr_969908064 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + token * 2 ^ (k_idx_1 * 32 + token * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_969908064), "h"(_bits_969908064) : "memory");
+#else
+                    __nv_bfloat16 _bval_972002576 = __float2bfloat16_rn(prefix * r_k[i_3]);
+                    uint16_t _bits_972002576 = *(uint16_t*)&_bval_972002576;
+                    uint32_t _addr_972002576 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + token * 2 ^ (k_idx_1 * 32 + token * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972002576), "h"(_bits_972002576) : "memory");
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                 }
                 int c_col = 4 + token;
                 {
                     c_col = 8 + token;
                 }
                 {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+                    __nv_bfloat16 _bval_972219984 = __float2bfloat16_rn(prefix * r_q[i_3]);
+                    uint16_t _bits_972219984 = *(uint16_t*)&_bval_972219984;
+                    uint32_t _addr_972219984 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + c_col * 2 ^ (k_idx_1 * 32 + c_col * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972219984), "h"(_bits_972219984) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
                     __nv_bfloat16 _bval_971999792 = __float2bfloat16_rn(prefix * r_q[i_3]);
                     uint16_t _bits_971999792 = *(uint16_t*)&_bval_971999792;
                     uint32_t _addr_971999792 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + c_col * 2 ^ (k_idx_1 * 32 + c_col * 2 >> 7 & 7) << 4)));
                     asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_971999792), "h"(_bits_971999792) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+                    __nv_bfloat16 _bval_969906336 = __float2bfloat16_rn(prefix * r_q[i_3]);
+                    uint16_t _bits_969906336 = *(uint16_t*)&_bval_969906336;
+                    uint32_t _addr_969906336 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + c_col * 2 ^ (k_idx_1 * 32 + c_col * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_969906336), "h"(_bits_969906336) : "memory");
+#else
+                    __nv_bfloat16 _bval_972003536 = __float2bfloat16_rn(prefix * r_q[i_3]);
+                    uint16_t _bits_972003536 = *(uint16_t*)&_bval_972003536;
+                    uint32_t _addr_972003536 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + c_col * 2 ^ (k_idx_1 * 32 + c_col * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972003536), "h"(_bits_972003536) : "memory");
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                 }
                 {
                     if (k_idx_1 < 64) {
                         {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+                            __nv_bfloat16 _bval_972213648 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_972213648 = *(uint16_t*)&_bval_972213648;
+                            uint32_t _addr_972213648 = static_cast<uint32_t>((sGramA0_addr + (unsigned int)(token * 128 + k_idx_1 * 2 ^ (token * 128 + k_idx_1 * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972213648), "h"(_bits_972213648) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
                             __nv_bfloat16 _bval_972003968 = __float2bfloat16_rn(r_k[i_3] / prefix);
                             uint16_t _bits_972003968 = *(uint16_t*)&_bval_972003968;
                             uint32_t _addr_972003968 = static_cast<uint32_t>((sGramA0_addr + (unsigned int)(token * 128 + k_idx_1 * 2 ^ (token * 128 + k_idx_1 * 2 >> 7 & 7) << 4)));
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972003968), "h"(_bits_972003968) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+                            __nv_bfloat16 _bval_969910944 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_969910944 = *(uint16_t*)&_bval_969910944;
+                            uint32_t _addr_969910944 = static_cast<uint32_t>((sGramA0_addr + (unsigned int)(token * 128 + k_idx_1 * 2 ^ (token * 128 + k_idx_1 * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_969910944), "h"(_bits_969910944) : "memory");
+#else
+                            __nv_bfloat16 _bval_972003776 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_972003776 = *(uint16_t*)&_bval_972003776;
+                            uint32_t _addr_972003776 = static_cast<uint32_t>((sGramA0_addr + (unsigned int)(token * 128 + k_idx_1 * 2 ^ (token * 128 + k_idx_1 * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972003776), "h"(_bits_972003776) : "memory");
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                         }
                     } else {
                         {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+                            __nv_bfloat16 _bval_972213648 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_972213648 = *(uint16_t*)&_bval_972213648;
+                            uint32_t _addr_972213648 = static_cast<uint32_t>((sGramA1_addr + (unsigned int)(token * 128 + (k_idx_1 - 64) * 2 ^ (token * 128 + (k_idx_1 - 64) * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972213648), "h"(_bits_972213648) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
                             __nv_bfloat16 _bval_972003968 = __float2bfloat16_rn(r_k[i_3] / prefix);
                             uint16_t _bits_972003968 = *(uint16_t*)&_bval_972003968;
                             uint32_t _addr_972003968 = static_cast<uint32_t>((sGramA1_addr + (unsigned int)(token * 128 + (k_idx_1 - 64) * 2 ^ (token * 128 + (k_idx_1 - 64) * 2 >> 7 & 7) << 4)));
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972003968), "h"(_bits_972003968) : "memory");
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+                            __nv_bfloat16 _bval_969910944 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_969910944 = *(uint16_t*)&_bval_969910944;
+                            uint32_t _addr_969910944 = static_cast<uint32_t>((sGramA1_addr + (unsigned int)(token * 128 + (k_idx_1 - 64) * 2 ^ (token * 128 + (k_idx_1 - 64) * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_969910944), "h"(_bits_969910944) : "memory");
+#else
+                            __nv_bfloat16 _bval_972003776 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_972003776 = *(uint16_t*)&_bval_972003776;
+                            uint32_t _addr_972003776 = static_cast<uint32_t>((sGramA1_addr + (unsigned int)(token * 128 + (k_idx_1 - 64) * 2 ^ (token * 128 + (k_idx_1 - 64) * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_972003776), "h"(_bits_972003776) : "memory");
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                         }
                     }
                 }
             }
         }
         {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+            if (warp_0 == ((1) ? 4 : 0)) {
+                {
+                    asm volatile("barrier.sync 1, 160;" ::: "memory");
+                }
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
             {
                 asm volatile("barrier.sync 1, 160;" ::: "memory");
             }
             if (warp_0 == ((1) ? 4 : 0)) {
+#else
+            if (warp_0 == ((0) ? 4 : 0)) {
+                {
+                    asm volatile("barrier.sync 1, 160;" ::: "memory");
+                }
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                 unsigned int gram_a_frag[4];
                 unsigned int gram_b_frag[4];
                 float gram_k_acc[4];
@@ -400,15 +785,39 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
                         sR[target1 * 5 + source_token] = beta_source * gram_q_acc[1];
                     }
                 }
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+            } else if (1) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
             } else if (0) {
+#else
+            } else if (1) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                 asm volatile("barrier.arrive 1, 160;" ::: "memory");
             }
         }
     }
     {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+        if (group < 8) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
         if (group < 4) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+        if (group < 8) {
+#else
+        if (group < 16) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
             #pragma unroll
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+            for (int row_local = 0; row_local < 2; row_local++) {
+#else
             for (int row_local = 0; row_local < 8; row_local++) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                 int value_row_local = owned_row_base + row_local;
                 int value_row = tile_row_base + value_row_local;
                 int state_base = initial_head_base + value_row * 128 + k_start;
@@ -443,7 +852,19 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
         }
     }
     __syncthreads();
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    if (warp_0 < 1) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     if (warp_0 < 2) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    if (warp_0 < 4) {
+#else
+    if (warp_0 < 8) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         #pragma unroll
         for (int state_half = 0; state_half < 2; state_half++) {
             #pragma unroll
@@ -557,7 +978,19 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
             u_hi[solve_token_1] = _shfl_21;
         }
     }
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    if (warp_0 < 1 && lane_quad >= 2) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     if (warp_0 < 2 && lane_quad >= 2) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    if (warp_0 < 4 && lane_quad >= 2) {
+#else
+    if (warp_0 < 8 && lane_quad >= 2) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         int token0 = (lane_quad - 2) * 2;
         int token1 = token0 + 1;
         int value_row_lo_1 = warp_0 * 16 + frag_row;
@@ -636,21 +1069,65 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
             }
         }
     }
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    if (warp_0 < 1) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     if (warp_0 < 2) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    if (warp_0 < 4) {
+#else
+    if (warp_0 < 8) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         if (lane_quad == 2) {
             int u_row_lo_1 = warp_0 * 16 + frag_row;
             int u_row_hi_1 = u_row_lo_1 + 8;
             #pragma unroll
             for (int solved_token = 0; solved_token < 5; solved_token++) {
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+                sU[solved_token * 16 + u_row_lo_1] = u_lo[solved_token];
+                sU[solved_token * 16 + u_row_hi_1] = u_hi[solved_token];
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
                 sU[solved_token * 32 + u_row_lo_1] = u_lo[solved_token];
                 sU[solved_token * 32 + u_row_hi_1] = u_hi[solved_token];
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+                sU[solved_token * 64 + u_row_lo_1] = u_lo[solved_token];
+                sU[solved_token * 64 + u_row_hi_1] = u_hi[solved_token];
+#else
+                sU[solved_token * 128 + u_row_lo_1] = u_lo[solved_token];
+                sU[solved_token * 128 + u_row_hi_1] = u_hi[solved_token];
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
             }
         }
+#if CAKE_KDA_DECODE_VALUE_SPLIT != 8
         {
             __syncwarp();
         }
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     }
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    {
+        __syncthreads();
+    }
+    if (BLOCK_CHECKPOINT_MMA != 0 && warp_0 < 1) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     if (BLOCK_CHECKPOINT_MMA != 0 && warp_0 < 2) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    if (BLOCK_CHECKPOINT_MMA != 0 && warp_0 < 4) {
+#else
+    if (BLOCK_CHECKPOINT_MMA != 0 && warp_0 < 8) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         int mma_lane_group = lane_1 / 4;
         int mma_lane_in_group = lane_1 & 3;
         int source0 = mma_lane_in_group * 2;
@@ -763,16 +1240,44 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
             }
         }
     }
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+    if (BLOCK_CHECKPOINT_MMA == 0 && group < 8) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
     if (BLOCK_CHECKPOINT_MMA == 0 && group < 4) {
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+    if (BLOCK_CHECKPOINT_MMA == 0 && group < 8) {
+#else
+    if (BLOCK_CHECKPOINT_MMA == 0 && group < 16) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         #pragma unroll
         for (int checkpoint_token_1 = 0; checkpoint_token_1 < 5; checkpoint_token_1++) {
             int slot_t = sSlot[checkpoint_token_1];
             #pragma unroll
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+            for (int row_local_1 = 0; row_local_1 < 2; row_local_1++) {
+#else
             for (int row_local_1 = 0; row_local_1 < 8; row_local_1++) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                 int value_row_local_1 = owned_row_base + row_local_1;
                 {
                     float beta_t = sBeta[checkpoint_token_1];
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 8
+                    float update = sU[checkpoint_token_1 * 16 + value_row_local_1] * beta_t;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 4
                     float update = sU[checkpoint_token_1 * 32 + value_row_local_1] * beta_t;
+#else
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 2
+                    float update = sU[checkpoint_token_1 * 64 + value_row_local_1] * beta_t;
+#else
+                    float update = sU[checkpoint_token_1 * 128 + value_row_local_1] * beta_t;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
                     {
                         #pragma unroll
                         for (int i_5 = 0; i_5 < 8; i_5++) {

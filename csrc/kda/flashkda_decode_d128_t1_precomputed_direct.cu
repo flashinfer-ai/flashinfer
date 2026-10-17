@@ -59,7 +59,11 @@ kernel_flashinfer_recurrent_kda_t1_direct(__nv_bfloat16* __restrict__ q, __nv_bf
 
     // === Task calls (dependency order) ===
     int work = blockIdx.x;
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
+    const int value_splits = 16;
+#else
     const int value_splits = 8;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     int value_tile = work & value_splits - 1;
     int hv = work / value_splits;
     int n = blockIdx.y;
@@ -74,7 +78,11 @@ kernel_flashinfer_recurrent_kda_t1_direct(__nv_bfloat16* __restrict__ q, __nv_bf
     int raw_slot = ssm_state_indices[n];
     int initial_slot = ((raw_slot < 0) ? 0 : raw_slot);
     bool active = raw_slot >= 0 && has_token;
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
+    int tile_row_base = value_tile * 8;
+#else
     int tile_row_base = value_tile * 16;
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
     int elem_start = lane_0 * 4;
     float q_src[4];
     float k_src[4];
@@ -177,7 +185,11 @@ kernel_flashinfer_recurrent_kda_t1_direct(__nv_bfloat16* __restrict__ q, __nv_bf
     int output_head_base = (token_pos * HV + hv) * 128;
     int output_state_head_base = initial_slot * state_stride_slot + hv * 128 * 128;
     #pragma unroll 1
+#if CAKE_KDA_DECODE_VALUE_SPLIT == 16
+    for (int row_block = 0; row_block < 1; row_block++) {
+#else
     for (int row_block = 0; row_block < 2; row_block++) {
+#endif  // CAKE_KDA_DECODE_VALUE_SPLIT
         #pragma unroll
         for (int row_local = 0; row_local < 4; row_local++) {
             int row_in_tile = v_lane + 2 * (row_block * 4 + row_local);
