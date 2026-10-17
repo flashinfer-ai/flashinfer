@@ -28,6 +28,7 @@
 #include "mainloop.cuh"
 #include "mainloop_mma.cuh"
 #include "sparse_mainloop.cuh"
+#include "sparse_mainloop_tma.cuh"
 #include "tile_scheduler.cuh"
 #include "utils.cuh"
 
@@ -274,7 +275,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
       }
       mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-              CollectiveMainloop::WarpScheduler>(
+              CollectiveMainloop::WarpScheduler, CollectiveMainloop::ZERO_V_TAIL>(
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
@@ -360,30 +361,49 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using DTypeO = typename KernelTraits::DTypeO;
   using IdType = typename KernelTraits::IdType;
 
-  using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
+  using CollectiveMainloop =
+      std::conditional_t<KernelTraits::USE_TMA_LOAD_KV,
+                         SparseTmaCollectiveMainloop<typename Params::AdditionalParams,
+                                                     KernelTraits, CAUSAL, MULTIITEMSCORING>,
+                         SparseCollectiveMainloop<typename Params::AdditionalParams, KernelTraits,
+                                                  CAUSAL, MULTIITEMSCORING>>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
                          BatchPrefillPersistentTileScheduler<IdType>>;
 
-  typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
-      {params.q_ptr,
-       get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
-                       params.q_stride_n,
-                       params.q_stride_h),  // layout_Q
-       params.k_ptr,
-       // NOTE(Zihao): nnz was useless here, we can just pass 0
-       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_QK, params.k_stride_n,
-                       params.k_stride_h),  // layout_K
-       params.v_ptr,
-       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_VO, params.v_stride_n,
-                       params.v_stride_h),  // layout_V
-       params.kv_indices, params.window_left,
-       params.k_page_stride,                     // Stride between pages for K
-       params.v_page_stride,                     // Stride between pages for V
-       static_cast<uint32_t>(params.page_size),  // Page size
-       params.additional_params});
+  auto layout_Q = get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
+                                  params.q_stride_n, params.q_stride_h);
+  typename CollectiveMainloop::Params mainloop_params = [&] {
+    if constexpr (KernelTraits::USE_TMA_LOAD_KV) {
+      return CollectiveMainloop::to_underlying_arguments(
+          {params.q_ptr, layout_Q, params.k_ptr,
+           get_paged_gmem_layout(params.page_size, params.num_kv_heads, KernelTraits::HEAD_DIM_QK,
+                                 params.num_pages, params.k_stride_n, params.k_stride_h,
+                                 params.k_page_stride),  // layout_K
+           params.v_ptr,
+           get_paged_gmem_layout(params.page_size, params.num_kv_heads, KernelTraits::HEAD_DIM_VO,
+                                 params.num_pages, params.v_stride_n, params.v_stride_h,
+                                 params.v_page_stride),  // layout_V
+           params.kv_indices, params.window_left, params.additional_params});
+    } else {
+      return CollectiveMainloop::to_underlying_arguments(
+          {params.q_ptr, layout_Q, params.k_ptr,
+           // NOTE(Zihao): nnz was useless here, we can just pass 0
+           get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_QK,
+                           params.k_stride_n,
+                           params.k_stride_h),  // layout_K
+           params.v_ptr,
+           get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_VO,
+                           params.v_stride_n,
+                           params.v_stride_h),  // layout_V
+           params.kv_indices, params.window_left,
+           params.k_page_stride,                     // Stride between pages for K
+           params.v_page_stride,                     // Stride between pages for V
+           static_cast<uint32_t>(params.page_size),  // Page size
+           params.additional_params});
+    }
+  }();
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           params.o_ptr,
@@ -576,7 +596,19 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
-    if constexpr (HEAD_DIM_VO == 64) {
+    if (params.page_size % PAGED_KV_TMA_MIN_BOX_ROWS == 0) {
+      // TMA gathers whole boxes from each page, so the dense tile shapes apply.
+      constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+          AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                                /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                                /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                                /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                typename Params::DTypeKV, typename Params::DTypeO,
+                                typename Params::IdType, AttentionVariant>,
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+          params, stream);
+    } else if constexpr (HEAD_DIM_VO == 64) {
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,

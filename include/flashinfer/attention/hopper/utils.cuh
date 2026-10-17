@@ -58,6 +58,14 @@ CUTLASS_HOST_DEVICE auto get_gmem_layout(int nnz, int num_heads, int head_dim, i
                      make_stride(n_stride, cute::_1{}, h_stride));
 }
 
+// (page_size, head_dim, num_heads, num_pages) view of a paged KV pool.
+CUTLASS_HOST_DEVICE auto get_paged_gmem_layout(int page_size, int num_heads, int head_dim,
+                                               int num_pages, int64_t n_stride, int64_t h_stride,
+                                               int64_t page_stride) {
+  return make_layout(make_shape(page_size, head_dim, num_heads, num_pages),
+                     make_stride(n_stride, cute::_1{}, h_stride, page_stride));
+}
+
 CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) {
   return make_layout(make_shape(num_heads, nnz), make_stride(cute::_1{}, int64_t(num_heads)));
 }
