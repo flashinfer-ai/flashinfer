@@ -324,6 +324,51 @@ def get_customize_batch_prefill_module(
     ).build_and_load()
 
 
+# trtllm-gen ships no NVFP4-KV context kernels above this head_dim: the
+# transformed K/V stages and scale-factor tiles do not fit in shared memory.
+# Larger head dims run the FP8 kernel on an FP8 copy of the active pages.
+_TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM = 256
+
+
+def _materialize_nvfp4_kv_for_trtllm_gen(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    key_block_scales: torch.Tensor,
+    value_block_scales: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_kv_len: int,
+    batch_size: int,
+    uses_shared_paged_kv_idx: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(k_cache, v_cache, block_tables)`` for an FP8 copy of the pages.
+
+    The tensor-level K/V scales already folded into ``bmm1_scale`` and
+    ``bmm2_scale`` stay valid, since only block scales are applied here.
+    The returned block table indexes the copy with shared K/V page indices.
+    """
+    if query.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"NVFP4 KV cache with head_dim > {_TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM} "
+            f"requires an FP8 query, got {query.dtype}"
+        )
+    from .quantization.kernels.nvfp4_kv_materialize import nvfp4_kv_materialize_fp8
+
+    kv_cache_fp8, block_tables = nvfp4_kv_materialize_fp8(
+        k_cache,
+        v_cache,
+        key_block_scales.view(torch.uint8),
+        value_block_scales.view(torch.uint8),
+        block_tables[:batch_size],
+        seq_lens[:batch_size],
+        max_kv_len,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+    k_cache, v_cache = kv_cache_fp8.unbind(dim=1)
+    return k_cache, v_cache, block_tables
+
+
 @functools.cache
 def get_trtllm_gen_prefill_module():
     mod = gen_trtllm_gen_fmha_module()
@@ -363,6 +408,24 @@ def get_trtllm_gen_prefill_module():
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
+        if (
+            key_block_scales is not None
+            and query.shape[-1] > _TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM
+        ):
+            k_cache, v_cache, block_tables = _materialize_nvfp4_kv_for_trtllm_gen(
+                query,
+                k_cache,
+                v_cache,
+                key_block_scales,
+                value_block_scales,
+                block_tables,
+                seq_lens,
+                max_kv_len,
+                batch_size,
+                uses_shared_paged_kv_idx,
+            )
+            key_block_scales = value_block_scales = None
+            uses_shared_paged_kv_idx = True
         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
             multi_ctas_kv_counter_buffer,
             batch_size,
@@ -7903,6 +7966,24 @@ def trtllm_batch_context_with_kv_cache(
 
     if backend != "cake":
         run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+        if (
+            key_block_scales is not None
+            and query.shape[-1] > _TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM
+        ):
+            k_cache, v_cache, block_tables = _materialize_nvfp4_kv_for_trtllm_gen(
+                query,
+                k_cache,
+                v_cache,
+                key_block_scales,
+                value_block_scales,
+                block_tables,
+                seq_lens,
+                max_kv_len,
+                batch_size,
+                uses_shared_paged_kv_idx,
+            )
+            key_block_scales = value_block_scales = None
+            uses_shared_paged_kv_idx = True
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
