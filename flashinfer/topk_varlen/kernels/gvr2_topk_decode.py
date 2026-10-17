@@ -6104,8 +6104,6 @@ class GvrClusKernel:
                 if r6 > aim:
                     aim = r6
                 amin = cutlass.Int32(3) * k
-                if cutlass.const_expr(self.cs != 2):
-                    amin = (cutlass.Int32(7) * k) >> cutlass.Int32(1)
                 if aim < amin:
                     aim = amin
                 if aim > (SCAP >> cutlass.Int32(1)):
@@ -6115,10 +6113,17 @@ class GvrClusKernel:
                 # ---- QUAD sample geometry (route_dynamic clus override,
                 # always-on per the deviation note above; k <= 1024 for this
                 # family so sfac has no k > 1024 arm).
+                # FlashInfer-local: every cluster size takes the CS = 2 ladder
+                # (sfac 32, amin 3k; upstream: 16 and 3.5k above CS = 2). Its
+                # quads are 16 adjacent values and the rank-TGT rung sits at about
+                # sfac, so at 16 a single quad over a run of high scores can set
+                # the rung: on captured DSv4 Pro / Flash rows of 32K-262K columns
+                # the first attempt kept fewer than k values on 75 of 342 rows
+                # (down to 0.02 k) and the row streamed again from the floor.
                 n4v = nv >> cutlass.Int32(2)
                 sel = cutlass.Int32(
                     cutlass.Float32(nv)
-                    * cutlass.Float32(32.0 if self.cs == 2 else 16.0)
+                    * cutlass.Float32(32.0)
                     * cute.arch.rcp_approx(cutlass.Float32(aim))
                 )
                 if sel < cutlass.Int32(256):
