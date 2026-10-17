@@ -1200,6 +1200,9 @@ def test_gvr2_graph_replay_lengths_change_after_capture(
 # ramps); paged output is mapped back through its injective page table and
 # checked like the unpaged output. Floods of more +inf than top_k are covered
 # separately (test_gvr2_streaming_flood*).
+# The two runs patterns put the top scores in runs of 16 adjacent columns, the
+# granularity the streaming samples read (8- and 16-value groups), so a few
+# groups can land on runs and set a sample rung above the k-th score.
 
 _HARD_PATTERNS = [
     "ties",
@@ -1212,6 +1215,8 @@ _HARD_PATTERNS = [
     "denormal",
     "ramp_up",
     "quantized4",
+    "runs",
+    "runs_half",
 ]
 _PAGED_PATTERNS = ["ties", "posinf_k", "neginf_most"]
 
@@ -1255,6 +1260,11 @@ def _hard_logits(pattern, n_r, width, top_k, seed):
         elif pattern == "quantized4":
             lv = torch.tensor([-2.0, -0.5, 0.5, 2.0], device=_DEV)
             row.copy_(lv[torch.randint(0, 4, (n,), generator=gen, device=_DEV)])
+        elif pattern in ("runs", "runs_half"):  # 2k (k / 2) top scores in runs of 16
+            row.mul_(0.1)
+            for s in pos[: max(1, top_k // (8 if pattern == "runs" else 32))].tolist():
+                e = min(s + 16, n)
+                row[s:e] = 4.0 + torch.rand(e - s, generator=gen, device=_DEV)
         x[r, n:] = 3e38
     return x
 
@@ -1455,6 +1465,32 @@ def test_gvr2_clus_solo_hard_rows(rows, width, top_k, next_n, page_size, pattern
     n_r = _row_valid_lens(kv, rows, next_n, 1, width)
     logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width)
     _run_hard(logits, kv, top_k, n_r, "clus", next_n=next_n, page_size=page_size)
+
+
+_SPLIT_DENSE_CASES = [
+    # rows, width, top_k, page size: SPLIT launches (K <= 1024 rows of up to 131,075
+    # columns, n4 <= 32768, take the 4x denser sample; longer rows the plain one)
+    (1, 1048576, 512, None),  # R 120 (B200: clusters of 8)
+    (4, 262144, 1024, None),  # R 32 (clusters of 4)
+    (16, 524288, 512, None),  # R 8 (clusters of 4)
+    (8, 1048576, 512, 128),  # paged: V4.1 page size
+    (4, 262144, 1024, 64),  # paged: DSv4 page size
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,page_size,pattern", _with_patterns(_SPLIT_DENSE_CASES)
+)
+def test_gvr2_split_dense_sample_rows(rows, width, top_k, page_size, pattern):
+    """SPLIT rows on both sides of the dense-sample bound (n4 = 32768) and of
+    the register path (16,384 columns), plus multi-tile rows, under hard scores."""
+    cols = [131071, 131072, 131075, 131076, 131079, 32768, 16385, 98304, 262144, width]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    if rows == 1:
+        n_r = [131075]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
 
 
 _ONECTA_CASES = [
