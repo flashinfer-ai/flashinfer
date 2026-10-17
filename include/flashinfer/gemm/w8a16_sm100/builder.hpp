@@ -35,11 +35,7 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace cutlass::gemm::collective {
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace detail {
+namespace cutlass::gemm::collective::detail {
 
 // Fork of sm100_make_trivial_mixed_input_tiled_mma (sm100_common.inl) keyed on the
 // W8A16 tags, with the 2SM smem-A (SS) case upstream leaves out.  ElementAMma is the
@@ -191,7 +187,9 @@ w8a16_sm100_compute_stage_count_or_override_mixed_input(StageCountAutoCarveout<c
   return cute::make_tuple(Load2TransformStageCount, Transform2MmaStageCount, AccumulatorStageCount);
 }
 
-} // namespace detail
+} // namespace cutlass::gemm::collective::detail
+
+namespace cutlass::gemm::collective {
 
 template <typename LayoutScale>
 constexpr int w8a16_get_ScaleGranularityK() {

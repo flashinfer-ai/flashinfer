@@ -58,9 +58,7 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
 
-namespace flashinfer {
-namespace gemm {
-namespace w8a16_sm90_detail {
+namespace flashinfer::gemm::w8a16_sm90_detail {
 
 __device__ __forceinline__ uint32_t prmt_b32(uint32_t a, uint32_t b, uint32_t sel) {
   uint32_t r;
@@ -98,14 +96,12 @@ __device__ __forceinline__ void e4m3x4_to_f16x4(uint32_t q, uint32_t& lo, uint32
       : "r"(q));
 }
 
-}  // namespace w8a16_sm90_detail
-}  // namespace gemm
-}  // namespace flashinfer
+}  // namespace flashinfer::gemm::w8a16_sm90_detail
 
-// The RS mixed-input transform converts in packs of gcd(fragment, 32 / 8) = 4; these
-// specialisations are more specialised than CUTLASS's <T, float_e4m3_t, N, Round> and
-// are declared before any instantiation below, so they take over for this module only
-// (the Blackwell header declares the same pair for its own module).
+// These partial specializations of CUTLASS's NumericArrayConverter belong in namespace cutlass.
+// They override <T, float_e4m3_t, N, Round> for RS packs of gcd(fragment, 32 / 8) = 4
+// in subsequent matching instantiations in this translation unit. Isolation from the
+// Blackwell specializations comes from compiling the two backends into separate JIT modules.
 namespace cutlass {
 
 template <FloatRoundStyle Round>
@@ -161,8 +157,7 @@ struct NumericArrayConverter<cutlass::half_t, cutlass::float_e4m3_t, 4, Round> {
 // slow dimension (activation tiles for raster "m"), the fast dimension walked within a group,
 // and a last, narrower group for the remainder instead of padding.  G = 1 is exactly
 // CUTLASS's order.  Cluster size 1 only; the stream-K variants keep CUTLASS's scheduler.
-namespace flashinfer {
-namespace gemm {
+namespace flashinfer::gemm {
 
 struct W8A16Sm90GroupedTileSchedulerTag {};
 
@@ -212,7 +207,13 @@ class W8A16Sm90GroupedTileScheduler
                                         const uint32_t = 1, uint32_t = 1u) {
     static_assert(cute::size(ClusterShape{}) == 1, "grouped scheduler: cluster size 1 only");
     Arguments a = arguments;
-    a.max_swizzle_size = 1;  // CUTLASS's own swizzle (and its padding) off
+    // max_swizzle_size controls output-tile traversal for L2 reuse; it is independent
+    // of the TMA shared-memory swizzle chosen by the CUTLASS mainloop.
+    // Disable CUTLASS's tile-order grouping here so the base scheduler does not pad
+    // either tile count to the group size. Preserve the requested size in p.group_
+    // below: work_for_linear_idx() applies our grouping to the unpadded tile grid,
+    // using a smaller final group for the remainder.
+    a.max_swizzle_size = 1;
     Params p;
     static_cast<cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params&>(p) =
         Base::to_underlying_arguments(problem_shape_mnkl, tile_shape, cluster_shape, hw_info, a,
@@ -291,8 +292,7 @@ class W8A16Sm90GroupedTileScheduler
   uint64_t stride_ = 1;
 };
 
-}  // namespace gemm
-}  // namespace flashinfer
+}  // namespace flashinfer::gemm
 
 namespace cutlass::gemm::kernel::detail {
 template <class ArchTag, class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -302,8 +302,31 @@ struct TileSchedulerSelector<flashinfer::gemm::W8A16Sm90GroupedTileSchedulerTag,
 };
 }  // namespace cutlass::gemm::kernel::detail
 
-namespace flashinfer {
-namespace gemm {
+namespace flashinfer::gemm::constants::W8A16Sm90 {
+
+// CTA tile dimensions: W = weight rows, A = activation rows, K = reduction depth.
+static constexpr int TileK = 64;
+static constexpr int CooperativeW = 128;
+static constexpr int PingpongW = 64;
+static constexpr int TileAMultiple = 8;
+static constexpr int TileA128 = 128;
+static constexpr int TileA160 = 160;
+static constexpr int TileA192 = 192;
+static constexpr int TileA256 = 256;
+static constexpr int MaxTileA = TileA256;
+static constexpr int DefaultCluster = 1;
+static constexpr int MulticastCluster = 2;
+
+// Split-K limits: equal slices of at least MinKTilesPerSplit reduction tiles.
+static constexpr int MaxSplits = 8;
+static constexpr int MinKTilesPerSplit = 8;
+static constexpr long long MaxPartialsBytes = 64LL << 20;
+
+}  // namespace flashinfer::gemm::constants::W8A16Sm90
+
+namespace flashinfer::gemm {
+
+namespace W8A16Sm90 = constants::W8A16Sm90;
 
 template <typename T>
 struct W8A16Sm90CutlassType;
@@ -316,39 +339,47 @@ struct W8A16Sm90CutlassType<half> {
   using type = cutlass::half_t;
 };
 
-// kTileW: weight rows per CTA tile (M'): 128 for the cooperative schedule (two consumer
+// TileW: weight rows per CTA tile (M'): 128 for the cooperative schedule (two consumer
 //         warpgroups, 64 rows each), 64 for ping-pong (one warpgroup per tile).
-// kTileA: activation rows per CTA tile (N' = wgmma N), any multiple of 8 up to 256.
-// kTileK: 64 fp8 bytes of weight per row per stage; with the 16-bit activation that is
-//         8 KB + kTileA * 128 B per stage (40 KB for 256 rows: 5 stages in 227 KB).
-// kCluster: CTAs per cluster along the weight-row dimension.  2 = the two CTAs take
+// TileA: activation rows per CTA tile (N' = wgmma N), any multiple of 8 up to 256.
+// TileK: 64 fp8 bytes of weight per row per stage; with the 16-bit activation that is
+//         8 KB + TileA * 128 B per stage (40 KB for 256 rows: 5 stages in 227 KB).
+// Cluster: CTAs per cluster along the weight-row dimension.  2 = the two CTAs take
 //         adjacent weight tiles of the same activation tile, which TMA multicasts to both
 //         (the hand kernel's arrangement): halves the activation's L2 -> SMEM traffic.
-template <int kTileW, int kTileA, int kTileK = 64, int kCluster = 1>
+template <int TileW, int TileA, int TileK = W8A16Sm90::TileK,
+          int Cluster = W8A16Sm90::DefaultCluster>
 struct W8A16Sm90Cfg {
-  static_assert(kTileW == 128 || kTileW == 64, "128 rows = cooperative, 64 rows = ping-pong");
-  static_assert(kTileA % 8 == 0 && kTileA <= 256, "wgmma N is a multiple of 8 up to 256");
-  static_assert(kCluster == 1 || kCluster == 2, "cluster of 1 or 2 CTAs");
-  static constexpr int kW = kTileW;
-  static constexpr int kA = kTileA;
-  static constexpr int kK = kTileK;
-  static constexpr bool kCooperative = kTileW == 128;
-  using TileShape = cute::Shape<cute::Int<kTileW>, cute::Int<kTileA>, cute::Int<kTileK>>;
-  using ClusterShape = cute::Shape<cute::Int<kCluster>, cute::_1, cute::_1>;
+  static_assert(TileW == W8A16Sm90::CooperativeW || TileW == W8A16Sm90::PingpongW,
+                "128 rows = cooperative, 64 rows = ping-pong");
+  static_assert(TileA % W8A16Sm90::TileAMultiple == 0 && TileA <= W8A16Sm90::MaxTileA,
+                "wgmma N is a multiple of 8 up to 256");
+  static_assert(Cluster == W8A16Sm90::DefaultCluster || Cluster == W8A16Sm90::MulticastCluster,
+                "cluster of 1 or 2 CTAs");
+  static constexpr int W = TileW;
+  static constexpr int A = TileA;
+  static constexpr int K = TileK;
+  static constexpr bool Cooperative = TileW == W8A16Sm90::CooperativeW;
+  using TileShape = cute::Shape<cute::Int<TileW>, cute::Int<TileA>, cute::Int<TileK>>;
+  using ClusterShape = cute::Shape<cute::Int<Cluster>, cute::_1, cute::_1>;
   using MainloopSchedule =
-      std::conditional_t<kCooperative, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+      std::conditional_t<Cooperative, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
                          cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
   using EpilogueSchedule =
-      std::conditional_t<kCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
+      std::conditional_t<Cooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
                          cutlass::epilogue::TmaWarpSpecialized>;
 };
 
-using W8A16Sm90Cfg128x256 = W8A16Sm90Cfg<128, 256>;  // the hand kernel's default shape
-using W8A16Sm90Cfg128x192 = W8A16Sm90Cfg<128, 192>;  // wave-fill heights (see PickTile)
-using W8A16Sm90Cfg128x160 = W8A16Sm90Cfg<128, 160>;
-using W8A16Sm90Cfg128x128 = W8A16Sm90Cfg<128, 128>;
-using W8A16Sm90Cfg64x256 = W8A16Sm90Cfg<64, 256>;  // ping-pong: 2 tiles in flight per SM
-using W8A16Sm90Cfg64x128 = W8A16Sm90Cfg<64, 128>;  // ping-pong, short activation tile
+using W8A16Sm90Cfg128x256 =
+    W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA256>;  // the hand kernel's default shape
+using W8A16Sm90Cfg128x192 =
+    W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA192>;  // wave-fill heights (see PickTile)
+using W8A16Sm90Cfg128x160 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA160>;
+using W8A16Sm90Cfg128x128 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA128>;
+using W8A16Sm90Cfg64x256 =
+    W8A16Sm90Cfg<W8A16Sm90::PingpongW, W8A16Sm90::TileA256>;  // ping-pong: 2 tiles in flight per SM
+using W8A16Sm90Cfg64x128 =
+    W8A16Sm90Cfg<W8A16Sm90::PingpongW, W8A16Sm90::TileA128>;  // ping-pong, short activation tile
 // W8A16Sm90Cfg<128, 256, 64, 2> (activation multicast pair) was swept on Tue 13 Oct 2026:
 // within +-2% of the cluster-1 tile on all 144 rows, so it is not instantiated.
 
@@ -499,11 +530,11 @@ struct W8A16Sm90Gemm {
     // the raster direction and how many tile rows / columns are grouped so that the
     // operand slab they share stays in L2.  CUTLASS's default is no grouping; the group
     // size is capped per problem because the scheduler pads the tile grid to it.
-    const int tiles_w = (N + Cfg::kW - 1) / Cfg::kW;
-    const int tiles_a = (M + Cfg::kA - 1) / Cfg::kA;
+    const int tiles_w = (N + Cfg::W - 1) / Cfg::W;
+    const int tiles_a = (M + Cfg::A - 1) / Cfg::A;
     args.scheduler.max_swizzle_size =
         kGrouped
-            ? W8A16Sm90PickGroup(M, N, K, Cfg::kW, Cfg::kA)
+            ? W8A16Sm90PickGroup(M, N, K, Cfg::W, Cfg::A)
             : W8A16Sm90PickSwizzle(tiles_w, tiles_a, cute::size<0>(typename Cfg::ClusterShape{}),
                                    W8A16Sm90SwizzleEnv());
     args.scheduler.raster_order = W8A16Sm90RasterEnv();
@@ -530,7 +561,7 @@ struct W8A16Sm90Gemm {
                          const T* bias, T* out, int M, int N, int K, void* workspace,
                          size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream,
                          int splits = 1) {
-    if (kSplitK && (splits < 2 || K % (splits * Cfg::kK) != 0)) return cudaErrorInvalidValue;
+    if (kSplitK && (splits < 2 || K % (splits * Cfg::K) != 0)) return cudaErrorInvalidValue;
     void* d_out = out;
     if constexpr (kSplitK) {
       auto probe = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
@@ -741,8 +772,6 @@ inline cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90RasterEnv() {
 // Split-K slicing: a whole number of 64-deep k-tiles per slice, all slices equal, at least
 // 8 k-tiles each, at most 8 slices.  FLASHINFER_W8A16_FP8_SM90_SPLITS pins a count (read
 // once).  The count itself comes from the cost model (W8A16Sm90SplitUs).
-constexpr int kW8A16Sm90MaxSplits = 8;
-constexpr int kW8A16Sm90MinKTilesPerSplit = 8;
 inline int W8A16Sm90SplitsEnv() {
   static const int v = [] {
     const char* s = std::getenv("FLASHINFER_W8A16_FP8_SM90_SPLITS");
@@ -753,12 +782,12 @@ inline int W8A16Sm90SplitsEnv() {
 }
 
 // Largest legal split <= want that divides the k-tile count (the batched problem needs
-// equal slices); 1 when K has fewer than 2 * kW8A16Sm90MinKTilesPerSplit k-tiles.
+// equal slices); 1 when K has fewer than 2 * W8A16Sm90::MinKTilesPerSplit k-tiles.
 inline int W8A16Sm90LegalSplits(int K, int want) {
-  const int ktiles = K / 64;
-  if (K % 64 != 0) return 1;
-  for (int s = std::min(want, kW8A16Sm90MaxSplits); s >= 2; --s) {
-    if (ktiles % s == 0 && ktiles / s >= kW8A16Sm90MinKTilesPerSplit) return s;
+  const int ktiles = K / W8A16Sm90::TileK;
+  if (K % W8A16Sm90::TileK != 0) return 1;
+  for (int s = std::min(want, W8A16Sm90::MaxSplits); s >= 2; --s) {
+    if (ktiles % s == 0 && ktiles / s >= W8A16Sm90::MinKTilesPerSplit) return s;
   }
   return 1;
 }
@@ -770,7 +799,7 @@ inline int W8A16Sm90PickSplits(int M, int N, int K, int num_sms, int tile_w, int
   if (const int e = W8A16Sm90SplitsEnv()) return W8A16Sm90LegalSplits(K, e);
   int best = 1;
   double best_us = 1e30;
-  for (int s = 2; s <= kW8A16Sm90MaxSplits; ++s) {
+  for (int s = 2; s <= W8A16Sm90::MaxSplits; ++s) {
     if (W8A16Sm90LegalSplits(K, s) != s) continue;
     const double us = W8A16Sm90SplitUs(M, N, K, num_sms, tile_w, tile_a, s);
     if (us < best_us) {
@@ -786,7 +815,7 @@ inline int W8A16Sm90PickSplits(int M, int N, int K, int num_sms, int tile_w, int
 inline int W8A16Sm90SplitsFor(int M, int N, int K, int num_sms, int tile_w, int tile_a) {
   const int s = W8A16Sm90PickSplits(M, N, K, num_sms, tile_w, tile_a);
   if (s >= 2) return s;
-  for (int c = 2; c <= kW8A16Sm90MaxSplits; ++c)
+  for (int c = 2; c <= W8A16Sm90::MaxSplits; ++c)
     if (W8A16Sm90LegalSplits(K, c) == c) return c;
   return 1;
 }
@@ -808,10 +837,9 @@ inline int W8A16Sm90SplitsFor(int M, int N, int K, int num_sms, int tile_w, int 
 //    peer per tile (the fix-up).
 //  * split-K s (equal slices of >= 8 k-tiles, <= 8): ceil(tiles x s / SMs) waves of a K/s
 //    tile + 2 us + 2e-6 us per fp32 partial element (write + reduce read); the partials are
-//    capped at kW8A16Sm90MaxPartialsBytes.
+//    capped at W8A16Sm90::MaxPartialsBytes.
 // Picks within 2% of the per-cell best variant (8% above 300 us, the bench's measured run-to-
 // run spread there) on 94 of 96 cells; geomean pick / best 1.0055.
-constexpr long long kW8A16Sm90MaxPartialsBytes = 64LL << 20;
 struct W8A16Sm90TileCost {
   W8A16Sm90Algo algo;
   int tile_w, tile_a;
@@ -819,18 +847,19 @@ struct W8A16Sm90TileCost {
   bool pingpong;
 };
 inline double W8A16Sm90TileUs(const W8A16Sm90TileCost& t, double k_len) {
-  const double epi = t.pingpong ? 0.0 : 2.0 * t.tile_a / 256.0;
+  const double epi = t.pingpong ? 0.0 : 2.0 * t.tile_a / W8A16Sm90::TileA256;
   return t.ns_per_k * 1e-3 * k_len + epi;
 }
 inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
   using A = W8A16Sm90Algo;
-  static constexpr W8A16Sm90TileCost kPlain[] = {{A::k128x256, 128, 256, 11.37, false},
-                                                 {A::k128x192, 128, 192, 9.00, false},
-                                                 {A::k128x128, 128, 128, 7.45, false},
-                                                 {A::k64x256, 64, 256, 6.15, true},
-                                                 {A::k64x128, 64, 128, 4.50, true}};
+  static constexpr W8A16Sm90TileCost Plain[] = {
+      {A::k128x256, W8A16Sm90::CooperativeW, W8A16Sm90::TileA256, 11.37, false},
+      {A::k128x192, W8A16Sm90::CooperativeW, W8A16Sm90::TileA192, 9.00, false},
+      {A::k128x128, W8A16Sm90::CooperativeW, W8A16Sm90::TileA128, 7.45, false},
+      {A::k64x256, W8A16Sm90::PingpongW, W8A16Sm90::TileA256, 6.15, true},
+      {A::k64x128, W8A16Sm90::PingpongW, W8A16Sm90::TileA128, 4.50, true}};
   const double sms = std::max(num_sms, 1);
-  const int ktiles = K / 64;
+  const int ktiles = K / W8A16Sm90::TileK;
   auto tiles_of = [&](const W8A16Sm90TileCost& t) {
     return static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
            static_cast<double>((M + t.tile_a - 1) / t.tile_a);
@@ -843,11 +872,11 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
       best = a;
     }
   };
-  for (const auto& t : kPlain)
+  for (const auto& t : Plain)
     consider(t.algo, std::ceil(tiles_of(t) / sms) * W8A16Sm90TileUs(t, K));
   // Stream-K over 128x256 / 128x192.
   for (int i = 0; i < 2; ++i) {
-    const auto& t = kPlain[i];
+    const auto& t = Plain[i];
     const double tiles = tiles_of(t);
     const double per_tile = W8A16Sm90TileUs(t, K);
     const double full = std::floor(tiles / sms), total = std::ceil(tiles / sms);
@@ -866,8 +895,8 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
   }
   // Split-K over 128x128 / 128x256.
   for (int i : {2, 0}) {
-    const auto& t = kPlain[i];
-    for (int s = 2; s <= kW8A16Sm90MaxSplits; ++s) {
+    const auto& t = Plain[i];
+    for (int s = 2; s <= W8A16Sm90::MaxSplits; ++s) {
       if (W8A16Sm90LegalSplits(K, s) != s) continue;
       consider(i == 2 ? A::k128x128SplitK : A::k128x256SplitK,
                W8A16Sm90SplitUs(M, N, K, num_sms, t.tile_w, t.tile_a, s));
@@ -877,10 +906,13 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
 }
 
 inline double W8A16Sm90SplitUs(int M, int N, int K, int num_sms, int tile_w, int tile_a, int s) {
-  if (4LL * M * N * s > kW8A16Sm90MaxPartialsBytes) return 1e30;  // partials capped
+  if (4LL * M * N * s > W8A16Sm90::MaxPartialsBytes) return 1e30;  // partials capped
   const W8A16Sm90TileCost t =
-      tile_a == 256 ? W8A16Sm90TileCost{W8A16Sm90Algo::k128x256SplitK, 128, 256, 11.37, false}
-                    : W8A16Sm90TileCost{W8A16Sm90Algo::k128x128SplitK, 128, 128, 7.45, false};
+      tile_a == W8A16Sm90::TileA256
+          ? W8A16Sm90TileCost{W8A16Sm90Algo::k128x256SplitK, W8A16Sm90::CooperativeW,
+                              W8A16Sm90::TileA256, 11.37, false}
+          : W8A16Sm90TileCost{W8A16Sm90Algo::k128x128SplitK, W8A16Sm90::CooperativeW,
+                              W8A16Sm90::TileA128, 7.45, false};
   (void)tile_w;
   const double tiles = static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
                        static_cast<double>((M + t.tile_a - 1) / t.tile_a);
@@ -894,7 +926,8 @@ inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int alg
   if (forced != W8A16Sm90Algo::kAuto) return forced;
   const W8A16Sm90Algo env = W8A16Sm90AlgoEnv();
   if (env != W8A16Sm90Algo::kAuto) return env;
-  const long long units = 1LL * ((N + 127) / 128) * ((M + 255) / 256);
+  const long long units = 1LL * ((N + W8A16Sm90::CooperativeW - 1) / W8A16Sm90::CooperativeW) *
+                          ((M + W8A16Sm90::TileA256 - 1) / W8A16Sm90::TileA256);
   const double waves = static_cast<double>(units) / std::max(num_sms, 1);
   const double frac = waves - std::floor(waves);
   if (M <= 8192) return W8A16Sm90PickByCost(M, N, K, num_sms);
@@ -947,10 +980,12 @@ size_t W8A16Fp8GemmSm90WorkspaceBytes(W8A16Sm90Algo algo, int M, int N, int K, i
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x128>::WorkspaceBytes(M, N, K, device_id, num_sms);
     case W8A16Sm90Algo::k128x128SplitK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, false, true>::WorkspaceBytes(
-          M, N, K, device_id, num_sms, W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 128));
+          M, N, K, device_id, num_sms,
+          W8A16Sm90SplitsFor(M, N, K, num_sms, W8A16Sm90::CooperativeW, W8A16Sm90::TileA128));
     case W8A16Sm90Algo::k128x256SplitK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, false, true>::WorkspaceBytes(
-          M, N, K, device_id, num_sms, W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 256));
+          M, N, K, device_id, num_sms,
+          W8A16Sm90SplitsFor(M, N, K, num_sms, W8A16Sm90::CooperativeW, W8A16Sm90::TileA256));
     case W8A16Sm90Algo::k128x192StreamK:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, true>::WorkspaceBytes(M, N, K, device_id,
                                                                          num_sms);
@@ -994,14 +1029,16 @@ cudaError_t W8A16Fp8GemmSm90(W8A16Sm90Algo algo, const T* act, const __nv_fp8_e4
                                                        workspace, workspace_bytes, device_id,
                                                        num_sms, stream);
     case W8A16Sm90Algo::k128x128SplitK: {
-      const int splits = W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 128);
+      const int splits =
+          W8A16Sm90SplitsFor(M, N, K, num_sms, W8A16Sm90::CooperativeW, W8A16Sm90::TileA128);
       if (splits < 2) return cudaErrorNotSupported;
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, false, true>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, splits);
     }
     case W8A16Sm90Algo::k128x256SplitK: {
-      const int splits = W8A16Sm90SplitsFor(M, N, K, num_sms, 128, 256);
+      const int splits =
+          W8A16Sm90SplitsFor(M, N, K, num_sms, W8A16Sm90::CooperativeW, W8A16Sm90::TileA256);
       if (splits < 2) return cudaErrorNotSupported;
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, false, true>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
@@ -1016,7 +1053,6 @@ cudaError_t W8A16Fp8GemmSm90(W8A16Sm90Algo algo, const T* act, const __nv_fp8_e4
   }
 }
 
-}  // namespace gemm
-}  // namespace flashinfer
+}  // namespace flashinfer::gemm
 
 #endif  // FLASHINFER_GEMM_W8A16_FP8_GEMM_SM90_CUH_

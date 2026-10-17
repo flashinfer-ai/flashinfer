@@ -77,9 +77,7 @@
 #include "flashinfer/gemm/w8a16_sm100/kernel.hpp"
 #include "flashinfer/gemm/w8a16_sm100/policy.hpp"
 
-namespace flashinfer {
-namespace gemm {
-namespace w8a16_sm100_detail {
+namespace flashinfer::gemm::w8a16_sm100_detail {
 
 __device__ __forceinline__ uint32_t prmt_b32(uint32_t a, uint32_t b, uint32_t sel) {
   uint32_t r;
@@ -161,9 +159,7 @@ __device__ __forceinline__ void e4m3x4_to_f16x4(uint32_t q, uint32_t& lo, uint32
 #endif
 }
 
-}  // namespace w8a16_sm100_detail
-}  // namespace gemm
-}  // namespace flashinfer
+}  // namespace flashinfer::gemm::w8a16_sm100_detail
 
 // The mixed-input transform converts in packs of 4 (gcd(fragment, 32 / 8)); these
 // specializations are more specialized than CUTLASS's <T, float_e4m3_t, N, Round> and
@@ -212,8 +208,7 @@ struct NumericArrayConverter<cutlass::half_t, cutlass::float_e4m3_t, 4, Round> {
 
 }  // namespace cutlass
 
-namespace flashinfer {
-namespace gemm {
+namespace flashinfer::gemm {
 
 // Split-K reduce: out[i] = T(sum_s ws[s][i] * scale + bias[i % N]), 8 elements per
 // thread (two 16 B loads per split, one 16 B store).  Requires N % 8 == 0 (the launcher
@@ -842,7 +837,6 @@ cudaError_t W8A16Fp8GemmSm100(const T* act, const __nv_fp8_e4m3* weight, const f
   }
 }
 
-}  // namespace gemm
-}  // namespace flashinfer
+}  // namespace flashinfer::gemm
 
 #endif  // FLASHINFER_GEMM_W8A16_FP8_GEMM_SM100_CUH_
