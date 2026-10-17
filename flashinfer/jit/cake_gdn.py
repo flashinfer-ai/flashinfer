@@ -16,8 +16,8 @@
 
 Every variant in ``csrc/gdn/cake/manifest.json`` names one kernel source, the
 compile-time specialization it is built with (passed as ``-D`` defines), and
-one TVM-FFI host shim.  The kernel is compiled to a cubin with ``nvcc`` and
-embedded into the host shim.
+the template and parameters of its TVM-FFI host shim.  The kernel is compiled
+to a cubin with ``nvcc`` and embedded into the rendered host shim.
 """
 
 from __future__ import annotations
@@ -276,6 +276,50 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
     return _cubin_path(cuda_path, arch=arch, digest=compile_digest)
 
 
+_HOST_SHIM_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+
+
+def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
+    """Render the TVM-FFI host shim of one variant from its class template.
+
+    ``host_binding.template`` names the template under ``host/templates/``.
+    ``@ENTRY@``, ``@MODULE_IDENT@``, ``@CUDA_SYMBOL@`` and ``@SHIM_NAMESPACE@``
+    come from ``host_binding``; every other ``@NAME@`` placeholder takes the
+    value of ``host_binding.params[NAME]``.  The result is byte-identical to
+    the per-variant shim file the template replaced.
+    """
+
+    host = record["host_binding"]
+    template = (_source_dir() / host["template"]).read_text(encoding="utf-8")
+    values = {
+        "ENTRY": host["entry"],
+        "MODULE_IDENT": host["module_ident"],
+        "CUDA_SYMBOL": host["cuda_symbol"],
+        "SHIM_NAMESPACE": host["shim_namespace"],
+    }
+    for key, value in host["params"].items():
+        if key in values:
+            raise RuntimeError(f"reserved Cake GDN host-shim parameter {key!r}")
+        values[key] = str(value)
+    unused = set(values)
+
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise RuntimeError(
+                f"{host['template']} needs {key!r}; {record['name']!r} lacks it"
+            )
+        unused.discard(key)
+        return values[key]
+
+    text = _HOST_SHIM_PLACEHOLDER.sub(substitute, template)
+    if unused:
+        raise RuntimeError(
+            f"unused host-shim parameters for {record['name']!r}: {sorted(unused)}"
+        )
+    return text
+
+
 @functools.cache
 def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     """Compile and load one Cake GDN host entrypoint."""
@@ -284,13 +328,13 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     record = _kernel_record(name)
     host = record["host_binding"]
     root = _source_dir()
-    host_path = root / host["path"]
-    module_digest = hashlib.sha256(
-        f"{cubin.stem}\0{_sha256(host_path)}".encode()
-    ).hexdigest()
+    host_source = render_cake_gdn_host_shim(record)
+    host_digest = hashlib.sha256(host_source.encode("utf-8")).hexdigest()
+    module_key = f"{cubin.stem}\0{host_digest}".encode()
+    module_digest = hashlib.sha256(module_key).hexdigest()
     module = cpp.load_inline(
         f"flashinfer_cake_gdn_{name}_{arch}_{module_digest[:12]}",
-        cpp_sources=host_path.read_text(encoding="utf-8"),
+        cpp_sources=host_source,
         embed_cubin={host["module_ident"]: cubin.read_bytes()},
         extra_include_paths=[
             str(Path(get_cuda_path()) / "include"),
@@ -1386,6 +1430,7 @@ __all__ = [
     "cake_gdn_prefill_geometries",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
+    "render_cake_gdn_host_shim",
     "select_cake_gdn_decode_variant",
     "select_cake_gdn_prefill_variant",
 ]

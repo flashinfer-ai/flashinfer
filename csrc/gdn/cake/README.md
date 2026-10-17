@@ -13,8 +13,8 @@ with per-variant SASS equivalence checks against the generated originals.
   the same kernel body), the `specializations` the resolver matches (also
   passed as the `-D` flags that specialize the body, unless the entry spells
   out its own `defines`: the decode bodies that bake their constants in-file
-  take none, and some bodies take only a subset of the keys), and one host
-  shim (`host_binding`).
+  take none, and some bodies take only a subset of the keys), and the
+  template, kernel symbol and parameters of its host shim (`host_binding`).
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
   outputs of a record partition its `architectures`, and the loader
@@ -57,13 +57,20 @@ with per-variant SASS equivalence checks against the generated originals.
   the kernel differently from the in-file form (same instruction count;
   register assignment, instruction order and one uniform address computation
   change), deterministically.
-- `host/` holds one TVM-FFI launcher per variant. The helpers they share
-  (device guard, tensor checks, dynamic shared-memory opt-in) live in
-  `host/cake_gdn_host_common.h`.
+- `host/templates/` holds one TVM-FFI launcher template per shim class. The
+  former per-variant shims differed only in identifiers and literals, which
+  the templates take as `@NAME@` placeholders: `@ENTRY@`, `@MODULE_IDENT@`,
+  `@CUDA_SYMBOL@` and `@SHIM_NAMESPACE@` come from `host_binding` (`entry`,
+  `module_ident`, `cuda_symbol`, `shim_namespace`), every other placeholder
+  from `host_binding.params`. `flashinfer/jit/cake_gdn.py` renders the shim
+  text at load time; it is byte-identical to the former file
+  (`tests/gdn/cake_gdn_host_shim_sha256.json` pins it per variant). The
+  helpers the launchers share (device guard, tensor checks, dynamic
+  shared-memory opt-in) live in `host/cake_gdn_host_common.h`.
 
 `flashinfer/jit/cake_gdn.py` compiles the kernel to a cubin with `nvcc`,
-embeds it into the host shim, and resolves requests to exactly one listed
-variant; requests outside the listed routes fail closed.
+embeds it into the rendered host shim, and resolves requests to exactly one
+listed variant; requests outside the listed routes fail closed.
 
 ## Contracts
 
