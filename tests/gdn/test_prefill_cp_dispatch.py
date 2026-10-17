@@ -144,7 +144,9 @@ def test_auto_still_declines_cp_when_there_is_plenty_of_work(monkeypatch, arch):
 def test_auto_on_sm80_picks_cp_inside_the_rule(monkeypatch, seq_lens, heads):
     """Inside the fitted region, auto takes CP."""
     call = _inputs(seq_lens, heads)
-    got = _dispatch(monkeypatch, arch=8, _max_seq_len=max(seq_lens), **call)
+    got = _dispatch(
+        monkeypatch, arch=8, cu_seqlens_cpu=call["cu_seqlens"].cpu(), **call
+    )
     assert got == "cp_delta_rule_dsl_sm80"
 
 
@@ -161,12 +163,15 @@ def test_auto_on_sm80_picks_cp_inside_the_rule(monkeypatch, seq_lens, heads):
 def test_auto_on_sm80_picks_fused_outside_the_rule(monkeypatch, seq_lens, heads, why):
     """Outside it, auto stays on the fused kernel."""
     call = _inputs(seq_lens, heads)
-    got = _dispatch(monkeypatch, arch=8, _max_seq_len=max(seq_lens), **call)
+    got = _dispatch(
+        monkeypatch, arch=8, cu_seqlens_cpu=call["cu_seqlens"].cpu(), **call
+    )
     assert got == "chunk_gated_delta_rule_sm80", why
 
 
 def test_auto_on_sm80_needs_the_exact_maximum(monkeypatch):
-    """No exact maximum, no CP -- and `total_seq_len` is not a substitute.
+    """No exact maximum, no CP -- and neither `total_seq_len` nor `max_seqlen`,
+    which may be any safe upper bound, is a substitute.
 
     `cu_seqlens` is on the device and reading it here would synchronize on
     every call, so the only source is the caller. Two sequences of 8192 have a
@@ -178,16 +183,25 @@ def test_auto_on_sm80_needs_the_exact_maximum(monkeypatch):
     call = _inputs([4096, 4096], 1)
     assert _dispatch(monkeypatch, arch=8, **call) == "chunk_gated_delta_rule_sm80"
     assert (
-        _dispatch(monkeypatch, arch=8, _max_seq_len=4096, **call)
+        _dispatch(monkeypatch, arch=8, cu_seqlens_cpu=call["cu_seqlens"].cpu(), **call)
         == "chunk_gated_delta_rule_sm80"
     )
+    call = _inputs([8192], 1)
+    got = _dispatch(monkeypatch, arch=8, max_seqlen=8192, **call)
+    assert got == "chunk_gated_delta_rule_sm80"
 
 
 @pytest.mark.parametrize("minor", [6, 9])
 def test_auto_on_sm86_and_sm89_stays_fused(monkeypatch, minor):
     """Fitted on 8.0 only. Different SM count, L2 and register file."""
     call = _inputs([8192], 1)
-    got = _dispatch(monkeypatch, arch=8, minor=minor, _max_seq_len=8192, **call)
+    got = _dispatch(
+        monkeypatch,
+        arch=8,
+        minor=minor,
+        cu_seqlens_cpu=call["cu_seqlens"].cpu(),
+        **call,
+    )
     assert got == "chunk_gated_delta_rule_sm80"
 
 
@@ -205,10 +219,16 @@ def test_auto_on_sm80_falls_back_when_cp_cannot_take_the_call(monkeypatch):
         checkpoint_every_n_tokens=2048,
     )
     with pytest.warns(RuntimeWarning, match="checkpointing"):
-        got = _dispatch(monkeypatch, arch=8, _max_seq_len=8192, **call, **extra)
+        got = _dispatch(
+            monkeypatch,
+            arch=8,
+            cu_seqlens_cpu=call["cu_seqlens"].cpu(),
+            **call,
+            **extra,
+        )
     assert got == "chunk_gated_delta_rule_sm80"
     with pytest.raises(ValueError, match="checkpointing"):
-        _dispatch(monkeypatch, arch=8, use_cp=True, _max_seq_len=8192, **call, **extra)
+        _dispatch(monkeypatch, arch=8, use_cp=True, **call, **extra)
     del total
 
 
@@ -221,12 +241,14 @@ def test_sm80_cp_is_entered_through_the_pointer_abi(monkeypatch):
     """
     import inspect
 
-    for kw in ({"use_cp": True}, {"use_cp": "auto", "_max_seq_len": 8192}):
+    for auto in (False, True):
         seen: dict = {}
         call = _inputs([8192], 1)
+        kw = {"use_cp": "auto", "cu_seqlens_cpu": call["cu_seqlens"].cpu()}
+        kw = kw if auto else {"use_cp": True}
         got = _dispatch(monkeypatch, arch=8, kwargs_out=seen, **kw, **call)
         assert got == "cp_delta_rule_dsl_sm80"
-        assert seen.get("_ptr_abi") is True, kw
+        assert seen.get("_ptr_abi") is True, auto
 
     for arch in (9, 10, 12):
         seen = {}
@@ -258,74 +280,29 @@ def test_explicit_cp_false_never_runs_cp(monkeypatch):
         assert _dispatch(monkeypatch, arch=arch, use_cp=False, **call) == fused
 
 
-def test_the_private_maximum_does_not_change_dispatch_above_sm80(monkeypatch):
-    """On SM90/SM100/SM120 it sizes per-sequence indexing and nothing else.
-
-    It *is* a routing input on SM80 now, which is why that architecture is not
-    in this list: the rule there is stated on the exact maximum. Above SM80 the
-    heuristic is `should_use_cp_host` on parallelism alone, and if the maximum
-    starts changing those choices it has crept somewhere it does not belong --
-    which is the regression this file was written for.
-    """
+def test_the_host_prefix_does_not_change_dispatch_above_sm80(monkeypatch):
+    """Above SM80 the heuristic is `should_use_cp_host` on parallelism alone."""
     for arch in (9, 10, 12):
-        base = _dispatch(monkeypatch, arch=arch, **_inputs([2048, 2048], 1))
-        for mx in (None, 2048, 4096):
-            got = _dispatch(
-                monkeypatch, arch=arch, _max_seq_len=mx, **_inputs([2048, 2048], 1)
-            )
-            assert got == base, f"arch {arch}, _max_seq_len={mx}"
+        call = _inputs([2048, 2048], 1)
+        base = _dispatch(monkeypatch, arch=arch, **call)
+        got = _dispatch(monkeypatch, arch=arch, **call, cu_seqlens_cpu=[0, 2048, 4096])
+        assert got == base, arch
 
 
-@pytest.mark.parametrize("bad", [0, -1, 4095, 4097, 1.0, True, "4096"])
-def test_the_private_maximum_is_validated(bad):
-    """A value below the real maximum under-sizes indexing, so it is checked."""
-    call = _inputs([4096], 1)
-    with pytest.raises(ValueError):
-        gp.chunk_gated_delta_rule(_max_seq_len=bad, **call)
+@pytest.mark.parametrize("bad", [[0, 4095], [0, 4097], [0, 2048, 4096]])
+def test_sm80_validates_the_host_prefix(monkeypatch, bad):
+    """A prefix that is not this batch's is refused before any launch."""
+    with pytest.raises(NotImplementedError, match="cu_seqlens"):
+        _dispatch(monkeypatch, arch=8, cu_seqlens_cpu=bad, **_inputs([4096], 1))
 
 
-@pytest.mark.parametrize("use_cp", ["auto", True])
-def test_sm80_cp_launch_is_sized_by_the_private_maximum(monkeypatch, use_cp):
-    """The rule picks CP from `_max_seq_len`, so the launch must use it too.
-
-    With no public `max_seqlen` the wrapper would otherwise size the grids
-    from the packed length: 8193 here, where the long sequence needs 8192.
-    """
-    seen: dict = {}
-    call = _inputs([8192, 1], 1)
-    got = _dispatch(
-        monkeypatch,
-        arch=8,
-        kwargs_out=seen,
-        use_cp=use_cp,
-        _max_seq_len=8192,
-        **call,
-    )
-    assert got == "cp_delta_rule_dsl_sm80"
-    assert seen["max_seqlen"] == 8192
-
-
-def test_a_public_maximum_below_the_private_one_is_rejected():
+def test_a_public_maximum_below_the_exact_one_is_rejected(monkeypatch):
     """The two maxima describe one batch; a contradiction is an error."""
     call = _inputs([8192, 1], 1)
-    with pytest.raises(ValueError, match="_max_seq_len"):
-        gp.chunk_gated_delta_rule(max_seqlen=4097, _max_seq_len=8192, **call)
-
-
-@pytest.mark.parametrize("mx", [2048, 4096])
-def test_the_private_maximum_accepts_the_edges(monkeypatch, mx):
-    """The batch mean and `total_seq_len` are both legal; neither reaches a kernel.
-
-    This used to call the public entry with nothing mocked and assert the
-    output's shape, which reached the real architecture-specific entry and
-    launched. That made one case in this file depend on the device it ran on,
-    which is the thing the file exists to avoid -- and it raised
-    `NotImplementedError` rather than skipping on an architecture with no GDN
-    prefill kernel.
-    """
-    call = _inputs([2048, 2048], 1)
-    got = _dispatch(monkeypatch, arch=8, _max_seq_len=mx, use_cp=False, **call)
-    assert got == "chunk_gated_delta_rule_sm80"
+    with pytest.raises(ValueError, match="cu_seqlens_cpu"):
+        _dispatch(
+            monkeypatch, arch=8, max_seqlen=4097, **call, cu_seqlens_cpu=[0, 8192, 8193]
+        )
 
 
 # ─── the V32 fused specialization's auto rule ────────────────────────────────
@@ -361,7 +338,7 @@ def _v32_inputs(
             len(seq_lens), h, HEAD_SIZE, HEAD_SIZE, dtype=state_dtype, device=dev
         ),
         output_final_state=True,
-        _max_seq_len=max(seq_lens),
+        cu_seqlens_cpu=[0, *torch.tensor(list(seq_lens)).cumsum(0).tolist()],
     )
     return call
 
@@ -375,13 +352,13 @@ def _offered_v32(monkeypatch, **overrides):
             if k in ("seq_lens", "heads", "dtype", "state_dtype")
         }
     )
-    for key in ("minor", "_max_seq_len", "use_cp"):
+    for key in ("minor", "cu_seqlens_cpu", "use_cp"):
         if key in overrides:
             if key == "minor":
                 continue
             call[key] = overrides[key]
-    if overrides.get("_max_seq_len", "keep") is None:
-        call.pop("_max_seq_len", None)
+    if overrides.get("cu_seqlens_cpu", "keep") is None:
+        call.pop("cu_seqlens_cpu", None)
     kwargs = {}
     got = _dispatch(
         monkeypatch, arch=8, minor=overrides.get("minor", 0), kwargs_out=kwargs, **call
@@ -406,7 +383,7 @@ def test_v32_not_offered_off_cc80(monkeypatch, minor):
 
 def test_v32_not_offered_without_an_exact_maximum(monkeypatch):
     """No exact longest sequence, no offer."""
-    got, offered = _offered_v32(monkeypatch, _max_seq_len=None)
+    got, offered = _offered_v32(monkeypatch, cu_seqlens_cpu=None)
     assert got == "chunk_gated_delta_rule_sm80"
     assert offered is False
 

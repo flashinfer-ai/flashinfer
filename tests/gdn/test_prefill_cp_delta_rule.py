@@ -988,14 +988,14 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("seq_lens", [[8192, 1], [1, 8192]])
-def test_cp_delta_rule_public_wrapper_sizes_the_launch_by_the_private_maximum(
+def test_cp_delta_rule_public_wrapper_sizes_the_launch_by_max_seqlen(
     qkv_factory,
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    """Only `_max_seq_len` is given, and the batch is far from balanced.
+    """`max_seqlen` is the exact maximum, and the batch is far from balanced.
 
-    The launch is sized from `_max_seq_len`, 8192 here, rather than the
+    The launch is sized from `max_seqlen`, 8192 here, rather than the
     packed length. A launch below the long sequence has no blocks for its
     tail, so its output and final state would go missing rather than out of
     tolerance.
@@ -1025,7 +1025,7 @@ def test_cp_delta_rule_public_wrapper_sizes_the_launch_by_the_private_maximum(
         cu_seqlens=cu_seqlens,
     )
     our_o, our_state = chunk_gated_delta_rule(
-        q, k, v, alpha, beta, 1.0, use_cp=True, _max_seq_len=max(seq_lens), **kwargs
+        q, k, v, alpha, beta, 1.0, use_cp=True, max_seqlen=max(seq_lens), **kwargs
     )
     ref_o, ref_state = chunk_gated_delta_rule(
         q, k, v, alpha, beta, 1.0, use_cp=False, **kwargs

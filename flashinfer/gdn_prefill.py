@@ -1054,18 +1054,6 @@ def chunk_gated_delta_rule(
     _cp_chunk_len: Optional[int] = None,
     backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
     max_seqlen: Optional[int] = None,
-    # The longest sequence in this batch, from the caller's host-side data.
-    # Private, and not a performance hint: it feeds `max_t_blocks_per_seq` and
-    # `max_cp_chunks_per_seq`, so a value below the real maximum under-sizes
-    # per-sequence indexing.  Caller precondition: if given it must equal
-    # `max(seq_lens)` for this batch.  The check below is type and range
-    # sanity only -- nothing here can verify the value without a
-    # synchronisation, which is the cost this argument exists to avoid.
-    #
-    # The wrapper cannot work it out for itself -- `cu_seqlens` lives on the
-    # device and reading it here would synchronise -- but vLLM's metadata
-    # builder already holds `prefill_query_start_loc_cpu`.
-    _max_seq_len: Optional[int] = None,
     *,
     gate_domain: Literal["linear", "log"] = "linear",
     use_gate_in_kernel: bool = False,
@@ -1239,30 +1227,17 @@ def chunk_gated_delta_rule(
         Safe upper bound on the maximum logical sequence length, no larger
         than ``total_seq_len``. CP kernels use this host-side hint to
         bound their per-sequence launch grids without reading ``cu_seqlens``
-        back from the GPU. When omitted, CP uses ``_max_seq_len`` if that is
-        given and ``total_seq_len`` otherwise, both correct for any batch;
-        passing the exact maximum of a batched call lets CP launch smaller
-        grids.  The SM100/SM103 ``use_cp="auto"`` band reads the hint (or the
-        exact maximum from ``cu_seqlens_cpu``) as the longest sequence and,
-        without either, the balanced-batch estimate
+        back from the GPU. When omitted, CP uses ``total_seq_len``, which is
+        correct for any batch; passing the exact maximum of a batched call
+        lets CP launch smaller grids.  The SM100/SM103 ``use_cp="auto"``
+        band reads the hint (or the exact maximum from ``cu_seqlens_cpu``) as
+        the longest sequence and, without either, the balanced-batch estimate
         ``ceil(total_seq_len / num_seqs)``; pass the exact maximum so the band
         decision matches the Cake dispatcher's. ``backend="cake_gdn"`` without
         CP uses the same bound (or the exact maximum from ``cu_seqlens_cpu``)
         to select its kernel variant and persistent grid; a loose bound is
         always correct and only affects the grid size and whether the
         single-chunk kernel is eligible.
-
-    _max_seq_len : int, optional
-        The longest sequence in this batch, from the caller's host-side data.
-        Internal, and not a performance hint: the SM8x dispatch rules read it,
-        and when ``max_seqlen`` is omitted it sizes the CP launch grids in its
-        place, so a value below the real maximum under-sizes per-sequence
-        indexing. Caller precondition: if given it must equal
-        ``max(seq_lens)`` for this batch, and a ``max_seqlen`` smaller than it
-        is rejected. Only type and range are checked -- verifying the value
-        would need a device synchronization, which is the cost this argument
-        exists to avoid. ``None`` (default) means the SM8x rules that need an
-        exact maximum decline.
     gate_domain : {"linear", "log"}
         Domain of precomputed ``g``: linear alpha (default) or natural-log
         alpha. ``None`` still means no decay. Ignored when use_gate_in_kernel
@@ -1283,7 +1258,8 @@ def chunk_gated_delta_rule(
         or a sequence of Python ints of length ``num_seqs + 1`` holding the
         same values (vLLM's ``query_start_loc_cpu``, the prefix sums of
         SGLang's ``extend_seq_lens_cpu``). Used by ``backend="cake_gdn"``
-        without CP and ignored by every other route. When given, the Cake
+        without CP, and on SM8x by the ``use_cp="auto"`` and V32 rules, which
+        need the exact longest sequence and keep the fused path without it. When given, the Cake
         route validates it on the host (non-decreasing, first entry ``0``,
         last entry ``total_seq_len``; a mismatch raises before any launch),
         takes the exact longest sequence as the bound for variant selection
@@ -1400,51 +1376,21 @@ def chunk_gated_delta_rule(
     total_seq_len = q.size(0)
     if num_seqs <= 0:
         raise ValueError("cu_seqlens must contain at least two entries")
-    minimum_cp_max_seqlen = (total_seq_len + num_seqs - 1) // num_seqs
-    if _max_seq_len is not None:
-        # Type and range sanity, nothing more.  Correctness rests entirely
-        # on the caller precondition: a positive value below the real maximum
-        # passes this and silently under-sizes `max_t_blocks_per_seq` and
-        # `max_cp_chunks_per_seq`.  Catching that would mean reading
-        # `cu_seqlens`, which is a device tensor, and the point of taking this
-        # argument is to avoid that synchronisation.  What the bounds do catch
-        # is a value that cannot be the longest sequence in this batch at all.
-        if not isinstance(_max_seq_len, int) or isinstance(_max_seq_len, bool):
-            raise ValueError(
-                f"_max_seq_len must be an int, got {type(_max_seq_len).__name__}"
-            )
-        minimum_max_seq_len = max(1, minimum_cp_max_seqlen)
-        if not minimum_max_seq_len <= _max_seq_len <= total_seq_len:
-            raise ValueError(
-                f"_max_seq_len must be in [{minimum_max_seq_len}, "
-                f"total_seq_len={total_seq_len}], got {_max_seq_len}"
-            )
-    # The SM8x rule selects CP from `_max_seq_len`, so the grids are sized
-    # from it too when no hint is given. Without either, only the packed
-    # length is a bound that holds for every batch; a smaller one leaves the
-    # tail of the longest sequence unprocessed.
-    cp_max_seqlen = (
-        max_seqlen
-        if max_seqlen is not None
-        else _max_seq_len
-        if _max_seq_len is not None
-        else total_seq_len
-    )
+    # Without a hint, only the packed length is a bound that holds for
+    # every batch; a smaller one leaves the tail of the longest sequence
+    # unprocessed.
+    cp_max_seqlen = max_seqlen if max_seqlen is not None else total_seq_len
     if type(cp_max_seqlen) is not int or cp_max_seqlen < 0:
         raise ValueError("max_seqlen must be a nonnegative integer")
     if total_seq_len and cp_max_seqlen == 0:
         raise ValueError("max_seqlen must be positive when q is nonempty")
+    minimum_cp_max_seqlen = (total_seq_len + num_seqs - 1) // num_seqs
     if cp_max_seqlen < minimum_cp_max_seqlen:
         raise ValueError(
             "max_seqlen cannot be smaller than ceil(total_seq_len / num_seqs)"
         )
     if cp_max_seqlen > total_seq_len:
         raise ValueError("max_seqlen cannot exceed total_seq_len")
-    if _max_seq_len is not None and cp_max_seqlen < _max_seq_len:
-        raise ValueError(
-            f"max_seqlen={cp_max_seqlen} cannot be smaller than "
-            f"_max_seq_len={_max_seq_len}, the longest sequence in the batch"
-        )
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
@@ -1600,6 +1546,18 @@ def chunk_gated_delta_rule(
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
     _parallel_work = num_seqs * num_sab_heads
+    # SM8x routes on the batch's exact longest sequence, which only the host
+    # copy of cu_seqlens carries; max_seqlen may be any safe upper bound.
+    sm8x_max_seqlen = None
+    if _arch_major == 8 and cu_seqlens_cpu is not None:
+        offsets = _cake_gdn_prefill_host_offsets(
+            cu_seqlens_cpu, num_seqs=num_seqs, total_tokens=total_seq_len
+        )
+        sm8x_max_seqlen = max(b - a for a, b in zip(offsets, offsets[1:], strict=False))
+        if cp_max_seqlen < sm8x_max_seqlen:
+            raise ValueError(
+                "max_seqlen is smaller than the longest sequence in cu_seqlens_cpu"
+            )
     cp_heuristic_matches = (
         _arch_major in (9, 10, 12)
         and should_use_cp_host(
@@ -1613,7 +1571,7 @@ def chunk_gated_delta_rule(
         # caller's upper bound or the packed length, and either would
         # select CP for multi-sequence batches whose real maximum is short,
         # which is where CP loses. So an unknown maximum means fused.
-        _max_seq_len,
+        sm8x_max_seqlen,
         _parallel_work,
         _device_capability,
     )
@@ -1701,7 +1659,7 @@ def chunk_gated_delta_rule(
         backend != "cake_gdn"
         and not will_use_cp
         and should_use_v32_sm80_host(
-            _max_seq_len,
+            sm8x_max_seqlen,
             num_seqs,
             num_q_heads,
             num_v_heads,
