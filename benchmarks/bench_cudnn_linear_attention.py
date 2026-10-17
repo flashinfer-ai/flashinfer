@@ -27,6 +27,12 @@ does not reproduce a caller using a separate fused gate producer such as vLLM.
 --seq-order passes the B1 identity scheduling hint to auto/native arms, as
 upstream Kimi does. Explicit cuDNN currently rejects that optional hint, so its
 arm omits it; the per-arm result records whether it was supplied.
+Decay gates are all ones by default (--gates ones: no decay, the fair
+comparison every backend sees the same way; the KDA and raw-GDN encodings put
+the raw gate where the in-kernel transform reconstructs a decay of exactly 1).
+--gates random restores the former random draws as a clearly labeled secondary
+regime. Write strengths (beta) are random in both regimes. The output records
+the regime and the min / max decay actually reconstructed.
 """
 
 import argparse
@@ -61,6 +67,12 @@ def arguments():
         "--seq-order",
         action="store_true",
         help="Supply the B1 identity scheduling hint to KDA auto/native arms",
+    )
+    parser.add_argument(
+        "--gates",
+        choices=("ones", "random"),
+        default="ones",
+        help="Decay-gate regime: ones (no decay, the fair comparison) or the former random draws",
     )
     parser.add_argument("--backends", default="auto,cudnn")
     parser.add_argument("--iters", type=int, default=20)
@@ -110,6 +122,28 @@ def arguments():
     return args
 
 
+def decay_range(args, data):
+    """(min, max) of the decay every provider reconstructs from the gates, so the
+    output can prove the regime (all ones gives exactly (1.0, 1.0))."""
+    g = data["g"].float()
+    if args.family == "kda":
+        decay = torch.exp(
+            -5.0
+            * torch.sigmoid(
+                torch.exp(data["A_log"].float())[:, None]
+                * (g + data["dt_bias"].float()[None, None])
+            )
+        )
+    elif args.gdn_raw_gates:
+        decay = torch.exp(
+            -torch.exp(data["A_log"].float())
+            * torch.nn.functional.softplus(g + data["dt_bias"].float())
+        )
+    else:
+        decay = g
+    return (decay.min().item(), decay.max().item())
+
+
 def make_data(args, seed):
     torch.manual_seed(seed)
     total, hq, hv, dim = sum(args.lengths), args.heads, args.value_heads, 128
@@ -133,7 +167,17 @@ def make_data(args, seed):
                 view.view(total, hq, dim) for view in carrier.split(hq * dim, -1)[:2]
             )
         q, k, v = (tensor.unsqueeze(0) for tensor in (q, k, v))
-        gate = torch.randn(1, total, hv, dim, device="cuda", dtype=dtype) * 0.1
+        if args.gates == "ones":
+            # Raw gate logit at the sigmoid floor: with lower_bound = -5 and
+            # A_log = dt_bias = 0 the in-kernel decay exp(-5 sigmoid(g)) is 1.
+            floor_logit = float(
+                torch.special.logit(torch.tensor(1e-20, dtype=torch.float64))
+            )
+            gate = torch.full(
+                (1, total, hv, dim), floor_logit, device="cuda", dtype=dtype
+            )
+        else:
+            gate = torch.randn(1, total, hv, dim, device="cuda", dtype=dtype) * 0.1
         beta = torch.randn(1, total, hv, device="cuda", dtype=dtype)
     else:
         if not args.gdn_normalize:
@@ -141,7 +185,10 @@ def make_data(args, seed):
                 torch.nn.functional.normalize(tensor.float(), dim=-1).to(dtype)
                 for tensor in (q, k)
             )
-        gate = 0.8 + 0.15 * torch.rand(total, hv, device="cuda")
+        if args.gates == "ones":
+            gate = torch.ones(total, hv, device="cuda")
+        else:
+            gate = 0.8 + 0.15 * torch.rand(total, hv, device="cuda")
         beta = 0.2 + 0.6 * torch.rand(total, hv, device="cuda")
     offsets = [0]
     for length in args.lengths:
@@ -162,12 +209,21 @@ def make_data(args, seed):
         dt_bias=torch.zeros(hv, dim, device="cuda"),
     )
     if args.family == "gdn" and args.gdn_raw_gates:
-        result.update(
-            g=-1 + 0.5 * torch.randn(total, hv, device="cuda", dtype=dtype),
-            beta=torch.randn(total, hv, device="cuda", dtype=dtype),
-            A_log=0.3 * torch.randn(hv, device="cuda"),
-            dt_bias=0.2 * torch.randn(hv, device="cuda"),
-        )
+        if args.gates == "ones":
+            # softplus(-30) vanishes, so alpha = exp(-exp(A_log) softplus(g)) is 1.
+            result.update(
+                g=torch.full((total, hv), -30.0, device="cuda", dtype=dtype),
+                beta=torch.randn(total, hv, device="cuda", dtype=dtype),
+                A_log=torch.zeros(hv, device="cuda"),
+                dt_bias=torch.zeros(hv, device="cuda"),
+            )
+        else:
+            result.update(
+                g=-1 + 0.5 * torch.randn(total, hv, device="cuda", dtype=dtype),
+                beta=torch.randn(total, hv, device="cuda", dtype=dtype),
+                A_log=0.3 * torch.randn(hv, device="cuda"),
+                dt_bias=0.2 * torch.randn(hv, device="cuda"),
+            )
     if args.seq_order:
         result["seq_order"] = torch.zeros(1, dtype=torch.int32, device="cuda")
     return result
@@ -604,6 +660,8 @@ def main():
         arm["checks"]["fresh_eager_addresses"] = assert_result(
             args, actual, changed_references[arm["norm"]]
         )
+    # The timed inputs' decay range, before the replay check overwrites them.
+    decay_min, decay_max = decay_range(args, data)
     for name, tensor in data.items():
         tensor.copy_(changed[name])
     for backend, arm in arms.items():
@@ -634,6 +692,11 @@ def main():
     output = dict(
         args={**vars(args), "output": str(args.output)},
         results=records,
+        gates=dict(
+            regime=args.gates,
+            decay_min=decay_min,
+            decay_max=decay_max,
+        ),
         versions=dict(
             flashinfer=flashinfer.__version__,
             frontend=cudnn.__version__,

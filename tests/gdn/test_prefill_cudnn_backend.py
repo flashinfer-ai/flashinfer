@@ -313,7 +313,7 @@ def test_cudnn_backend_accepts_beta_dtypes(beta_dtype):
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_cudnn_backend_carries_state_dtype(state_dtype):
     """A bf16 state pool crosses untransposed and comes back at its own width."""
     device = torch.device("cuda")
@@ -584,7 +584,7 @@ def test_cudnn_backend_replays_under_cuda_graph_capture():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("in_place", [False, True])
 @pytest.mark.parametrize("padding", [0, 96])
 def test_cudnn_backend_state_pool(state_dtype, in_place, padding):
@@ -761,6 +761,110 @@ def test_cudnn_gdn_normalizes_zero_and_tiny_vectors_with_additive_epsilon(
         "additive normalization state", actual_state, expected_state, SERIAL_TOLERANCE
     )
     assert torch.count_nonzero(actual_out[:16]).item() == 0
+
+
+@pytest.mark.parametrize("prefer", [True, False])
+def test_auto_follows_the_cudnn_policy(prefer, monkeypatch):
+    """``backend="auto"`` runs cuDNN when ``_prefer_cudnn_gdn_prefill`` says
+    so and the native kernel otherwise; both match the serial oracle.
+
+    The policy is patched rather than driven by shape so this test does not
+    move with the measured region, which the policy unit tests pin down.
+    """
+    from flashinfer import gdn_prefill
+    from flashinfer.cudnn import linear_attention
+
+    if not linear_attention._linear_attention_auto_available():
+        pytest.skip("auto needs cudnn-frontend 1.31+ and CuTe DSL 4.7+")
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if cuda_major < 13:
+        pytest.skip("the native Blackwell GDN prefill requires CUDA 13+")
+    monkeypatch.setattr(
+        gdn_prefill, "_prefer_cudnn_gdn_prefill", lambda *args, **kwargs: prefer
+    )
+    inputs = _make_inputs([1024, 512], 4, 4, 8, seed=131, initial_state=True)
+    executions = []
+    run = linear_attention._run_la_graph
+
+    def observe(*args, **kwargs):
+        executions.append(args[0])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(linear_attention, "_run_la_graph", observe)
+    out, state = chunk_gated_delta_rule(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        None,
+        initial_state=inputs["initial_state"].clone(),
+        output_final_state=True,
+        cu_seqlens=inputs["cu_seqlens"],
+    )
+    assert executions == (["gdn"] if prefer else [])
+    expected_out, expected_state = _serial(inputs)
+    assert_rel_close("output", out, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close("final_state", state, expected_state, SERIAL_TOLERANCE)
+
+
+@pytest.mark.parametrize("prefer", [True, False])
+def test_auto_serves_state_pools(prefer, monkeypatch):
+    """A pool call with its in-place output pool follows the same auto policy
+    as its compact form: cuDNN when the policy says so, the native pool route
+    otherwise; both update only the selected slots and match the serial
+    oracle."""
+    import cudnn
+
+    from flashinfer import gdn_prefill
+    from flashinfer.cudnn import linear_attention
+
+    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
+        pytest.skip("state pools require cuDNN frontend 1.31+")
+    if not linear_attention._linear_attention_auto_available():
+        pytest.skip("auto needs cudnn-frontend 1.31+ and CuTe DSL 4.7+")
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if cuda_major < 13:
+        pytest.skip("the native Blackwell GDN prefill requires CUDA 13+")
+    monkeypatch.setattr(
+        gdn_prefill, "_prefer_cudnn_gdn_prefill", lambda *args, **kwargs: prefer
+    )
+    inputs = _make_inputs([1024, 512], 4, 4, 8, seed=133, initial_state=True)
+    pool = torch.randn(6, 8, HEAD_DIM, HEAD_DIM, device="cuda") * 0.01
+    slots = torch.tensor([4, 1], dtype=torch.int32, device="cuda")
+    before = pool.clone()
+    expected_out, expected_state = _serial(
+        inputs, initial_state=pool.index_select(0, slots)
+    )
+    executions = []
+    run = linear_attention._run_la_graph
+
+    def observe(*args, **kwargs):
+        executions.append(args[0])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(linear_attention, "_run_la_graph", observe)
+    out, state = chunk_gated_delta_rule(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        None,
+        initial_state=pool,
+        output_state=pool,
+        output_final_state=True,
+        cu_seqlens=inputs["cu_seqlens"],
+        state_indices=slots,
+    )
+    assert executions == (["gdn"] if prefer else [])
+    assert state is pool
+    assert_rel_close("pool output", out, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close(
+        "pool state", pool.index_select(0, slots), expected_state, SERIAL_TOLERANCE
+    )
+    untouched = [0, 2, 3, 5]
+    assert torch.equal(pool[untouched], before[untouched])
 
 
 def test_cudnn_backend_rejects_context_parallel():

@@ -110,7 +110,7 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
     elif change == "state":
         options["initial_state"] = torch.zeros(1, 3, 3)
     elif change == "frontend":
-        monkeypatch.setattr(la.cudnn, "__version__", "1.32.0")
+        monkeypatch.setattr(la.cudnn, "__version__", la.cudnn.__version__ + ".post1")
     else:
         monkeypatch.setattr(la, "_build_la_graph", lambda *args, **kwargs: None)
     la._try_cudnn_auto(decline, q, **options)

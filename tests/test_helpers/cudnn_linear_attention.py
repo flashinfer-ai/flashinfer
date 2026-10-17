@@ -323,6 +323,82 @@ def serial_delta_rule2(
     return out, state
 
 
+def serial_mamba2(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    dt_softplus: bool = False,
+    dt_min: float = 0.0,
+    dt_max: float = float("inf"),
+    initial_state: Optional[torch.Tensor] = None,
+):
+    """Token-at-a-time fp32 Mamba-2 SSD recurrence, state V-major as ``[N, H, P, Nstate]``.
+
+    The gated delta rule without the erase term: one per-token scalar ``dt`` is
+    both the decay exponent and the write strength,
+    ``dt_t = clamp(softplus(dt_t + dt_bias), dt_min, dt_max)`` (softplus only
+    under ``dt_softplus``), ``S_t = exp(A dt_t) S_{t-1} + dt_t B_t (x) x_t``,
+    ``y_t = C_t S_t + D x_t`` and ``y_t *= z_t sigmoid(z_t)`` when ``z`` is given.
+
+    ``x`` ``[total, H, P]``, ``dt`` ``[total, H]``, ``B`` / ``C`` ``[total, G, Nstate]``
+    with ``H // G`` heads sharing each group, ``A`` and ``dt_bias`` ``[H]``, ``D``
+    ``[H]`` or ``[H, P]``, ``z`` like ``x``; packed over ``cu_seqlens``. The state
+    ``[P, Nstate]`` per head is FlashInfer's ``[nheads, headdim, dstate]``.
+    """
+    total, num_heads, head_dim = x.shape
+    num_groups, state_dim = B.shape[1], B.shape[2]
+    group = torch.arange(num_heads, device=x.device) // (num_heads // num_groups)
+    offsets = [int(value) for value in cu_seqlens.tolist()]
+
+    step = dt.float()
+    if dt_bias is not None:
+        step = step + dt_bias.float()
+    if dt_softplus:
+        step = F.softplus(step)
+    step = step.clamp(float(dt_min), float(dt_max))
+    alpha = torch.exp(A.float()[None, :] * step)
+    value = x.float()
+    key = B.float()
+    query = C.float()
+
+    out = torch.empty(total, num_heads, head_dim, dtype=torch.float32, device=x.device)
+    if initial_state is None:
+        state = torch.zeros(
+            len(offsets) - 1,
+            num_heads,
+            head_dim,
+            state_dim,
+            dtype=torch.float32,
+            device=x.device,
+        )
+    else:
+        state = initial_state.float().clone()
+
+    for sequence in range(len(offsets) - 1):
+        running = state[sequence]
+        for token in range(offsets[sequence], offsets[sequence + 1]):
+            key_t = key[token, group]
+            running = alpha[token][:, None, None] * running + step[token][
+                :, None, None
+            ] * torch.einsum("hp,hn->hpn", value[token], key_t)
+            out[token] = torch.einsum("hpn,hn->hp", running, query[token, group])
+        state[sequence] = running
+    if D is not None:
+        skip = D.float()
+        out = out + (skip[:, None] if skip.dim() == 1 else skip) * value
+    if z is not None:
+        gate = z.float()
+        out = out * (gate * torch.sigmoid(gate))
+    return out, state
+
+
 def kda_safe_gate(
     g: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor, lower_bound: float
 ) -> torch.Tensor:

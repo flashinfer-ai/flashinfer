@@ -12,7 +12,23 @@ parallel across cores, and is a near-free no-op when the modules are already
 present in the JIT disk cache.
 """
 
+import pytest
 import torch
+
+
+@pytest.fixture(autouse=True)
+def native_auto_policy(monkeypatch):
+    """The CuTe and Cake suites test FlashInfer's own SSD kernels, so
+    ``backend="auto"`` keeps the native defaults here (the CuTe kernel for
+    the class, Cake for the function) even where cuDNN would serve the call
+    (an SM100 box with cudnn-frontend 1.32+). A module that tests the auto
+    resolution itself overrides this fixture by name."""
+    from flashinfer.mamba import ssd_combined
+
+    monkeypatch.setattr(
+        ssd_combined, "_ssd_auto_prefers_cudnn", lambda *args, **kwargs: False
+    )
+
 
 # Every _CHECKPOINTING_SSU_VARIANT_FIELDS combination requested by
 # tests/mamba/test_checkpointing_ssu.py, captured by instrumenting
