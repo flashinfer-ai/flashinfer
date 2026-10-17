@@ -78,8 +78,8 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
         Params params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
-        params.k = static_cast<DTypeKV*>(k.data_ptr());
-        params.v = static_cast<DTypeKV*>(v.data_ptr());
+        params.k = static_cast<DTypeK*>(k.data_ptr());
+        params.v = static_cast<DTypeV*>(v.data_ptr());
         params.o = static_cast<DTypeO*>(o.data_ptr());
         params.lse =
             maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
