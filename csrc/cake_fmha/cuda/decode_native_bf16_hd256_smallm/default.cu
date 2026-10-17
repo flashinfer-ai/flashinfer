@@ -41,11 +41,21 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define NUM_KV_PIPE_STAGES 2
 #define NUM_SM_PIPE_STAGES 2
 #define SMEM_SMEM_ST_A_OFF 191488
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
 #define SMEM_SMEM_ST_A_STAGE_BYTES 16512
 #define SMEM_SMEM_ST_A_STRIDE 16512
+#else
+#define SMEM_SMEM_ST_A_STAGE_BYTES 8256
+#define SMEM_SMEM_ST_A_STRIDE 8256
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 #define SMEM_SMEM_ST_B_OFF 208000
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
 #define SMEM_SMEM_ST_B_STAGE_BYTES 16512
 #define SMEM_SMEM_ST_B_STRIDE 16512
+#else
+#define SMEM_SMEM_ST_B_STAGE_BYTES 8256
+#define SMEM_SMEM_ST_B_STRIDE 8256
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 #define SMEM_SMEM_SCALE_OFF 5120
 #define SMEM_SMEM_SCALE_STAGE_BYTES 512
 #define SMEM_SMEM_SCALE_STRIDE 512
@@ -62,11 +72,21 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SMEM_W_STAGE_BYTES 1024
 #define SMEM_SMEM_W_STRIDE 1024
 #define SMEM_SMEM_Q_HI_OFF 11264
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
 #define SMEM_SMEM_Q_HI_STAGE_BYTES 16384
 #define SMEM_SMEM_Q_HI_STRIDE 16384
+#else
+#define SMEM_SMEM_Q_HI_STAGE_BYTES 8192
+#define SMEM_SMEM_Q_HI_STRIDE 8192
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 #define SMEM_SMEM_Q_LO_OFF 27648
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
 #define SMEM_SMEM_Q_LO_STAGE_BYTES 16384
 #define SMEM_SMEM_Q_LO_STRIDE 16384
+#else
+#define SMEM_SMEM_Q_LO_STAGE_BYTES 8192
+#define SMEM_SMEM_Q_LO_STRIDE 8192
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 #define SMEM_SMEM_KV_HI_OFF 44032
 #define SMEM_SMEM_KV_HI_STAGE_BYTES 32768
 #define SMEM_SMEM_KV_HI_STRIDE 32768
@@ -80,8 +100,13 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SMEM_V_LO_STAGE_BYTES 32768
 #define SMEM_SMEM_V_LO_STRIDE 32768
 #define SMEM_SMEM_P_OFF 175104
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
 #define SMEM_SMEM_P_STAGE_BYTES 16384
 #define SMEM_SMEM_P_STRIDE 16384
+#else
+#define SMEM_SMEM_P_STAGE_BYTES 8192
+#define SMEM_SMEM_P_STRIDE 8192
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 #define SMEM_TOTAL 224512
 #define THREADS 512
 #ifndef Q_LEN
@@ -383,6 +408,21 @@ __device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
 }
 
 
+#if CAKE_FMHA_SMALLM_N_ROWS != 64
+__device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
+        " {%0, %1, %2, %3, %4, %5, %6, %7,"
+        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
+          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
+          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
+          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
+        : "r"(tmem_addr));
+}
+
+
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 __device__ __forceinline__ void tmem_st_x32_f32(int tmem_addr, const float* src) {
     asm volatile(
         "tcgen05.st.sync.aligned.32x32b.x32.b32"
@@ -501,7 +541,27 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p64(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p32(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+#else
 kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p32(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+#else
+kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
 {
     // TMA descriptors are __grid_constant__ parameters (captured by value in
     // CUDA graphs); the kernel addresses them through the param space.
@@ -606,7 +666,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
 
     __syncwarp();
 
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
     // TMEM alloc (256 columns, 256 used)
+#else
+    // TMEM alloc (256 columns, 224 used)
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 104);
     if (warp == 0) {
         int _tmem_hold = smem + 104;
@@ -655,9 +719,15 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
             const int warp_in_wg = warp % 4;
             const int lane_base = warp_in_wg * 32;
             int wg_tid = warp_in_wg * 32 + lane;
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
             int col_local = wg_tid / 4;
             int quarter = wg_tid % 4;
             int col_base = wg * 32;
+#else
+            int col_local = wg_tid / 8;
+            int quarter = wg_tid % 8;
+            int col_base = wg * 16;
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
             int my_col = col_base + col_local;
             int tok_base = quarter * 8;
             int my_s_base = taddr + (unsigned int)(lane_base << 16) + (unsigned int)col_base;
@@ -671,15 +741,24 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
             #pragma unroll 1
             for (int n = 0; n < cnt; n++) {
                 mbarrier_wait(s_full_addr + (sm_stage) * 8, sm_phase);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 float _tmem_load_0[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                     : "r"(my_s_base + sm_stage * 64));
+#else
+                float _tmem_load_0[16];
+                tmem_ld_x16(&_tmem_load_0[0], my_s_base + sm_stage * 32);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 int tok_w = lane_base + lane;
                 #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int c = 0; c < 32; c++) {
+#else
+                for (int c = 0; c < 16; c++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     st_ptr[c * 129 + tok_w] = _tmem_load_0[c];
                 }
                 if (wg != 0) {
@@ -689,14 +768,27 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                 }
                 int my_block = start + cnt - 1 - n;
                 int blk_pos = my_block * BLOCK_N + tok_base;
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 float svals[32];
+#else
+                float svals[16];
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 float lmax = -CAKE_FMHA_INF;
                 #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int j = 0; j < 4; j++) {
+#else
+                for (int j = 0; j < 2; j++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     #pragma unroll
                     for (int i = 0; i < 8; i++) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         float s_ji = st_ptr[col_local * 129 + tok_base + 32 * j + i];
                         if (vis_col <= blk_pos + 32 * j + i) {
+#else
+                        float s_ji = st_ptr[col_local * 129 + tok_base + 64 * j + i];
+                        if (vis_col <= blk_pos + 64 * j + i) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             s_ji = -CAKE_FMHA_INF;
                         }
                         svals[j * 8 + i] = s_ji;
@@ -710,6 +802,13 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                 float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, lmax, 2);
                 float _max_2 = max_noftz(lmax, _shfl_xor_1);
                 lmax = _max_2;
+#if CAKE_FMHA_SMALLM_N_ROWS != 64
+                {
+                    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, lmax, 4);
+                    float _max_3 = max_noftz(lmax, _shfl_xor_2);
+                    lmax = _max_3;
+                }
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 float _max_4 = max_noftz(row_max, lmax);
                 float new_max = _max_4;
                 float acc_scale = 1.0f;
@@ -718,10 +817,18 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     acc_scale = _exp2_0;
                 }
                 float safe_max = ((new_max == -CAKE_FMHA_INF) ? 0.0f : new_max);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 float p_vals[32];
+#else
+                float p_vals[16];
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 float lsum = 0.0f;
                 #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int k = 0; k < 32; k++) {
+#else
+                for (int k = 0; k < 16; k++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     float _exp2_1 = approx_exp2((svals[k] - safe_max) * softmax_scale_log2);
                     float p_k = _exp2_1;
                     p_vals[k] = p_k;
@@ -746,14 +853,20 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(p_vals[_lp*2 + 0], p_vals[_lp*2+1 + 0]));
                     regs_p[_lp] = *(uint32_t*)&_bf2;
                 }
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)((k_run / 64 * 64 + my_col) * 128 + (k_run % 64 + tok_base) * 2 ^ ((k_run / 64 * 64 + my_col) * 128 + (k_run % 64 + tok_base) * 2 >> 7 & 7) << 4))), "r"(regs_p[0]), "r"(regs_p[1]), "r"(regs_p[2]), "r"(regs_p[3]) : "memory");
                 int k_run_0 = 32;
+#else
+                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)((k_run / 64 * 32 + my_col) * 128 + (k_run % 64 + tok_base) * 2 ^ ((k_run / 64 * 32 + my_col) * 128 + (k_run % 64 + tok_base) * 2 >> 7 & 7) << 4))), "r"(regs_p[0]), "r"(regs_p[1]), "r"(regs_p[2]), "r"(regs_p[3]) : "memory");
+                int k_run_0 = 64;
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 unsigned int regs_p_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(p_vals[_lp*2 + 8], p_vals[_lp*2+1 + 8]));
                     regs_p_1[_lp] = *(uint32_t*)&_bf2;
                 }
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)((k_run_0 / 64 * 64 + my_col) * 128 + (k_run_0 % 64 + tok_base) * 2 ^ ((k_run_0 / 64 * 64 + my_col) * 128 + (k_run_0 % 64 + tok_base) * 2 >> 7 & 7) << 4))), "r"(regs_p_1[0]), "r"(regs_p_1[1]), "r"(regs_p_1[2]), "r"(regs_p_1[3]) : "memory");
                 int k_run_2 = 64;
                 unsigned int regs_p_3[4];
@@ -771,6 +884,9 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     regs_p_5[_lp] = *(uint32_t*)&_bf2;
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)((k_run_4 / 64 * 64 + my_col) * 128 + (k_run_4 % 64 + tok_base) * 2 ^ ((k_run_4 / 64 * 64 + my_col) * 128 + (k_run_4 % 64 + tok_base) * 2 >> 7 & 7) << 4))), "r"(regs_p_5[0]), "r"(regs_p_5[1]), "r"(regs_p_5[2]), "r"(regs_p_5[3]) : "memory");
+#else
+                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)((k_run_0 / 64 * 32 + my_col) * 128 + (k_run_0 % 64 + tok_base) * 2 ^ ((k_run_0 / 64 * 32 + my_col) * 128 + (k_run_0 % 64 + tok_base) * 2 >> 7 & 7) << 4))), "r"(regs_p_1[0]), "r"(regs_p_1[1]), "r"(regs_p_1[2]), "r"(regs_p_1[3]) : "memory");
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 asm volatile("fence.proxy.async;");
                 mbarrier_arrive(p_full_addr);
                 if (wg != 0) {
@@ -785,6 +901,12 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
             float total = psum + _shfl_xor_3;
             float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, total, 2);
             total = total + _shfl_xor_4;
+#if CAKE_FMHA_SMALLM_N_ROWS != 64
+            {
+                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, total, 4);
+                total = total + _shfl_xor_5;
+            }
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
             if (quarter == 0) {
                 smem_sum[my_col] = total;
                 smem_max[my_col] = row_max;
@@ -817,10 +939,18 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                 asm volatile("fence.acquire.gpu;" ::: "memory");
                 int slot_base = tile_idx * NUM_SPLIT;
                 #pragma unroll 1
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int r = split_idx; r < 64; r += NUM_SPLIT) {
+#else
+                for (int r = split_idx; r < 32; r += NUM_SPLIT) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     float my_lse = -CAKE_FMHA_INF;
                     if (flat_tid_s < NUM_SPLIT) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         my_lse = partial_LSE_ptr[(slot_base + flat_tid_s) * 64 + r];
+#else
+                        my_lse = partial_LSE_ptr[(slot_base + flat_tid_s) * 32 + r];
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     float _warp_reduce_0 = my_lse;
                     #pragma unroll
@@ -874,7 +1004,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         float w_i = smem_w[i_1];
                         float _vec_load_0[8];
                         {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O_ptr + (((slot_base + i_1) * 64 + r) * HEAD_DIM + d0) + 0);
+#else
+                            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O_ptr + (((slot_base + i_1) * 32 + r) * HEAD_DIM + d0) + 0);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             uint4 _vld_0[1];
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -990,7 +1124,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     int sc_off = n_1 % NUM_KV_STAGES * 64;
                     int need = 0;
                     #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                     for (int c_1 = 0; c_1 < 64; c_1++) {
+#else
+                    for (int c_1 = 0; c_1 < 32; c_1++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         need = need | ((smem_scale[sc_off + c_1] != 1.0f) ? 1 : 0);
                     }
                     int _vote_0 = __any_sync(0xFFFFFFFF, need != 0);
@@ -999,7 +1137,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         for (int half = 0; half < 2; half++) {
                             int o_base = taddr + (unsigned int)(((half == 0) ? 128 : 192)) + (unsigned int)corr_row;
                             #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             for (int chunk = 0; chunk < 2; chunk++) {
+#else
+                            for (int chunk = 0; chunk < 1; chunk++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                                 float _tmem_load_1[32];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -1031,7 +1173,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
             for (int half_1 = 0; half_1 < 2; half_1++) {
                 int o_base_e = taddr + (unsigned int)(((half_1 == 0) ? 128 : 192)) + (unsigned int)corr_row;
                 #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int chunk_1 = 0; chunk_1 < 2; chunk_1++) {
+#else
+                for (int chunk_1 = 0; chunk_1 < 1; chunk_1++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     float o_epi[32];
                     if (cnt_1 > 0) {
                         asm volatile(
@@ -1083,14 +1229,22 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         if (cnt_1 == 0) {
                             val_c = 0.0f;
                         }
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         int p_idx = (slot * 64 + r_c) * HEAD_DIM + half_1 * HEAD_DIM_HALF + d_idx;
+#else
+                        int p_idx = (slot * 32 + r_c) * HEAD_DIM + half_1 * HEAD_DIM_HALF + d_idx;
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         *(reinterpret_cast<__nv_bfloat16*>(partial_O_ptr + p_idx) + (0)) = __float2bfloat16_rn(val_c);
                     }
                 }
             }
             if (warp_in_wg_c == 0) {
                 #pragma unroll
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int chunk_2 = 0; chunk_2 < 2; chunk_2++) {
+#else
+                for (int chunk_2 = 0; chunk_2 < 1; chunk_2++) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     int r_l = chunk_2 * 32 + lane;
                     float m_l = smem_max[r_l];
                     float s_l = smem_sum[r_l];
@@ -1100,7 +1254,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(s_l));
                         lse_l = m_l * softmax_scale_log2 + _log2_1;
                     }
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                     *(reinterpret_cast<float*>(partial_LSE_ptr + (slot * 64 + r_l)) + (0)) = lse_l;
+#else
+                    *(reinterpret_cast<float*>(partial_LSE_ptr + (slot * 32 + r_l)) + (0)) = lse_l;
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                 }
             }
             mbarrier_arrive(tmem_dealloc_addr);
@@ -1131,10 +1289,18 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                 asm volatile("fence.acquire.gpu;" ::: "memory");
                 int slot_base_1 = tile_idx_1 * NUM_SPLIT;
                 #pragma unroll 1
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                 for (int r_1 = split_idx_1; r_1 < 64; r_1 += NUM_SPLIT) {
+#else
+                for (int r_1 = split_idx_1; r_1 < 32; r_1 += NUM_SPLIT) {
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     float my_lse_1 = -CAKE_FMHA_INF;
                     if (flat_tid_c < NUM_SPLIT) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         my_lse_1 = partial_LSE_ptr[(slot_base_1 + flat_tid_c) * 64 + r_1];
+#else
+                        my_lse_1 = partial_LSE_ptr[(slot_base_1 + flat_tid_c) * 32 + r_1];
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     float _warp_reduce_2 = my_lse_1;
                     #pragma unroll
@@ -1188,7 +1354,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         float w_i_1 = smem_w[i_2];
                         float _vec_load_1[8];
                         {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O_ptr + (((slot_base_1 + i_2) * 64 + r_1) * HEAD_DIM + d0_1) + 0);
+#else
+                            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O_ptr + (((slot_base_1 + i_2) * 32 + r_1) * HEAD_DIM + d0_1) + 0);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             uint4 _vld_0[1];
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1299,42 +1469,78 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                     uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 0);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 0);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 1018U);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 506U);
+#else
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 250U);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                 }
                 int _mma_a_lo_1 = make_warp_uniform((((smem_kv_lo_addr) >> 4) & 0x3FFF) + (0) * 2048);
@@ -1343,42 +1549,78 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
                     uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_1);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 1018U);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 506U);
+#else
+                    incr_smem_desc_lo(_mma_ss_b_desc_1, 250U);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                     incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
                     incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
                     if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135267472, 1);
+#else
+                        tcgen05_mma_f16(tmem_tmem_s, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     }
                 }
                 elect_commit(s_full_addr);
@@ -1397,42 +1639,78 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                             uint64_t _mma_ss_a_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
                             uint64_t _mma_ss_b_desc_2 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 0);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 0);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 1018U);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 506U);
+#else
+                            incr_smem_desc_lo(_mma_ss_b_desc_2, 250U);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_2, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_2, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_2, _mma_ss_b_desc_2, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                         }
                         int _mma_a_lo_3 = make_warp_uniform((((smem_kv_lo_addr) >> 4) & 0x3FFF) + (nstage) * 2048);
@@ -1441,42 +1719,78 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                             uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
                             uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_3);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 1018U);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 506U);
+#else
+                            incr_smem_desc_lo(_mma_ss_b_desc_3, 250U);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                             incr_smem_desc_lo(_mma_ss_a_desc_3, 2U);
                             incr_smem_desc_lo(_mma_ss_b_desc_3, 2U);
                             if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                                 tcgen05_mma_f16((tmem_tmem_s + (nstage * 64)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 135267472, 1);
+#else
+                                tcgen05_mma_f16((tmem_tmem_s + (nstage * 32)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 134743184, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                             }
                         }
                         elect_commit(s_full_addr + (nstage) * 8);
@@ -1488,47 +1802,87 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int first_pv_flag = first_pv;
                     int _mma_a_lo_4 = make_warp_uniform(((((smem_v_hi_addr) >> 4) & 0x3FFF) | 0x4000000) + (stage) * 2048);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                     int _mma_b_lo_4 = make_warp_uniform((((smem_p_addr) >> 4) & 0x3FFF) | 0x2000000);
+#else
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_p_addr) >> 4) & 0x3FFF) | 0x1000000);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     {
                         uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_4);
                         uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, ((first_pv_flag) ? 0 : 1));
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, ((first_pv_flag) ? 0 : 1));
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 506U);
+#else
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 250U);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_4, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_hi, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                     }
                     int _mma_a_lo_5 = make_warp_uniform(((((smem_v_lo_addr) >> 4) & 0x3FFF) | 0x4000000) + (stage) * 2048);
@@ -1536,42 +1890,78 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_5);
                         uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_4);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, ((first_pv_flag) ? 0 : 1));
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, ((first_pv_flag) ? 0 : 1));
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 506U);
+#else
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 250U);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
                         incr_smem_desc_lo(_mma_ss_b_desc_5, 2U);
                         if (elect_sync()) {
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                             tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135300240, 1);
+#else
+                            tcgen05_mma_f16(tmem_tmem_o_lo, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 134775952, 1);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                         }
                     }
                     elect_commit2(kv_empty_addr + (stage) * 8, o_ready_addr);
@@ -1605,14 +1995,26 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                 start_3 = split_idx_3 * (base_blocks_3 + 1);
             }
             int prefix_3 = kv_len_3 - Q_LEN;
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+            int max_pg = (kv_len_3 + 64 - 1) / 64 - 1;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+            int max_pg = (kv_len_3 + 32 - 1) / 32 - 1;
+#else
             int max_pg = (kv_len_3 + 16 - 1) / 16 - 1;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
             int pt_base = batch_idx_3 * max_pages_per_seq;
             const int kv_tx = BLOCK_N * HEAD_DIM * 2;
             if (cnt_3 > 0) {
                 if (elect_sync()) {
                     int q_head0 = kv_head_idx_3 * GROUP;
                     int q_row0 = batch_idx_3 * Q_LEN;
+#if CAKE_FMHA_SMALLM_N_ROWS == 64
                     mbarrier_arrive_expect_tx(q_full_addr, 64 * HEAD_DIM * 2);
+#else
+                    mbarrier_arrive_expect_tx(q_full_addr, 32 * HEAD_DIM * 2);
+#endif  // CAKE_FMHA_SMALLM_N_ROWS
                     tma_4d_gmem2smem(smem_q_hi_addr, Q, 0, q_head0, q_row0, 0, q_full_addr);
                     tma_4d_gmem2smem(smem_q_lo_addr, Q, 0, q_head0, q_row0, 2, q_full_addr);
                     int kv_stage = 0;
@@ -1626,13 +2028,31 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         int hdst = smem_kv_hi_addr + (unsigned int)(kv_stage * 32768);
                         int ldst = smem_kv_lo_addr + (unsigned int)(kv_stage * 32768);
                         #pragma unroll
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                        for (int pg_i = 0; pg_i < 2; pg_i++) {
+                            int raw_p = n_block * 2 + pg_i;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                        for (int pg_i = 0; pg_i < 4; pg_i++) {
+                            int raw_p = n_block * 4 + pg_i;
+#else
                         for (int pg_i = 0; pg_i < 8; pg_i++) {
                             int raw_p = n_block * 8 + pg_i;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                             int clamp_p = ((raw_p > max_pg) ? max_pg : raw_p);
                             int pg0 = page_table[pt_base + clamp_p];
                             #pragma unroll
                             for (int hg = 0; hg < 2; hg++) {
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                                int toff = hg * 16384 + pg_i * 8192;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                                int toff = hg * 16384 + pg_i * 4096;
+#else
                                 int toff = hg * 16384 + pg_i * 2048;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                 asm volatile(
                                     "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -1641,7 +2061,15 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                             }
                             #pragma unroll
                             for (int hg_1 = 0; hg_1 < 2; hg_1++) {
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                                int toff_1 = hg_1 * 16384 + pg_i * 8192;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                                int toff_1 = hg_1 * 16384 + pg_i * 4096;
+#else
                                 int toff_1 = hg_1 * 16384 + pg_i * 2048;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                 asm volatile(
                                     "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -1661,13 +2089,31 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                         int hdst_1 = smem_kv_hi_addr + (unsigned int)(stage_1 * 32768);
                         int ldst_1 = smem_kv_lo_addr + (unsigned int)(stage_1 * 32768);
                         #pragma unroll
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                        for (int pg_i_1 = 0; pg_i_1 < 2; pg_i_1++) {
+                            int raw_p_1 = n_block_1 * 2 + pg_i_1;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                        for (int pg_i_1 = 0; pg_i_1 < 4; pg_i_1++) {
+                            int raw_p_1 = n_block_1 * 4 + pg_i_1;
+#else
                         for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
                             int raw_p_1 = n_block_1 * 8 + pg_i_1;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                             int clamp_p_1 = ((raw_p_1 > max_pg) ? max_pg : raw_p_1);
                             int pg0_1 = page_table[pt_base + clamp_p_1];
                             #pragma unroll
                             for (int hg_2 = 0; hg_2 < 2; hg_2++) {
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                                int toff_2 = hg_2 * 16384 + pg_i_1 * 8192;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                                int toff_2 = hg_2 * 16384 + pg_i_1 * 4096;
+#else
                                 int toff_2 = hg_2 * 16384 + pg_i_1 * 2048;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                 asm volatile(
                                     "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -1676,7 +2122,15 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                             }
                             #pragma unroll
                             for (int hg_3 = 0; hg_3 < 2; hg_3++) {
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                                int toff_3 = hg_3 * 16384 + pg_i_1 * 8192;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                                int toff_3 = hg_3 * 16384 + pg_i_1 * 4096;
+#else
                                 int toff_3 = hg_3 * 16384 + pg_i_1 * 2048;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                 asm volatile(
                                     "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -1692,13 +2146,31 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                             int hdst_0 = smem_kv_hi_addr + (unsigned int)(stage_1 * 32768);
                             int ldst_1_1 = smem_kv_lo_addr + (unsigned int)(stage_1 * 32768);
                             #pragma unroll
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                            for (int pg_i_2 = 0; pg_i_2 < 2; pg_i_2++) {
+                                int raw_p_2 = next_block * 2 + pg_i_2;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                            for (int pg_i_2 = 0; pg_i_2 < 4; pg_i_2++) {
+                                int raw_p_2 = next_block * 4 + pg_i_2;
+#else
                             for (int pg_i_2 = 0; pg_i_2 < 8; pg_i_2++) {
                                 int raw_p_2 = next_block * 8 + pg_i_2;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                 int clamp_p_2 = ((raw_p_2 > max_pg) ? max_pg : raw_p_2);
                                 int pg0_2 = page_table[pt_base + clamp_p_2];
                                 #pragma unroll
                                 for (int hg_4 = 0; hg_4 < 2; hg_4++) {
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                                    int toff_4 = hg_4 * 16384 + pg_i_2 * 8192;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                                    int toff_4 = hg_4 * 16384 + pg_i_2 * 4096;
+#else
                                     int toff_4 = hg_4 * 16384 + pg_i_2 * 2048;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
@@ -1707,7 +2179,15 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(const __grid_constant__
                                 }
                                 #pragma unroll
                                 for (int hg_5 = 0; hg_5 < 2; hg_5++) {
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 64
+                                    int toff_5 = hg_5 * 16384 + pg_i_2 * 8192;
+#else
+#if CAKE_FMHA_SMALLM_PAGE_SIZE == 32
+                                    int toff_5 = hg_5 * 16384 + pg_i_2 * 4096;
+#else
                                     int toff_5 = hg_5 * 16384 + pg_i_2 * 2048;
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
+#endif  // CAKE_FMHA_SMALLM_PAGE_SIZE
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"

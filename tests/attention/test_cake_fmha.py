@@ -312,6 +312,40 @@ def test_cake_fmha_generic_members_share_one_folded_source(
     assert all(set(member["selector"]) == set(macros) for member in generic_members)
 
 
+def test_cake_fmha_smallm_components_share_one_folded_source() -> None:
+    """The small-M hd256 components share one source driven by the loader defines."""
+
+    folded = "cuda/decode_native_bf16_hd256_smallm/default.cu"
+    csrc_dir = get_cake_fmha_csrc_dir()
+    components = get_cake_fmha_manifest()["components"]
+    names = [
+        cake_fmha_smallm_component_name(n_rows, page_size)
+        for n_rows in (32, 64)
+        for page_size in (16, 32, 64)
+    ]
+    for name in names:
+        members = components[name]["source_family"]
+        assert len(members) == 1
+        assert members[0]["selector"] == {}
+        assert members[0]["sources"] == {"sm_100a": folded, "sm_103a": folded}
+        assert not (csrc_dir / "cuda" / name).exists()
+    lines = (csrc_dir / folded).read_text(encoding="utf-8").split("\n")
+    for name in names:
+        symbol = components[name]["public_symbol"]
+        assert sum(line.startswith(f"{symbol}(") for line in lines) == 1
+    fixed_defines = (
+        "#define N_ROWS ",
+        "#define PAGE_SIZE ",
+        "#define CAKE_FMHA_SMALLM_",
+    )
+    assert not [line for line in lines if line.startswith(fixed_defines)]
+    knobs = {"CAKE_FMHA_SMALLM_N_ROWS": {64}, "CAKE_FMHA_SMALLM_PAGE_SIZE": {32, 64}}
+    for knob, values in knobs.items():
+        opens = [line for line in lines if line.startswith(f"#if {knob} ")]
+        assert {int(line.rsplit(" ", 1)[1]) for line in opens} == values
+        assert len(opens) == lines.count(f"#endif  // {knob}") > 0
+
+
 @pytest.mark.parametrize(
     ("component", "sources"),
     (
@@ -3359,8 +3393,7 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         "cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     }
     assert any(
-        "decode_native_bf16_hd256_smallm_n64_p64/default.cu" in str(s)
-        for s in spec.sources
+        "decode_native_bf16_hd256_smallm/default.cu" in str(s) for s in spec.sources
     )
     assert "-DQ_LEN=8" in spec.extra_cuda_cflags
     assert "-DQ_BOX_ROWS=8" in spec.extra_cuda_cflags

@@ -3409,8 +3409,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3535,8 +3535,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3661,8 +3661,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3787,8 +3787,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -3913,8 +3913,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
@@ -4039,8 +4039,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm/default.cu"
           }
         }
       ],
