@@ -41,14 +41,14 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_TMA_PIPE_STAGES 4
+#define NUM_TMA_PIPE_STAGES 6
 #define SMEM_SMEM_A_OFF 0
 #define SMEM_SMEM_A_STAGE_BYTES 16384
 #define SMEM_SMEM_A_STRIDE 32768
 #define SMEM_SMEM_B_OFF 16384
 #define SMEM_SMEM_B_STAGE_BYTES 16384
 #define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_TOTAL 131136
+#define SMEM_TOTAL 196704
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -138,7 +138,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target)
+kernel_cake_qkv_norm_rope_exchange_overlap_2a944243ea81979c5d5c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ cos_sin, __nv_bfloat16* __restrict__ q_scale, __nv_bfloat16* __restrict__ k_scale, long long* __restrict__ tiles, long long* __restrict__ dst_ptrs, long long* __restrict__ ready_ptrs, unsigned int* __restrict__ counters, int num_tiles, int M, int K, int S_local, int head_stride, long long batch_stride, long long slot_elem_offset, int pad_base, int num_words, int rank, int world, unsigned int ready_target)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -148,9 +148,9 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
-    const int mbar_base = smem + 131072;
+    const int mbar_base = smem + 196608;
     #define full_addr (mbar_base + 0)
-    #define empty_addr (mbar_base + 32)
+    #define empty_addr (mbar_base + 48)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -170,41 +170,34 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
     }
     __syncwarp();
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[131072..131136)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 12 barriers)
+    // Mbarriers at smem_raw[196608..196704)
 
     if (warp == 1) {
         uint32_t leader = elect_sync();
         if (leader) {
             // Stage-major initialization across barrier declarations.
-            mbarrier_init(smem + 131072, 1);
-            mbarrier_init(smem + 131104, 256);
-            mbarrier_init(smem + 131080, 1);
-            mbarrier_init(smem + 131112, 256);
-            mbarrier_init(smem + 131088, 1);
-            mbarrier_init(smem + 131120, 256);
-            mbarrier_init(smem + 131096, 1);
-            mbarrier_init(smem + 131128, 256);
+            mbarrier_init(smem + 196608, 1);
+            mbarrier_init(smem + 196656, 256);
+            mbarrier_init(smem + 196616, 1);
+            mbarrier_init(smem + 196664, 256);
+            mbarrier_init(smem + 196624, 1);
+            mbarrier_init(smem + 196672, 256);
+            mbarrier_init(smem + 196632, 1);
+            mbarrier_init(smem + 196680, 256);
+            mbarrier_init(smem + 196640, 1);
+            mbarrier_init(smem + 196688, 256);
+            mbarrier_init(smem + 196648, 1);
+            mbarrier_init(smem + 196696, 256);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
     __syncthreads();
 
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
-    if (warp >= 8 && warp <= 11) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
-    }
-    __syncthreads();
-    // Inc phase consumes the registers released above.
-    if (warp >= 0 && warp <= 7) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
-    }
-    __syncthreads();
-
     // ---- Role: producer ----
     if (warp >= 8 && warp <= 11) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
         { // producer_main
             unsigned int total_tiles_p = (unsigned int)num_tiles;
             unsigned int num_k_stages_p = (unsigned int)K / 64;
@@ -216,8 +209,8 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
                         unsigned int mt_p = (unsigned int)tiles[tile_p * 8];
                         unsigned int n0_p = (unsigned int)tiles[tile_p * 8 + 1];
                         for (unsigned int k_p = 0; k_p < num_k_stages_p; k_p++) {
-                            unsigned int stage_p = it_p % 4;
-                            mbarrier_wait_hint(empty_addr + (stage_p) * 8, it_p / 4 + 1 & 1, 10000000);
+                            unsigned int stage_p = it_p % 6;
+                            mbarrier_wait_hint(empty_addr + (stage_p) * 8, it_p / 6 + 1 & 1, 10000000);
                             {
                                 const uint64_t _tma_operand_pack_0_desc = (uint64_t)((&A));
                                 const uint32_t _tma_operand_pack_0_mbar = (uint32_t)(full_addr + (stage_p) * 8);
@@ -253,6 +246,7 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
         }
     // ---- Role: math ----
     } else if (warp <= 7) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
         { // math_main
             unsigned int total_tiles_c = (unsigned int)num_tiles;
             unsigned int num_k_stages_c = (unsigned int)K / 64;
@@ -348,8 +342,8 @@ kernel_cake_qkv_norm_rope_exchange_overlap_849dd94cf08ca290ee35(const __grid_con
                 accum[62] = 0.0f;
                 accum[63] = 0.0f;
                 for (unsigned int k_c = 0; k_c < num_k_stages_c; k_c++) {
-                    unsigned int stage_c = it_c % 4;
-                    mbarrier_wait_relaxed_hint(full_addr + (stage_c) * 8, it_c / 4 & 1, 10000000);
+                    unsigned int stage_c = it_c % 6;
+                    mbarrier_wait_relaxed_hint(full_addr + (stage_c) * 8, it_c / 6 & 1, 10000000);
                     asm volatile("" : "+f"(accum[0]) :: "memory");
                     asm volatile("" : "+f"(accum[1]) :: "memory");
                     asm volatile("" : "+f"(accum[2]) :: "memory");
