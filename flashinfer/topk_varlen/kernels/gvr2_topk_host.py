@@ -1074,11 +1074,25 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         )
     )
     big = _big_regime(num_rows, r_const, n_route >> 2)
-    aim_base = (
-        ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
-        if big
-        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
-    )
+    # FlashInfer-local: the one-CTA slabs (R == 1) aim at 7k/4, except the
+    # 1024-thread one-wave slab at K = 512, which keeps upstream's 2k (upstream:
+    # 11k/8 at K >= 1024 and 3k/2 below off the big regime, 4k at K >= 1024 on
+    # it). The first threshold is the sample's rank-TGT rung, which keeps about
+    # `aim` values; the sample reads runs of 8 adjacent values, so on real rows,
+    # whose top scores come in runs, its estimate is coarse, and at 1.375-1.5k
+    # the rung kept fewer than k values on 28 of 441 captured DSv4 / V3.2 decode
+    # rows of 8K-262K columns (up to 21% of one layer's rows). Such a row streams
+    # a second time and the one-wave batch waits for it. At 7k/4 none misses and
+    # the staged count stays under 0.6 SCAP. The one-wave slab is the plan of a
+    # launch at a wide capacity at 75-148 rows (33-148 at K = 2048), whatever
+    # its rows; at 4k it staged 2.2x the candidates for no fewer misses (B200,
+    # at 7k/4: 32K-column rows 0.81-0.89x the 4k time with the caches cold,
+    # rows of 16K-524K columns 0.76-0.99x warm). The sample, sfac n / aim
+    # values, grows 2.3x, which costs rows streamed from DRAM at 96-144 rows up
+    # to 1.5% cold and 2.7% behind a warm producer (GLM-5.2 rows of 0.87M-1M
+    # columns). At K = 512 the slab keeps 2k: 7k/4 was slower there on
+    # 131K-column and deep-layer 32K-column rows.
+    aim_base = 2 * k if big and (r_const > 1 or k < 1024) else (7 * k) // 4
     sfac = (
         (32 if r_const == 2 else (48 if k > 1024 else 16))
         if r_const > 1
