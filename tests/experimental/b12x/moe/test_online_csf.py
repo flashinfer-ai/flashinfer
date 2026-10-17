@@ -7,6 +7,7 @@ import torch
 
 from b12x.moe import fused_moe as moe
 from b12x.preparation import PreparationSession, PreparedCall
+from benchmarks.experimental.b12x.moe_preparation import prepare_csf_32x2_weights
 from .test_nvfp4_phase_kernels import _build_domain
 from ..conftest import require_b12x
 from ..quantization.test_mxfp4_csf import fixture
@@ -109,7 +110,10 @@ def _assert_scales_released(online, native_scales, buffers):
 @pytest.mark.parametrize("tokens", [1, 17, 128])
 @pytest.mark.parametrize("h,n", [(512, 192), (5120, 576)])
 @pytest.mark.parametrize("nonlinearity", ["silu", "situ"])
-def test_mxfp4_online_compression_matches_native_experts(tokens, h, n, nonlinearity):
+@pytest.mark.parametrize("encoding", ["csf", "csf_32x2_v1"])
+def test_mxfp4_online_compression_matches_native_experts(
+    tokens, h, n, nonlinearity, encoding
+):
     device = require_b12x()
     e, topk = 8, 2
     _, s13 = fixture(2 * n, h // 32, finite_scales=True)
@@ -146,9 +150,10 @@ def test_mxfp4_online_compression_matches_native_experts(tokens, h, n, nonlinear
         torch.empty_like(scale).view(torch.uint8)
         for scale in (native._impl.w1_blockscale, native._impl.w2_blockscale)
     )
-    online = moe.prepare_weights(
-        plan=plan("csf"), weights=online_weights, scale_scratch=buffers
+    prepare = (
+        prepare_csf_32x2_weights if encoding == "csf_32x2_v1" else moe.prepare_weights
     )
+    online = prepare(plan=plan("csf"), weights=online_weights, scale_scratch=buffers)
     _assert_scales_released(online, sources, buffers)
     _replay_matches_native(
         native, online, buffers, e=e, h=h, tokens=tokens, topk=topk, device=device
@@ -158,7 +163,10 @@ def test_mxfp4_online_compression_matches_native_experts(tokens, h, n, nonlinear
 @pytest.mark.parametrize("tokens", [1, 17, 33])
 @pytest.mark.parametrize("activation_mode", ["a4", "a16"])
 @pytest.mark.parametrize("n", [64, 192, 320])
-def test_nvfp4_online_compression_matches_native_experts(tokens, activation_mode, n):
+@pytest.mark.parametrize("encoding", ["csf", "csf_32x2_v1"])
+def test_nvfp4_online_compression_matches_native_experts(
+    tokens, activation_mode, n, encoding
+):
     device = require_b12x()
     e, h, topk = 8, 256, 2
     domain = _build_domain(E=e, K=h, n=n, m=tokens, top_k=topk, seed=931)
@@ -201,9 +209,10 @@ def test_nvfp4_online_compression_matches_native_experts(tokens, activation_mode
         w2_block_scales=sources[1],
     )
     native = moe.prepare_weights(plan=plan(None), weights=packed)
-    online = moe.prepare_weights(
-        plan=plan("csf"), weights=online_weights, scale_scratch=buffers
+    prepare = (
+        prepare_csf_32x2_weights if encoding == "csf_32x2_v1" else moe.prepare_weights
     )
+    online = prepare(plan=plan("csf"), weights=online_weights, scale_scratch=buffers)
     _assert_scales_released(online, sources, buffers)
     _replay_matches_native(
         native, online, buffers, e=e, h=h, tokens=tokens, topk=topk, device=device

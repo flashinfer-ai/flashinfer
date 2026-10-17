@@ -101,7 +101,7 @@ def session(tmp_path, **kwargs):
     """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
     value._cache = SelectionCache(
-        tmp_path, {"schema_version": 22, "tuning_cache_version": 1}
+        tmp_path, {"schema_version": 23, "tuning_cache_version": 1}
     )
     return value
 

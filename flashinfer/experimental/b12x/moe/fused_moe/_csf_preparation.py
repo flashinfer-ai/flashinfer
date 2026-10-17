@@ -182,10 +182,13 @@ def prepare_csf_block_weights(plan, weights):
         )
     )
     decoder = Nvfp4CsfDecoder.prepare(*planes, *outputs)
+    impl_plan = replace(prepared._impl.plan, csf_inline_scales=True)
     return replace(
         prepared,
+        plan=replace(prepared.plan, _impl=impl_plan),
         _impl=replace(
             prepared._impl,
+            plan=impl_plan,
             representation=None if rep is None else replace(rep, value=native),
             w1_blockscale=outputs[0],
             w2_blockscale=outputs[1],

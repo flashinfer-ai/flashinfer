@@ -95,7 +95,7 @@ def test_builtin_contracts_use_schema_22_or_later(registration):
 
 
 @pytest.mark.parametrize("manual_version", [None, "41"])
-def test_schema_22_retunes_without_deleting_schema_6_choices(
+def test_schema_23_retunes_without_deleting_schema_22_choices(
     cache_device,
     tmp_path,
     monkeypatch,
@@ -104,9 +104,9 @@ def test_schema_22_retunes_without_deleting_schema_6_choices(
     if manual_version is not None:
         monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", manual_version)
     identity = cache_identity({}, 0)
-    assert identity["schema_version"] == 22
+    assert identity["schema_version"] == 23
     assert identity["tuning_cache_version"] == int(manual_version or "1")
-    previous_identity = {**identity, "schema_version": 6}
+    previous_identity = {**identity, "schema_version": 22}
     previous_path = tmp_path / f"{digest(previous_identity)}.json"
     previous_payload = json.dumps(
         {
@@ -136,7 +136,7 @@ def test_schema_22_retunes_without_deleting_schema_6_choices(
     assert reused.path == cold.path
     assert reused.get("shape") == cold.get("shape")
     assert previous_path.read_text() == previous_payload
-    with pytest.raises(ValueError, match="requires schema 22"):
+    with pytest.raises(ValueError, match="requires schema 23"):
         SelectionCache(tmp_path, previous_identity)
 
 

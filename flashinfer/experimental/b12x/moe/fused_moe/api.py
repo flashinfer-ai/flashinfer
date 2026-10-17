@@ -295,8 +295,8 @@ def uses_expanded_nvfp4_scales(
     Route mappings and activation calibration must describe the later bind.
     ``scales_expanded=True`` queries a call whose scale expansion is already
     ordered before execution, or a prospective call for which the caller will
-    arrange that ordering. Large eligible A4 calls can then consume the shared
-    expansion instead of decoding scale tiles in shared memory.
+    arrange that ordering. Inline plans return False regardless of this flag;
+    their kernels reconstruct scales from the resident compact blocks.
     """
     if getattr(plan, "_prepared", None) is None:
         raise RuntimeError("scale-consumer queries require a prepared MoE plan")

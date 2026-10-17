@@ -61,6 +61,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
+from b12x._lib.quant.csf_inline import CsfInlineReader, Nvfp4CsfStageReader
 from b12x._lib.intrinsics import (
     atomic_add_global_i32,
     bfloat2_to_float2_scaled,
@@ -304,6 +305,22 @@ def _w4a8_stage_repacked_b_full(
             )
 
 
+@dsl_user_op
+def _w4a8_fc2_barrier(threads: Int32, *, loc=None, ip=None):
+    # Compute and producer warps reach matching barriers at distinct PCs.
+    llvm.inline_asm(
+        None,
+        [threads.ir_value(loc=loc, ip=ip)],
+        "barrier.cta.sync 0, $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def _w4a8_stage_repacked_sfb_half(
     sfb_rp_u32: cute.Tensor,
@@ -312,11 +329,24 @@ def _w4a8_stage_repacked_sfb_half(
     half: Int32,
     tidx: Int32,
     tcnt: cutlass.Constexpr,
+    csf_reader: cutlass.Constexpr = None,
 ):
     """Stage the 512B SFB half paired with an N128 B half."""
 
+    if cutlass.const_expr(csf_reader is not None):
+        target = cute.make_ptr(
+            Uint8, smem_base, cute.AddressSpace.smem, assumed_align=16
+        )
+        csf_reader.stage_native(
+            sfb_rp_u32.iterator,
+            (tile_base + half.to(Int64) * Int64(128)) * Int64(4),
+            target,
+            tidx,
+        )
     transfers = (16 * 8) // 4
-    for i in cutlass.range_constexpr((transfers + tcnt - 1) // tcnt):
+    for i in cutlass.range_constexpr(
+        0 if csf_reader is not None else (transfers + tcnt - 1) // tcnt
+    ):
         idx = tidx + Int32(i * tcnt)
         if idx < Int32(transfers):
             src_word = tile_base + Int64(half * Int32(16 * 8) + idx * 4)
@@ -333,11 +363,28 @@ def _w4a8_stage_repacked_sfb_full(
     tile_base: Int64,
     tidx: Int32,
     tcnt: cutlass.Constexpr,
+    csf_reader: cutlass.Constexpr = None,
 ):
     """Stage one contiguous N256 repacked SFB tile (1KB)."""
 
+    if cutlass.const_expr(csf_reader is not None):
+        for half in cutlass.range_constexpr(2):
+            target = cute.make_ptr(
+                Uint8,
+                smem_base + Int32(half * 512),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            )
+            csf_reader.stage_native(
+                sfb_rp_u32.iterator,
+                (tile_base + Int64(half * 128)) * Int64(4),
+                target,
+                tidx,
+            )
     transfers = (32 * 8) // 4
-    for i in cutlass.range_constexpr((transfers + tcnt - 1) // tcnt):
+    for i in cutlass.range_constexpr(
+        0 if csf_reader is not None else (transfers + tcnt - 1) // tcnt
+    ):
         idx = tidx + Int32(i * tcnt)
         if idx < Int32(transfers):
             cp_async4_shared_global(
@@ -810,6 +857,7 @@ class MoEDynamicKernelBackend:
         swap_ab: bool = False,
         separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
+        csf_inline_scales: bool = False,
         w4a8_repacked: bool = False,
         w4a8_n64_repacked: bool = False,
         w4a8_n64_tail: bool = False,
@@ -865,6 +913,25 @@ class MoEDynamicKernelBackend:
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
+        self.csf_inline_scales = bool(csf_inline_scales)
+        self.nvfp4_csf_inline = bool(csf_inline_scales and quant_recipe == "nvfp4")
+        self.csf_w13_reader = None
+        self.csf_down_reader = None
+        if self.csf_inline_scales and quant_recipe not in {"nvfp4", "w4a8_mx"}:
+            raise ValueError("Inline CSF requires native FP4 weights")
+        if self.csf_inline_scales and mma_tiler_mn[0] not in {16, 32}:
+            raise ValueError("Inline FP4 scales require M16 or M32 operand staging")
+        if self.nvfp4_csf_inline and (
+            quant_recipe != "nvfp4"
+            or activation != "silu"
+            or mma_tiler_mn[1] != 128
+            or sf_vec_size != 16
+            or separate_w13_halves
+            or materialize_intermediate
+        ):
+            raise ValueError(
+                "Inline NVFP4 scales require fused SiLU N128/K128 operand staging"
+            )
         self.quant_recipe = quant_recipe
         self.work_source = work_source
         self.work_is_persistent_grid = work_source == _WORK_SOURCE_PERSISTENT_GRID
@@ -1408,7 +1475,7 @@ class MoEDynamicKernelBackend:
             barrier_id=10,
             num_threads=w4a8_stage_threads,
         )
-        self.load_register_requirement = 32
+        self.load_register_requirement = 64 if self.csf_inline_scales else 32
         self.mma_register_requirement = 232
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma):
@@ -2133,18 +2200,14 @@ class MoEDynamicKernelBackend:
                 copy_threads,
             )
         else:
-            for i in cutlass.range_constexpr(
-                (256 // 4 + copy_threads - 1) // copy_threads
-            ):
-                transfer = copy_tid + Int32(i * copy_threads)
-                if transfer < Int32(256 // 4):
-                    cp_async4_shared_global(
-                        sfb_base + (transfer << Int32(4)),
-                        get_ptr_as_int64(
-                            down_sfb_rp,
-                            sfb_word_base + Int64(transfer << Int32(2)),
-                        ),
-                    )
+            _w4a8_stage_repacked_sfb_full(
+                down_sfb_rp,
+                sfb_base,
+                sfb_word_base,
+                copy_tid,
+                copy_threads,
+                self.csf_down_reader if self.csf_inline_scales else None,
+            )
 
     @cute.jit
     def _run_w4a8_materialized_fc2(
@@ -2249,8 +2312,17 @@ class MoEDynamicKernelBackend:
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(1)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                cute.arch.sync_threads()
+                _w4a8_fc2_barrier(Int32(self.threads_per_cta))
 
+                if cutlass.const_expr(self.csf_inline_scales):
+                    self.csf_down_reader.expand_slots(
+                        down_sfb_rp.iterator,
+                        sfb_base,
+                        tid,
+                        copy_threads,
+                        2,
+                    )
+                    _w4a8_fc2_barrier(Int32(self.threads_per_cta))
                 asc = cute.make_rmem_tensor((m_blocks,), Uint32)
                 for blk in cutlass.range_constexpr(m_blocks):
                     sf_row = (
@@ -2330,7 +2402,7 @@ class MoEDynamicKernelBackend:
                                 facc[blk, nt, 2] = d2
                                 facc[blk, nt, 3] = d3
 
-                cute.arch.sync_threads()
+                _w4a8_fc2_barrier(Int32(self.threads_per_cta))
                 intermediate_slice += Int32(1)
 
             scatter_n = Int32(scatter_output.shape[1])
@@ -2402,8 +2474,11 @@ class MoEDynamicKernelBackend:
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(1)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                cute.arch.sync_threads()
-                cute.arch.sync_threads()
+                _w4a8_fc2_barrier(Int32(self.threads_per_cta))
+                if cutlass.const_expr(self.csf_inline_scales):
+                    # Match the compute warps' scale reconstruction barrier.
+                    _w4a8_fc2_barrier(Int32(self.threads_per_cta))
+                _w4a8_fc2_barrier(Int32(self.threads_per_cta))
                 intermediate_slice += Int32(1)
 
     def _publish_ready_tasks(
@@ -2641,6 +2716,29 @@ class MoEDynamicKernelBackend:
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         self._setup_attributes()
+
+        if cutlass.const_expr(self.nvfp4_csf_inline):
+            self.csf_w13_reader = Nvfp4CsfStageReader(
+                b_w13.shape[0], b_w13.shape[1] // 16, b_w13.shape[2]
+            )
+            self.csf_down_reader = Nvfp4CsfStageReader(
+                b_down.shape[0], b_down.shape[1] // 16, b_down.shape[2]
+            )
+
+        if cutlass.const_expr(self.csf_inline_scales and self.is_w4a8):
+            h, n, e = b_w13.shape[1], b_w13.shape[0] // 2, b_w13.shape[2]
+            destination = 3 if self.w4a8_n64_repacked else 2
+            self.csf_w13_reader = CsfInlineReader(
+                (2 * n, h // 32, 1, 9, n, h // 32, e, 8, 1, destination, 2)
+            )
+            self.csf_down_reader = CsfInlineReader(
+                (h, n // 32, 1, 9, h, n // 32, e, 8, 1, destination, 1)
+            )
+            if cutlass.const_expr(self.w4a8_n64_repacked):
+                self.materialized_phase1_kernel.csf_inline = True
+                self.materialized_phase1_kernel.csf_reader = self.csf_w13_reader
+                self.materialized_phase2_kernel.csf_inline = True
+                self.materialized_phase2_kernel.csf_reader = self.csf_down_reader
 
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             packed_a.shape, self.sf_vec_size
@@ -2928,6 +3026,8 @@ class MoEDynamicKernelBackend:
             down_sfb_rp,
             trellis_lut,
             trellis_rotations,
+            sfb_w13_ptr,
+            sfb_down_ptr,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -3108,6 +3208,8 @@ class MoEDynamicKernelBackend:
         down_sfb_rp: cute.Tensor,
         trellis_lut: cute.Tensor,
         trellis_rotations: cute.Tensor,
+        compressed_w13: cute.Pointer,
+        compressed_down: cute.Pointer,
     ):
         """Kernel entry point."""
         from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -3125,12 +3227,14 @@ class MoEDynamicKernelBackend:
             cpasync.prefetch_descriptor(tma_a)
             cpasync.prefetch_descriptor(tma_sfa)
             cpasync.prefetch_descriptor(tma_b_w13)
-            cpasync.prefetch_descriptor(tma_sfb_w13)
+            if cutlass.const_expr(not self.nvfp4_csf_inline):
+                cpasync.prefetch_descriptor(tma_sfb_w13)
             if cutlass.const_expr(self.separate_w13_halves):
                 cpasync.prefetch_descriptor(tma_b_w13_gate)
                 cpasync.prefetch_descriptor(tma_sfb_w13_gate)
             cpasync.prefetch_descriptor(tma_b_down)
-            cpasync.prefetch_descriptor(tma_sfb_down)
+            if cutlass.const_expr(not self.nvfp4_csf_inline):
+                cpasync.prefetch_descriptor(tma_sfb_down)
 
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cluster_coord = cta_layout_mnk.get_flat_coord(cta_rank)
@@ -3147,7 +3251,11 @@ class MoEDynamicKernelBackend:
             )
         else:
             b_stage_tma_bytes = cute.size_in_bytes(self.b_dtype, b_smem_one)
-        sfb_transfer_bytes = cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+        sfb_transfer_bytes = (
+            0
+            if self.nvfp4_csf_inline
+            else cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+        )
         tma_copy_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_one)
             + b_stage_tma_bytes
@@ -3237,14 +3345,24 @@ class MoEDynamicKernelBackend:
 
         storage = smem.allocate(Storage)
 
-        prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        prod_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, 65 if self.nvfp4_csf_inline else 1
+        )
+        ml_prod_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            129
+            if self.nvfp4_csf_inline
+            and self.swap_ab
+            and ((mB_w13.shape[0] // 2) % self.tile_shape_mnk[1]) != 0
+            else (65 if self.nvfp4_csf_inline else 1),
+        )
         cons_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.num_mma_warps
         )
         cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
         ml_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stage,
-            producer_group=prod_group,
+            producer_group=ml_prod_group,
             consumer_group=cons_group,
             tx_count=ml_tx_count,
             barrier_storage=storage.pipeline_array.data_ptr(),
@@ -5554,6 +5672,24 @@ class MoEDynamicKernelBackend:
                         for _kt in range(fc1_k_tile_cnt):
                             _pk = ml_pipeline.consumer_try_wait(cons_state)
                             ml_pipeline.consumer_wait(cons_state, _pk)
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_w13_reader.expand_shared(
+                                    compressed_w13,
+                                    storage.sSFB.data_ptr(),
+                                    cons_state.index,
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
+                            if cutlass.const_expr(
+                                self.nvfp4_csf_inline and gate_lo_sub > 0
+                            ):
+                                self.csf_w13_reader.expand_shared(
+                                    compressed_w13,
+                                    storage.sSFB_up.data_ptr(),
+                                    cons_state.index,
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
                             _i = cons_state.index
                             for _kb in cutlass.range_constexpr(num_k_blocks):
                                 cute.copy(
@@ -5636,6 +5772,14 @@ class MoEDynamicKernelBackend:
                         for _kt in range(fc1_k_tile_cnt):
                             _pk = up_pipeline.consumer_try_wait(up_cons_state)
                             up_pipeline.consumer_wait(up_cons_state, _pk)
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_w13_reader.expand_shared(
+                                    compressed_w13,
+                                    storage.sSFB_up.data_ptr(),
+                                    up_cons_state.index,
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
                             _i = up_cons_state.index
                             for _kb in cutlass.range_constexpr(num_k_blocks):
                                 cute.copy(
@@ -5971,6 +6115,15 @@ class MoEDynamicKernelBackend:
                                 else:
                                     asc_buf = sfa_base_addr + (par << Int32(9))
 
+                                if cutlass.const_expr(self.csf_inline_scales):
+                                    self.csf_w13_reader.expand_slots(
+                                        w13_sfb_rp.iterator,
+                                        sfb_buf,
+                                        Int32(tidx),
+                                        self.num_mma_warps * self.num_threads_per_warp,
+                                        2 if self.w4a8_fused else 1,
+                                    )
+                                    self.epilog_sync_barrier.arrive_and_wait()
                                 n_in_arr = cute.make_rmem_tensor((fc1_n_tiles,), Int32)
                                 sfb_words = cute.make_rmem_tensor(
                                     (fc1_n_tiles,), Uint32
@@ -6949,8 +7102,24 @@ class MoEDynamicKernelBackend:
                         if cutlass.const_expr(self.w4a4_fc1_fused):
                             up_peek = up_pipeline.consumer_try_wait(up_cons_state)
                         ml_pipeline.consumer_wait(cons_state, peek)
+                        if cutlass.const_expr(self.nvfp4_csf_inline):
+                            self.csf_w13_reader.expand_shared(
+                                compressed_w13,
+                                storage.sSFB.data_ptr(),
+                                cons_state.index,
+                                self.num_mma_warps * self.num_threads_per_warp,
+                                self.epilog_sync_barrier,
+                            )
                         if cutlass.const_expr(self.w4a4_fc1_fused):
                             up_pipeline.consumer_wait(up_cons_state, up_peek)
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_w13_reader.expand_shared(
+                                    compressed_w13,
+                                    storage.sSFB_up.data_ptr(),
+                                    up_cons_state.index,
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
                         if cutlass.const_expr(self.is_w6a8):
                             # Expand the TMA-staged 3:4-packed FP6 B tile in
                             # place into the swizzled byte-container sB stage
@@ -7022,7 +7191,7 @@ class MoEDynamicKernelBackend:
                             0,
                             fc1_k_tile_cnt - 1,
                             1,
-                            unroll=4,
+                            unroll=1 if self.nvfp4_csf_inline else 4,
                         ):
                             for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                                 k_next = (
@@ -7057,10 +7226,28 @@ class MoEDynamicKernelBackend:
                                     if cutlass.const_expr(self.w4a4_fc1_fused):
                                         fz_csSFB_up_p = cute.filter_zeros(csSFB_up_p)
                                     ml_pipeline.consumer_wait(cons_state, peek)
+                                    if cutlass.const_expr(self.nvfp4_csf_inline):
+                                        self.csf_w13_reader.expand_shared(
+                                            compressed_w13,
+                                            storage.sSFB.data_ptr(),
+                                            cons_state.index,
+                                            self.num_mma_warps
+                                            * self.num_threads_per_warp,
+                                            self.epilog_sync_barrier,
+                                        )
                                     if cutlass.const_expr(self.w4a4_fc1_fused):
                                         up_pipeline.consumer_wait(
                                             up_cons_state, up_peek
                                         )
+                                        if cutlass.const_expr(self.nvfp4_csf_inline):
+                                            self.csf_w13_reader.expand_shared(
+                                                compressed_w13,
+                                                storage.sSFB_up.data_ptr(),
+                                                up_cons_state.index,
+                                                self.num_mma_warps
+                                                * self.num_threads_per_warp,
+                                                self.epilog_sync_barrier,
+                                            )
                                     if cutlass.const_expr(self.is_w6a8):
                                         # The stage just became full (packed
                                         # bytes only); expand before this
@@ -7883,7 +8070,7 @@ class MoEDynamicKernelBackend:
                         0,
                         phase1_output_tile_cnt,
                         self.w4a8_fc2_compute_width,
-                        unroll=4,
+                        unroll=1 if self.nvfp4_csf_inline else 4,
                     ):
                         if cutlass.const_expr(not self.is_w4a8):
                             phase2_peek = phase2_pipeline.consumer_try_wait(
@@ -7892,6 +8079,14 @@ class MoEDynamicKernelBackend:
                             phase2_pipeline.consumer_wait(
                                 phase2_cons_state, phase2_peek
                             )
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_down_reader.expand_shared(
+                                    compressed_down,
+                                    storage.sSFB.data_ptr(),
+                                    phase2_cons_state.index,
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
                             if cutlass.const_expr(self.is_w6a8):
                                 # Expand the packed FP6 B_down stage in place
                                 # before this tile's ldmatrix reads.
@@ -7984,6 +8179,15 @@ class MoEDynamicKernelBackend:
                             else:
                                 sfb_buf = w4a8_sfbb + (par << Int32(9))
                                 res_buf = w4a8_res2 + (par << Int32(10))
+                            if cutlass.const_expr(self.csf_inline_scales):
+                                self.csf_down_reader.expand_slots(
+                                    down_sfb_rp.iterator,
+                                    sfb_buf,
+                                    Int32(tidx),
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    2 if self.w4a8_fc2_pair else 1,
+                                )
+                                self.epilog_sync_barrier.arrive_and_wait()
                             n_in_arr2 = cute.make_rmem_tensor((fc2_n_tiles,), Int32)
                             sfb_words2 = cute.make_rmem_tensor(
                                 (self.w4a8_fc2_compute_width, fc2_n_tiles),
@@ -9033,6 +9237,9 @@ class MoEDynamicKernelBackend:
                                             rp_half,
                                             Int32(lane_id),
                                             32,
+                                            self.csf_w13_reader
+                                            if self.csf_inline_scales
+                                            else None,
                                         )
                                         if cutlass.const_expr(self.w4a8_fused):
                                             _w4a8_stage_repacked_sfb_half(
@@ -9042,6 +9249,9 @@ class MoEDynamicKernelBackend:
                                                 rp_halfu,
                                                 Int32(lane_id),
                                                 32,
+                                                self.csf_w13_reader
+                                                if self.csf_inline_scales
+                                                else None,
                                             )
                                     elif cutlass.const_expr(not self.w4a8_trellis):
                                         _w4a8_stage_bytes4(
@@ -9505,6 +9715,9 @@ class MoEDynamicKernelBackend:
                                         Int64(rp_tile2) * Int64(256),
                                         Int32(lane_id),
                                         32,
+                                        self.csf_down_reader
+                                        if self.csf_inline_scales
+                                        else None,
                                     )
                                 elif cutlass.const_expr(not self.w4a8_trellis):
                                     _w4a8_stage_bytes4(
@@ -9627,11 +9840,26 @@ class MoEDynamicKernelBackend:
                     prod_state.reset_count()
                     if cutlass.const_expr(self.w4a4_fc1_fused):
                         up_prod_state.reset_count()
+                    if cutlass.const_expr(self.nvfp4_csf_inline):
+                        csf_gate_bounds = self.csf_w13_reader.prefetch_bounds(
+                            compressed_w13,
+                            num_experts,
+                            task_expert_idx,
+                            gate_slice_idx,
+                            columns=True,
+                        )
+                        csf_up_bounds = self.csf_w13_reader.prefetch_bounds(
+                            compressed_w13,
+                            num_experts,
+                            task_expert_idx,
+                            intermediate_slice,
+                            columns=True,
+                        )
                     for k_tile in range(
                         0,
                         fc1_k_tile_cnt if not self.is_w4a8 else 0,
                         1,
-                        unroll=4,
+                        unroll=1 if self.nvfp4_csf_inline else 4,
                     ):
                         ml_pipeline.producer_acquire(prod_state)
                         # The MMA warps release a stage while their ldmatrix and
@@ -9659,12 +9887,28 @@ class MoEDynamicKernelBackend:
                             gate_tBsB[(None, prod_state.index)],
                             tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
                         )
-                        cute.copy(
-                            gate_tma_sfb,
-                            tBgSFB_w13_gate_nk[(None, k_tile)],
-                            gate_tBsSFB[(None, prod_state.index)],
-                            tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
-                        )
+                        if cutlass.const_expr(self.nvfp4_csf_inline):
+                            self.csf_w13_reader.stage(
+                                compressed_w13,
+                                num_experts,
+                                task_expert_idx,
+                                gate_slice_idx,
+                                k_tile,
+                                storage.sSFB.data_ptr(),
+                                prod_state.index,
+                                ml_pipeline.producer_get_barrier(prod_state),
+                                csf_gate_bounds,
+                                k_tile,
+                            )
+                        else:
+                            cute.copy(
+                                gate_tma_sfb,
+                                tBgSFB_w13_gate_nk[(None, k_tile)],
+                                gate_tBsSFB[(None, prod_state.index)],
+                                tma_bar_ptr=ml_pipeline.producer_get_barrier(
+                                    prod_state
+                                ),
+                            )
                         if cutlass.const_expr(self.swap_ab and gate_lo_sub > 0):
                             # atom-hi (the next 128-row atom) staged in sB_up/
                             # sSFB_up under ml_pipeline. Safe to share with the up
@@ -9683,14 +9927,26 @@ class MoEDynamicKernelBackend:
                                     prod_state
                                 ),
                             )
-                            cute.copy(
-                                tma_sfb_w13,
-                                tBgSFB_w13_gate_hi_nk[(None, k_tile)],
-                                tBsSFB_w13_up[(None, prod_state.index)],
-                                tma_bar_ptr=ml_pipeline.producer_get_barrier(
-                                    prod_state
-                                ),
-                            )
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_w13_reader.stage(
+                                    compressed_w13,
+                                    num_experts,
+                                    task_expert_idx,
+                                    gate_hi_idx,
+                                    k_tile,
+                                    storage.sSFB_up.data_ptr(),
+                                    prod_state.index,
+                                    ml_pipeline.producer_get_barrier(prod_state),
+                                )
+                            else:
+                                cute.copy(
+                                    tma_sfb_w13,
+                                    tBgSFB_w13_gate_hi_nk[(None, k_tile)],
+                                    tBsSFB_w13_up[(None, prod_state.index)],
+                                    tma_bar_ptr=ml_pipeline.producer_get_barrier(
+                                        prod_state
+                                    ),
+                                )
                         ml_pipeline.producer_commit(prod_state)
                         prod_state.advance()
                         if cutlass.const_expr(self.w4a4_fc1_fused):
@@ -9705,14 +9961,28 @@ class MoEDynamicKernelBackend:
                                     up_prod_state
                                 ),
                             )
-                            cute.copy(
-                                tma_sfb_w13,
-                                tBgSFB_w13_up_nk[(None, k_tile)],
-                                tBsSFB_w13_up[(None, up_prod_state.index)],
-                                tma_bar_ptr=up_pipeline.producer_get_barrier(
-                                    up_prod_state
-                                ),
-                            )
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_w13_reader.stage(
+                                    compressed_w13,
+                                    num_experts,
+                                    task_expert_idx,
+                                    intermediate_slice,
+                                    k_tile,
+                                    storage.sSFB_up.data_ptr(),
+                                    up_prod_state.index,
+                                    up_pipeline.producer_get_barrier(up_prod_state),
+                                    csf_up_bounds,
+                                    k_tile,
+                                )
+                            else:
+                                cute.copy(
+                                    tma_sfb_w13,
+                                    tBgSFB_w13_up_nk[(None, k_tile)],
+                                    tBsSFB_w13_up[(None, up_prod_state.index)],
+                                    tma_bar_ptr=up_pipeline.producer_get_barrier(
+                                        up_prod_state
+                                    ),
+                                )
                             up_pipeline.producer_commit(up_prod_state)
                             up_prod_state.advance()
 
@@ -9735,7 +10005,7 @@ class MoEDynamicKernelBackend:
                             0,
                             fc1_k_tile_cnt if not self.is_w4a8 else 0,
                             1,
-                            unroll=4,
+                            unroll=1 if self.nvfp4_csf_inline else 4,
                         ):
                             up_pipeline.producer_acquire(up_prod_state)
                             # Generic-proxy stage reads before the TMA refill.
@@ -9764,14 +10034,28 @@ class MoEDynamicKernelBackend:
                                     up_prod_state
                                 ),
                             )
-                            cute.copy(
-                                tma_sfb_w13,
-                                tBgSFB_w13_up_nk[(None, k_tile)],
-                                tBsSFB_w13_up[(None, up_prod_state.index)],
-                                tma_bar_ptr=up_pipeline.producer_get_barrier(
-                                    up_prod_state
-                                ),
-                            )
+                            if cutlass.const_expr(self.nvfp4_csf_inline):
+                                self.csf_w13_reader.stage(
+                                    compressed_w13,
+                                    num_experts,
+                                    task_expert_idx,
+                                    intermediate_slice,
+                                    k_tile,
+                                    storage.sSFB_up.data_ptr(),
+                                    up_prod_state.index,
+                                    up_pipeline.producer_get_barrier(up_prod_state),
+                                    csf_up_bounds,
+                                    k_tile,
+                                )
+                            else:
+                                cute.copy(
+                                    tma_sfb_w13,
+                                    tBgSFB_w13_up_nk[(None, k_tile)],
+                                    tBsSFB_w13_up[(None, up_prod_state.index)],
+                                    tma_bar_ptr=up_pipeline.producer_get_barrier(
+                                        up_prod_state
+                                    ),
+                                )
                             up_pipeline.producer_commit(up_prod_state)
                             up_prod_state.advance()
 
@@ -9783,11 +10067,19 @@ class MoEDynamicKernelBackend:
                     # Load ALL FC2 tiles continuously once stage1 no longer needs
                     # the gate staging buffers.
                     phase2_prod_state.reset_count()
+                    if cutlass.const_expr(self.nvfp4_csf_inline):
+                        csf_down_bounds = self.csf_down_reader.prefetch_bounds(
+                            compressed_down,
+                            num_experts,
+                            task_expert_idx,
+                            intermediate_slice,
+                            columns=False,
+                        )
                     for output_tile_idx in range(
                         0,
                         phase1_output_tile_cnt if not self.is_w4a8 else 0,
                         1,
-                        unroll=4,
+                        unroll=1 if self.nvfp4_csf_inline else 4,
                     ):
                         phase2_pipeline.producer_acquire(phase2_prod_state)
                         # Generic-proxy stage reads before the TMA refill.
@@ -9807,21 +10099,35 @@ class MoEDynamicKernelBackend:
                                 phase2_prod_state
                             ),
                         )
-                        cute.copy(
-                            tma_sfb_down,
-                            tBgSFB_down[
-                                (
-                                    None,
-                                    output_tile_idx,
-                                    intermediate_slice,
-                                    task_expert_idx,
-                                )
-                            ],
-                            tBsSFB_down[(None, phase2_prod_state.index)],
-                            tma_bar_ptr=phase2_pipeline.producer_get_barrier(
-                                phase2_prod_state
-                            ),
-                        )
+                        if cutlass.const_expr(self.nvfp4_csf_inline):
+                            self.csf_down_reader.stage(
+                                compressed_down,
+                                num_experts,
+                                task_expert_idx,
+                                output_tile_idx,
+                                intermediate_slice,
+                                storage.sSFB.data_ptr(),
+                                phase2_prod_state.index,
+                                phase2_pipeline.producer_get_barrier(phase2_prod_state),
+                                csf_down_bounds,
+                                output_tile_idx,
+                            )
+                        else:
+                            cute.copy(
+                                tma_sfb_down,
+                                tBgSFB_down[
+                                    (
+                                        None,
+                                        output_tile_idx,
+                                        intermediate_slice,
+                                        task_expert_idx,
+                                    )
+                                ],
+                                tBsSFB_down[(None, phase2_prod_state.index)],
+                                tma_bar_ptr=phase2_pipeline.producer_get_barrier(
+                                    phase2_prod_state
+                                ),
+                            )
                         phase2_pipeline.producer_commit(phase2_prod_state)
                         phase2_prod_state.advance()
 

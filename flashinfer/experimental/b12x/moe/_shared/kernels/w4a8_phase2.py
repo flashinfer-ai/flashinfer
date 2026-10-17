@@ -82,6 +82,7 @@ class W4A8MaterializedPhase2Kernel:
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         self.direct_routes = bool(direct_routes)
+        self.csf_inline = False
         if self.direct_routes:
             if source_tile_m != 1:
                 raise ValueError("direct materialized phase 2 requires source_tile_m=1")
@@ -244,8 +245,22 @@ class W4A8MaterializedPhase2Kernel:
         if cutlass.const_expr(self.n64_tail):
             if k128_slice == Int32(total_k32 // 4):
                 tile_cols = Int32(2)
+        if cutlass.const_expr(self.csf_inline):
+            if tid < Int32(32):
+                target = cute.make_ptr(
+                    Uint8, dst_base, cute.AddressSpace.smem, assumed_align=16
+                )
+                group = (
+                    output_tile * Int32(self.csf_reader.plane.storage.column_groups)
+                    + k128_slice
+                )
+                self.csf_reader.stage_compressed(
+                    scales.iterator, expert_idx, group, target, tid
+                )
         for i in cutlass.range_constexpr(
-            (copies + self.threads_per_cta - 1) // self.threads_per_cta
+            0
+            if self.csf_inline
+            else (copies + self.threads_per_cta - 1) // self.threads_per_cta
         ):
             idx = tid + Int32(i * self.threads_per_cta)
             if idx < Int32(copies):
@@ -549,6 +564,15 @@ class W4A8MaterializedPhase2Kernel:
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
+            if cutlass.const_expr(self.csf_inline):
+                self.csf_reader.expand_slots(
+                    down_sfb_rp.iterator,
+                    sfb_base,
+                    tid,
+                    self.threads_per_cta,
+                    self.tile_n // 128,
+                )
+                cute.arch.sync_threads()
             asc = cute.make_rmem_tensor((m_blocks,), Uint32)
             for blk in cutlass.range_constexpr(m_blocks):
                 if cutlass.const_expr(self.direct_routes):

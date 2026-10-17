@@ -77,6 +77,7 @@ class W4A8MaterializedPhase1Kernel:
         n64_tail: bool = False,
     ):
         self.fast_math = bool(fast_math)
+        self.csf_inline = False
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.n64_repacked = bool(n64_repacked)
@@ -312,6 +313,19 @@ class W4A8MaterializedPhase1Kernel:
         total_k32: cutlass.Constexpr,
         tid: Int32,
     ):
+        if cutlass.const_expr(self.csf_inline):
+            if tid < Int32(32):
+                group = (
+                    projection * Int32(self.csf_reader.plane.storage.groups)
+                    + output_tile * Int32(self.csf_reader.plane.storage.column_groups)
+                    + k128_slice
+                )
+                target = cute.make_ptr(
+                    cutlass.Uint8, dst_base, cute.AddressSpace.smem, assumed_align=16
+                )
+                self.csf_reader.stage_compressed(
+                    scales.iterator, expert_idx, group, target, tid
+                )
         logical_n = intermediate_tiles * Int32(128)
         if cutlass.const_expr(self.n64_tail):
             logical_n -= Int32(64)
@@ -325,7 +339,9 @@ class W4A8MaterializedPhase1Kernel:
         tile_base = output_tile * Int32(128 * total_k32 // 4)
         valid_transfers = n_rows // Int32(4)
         for i in cutlass.range_constexpr(
-            (transfers + self.threads_per_cta - 1) // self.threads_per_cta
+            0
+            if self.csf_inline
+            else (transfers + self.threads_per_cta - 1) // self.threads_per_cta
         ):
             transfer = tid + Int32(i * self.threads_per_cta)
             if transfer < Int32(transfers):
@@ -498,28 +514,29 @@ class W4A8MaterializedPhase1Kernel:
                 total_k32,
                 tid,
             )
-            self._stage_n64_sfb(
-                w13_sfb_rp,
-                gate_sfb_base,
-                expert_idx,
-                Int32(1),
-                output_tile,
-                k128_slice,
-                intermediate_tiles,
-                total_k32,
-                tid,
-            )
-            self._stage_n64_sfb(
-                w13_sfb_rp,
-                up_sfb_base,
-                expert_idx,
-                Int32(0),
-                output_tile,
-                k128_slice,
-                intermediate_tiles,
-                total_k32,
-                tid,
-            )
+            if not self.csf_inline or k_half == Int32(0):
+                self._stage_n64_sfb(
+                    w13_sfb_rp,
+                    gate_sfb_base,
+                    expert_idx,
+                    Int32(1),
+                    output_tile,
+                    k128_slice,
+                    intermediate_tiles,
+                    total_k32,
+                    tid,
+                )
+                self._stage_n64_sfb(
+                    w13_sfb_rp,
+                    up_sfb_base,
+                    expert_idx,
+                    Int32(0),
+                    output_tile,
+                    k128_slice,
+                    intermediate_tiles,
+                    total_k32,
+                    tid,
+                )
         else:
             self._stage_b_half_k64(
                 w13_rp,
@@ -664,6 +681,11 @@ class W4A8MaterializedPhase1Kernel:
             for nt in cutlass.range_constexpr(n_fragments):
                 gate_acc[blk][nt].fill(0.0)
                 up_acc[blk][nt].fill(0.0)
+        if cutlass.const_expr(self.csf_inline):
+            gate_scale_words = cute.make_rmem_tensor((n_fragments,), Uint32)
+            up_scale_words = cute.make_rmem_tensor((n_fragments,), Uint32)
+            gate_scale_words.fill(Uint32(0))
+            up_scale_words.fill(Uint32(0))
         k64_slice = Int32(0)
         while k64_slice < input_k64_tiles:
             stage = k64_slice & Int32(self.stages - 1)
@@ -700,6 +722,20 @@ class W4A8MaterializedPhase1Kernel:
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 
+            if cutlass.const_expr(self.csf_inline):
+                if k64_slice & Int32(1) == Int32(0):
+                    self.csf_reader.expand_slots(
+                        w13_sfb_rp.iterator, gate_sfb_base, tid, self.threads_per_cta, 2
+                    )
+                    cute.arch.sync_threads()
+                    # One native K128 word serves both K64 pipeline epochs.
+                    for nt in cutlass.range_constexpr(n_fragments):
+                        n8 = warp_idx * Int32(n_fragments) + Int32(nt)
+                        scale_offset = (n8 * Int32(8) + q) << Int32(2)
+                        gate_scale_words[nt] = ld_shared_u32(
+                            gate_sfb_base + scale_offset
+                        )
+                        up_scale_words[nt] = ld_shared_u32(up_sfb_base + scale_offset)
             scale_shift = Uint32(k64_slice & Int32(1)) * Uint32(16)
             asc = cute.make_rmem_tensor((self.tile_m // 16,), Uint32)
             for blk in cutlass.range_constexpr(self.tile_m // 16):
@@ -796,7 +832,10 @@ class W4A8MaterializedPhase1Kernel:
                     ub1 = up_b1[nt]
                     gate_sfb = Uint32(0x7F7F7F7F)
                     up_sfb = Uint32(0x7F7F7F7F)
-                    if cutlass.const_expr(not self.w4a8_trellis):
+                    if cutlass.const_expr(self.csf_inline):
+                        gate_sfb = gate_scale_words[nt] >> scale_shift
+                        up_sfb = up_scale_words[nt] >> scale_shift
+                    elif cutlass.const_expr(not self.w4a8_trellis):
                         gate_sfb = (
                             ld_shared_u32(
                                 gate_sfb_base + ((n8 * Int32(8) + q) << Int32(2))

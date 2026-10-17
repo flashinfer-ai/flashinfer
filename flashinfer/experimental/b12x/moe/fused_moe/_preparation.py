@@ -256,6 +256,7 @@ def _query(
         numerical_recipe=invocation.get("numerical_recipe"),
         controls=controls,
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
+        csf_inline_scales=plan.csf_inline_scales,
     )
 
 
@@ -267,6 +268,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
     )
     return {
         "quant_modes": tuple(plan.quant_modes),
+        "csf_inline_scales": plan.csf_inline_scales,
         "source_format": plan.source_format,
         "activation": plan.activation,
         "params_dtype": plan.io_dtype,
@@ -629,6 +631,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             scale_format=scale_format,
             w13_layout=w13_layout,
             force_tile_config=caps.decode_config.w4a16_tile_config,
+            csf_inline_scales=caps.decode_config.csf_inline_scales,
             pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
             skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
             small_m_occupancy=caps.w4a16_small_m_occupancy,
@@ -866,6 +869,9 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         "share_input_across_experts": share_input,
         "planned_tile_m": tile_m,
         "mma_warps": plan.decode_config.dynamic_mma_warps,
+        "csf_inline_scales": bool(
+            caps.weight_plan.csf_inline_scales and plan.decode_config.csf_inline_scales
+        ),
     }
 
 
@@ -1048,6 +1054,7 @@ def _program_carriers(
                 w4a8_repacked=dynamic["w4a8_repacked"],
                 w4a8_n64_repacked=dynamic["w4a8_n64_repacked"],
                 nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+                csf_inline_scales=dynamic["csf_inline_scales"],
                 direct_routing=dynamic["direct_routing"],
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],
@@ -1203,7 +1210,10 @@ class _FusedMoeState:
     ) -> bool:
         if not 0 < int(num_tokens) <= self.scratch.caps.max_tokens:
             raise ValueError("token count exceeds prepared MoE capacity")
-        return self.experts._impl.nvfp4_csf is not None
+        decoder = self.experts._impl.nvfp4_csf
+        return decoder is not None and not (
+            self.config.csf_inline_scales and self.experts._impl.plan.csf_inline_scales
+        )
 
     def bind(self, **kwargs):
         experts = kwargs.pop("experts", self.experts)

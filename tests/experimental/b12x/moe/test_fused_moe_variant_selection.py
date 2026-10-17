@@ -132,44 +132,41 @@ def test_shared_40_workload_reuses_experts_across_distinct_topk_rows(
 
 
 @pytest.mark.parametrize(
-    "tokens,topk,experts,expected_unique",
-    (
-        (2, 6, 256, [12, 10, 7, 6, 6]),
-        (6, 6, 256, [36, 29, 22, 14, 7]),
-        (8, 6, 256, [48, 38, 29, 19, 10]),
-        (6, 6, 6, [6, 6, 6, 6, 6]),
-        (6, 6, 12, [12, 12, 12, 12, 7]),
-    ),
+    "tokens,topk,experts",
+    ((1, 8, 288), (8, 6, 384), (128, 6, 384), (4096, 8, 288), (6, 6, 6)),
 )
-def test_verifier_tuning_corpus_spans_sharing_without_duplicate_token_routes(
-    tokens,
-    topk,
-    experts,
-    expected_unique,
-):
-    """A fixed mean must not collapse every trial to the same expert count."""
+def test_tuning_routes_cover_distinct_valid_scenarios(tokens, topk, experts):
     from b12x.moe.fused_moe.workloads import make_tuning_routes
 
     ids = make_tuning_routes(tokens, topk, experts, device="cpu")
-    assert ids.shape == (5, tokens, topk)
+    assert ids.shape == (6, tokens, topk)
     assert ids.dtype == torch.int32
-    assert [pattern.unique().numel() for pattern in ids] == expected_unique
-    assert all(row.unique().numel() == topk for pattern in ids for row in pattern)
     assert ids.min() >= 0 and ids.max() < experts
+    assert (ids.sort(dim=-1).values.diff(dim=-1) > 0).all()
     torch.testing.assert_close(
-        ids,
-        make_tuning_routes(tokens, topk, experts, device="cpu"),
+        ids, make_tuning_routes(tokens, topk, experts, device="cpu")
+    )
+    assert not torch.equal(
+        ids, make_tuning_routes(tokens, topk, experts, device="cpu", seed=999)
     )
 
 
-@pytest.mark.parametrize("tokens", (1, 9, 128))
-def test_nonverifier_tuning_routes_retain_cyclic_coverage(tokens):
-    from b12x.moe.fused_moe.workloads import make_routing_ids, make_tuning_routes
+def test_statistical_routes_separate_popularity_and_token_correlation():
+    from b12x.moe.fused_moe.workloads import make_routing_ids
 
-    torch.testing.assert_close(
-        make_tuning_routes(tokens, 6, 256, device="cpu"),
-        make_routing_ids(tokens, 6, 256, workload="disjoint").unsqueeze(0),
-    )
+    ids = {
+        name: make_routing_ids(4096, 8, 288, workload=name)
+        for name in ("diffuse", "skewed", "correlated")
+    }
+    counts = {
+        name: torch.bincount(routes.flatten().long(), minlength=288).float()
+        for name, routes in ids.items()
+    }
+    assert counts["skewed"].std() > 1.8 * counts["diffuse"].std()
+    groups = ids["correlated"].reshape(-1, 4, 8)
+    within = (groups[:, 0, :, None] == groups[:, 1, None, :]).any(-1).float().mean()
+    across = (groups[:-1, 0, :, None] == groups[1:, 0, None, :]).any(-1).float().mean()
+    assert within > 2 * across
 
 
 def test_variant_for_preserves_exact_counts_and_reuses_prefill_capacity():

@@ -6,8 +6,9 @@ swizzle) domain.  This kernel consumes that domain as M64xN128 tasks,
 computes gate and up together in one K sweep with the SM120 native NVFP4
 block-scaled QMMA (``kind::mxf4nvf4`` ``scale_vec::4X`` m16n8k64), applies
 SiLU(gate)*up with the monolithic kernel's alpha semantics, and requantizes
-the intermediate to NVFP4 (per-16 E4M3 block scale, ``quantize_block_fp4``
-semantics) into the caller-owned intermediate workspace.
+the intermediate to NVFP4 (per-16 E4M3 block scale) into the caller-owned
+intermediate workspace. ``fast_math`` selects reciprocal-based FP4 conversion;
+otherwise quantization uses FP4 rounding thresholds, matching the dynamic kernel.
 
 The published weight contract is the original (non-repacked) swizzled
 block-scale FP4 tensors: ``w13_b`` is the packed E2M1 payload
@@ -46,6 +47,7 @@ from b12x._lib.intrinsics import (
     nvfp4_mma_m16n8k64_f32_e2m1,
     pack_f32x2_to_bfloat2,
     quantize_block_fp4,
+    quantize_block_fp4_fast,
     shared_ptr_to_u32,
     st_global_u64,
     st_global_u32,
@@ -599,7 +601,14 @@ class Nvfp4MaterializedPhase1Kernel:
                     abs_value = fabs_f32(value)
                     if abs_value > block_max:
                         block_max = abs_value
-                payload, scale_byte = quantize_block_fp4(values, block_max, quant_gs)
+                if cutlass.const_expr(self.fast_math):
+                    payload, scale_byte = quantize_block_fp4_fast(
+                        values, block_max, quant_gs
+                    )
+                else:
+                    payload, scale_byte = quantize_block_fp4(
+                        values, block_max, quant_gs
+                    )
                 dst_word = Int64(phys_row) * Int64(words_per_row) + Int64(
                     output_tile * Int32(16) + Int32(block * 2)
                 )

@@ -1266,6 +1266,7 @@ class W4A16GemmKernel:
         pipeline_stages: int | None = None,
         skip_empty_m_blocks: bool | None = None,
         small_m_occupancy: int | None = None,
+        csf_inline_scales: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1497,6 +1498,15 @@ class W4A16GemmKernel:
         )
         self.b_bundle_rows = 2
         self.scale_format = scale_format
+        self.csf_block_inline = bool(csf_inline_scales)
+        if self.csf_block_inline:
+            from b12x._lib.quant.csf_inline import CsfInlineReader
+
+            bits = 1 if scale_format == "e8m0_k32" else 4
+            columns = (size_k + scale_group_size - 1) // scale_group_size
+            self.csf_block_reader = CsfInlineReader(
+                (size_n, columns, bits, 9, size_n, columns, num_experts, 8, 1, 1, 1)
+            )
         self.native_nvfp4_scales = (
             weight_layout == "modelopt" and scale_format == "e4m3_k16"
         )
@@ -1708,7 +1718,32 @@ class W4A16GemmKernel:
             + _reduction_shared_bytes(self.tile_n, self.tile_k, self.uses_m_block_8)
             // 16,
         )
+        if self.csf_block_inline:
+            self.csf_stage_groups = ((self.tile_n + 127) // 128) * (
+                (self.s_tb_groups + 3) // 4
+            )
+            self.csf_inplace_stage = (
+                self.tile_n == 128
+                and self.size_n % 128 == 0
+                and self.s_tb_groups % 4 == 0
+            )
+            if self.csf_inplace_stage:
+                self.sh_csf_block_off = self.sh_s_off * 16
+            else:
+                self.sh_csf_block_off = self.shared_int4 * 16
+                self.shared_int4 += self.stages * self.csf_stage_groups * 32
+            self.sh_csf_index_off = self.shared_int4 * 16
+            self.csf_index_count = (
+                (self.tile_n + 127) // 128
+            ) * self.csf_block_reader.plane.storage.column_groups
+            self.shared_int4 += (self.csf_index_count * 8 + 15) // 16
         self.shared_words = self.shared_int4 * 4
+        if self.csf_block_inline:
+            self.blocks_per_sm = min(
+                self.blocks_per_sm,
+                _device_shared_mem_per_sm()
+                // _resident_cta_shared_bytes(self.shared_words * 4),
+            )
         if self.shared_words * 4 > int(max_shared_mem):
             raise ValueError(
                 "W4A16 shared-memory footprint exceeds device opt-in limit: "
@@ -1742,6 +1777,8 @@ class W4A16GemmKernel:
             self.trellis_pair_kind,
             self.trellis_rate_axis,
             self.scale_format,
+            self.csf_block_inline,
+            self.num_experts if self.csf_block_inline else None,
             self.native_nvfp4_scales,
             self.w13_layout,
             self.source_n_rotation,
@@ -5486,7 +5523,18 @@ class W4A16GemmKernel:
                     tile_idx,
                     Int32(i * self.cta_threads) + tid,
                 )
-        if cutlass.const_expr(self.native_nvfp4_scales):
+
+        if cutlass.const_expr(self.csf_block_inline):
+            self._csf_block_stage(
+                scales_i32_flat,
+                smem_base,
+                tid,
+                pipe,
+                tile_idx,
+                expert_idx,
+                output_n_tile,
+            )
+        elif cutlass.const_expr(self.native_nvfp4_scales):
             self._stage_modelopt_scales(
                 scales_i32_flat,
                 smem_base,
@@ -5529,6 +5577,110 @@ class W4A16GemmKernel:
                         get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
                     )
         cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def _csf_block_stage(
+        self, scales, smem_base, tid, pipe, tile_idx, expert, output_tile
+    ):
+        warp, lane = tid // Int32(32), tid % Int32(32)
+        columns = (self.s_tb_groups + 3) // 4
+        for chunk in cutlass.range_constexpr(
+            (self.csf_stage_groups + self.cta_threads // 32 - 1)
+            // (self.cta_threads // 32)
+        ):
+            local = warp + Int32(chunk * (self.cta_threads // 32))
+            if local < Int32(self.csf_stage_groups):
+                group = (
+                    (
+                        output_tile * Int32(self.tile_n) // Int32(128)
+                        + local // Int32(columns)
+                    )
+                    * Int32(self.csf_block_reader.plane.storage.column_groups)
+                    + tile_idx * Int32(self.s_tb_groups) // Int32(4)
+                    + local % Int32(columns)
+                )
+                target = cute.make_ptr(
+                    cutlass.Uint8,
+                    smem_base
+                    + Int32(self.sh_csf_block_off)
+                    + (pipe * Int32(self.csf_stage_groups) + local) * Int32(512),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                )
+                index = (
+                    local
+                    // Int32(columns)
+                    * Int32(self.csf_block_reader.plane.storage.column_groups)
+                    + tile_idx * Int32(self.s_tb_groups) // Int32(4)
+                    + local % Int32(columns)
+                )
+                index_addr = smem_base + Int32(self.sh_csf_index_off) + index * Int32(8)
+                bounds = (
+                    ld_shared_u32(index_addr),
+                    ld_shared_u32(index_addr + Int32(4)),
+                )
+                self.csf_block_reader.stage_compressed(
+                    scales.iterator, expert, group, target, lane, bounds
+                )
+
+    @cute.jit
+    def _csf_block_expand(self, scales, smem_base, tid, pipe, tile_idx, output_tile):
+        warp, lane = tid // Int32(32), tid % Int32(32)
+        columns = (self.s_tb_groups + 3) // 4
+        for chunk in cutlass.range_constexpr(
+            (self.csf_stage_groups + self.cta_threads // 32 - 1)
+            // (self.cta_threads // 32)
+        ):
+            local = warp + Int32(chunk * (self.cta_threads // 32))
+            if local < Int32(self.csf_stage_groups):
+                row_start = output_tile * Int32(self.tile_n)
+                row_group = row_start // Int32(128) + local // Int32(columns)
+                column_group = tile_idx * Int32(self.s_tb_groups) // Int32(
+                    4
+                ) + local % Int32(columns)
+                group = (
+                    row_group * Int32(self.csf_block_reader.plane.storage.column_groups)
+                    + column_group
+                )
+                target = cute.make_ptr(
+                    cutlass.Uint8,
+                    smem_base
+                    + Int32(self.sh_csf_block_off)
+                    + (pipe * Int32(self.csf_stage_groups) + local) * Int32(512),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                )
+                self.csf_block_reader.expand_compressed(
+                    scales.iterator, group, target, lane
+                )
+                if cutlass.const_expr(not self.csf_inplace_stage):
+                    valid_rows = Int32(self.size_n) - row_group * Int32(128)
+                    nr = cutlass.max(Int32(1), cutlass.min(Int32(128), valid_rows))
+                    for quarter in cutlass.range_constexpr(4):
+                        position = lane * Int32(16) + Int32(quarter * 4)
+                        row = row_group * Int32(128) + position % nr - row_start
+                        column = (
+                            column_group * Int32(4)
+                            + position // nr
+                            - tile_idx * Int32(self.s_tb_groups)
+                        )
+                        if (
+                            valid_rows > 0
+                            and row >= 0
+                            and row < Int32(self.tile_n)
+                            and column >= 0
+                            and column < Int32(self.s_tb_groups)
+                        ):
+                            value = ld_shared_u32(target.toint().to(Int32) + position)
+                            st_shared_u32(
+                                smem_base
+                                + Int32(self.sh_s_off * 16)
+                                + pipe * Int32(self.s_sh_stage * 16)
+                                + column * Int32(self.tile_n)
+                                + row,
+                                value,
+                            )
+        cute.arch.sync_threads()
 
     @cute.jit
     def _prefetch_pipeline_step(
@@ -5610,6 +5762,29 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.csf_block_inline):
+            source = cute.recast_ptr(scales_i32_flat.iterator, dtype=cutlass.Uint8)
+            for chunk in cutlass.range_constexpr(
+                (self.csf_index_count + self.cta_threads - 1) // self.cta_threads
+            ):
+                index = tid + Int32(chunk * self.cta_threads)
+                if index < Int32(self.csf_index_count):
+                    group = (
+                        output_n_tile
+                        * Int32(self.tile_n)
+                        // Int32(128)
+                        * Int32(self.csf_block_reader.plane.storage.column_groups)
+                        + index
+                    )
+                    first, end = Uint32(0), Uint32(0)
+                    if group < Int32(self.csf_block_reader.plane.storage.groups):
+                        first, end = self.csf_block_reader.plane.group_record_bounds(
+                            source, expert_idx, group
+                        )
+                    addr = smem_base + Int32(self.sh_csf_index_off) + index * Int32(8)
+                    st_shared_u32(addr, first)
+                    st_shared_u32(addr + Int32(4), end)
+            cute.arch.sync_threads()
         for pipe in cutlass.range_constexpr(self.stages - 1):
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
@@ -5639,6 +5814,16 @@ class W4A16GemmKernel:
                 cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(self.stages - 2)
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.csf_block_inline):
+            if k_tiles > Int32(0):
+                self._csf_block_expand(
+                    scales_i32_flat,
+                    smem_base,
+                    tid,
+                    Int32(0),
+                    reduce_k_tile,
+                    output_n_tile,
+                )
 
     @cute.jit
     def _prefetch_lookahead_tile(
@@ -5697,6 +5882,16 @@ class W4A16GemmKernel:
         if cutlass.const_expr(not self.weight_layout_block):
             cute.arch.cp_async_wait_group(self.stages - 2)
             cute.arch.sync_threads()
+        if cutlass.const_expr(self.csf_block_inline):
+            if tile_idx + Int32(1) < k_tiles:
+                self._csf_block_expand(
+                    scales_i32_flat,
+                    smem_base,
+                    tid,
+                    Int32((pipe + 1) % self.stages),
+                    reduce_k_tile + tile_idx + Int32(1),
+                    output_n_tile,
+                )
 
     @cute.jit
     def _reduction_offsets(self, tid: Int32):
@@ -6634,6 +6829,7 @@ class W4A16FusedMoeKernel:
         skip_empty_m_blocks: bool | None = None,
         trellis_decode_table: str = "auto",
         small_m_occupancy: int | None = None,
+        csf_inline_scales: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6892,6 +7088,7 @@ class W4A16FusedMoeKernel:
             pipeline_stages=pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
+            csf_inline_scales=csf_inline_scales,
         )
         if (
             _FP32_TOPK_WEIGHTS
@@ -6943,6 +7140,7 @@ class W4A16FusedMoeKernel:
             pipeline_stages=pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
+            csf_inline_scales=csf_inline_scales,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -10336,6 +10534,7 @@ def compile_w4a16_fused_moe(
     trellis_decode_table: str = "auto",
     _require_cached: bool = False,
     small_m_occupancy: int | None = None,
+    csf_inline_scales: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     if small_m_occupancy is None:
         small_m_occupancy = _w4a16_small_m_occupancy()
@@ -10748,6 +10947,7 @@ def compile_w4a16_fused_moe(
         skip_empty_m_blocks=skip_empty_m_blocks,
         trellis_decode_table=trellis_decode_table,
         small_m_occupancy=small_m_occupancy,
+        csf_inline_scales=csf_inline_scales,
     )
     cache_key = (
         "w4a16_fused_moe",

@@ -6,13 +6,24 @@ generation, top-k selection, compilation, and oracle/reference checks all
 happen outside the timed region. Use ``--include-routing`` to include the
 deterministic top-k + softmax routing step in the measured closure.
 
+``--scale-compression csf_32x2_v1`` exports native scales into indexed 32x2
+checkpoint blocks before preparation. ``csf`` uses the slab checkpoint encoding.
+Both prepare the same compact resident format. Expansion, when selected, is
+included in each timed call.
+For ``csf_32x2_v1``, ``csf_inline_scales=true`` in ``--moe-config`` selects
+scale reconstruction inside the compute kernel. The autotuner compares it with
+whole-expert expansion using the same resident payload and complete-call timing.
+``--time-graph-replay`` times the captured graph itself. Combine it with
+``--no-flush-l2`` to retain cache state across repeated calls to one layer.
+
 Step-5 TP4/C1 with MTP3 verifies four rows. Its checkpoint profile defaults to
 layer 3, NVFP4 W4A4, lossless CSF scales, and the checkpoint's clamp-after-SiLU
 limit. For the expert-sharing sweep, run with ``--model-profile
 step5-preview-nvfp4 --batch-sizes 4 --graph-only --routing-workload shared_N``
 for N in 0, 20, 40, 60, 80. CSF expansion is inside each timed call;
 ``--scale-compression none`` measures native scales instead. Autotuning uses
-all five sharing patterns independently of the selected measurement case.
+independent synthetic input samples, with arithmetic mean latency over equally
+weighted routing scenarios. Tuning and evaluation use separate random seeds.
 """
 
 from __future__ import annotations
@@ -27,6 +38,7 @@ import os
 import pathlib
 import statistics
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, replace
 from fnmatch import fnmatchcase
 from functools import partial
@@ -69,6 +81,7 @@ from b12x.testing.reference.w4a16_reference import moe_reference_w4a16
 from b12x.moe import fused_moe
 from b12x.preparation import PreparationSession, PreparedCall
 from benchmarks.experimental.b12x.moe_preparation import (
+    prepare_csf_32x2_weights,
     prepared_call,
     request_for_capacity,
     scratch_for,
@@ -2271,7 +2284,9 @@ def plan_b12x_benchmark_weights(
             **activation_params.kwargs(),
         ),
         constraints=fused_moe.WeightPlanConstraints(
-            scale_compression=scale_compression,
+            scale_compression=(
+                "csf" if scale_compression == "csf_32x2_v1" else scale_compression
+            ),
             required_packing=(
                 fused_moe.WeightPacking.SOURCE_NATIVE
                 if quant_mode.lower() == "w4a16" and w4a16_native
@@ -2323,7 +2338,12 @@ def prepare_b12x_benchmark_weights(
     else:
         w1_global_scale = params.g1_alphas * params.a1_gscale
         w2_global_scale = params.g2_alphas * params.a2_gscale
-    experts = fused_moe.prepare_weights(
+    prepare = (
+        prepare_csf_32x2_weights
+        if scale_compression == "csf_32x2_v1"
+        else fused_moe.prepare_weights
+    )
+    experts = prepare(
         plan=plan,
         weights=fused_moe.PackedWeights(
             w13=weights.w13_weight,
@@ -2768,12 +2788,11 @@ def make_oracle_reference(
 
 ORACLE_TOLERANCES = {
     "silu": {
-        # Default fast_math keeps the fast FP4 dot path.  It is intentionally
-        # not bit-exact against the f32-accum oracle, but should remain well
-        # within the numerical tolerance of the MiniMax-M2.7 micro profile.
-        "max_abs": 0.05,
-        "rmse": 0.0075,
-        "mean_abs": 0.005,
+        # Match the dynamic NVFP4 tests across checkpoint output scales.
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "normalized_rmse": 0.015,
         "cos_min": 0.9999,
     },
     # relu2 outputs are ~1000x larger in magnitude than silu's, and the
@@ -2842,6 +2861,7 @@ def format_oracle_metrics(name: str, metrics: OracleMetrics) -> str:
         f"{name}: max_abs={metrics.max_abs:.5f} "
         f"rmse={metrics.rmse:.5f} "
         f"mean_abs={metrics.mean_abs:.5f} "
+        f"normalized_rmse={metrics.normalized_rmse:.6f} "
         f"cos={metrics.cos:.6f}"
     )
 
@@ -2861,6 +2881,7 @@ def check_oracle_metrics(
         "rmse": metrics.rmse,
         "mean_abs": metrics.mean_abs,
         "cos": metrics.cos,
+        "normalized_rmse": metrics.normalized_rmse,
     }
     nonfinite = [
         name for name, value in metric_values.items() if not math.isfinite(value)
@@ -2887,6 +2908,14 @@ def check_oracle_metrics(
     if tol["mean_abs"] is not None and metrics.mean_abs > tol["mean_abs"]:
         failures.append(
             f"  bs={batch_size} {label}: mean_abs={metrics.mean_abs:.5f} > {tol['mean_abs']}"
+        )
+    normalized_rmse_max = tol.get("normalized_rmse")
+    if (
+        normalized_rmse_max is not None
+        and metrics.normalized_rmse > normalized_rmse_max
+    ):
+        failures.append(
+            f"  bs={batch_size} {label}: normalized_rmse={metrics.normalized_rmse:.6f} > {normalized_rmse_max}"
         )
     cos_min = tol["cos_min"] if min_cosine is None else float(min_cosine)
     if metrics.cos < cos_min:
@@ -2937,12 +2966,7 @@ def compare_graph_replay_outputs(
     actual_norm = actual.float().norm().item()
     reference_norm = reference.float().norm().item()
     if max(actual_norm, reference_norm) <= 1e-8:
-        return OracleMetrics(
-            max_abs=metrics.max_abs,
-            rmse=metrics.rmse,
-            mean_abs=metrics.mean_abs,
-            cos=1.0,
-        )
+        return replace(metrics, cos=1.0)
     return metrics
 
 
@@ -2956,9 +2980,12 @@ def prepare_moe_execution(
     outputs: dict[int, torch.Tensor],
     route_mode: str = "auto",
     override: fused_moe.MoeDecodeConfig | None = None,
+    benchmark_inputs: dict[
+        int, tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]
+    ]
+    | None = None,
 ) -> object:
     """Prepare each exact benchmark M before binding its real caller buffers."""
-    from b12x.moe.fused_moe.workloads import TUNING_WORKLOAD_VERSION, make_tuning_routes
     from b12x.preparation._measurement import capture_benchmark_call
 
     capacity = fused_moe.ExecutionCapacity(
@@ -2976,6 +3003,18 @@ def prepare_moe_execution(
             max_active_clusters=None,
             w4a16_route_mode=route_mode,
         )
+    from b12x.moe.fused_moe.workloads import TUNING_WORKLOAD_VERSION, make_tuning_routes
+
+    if benchmark_inputs is None:
+        benchmark_inputs = {
+            m: tuple(
+                (x, ids.to(dtype=input_ids.dtype), weights)
+                for ids in make_tuning_routes(
+                    m, top_k, experts.num_experts, device=x.device
+                )
+            )
+            for m, (x, input_ids, weights) in inputs.items()
+        }
     invocation = {"tuning_route_pattern": TUNING_WORKLOAD_VERSION}
     if experts.has_csf_blocks:
         invocation["tuning_execution"] = "cuda_graph"
@@ -3016,18 +3055,15 @@ def prepare_moe_execution(
         m: (
             tuple(t.clone() for t in inputs[m]),
             torch.empty_like(outputs[m]),
-            make_tuning_routes(
-                m, top_k, experts.num_experts, device=inputs[m][0].device
-            ),
+            benchmark_inputs[m],
         )
         for m in inputs
     }
 
     def produce(tokens, index):
-        operands, _, routes = tuning[tokens]
-        operands[0].copy_(inputs[tokens][0])
-        operands[1].copy_(routes[index])
-        operands[2].copy_(inputs[tokens][2])
+        operands, _, scenarios = tuning[tokens]
+        for operand, source in zip(operands, scenarios[index], strict=True):
+            operand.copy_(source)
 
     def scale_call(state, ids):
         active = torch.empty(experts.num_experts, dtype=torch.int32, device=ids.device)
@@ -3040,7 +3076,7 @@ def prepare_moe_execution(
         return PreparedCall(run=binding.run, owners=(binding, active, experts))
 
     def race_call(state, *, tokens, expansion=False):
-        operands, output, routes = tuning[tokens]
+        operands, output, scenarios = tuning[tokens]
         if expansion:
             call = scale_call(state, operands[1])
         else:
@@ -3056,7 +3092,7 @@ def prepare_moe_execution(
                     input_scales_static=True,
                 ),
             )(state)
-        producers = tuple(partial(produce, tokens, i) for i in range(len(routes)))
+        producers = tuple(partial(produce, tokens, i) for i in range(len(scenarios)))
         call = replace(
             call,
             produce=producers[0],
@@ -3461,7 +3497,7 @@ def bench_multilayer_graph_mode(
 
 def bench_e2e() -> None:
     from b12x.moe.fused_moe._impl import default_moe_quant_mode
-    from b12x.moe.fused_moe.workloads import ROUTING_WORKLOADS
+    from b12x.moe.fused_moe.workloads import ROUTING_MIX, ROUTING_WORKLOADS
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
@@ -3489,7 +3525,10 @@ def bench_e2e() -> None:
         "--moe-config",
         type=json.loads,
         default=None,
-        help="JSON MoeDecodeConfig override for controlled single-op experiments.",
+        help=(
+            "JSON MoeDecodeConfig override for controlled single-op experiments. "
+            "csf_inline_scales=true reads csf_32x2_v1 scales inside the compute kernel."
+        ),
     )
     parser.add_argument(
         "--repeats",
@@ -3509,9 +3548,21 @@ def bench_e2e() -> None:
     )
     parser.add_argument(
         "--routing-workload",
-        choices=("default", *ROUTING_WORKLOADS),
-        default="default",
-        help="shared_N reuses about N%% of token/expert assignments across the batch.",
+        choices=("default", "mixture", *ROUTING_WORKLOADS),
+        default=None,
+        help="Synthetic route distribution; pre-routed single-op runs default to mixture.",
+    )
+    parser.add_argument(
+        "--tuning-samples",
+        type=int,
+        default=2,
+        help="Independent seeds per routing scenario in candidate races.",
+    )
+    parser.add_argument(
+        "--routing-samples",
+        type=int,
+        default=1,
+        help="Held-out seeds per routing scenario at each token count.",
     )
     parser.add_argument(
         "--routing-repeat-period",
@@ -3568,9 +3619,9 @@ def bench_e2e() -> None:
     )
     parser.add_argument(
         "--scale-compression",
-        choices=("none", "csf"),
+        choices=("none", "csf", "csf_32x2_v1"),
         default=None,
-        help="Lossless expert-scale compression, including expansion in the timed call; profile default if omitted.",
+        help="Lossless expert-scale compression: csf uses slabs, csf_32x2_v1 uses indexed 32x2 blocks. Expansion is timed; profile default if omitted.",
     )
     parser.add_argument(
         "--swiglu-alpha",
@@ -3681,6 +3732,11 @@ def bench_e2e() -> None:
         help="Measure only the graph-qualified workload path with stream-gated events.",
     )
     parser.add_argument(
+        "--time-graph-replay",
+        action="store_true",
+        help="Time actual CUDA graph replay; requires single-op --graph-only.",
+    )
+    parser.add_argument(
         "--profile-once",
         choices=[
             "none",
@@ -3691,7 +3747,7 @@ def bench_e2e() -> None:
     parser.add_argument(
         "--profile-graphs",
         action="store_true",
-        help="Expose one cold-L2 CUDA graph replay per case to CUDA profiling.",
+        help="Expose one CUDA graph replay per case to profiling, honoring --flush-l2.",
     )
     parser.add_argument(
         "--fast-math",
@@ -3712,6 +3768,13 @@ def bench_e2e() -> None:
     )
     args = parser.parse_args()
 
+    if args.time_graph_replay and (
+        not args.graph_only
+        or not args.cuda_graph
+        or args.graph_mode != "single-op"
+        or args.tp_parallel
+    ):
+        parser.error("--time-graph-replay requires single-op, single-rank --graph-only")
     if args.torch_trace_dir is not None and (
         not args.graph_only
         or not args.cuda_graph
@@ -3724,11 +3787,8 @@ def bench_e2e() -> None:
         or not args.cuda_graph
         or args.graph_mode != "single-op"
         or args.profile_once != "none"
-        or not args.flush_l2
     ):
-        parser.error(
-            "--profile-graphs requires cold-L2 single-op --graph-only execution"
-        )
+        parser.error("--profile-graphs requires single-op --graph-only execution")
     if (args.moe_config is not None or args.output_json is not None) and (
         args.graph_mode != "single-op" or args.tp_parallel
     ):
@@ -3754,6 +3814,14 @@ def bench_e2e() -> None:
         args.scale_compression = model_profile.default_scale_compression
     elif args.scale_compression == "none":
         args.scale_compression = None
+    if config_override is not None and config_override.csf_inline_scales:
+        if (
+            args.quant_mode not in {"nvfp4", "w4a16", "w4a8_mx"}
+            or args.scale_compression != "csf_32x2_v1"
+        ):
+            parser.error(
+                "csf_inline_scales requires csf_32x2_v1 scales and a native FP4 recipe"
+            )
     if args.swiglu_clamp_after_silu is None:
         args.swiglu_clamp_after_silu = model_profile.default_swiglu_clamp_after_silu
     use_w4a16 = args.quant_mode == "w4a16"
@@ -3828,6 +3896,17 @@ def bench_e2e() -> None:
         raise ValueError("--quant-mode w4a16 currently does not support --tp-parallel")
     if args.graph_only and not args.cuda_graph:
         raise ValueError("--graph-only requires --cuda-graph")
+    if args.routing_workload is None:
+        args.routing_workload = (
+            "mixture"
+            if not (
+                args.include_routing
+                or args.routing_repeat_period
+                or args.tp_parallel
+                or args.graph_mode != "single-op"
+            )
+            else "default"
+        )
     if args.routing_workload != "default" and (
         args.include_routing
         or args.routing_repeat_period
@@ -3840,6 +3919,8 @@ def bench_e2e() -> None:
         )
     if args.routing_repeat_period < 0:
         raise ValueError("--routing-repeat-period must be non-negative")
+    if args.tuning_samples < 1 or args.routing_samples < 1:
+        raise ValueError("--tuning-samples and --routing-samples must be positive")
     if args.routing_repeat_period and args.graph_mode != "single-op":
         raise ValueError("--routing-repeat-period requires --graph-mode single-op")
     if args.routing_repeat_period and any(
@@ -3981,6 +4062,61 @@ def bench_e2e() -> None:
         activation=args.activation,
         checkpoint_family=model_profile.checkpoint_family,
     )
+    routing_workloads = (
+        ROUTING_MIX if args.routing_workload == "mixture" else (args.routing_workload,)
+    )
+    evaluation_scenarios = tuple(
+        (workload, index)
+        for workload in routing_workloads
+        for index in range(args.routing_samples)
+    )
+    cases = tuple(
+        (tokens, index)
+        for tokens in batch_sizes
+        for index in range(len(evaluation_scenarios))
+    )
+
+    def benchmark_case(tokens, seed, index):
+        workload, sample = evaluation_scenarios[index]
+
+        x, ids, route_weights, logits = make_benchmark_case(
+            model_profile,
+            weights,
+            spec,
+            tokens,
+            seed + 1009 * sample,
+            device,
+            routing_workload=workload,
+        )
+        ids, route_weights = repeat_routing_pattern(
+            ids, route_weights, args.routing_repeat_period
+        )
+        return x, ids, route_weights, logits
+
+    cached_tuning_inputs = {}
+
+    def tuning_inputs(tokens):
+        if tokens in cached_tuning_inputs:
+            return cached_tuning_inputs[tokens]
+        scenarios = []
+        for workload in routing_workloads:
+            for index in range(args.tuning_samples):
+                x, ids, route_weights, _ = make_benchmark_case(
+                    model_profile,
+                    weights,
+                    spec,
+                    tokens,
+                    104729 + tokens + 1009 * index,
+                    device,
+                    routing_workload=workload,
+                )
+                ids, route_weights = repeat_routing_pattern(
+                    ids, route_weights, min(args.routing_repeat_period, tokens)
+                )
+                scenarios.append((x, ids, route_weights))
+        cached_tuning_inputs[tokens] = tuple(scenarios)
+        return cached_tuning_inputs[tokens]
+
     if args.raw_samples_jsonl is not None:
         from b12x._lib.compiler import b12x_package_fingerprint
 
@@ -4036,27 +4172,16 @@ def bench_e2e() -> None:
         w4a16_native=args.w4a16_native,
         scale_compression=args.scale_compression,
     )
-    precomputed_oracles: dict[int, torch.Tensor] = {}
+    precomputed_oracles: dict[tuple[int, int], torch.Tensor] = {}
     if args.validate == "oracle":
         print(
             "  Precomputing oracle outputs before destructive weight preparation...",
             end="",
             flush=True,
         )
-        for batch_size in batch_sizes:
-            oracle_x, oracle_ids, oracle_topk, _ = make_benchmark_case(
-                model_profile,
-                weights,
-                spec,
-                batch_size,
-                42 + batch_size,
-                device,
-                routing_workload=args.routing_workload,
-            )
-            oracle_ids, oracle_topk = repeat_routing_pattern(
-                oracle_ids,
-                oracle_topk,
-                args.routing_repeat_period,
+        for batch_size, sample_index in cases:
+            oracle_x, oracle_ids, oracle_topk, _ = benchmark_case(
+                batch_size, 42 + batch_size, sample_index
             )
             oracle_output = make_oracle_reference(
                 args.oracle_mode,
@@ -4072,7 +4197,7 @@ def bench_e2e() -> None:
             )
             # Outputs are the only state retained across the ownership
             # transfer.  Keep them off-device; never retain a second model.
-            precomputed_oracles[batch_size] = oracle_output.detach().cpu()
+            precomputed_oracles[batch_size, sample_index] = oracle_output.detach().cpu()
             del oracle_x, oracle_ids, oracle_topk, oracle_output
         torch.cuda.synchronize()
         # representation.  It must not survive into B12X preparation/runtime.
@@ -4090,9 +4215,13 @@ def bench_e2e() -> None:
         w4a16_native=args.w4a16_native,
         activation_params=activation_params,
         plan=weight_plan,
+        scale_compression=args.scale_compression,
     )
     _clear_b12x_caches()
-    b12x_session = PreparationSession(device=device, autotune=args.autotune)
+    tuning_cache = tempfile.TemporaryDirectory(prefix="b12x-moe-tuning-")
+    b12x_session = PreparationSession(
+        device=device, autotune=args.autotune, cache_dir=tuning_cache.name
+    )
     print("  Preparing b12x declarations...", end="", flush=True)
     x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
         model_profile,
@@ -4112,6 +4241,7 @@ def bench_e2e() -> None:
         outputs={1: warmup_output},
         route_mode=args.w4a16_route_policy,
         override=config_override,
+        benchmark_inputs={1: tuning_inputs(1)},
     )
     warmup_binding = bind_prepared_moe(
         warmup_execution,
@@ -4182,29 +4312,20 @@ def bench_e2e() -> None:
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
 
-    batch_results: dict[int, BatchResult] = {}
+    batch_results: dict[tuple[int, int], BatchResult] = {}
     accuracy_failures: list[str] = []
     evidence: list[dict] = []
-    for batch_size in batch_sizes:
+    for batch_size, sample_index in cases:
         print(f"\n{'=' * 70}")
         print(
             f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)"
         )
         print(f"{'=' * 70}")
 
-        x, topk_ids, topk_weights, routing_logits = make_benchmark_case(
-            model_profile,
-            weights,
-            spec,
-            batch_size,
-            42 + batch_size,
-            device,
-            routing_workload=args.routing_workload,
-        )
-        topk_ids, topk_weights = repeat_routing_pattern(
-            topk_ids,
-            topk_weights,
-            args.routing_repeat_period,
+        print(f"  routing scenario: {evaluation_scenarios[sample_index]}")
+
+        x, topk_ids, topk_weights, routing_logits = benchmark_case(
+            batch_size, 42 + batch_size, sample_index
         )
         local_routes = topk_ids >= 0
         active_experts = int(torch.unique(topk_ids[local_routes]).numel())
@@ -4225,7 +4346,9 @@ def bench_e2e() -> None:
         def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
             if model_profile.default_routing == "model":
                 timed_topk_ids, timed_topk_weights = compute_model_gate_routing(
-                    weights, x, seed=43 + batch_size
+                    weights,
+                    x,
+                    seed=43 + batch_size + 1009 * evaluation_scenarios[sample_index][1],
                 )
             else:
                 assert routing_logits is not None
@@ -4245,13 +4368,14 @@ def bench_e2e() -> None:
         backend_output = torch.empty_like(x)
         backend_execution = prepare_moe_execution(
             session=b12x_session,
-            name=f"benchmark-moe-m{batch_size}",
+            name=f"benchmark-moe-m{batch_size}-sample{sample_index}",
             experts=experts,
             top_k=spec.top_k,
             inputs={batch_size: (x, topk_ids, topk_weights)},
             outputs={batch_size: backend_output},
             route_mode=args.w4a16_route_policy,
             override=config_override,
+            benchmark_inputs={batch_size: tuning_inputs(batch_size)},
         )
         backend_binding = bind_prepared_moe(
             backend_execution,
@@ -4285,7 +4409,7 @@ def bench_e2e() -> None:
 
         oracle_ref = None
         if args.validate == "oracle":
-            oracle_ref = precomputed_oracles[batch_size].to(device=device)
+            oracle_ref = precomputed_oracles[batch_size, sample_index].to(device=device)
             print(
                 "  oracle:".ljust(28),
                 f"norm={oracle_ref.float().norm().item():.5f}",
@@ -4340,6 +4464,10 @@ def bench_e2e() -> None:
         )
         record = {
             "tokens": batch_size,
+            "routing_workload": evaluation_scenarios[sample_index][0],
+            "input_seed": 42
+            + batch_size
+            + 1009 * evaluation_scenarios[sample_index][1],
             "active_experts": active_experts,
             "expert_row_counts": sorted(
                 topk_ids[local_routes].unique(return_counts=True)[1].cpu().tolist()
@@ -4397,7 +4525,10 @@ def bench_e2e() -> None:
             graph_launches = [(backend_label, backend_e2e)]
 
             for name, fn in graph_launches:
-                print(f"  {name} (CUDA graph):".ljust(28), end="", flush=True)
+                timed_kind = (
+                    "graph replay" if args.time_graph_replay else "prepared call"
+                )
+                print(f"  {name} ({timed_kind}):".ljust(28), end="", flush=True)
                 try:
                     # Warm eager launch state before capture so compile/cache work
                     # does not leak into the replay measurement.
@@ -4436,7 +4567,7 @@ def bench_e2e() -> None:
                             )
                         record["graph_oracle"] = asdict(graph_metrics)
 
-                    # Time the prepared invocation after graph correctness qualification.
+                    timed_fn = replay if args.time_graph_replay else fn
                     device_before = (
                         nvidia_smi_gpu_mode_snapshot()
                         if args.raw_samples_jsonl is not None
@@ -4444,7 +4575,10 @@ def bench_e2e() -> None:
                     )
                     graph_runs = [
                         bench_events(
-                            fn, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
+                            timed_fn,
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            l2_flush=l2_flush,
                         )
                         for _ in range(args.repeats)
                     ]
@@ -4500,7 +4634,8 @@ def bench_e2e() -> None:
                     if args.profile_graphs:
                         if accuracy_failures:
                             raise RuntimeError("cannot profile a failed oracle check")
-                        l2_flush()
+                        if l2_flush is not None:
+                            l2_flush()
                         torch.cuda.synchronize()
                         torch.cuda.profiler.start()
                         try:
@@ -4519,11 +4654,13 @@ def bench_e2e() -> None:
                     print(f" FAILED ({type(exc).__name__}: {exc})")
                     raise
 
-            batch_results[batch_size] = BatchResult(
+            batch_results[batch_size, sample_index] = BatchResult(
                 backend_stats=graph_stats_by_name[backend_label],
             )
         elif backend_stats is not None:
-            batch_results[batch_size] = BatchResult(backend_stats=backend_stats)
+            batch_results[batch_size, sample_index] = BatchResult(
+                backend_stats=backend_stats
+            )
 
         # ---- TP-parallel graph replay ----
         if tp_parallel_ranks:
@@ -4643,6 +4780,25 @@ def bench_e2e() -> None:
     torch.cuda.synchronize()
     b12x_session.close()
 
+    tuning_cache.cleanup()
+
+    routing_summary = []
+    for batch_size in batch_sizes:
+        times = [
+            result.backend_stats.median_us
+            for (tokens, _), result in batch_results.items()
+            if tokens == batch_size
+        ]
+        routing_summary.append(
+            dict(
+                tokens=batch_size,
+                samples=len(times),
+                mean_us=statistics.fmean(times),
+                min_us=min(times),
+                max_us=max(times),
+            )
+        )
+
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(
@@ -4660,11 +4816,19 @@ def bench_e2e() -> None:
                     "scale_compression": args.scale_compression,
                     "activation_params": asdict(activation_params),
                     "routing_workload": args.routing_workload,
+                    "tuning_samples_per_scenario": args.tuning_samples,
+                    "routing_samples_per_scenario": args.routing_samples,
                     "timing_backend": args.timing_backend,
+                    "timed_callable": (
+                        "cuda_graph_replay"
+                        if args.time_graph_replay
+                        else "prepared_call"
+                    ),
                     "cold_l2": args.flush_l2,
                     "validation": args.validate,
                     "oracle_quant_scale_math": args.oracle_quant_scale_math,
                     "cases": evidence,
+                    "routing_summary": routing_summary,
                 },
                 indent=2,
                 default=str,
@@ -4672,9 +4836,14 @@ def bench_e2e() -> None:
             + "\n"
         )
 
-    for batch_size, result in sorted(batch_results.items()):
+    for summary in routing_summary:
         print(
-            f"M={batch_size}: {backend_label} {result.backend_stats.median_us:.1f} us"
+            f"M={summary['tokens']}: {backend_label} {summary['mean_us']:.1f} us"
+            + (
+                f" (mean over {summary['samples']} routing samples)"
+                if summary["samples"] > 1
+                else ""
+            )
         )
 
     if accuracy_failures:

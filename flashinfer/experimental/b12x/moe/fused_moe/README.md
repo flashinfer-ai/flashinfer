@@ -41,11 +41,60 @@ caller-owned scratch buffers. When an exact decode variant lacks the padded
 A4 workspace, a composite plan reuses a larger fitting prepared variant in
 the same scratch arena. A plan with no fitting A4 variant retains W4A16.
 
-Compressed NVFP4 and MXFP4 scales expand into caller-owned native scale
-buffers before compute. Small calls expand only routed experts; long prefills
-expand all experts. MoE and dense GEMM kernels accept native scales and use the
-same arithmetic and tuning candidates as resident native weights. W4A16
-preparation preserves its scale normalization and packed layout in the expander.
+Compressed NVFP4 and MXFP4 scales use `csf_32x2_v1` resident blocks. MoE
+preparation exposes `MoeDecodeConfig.csf_inline_scales` as a tuning choice for
+compatible FP4 kernels. `False` expands scales into caller-owned native buffers
+before compute; small calls expand routed experts and long prefills expand all
+experts. `True` reconstructs scales inside the compute kernel's shared-memory
+pipeline stages. Both choices read the same resident
+payload and preserve native scale bytes, normalization, and arithmetic.
+
+The autotuner measures the complete invocation, including expansion, route
+planning, synchronization resets, and reduction. Token capacity is part of the
+tuning query. Explicit config overrides select either choice; preparation
+without autotuning defaults to expansion. Inline readers cover M16/M32 NVFP4
+W4A4 and MXFP4 W4A8 tiles, and packed W4A16 kernels. Scalar and compact micro
+kernels, M64/M128 activation-quantized tiles, materialized NVFP4 W4A4,
+source-native W4A16, dense GEMM, and the optional
+W4A16 activation-prefill path consume expanded scales. Unsupported inline
+overrides are rejected during planning.
+
+M16/M32 inline candidates are omitted from autotuning when routed rows exceed
+the expert count times the tile height. Explicit overrides can still measure
+these kernels with larger batches. Compact MXFP4 W4A8 retains reconstructed
+K128 scale words across both K64 pipeline steps.
+
+Expansion reconstructs each selected expert's scales once per invocation.
+Inline reconstruction repeats for every compute tile that consumes those
+scales. Inline can reduce memory traffic when many experts are active and each
+has few token tiles. With few active experts, expanded scales can remain in L2;
+with many token tiles per expert, repeated inline decoding competes with compute
+while expansion is amortized. NVFP4 has one scale byte per 16 weights, twice
+MXFP4's scale density. Kernel staging, routing distribution, and cache residency
+determine whether the saved traffic pays for decoding and synchronization.
+
+The benchmark option `--scale-compression csf_32x2_v1` uses these resident
+blocks. `--moe-config '{"backend":"w4a16","route_planner":"internal",
+"max_active_clusters":null,"w4a16_route_mode":"packed",
+"csf_inline_scales":true}'` forces inline W4A16. Omit `--moe-config` to tune
+both choices. `--time-graph-replay` measures the captured invocation, including
+scale expansion when selected.
+
+Pre-routed single-op benchmarks default to `--routing-workload mixture`.
+The synthetic scenarios cover diffuse expert popularity, concentrated popularity,
+and correlated preferences within groups of four tokens. Expert IDs are sampled
+without replacement within each token. `--tuning-samples` selects independent
+seeds per scenario, and `--routing-samples` selects held-out evaluation seeds.
+No recorded model inputs are required. `--routing-workload default` uses the
+profile's input generator; individual workload names allow controlled comparisons.
+
+Candidate races minimize the arithmetic mean of invocation latencies across the
+synthetic scenarios. Equal scenario weights provide distribution coverage;
+they are not measured production traffic frequencies. Invocation-frequency
+weights, when known, belong in this arithmetic mean. Geometric mean speedup can
+favor a configuration that consumes more total GPU time. Evaluation reports
+individual scenarios and their arithmetic mean. Each benchmark process uses a
+fresh selection cache so a previous routing distribution cannot supply its winner.
 
 `expand_scales(experts)` expands every NVFP4 expert on the current stream.
 A later `bind(..., scales_expanded=True)` skips per-call expansion, except for
@@ -56,13 +105,13 @@ stream dependencies.
 
 `uses_expanded_nvfp4_scales(plan, num_tokens=..., a4_prefill=...,
 route_ids_dtype=..., scales_expanded=...)` reports whether a prepared call has
-compressed NVFP4 scales. All such calls consume expanded scales, independent
-of activation precision and token count. The query performs no GPU work.
+an expansion consumer. It returns `False` for an inline plan, allowing callers
+to skip scale prefetch. The query performs no GPU work.
 
 `B12X_W4A16_A4_PREFILL_TERMS=1` uses one NVFP4 activation plane. A value of `2`
 adds an independently quantized residual plane. `B12X_W4A16_A4_PREFILL_WARPS`
 accepts `8` (default) or `16`. These controls and the capability flag are immutable
-execution-plan inputs and are part of tuning query schema 28. Changing the
+execution-plan inputs and are part of the tuning query. Changing the
 environment requires preparing another execution plan. Kernel compilation
 retains device-owned callables; replay performs no compilation or tensor
 allocation. A4 always applies router weights in the FP32 final sum. Set

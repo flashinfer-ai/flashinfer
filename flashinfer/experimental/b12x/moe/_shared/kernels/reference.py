@@ -28,6 +28,7 @@ class OracleMetrics:
     rmse: float
     mean_abs: float
     cos: float
+    normalized_rmse: float
 
 
 @dataclass(frozen=True)
@@ -74,11 +75,14 @@ def compare_to_reference(
         torch.where(denom > 1e-24, dot / denom, torch.zeros_like(dot)),
     )
     cos = cos_rows.mean().item()
+    rmse = diff.square().mean().sqrt()
+    reference_rms = reference_fp32.square().mean().sqrt()
     return OracleMetrics(
         max_abs=diff.abs().max().item(),
-        rmse=diff.square().mean().sqrt().item(),
+        rmse=rmse.item(),
         mean_abs=diff.abs().mean().item(),
         cos=cos,
+        normalized_rmse=(rmse / reference_rms.clamp_min(1e-30)).item(),
     )
 
 

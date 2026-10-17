@@ -54,6 +54,9 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     deterministic=True,
     tile_m=16,
     after_plan=None,
+    inline_scales=False,
+    mma_warps=None,
+    execution_override=None,
 ):
     device = require_b12x()
     e, h, topk = 8, 256, 2
@@ -109,9 +112,19 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             route_planner="internal",
             max_active_clusters=None,
             dynamic_tile_m=tile_m,
+            dynamic_mma_warps=mma_warps,
             dynamic_route_mode="grouped",
         )
     )
+    if inline_scales and activation_mode == "a16":
+        override = MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            w4a16_route_mode="packed",
+        )
+    if execution_override is not None:
+        override = execution_override
     expansion = (
         moe.plan_scale_expansion(experts[1], routes=tokens * topk)
         if raw == "blocks"
@@ -123,7 +136,11 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
             invocation={"fast_math": False},
             routing=moe.RoutingSpec(deterministic_output=deterministic),
-            override=override,
+            override=(
+                replace(override, csf_inline_scales=True)
+                if inline_scales and i == 1
+                else override
+            ),
             scale_expansion=expansion if i == 1 else None,
         )
         for i, owner in enumerate(experts)
@@ -217,6 +234,8 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             owners.append(scratch)
             outputs.append(output)
             bindings.append(binding)
+        if inline_scales:
+            assert not moe.uses_expanded_nvfp4_scales(plans[1], num_tokens=tokens)
         session.freeze()
         for binding in bindings:
             graph = torch.cuda.CUDAGraph()
@@ -243,7 +262,10 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             )
             assert torch.isfinite(outputs[0]).all() and torch.count_nonzero(outputs[0])
             torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
-            assert not torch.all(buffers[0].view(torch.uint8) == 0x7F)
+            if inline_scales:
+                assert all(torch.all(b.view(torch.uint8) == 0x7F) for b in buffers)
+            else:
+                assert not torch.all(buffers[0].view(torch.uint8) == 0x7F)
         for graph in graphs:
             graph.reset()
 
@@ -597,4 +619,61 @@ def test_block_scales_use_native_expert_math_and_shared_scratch(tokens, mode, wi
         raw="blocks",
         n=width,
         autotune=(tokens == 33 and mode == "a4" and width == 192),
+    )
+
+
+@pytest.mark.parametrize("tile_m,mma_warps", [(16, None), (16, 4), (32, None)])
+@pytest.mark.parametrize("n", [64, 320])
+def test_inline_scales_bypass_expansion_under_frozen_graph_replay(tile_m, mma_warps, n):
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        8,
+        "a4",
+        "blocks",
+        n,
+        dynamic_override=True,
+        tile_m=tile_m,
+        inline_scales=True,
+        mma_warps=mma_warps,
+    )
+
+
+@pytest.mark.parametrize("tokens", [4, 32])
+@pytest.mark.parametrize("n", [128, 320])
+def test_w4a16_inline_scales_bypass_expansion_under_frozen_graph_replay(tokens, n):
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        tokens, "a16", "blocks", n, inline_scales=True
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_w4a16_direct_inline_poisoned_graph(tokens):
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        tokens,
+        "a16",
+        "blocks",
+        128,
+        inline_scales=True,
+        execution_override=MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            w4a16_route_mode="direct",
+        ),
+    )
+
+
+def test_w4a16_wide_inline_poisoned_graph(monkeypatch):
+    from b12x.moe._shared.kernels.w4a16 import kernel
+
+    compile_moe = kernel.compile_w4a16_fused_moe
+
+    def compile_wide(*args, **kwargs):
+        kwargs["force_tile_config"] = (64, 256, 64, 256)
+        return compile_moe(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "compile_w4a16_fused_moe", compile_wide)
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        32, "a16", "blocks", 256, inline_scales=True
     )

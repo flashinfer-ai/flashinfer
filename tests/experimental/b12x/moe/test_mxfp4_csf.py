@@ -1,5 +1,7 @@
 """MXFP4-CSF preserves native W4A8 expert math and serialized scale scratch."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -230,7 +232,9 @@ def _csf_planes(rows, columns, *, experts, seed):
     return batch, torch.from_numpy(np.stack(grids)).to(device)
 
 
-def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
+def _prepare_arms(
+    h, n, layout, monkeypatch, *, experts=8, seed=0, activation_mode="a8", packing=None
+):
     """Native and compressed experts sharing the same MXFP4 arithmetic."""
     device = require_b12x()
     first, s13 = _csf_planes(2 * n, h // 32, experts=experts, seed=seed)
@@ -243,8 +247,9 @@ def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
     weight_plan = moe.plan_weights(
         source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout=layout),
         activation=moe.ActivationSpec(
-            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+            mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16
         ),
+        constraints=moe.WeightPlanConstraints(required_packing=packing),
         geometry=moe.MoEGeometry(
             num_experts=experts, hidden_size=h, intermediate_size=n
         ),
@@ -296,12 +301,28 @@ def _assert_bitwise(expected, actual):
     ],
 )
 def test_expanded_scales_match_native_under_poisoned_replay(
-    h, n, tokens, layout, ids_dtype, monkeypatch, after_plan=None
+    h,
+    n,
+    tokens,
+    layout,
+    ids_dtype,
+    monkeypatch,
+    after_plan=None,
+    inline=False,
+    execution_override=None,
+    activation_mode="a8",
+    deterministic=True,
+    packing=None,
 ):
     """Poisoned scale scratch is restored before native kernels execute."""
     device = require_b12x()
     e, topk = 8, 2
-    (native, expanded), scratch = _prepare_arms(h, n, layout, monkeypatch)
+    (native, expanded), scratch = _prepare_arms(
+        h, n, layout, monkeypatch, activation_mode=activation_mode, packing=packing
+    )
+    if packing == "source_native":
+        assert native.plan._impl.w4a16_weight_layout == "modelopt"
+        assert native._impl.representation.value.micro_w13_scale is not None
     assert expanded._impl.nvfp4_csf is not None
     assert expanded._impl.w1_blockscale.data_ptr() == scratch[0][0].data_ptr()
     arms = (native, expanded)
@@ -310,9 +331,12 @@ def test_expanded_scales_match_native_under_poisoned_replay(
             experts=owner,
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
             invocation={"fast_math": False},
-            routing=moe.RoutingSpec(deterministic_output=True),
+            routing=moe.RoutingSpec(deterministic_output=deterministic),
+            override=replace(execution_override, csf_inline_scales=(inline and i == 1))
+            if execution_override is not None
+            else None,
         )
-        for owner in arms
+        for i, owner in enumerate(arms)
     ]
     if after_plan is not None:
         after_plan()
@@ -389,7 +413,7 @@ def test_expanded_scales_match_native_under_poisoned_replay(
             )
             _assert_bitwise(outputs[0], outputs[1])
             assert all(
-                not bool((buffer.view(torch.uint8) == 0xFF).all())
+                bool((buffer.view(torch.uint8) == 0xFF).all()) == inline
                 for buffer in scratch[0]
             )
         for graph in graphs:
@@ -572,4 +596,72 @@ def test_block_scales_use_native_expert_math_and_shared_scratch(tokens, mode, h,
         raw="blocks",
         nonlinearity="silu",
         activation_mode=mode,
+    )
+
+
+@pytest.mark.parametrize(
+    "h,n,tokens,backend,tile_m",
+    [
+        (512, 256, 8, "dynamic", 16),
+        (512, 256, 32, "dynamic", 32),
+        (512, 384, 33, "dynamic", 32),
+        (512, 192, 8, "dynamic", 16),
+        (5120, 576, 128, "dynamic", 16),
+        (512, 256, 4, "w4a16", None),
+        (512, 192, 32, "w4a16", None),
+    ],
+)
+@pytest.mark.parametrize("layout", ["w13", "w31"])
+def test_inline_poisoned_graph(h, n, tokens, backend, tile_m, layout, monkeypatch):
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    config = MoeDecodeConfig(
+        backend=backend,
+        route_planner="internal",
+        max_active_clusters=None,
+        dynamic_tile_m=tile_m,
+        dynamic_route_mode="grouped" if tile_m else None,
+        w4a16_route_mode="packed" if backend == "w4a16" else None,
+    )
+    test_expanded_scales_match_native_under_poisoned_replay(
+        h,
+        n,
+        tokens,
+        layout,
+        torch.int32,
+        monkeypatch,
+        inline=True,
+        execution_override=config,
+        activation_mode="a16" if backend == "w4a16" else "a8",
+        packing="mma_packed" if backend == "w4a16" else None,
+    )
+
+
+def test_w4a16_wide_inline_poisoned_graph(monkeypatch):
+    from b12x.moe._shared.kernels.w4a16 import kernel
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    compile_moe = kernel.compile_w4a16_fused_moe
+
+    def compile_wide(*args, **kwargs):
+        kwargs["force_tile_config"] = (64, 256, 64, 256)
+        return compile_moe(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "compile_w4a16_fused_moe", compile_wide)
+    test_expanded_scales_match_native_under_poisoned_replay(
+        512,
+        256,
+        32,
+        "w31",
+        torch.int32,
+        monkeypatch,
+        inline=True,
+        execution_override=MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            w4a16_route_mode="packed",
+        ),
+        activation_mode="a16",
+        packing="mma_packed",
     )
