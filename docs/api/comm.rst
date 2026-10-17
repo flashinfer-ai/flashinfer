@@ -154,6 +154,54 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+NVFP4-Transport AllReduce
+-------------------------
+
+``fp4_allreduce`` sums ``[rows, 6144]`` bfloat16 activations over a two- or
+four-rank NCCL process group through NVFP4 records: every rank quantises its
+rows (E2M1 values, E4M3 block scales, one float32 row scale), pushes them into
+Lamport receive windows of its peers and decodes the gathered records in rank
+order, so the result is bitwise identical on every rank.  World size 2 runs a
+one-shot exchange, world size 4 a two-shot exchange whose owner ranks reduce,
+re-encode and all-gather.  The quantisation follows the NVFP4 all-reduce
+reference by Fan Shi (``fans-nv/fp4-all-reduce``, commit ``2878bf5``).
+
+A ``Fp4AllReduceWorkspace`` is created collectively on every rank of the group
+with the same capacity (the row count the generated programs are specialised
+for) and family; it shares the receive windows through CUDA IPC, arms their
+sentinels and publishes the peer window table.  Calls accept any row count up
+to the capacity (a multiple of 4 for world size 4 and for the fused family),
+perform no allocation when the output buffers are given and no host
+synchronisation, so they can be captured into CUDA graphs; the
+``launch_with_pdl`` flag issues the kernel as a programmatic dependent launch.
+``fp4_allreduce_nvfp4`` accepts pre-quantised records with one static scale per
+rank.  SM100, SM103 and SM107 devices are routed to their own compilation of the
+same generated sources.
+
+``fp4_allreduce_rmsnorm`` (family ``"rmsnorm"``, world size 2) fuses the
+exchange with the residual add and the Gemma RMSNorm: ``z = sum + residual`` is
+kept in float32, ``residual_out = bf16(z)`` and
+``y = z * rsqrt(mean(z^2) + eps) * (1 + weight)`` with ``eps = 1e-6`` compiled
+in.  ``Fp4AllReduceFusedNormSpec`` selects the output: bfloat16 ``y``, or ``y``
+quantised to NVFP4 (packed E2M1 values and 128x4-swizzled E4M3 block scales for
+a caller-supplied float32 global scale -- the layout and arithmetic of
+``fp4_quantize``) or to MXFP8 (E4M3 values and swizzled UE8M0 scales, as
+``mxfp8_quantize``).  ``fp4_allreduce_rmsnorm_nvfp4`` takes pre-quantised
+records and produces the bfloat16 ``y``.  Both return a
+``Fp4AllReduceFusedNormResult``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    Fp4AllReduceWorkspace
+    fp4_allreduce
+    fp4_allreduce_nvfp4
+    fp4_allreduce_rmsnorm
+    fp4_allreduce_rmsnorm_nvfp4
+    Fp4AllReduceFusedNormSpec
+    Fp4AllReduceFusedNormOutput
+    Fp4AllReduceFusedNormResult
+
 FP8 Quantized AllReduce
 -----------------------
 
