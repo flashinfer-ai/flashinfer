@@ -905,10 +905,10 @@ def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_ban
 
 def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     # One table (sm_107a only): the `mid4` twin in the small band (B < 32), the
-    # `tilev32_x2` twin in the large band's wave-fit range (32 <= B < 35), the shipped
+    # `tilev32_x2` twin in the large band's wave-fit range (32 <= B < 37), the shipped
     # small / large bodies everywhere else; B200 / B300 keep the shipped bodies.
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD == 32
-    assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT == 35
+    assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT == 37
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES == {
         "small": "gdn_decode_nontranspose_fp32_t1_small",
         "large": "gdn_decode_nontranspose_fp32_t1",
@@ -934,7 +934,8 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
         (31, "small"),
         (32, "large_wavefit"),
         (34, "large_wavefit"),
-        (35, "large"),
+        (36, "large_wavefit"),
+        (37, "large"),
         (512, "large"),
     ):
         assert rule_band(batch_size) == expected, batch_size
@@ -958,15 +959,15 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     for arch in ("sm_100a", "sm_103a"):
         for batch_size in (1, 4, 8, 16, 31):
             assert rule(batch_size, arch) == small
-        for batch_size in (32, 33, 34, 35, 64, 128, 512):
+        for batch_size in (32, 33, 34, 35, 36, 37, 64, 128, 512):
             assert rule(batch_size, arch) == large
     # the public nontranspose rows (HV=32) on sm_107a: b1 .. b31 take mid4, the wave-fit
-    # range b32 .. b34 takes tilev32_x2, b35 .. b512 keep the shipped large body
+    # range b32 .. b36 takes tilev32_x2, b37 .. b512 keep the shipped large body
     for batch_size in (1, 4, 8, 16, 31):
         assert rule(batch_size, "sm_107a") == mid4
-    for batch_size in (32, 33, 34):
+    for batch_size in (32, 33, 34, 35, 36):
         assert rule(batch_size, "sm_107a") == x2
-    for batch_size in (35, 36, 64, 128, 512):
+    for batch_size in (37, 38, 64, 128, 512):
         assert rule(batch_size, "sm_107a") == large
 
 
@@ -976,14 +977,14 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
 ) -> None:
     # The K-major fp32-state T=1 rows run the `mid4` twin on Rubin (sm_107a) below 32
     # batch rows (four CTAs per state head instead of eight) and the `tilev32_x2` twin
-    # in the wave-fit range 32 <= B < 35 (two CTAs per state head instead of one): same
+    # in the wave-fit range 32 <= B < 37 (two CTAs per state head instead of one): same
     # kernel contract, bitwise-identical output and state.  The route id names the twin
     # and the host takes the grid from the resolved record, not from a fixed eight / one.
-    for batch_size in (1, 4, 8, 16, 31, 32, 33, 34, 35, 36, 64, 128):
+    for batch_size in (1, 4, 8, 16, 31, 32, 33, 34, 35, 36, 37, 38, 64, 128):
         route = _decode(arch=arch, layout="nontranspose", batch_size=batch_size)
         band = "small" if batch_size < 32 else "large"
         mid4 = arch == "sm_107a" and batch_size < 32
-        x2 = arch == "sm_107a" and 32 <= batch_size < 35
+        x2 = arch == "sm_107a" and 32 <= batch_size < 37
         suffix = "_mid4" if mid4 else "_tilev32_x2" if x2 else ""
         assert (
             route.route_id

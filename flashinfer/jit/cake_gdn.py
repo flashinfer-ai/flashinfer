@@ -1074,7 +1074,7 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` in
 # loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
-CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = 35
+CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = 37  # CAKE-1096 R26 lane P2 (P2-K37): 35 -> 37; see the Cake launcher
 CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES: dict[str, str] = {
     "small": "gdn_decode_nontranspose_fp32_t1_small",
     "large": "gdn_decode_nontranspose_fp32_t1",
@@ -1101,7 +1101,7 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
 
 
 def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
-    """Rule band of ``batch_size`` rows: ``small`` (B < 32), ``large_wavefit`` (32 <= B < 35) or ``large``."""
+    """Rule band of ``batch_size`` rows: ``small`` (B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
 
     if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD:
         return "small"
