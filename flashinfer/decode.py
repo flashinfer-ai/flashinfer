@@ -1771,6 +1771,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
 
+        # Normalized like plan(): the native size query reads raw pointers (#5260).
+        indptr = indptr.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         indptr_host = indptr.to("cpu")
         last_page_len_host = last_page_len.to("cpu")
         if seq_lens is None:
@@ -2071,6 +2077,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
         )
+
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        indptr = indptr.contiguous()
+        indices = indices.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
@@ -4892,6 +4905,10 @@ def fast_decode_plan(
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
     """
+    # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
+    indptr = indptr.contiguous()
+    indices = indices.contiguous()
+    last_page_len = last_page_len.contiguous()
     batch_size = len(last_page_len)
     wants_cudnn = self._backend == "cudnn"
     if self._requested_backend == "auto":
@@ -5060,7 +5077,8 @@ def fast_decode_plan(
     )
 
     indptr_host = (
-        global_override_indptr_cpu
+        # Normalized: the planner reads this as a raw pointer (#5260).
+        global_override_indptr_cpu.contiguous()
         if global_override_indptr_cpu is not None
         else indptr.cpu()
     )
