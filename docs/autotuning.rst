@@ -453,10 +453,14 @@ capacity fallback. Returning a ``TuningResult`` does not publish a record.
 managed store when tuning is enabled. With ``autotune_v2()``, that store is
 attached automatically and remains available after context exit.
 ``persistent_cache=False`` keeps records in memory. Protocols must also honor
-``context.disk_cache_enabled`` for any compatibility-file I/O. Managed writes are atomic per record.
+``context.disk_cache_enabled`` for any compatibility-file I/O. Results use the
+same managed entries and atomic writer as runner tactics, with a tagged key
+identifying the protocol namespace and record. Each protocol defines its JSON
+payload; adding another protocol does not require a new cache format.
 
 Protocols must implement or reject ``context.measurement_policy`` and inherited
-graph replay counts. They manage numerical checks, capture restrictions and
+graph replay counts, ``context.tuning_buckets`` and ``context.round_up``. They
+manage numerical checks, capture restrictions and
 allocation lifetime. Distributed protocols must coordinate collective execution
 and cache decisions, including which participants publish a shared result;
 AutoTuner provides no cross-process synchronization.

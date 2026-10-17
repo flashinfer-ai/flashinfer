@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from flashinfer import autotune
@@ -122,7 +124,13 @@ def test_protocol_managed_persistence_replay_and_root_isolation(managed, tmp_pat
             managed.choose_with_protocol("test.protocol", RecordingProtocol())
             == "tuned"
         )
-        assert len(list(tmp_path.glob("v2/*/protocols/*/*.json"))) == 1
+        paths = list(tmp_path.glob("v2/*/entries/*.json"))
+        assert len(paths) == 1
+        entry = json.loads(paths[0].read_text())
+        assert entry["runner"] == "test.protocol"
+        assert entry["key"] == str(("__protocol__", "test.protocol", "shape"))
+        assert entry["tactic"] == {"tile": [128, 256], "external_factor": 3}
+        assert not list(tmp_path.glob("v2/*/protocols"))
     managed._managed_cache = None
     managed._managed_stores.clear()
     managed.clear_cache()
@@ -147,17 +155,16 @@ def test_protocol_managed_persistence_replay_and_root_isolation(managed, tmp_pat
 def test_protocol_memory_only_and_reload(managed, tmp_path):
     from flashinfer import autotune_v2
     from flashinfer.autotune_cache import autotune_v2_reload
-    import json
 
     with autotune_v2():
         managed.choose_with_protocol("test.protocol", RecordingProtocol())
-    path = next(tmp_path.glob("v2/*/protocols/*/*.json"))
+    path = next(tmp_path.glob("v2/*/entries/*.json"))
     with autotune_v2(persistent_cache=False):
         protocol = RecordingProtocol()
         assert managed.choose_with_protocol("test.protocol", protocol) == "tuned"
         assert not protocol.contexts[-1].disk_cache_enabled
     record = json.loads(path.read_text())
-    record["value"]["tile"] = [64, 64]
+    record["tactic"]["tile"] = [64, 64]
     path.write_text(json.dumps(record))
     assert managed.choose_with_protocol("test.protocol", RecordingProtocol())[
         "tile"
@@ -170,7 +177,7 @@ def test_protocol_memory_only_and_reload(managed, tmp_path):
     ] == [64, 64]
     with autotune_v2(mode="replay", cache_root=tmp_path / "other"):
         pass
-    record["value"]["tile"] = [32, 32]
+    record["tactic"]["tile"] = [32, 32]
     path.write_text(json.dumps(record))
     autotune_v2_reload()
     with autotune_v2(mode="replay"):
@@ -191,13 +198,18 @@ def test_protocol_policy_partition_and_inherited_controls(managed):
     graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
     with (
         autotune_v2(persistent_cache=False, measurement_policy=graph_policy),
-        autotune(cuda_graph_profile_replays=3),
+        autotune(cuda_graph_profile_replays=3, tuning_buckets=(64, 256), round_up=True),
     ):
         context = managed.protocol_context("test.protocol")
         assert context.cuda_graph_profile_replays == 3
+        assert context.tuning_buckets == (64, 256)
+        assert context.round_up
         assert context.measurement_policy is graph_policy
         managed.choose_with_protocol("test.protocol", RecordingProtocol())
     with autotune_v2(persistent_cache=False, mode="replay"):
+        context = managed.protocol_context("test.protocol")
+        assert context.tuning_buckets is None
+        assert not context.round_up
         assert (
             managed.choose_with_protocol("test.protocol", RecordingProtocol())
             == "deferred"
@@ -222,6 +234,97 @@ def test_protocol_policy_is_preserved_after_persistent_context(managed):
     assert context.measurement_policy == policy
     with autotune_v2(persistent_cache=False):
         assert managed.protocol_context("test.protocol").measurement_policy is None
+
+
+def test_protocol_and_runner_entries_share_store(managed, tmp_path, monkeypatch):
+    import torch
+
+    from flashinfer import autotune_v2
+    from flashinfer.autotuner import TuningConfig
+
+    from .utils import DummyRunner
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    tactic = (2, (4, 8))
+    runner, config, inputs = DummyRunner([tactic]), TuningConfig(), [torch.zeros(8)]
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, r, x, t, c, **kw: 1 if t == tactic else 2,
+    )
+    with autotune_v2():
+        assert managed.choose_one("test.runner", [runner], config, inputs)[1] == tactic
+        context = managed.protocol_context("test.protocol")
+        context.publish("64", {"capacity": 64, "knobs": {"tile": (8, 16)}})
+        context.publish("256", {"capacity": 256, "knobs": {"tile": (16, 32)}})
+        managed.protocol_context("test.other").publish("64", [1, [2, 3]])
+        expected = context.records()
+        assert expected["64"]["knobs"]["tile"] == [8, 16]
+    assert len(list(tmp_path.glob("v2/*/entries/*.json"))) == 4
+
+    managed._managed_cache = None
+    managed._managed_stores.clear()
+    managed.clear_cache()
+    with autotune_v2(mode="replay"):
+        # Preload must serve both formats without a per-key disk lookup.
+        monkeypatch.setattr(
+            managed._active_managed_store,
+            "lookup",
+            lambda key: pytest.fail("preloaded entry was not found"),
+        )
+        assert managed.choose_one("test.runner", [runner], config, inputs)[1] == tactic
+        context = managed.protocol_context("test.protocol")
+        assert context.records() == expected
+        assert context.lookup("64") == expected["64"]
+        context.lookup("64")["knobs"]["tile"][0] = 0
+        assert context.records() == expected
+        assert managed.protocol_context("test.other").lookup("64") == [1, [2, 3]]
+        assert not managed.protocol_context("test.absent").records()
+
+
+@pytest.mark.parametrize("mode", ["replay", "write_failure"])
+def test_protocol_keeps_unpersisted_result_in_memory(
+    managed, tmp_path, monkeypatch, mode
+):
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+    import flashinfer.autotune_cache as cache_module
+
+    def fail_write(*args, **kwargs):
+        raise OSError("read-only cache")
+
+    with autotune_v2(mode="replay" if mode == "replay" else "tune"):
+        monkeypatch.setattr(cache_module, "_atomic_write_json", fail_write)
+        managed.protocol_context("test.protocol").publish("shape", {"tile": [8, 16]})
+    assert managed.protocol_context("test.protocol").lookup("shape") == {
+        "tile": [8, 16]
+    }
+    assert not list(tmp_path.glob("v2/*/entries/*.json"))
+    autotune_v2_reload()
+    assert managed.protocol_context("test.protocol").lookup("shape") is None
+
+
+@pytest.mark.parametrize(
+    "fields,runner",
+    [
+        (("__protocol__", "test.protocol", "bad"), "wrong.protocol"),
+        (("__protocol__", "test.protocol", 1), "test.protocol"),
+        (("__protocol__", "test.protocol"), "test.protocol"),
+    ],
+)
+def test_malformed_protocol_entry_does_not_hide_valid_entries(managed, fields, runner):
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    with autotune_v2():
+        managed._active_managed_store.publish(
+            str(fields), runner, {"tile": [0]}, key_fields=fields
+        )
+        managed.protocol_context("test.protocol").publish("valid", {"tile": [8, 16]})
+    autotune_v2_reload()
+    context = managed.protocol_context("test.protocol")
+    assert context.records() == {"valid": {"tile": [8, 16]}}
+    assert context.lookup("bad") is None
 
 
 @pytest.mark.parametrize("local_failure", [False, True])

@@ -157,23 +157,33 @@ skipped, so a protocol can coordinate its fallback or cache decision.
 tuning is enabled. Returning a `TuningResult` does not publish it. Replay imports
 remain in memory. No JSON filename is required.
 
-Protocol records live under `protocols/<namespace_hash>/<key_hash>.json` in the
-same environment directory as tactic entries. Each file contains its namespace,
-key and JSON value. The store validates both hashes and preloads these records
-at attach. Atomic per-record writes preserve unrelated concurrent writes;
-writers to the same key can overwrite each other. `clear_cache()` and
-`autotune_v2_reload()` invalidate lookup memos. The protocol retains its own
-compatibility and bucket selection over these records.
+Protocol results use the same `entries/` files, writer and preload as runner
+tactics. Their structural key is `("__protocol__", namespace, record_key)`;
+`runner` holds the stable protocol namespace and `tactic` holds the JSON result,
+including any metadata needed for selection. Neither field requires a runner
+instance. The protocol owns its record keys and payload schema. Changing
+aggregation or selection requires a distinct key or compatibility check when
+previous results are no longer reusable.
+
+Preload indexes these results by namespace for `context.records()`, preserving
+JSON lists and dictionaries. `context.lookup(key)` reads one result without
+copying the namespace. Both return copies. Ordinary runner tactics keep their
+existing decoding. Atomic writes preserve unrelated entries; writes to the same
+key can overwrite each other. `clear_cache()` and `autotune_v2_reload()` clear
+the namespace index along with other lookup memos. The protocol retains its
+own compatibility and capacity selection rules.
 
 Root and environment switches isolate protocol records. With persistence disabled,
 records use the in-memory measurement-policy partition, and the protocol must
-also disable any compatibility-file reads and writes. Measurement policies and
-inherited graph replay counts are passed to the protocol, which must implement
-or reject them. Protocol records are separate from v1 JSON import/export.
+also disable any compatibility-file reads and writes. Measurement policies,
+inherited graph replay counts, `tuning_buckets` and `round_up` are passed to the
+protocol, which must implement or reject them. Protocol records are separate
+from v1 JSON import/export.
 Existing `autotune()` controls still compose with v2 as described above.
 `context.cache_identity` includes the store or policy identity, reload generation
-and skip state so protocols can invalidate prepared selections. Inherited graph
-replay counts are exposed separately; they are not part of that identity.
+and skip state so protocols can invalidate prepared selections. Replay counts
+and bucket overrides are exposed separately; protocols must account for them
+when reusing prepared state or tuning results.
 Serving outside a context uses the attached store's measurement policy.
 
 ### 2.5 MeasurementPolicy — tune the way you deploy

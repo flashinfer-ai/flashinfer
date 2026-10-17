@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Delegation for operations that own their complete tuning transaction."""
+"""Delegation for operations with their own tuning loop."""
 
 from __future__ import annotations
 
@@ -12,6 +12,17 @@ if TYPE_CHECKING:
     from .autotuner import AutoTuner
 
 T = TypeVar("T")
+
+_PROTOCOL_KEY = "__protocol__"
+
+
+def _protocol_cache_key(namespace: str, key: str) -> tuple[str, str, str]:
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("protocol namespace must be a nonempty string")
+    if not isinstance(key, str):
+        raise TypeError("protocol record key must be a string")
+    return (_PROTOCOL_KEY, namespace, key)
+
 
 # Scope identity is local and never enters a cache key or collective payload.
 _tuning_scope: ContextVar[object | None] = ContextVar("tuning_scope", default=None)
@@ -68,6 +79,16 @@ class TuningContext:
         return self.tuner._override_cuda_graph_profile_replays
 
     @property
+    def tuning_buckets(self) -> tuple[int, ...] | None:
+        """Inherited bucket override, or None for the protocol's own capacities."""
+        return self.tuner._override_tuning_buckets
+
+    @property
+    def round_up(self) -> bool:
+        """Whether the caller requested upward bucket rounding."""
+        return self.tuner._override_round_up
+
+    @property
     def cache_identity(self) -> tuple:
         """Identify the store/policy, cache generation and skip state."""
         return (
@@ -83,7 +104,9 @@ class TuningContext:
         return self.tuner.get_protocol_records(self.namespace)
 
     def lookup(self, key: str) -> Any:
-        return self.records().get(key)
+        if self.skipped:
+            return None
+        return self.tuner.get_protocol_record(self.namespace, key)
 
     def publish(self, key: str, value: Any) -> None:
         if self.skipped:
@@ -107,7 +130,7 @@ class TuningProtocol(Protocol[T]):
     AutoTuner supplies its controls, lock and record storage for single-device
     or distributed tuning. The protocol owns input bucketing, preparation,
     measurement and any distributed coordination. It must implement or reject
-    the measurement policy and inherited replay counts.
+    the measurement policy, inherited replay counts and bucket overrides.
 
     A skipped operation must use its built-in fallback without cache selection.
     Publish selected records through the context; returning a TuningResult

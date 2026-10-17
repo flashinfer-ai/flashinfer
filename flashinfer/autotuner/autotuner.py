@@ -46,6 +46,7 @@ from flashinfer.autotuner.protocol import (
     T,
     TuningContext,
     TuningProtocol,
+    _protocol_cache_key,
     _tuning_scope,
 )
 
@@ -1676,6 +1677,7 @@ class AutoTuner:
         self._dirty_seq = 0
         # Product-owned current-schema records persisted beside tactic records.
         self._namespaced_records: dict[str, dict[str, Any]] = {}
+        # Namespace index of JSON results, partitioned like managed winners.
         self._protocol_record_partitions: dict[tuple, dict[str, dict[str, Any]]] = {}
         self._protocol_cache_generation = 0
         # Namespaces changed in this process and requiring single-writer checks.
@@ -3954,32 +3956,49 @@ class AutoTuner:
         with self._lock:
             self._observed_cache_generations[os.path.abspath(path)] = generation
 
+    def _protocol_records_for_namespace(self, namespace: str) -> dict[str, Any]:
+        _protocol_cache_key(namespace, "")
+        store = self._active_managed_store
+        if store is not None:
+            from flashinfer.autotune_cache import _hydrate_from_store
+
+            _hydrate_from_store(self, store)
+        identity = self._winner_cache_identity() or ("__memory__",)
+        return self._protocol_record_partitions.setdefault(identity, {}).setdefault(
+            namespace, {}
+        )
+
     def get_protocol_records(self, namespace: str) -> dict[str, Any]:
         """Read protocol records under the active persistence identity."""
         with self._lock:
+            return copy.deepcopy(self._protocol_records_for_namespace(namespace))
+
+    def get_protocol_record(self, namespace: str, key: str) -> Any:
+        """Look up one record without copying the entire namespace."""
+        fields = _protocol_cache_key(namespace, key)
+        with self._lock:
+            records = self._protocol_records_for_namespace(namespace)
             store = self._active_managed_store
-            if store is not None:
-                return store.protocol_records(namespace)
-            identity = self._winner_cache_identity() or ("__memory__",)
-            return copy.deepcopy(
-                self._protocol_record_partitions.get(identity, {}).get(namespace, {})
-            )
+            if key not in records and store is not None:
+                entry = store.lookup(str(fields))
+                if entry is not None and entry.runner == namespace:
+                    records[key] = entry.tactic
+            return copy.deepcopy(records.get(key))
 
     def publish_protocol_record(
         self, namespace: str, key: str, value: Any, *, persist: bool
     ) -> None:
-        """Publish through the active store without mixing cache identities."""
+        """Publish a JSON result through the ordinary managed-entry writer."""
+        fields = _protocol_cache_key(namespace, key)
+        # Keep memory and disk results in the same JSON representation. Unlike
+        # runner tactics, protocol payloads do not require hashable tuples.
+        value = json.loads(json.dumps(value, allow_nan=False))
         with self._lock:
-            json.dumps(value, allow_nan=False)
+            records = self._protocol_records_for_namespace(namespace)
+            records[key] = value
             store = self._active_managed_store
-            if store is not None:
-                store.publish_protocol_record(namespace, key, value, persist=persist)
-                return
-            identity = self._winner_cache_identity() or ("__memory__",)
-            records = self._protocol_record_partitions.setdefault(
-                identity, {}
-            ).setdefault(namespace, {})
-            records[key] = copy.deepcopy(value)
+            if store is not None and persist:
+                store.publish(str(fields), namespace, value, key_fields=fields)
 
     def get_namespaced_records(self, namespace: str) -> dict[str, Any]:
         """Return a copy of product-owned records loaded for one namespace."""
