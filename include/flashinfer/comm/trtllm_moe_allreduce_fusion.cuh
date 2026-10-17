@@ -1303,52 +1303,64 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       break;
     }
 
-    // * MoE finalize
-    vec_t<T, VEC_SIZE> accumulator;
-    accumulator.fill(0.f);
-
-    for (int k = 0; k < top_k; k++) {
-      int const expanded_idx = token_id * top_k + k;
-      int32_t const permuted_idx = params.expanded_idx_to_permuted_idx[expanded_idx];
-
-      if (permuted_idx == -1) continue;
-
-      int thread_offset_across_token =
-          permuted_idx * params.hidden_dim + thread_offset_within_token;
-      vec_t<T, VEC_SIZE> permuted_data;
-      permuted_data.load(reinterpret_cast<T*>(params.allreduce_in) + thread_offset_across_token);
-
-      // * acc += scale(data)
-      if (use_scale_factor) {
-        float block_scale =
-            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
+    // * MoE finalize, accumulated in FP32.
+    float acc[VEC_SIZE];
 #pragma unroll
-        for (int i = 0; i < VEC_SIZE; ++i) {
-          // assume computation is done in ScaleType
-          accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
-        }
-      } else {
-        accumulator = vec_add<T, VEC_SIZE>(accumulator, permuted_data);
-      }
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      acc[i] = 0.f;
     }
-
-    // Apply the global routed scaling once after accumulating all routed experts.
-    if (use_routed_scaling_factor) {
-#pragma unroll
-      for (int i = 0; i < VEC_SIZE; ++i) {
-        accumulator[i] = static_cast<T>(static_cast<float>(accumulator[i]) * routed_scaling_factor);
-      }
-    }
-
-    // * Add shared expert output
+    // The shared expert row does not depend on the routing; load it first.
+    vec_t<T, VEC_SIZE> shared_expert_output;
     if (params.shared_expert_output) {
-      // * Load shared expert output
-      int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
-      vec_t<T, VEC_SIZE> shared_expert_output;
       shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
-                                thread_offset_across_token);
+                                token_id * params.hidden_dim + thread_offset_within_token);
+    }
+
+    // Experts are gathered kTopKChunk at a time: all permute indices and scales first, then
+    // all rows, so their loads are in flight together instead of one dependent pair per expert.
+    constexpr int kTopKChunk = 8;
+    for (int k0 = 0; k0 < top_k; k0 += kTopKChunk) {
+      int32_t permuted_idx[kTopKChunk];
+      float block_scale[kTopKChunk];
 #pragma unroll
-      accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
+      for (int j = 0; j < kTopKChunk; ++j) {
+        int const k = k0 + j;
+        int const expanded_idx = token_id * top_k + k;
+        permuted_idx[j] = k < top_k ? params.expanded_idx_to_permuted_idx[expanded_idx] : -1;
+        block_scale[j] = k < top_k && use_scale_factor
+                             ? static_cast<float>(static_cast<ScaleType*>(
+                                   params.expert_scale_factor)[expanded_idx])
+                             : 1.f;
+      }
+      vec_t<T, VEC_SIZE> permuted_data[kTopKChunk];
+#pragma unroll
+      for (int j = 0; j < kTopKChunk; ++j) {
+        if (permuted_idx[j] != -1) {
+          permuted_data[j].load(reinterpret_cast<T*>(params.allreduce_in) +
+                                permuted_idx[j] * params.hidden_dim + thread_offset_within_token);
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kTopKChunk; ++j) {
+        if (permuted_idx[j] != -1) {
+#pragma unroll
+          for (int i = 0; i < VEC_SIZE; ++i) {
+            acc[i] += static_cast<float>(permuted_data[j][i]) * block_scale[j];
+          }
+        }
+      }
+    }
+
+    // Apply the global routed scaling once after accumulating all routed experts, then add the
+    // shared expert output.
+    vec_t<T, VEC_SIZE> accumulator;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float v = use_routed_scaling_factor ? acc[i] * routed_scaling_factor : acc[i];
+      if (params.shared_expert_output) {
+        v += static_cast<float>(shared_expert_output[i]);
+      }
+      accumulator[i] = static_cast<T>(v);
     }
 
     // * AR Store
@@ -1379,15 +1391,21 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) +
+        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
     }
-    vec_t<T, VEC_SIZE> sum_val = vals[0];
+    // Sum the ranks in FP32.
+    vec_t<T, VEC_SIZE> sum_val;
 #pragma unroll
-    for (int r = 1; r < NRanks; ++r) {
-      sum_val = vec_add<T, VEC_SIZE>(sum_val, vals[r]);
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float sum = static_cast<float>(vals[0][i]);
+#pragma unroll
+      for (int r = 1; r < NRanks; ++r) {
+        sum += static_cast<float>(vals[r][i]);
+      }
+      sum_val[i] = static_cast<T>(sum);
     }
 
     // * Fuse: AllReduceOut is always false in finalize_moe_allreduce

@@ -1,5 +1,7 @@
 import multiprocessing as mp
+import os
 import socket
+import time
 from typing import Any
 
 import numpy as np
@@ -8,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from flashinfer.utils import round_up
 
 # todo(Yingyi): add benchmark and quant test
 
@@ -99,8 +102,12 @@ def _run_correctness_worker(
                     quant_out = torch.empty(
                         seq_len * hidden_size // 4, dtype=dtype, device=device
                     )
+                    # E4M3 scales in the SWIZZLED_128x4 layout.
                     scale_out = torch.empty(
-                        seq_len * hidden_size // SF_VEC_SIZE, dtype=dtype, device=device
+                        round_up(seq_len, 128)
+                        * round_up(hidden_size // SF_VEC_SIZE, 4),
+                        dtype=torch.uint8,
+                        device=device,
                     )
                     routed_scaling_factor = 2.5
 
@@ -159,19 +166,18 @@ def _run_correctness_worker(
 
                     torch.cuda.synchronize()
 
-                    # == Calculate reference output ==
+                    # == Calculate reference output (in FP32, like the kernel) ==
                     expert_reduction = torch.sum(
-                        fc2_output_clone[expanded_idx_to_permuted_idx]
-                        * scale.unsqueeze(-1)
+                        fc2_output_clone.float()[expanded_idx_to_permuted_idx]
+                        * scale.float().unsqueeze(-1)
                         * routed_scaling_factor,
                         dim=1,
                     )
 
                     torch_before_residual = (
-                        expert_reduction + shared_expert_output
+                        expert_reduction + shared_expert_output.float()
                     ) * world_size
-                    torch_residual = torch_before_residual + residual
-                    torch_residual = torch_residual.to(torch.float32)
+                    torch_residual = torch_before_residual + residual.float()
                     torch_output_hidden_states = rms_norm(
                         torch_residual, norm_weight, eps
                     ).to(dtype)
@@ -257,6 +263,86 @@ def _run_correctness_worker(
         dist.destroy_process_group(group=group)
 
 
+def _run_back_to_back_worker(world_size, rank, dtype, distributed_init_port):
+    """Replays many back-to-back launches, so a rank can start the next launch
+    while its peers are still in the previous one. Exits with code 2 if the
+    launches do not finish."""
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    group = dist.group.WORLD
+    token_num, top_k = kOneShotMaxTokenNum, 8
+    _, workspace_tensor = comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+        rank, world_size, MAX_TOKEN_NUM, HIDDEN_SIZE, group=group
+    )
+    torch.manual_seed(0)
+    fc2_output = torch.randn(token_num * top_k, HIDDEN_SIZE, dtype=dtype, device=device)
+    expanded_idx_to_permuted_idx = torch.arange(
+        token_num * top_k, dtype=torch.int32, device=device
+    ).view(token_num, top_k)
+    scale = torch.rand(token_num, top_k, dtype=dtype, device=device)
+    residual = torch.randn(token_num, HIDDEN_SIZE, dtype=dtype, device=device)
+    norm_weight = torch.ones(HIDDEN_SIZE, dtype=dtype, device=device)
+    norm_out = torch.empty_like(residual)
+    residual_out = torch.empty_like(residual)
+
+    def run():
+        comm.trtllm_moe_finalize_allreduce_fusion(
+            allreduce_in=fc2_output,
+            residual_in=residual,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            workspace_ptrs=workspace_tensor,
+            launch_with_pdl=True,
+            world_rank=rank,
+            world_size=world_size,
+            eps=1e-5,
+            shared_expert_output=None,
+            expert_scale_factor=scale,
+            norm_out=norm_out,
+            residual_out=residual_out,
+            quant_out=None,
+            scale_out=None,
+            routed_scaling_factor=1.0,
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(20):
+            run()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    for _ in range(50):
+        g.replay()
+    done = torch.cuda.Event()
+    done.record()
+    deadline = time.monotonic() + 60
+    while not done.query():
+        if time.monotonic() > deadline:
+            print(f"Rank {rank}: back-to-back launches did not finish", flush=True)
+            os._exit(2)
+        time.sleep(0.01)
+
+    # Every rank has the same inputs.
+    expected = residual.float() + world_size * (
+        fc2_output.float()[expanded_idx_to_permuted_idx.long()]
+        * scale.float().unsqueeze(-1)
+    ).sum(dim=1)
+    torch.testing.assert_close(residual_out.float(), expected, rtol=2e-2, atol=0.5)
+    dist.barrier(group=group)
+    dist.destroy_process_group(group=group)
+
+
 def get_open_port() -> int:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -327,6 +413,13 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
         ),
     )
     print(f"moe finalize allreduce fusion tp = {world_size}: OK")
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_trtllm_moe_finalize_allreduce_fusion_back_to_back(world_size):
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"world_size {world_size} is greater than available GPUs")
+    multi_process_parallel(world_size, torch.bfloat16, _run_back_to_back_worker)
 
 
 if __name__ == "__main__":
