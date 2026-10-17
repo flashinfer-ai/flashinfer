@@ -1060,14 +1060,17 @@ def _gen_batch_prefill_module(
             "uint8_t",
             "uint8_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
+        # kv_logical_block_size: 0 reads a route element as a page id; a
+        # block-sparse route over a paged cache passes 1 to read flat slots.
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
             "token_pos_in_items_len",
+            "kv_logical_block_size",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+        additional_scalar_dtypes = ["double"] * 4 + ["int64_t"] * 2
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:

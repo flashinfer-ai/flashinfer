@@ -86,6 +86,24 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 }
 
 /*!
+ * \brief Like load_128b<PrefetchMode::kNoPrefetch>, through cp.async.ca so the line is kept in L1
+ *   as well as L2: for a tile that several concurrent blocks read, L1 answers the repeats.
+ * \tparam T Data type
+ * \param smem_ptr Pointer to shared memory
+ * \param gmem_ptr Pointer to global memory
+ */
+template <typename T>
+__device__ __forceinline__ void load_128b_ca(T* smem_ptr, const T* gmem_ptr) {
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr), "l"(gmem_ptr),
+               "n"(16), "r"(16));
+#else
+  *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+#endif
+}
+
+/*!
  * \brief Wrapper of PTX cp.async.cg.shared.global instruction, asynchronously copy data from
  *   global memory to shared memory with predicate.
  * \tparam prefetch_mode Whether to fetch additional data from global memory to L2
