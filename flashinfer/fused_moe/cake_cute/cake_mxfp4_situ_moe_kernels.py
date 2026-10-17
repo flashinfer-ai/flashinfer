@@ -37,6 +37,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -245,7 +246,12 @@ class Kernel:
         binding = _import_source(
             f"{__name__}._generated_{name}_binding", source_path(units["binding"])
         )
-        program = device.compile_program()
+        # the dense GEMM programs are shared by the PDL and _nopdl modules: they take the launch attribute at
+        # compile time; the other programs keep their fixed attribute
+        if "use_pdl" in inspect.signature(device.compile_program).parameters:
+            program = device.compile_program(use_pdl=self.use_pdl)
+        else:
+            program = device.compile_program()
         return binding.Kernel(program)
 
     @property

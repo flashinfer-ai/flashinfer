@@ -5095,10 +5095,10 @@
         "sha256": "9f5874a683450ccef80252ead30776124e442d4a810cbd92df5b403e5e54a343"
       },
       {
-        "bytes": 15942,
+        "bytes": 16300,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_kernels.py",
-        "sha256": "d88e4987e71e51dcd69175ad6a994a18fa8603b093638c60e971c99892102455"
+        "sha256": "8ccf406c0419199892e46f64411a50535113f00c0931435c558a7d30e8ca6280"
       },
       {
         "bytes": 288343,
@@ -5410,10 +5410,10 @@
       "sha256": "39c2c655aaccc599e337a969ec132891cad85cd571d015d7a7afa3c8be1a8ad1"
     },
     {
-      "bytes": 201854,
+      "bytes": 202034,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py",
-      "sha256": "de0ecc0f5fbb677fbf3c039a4d603c9edbdea4607a01fe6150df5ee0778c2a70"
+      "sha256": "e0325e0e57030db85731415a20b916ae8ed5e7a2b9668e62875e6aacadf6ec6f"
     },
     {
       "bytes": 6266,
@@ -5482,10 +5482,10 @@
       "sha256": "0001eda1cad4ea1162fa8c2a52af691d1f1d8493ce2aa28eec0f23dbd79b110a"
     },
     {
-      "bytes": 108762,
+      "bytes": 108942,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py",
-      "sha256": "c19803e5b1816857f67b1b707383e337174ae5d084e093148714556889917932"
+      "sha256": "4b7efa3cbb2975a2b30d691f3d3b9798812a32a6d9d9934f4c7de6fe0e384c8d"
     },
     {
       "bytes": 2949,
@@ -5548,18 +5548,6 @@
       "sha256": "c6c3dafde66d4499d7d110d42be19221c460ddd59ef01a5574885cdfa498da34"
     },
     {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_binding.py",
-      "sha256": "ff516640bcefbc44fb02b5aad1d69e4d46e5a96cc2696689e66cbb0835f501ee"
-    },
-    {
-      "bytes": 201832,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_kernel.py",
-      "sha256": "2e45b99bbc4ff690cc500a6cc1030b434d756a0bc04f1971486859ee572fc0a0"
-    },
-    {
       "bytes": 6266,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_394ae8bc3951d3e66cbe_binding.py",
@@ -5608,18 +5596,6 @@
       "sha256": "4d97c87bef3bd7617e7133de2e48958d3b09e79d50a7bcffb2f96432d3e1cb79"
     },
     {
-      "bytes": 8882,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_binding.py",
-      "sha256": "97e9f6f419d7ac785bbf2b98a52f977047c2df1f07729926da4d4355200f2e43"
-    },
-    {
-      "bytes": 266517,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_kernel.py",
-      "sha256": "a9878bd768e83a7bf7f3c11ac6bac9949f4d5fd3900f3d5187b26733272dde4a"
-    },
-    {
       "bytes": 6266,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_48a8beddc50f3585743e_binding.py",
@@ -5650,10 +5626,10 @@
       "sha256": "04511102abbc75bf67c16de704a290c3f58c4a938486bee90dfdd70b13d000f4"
     },
     {
-      "bytes": 189908,
+      "bytes": 190088,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py",
-      "sha256": "76b0d224b25f9ff5e683645f4d4fc65fb24dcba7a9ed0e012b9d598f51a249f4"
+      "sha256": "6d0d3f4bf7a5559ac43ad87f5f4bb15b374e4f917e7df4e8b0cd05487a3b6d57"
     },
     {
       "bytes": 8237,
@@ -5714,18 +5690,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e5ee0eae63df027f2b0_kernel.py",
       "sha256": "b75e4bc00a7c43a8a4ecf931140f764342335bc474190ff1f995bbfa14855327"
-    },
-    {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_binding.py",
-      "sha256": "354283d0f7ec0b42e477e0827d1033aac55f6a550fff4c8e0c0de5d24d952d38"
-    },
-    {
-      "bytes": 208825,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_kernel.py",
-      "sha256": "8124bde8532f82813274ea6852a8d38e78c4140c9e560e06c44484d4a1c17c2d"
     },
     {
       "bytes": 6266,
@@ -5914,10 +5878,10 @@
       "sha256": "2124bc5a2ded8884c6f8cfa87788467da6e45349e59d0d844b6f9dbce62d4715"
     },
     {
-      "bytes": 126271,
+      "bytes": 126451,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py",
-      "sha256": "68b91151b7d21b8ec8cfea332e03ce7a5f86beb149d57f87ed79ab5f019c4cc7"
+      "sha256": "ee6b42d379be618a0323eb9beec0e237bf124be48eaf7974ea9b2ccc221fa231"
     },
     {
       "bytes": 8237,
@@ -5998,10 +5962,10 @@
       "sha256": "6d3bec475784debdb2f032adae2cb6798de436bb0bef79f6229926eb0b2ac96b"
     },
     {
-      "bytes": 129144,
+      "bytes": 129324,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py",
-      "sha256": "6949329d0ec53f422f7b075b45b41dcb3703cdf8c9688106ed9b7e190ffff019"
+      "sha256": "e05da9c2e94520083f4b71e9be58652c22e38deca0a964a7e162d3b01cd034c5"
     },
     {
       "bytes": 9138,
@@ -6034,10 +5998,10 @@
       "sha256": "b452e920087c28e6a01bc9d165705f4b06c846378a07d610a7c0be753acc8886"
     },
     {
-      "bytes": 266539,
+      "bytes": 266719,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py",
-      "sha256": "002914067fb66ea687ea653bdb7db379b77f6e671642c33ff87a6e5ff91c7cf6"
+      "sha256": "2c3c4ae43583303e214a52278e93ea1361eb8adbde0a4b154a996618d0844954"
     },
     {
       "bytes": 6266,
@@ -6050,42 +6014,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7528d4a7c36462909dd5_kernel.py",
       "sha256": "7c2eaf97574f09bec1aa9928a3941350a2daec776853ff2459b6c7e5702f14fc"
-    },
-    {
-      "bytes": 9137,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_binding.py",
-      "sha256": "fb9aaf2cc1d7daab5ab9c8c38026e48f46a355d3f6fa925c4c3bf5f98c340c9f"
-    },
-    {
-      "bytes": 129122,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_kernel.py",
-      "sha256": "6a3185474e32584b1e2984b9fa5441415a893c1f128ab37b488e4ce835183584"
-    },
-    {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_binding.py",
-      "sha256": "a27fc55e5b19d14881d68b0898f676307dffeef60403079101659e4fcc7fa804"
-    },
-    {
-      "bytes": 189886,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_kernel.py",
-      "sha256": "72fe1340a1e0a6b2a6c2c56f2b4899382d36ab008d73a2cb0a515d79b236ab47"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_binding.py",
-      "sha256": "c9bef4dac596bac97d9fdb8043686556fc03f6588d61b1337d6854a53def9da3"
-    },
-    {
-      "bytes": 108740,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_kernel.py",
-      "sha256": "c80834e051e459ecee80367f1ebce095d2f80e8078edd719cf01e2eead8cd397"
     },
     {
       "bytes": 6266,
@@ -6170,18 +6098,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9221d6e47489705fb9f3_kernel.py",
       "sha256": "2d62c21c79b0038cedb20a09877ea745ed0be33d17ee70879a02a934c11a6579"
-    },
-    {
-      "bytes": 9137,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_binding.py",
-      "sha256": "8bbe4963c2b59f165676f42e793553ea93b546af847f864dfcd404099e9583a1"
-    },
-    {
-      "bytes": 111612,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_kernel.py",
-      "sha256": "b4e194f1a98911cd5500be18f4cba0e2e50c4008aaf6a9e66bef203af2dd44d6"
     },
     {
       "bytes": 6266,
@@ -6370,22 +6286,10 @@
       "sha256": "188366be6962f6db0033ac29f989583ac4cd81a2ff9d777599e522298f4d49d1"
     },
     {
-      "bytes": 129505,
+      "bytes": 129685,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py",
-      "sha256": "4ba88cd7bdfb8eaaab89473c1060942a8894aaa248d5f3ac6736a0081dd38202"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_binding.py",
-      "sha256": "4ffc06f9a1724084734b1837660275a5a022cfc4c0429b66a7d4879654a7907e"
-    },
-    {
-      "bytes": 129483,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_kernel.py",
-      "sha256": "c3d87c1d6bf86a6e5ea75318650966d52a01f927a37c03909254463c107cb506"
+      "sha256": "705dcb41e7f63816fd33f15b488243b1e77e897247ae70b6284a55943f31a03d"
     },
     {
       "bytes": 8237,
@@ -6526,10 +6430,10 @@
       "sha256": "58568bd0568dd65171654cf5f4a83a06104faea37d292db5dded0348cf351833"
     },
     {
-      "bytes": 208847,
+      "bytes": 209027,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py",
-      "sha256": "56813ec6ead85eb2f469c466c1428e9f29f049c375285702695571c51a0f3b4b"
+      "sha256": "1dda13f1b4b65e6a853378504b7721fc8abf7357b5d422a23bddd02711a97c12"
     },
     {
       "bytes": 6266,
@@ -6562,10 +6466,10 @@
       "sha256": "27435911e4609d7771976085183906535312f0edb98004539c3c8218e8cd1f49"
     },
     {
-      "bytes": 111634,
+      "bytes": 111814,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py",
-      "sha256": "a55f32be31f5ea0289fa860a21d515f69a5dd33bdc14c6f423f00f0a9f1e12c0"
+      "sha256": "7d63f9416cd95e72c512b00299217a0ea40722aeb950092c1dd806eb4eca9e9c"
     },
     {
       "bytes": 6266,
@@ -6650,18 +6554,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e0ed95f2da24a7c364d3_kernel.py",
       "sha256": "b742dedeeb224b69e5f7b02b8bca1184eb8dd2d5c9532e89f1f53a2dee9dbe2e"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_binding.py",
-      "sha256": "f6059df5e8e21e0987a8377d421a95edcf3d50f7f20c575f2aac5f00ea7fe02a"
-    },
-    {
-      "bytes": 126249,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_kernel.py",
-      "sha256": "0b76b08f353ed0905aea29191d3a6e49334d8d92013c58290bef70317a0ea705"
     },
     {
       "bytes": 6266,
@@ -9508,9 +9400,9 @@
       },
       "closure": [
         {
-          "bytes": 201854,
+          "bytes": 202034,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py",
-          "sha256": "de0ecc0f5fbb677fbf3c039a4d603c9edbdea4607a01fe6150df5ee0778c2a70"
+          "sha256": "e0325e0e57030db85731415a20b916ae8ed5e7a2b9668e62875e6aacadf6ec6f"
         },
         {
           "bytes": 8854,
@@ -11325,9 +11217,9 @@
       },
       "closure": [
         {
-          "bytes": 108762,
+          "bytes": 108942,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py",
-          "sha256": "c19803e5b1816857f67b1b707383e337174ae5d084e093148714556889917932"
+          "sha256": "4b7efa3cbb2975a2b30d691f3d3b9798812a32a6d9d9934f4c7de6fe0e384c8d"
         },
         {
           "bytes": 9138,
@@ -13005,14 +12897,14 @@
       },
       "closure": [
         {
-          "bytes": 201832,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_kernel.py",
-          "sha256": "2e45b99bbc4ff690cc500a6cc1030b434d756a0bc04f1971486859ee572fc0a0"
+          "bytes": 202034,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py",
+          "sha256": "e0325e0e57030db85731415a20b916ae8ed5e7a2b9668e62875e6aacadf6ec6f"
         },
         {
           "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_binding.py",
-          "sha256": "ff516640bcefbc44fb02b5aad1d69e4d46e5a96cc2696689e66cbb0835f501ee"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_binding.py",
+          "sha256": "39c2c655aaccc599e337a969ec132891cad85cd571d015d7a7afa3c8be1a8ad1"
         }
       ],
       "closure_sha256": "543168463a2301b78b9719b865dd2622925e29f2a1448bb8fcdf0d934b6f54cc",
@@ -13022,7 +12914,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_38c94c53571235d152a9",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_1d4a75945e58e438939d",
       "launch": {
         "block": [
           384,
@@ -13165,9 +13057,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py"
       }
     },
     {
@@ -14645,14 +14537,14 @@
       },
       "closure": [
         {
-          "bytes": 266517,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_kernel.py",
-          "sha256": "a9878bd768e83a7bf7f3c11ac6bac9949f4d5fd3900f3d5187b26733272dde4a"
+          "bytes": 266719,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py",
+          "sha256": "2c3c4ae43583303e214a52278e93ea1361eb8adbde0a4b154a996618d0844954"
         },
         {
           "bytes": 8882,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_binding.py",
-          "sha256": "97e9f6f419d7ac785bbf2b98a52f977047c2df1f07729926da4d4355200f2e43"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_binding.py",
+          "sha256": "b452e920087c28e6a01bc9d165705f4b06c846378a07d610a7c0be753acc8886"
         }
       ],
       "closure_sha256": "ec1c5f6454b35a0381e2e222fe3c021b54fd960eac3ada2a503d3c12a624d356",
@@ -14662,7 +14554,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_461999ab4ec89487bba9",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_732677fc893d245b8761",
       "launch": {
         "block": [
           384,
@@ -14801,9 +14693,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py"
       }
     },
     {
@@ -15607,9 +15499,9 @@
       },
       "closure": [
         {
-          "bytes": 189908,
+          "bytes": 190088,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py",
-          "sha256": "76b0d224b25f9ff5e683645f4d4fc65fb24dcba7a9ed0e012b9d598f51a249f4"
+          "sha256": "6d0d3f4bf7a5559ac43ad87f5f4bb15b374e4f917e7df4e8b0cd05487a3b6d57"
         },
         {
           "bytes": 8854,
@@ -17499,14 +17391,14 @@
       },
       "closure": [
         {
-          "bytes": 208825,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_kernel.py",
-          "sha256": "8124bde8532f82813274ea6852a8d38e78c4140c9e560e06c44484d4a1c17c2d"
+          "bytes": 209027,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py",
+          "sha256": "1dda13f1b4b65e6a853378504b7721fc8abf7357b5d422a23bddd02711a97c12"
         },
         {
           "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_binding.py",
-          "sha256": "354283d0f7ec0b42e477e0827d1033aac55f6a550fff4c8e0c0de5d24d952d38"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_binding.py",
+          "sha256": "58568bd0568dd65171654cf5f4a83a06104faea37d292db5dded0348cf351833"
         }
       ],
       "closure_sha256": "db698efdb396f84729f76c4eb501159ecbaebe94cf3dec19b791dcc6a62713ba",
@@ -17516,7 +17408,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_4e682a0086945425259c",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_d440250f695cbc9f1c43",
       "launch": {
         "block": [
           384,
@@ -17663,9 +17555,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py"
       }
     },
     {
@@ -21981,9 +21873,9 @@
       },
       "closure": [
         {
-          "bytes": 126271,
+          "bytes": 126451,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py",
-          "sha256": "68b91151b7d21b8ec8cfea332e03ce7a5f86beb149d57f87ed79ab5f019c4cc7"
+          "sha256": "ee6b42d379be618a0323eb9beec0e237bf124be48eaf7974ea9b2ccc221fa231"
         },
         {
           "bytes": 9138,
@@ -24153,9 +24045,9 @@
       },
       "closure": [
         {
-          "bytes": 129144,
+          "bytes": 129324,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py",
-          "sha256": "6949329d0ec53f422f7b075b45b41dcb3703cdf8c9688106ed9b7e190ffff019"
+          "sha256": "e05da9c2e94520083f4b71e9be58652c22e38deca0a964a7e162d3b01cd034c5"
         },
         {
           "bytes": 9137,
@@ -25069,9 +24961,9 @@
       },
       "closure": [
         {
-          "bytes": 266539,
+          "bytes": 266719,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py",
-          "sha256": "002914067fb66ea687ea653bdb7db379b77f6e671642c33ff87a6e5ff91c7cf6"
+          "sha256": "2c3c4ae43583303e214a52278e93ea1361eb8adbde0a4b154a996618d0844954"
         },
         {
           "bytes": 8882,
@@ -25660,14 +25552,14 @@
       },
       "closure": [
         {
-          "bytes": 129122,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_kernel.py",
-          "sha256": "6a3185474e32584b1e2984b9fa5441415a893c1f128ab37b488e4ce835183584"
+          "bytes": 129324,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py",
+          "sha256": "e05da9c2e94520083f4b71e9be58652c22e38deca0a964a7e162d3b01cd034c5"
         },
         {
           "bytes": 9137,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_binding.py",
-          "sha256": "fb9aaf2cc1d7daab5ab9c8c38026e48f46a355d3f6fa925c4c3bf5f98c340c9f"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_binding.py",
+          "sha256": "6d3bec475784debdb2f032adae2cb6798de436bb0bef79f6229926eb0b2ac96b"
         }
       ],
       "closure_sha256": "3308eb3388a896f437e7675248b5987de32f598221db065ab0f003a4dac0f750",
@@ -25677,7 +25569,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_75bd0a129e437c606531",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_6fd2cab425181a6f291d",
       "launch": {
         "block": [
           256,
@@ -25831,9 +25723,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py"
       }
     },
     {
@@ -25967,14 +25859,14 @@
       },
       "closure": [
         {
-          "bytes": 189886,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_kernel.py",
-          "sha256": "72fe1340a1e0a6b2a6c2c56f2b4899382d36ab008d73a2cb0a515d79b236ab47"
+          "bytes": 190088,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py",
+          "sha256": "6d0d3f4bf7a5559ac43ad87f5f4bb15b374e4f917e7df4e8b0cd05487a3b6d57"
         },
         {
           "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_binding.py",
-          "sha256": "a27fc55e5b19d14881d68b0898f676307dffeef60403079101659e4fcc7fa804"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_binding.py",
+          "sha256": "04511102abbc75bf67c16de704a290c3f58c4a938486bee90dfdd70b13d000f4"
         }
       ],
       "closure_sha256": "3034391f1fdfabe922e47c3496e6ef92b53218fed67994dbb8b243ed0d0fbcf9",
@@ -25984,7 +25876,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_7ba2742add8b70703b98",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_4a9166a7c40e96ae6031",
       "launch": {
         "block": [
           384,
@@ -26123,9 +26015,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py"
       }
     },
     {
@@ -26223,14 +26115,14 @@
       },
       "closure": [
         {
-          "bytes": 108740,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_kernel.py",
-          "sha256": "c80834e051e459ecee80367f1ebce095d2f80e8078edd719cf01e2eead8cd397"
+          "bytes": 108942,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py",
+          "sha256": "4b7efa3cbb2975a2b30d691f3d3b9798812a32a6d9d9934f4c7de6fe0e384c8d"
         },
         {
           "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_binding.py",
-          "sha256": "c9bef4dac596bac97d9fdb8043686556fc03f6588d61b1337d6854a53def9da3"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_binding.py",
+          "sha256": "0001eda1cad4ea1162fa8c2a52af691d1f1d8493ce2aa28eec0f23dbd79b110a"
         }
       ],
       "closure_sha256": "255061841d74c0ad0dc736a2f0809d2de09de5ff1059f7e634f1a53731be121e",
@@ -26240,7 +26132,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_7bbbab73a144bc109348",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_28f8827fbe1200a49d77",
       "launch": {
         "block": [
           256,
@@ -26388,9 +26280,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py"
       }
     },
     {
@@ -28610,14 +28502,14 @@
       },
       "closure": [
         {
-          "bytes": 111612,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_kernel.py",
-          "sha256": "b4e194f1a98911cd5500be18f4cba0e2e50c4008aaf6a9e66bef203af2dd44d6"
+          "bytes": 111814,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py",
+          "sha256": "7d63f9416cd95e72c512b00299217a0ea40722aeb950092c1dd806eb4eca9e9c"
         },
         {
           "bytes": 9137,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_binding.py",
-          "sha256": "8bbe4963c2b59f165676f42e793553ea93b546af847f864dfcd404099e9583a1"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_binding.py",
+          "sha256": "27435911e4609d7771976085183906535312f0edb98004539c3c8218e8cd1f49"
         }
       ],
       "closure_sha256": "cce4acd9851cda674eeebf670ac5db0ba63b28d27b70286dfd67f1d9a29ea6d7",
@@ -28627,7 +28519,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_9259590e6c86f26a96ae",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c",
       "launch": {
         "block": [
           256,
@@ -28780,9 +28672,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py"
       }
     },
     {
@@ -33355,9 +33247,9 @@
       },
       "closure": [
         {
-          "bytes": 129505,
+          "bytes": 129685,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py",
-          "sha256": "4ba88cd7bdfb8eaaab89473c1060942a8894aaa248d5f3ac6736a0081dd38202"
+          "sha256": "705dcb41e7f63816fd33f15b488243b1e77e897247ae70b6284a55943f31a03d"
         },
         {
           "bytes": 9138,
@@ -33625,14 +33517,14 @@
       },
       "closure": [
         {
-          "bytes": 129483,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_kernel.py",
-          "sha256": "c3d87c1d6bf86a6e5ea75318650966d52a01f927a37c03909254463c107cb506"
+          "bytes": 129685,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py",
+          "sha256": "705dcb41e7f63816fd33f15b488243b1e77e897247ae70b6284a55943f31a03d"
         },
         {
           "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_binding.py",
-          "sha256": "4ffc06f9a1724084734b1837660275a5a022cfc4c0429b66a7d4879654a7907e"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_binding.py",
+          "sha256": "188366be6962f6db0033ac29f989583ac4cd81a2ff9d777599e522298f4d49d1"
         }
       ],
       "closure_sha256": "81a90268f1df865e5753fa66d74d6ddb210d0d21f7d973691662e6bd9906eb43",
@@ -33642,7 +33534,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_ba6019321e44f6c49a14",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_b97edc7bde63a08c2f75",
       "launch": {
         "block": [
           256,
@@ -33795,9 +33687,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py"
       }
     },
     {
@@ -37424,9 +37316,9 @@
       },
       "closure": [
         {
-          "bytes": 208847,
+          "bytes": 209027,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py",
-          "sha256": "56813ec6ead85eb2f469c466c1428e9f29f049c375285702695571c51a0f3b4b"
+          "sha256": "1dda13f1b4b65e6a853378504b7721fc8abf7357b5d422a23bddd02711a97c12"
         },
         {
           "bytes": 8854,
@@ -38192,9 +38084,9 @@
       },
       "closure": [
         {
-          "bytes": 111634,
+          "bytes": 111814,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py",
-          "sha256": "a55f32be31f5ea0289fa860a21d515f69a5dd33bdc14c6f423f00f0a9f1e12c0"
+          "sha256": "7d63f9416cd95e72c512b00299217a0ea40722aeb950092c1dd806eb4eca9e9c"
         },
         {
           "bytes": 9137,
@@ -40594,14 +40486,14 @@
       },
       "closure": [
         {
-          "bytes": 126249,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_kernel.py",
-          "sha256": "0b76b08f353ed0905aea29191d3a6e49334d8d92013c58290bef70317a0ea705"
+          "bytes": 126451,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py",
+          "sha256": "ee6b42d379be618a0323eb9beec0e237bf124be48eaf7974ea9b2ccc221fa231"
         },
         {
           "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_binding.py",
-          "sha256": "f6059df5e8e21e0987a8377d421a95edcf3d50f7f20c575f2aac5f00ea7fe02a"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_binding.py",
+          "sha256": "2124bc5a2ded8884c6f8cfa87788467da6e45349e59d0d844b6f9dbce62d4715"
         }
       ],
       "closure_sha256": "f23e2a7e33adfb81966af24adb4acef6462bdf038b96709d01ea50c2c37d1cf4",
@@ -40611,7 +40503,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_e1933c9307851db41e03",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_6a021d55b7aaa069c148",
       "launch": {
         "block": [
           256,
@@ -40760,9 +40652,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py"
       }
     },
     {
