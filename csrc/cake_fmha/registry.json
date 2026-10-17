@@ -3167,11 +3167,11 @@
           "launch_override": {
             "by_arch": {
               "sm_100a": {
-                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_100a_binding.cu",
+                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu",
                 "dynamic_shared_memory_bytes": 178176
               },
               "sm_103a": {
-                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_103a_binding.cu",
+                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu",
                 "dynamic_shared_memory_bytes": 210944
               }
             },

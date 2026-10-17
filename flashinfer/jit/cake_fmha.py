@@ -32,6 +32,9 @@ _TARGET_FLAGS = {
 }
 _TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _DECODE_NATIVE_BF16_JIT_BINDING = "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+# The b256 sink member's shared host binding reads the architecture's dynamic
+# shared memory (``launch_override.by_arch[arch]``) from this define.
+_SINK_PEER_CLC_DYNAMIC_SMEM_MACRO = "CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES"
 _DECODE_BALANCED_JIT_BINDING = "jit/cake_fmha_decode_balanced_jit_binding.cu"
 CAKE_FMHA_BALANCED_DTYPES = ("bf16", "fp16")
 CAKE_FMHA_BALANCED_MTP_ROWS = (32, 64)
@@ -343,6 +346,28 @@ def _get_component_launch_sources(
         if not source.is_file():
             raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
     return body, launch_binding
+
+
+def _get_component_launch_defines(
+    component_name: str,
+    target: CakeFmhaTarget,
+    selector: Mapping[str, int],
+) -> list[str]:
+    """Defines a member's per-architecture launch override hands its binding.
+
+    A member whose ``launch_override.by_arch`` splits only the dynamic shared
+    memory by architecture compiles one host binding for both architectures;
+    the binding reads the architecture's ``dynamic_shared_memory_bytes`` from
+    ``CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES``.
+    """
+
+    member = _get_component_member(component_name, selector, required=True)
+    assert member is not None
+    by_arch = (member.get("launch_override") or {}).get("by_arch")
+    if by_arch is None:
+        return []
+    smem = by_arch[_TARGET_MANIFEST_ARCH[target]]["dynamic_shared_memory_bytes"]
+    return [f"-D{_SINK_PEER_CLC_DYNAMIC_SMEM_MACRO}={smem}"]
 
 
 def _get_component_sources(
@@ -1172,6 +1197,7 @@ def gen_cake_fmha_decode_native_bf16_module(
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
             f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
+            *_get_component_launch_defines("decode_native_bf16", target, selector),
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )

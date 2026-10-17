@@ -645,10 +645,12 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
     (("sm100a", "sm_100a", 178176), ("sm103a", "sm_103a", 210944)),
 )
 def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
-    target, manifest_arch, shared_memory_bytes
+    monkeypatch, target, manifest_arch, shared_memory_bytes
 ) -> None:
+    import flashinfer.jit.core as jit_core
     from flashinfer.jit import cake_fmha as cake_jit
 
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
     manifest = get_cake_fmha_manifest()
     component = manifest["components"]["decode_native_bf16"]
     sink_members = [
@@ -681,9 +683,11 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
         "USE_SCALE_PTR": 0,
     }
 
-    sink_binding = f"bindings/cake_fmha_decode_native_bf16_sink_peer_clc_{manifest_arch}_binding.cu"
+    sink_binding = "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu"
     launch_override = sink_member["launch_override"]
     arch_override = launch_override["by_arch"][manifest_arch]
+    # Both arches name one host binding; the arch's dynamic shared memory
+    # reaches it through the loader define.
     assert arch_override["binding_source"] == sink_binding
     assert arch_override["dynamic_shared_memory_bytes"] == shared_memory_bytes
     body, binding = cake_jit._get_component_launch_sources(
@@ -691,6 +695,22 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     )
     assert body == get_cake_fmha_csrc_dir() / sink_member["sources"][manifest_arch]
     assert binding == get_cake_fmha_csrc_dir() / sink_binding
+    spec = gen_cake_fmha_decode_native_bf16_module(
+        target,
+        selector["BATCH_SIZE"],
+        selector["Q_LEN"],
+        selector["NUM_Q_HEADS"],
+        selector["NUM_KV_HEADS"],
+        has_sink=True,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=bool(selector["RETAIN_KV_L2"]),
+    )
+    assert Path(spec.sources[1]) == binding
+    assert (
+        f"-DCAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES={shared_memory_bytes}"
+        in spec.extra_cuda_cflags
+    )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True
 
@@ -708,6 +728,89 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     assert "grid_x = Q_LEN;" in exact_branch
     assert "grid_y = NUM_KV_HEADS;" in exact_branch
     assert "grid_z = BATCH_SIZE;" in exact_branch
+
+
+def test_cake_fmha_exact_sink_member_shares_one_host_binding(monkeypatch) -> None:
+    """Both arches compile one sink binding; the loader define carries the smem."""
+
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    macro = "CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES"
+    component = get_cake_fmha_manifest()["components"]["decode_native_bf16"]
+    sink_members = [
+        member
+        for member in component["source_family"]
+        if "BATCH_SIZE" in member["selector"]
+        and member["selector"].get("HAS_SINK") == 1
+    ]
+    (sink_member,) = sink_members
+    launch_override = sink_member["launch_override"]
+    shared_binding = "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu"
+    # Both per-arch records name one binding; the registry keeps the per-arch
+    # dynamic shared memory (the manifest schema is unchanged).
+    assert launch_override["by_arch"] == {
+        "sm_100a": {
+            "binding_source": shared_binding,
+            "dynamic_shared_memory_bytes": 178176,
+        },
+        "sm_103a": {
+            "binding_source": shared_binding,
+            "dynamic_shared_memory_bytes": 210944,
+        },
+    }
+    by_arch_members = [
+        member
+        for member in component["source_family"]
+        if "by_arch" in (member.get("launch_override") or {})
+    ]
+    assert by_arch_members == [sink_member]
+
+    csrc_dir = get_cake_fmha_csrc_dir()
+    for arch in ("sm_100a", "sm_103a"):
+        old_binding = f"cake_fmha_decode_native_bf16_sink_peer_clc_{arch}_binding.cu"
+        assert not (csrc_dir / "bindings" / old_binding).exists()
+    text = (csrc_dir / shared_binding).read_text(encoding="utf-8")
+    assert f"#ifndef {macro}\n#error " in text
+    assert text.count(f"        {macro});\n") == 1
+    assert text.count(f"    config.dynamicSmemBytes = {macro};\n") == 1
+    assert "178176" not in text
+    assert "210944" not in text
+
+    selector = sink_member["selector"]
+    for target, arch in (("sm100a", "sm_100a"), ("sm103a", "sm_103a")):
+        spec = gen_cake_fmha_decode_native_bf16_module(
+            target,
+            selector["BATCH_SIZE"],
+            selector["Q_LEN"],
+            selector["NUM_Q_HEADS"],
+            selector["NUM_KV_HEADS"],
+            has_sink=True,
+            has_window=False,
+            use_scale_ptr=False,
+            retain_kv_l2=False,
+        )
+        assert Path(spec.sources[1]) == csrc_dir / shared_binding
+        smem = launch_override["by_arch"][arch]["dynamic_shared_memory_bytes"]
+        assert spec.extra_cuda_cflags.count(f"-D{macro}={smem}") == 1
+        assert sum(macro in flag for flag in spec.extra_cuda_cflags) == 1
+    # A member whose launch override is not split by arch keeps its own binding
+    # and receives no define.
+    b4_spec = gen_cake_fmha_decode_native_bf16_module(
+        "sm100a",
+        4,
+        1,
+        32,
+        4,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=True,
+    )
+    assert Path(b4_spec.sources[1]).name == (
+        "cake_fmha_decode_native_bf16_b4_exact_cga_binding.cu"
+    )
+    assert not any(macro in flag for flag in b4_spec.extra_cuda_cflags)
 
 
 def test_cake_fmha_decode_native_bf16_exact_b4_grid_matches_cga_selector() -> None:

@@ -3,6 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#ifndef CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES
+#error "CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES (dynamic shared memory of the b256 sink member for the compiled architecture) must be defined"
+#endif
+
 #include "../include/cake_fmha.h"
 
 extern "C" __global__ void kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* O_ptr, float* LSE_ptr, int* page_table, int* causal_seqlens_kv_global, float* scale_log2_ptr, float* sinks_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size);
@@ -31,7 +35,7 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
     cudaError_t status = cudaFuncSetAttribute(
         reinterpret_cast<const void*>(kernel_cake_fmha_decode_native_bf16),
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        178176);
+        CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES);
     if (status != cudaSuccess) {
         return status;
     }
@@ -63,7 +67,7 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
     cudaLaunchConfig_t config = {};
     config.gridDim = dim3(grid_x, grid_y, grid_z);
     config.blockDim = dim3(512, 1, 1);
-    config.dynamicSmemBytes = 178176;
+    config.dynamicSmemBytes = CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES;
     config.stream = stream;
     config.attrs = launch_attributes;
     config.numAttrs = 2;
