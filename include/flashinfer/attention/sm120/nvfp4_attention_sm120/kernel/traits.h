@@ -117,9 +117,12 @@ struct Flash_fwd_kernel_traits {
       decltype(cute::make_tiled_mma(cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{},
                                     AtomLayoutMNK{}, Tile<PermTileM, PermTileN, PermTileK>{}));
 
+  // PV reduces over the KV block (kBlockN), not over the head dim. A PermTileK
+  // (= kHeadDim) tiler was benign while it divides kBlockN (head_dim 64/128),
+  // but silently aliases smem/SF fragments once kHeadDim > kBlockN.
   using TiledMmaPV =
       decltype(cute::make_tiled_mma(cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{},
-                                    AtomLayoutMNK{}, Tile<PermTileM, _32, PermTileK>{}));
+                                    AtomLayoutMNK{}, Tile<PermTileM, _32, Int<kBlockN>>{}));
 
   using AtomLayoutMNK_Full = Layout<Shape<_8, _1, _1>>;
   using TiledMmaQK_Full = decltype(cute::make_tiled_mma(
@@ -127,11 +130,11 @@ struct Flash_fwd_kernel_traits {
       Tile<Int<kBlockM>, PermTileN, PermTileK>{}));
   using TiledMmaPV_Full =
       decltype(cute::make_tiled_mma(cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{},
-                                    AtomLayoutMNK_Full{}, Tile<Int<kBlockM>, _32, PermTileK>{}));
+                                    AtomLayoutMNK_Full{}, Tile<Int<kBlockM>, _32, Int<kBlockN>>{}));
   using AtomLayoutMNK_Store = Layout<Shape<Int<kStoreBlockM / 16>, _1, _1>>;
   using TiledMmaPV_Store = decltype(cute::make_tiled_mma(
       cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{}, AtomLayoutMNK_Store{},
-      Tile<Int<kStoreBlockM>, _32, PermTileK>{}));
+      Tile<Int<kStoreBlockM>, _32, Int<kBlockN>>{}));
 
   static constexpr int MMA_NSF = size<2>(typename TiledMmaQK::AtomShape_MNK{}) / SFVectorSize;
 
