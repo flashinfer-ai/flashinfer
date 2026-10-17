@@ -977,7 +977,9 @@ def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
 # barrier, token loop unrolled; bitwise-identical output), every other
 # architecture and every T=1 band row the shipped wide body.  Mirrors
 # `BF16_WIDE_ARCH_BODIES` / `select_bf16_wide_body` of the Cake exporter.
-CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
+# CAKE-1096 R26 (lane P2, P2-W1-WIDE): sm_107a takes the `wide128_vpre_xchg` twin (exchange-based
+# output path of `wide128_vpre`; bitwise-identical output) for the T >= 2 wide rows.
+CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre_xchg"}
 # The promoted fp32-state MTP update body (B4 T4 with the intermediate-state cache,
 # `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
 # `_pro` twin (producer phase parallel over the draft tokens, every independent global
