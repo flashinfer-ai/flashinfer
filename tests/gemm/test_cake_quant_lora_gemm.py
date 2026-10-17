@@ -2583,10 +2583,14 @@ def test_fp8_sm90_dispatch_rule():
         "fp8_sm90",
         "fp8_sm90_hint",
     )
+    # The gated program's raster group is 1 since CAKE-2550 step 2 (4 since #6324): on the one contract row the rule
+    # selects (M 131072 x N 8192 x K 32768) this program reads 60.1-60.7 ms back to back / 58.7-60.4 ms cooled at group 1
+    # against 64.3-67.7 / 69.0-80.0 ms at group 4 (six same-GPU interleaved CUPTI cold-L2 runs on two H100 nodes, four of
+    # them sweeping the group; group 2 60.5-62.2 / 59.4-63.0 ms, group 8 79.5 ms); the output is bit-identical across groups.
     assert (
         (default["group_m"], gated["group_m"])
         == (constants["default_group_m"], constants["gated_group_m"])
-        == (8, 4)
+        == (8, 1)
     )
     assert default["form"] != gated["form"]
     assert default["block_n"] == gated["block_n"] == constants["block_n"] == 192
