@@ -1,6 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 from dataclasses import replace
 
 import pytest
@@ -21,6 +22,7 @@ from tests.prims_ts.gemm_fp4_reference import (
     dequantize_nvfp4_128x4,
     linear_scale_to_128x4,
 )
+from tests.prims_ts.test_gemm_fp8 import _qknorm_rope_oracle, _qkv_rope_inputs
 
 
 def _require_gemm_gpu():
@@ -536,3 +538,99 @@ def test_nvfp4_overlap_epilogue_warp_config_isolation():
     assert base != wide
     assert _load_kernel(base).num_epilogue_warps == 4
     assert _load_kernel(wide).num_epilogue_warps == 8
+
+
+def test_fp4_linear_delta_matches_sum():
+    _require_gemm_gpu()
+    m, n, k = 200, 1024, 512
+    a, a_scale, w, w_scale = _fp4_problem(m, n, k)
+    a_sf, w_sf = _swizzled(a_scale, w_scale)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    base = fp4_linear(a, a_sf, 0.5, w, w_sf, 2.0)
+    actual = fp4_linear(a, a_sf, 0.5, w, w_sf, 2.0, delta=delta)
+    torch.testing.assert_close(
+        actual.float(), base.float() + delta.float(), atol=2e-2, rtol=1e-2
+    )
+    prepared = prepare_fp4_linear(w, w_sf, 0.5, 2.0)
+    torch.testing.assert_close(prepared(a, a_sf), base, atol=0, rtol=0)
+    torch.testing.assert_close(prepared(a, a_sf, delta=delta), actual, atol=0, rtol=0)
+    torch.testing.assert_close(prepared(a, a_sf), base, atol=0, rtol=0)
+
+
+def test_fp4_swiglu_delta_is_added_before_activation():
+    _require_gemm_gpu()
+    m, n, k = 200, 1024, 512
+    a, a_scale, w, w_scale = _fp4_problem(m, n, k)
+    a_sf, w_sf = _swizzled(a_scale, w_scale)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    prepared = prepare_fp4_linear_swiglu(w, w_sf, 1.0, 1.0)
+    actual = prepared(a, a_sf, delta=delta)
+    linear = fp4_linear(a, a_sf, 1.0, w, w_sf, 1.0, delta=delta).float()
+    expected = linear[:, 0::2] * F.silu(linear[:, 1::2])
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)
+    with pytest.raises(ValueError, match="delta"):
+        prepare_fp4_linear_swiglu(w, w_sf, 1.0, 1.0, out_dtype=torch.uint8)(
+            a, a_sf, delta=delta
+        )
+
+
+def test_fp4_qkv_delta_is_added_before_qknorm():
+    _require_gemm_gpu()
+    m, n, k, head_dim = 200, 1536, 512, 128
+    a, a_scale, w, w_scale = _fp4_problem(m, n, k)
+    a_sf, w_sf = _swizzled(a_scale, w_scale)
+    q_weight, k_weight, cos_sin, positions = _qkv_rope_inputs(m, head_dim)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    prepared = prepare_fp4_qkv_qknorm_rope(
+        w,
+        w_sf,
+        1.0,
+        1.0,
+        q_weight,
+        k_weight,
+        num_q_heads=4,
+        num_kv_heads=4,
+        head_dim=head_dim,
+    )
+    actual = prepared(a, a_sf, cos_sin=cos_sin, positions=positions, delta=delta)
+    base = fp4_linear(a, a_sf, 1.0, w, w_sf, 1.0, delta=delta).float()
+    expected = _qknorm_rope_oracle(base, q_weight, k_weight, cos_sin, 4, head_dim)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("epilogue", ["linear", "swiglu", "qkv_qknorm_rope"])
+def test_fp4_delta_tmem_overlap_matches_plain(epilogue):
+    _require_gemm_gpu()
+    m, k, head_dim = 4097, 512, 128
+    n = 1536 if epilogue == "qkv_qknorm_rope" else 2048
+    a, asf, b, bsf = _fp4_problem(m, n, k)
+    sfa, sfb = _swizzled(asf, bsf)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    call = {}
+    if epilogue == "qkv_qknorm_rope":
+        q_weight, k_weight, cos_sin, positions = _qkv_rope_inputs(m, head_dim)
+        call = dict(cos_sin=cos_sin, positions=positions)
+        prepare = functools.partial(
+            prepare_fp4_qkv_qknorm_rope,
+            b,
+            sfb,
+            1.0,
+            1.0,
+            q_weight,
+            k_weight,
+            num_q_heads=4,
+            num_kv_heads=4,
+            head_dim=head_dim,
+        )
+    else:
+        prepare_fn = (
+            prepare_fp4_linear if epilogue == "linear" else prepare_fp4_linear_swiglu
+        )
+        prepare = functools.partial(prepare_fn, b, sfb, 1.0, 1.0)
+    plain = prepare()
+    overlap = prepare(tmem_overlap=True)
+    assert overlap.config.tmem_overlap and not plain.config.tmem_overlap
+    expected = plain(a, sfa, delta=delta, **call)
+    actual = overlap(a, sfa, delta=delta, **call)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(overlap(a, sfa, **call), actual)
