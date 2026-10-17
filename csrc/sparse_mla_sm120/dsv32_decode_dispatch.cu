@@ -71,7 +71,7 @@ static bool launch_decode_dsv3_2_impl(
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
       chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row,
-      flashinfer::uint_fastdiv(uint32_t(page_size)));
+      flashinfer::uint_fastdiv(uint32_t(page_size)), nullptr);
   DSV32_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).

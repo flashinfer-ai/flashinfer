@@ -7,9 +7,9 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
+template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD, typename MidT = bf16>
 static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
-    sparse_mla_decode_dsv4_merge_kernel(const bf16* __restrict__ mid_out,
+    sparse_mla_decode_dsv4_merge_kernel(const MidT* __restrict__ mid_out,
                                         const float* __restrict__ mid_lse,
                                         bf16* __restrict__ output, float* __restrict__ out_lse,
                                         const float* __restrict__ attn_sink, int num_tokens,
@@ -77,7 +77,7 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
   const float global_max = sm_gmax;
   const float inv_global_sum = sm_inv_gsum;
 
-  const bf16* mid_base = mid_out + ((size_t)t_idx * m_heads + h) * (size_t)num_splits * D_V_VAL;
+  const MidT* mid_base = mid_out + ((size_t)t_idx * m_heads + h) * (size_t)num_splits * D_V_VAL;
   bf16* out_ptr = output + ((size_t)t_idx * q_heads + h) * D_V_VAL;
   const int dim_base = tid * DIMS_PER_THREAD;
 
@@ -89,7 +89,17 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
     float lse_sp = sm_lse[sp];
     if (lse_sp <= -1e29f) continue;
     const float weight = exp2f(lse_sp - global_max);
-    const bf16* row_base = mid_base + (size_t)sp * D_V_VAL + dim_base;
+    const MidT* row_base = mid_base + (size_t)sp * D_V_VAL + dim_base;
+    if constexpr (sizeof(MidT) == sizeof(float)) {
+#pragma unroll
+      for (int v = 0; v < DIMS_PER_THREAD / 4; ++v) {
+        const float4 f = *reinterpret_cast<const float4*>(row_base + v * 4);
+        acc[v * 4] += weight * f.x;
+        acc[v * 4 + 1] += weight * f.y;
+        acc[v * 4 + 2] += weight * f.z;
+        acc[v * 4 + 3] += weight * f.w;
+      }
+    } else {
 #pragma unroll
     for (int v = 0; v < VECS_PER_THREAD; v++) {
       const uint4 packed = *reinterpret_cast<const uint4*>(row_base + v * 8);
@@ -100,6 +110,7 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
         acc[v * 8 + p * 2 + 0] += weight * f.x;
         acc[v * 8 + p * 2 + 1] += weight * f.y;
       }
+    }
     }
   }
 

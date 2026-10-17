@@ -44,7 +44,7 @@ __device__ __forceinline__ void qk_fp8_nope_16x8(float qk[4], const uint8_t* q, 
   }
 }
 
-template <typename KV>
+template <typename KV, bool DUPLICATE_Q_ROWS = false>
 __device__ __forceinline__ void qk_fp8_scale_group_16x8(float& acc0, float& acc1, float& acc2,
                                                         float& acc3, const uint8_t* q,
                                                         const uint8_t* k, int group, uint8_t sfa,
@@ -53,7 +53,8 @@ __device__ __forceinline__ void qk_fp8_scale_group_16x8(float& acc0, float& acc1
   for (int ks = 0; ks < KV::QUANT_TILE / 32; ks++) {
     const int ko = group * KV::QUANT_TILE + ks * 32;
     uint32_t a0, a1, a2, a3, b0, b1;
-    ldmatrix_load_a_packed_16x32_bytes(a0, a1, a2, a3, q + ko, KV::Q_NOPE_STRIDE, lane);
+    ldmatrix_load_a_packed_16x32_bytes(a0, a1, a2, a3, q + ko, KV::Q_NOPE_STRIDE,
+                                       DUPLICATE_Q_ROWS ? (lane & ~8) : lane);
     ldmatrix_load_b_packed_8x32_bytes(b0, b1, k + ko, KV::KV_SMEM_STRIDE, lane);
     MmaFp8Result r =
         mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1, acc2, acc3, sfa, sfb);

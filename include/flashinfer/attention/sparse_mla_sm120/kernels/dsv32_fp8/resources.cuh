@@ -20,20 +20,33 @@ constexpr int DSV32_KV_BUF_COUNT = 2;
 constexpr int DSV32_ENTRIES_PER_WARP = DSV32_BI / DSV32_N_WARPS;  // 8
 constexpr int DSV32_QK_N_TILES = DSV32_ENTRIES_PER_WARP / 8;      // 1
 
-template <ModelType MT>
+template <ModelType MT, int NUM_HEADS>
+struct Dsv32DecodeConfig {
+  static constexpr bool HALF_HEAD_TILE = MT == ModelType::GLM_NSA_NVFP4 && NUM_HEADS == 8;
+  static constexpr int BI = HALF_HEAD_TILE ? 32 : DSV32_BI;
+  static constexpr int MATH_WARPS = HALF_HEAD_TILE ? 4 : DSV32_N_WARPS;
+  static constexpr int MATH_THREADS = MATH_WARPS * 32;
+  static constexpr int BLOCK_THREADS = MATH_THREADS + DSV32_IO_THREADS;
+  static constexpr int Q_ROWS = HALF_HEAD_TILE ? 8 : HPB;
+  static constexpr int ENTRIES_PER_WARP = BI / MATH_WARPS;
+  static constexpr int QK_N_TILES = ENTRIES_PER_WARP / 8;
+};
+
+template <ModelType MT, int NUM_HEADS = 0>
 struct Dsv32DecodeSmem {
   using KV = KVCacheTraits<MT>;
+  using Cfg = Dsv32DecodeConfig<MT, NUM_HEADS>;
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
-  static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
-  static constexpr size_t SMEM_Q_FP8 = HPB * KV::Q_NOPE_STRIDE;
-  static constexpr size_t SMEM_Q_SC = HPB * KV::NUM_SCALES * sizeof(float);
-  static constexpr size_t SMEM_KV_FP8_BUF = DSV32_BI * KV::KV_SMEM_STRIDE;
-  static constexpr size_t SMEM_KV_ROPE_BUF = DSV32_BI * KV::D_ROPE * sizeof(bf16);
+  static constexpr size_t SMEM_Q_ROPE = Cfg::Q_ROWS * KV::D_ROPE * sizeof(bf16);
+  static constexpr size_t SMEM_Q_FP8 = Cfg::Q_ROWS * KV::Q_NOPE_STRIDE;
+  static constexpr size_t SMEM_Q_SC = Cfg::Q_ROWS * KV::NUM_SCALES * sizeof(float);
+  static constexpr size_t SMEM_KV_FP8_BUF = Cfg::BI * KV::KV_SMEM_STRIDE;
+  static constexpr size_t SMEM_KV_ROPE_BUF = Cfg::BI * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_MBAR_PAIR = 2 * sizeof(uint64_t);
-  static constexpr size_t SMEM_REDUCE = 2 * DSV32_N_WARPS * HPB * sizeof(float);
+  static constexpr size_t SMEM_REDUCE = 2 * Cfg::MATH_WARPS * HPB * sizeof(float);
   static constexpr size_t SMEM_W_HEAD_SC = N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_BUF = HPB * (DSV32_BI + 16);
+  static constexpr size_t SMEM_W_FP8_BUF = HPB * (Cfg::BI + 16);
 
   static constexpr size_t OFF_Q_ROPE = 0;
   static constexpr size_t OFF_Q_FP8 = OFF_Q_ROPE + SMEM_Q_ROPE;
@@ -78,7 +91,7 @@ struct Dsv32DecodeSmem {
     return reinterpret_cast<float*>(base + OFF_REDUCE);
   }
   __device__ __forceinline__ float* warp_max() const { return reduce(); }
-  __device__ __forceinline__ float* warp_sum() const { return reduce() + DSV32_N_WARPS * HPB; }
+  __device__ __forceinline__ float* warp_sum() const { return reduce() + Cfg::MATH_WARPS * HPB; }
   __device__ __forceinline__ float* w_head_sc() const {
     return reinterpret_cast<float*>(base + OFF_W_HEAD_SC);
   }
