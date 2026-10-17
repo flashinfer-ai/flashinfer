@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import importlib
+import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -238,10 +241,10 @@ def test_registry_routes_every_variant_to_one_generated_program():
     for variant in variants:
         record = cake_jit.MODULES[variant.module]
         assert variant.body_path.name.startswith("cake_fused_kda_decode_")
-        assert variant.binding_path.name.startswith("cake_fused_kda_decode_")
-        assert variant.body_path.is_file() and variant.binding_path.is_file()
-        assert variant.body_path.name == record["sources"][0]
-        assert variant.binding_path.name == record["sources"][1]
+        assert variant.binding_template.parent.name == "cake_fused_kda_decode_templates"
+        assert variant.binding_template.name.startswith(variant.abi_kind)
+        assert variant.body_path.is_file() and variant.binding_template.is_file()
+        assert record["sources"] == [variant.body_path.name]
         assert [
             flag for flag in variant.extra_cuda_cflags if flag.startswith("-D")
         ] == [f"-D{define}" for define in record["defines"]]
@@ -257,6 +260,26 @@ def test_registry_routes_every_variant_to_one_generated_program():
         else:
             assert "--use_fast_math" in variant.extra_cuda_cflags
         assert len(variant.source_sha256) == 64
+
+
+def test_bindings_render_to_the_former_per_program_text():
+    # Every program's tvm-ffi binding is rendered from the template of its launch
+    # ABI; the sidecar pins the rendered text to the sha256 of the checked-in
+    # binding file it replaced (keyed by generated program).
+    sidecar = Path(__file__).with_name("cake_fused_kda_decode_binding_sha256.json")
+    pinned = json.loads(sidecar.read_text(encoding="utf-8"))
+    variants = cake_jit.get_cake_fused_kda_decode_variants()
+    assert sorted(pinned) == sorted(variant.module for variant in variants)
+    for variant in variants:
+        text = cake_jit.render_cake_fused_kda_decode_binding(variant)
+        assert "@" not in text, variant.name
+        assert f'extern "C" __global__ void {variant.kernel_symbol}(' in text
+        assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({variant.ffi_entry}, " in text
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        assert digest == pinned[variant.module], variant.name
+        # The binding does not depend on the target architecture.
+        sm103 = cake_jit.get_cake_fused_kda_decode_variant(variant.name, "sm103a")
+        assert cake_jit.render_cake_fused_kda_decode_binding(sm103) == text
 
 
 # Shared kernel bodies: a route compiles ``MODULES[...]["sources"][0]`` with the
@@ -858,7 +881,10 @@ def test_cake_jit_spec_uses_exact_target_flags(
     variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
     spec = cake_jit.gen_cake_fused_kda_decode_module(variant.name, target)
     assert spec.name == cake_jit.get_cake_fused_kda_decode_uri(variant.name, target)
-    assert list(spec.sources) == [variant.body_path, variant.binding_path]
+    binding = tmp_path / spec.name / "cake_fused_kda_decode_binding.cu"
+    assert list(spec.sources) == [variant.body_path, binding]
+    rendered = cake_jit.render_cake_fused_kda_decode_binding(variant)
+    assert binding.read_text(encoding="utf-8") == rendered
     assert [
         flag for flag in spec.extra_cuda_cflags if flag.startswith("-gencode=")
     ] == [f"-gencode=arch=compute_10{minor}a,code=sm_10{minor}a"]
