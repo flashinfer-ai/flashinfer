@@ -40,7 +40,7 @@ A prepared launch performs no allocation and no host synchronisation and is
 CUDA-graph capturable; the caller runs it once eagerly before capturing
 (first-call binding side effects: dynamic-smem opt-in, lazy module load).
 Nothing here reads the environment: every switch is a keyword, resolved by
-the ``flashinfer.fused_moe`` facade.
+the public fused-MoE facade (``CakeStepFunConfig`` / ``CakeStepFunRunner``).
 """
 
 from __future__ import annotations
