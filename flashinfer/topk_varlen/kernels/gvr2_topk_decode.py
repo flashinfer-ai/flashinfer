@@ -1599,13 +1599,11 @@ class GvrMainKernel:
             )
         # TSH-floor staging arm.  SPLIT-only compile-time key; the CUDA form
         # is a grid-uniform runtime gate over the same predicate
-        # (b > 15 && k <= 1024 && n4 <= 32768).  varlen mode compiles the
-        # machinery in whenever SPLIT and gates it per row at runtime
-        # (tsh_en && n4 <= 32768) — mirroring the CUDA runtime gate.
-        if self.varlen:
-            self.tshg = bool(split)
-        else:
-            self.tshg = bool(tshg) and bool(split)
+        # (b > 15 && k <= 1024 && n4 <= 32768).  FlashInfer-local: in varlen
+        # mode the rows that gate admits (tsh_en && n4 <= 32768, per row)
+        # sample 4x denser instead (see the ladder), so the floor is not
+        # compiled in.
+        self.tshg = bool(tshg) and bool(split) and not self.varlen
         # derived constexprs (bit-identical to the CUDA)
         self.hb = nbs
         self.kbig = (kpt >= 2) and (kpt * blk >= 2048)
@@ -2061,7 +2059,7 @@ class GvrMainKernel:
                 else:
                     Q = cutlass.Int32(0)
             # per-row TSH-floor runtime gate (CUDA parity: b>15 && k<=1024 in
-            # tsh_en, n4 <= 32768 per row)
+            # tsh_en, n4 <= 32768 per row); here it selects the denser sample
             tsh_run = cutlass.Int32(0)
             if tsh_en != cutlass.Int32(0):
                 if (n >> cutlass.Int32(2)) <= cutlass.Int32(32768):
@@ -2300,8 +2298,20 @@ class GvrMainKernel:
                     if gate != cutlass.Int32(0):
                         # sel = sfac*n // aim via rcp (sfac*n <= 2^24: f32-exact
                         # to the last unit; quotient error < 1 => +-1 drift)
+                        # FlashInfer-local: a row the TSH floor would guard samples
+                        # 4x denser instead. The sample comes in runs of 8 adjacent
+                        # values and its rank-TGT rung sits at about sfac (16), so two
+                        # runs over a cluster of high scores can put the rung above
+                        # the k-th value (real DSv4 rows: count(>= T) down to 0.94 k);
+                        # the floor (rank 2 * TGT) catches that by staging about twice
+                        # the candidates for the last CTA. At 4x the rung needs eight
+                        # such runs (captured V4.1/DSv4 rows: count >= 2.4 k), and the
+                        # last CTA ranks half as many candidates.
+                        sfr = sfac
+                        if tsh_run != cutlass.Int32(0):
+                            sfr = sfac * cutlass.Int32(4)
                         sel = cutlass.Int32(
-                            cutlass.Float32(sfac * n) * cute.arch.rcp_approx(cutlass.Float32(aim))
+                            cutlass.Float32(sfr * n) * cute.arch.rcp_approx(cutlass.Float32(aim))
                         )
                         if sel < cutlass.Int32(256):
                             sel = cutlass.Int32(256)
@@ -2622,8 +2632,8 @@ class GvrMainKernel:
                 # count(>=TSH) >= k.  TSH miss falls to GMIN/degen unchanged.
                 cute.arch.barrier()
                 t5s = s_tsh[0]
-                # varlen: per-row runtime gate (tsh_run == 1 always in legacy
-                # mode, so legacy codegen semantics are unchanged)
+                # legacy mode only (tsh_run == 1): varlen compiles the floor
+                # out and samples the rows it would guard 4x denser instead
                 if tsh_run != cutlass.Int32(0):
                     if t5s > cutlass.Float32(_NEG_INF):
                         if t5s < T:
@@ -3667,8 +3677,8 @@ def get_compiled(
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
-    — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
-    machinery in whenever SPLIT and gates it per row at runtime).
+    — per-row varlen mode (TSHG slot is ignored: varlen engines never compile
+    the TSH floor; the rows it would guard sample 4x denser instead).
     ``hint_free`` compiles the hint-gather sites out (part of the key).
 
     ``prefill`` selects the per-row [ks, ke) window mode (TRT-LLM #18702). It
