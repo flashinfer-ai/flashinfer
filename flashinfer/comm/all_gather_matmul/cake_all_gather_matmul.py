@@ -31,10 +31,12 @@ largest padded row count seen; ``prepare_all_gather_matmul`` sizes it once
 for ``max_rows`` and the returned launcher then serves every ``M`` up to that
 capacity without another collective. Calls with at most 512 padded local
 rows at world sizes 4 and 8 whose ``N`` is within the route's width ceiling
-(``loader.sm_push_max_cols``: 10240 at 128 padded rows, 4096 at 512) replace
-the copy-engine pushes with one SM push kernel chained to the main kernel
-through programmatic dependent launch; wider GEMMs overlap the copy-engine
-pushes instead.
+(``loader.sm_push_max_cols``: 10240 at 128 padded rows, 4096 at 512), and the
+calls in the device architecture's SM push bands
+(``loader.SM_PUSH_BANDS_BY_ARCH``: on ``sm_103a`` the eight-rank calls of
+exactly 1024 padded rows with ``N <= 1619``), replace the copy-engine pushes
+with one SM push kernel chained to the main kernel through programmatic
+dependent launch; wider GEMMs overlap the copy-engine pushes instead.
 Every symmetric rendezvous is checked against the tensor it was returned
 for: torch's NVSHMEM allocator before pytorch#192579 hands a new allocation
 at a freed address the freed buffer's cached handle, and the backend
@@ -648,10 +650,12 @@ def _prepare_session(
                 call.arch,
             )
         # The SM push route's device tables are resolved now (when any row
-        # count of this group and width can take that route: the ceiling is
-        # widest at 128 padded rows) so a captured call allocates nothing.
-        sm_push = loader.uses_sm_push(
-            rows=loader.BLOCK_M, world_size=call.world_size, cols=call.n
+        # count of this group and width can take that route on this device's
+        # architecture: the base rule at its widest ceiling, 128 padded rows,
+        # or one of the architecture's bands) so a captured call allocates
+        # nothing.
+        sm_push = loader.sm_push_reachable(
+            world_size=call.world_size, cols=call.n, arch=call.arch
         )
         if (
             sm_push
@@ -752,6 +756,7 @@ def _launch(
             rows=rows,
             world_size=call.world_size,
             cols=call.n,
+            arch=call.arch,
         )
         if capturing and sm_push and workspace.push_buffers is None:
             # A caller error, not a failed collective: nothing was submitted.
@@ -794,12 +799,26 @@ def _launch(
                 dtype_name=call.dtype_name,
                 b_layout=call.b_layout,
             )
+            # Form of the main program for this call ("cg1", or "cg2" when the
+            # loader's table routes this class and shape to the CTA-pair twin,
+            # launched as clusters of two CTAs on an even grid).
+            form = loader.main_form(
+                rows,
+                call.n,
+                world_size=world_size,
+                arch=call.arch,
+                dtype_name=call.dtype_name,
+                b_layout=call.b_layout,
+                block_n=block_n,
+            )
+            main_cg2 = 1 if form == "cg2" else 0
             grid_x, grid_y, grid_z = loader.main_grid(
                 rows,
                 call.n,
                 world_size=world_size,
                 sm_count=facts.sm_count,
                 block_n=block_n,
+                form=form,
             )
             if sm_push:
                 # The SM push kernel and the main kernel run on the caller's
@@ -824,6 +843,7 @@ def _launch(
                     grid_y,
                     grid_z,
                     block_n,
+                    main_cg2,
                     main_handle,
                     workspace.comm_handle,
                 )
@@ -853,6 +873,7 @@ def _launch(
                     grid_y,
                     grid_z,
                     block_n,
+                    main_cg2,
                     main_handle,
                     workspace.comm_handle,
                 )
