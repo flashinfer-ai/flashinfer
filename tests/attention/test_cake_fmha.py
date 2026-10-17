@@ -463,8 +463,8 @@ def test_cake_fmha_smallm_components_share_one_folded_source() -> None:
         (
             "decode_quant_fp8",
             {
-                "sm_100a": "cuda/decode_quant_fp8/sm_100a/default.cu",
-                "sm_103a": "cuda/decode_quant_fp8/sm_103a/default.cu",
+                "sm_100a": "cuda/decode_quant_fp8/default.cu",
+                "sm_103a": "cuda/decode_quant_fp8/default.cu",
             },
         ),
     ),
@@ -489,6 +489,36 @@ def test_cake_fmha_decode_quant_members_share_one_folded_source(
         ]
         assert guards
         assert len(guards) == text.count("#endif  // PAGE_SIZE\n")
+
+
+def test_cake_fmha_decode_quant_fp8_members_share_one_arch_source() -> None:
+    """Both arches compile one decode_quant_fp8 source split only by __CUDA_ARCH__."""
+
+    folded = "cuda/decode_quant_fp8/default.cu"
+    arches = ("sm_100a", "sm_103a")
+    component = get_cake_fmha_manifest()["components"]["decode_quant_fp8"]
+    members = component["source_family"]
+    assert sorted(member["selector"]["PAGE_SIZE"] for member in members) == [16, 32]
+    sources = {member["sources"][arch] for member in members for arch in arches}
+    assert sources == {folded}
+    csrc_dir = get_cake_fmha_csrc_dir()
+    for arch in arches:
+        assert not (csrc_dir / f"cuda/decode_quant_fp8/{arch}").exists()
+    text = (csrc_dir / folded).read_text(encoding="utf-8")
+    lines = text.split("\n")
+    assert "#define __CUDA_ARCH__" not in text
+    openers = ("#if __CUDA_ARCH__ == 1030", "#if __CUDA_ARCH__ != 1030")
+    arch_opens = [line for line in lines if line in openers]
+    assert len(arch_opens) == lines.count("#endif  // __CUDA_ARCH__") > 0
+    # The earlier page-size fold is untouched: one PAGE_SIZE knob define and
+    # balanced PAGE_SIZE guards.
+    defines = [line for line in lines if line.startswith("#define PAGE_SIZE ")]
+    assert defines == ["#define PAGE_SIZE CAKE_FMHA_PAGE_SIZE"]
+    page_opens = [line for line in lines if line.startswith("#if PAGE_SIZE")]
+    assert len(page_opens) == lines.count("#endif  // PAGE_SIZE") > 0
+    # One kernel whose signature and extern "C" block are shared by both arches.
+    assert sum(line.startswith("__global__ ") for line in lines) == 1
+    assert text.rindex("#endif  // __CUDA_ARCH__\n") < text.index('} // extern "C"')
 
 
 @pytest.mark.parametrize(
@@ -922,7 +952,7 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
     assert any(
-        str(source).endswith("cuda/decode_quant_fp8/sm_103a/default.cu")
+        str(source).endswith("cuda/decode_quant_fp8/default.cu")
         for source in spec.sources
     )
     assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags

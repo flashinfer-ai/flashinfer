@@ -4840,8 +4840,8 @@
             "PAGE_SIZE": 16
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_quant_fp8/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/default.cu"
           }
         },
         {
@@ -4850,8 +4850,8 @@
             "PAGE_SIZE": 32
           },
           "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_quant_fp8/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/default.cu"
           }
         }
       ],
