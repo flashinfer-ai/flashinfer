@@ -213,6 +213,30 @@ def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tac
     return sorted(valid_tactics, key=score, reverse=True)[:max_tactics]
 
 
+def _rank_mm_mxfp8_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tactics):
+    """Optional bounded search; keep all low-M split-K candidates.
+
+    The shared score was calibrated for FP4. MXFP8 uses the full search by
+    default until target-GPU comparisons establish a suitable candidate budget.
+    """
+    if max_tactics == 0 or len(valid_tactics) <= max_tactics:
+        return valid_tactics
+    split_k = [t for t in valid_tactics if t[-1] > 1]
+    persistent = [t for t in valid_tactics if t[-1] == 1]
+    if max_tactics < len(split_k) + 1:
+        raise ValueError(
+            "MXFP8 tactic budget must retain split-K and at least one persistent tactic"
+        )
+    ranked = sorted(
+        persistent,
+        key=lambda t: _score_block_scaled_tactic(
+            m, n, real_k, sm_count, t[0], t[1], t[2]
+        ),
+        reverse=True,
+    )
+    return ranked[: max_tactics - len(split_k)] + split_k
+
+
 def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
     """Select the best tactic for mm_fp4(backend='cute-dsl').
 

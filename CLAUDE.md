@@ -31,6 +31,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
+| Set SM100-family MXFP8 CuTe-DSL compile workers (default 4; 0/1 means on-demand) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS=4` |
+| Limit MXFP8 CuTe-DSL autotune candidates (experimental; default 0 keeps full search) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=32` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
@@ -137,6 +139,13 @@ fused-producer baseline. Keep host CPU, completed wall and reset-inclusive
 CUDA graph times separate.
 
 ## Testing
+
+`benchmarks/bench_mxfp8_startup.py --output-dir /path/to/new/results` compares
+MXFP8 GEMM startup with persistence disabled, serial disk-cache population,
+parallel population, fresh-process disk hits, and saved tuning winners. It uses
+isolated caches and checks results after CUDA graph replay. Run on B200/B300;
+the default shapes exercise the SM100-family persistent/split-K runner. See
+`docs/design_docs/cute_dsl_kernel_cache.md` for the scope and cache layers.
 
 Run the regular test suite:
 
