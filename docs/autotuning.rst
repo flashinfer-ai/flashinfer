@@ -15,7 +15,7 @@ tactics (e.g. tile sizes, pipeline stages).  The best choice depends on the
 hardware, data types, and input shapes of your workload.
 
 Without autotuning, FlashInfer picks a default (fallback) tactic.  With
-autotuning enabled, the autotuner profiles every candidate for a given shape and
+autotuning enabled, the default search profiles every candidate for a given shape and
 automatically selects the fastest one.
 
 Enabling Autotuning
@@ -54,6 +54,47 @@ only uses previously cached or loaded configs. This is equivalent to ``flashinfe
     with flashinfer.autotune(False):
         # No profiling -- uses default/fallback tactic if nothing is cached.
         model(inputs)
+
+Factorized MoE search
+^^^^^^^^^^^^^^^^^^^^^
+
+For ordinary TRT-LLM MoE calls, you can opt into a shorter search:
+
+.. code-block:: python
+
+    with flashinfer.autotune(moe_search_strategy="factorized"):
+        model(inputs)
+
+For each tile size, this strategy uses the runner's native factorization to
+alternate between the first and second GEMM configurations for up to two
+sweeps. It profiles each visited tactic once, using the same warmups, CUDA
+graphs and timing policy as exhaustive search. This can reduce preparation
+time, but it can miss a faster pair of configurations. Check the selected
+kernel's latency on your workload before deploying it.
+
+The default is ``"exhaustive"``. A nested context inherits its enclosing
+strategy unless you supply one explicitly. The strategy only affects cache
+misses; changing it does not invalidate a previously selected tactic.
+Use a fresh cache when you want an exhaustive comparison, including when a
+factorized winner was saved through ``autotune(cache=...)``.
+
+This optimization applies to plain ``autotune()``. ``autotune_v2`` also races
+the default tactic, so it uses exhaustive search even if an enclosing context
+requests factorized search. Debug logs report shortened searches and fallback.
+
+Runners without complete factorization metadata, including tactic spaces
+filtered by a blocklist, use exhaustive search. If a candidate fails during
+factorized search, the ordinary fallback reuses measurements already taken.
+The existing out-of-memory handling still applies.
+
+With a distributed tuning group, every participant must use the same strategy
+and enter the same tuning calls with compatible cache state. Before factorized
+profiling, ranks compare the ordered legal tactics and factorization metadata.
+A metadata rejection selects exhaustive search on all ranks. Inconsistent legal
+tactics fail before profiling. This agreement does not recover an absent rank
+or make mismatched cache hits safe.
+An enabled context adds one metadata all-gather per uncached runner/profile,
+including non-MoE operations that then use exhaustive search.
 
 Autotuning in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
