@@ -34,7 +34,11 @@ def run_gemm_test(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
-    if args.routine == "gemm_fp8_nt_groupwise":
+    if args.routine == "prims_ts_gemm":
+        from .prims_ts_gemm import run_prims_ts_gemm_test
+
+        return run_prims_ts_gemm_test(args)
+    elif args.routine == "gemm_fp8_nt_groupwise":
         return testGemmFp8NtGroupwise(args)
     elif args.routine == "group_gemm_fp8_nt_groupwise":
         return testGroupGemmFp8NtGroupwise(args)
@@ -188,6 +192,44 @@ def parse_gemm_args(line, parser):
         default=False,
         help="Use bias (enabled for mm_bf16 with TGV and TinyGEMM backends)",
     )
+    if parser.parse_known_args(line)[0].routine == "prims_ts_gemm":
+        parser.add_argument(
+            "--dtype",
+            choices=("fp8", "fp4"),
+            default="fp8",
+            help="Prims-TS input format.",
+        )
+        parser.add_argument(
+            "--epilogue",
+            choices=("linear", "swiglu", "qkv_qknorm_rope"),
+            default="linear",
+            help="Prims-TS fused epilogue.",
+        )
+        parser.add_argument(
+            "--mode",
+            choices=("one_shot", "prepared"),
+            default="one_shot",
+            help="Prims-TS API mode.",
+        )
+        parser.add_argument(
+            "--output_format",
+            choices=("bf16", "nvfp4"),
+            default="bf16",
+            help="Prims-TS output format.",
+        )
+        parser.add_argument(
+            "--tuning_bucket",
+            type=int,
+            default=None,
+            help="Single runtime-M bucket used to tune a one-shot Prims-TS case.",
+        )
+        parser.add_argument(
+            "--mma_k",
+            type=int,
+            choices=(64, 96),
+            default=64,
+            help="Prepared NVFP4 MMA K width; 96 selects the SM103 3x path.",
+        )
 
     args = parser.parse_args(line)
     has_backends_arg = any(

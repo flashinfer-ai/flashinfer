@@ -49,6 +49,13 @@ output_column_dict = {
         "use_128x4_sf_layout",
         "use_nvfp4",
         "bias",
+        "dtype",
+        "epilogue",
+        "mode",
+        "output_format",
+        "tuning_bucket",
+        "mma_k",
+        "gpu_sm",
     ],
     "moe": [
         "num_tokens",
@@ -252,6 +259,7 @@ benchmark_apis = {
         "mm_bf16",
         "bmm_bf16",
         "tinygemm_bf16",
+        "prims_ts_gemm",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
