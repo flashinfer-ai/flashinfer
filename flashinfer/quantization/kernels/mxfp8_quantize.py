@@ -544,6 +544,8 @@ class MXFP8QuantizeSwizzledKernel:
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
+            # Launch consumers early; they still wait before dependent reads.
+            cute.arch.griddepcontrol_launch_dependents()
 
         # Compile-time constants
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
