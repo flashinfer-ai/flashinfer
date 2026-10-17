@@ -1449,7 +1449,8 @@ def _fmha_v2_prefill_deepseek_init(
     seq_len: int = 128,
     scale_size: int = 1,
     num_heads: int = 32,
-    head_dim: int = 128,
+    head_dim: int = 192,
+    head_dim_v: int = 128,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1460,8 +1461,23 @@ def _fmha_v2_prefill_deepseek_init(
         batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    out = torch.empty_like(q)
+    v = torch.randn(
+        batch_size, seq_len, num_heads, head_dim_v, dtype=torch.bfloat16, device=device
+    )
+    out = torch.empty_like(v)
+    kwargs = {
+        "scale_softmax": 0.0,
+        "scale_bmm1": 1.0 / math.sqrt(head_dim),
+    }
+    if (head_dim, head_dim_v) == (256, 256):
+        q, q_scale = per_tensor_fp8_quantize(q)
+        k, k_scale = per_tensor_fp8_quantize(k)
+        v, v_scale = per_tensor_fp8_quantize(v)
+        kwargs = {
+            "scale_softmax": 1.0,
+            "scale_bmm1": (q_scale * k_scale / 16).item(),
+            "scale_bmm2": v_scale.item(),
+        }
     return {
         "query": q,
         "key": k,
@@ -1470,7 +1486,7 @@ def _fmha_v2_prefill_deepseek_init(
         "num_heads": int(num_heads),
         "head_dim": int(head_dim),
         "seq_len": int(seq_len),
-        "scale_softmax": 1.0 / math.sqrt(head_dim),
+        **kwargs,
     }
 
 
@@ -1526,7 +1542,7 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="fmha_v2_prefill_deepseek",
     description=(
-        "DeepSeek-specific FMHA v2 prefill: separate Q/K/V tensors, "
+        "DeepSeek 192/128 or GLM 256/256 FMHA v2 prefill: separate Q/K/V tensors, "
         "fixed seq_len, causal SDPA per batch. Mutates ``out`` in-place."
     ),
     axes={
@@ -1534,14 +1550,15 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "head_dim_v": Const(abbrev="dv"),
         "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
         "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
-        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim_v"]),
         "out": Tensor(
-            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            ["batch_size", "seq_len", "num_heads", "head_dim_v"],
             description="In-place output buffer.",
         ),
         "num_heads": Scalar("int32"),
@@ -1553,17 +1570,19 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "scale_bmm1_d": Tensor(
             ["scale_size"],
             optional=True,
+            dtype="float32",
             description="Persistent FP32 CUDA QK-scale model weight.",
         ),
         "scale_bmm2_d": Tensor(
             ["scale_size"],
             optional=True,
+            dtype="float32",
             description="Persistent FP32 CUDA V dequantization model weight.",
         ),
     },
     outputs={
         "out": Tensor(
-            ["batch_size", "seq_len", "num_heads", "head_dim"], dtype_from="query"
+            ["batch_size", "seq_len", "num_heads", "head_dim_v"], dtype_from="out"
         ),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],

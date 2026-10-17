@@ -299,6 +299,33 @@ follow effective compute precision; TMA descriptors and raw allocations must
 follow storage precision. The public plan accepts separate `k_data_type` and
 `v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
 
+`fmha_v2_prefill_deepseek` also supports GLM-4.7-Flash expanded prefill on
+SM12x: contiguous FP8 E4M3 Q/K/V with head dimensions 256/256 and BF16/FP16
+output. Apply RoPE upstream; NoPE and RoPE share the FP8 dtype and scalar
+scale. GLM's fused QK scale is `q_scale * k_scale / 16`.
+
+The SM120 GLM 256/256 specialization keeps 64-token outer Q tiles but uses
+full Q/K head tiles and 64-token PV reduction tiles. Its BF16/FP16 epilogue
+writes accumulator fragments directly, reducing dynamic shared memory from
+64 KiB to 48 KiB and permitting two resident CTAs on SM120. Single-buffer K/V
+reuse includes CTA barriers after each GEMM's final shared reads; omitting
+them can produce nondeterministic results when multiple CTAs are resident.
+The SM120 GLM specialization now uses official 128-byte tensor maps for TMA
+Q/K/V loads (CUDA 12.8+), retaining the original FP8 MMA/softmax arithmetic.
+Causal query tiles run in descending order with heads varying fastest to avoid
+tail imbalance. Two mbarriers add 16 bytes to the 48 KiB shared allocation.
+The scalar-scale API uses uniform padded BSHD storage with equal Q/KV heads.
+`fmha_v2_prefill_glm` additionally accepts packed head-major Q/K/V with
+separate device cumulative Q/KV lengths and per-head/per-64-token scales.
+It computes only real Q rows, using bottom-right causal masks for prefixes.
+The block-scaled entry points reuse the Sage scale parameter storage but
+retain GLM FP8 MMA, including P's existing quantization factor of 256.
+Online O rescaling includes previous/current V scale; the softmax sum must
+not receive this factor. Quantization and K concatenation run upstream.
+Other shapes and layouts retain their original tiling and epilogue. When
+testing source changes, ensure a prebuilt `data/aot/trtllm_fmha_v2` artifact
+is not masking the new JIT build.
+
 ## Code Linting
 
 Run all pre-commit hooks:

@@ -1,0 +1,3721 @@
+{
+  "time_utc": "2026-10-09T10:01:13.627773+00:00",
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell (SM120)",
+  "counts": {
+    "numerical": 118,
+    "memcheck": 12,
+    "racecheck": 4
+  },
+  "max_relative_l2_vs_dequant_fp64": 0.01044090287934999,
+  "max_lse_abs": 2.15368714862052e-06,
+  "memcheck_errors": 0,
+  "racecheck_errors": 0,
+  "racecheck_warnings": 0,
+  "reference": "CPU FP64 with dequantized Q/KV; graph replay and BF16-Q quantization API checked in every numerical case",
+  "source_sha256": {
+    "flashinfer/experimental/mla_fp8_sm120/quantization.py": "b5d01987ad1815abf42ac9aa8792ecd10e530d8cf9bebd80cc3f992c9a0bcb63",
+    "flashinfer/experimental/mla_fp8_sm120/__init__.py": "f1cd9bcab75bb3feacc9d26fbd9a8469d582fd66f3975f1f40c24807ccfb3e85",
+    "flashinfer/experimental/mla_fp8_sm120/wrapper.py": "e2a299d7f77be0ce11902afe0f5e164146e018c79b2146fc70a435835c3395cd",
+    "flashinfer/experimental/mla_fp8_sm120/mla_fp8.cu": "4b4f295c4564c21dde693f7d30875f319bebef6e2999821316bbef21eb681694",
+    "tests/experimental/mla_fp8_sm120/check.py": "703ff96217cb6d43f09d01835175ab0cde5f13382ec01ecbbbe799612c6b11ab"
+  },
+  "runs": [
+    {
+      "name": "profile",
+      "command": [
+        "/usr/local/cuda/bin/ncu",
+        "--clock-control",
+        "none",
+        "--cache-control",
+        "none",
+        "--kernel-name",
+        "regex:BatchMLAPagedAttentionFP8SM120",
+        "--launch-skip",
+        "1",
+        "--launch-count",
+        "1",
+        "--section",
+        "LaunchStats",
+        "--section",
+        "Occupancy",
+        "--section",
+        "SpeedOfLight",
+        "--section",
+        "WarpStateStats",
+        "--csv",
+        "--log-file",
+        "/tmp/mla-profile-shared.csv",
+        "python",
+        "benchmarks/mla_fp8_sm120/native_fp8/profile_revision.py"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-profile.log"
+    },
+    {
+      "name": "q64g4",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "64",
+        "--bn",
+        "64",
+        "--groups",
+        "4",
+        "--share-p",
+        "--output",
+        "/tmp/mla-shared-q64g4.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-q64g4.log"
+    },
+    {
+      "name": "q32g4",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "32",
+        "--bn",
+        "64",
+        "--groups",
+        "4",
+        "--share-p",
+        "--output",
+        "/tmp/mla-shared-q32g4.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-q32g4.log"
+    },
+    {
+      "name": "q16g2",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "16",
+        "--bn",
+        "64",
+        "--groups",
+        "2",
+        "--share-p",
+        "--output",
+        "/tmp/mla-shared-q16g2.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-q16g2.log"
+    },
+    {
+      "name": "q32g2",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--share-p",
+        "--output",
+        "/tmp/mla-shared-q32g2.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-q32g2.log"
+    },
+    {
+      "name": "stages2",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "64",
+        "--bn",
+        "32",
+        "--groups",
+        "4",
+        "--stages",
+        "2",
+        "--share-p",
+        "--only",
+        "decode_ragged",
+        "prefill_tiles",
+        "empty_kv",
+        "--output",
+        "/tmp/mla-shared-stages2.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-stages2.log"
+    },
+    {
+      "name": "unshared",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--only",
+        "decode",
+        "prefill_tiles",
+        "--output",
+        "/tmp/mla-shared-unshared.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-unshared.log"
+    },
+    {
+      "name": "memcheck",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--error-exitcode",
+        "99",
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "64",
+        "--bn",
+        "64",
+        "--groups",
+        "4",
+        "--share-p",
+        "--only",
+        "decode_ragged",
+        "prefill_tiles",
+        "empty_kv",
+        "--output",
+        "/tmp/mla-shared-memcheck.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-memcheck.log",
+      "sanitizer_summary": "ERROR SUMMARY: 0 errors"
+    },
+    {
+      "name": "memcheck_stages2",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--error-exitcode",
+        "99",
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "64",
+        "--bn",
+        "32",
+        "--stages",
+        "2",
+        "--groups",
+        "4",
+        "--share-p",
+        "--only",
+        "prefill_causal",
+        "--output",
+        "/tmp/mla-shared-memcheck_stages2.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-memcheck_stages2.log",
+      "sanitizer_summary": "ERROR SUMMARY: 0 errors"
+    },
+    {
+      "name": "racecheck",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "racecheck",
+        "--error-exitcode",
+        "99",
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "64",
+        "--bn",
+        "64",
+        "--groups",
+        "4",
+        "--share-p",
+        "--only",
+        "prefill_causal",
+        "--output",
+        "/tmp/mla-shared-racecheck.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-racecheck.log",
+      "sanitizer_summary": "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)"
+    },
+    {
+      "name": "example",
+      "command": [
+        "python",
+        "benchmarks/mla_fp8_sm120/native_fp8/example.py",
+        "--prefill"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-example.log"
+    },
+    {
+      "name": "selected_short",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--groups",
+        "4",
+        "--share-p",
+        "--output",
+        "/tmp/mla-shared-selected_short.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-selected_short.log"
+    },
+    {
+      "name": "selected_stages2",
+      "command": [
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "32",
+        "--bn",
+        "64",
+        "--stages",
+        "2",
+        "--groups",
+        "4",
+        "--share-p",
+        "--output",
+        "/tmp/mla-shared-selected_stages2.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-selected_stages2.log"
+    },
+    {
+      "name": "memcheck_selected",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--error-exitcode",
+        "99",
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "32",
+        "--bn",
+        "64",
+        "--stages",
+        "2",
+        "--groups",
+        "4",
+        "--share-p",
+        "--only",
+        "prefill_tiles",
+        "empty_kv",
+        "--output",
+        "/tmp/mla-shared-memcheck_selected.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-memcheck_selected.log",
+      "sanitizer_summary": "ERROR SUMMARY: 0 errors"
+    },
+    {
+      "name": "racecheck_stages2",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "racecheck",
+        "--error-exitcode",
+        "99",
+        "python",
+        "tests/experimental/mla_fp8_sm120/check.py",
+        "--bm",
+        "32",
+        "--bn",
+        "64",
+        "--stages",
+        "2",
+        "--groups",
+        "4",
+        "--share-p",
+        "--only",
+        "prefill_tiles",
+        "--output",
+        "/tmp/mla-shared-racecheck_stages2.json"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/mla-shared-racecheck_stages2.log",
+      "sanitizer_summary": "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)"
+    }
+  ],
+  "checks": {
+    "q64g4": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009764286090667483,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 6.708826880696961e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009764286090667483,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 6.708826880696961e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.005075258756086356,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.005075258756086356,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009056134391598514,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009056134391598514,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.01044090287934999,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.01044090287934999,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999338242625,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999338242625,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009353305247874519,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009353305247874519,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      }
+    ],
+    "q32g4": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 184,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009764286090667483,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 6.708826880696961e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 178,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009764286090667483,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 6.708826880696961e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 184,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.005075259091973196,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 178,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.005075259091973196,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 191,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009056134391598514,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 189,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009056134391598514,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 191,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 189,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 184,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.01044090287934999,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 178,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.01044090287934999,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 191,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999338242625,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 189,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999338242625,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 191,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 189,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 191,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009289006095437216,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 189,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009289006095437216,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 184,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 178,
+          "shared_bytes": 58112,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s1_d4_p1_d5df73a7e5781d2a.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      }
+    ],
+    "q16g2": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009764285226966528,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 7.61840718510598e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009764285226966528,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 7.61840718510598e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.005075259048031103,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0290405576540707e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.005075259048031103,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0290405576540707e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009056165812772944,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009056165812772944,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.01044087900294755,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.01044087900294755,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999275845052,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.778934551007978e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999275845052,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.778934551007978e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009288933224158576,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 234,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009288933224158576,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 16,
+          "bn": 64,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 47616,
+          "active_ctas_per_sm": 2,
+          "threads": 64,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q16_k64_s1_d2_p1_c362e2e0ff7b3391.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      }
+    ],
+    "q32g2": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.004476570885112471,
+        "max_abs": 0.046790374645724664,
+        "lse_max_abs": 1.0275660482506055e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.004476570885112471,
+        "max_abs": 0.046790374645724664,
+        "lse_max_abs": 1.0275660482506055e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.00784851079172371,
+        "max_abs": 0.06241526290710231,
+        "lse_max_abs": 1.1110742548225971e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.00784851079172371,
+        "max_abs": 0.06241526290710231,
+        "lse_max_abs": 1.1110742548225971e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+        "max_abs": 0.12303631330802678,
+        "lse_max_abs": 1.5935432617908418e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+        "max_abs": 0.12303631330802678,
+        "lse_max_abs": 1.5935432617908418e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.009586048589432577,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1834172930491604e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.009586048589432577,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1834172930491604e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.006297120019803729,
+        "max_abs": 0.05111847656429391,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.006297120019803729,
+        "max_abs": 0.05111847656429391,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.2171567185248477e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.2171567185248477e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.007876474926816826,
+        "max_abs": 0.11041023918133774,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 225,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.007876474926816826,
+        "max_abs": 0.11041023918133774,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.009457704941308721,
+        "max_abs": 0.10349196250344672,
+        "lse_max_abs": 7.680228666373523e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 222,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p1_400c63fbee47fabf.so",
+        "relative_l2_vs_dequant_fp64": 0.009457704941308721,
+        "max_abs": 0.10349196250344672,
+        "lse_max_abs": 7.680228666373523e-07,
+        "finite": true
+      }
+    ],
+    "stages2": [
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 124,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.005553977078495948,
+        "max_abs": 0.06391753258064359,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 124,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.005553977078495948,
+        "max_abs": 0.06391753258064359,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.008400527679695522,
+        "max_abs": 0.11300635811761439,
+        "lse_max_abs": 2.0585855757815352e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.008400527679695522,
+        "max_abs": 0.11300635811761439,
+        "lse_max_abs": 2.0585855757815352e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 124,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.010125017739198697,
+        "max_abs": 0.06925933128653927,
+        "lse_max_abs": 5.443538322325026e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 124,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.010125017739198697,
+        "max_abs": 0.06925933128653927,
+        "lse_max_abs": 5.443538322325026e-07,
+        "finite": true
+      }
+    ],
+    "unshared": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p0_9449028178518a8a.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p0_9449028178518a8a.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": false,
+          "share_p": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 242,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p0_9449028178518a8a.so",
+        "relative_l2_vs_dequant_fp64": 0.00810330183810097,
+        "max_abs": 0.1125104366721228,
+        "lse_max_abs": 2.15368714862052e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 2,
+          "fused": true,
+          "share_p": false,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 236,
+          "shared_bytes": 36992,
+          "active_ctas_per_sm": 2,
+          "threads": 128,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d2_p0_9449028178518a8a.so",
+        "relative_l2_vs_dequant_fp64": 0.00810330183810097,
+        "max_abs": 0.1125104366721228,
+        "lse_max_abs": 2.15368714862052e-06,
+        "finite": true
+      }
+    ],
+    "memcheck": [
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.006165058026787144,
+        "max_abs": 0.0691489997399315,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.006165058026787144,
+        "max_abs": 0.0691489997399315,
+        "lse_max_abs": 1.0743095160137273e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009438631377071032,
+        "max_abs": 0.11300635811761439,
+        "lse_max_abs": 1.939788651483809e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.009438631377071032,
+        "max_abs": 0.11300635811761439,
+        "lse_max_abs": 1.939788651483809e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.010005682986776314,
+        "max_abs": 0.06925933128653927,
+        "lse_max_abs": 7.128342183193581e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 120
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.010005682986776314,
+        "max_abs": 0.06925933128653927,
+        "lse_max_abs": 7.128342183193581e-07,
+        "finite": true
+      }
+    ],
+    "memcheck_stages2": [
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.00880416228878974,
+        "max_abs": 0.13561487963136498,
+        "lse_max_abs": 1.4916481410054416e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 32,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 77056,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k32_s2_d4_p1_8a63fcba519902e4.so",
+        "relative_l2_vs_dequant_fp64": 0.00880416228878974,
+        "max_abs": 0.13561487963136498,
+        "lse_max_abs": 1.4916481410054416e-06,
+        "finite": true
+      }
+    ],
+    "racecheck": [
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 88
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.008919493245906221,
+        "max_abs": 0.13561487963136498,
+        "lse_max_abs": 1.3848406190675178e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 64,
+          "bn": 64,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 79104,
+          "active_ctas_per_sm": 1,
+          "threads": 512,
+          "local_bytes": 128
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q64_k64_s1_d4_p1_4184221680a30950.so",
+        "relative_l2_vs_dequant_fp64": 0.008919493245906221,
+        "max_abs": 0.13561487963136498,
+        "lse_max_abs": 1.3848406190675178e-06,
+        "finite": true
+      }
+    ],
+    "selected_short": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142073161,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.007914729142073161,
+        "max_abs": 0.04860561618633086,
+        "lse_max_abs": 8.085393616852343e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.004476566363033235,
+        "max_abs": 0.046790374645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.004476566363033235,
+        "max_abs": 0.046790374645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.007848511415736956,
+        "max_abs": 0.06241526290710231,
+        "lse_max_abs": 1.1436122679953087e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.007848511415736956,
+        "max_abs": 0.06241526290710231,
+        "lse_max_abs": 1.1436122679953087e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+        "max_abs": 0.12303631330802678,
+        "lse_max_abs": 1.5935432617908418e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+        "max_abs": 0.12303631330802678,
+        "lse_max_abs": 1.5935432617908418e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.009586048088571008,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1834172930491604e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.009586048088571008,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1834172930491604e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.006297120023438007,
+        "max_abs": 0.05111847656429391,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.006297120023438007,
+        "max_abs": 0.05111847656429391,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.2171567185248477e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.2171567185248477e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.007876474926816826,
+        "max_abs": 0.11041023918133774,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 146,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.007876474926816826,
+        "max_abs": 0.11041023918133774,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.009457704941308721,
+        "max_abs": 0.10349196250344672,
+        "lse_max_abs": 7.680228666373523e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 32,
+          "stages": 1,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 128,
+          "shared_bytes": 38528,
+          "active_ctas_per_sm": 2,
+          "threads": 256,
+          "local_bytes": 8
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k32_s1_d4_p1_fab0d8c87c0108d7.so",
+        "relative_l2_vs_dequant_fp64": 0.009457704941308721,
+        "max_abs": 0.10349196250344672,
+        "lse_max_abs": 7.680228666373523e-07,
+        "finite": true
+      }
+    ],
+    "selected_stages2": [
+      {
+        "name": "decode",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009764286090667483,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 6.708826880696961e-07,
+        "finite": true
+      },
+      {
+        "name": "decode",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009764286090667483,
+        "max_abs": 0.04170943777741143,
+        "lse_max_abs": 6.708826880696961e-07,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.005075259091973196,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "decode_ragged",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.005075259091973196,
+        "max_abs": 0.052649749645724664,
+        "lse_max_abs": 1.0087480060150256e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009056134391598514,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "extend_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009056134391598514,
+        "max_abs": 0.07227074183350934,
+        "lse_max_abs": 1.292986874901203e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_causal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.01026259762737692,
+        "max_abs": 0.11522381330802678,
+        "lse_max_abs": 1.5234651513651443e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.01044090287934999,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_noncausal",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.01044090287934999,
+        "max_abs": 0.09386453756269297,
+        "lse_max_abs": 1.1885639352726685e-06,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999338242625,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp2_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.008857999338242625,
+        "max_abs": 0.06524860517514375,
+        "lse_max_abs": 9.637749158741826e-07,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "tp4_heads",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.008286924040716598,
+        "max_abs": 0.05282888045440237,
+        "lse_max_abs": 1.835096112401402e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009289006095437216,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009289006095437216,
+        "max_abs": 0.11913312211894933,
+        "lse_max_abs": 1.9863069251613297e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009345710531227184,
+        "max_abs": 0.11130446250344672,
+        "lse_max_abs": 6.856842027502807e-07,
+        "finite": true
+      }
+    ],
+    "memcheck_selected": [
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009039147882363699,
+        "max_abs": 0.10595964232349764,
+        "lse_max_abs": 1.770885601715122e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009039147882363699,
+        "max_abs": 0.10595964232349764,
+        "lse_max_abs": 1.770885601715122e-06,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.010931857237708783,
+        "max_abs": 0.07280217611837192,
+        "lse_max_abs": 5.588242411036504e-07,
+        "finite": true
+      },
+      {
+        "name": "empty_kv",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 164,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.010931857237708783,
+        "max_abs": 0.07280217611837192,
+        "lse_max_abs": 5.588242411036504e-07,
+        "finite": true
+      }
+    ],
+    "racecheck_stages2": [
+      {
+        "name": "prefill_tiles",
+        "fused": false,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": false,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009039147882363699,
+        "max_abs": 0.10595964232349764,
+        "lse_max_abs": 1.770885601715122e-06,
+        "finite": true
+      },
+      {
+        "name": "prefill_tiles",
+        "fused": true,
+        "config": {
+          "bm": 32,
+          "bn": 64,
+          "stages": 2,
+          "groups": 4,
+          "fused": true,
+          "share_p": true,
+          "workers": 110
+        },
+        "attributes": {
+          "registers": 175,
+          "shared_bytes": 95232,
+          "active_ctas_per_sm": 1,
+          "threads": 256,
+          "local_bytes": 0
+        },
+        "binary": "/root/.cache/flashinfer/experimental/mla_fp8_sm120/mla_q32_k64_s2_d4_p1_a02323cfdc23b087.so",
+        "relative_l2_vs_dequant_fp64": 0.009039147882363699,
+        "max_abs": 0.10595964232349764,
+        "lse_max_abs": 1.770885601715122e-06,
+        "finite": true
+      }
+    ]
+  },
+  "lint": "Whole-repository pre-commit run -a passed; see pre_commit.txt. Final scoped hooks also passed."
+}

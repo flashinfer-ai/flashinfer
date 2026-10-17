@@ -1221,7 +1221,7 @@ struct Tile_o_normalizer_fp32 {
   inline __device__ void update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N],
                                 float (&curr_max)[ROWS_PER_THREAD],
                                 float const (&prev_max)[ROWS_PER_THREAD],
-                                float (&sum)[ROWS_PER_THREAD]) {
+                                float (&sum)[ROWS_PER_THREAD], float output_scale = 1.f) {
 #pragma unroll
     for (int mi = 0; mi < MMAS_M; ++mi) {
       // Precompute the scaling factors for the 2 rows.
@@ -1234,6 +1234,8 @@ struct Tile_o_normalizer_fp32 {
         curr_max[jj] = fmax(prev_max[jj], curr_max[jj]);
         alpha[ii] = expf(prev_max[jj] - curr_max[jj]);
         sum[jj] *= alpha[ii];
+        // Rescale O into the current V block's units; the softmax sum is unchanged.
+        alpha[ii] *= output_scale;
       }
 
 #pragma unroll
@@ -1253,7 +1255,7 @@ struct Tile_o_normalizer_fp32 {
 
   // Update o after P * V
   inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N],
-                                      float (&sum)[ROWS_PER_THREAD]) {
+                                      float (&sum)[ROWS_PER_THREAD], float output_scale = 1.f) {
 #pragma unroll
     for (int mi = 0; mi < MMAS_M; ++mi) {
       // Precompute the scaling factors for the 2 rows.
@@ -1264,7 +1266,7 @@ struct Tile_o_normalizer_fp32 {
         int jj = 2 * mi + ii;
 
         // The diviser.
-        beta[ii] = (sum[jj] == 0.f || sum[jj] != sum[jj]) ? 1.f : 1.f / sum[jj];
+        beta[ii] = (sum[jj] == 0.f || sum[jj] != sum[jj]) ? output_scale : output_scale / sum[jj];
       }
 
 #pragma unroll

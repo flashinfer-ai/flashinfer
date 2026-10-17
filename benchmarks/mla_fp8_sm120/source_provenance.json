@@ -1,0 +1,36 @@
+{
+  "flashinfer/data/include/flashinfer/attention/mla.cuh": {
+    "sha256": "b13080c8c1625d60da21077f1af287399f4a94ced8ff5fe9eeb6628e45b405b2",
+    "matches_installed_RECORD": true
+  },
+  "flashinfer/data/include/flashinfer/attention/scheduler.cuh": {
+    "sha256": "c11180be56e1292f95990bd144fcdf63bd2ddc81b04258d8abd83c9771f7d402",
+    "matches_installed_RECORD": true
+  },
+  "flashinfer/data/include/flashinfer/mma.cuh": {
+    "sha256": "f6df5d6475bf2fc33932399b7063894a2a4ed27cfabe45ae7cd239a1c61943e9",
+    "matches_installed_RECORD": true
+  },
+  "flashinfer/data/csrc/batch_mla_run.cu": {
+    "sha256": "d4b749962c79596d10f3ed99dfc43b15daf7700c4728ab4a4cdcaa5c56c12a01",
+    "matches_installed_RECORD": true
+  },
+  "flashinfer/jit/attention/modules.py": {
+    "sha256": "0eaabbdea8f68b54765249792457f7ac38a1ab84e439cd48478d371af9ae0f91",
+    "matches_installed_RECORD": true
+  },
+  "flashinfer/mla/_core.py": {
+    "sha256": "482b785d669dc68dab6cfe3934f19ae58b3450d25235f3de4908b871c72aee6e",
+    "matches_installed_RECORD": false
+  },
+  "flashinfer/xqa.py": {
+    "sha256": "82e28904f53f5e07b0678707f0b4018c734053418c4cf023af25d67edf09502c",
+    "matches_installed_RECORD": true
+  },
+  "flashinfer/jit/xqa.py": {
+    "sha256": "d9a4429b0404cabfec0243e9eae771f94eb9fa3e9497ec10ea3a0491e7120c88",
+    "matches_installed_RECORD": true
+  },
+  "core_original_backup_matches_RECORD": true,
+  "target_wrapper_region_matches_original": true
+}

@@ -1,0 +1,284 @@
+[
+  {
+    "stage": "DISCARD_TIMING",
+    "case": "decode_b16_32k",
+    "monitor": {
+      "external_activity": [],
+      "monitor_errors": [],
+      "before": {
+        "time": 1791538226.4195344,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 2292842496,
+        "sm_clock_mhz": 2370,
+        "mem_clock_mhz": 13365,
+        "power_w": 59.994,
+        "external_pids": [
+          81912
+        ],
+        "external_memory": {
+          "81912": 72089600000
+        }
+      },
+      "after": {
+        "time": 1791538227.7118902,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 74388537344,
+        "sm_clock_mhz": 2400,
+        "mem_clock_mhz": 13365,
+        "power_w": 69.921,
+        "external_pids": [],
+        "external_memory": {}
+      }
+    }
+  },
+  {
+    "stage": "DISCARD_TIMING",
+    "case": "prefill_128",
+    "monitor": {
+      "external_activity": [
+        {
+          "pid": 84366,
+          "sm": 15,
+          "memory": 12,
+          "timestamp": 1791538264960280
+        },
+        {
+          "pid": 84366,
+          "sm": 5,
+          "memory": 3,
+          "timestamp": 1791538265760277
+        }
+      ],
+      "monitor_errors": [],
+      "before": {
+        "time": 1791538263.557563,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 73956720640,
+        "sm_clock_mhz": 2385,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.768,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 1310720000
+        }
+      },
+      "after": {
+        "time": 1791538264.6293135,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 73174482944,
+        "sm_clock_mhz": 2377,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.811,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 2092957696
+        }
+      }
+    }
+  },
+  {
+    "stage": "DISCARD_TUNING",
+    "case": "prefill_128",
+    "monitor": {
+      "external_activity": [
+        {
+          "pid": 84366,
+          "sm": 17,
+          "memory": 13,
+          "timestamp": 1791538276360238
+        },
+        {
+          "pid": 84366,
+          "sm": 3,
+          "memory": 1,
+          "timestamp": 1791538277360255
+        }
+      ],
+      "monitor_errors": [],
+      "before": {
+        "time": 1791538274.9637597,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 65394049024,
+        "sm_clock_mhz": 2377,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.643,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 9896460288
+        }
+      },
+      "after": {
+        "time": 1791538276.2279093,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 64525828096,
+        "sm_clock_mhz": 2377,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.658,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 10741612544
+        }
+      }
+    }
+  },
+  {
+    "stage": "DISCARD_TUNING",
+    "case": "prefill_128",
+    "monitor": {
+      "external_activity": [
+        {
+          "pid": 84366,
+          "sm": 15,
+          "memory": 11,
+          "timestamp": 1791538287960221
+        },
+        {
+          "pid": 84366,
+          "sm": 3,
+          "memory": 0,
+          "timestamp": 1791538288560176
+        },
+        {
+          "pid": 84366,
+          "sm": 3,
+          "memory": 1,
+          "timestamp": 1791538288960180
+        }
+      ],
+      "monitor_errors": [],
+      "before": {
+        "time": 1791538286.5589309,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 56344838144,
+        "sm_clock_mhz": 2377,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.857,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 18945671168
+        }
+      },
+      "after": {
+        "time": 1791538287.8233938,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 55476617216,
+        "sm_clock_mhz": 2377,
+        "mem_clock_mhz": 13365,
+        "power_w": 61.06,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 19790823424
+        }
+      }
+    }
+  },
+  {
+    "stage": "DISCARD_TUNING",
+    "case": "prefill_128",
+    "monitor": {
+      "external_activity": [
+        {
+          "pid": 84366,
+          "sm": 11,
+          "memory": 8,
+          "timestamp": 1791538312760107
+        },
+        {
+          "pid": 84366,
+          "sm": 4,
+          "memory": 2,
+          "timestamp": 1791538313560147
+        }
+      ],
+      "monitor_errors": [],
+      "before": {
+        "time": 1791538311.1609356,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 6633947136,
+        "sm_clock_mhz": 2370,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.31,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 68656562176
+        }
+      },
+      "after": {
+        "time": 1791538312.4242969,
+        "util": 47,
+        "memory_util": 39,
+        "free_bytes": 6610878464,
+        "sm_clock_mhz": 2400,
+        "mem_clock_mhz": 13365,
+        "power_w": 71.476,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 68656562176
+        }
+      }
+    }
+  },
+  {
+    "stage": "DISCARD_TUNING",
+    "case": "prefill_128",
+    "monitor": {
+      "external_activity": [],
+      "monitor_errors": [],
+      "before": {
+        "time": 1791538322.754521,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 6619267072,
+        "sm_clock_mhz": 2370,
+        "mem_clock_mhz": 13365,
+        "power_w": 60.257,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 68671242240
+        }
+      },
+      "after": {
+        "time": 1791538324.0179968,
+        "util": 0,
+        "memory_util": 0,
+        "free_bytes": 6313082880,
+        "sm_clock_mhz": 2370,
+        "mem_clock_mhz": 13365,
+        "power_w": 66.651,
+        "external_pids": [
+          84366
+        ],
+        "external_memory": {
+          "84366": 68954357760
+        }
+      }
+    }
+  }
+]

@@ -1,0 +1,775 @@
+{
+  "numerical": [
+    {
+      "name": "decode",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+      "max_abs": 0.04860561618633086,
+      "lse_max_abs": 8.085393616852343e-07,
+      "finite": true
+    },
+    {
+      "name": "decode",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007914729142942799,
+      "max_abs": 0.04860561618633086,
+      "lse_max_abs": 8.085393616852343e-07,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.004476570885112471,
+      "max_abs": 0.046790374645724664,
+      "lse_max_abs": 1.0275660482506055e-06,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.004476570885112471,
+      "max_abs": 0.046790374645724664,
+      "lse_max_abs": 1.0275660482506055e-06,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.00784851079172371,
+      "max_abs": 0.06241526290710231,
+      "lse_max_abs": 1.1110742548225971e-06,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.00784851079172371,
+      "max_abs": 0.06241526290710231,
+      "lse_max_abs": 1.1110742548225971e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_causal",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+      "max_abs": 0.12303631330802678,
+      "lse_max_abs": 1.5935432617908418e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_causal",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009652226393397727,
+      "max_abs": 0.12303631330802678,
+      "lse_max_abs": 1.5935432617908418e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_noncausal",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009586048589432577,
+      "max_abs": 0.09386453756269297,
+      "lse_max_abs": 1.1834172930491604e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_noncausal",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009586048589432577,
+      "max_abs": 0.09386453756269297,
+      "lse_max_abs": 1.1834172930491604e-06,
+      "finite": true
+    },
+    {
+      "name": "tp2_heads",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.006297120019803729,
+      "max_abs": 0.05111847656429391,
+      "lse_max_abs": 9.637749158741826e-07,
+      "finite": true
+    },
+    {
+      "name": "tp2_heads",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.006297120019803729,
+      "max_abs": 0.05111847656429391,
+      "lse_max_abs": 9.637749158741826e-07,
+      "finite": true
+    },
+    {
+      "name": "tp4_heads",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+      "max_abs": 0.05282888045440237,
+      "lse_max_abs": 1.2171567185248477e-06,
+      "finite": true
+    },
+    {
+      "name": "tp4_heads",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.0076800996023010494,
+      "max_abs": 0.05282888045440237,
+      "lse_max_abs": 1.2171567185248477e-06,
+      "finite": true
+    },
+    {
+      "name": "empty_kv",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.01209520790854036,
+      "max_abs": 0.11083715917685588,
+      "lse_max_abs": 8.554717503272968e-07,
+      "finite": true
+    },
+    {
+      "name": "empty_kv",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.01209520790854036,
+      "max_abs": 0.11083715917685588,
+      "lse_max_abs": 8.554717503272968e-07,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 4,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 166,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d4_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.005553977001880111,
+      "max_abs": 0.06391753258064359,
+      "lse_max_abs": 1.0743095160137273e-06,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 4,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 166,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d4_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.005553977001880111,
+      "max_abs": 0.06391753258064359,
+      "lse_max_abs": 1.0743095160137273e-06,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 4,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 167,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d4_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007186399440960009,
+      "max_abs": 0.06748524126699351,
+      "lse_max_abs": 1.328296889369085e-06,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 4,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 166,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d4_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007186399440960009,
+      "max_abs": 0.06748524126699351,
+      "lse_max_abs": 1.328296889369085e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_causal",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 4,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 167,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d4_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009221784489575084,
+      "max_abs": 0.12897630652607317,
+      "lse_max_abs": 1.2836762692813863e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_causal",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 4,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 166,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d4_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009221784489575084,
+      "max_abs": 0.12897630652607317,
+      "lse_max_abs": 1.2836762692813863e-06,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": false,
+      "config": {
+        "bm": 64,
+        "bn": 64,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 254,
+        "shared_bytes": 73984,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q64_k64_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.0061650616768551495,
+      "max_abs": 0.0691489997399315,
+      "lse_max_abs": 1.0743095160137273e-06,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": true,
+      "config": {
+        "bm": 64,
+        "bn": 64,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 254,
+        "shared_bytes": 73984,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q64_k64_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.0061650616768551495,
+      "max_abs": 0.0691489997399315,
+      "lse_max_abs": 1.0743095160137273e-06,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": false,
+      "config": {
+        "bm": 64,
+        "bn": 64,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 254,
+        "shared_bytes": 73984,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q64_k64_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007955710318817748,
+      "max_abs": 0.06642767868915733,
+      "lse_max_abs": 9.192824315107373e-07,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": true,
+      "config": {
+        "bm": 64,
+        "bn": 64,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 254,
+        "shared_bytes": 73984,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q64_k64_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007955710318817748,
+      "max_abs": 0.06642767868915733,
+      "lse_max_abs": 9.192824315107373e-07,
+      "finite": true
+    },
+    {
+      "name": "prefill_causal",
+      "fused": false,
+      "config": {
+        "bm": 64,
+        "bn": 64,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 254,
+        "shared_bytes": 73984,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q64_k64_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009222869330604497,
+      "max_abs": 0.12897630652607317,
+      "lse_max_abs": 1.2836762692813863e-06,
+      "finite": true
+    },
+    {
+      "name": "prefill_causal",
+      "fused": true,
+      "config": {
+        "bm": 64,
+        "bn": 64,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 254,
+        "shared_bytes": 73984,
+        "active_ctas_per_sm": 1,
+        "threads": 256,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q64_k64_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.009222869330604497,
+      "max_abs": 0.12897630652607317,
+      "lse_max_abs": 1.2836762692813863e-06,
+      "finite": true
+    }
+  ],
+  "memcheck": [
+    {
+      "name": "decode_ragged",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.005553977435189814,
+      "max_abs": 0.06391753258064359,
+      "lse_max_abs": 1.0743095160137273e-06,
+      "finite": true
+    },
+    {
+      "name": "decode_ragged",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.005553977435189814,
+      "max_abs": 0.06391753258064359,
+      "lse_max_abs": 1.0743095160137273e-06,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": false,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": false,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 242,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007186402363055337,
+      "max_abs": 0.06748524126699351,
+      "lse_max_abs": 9.200597617109452e-07,
+      "finite": true
+    },
+    {
+      "name": "extend_causal",
+      "fused": true,
+      "config": {
+        "bm": 32,
+        "bn": 32,
+        "stages": 1,
+        "groups": 2,
+        "fused": true,
+        "workers": 110
+      },
+      "attributes": {
+        "registers": 236,
+        "shared_bytes": 36992,
+        "active_ctas_per_sm": 2,
+        "threads": 128,
+        "local_bytes": 0
+      },
+      "binary": "/sgl-workspace/flashinfer-mla-study/native_fp8/mla_q32_k32_s1_d2_730b6bc7d965.so",
+      "relative_l2_vs_dequant_fp64": 0.007186402363055337,
+      "max_abs": 0.06748524126699351,
+      "lse_max_abs": 9.200597617109452e-07,
+      "finite": true
+    }
+  ],
+  "memcheck_error_summary": "ERROR SUMMARY: 0 errors"
+}

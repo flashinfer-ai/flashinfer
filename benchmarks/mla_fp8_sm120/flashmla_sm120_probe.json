@@ -1,0 +1,11 @@
+{
+  "gpu": "NVIDIA RTX PRO 5000 72GB Blackwell",
+  "capability": [12, 0],
+  "api": "sgl_kernel.flash_mla.get_mla_metadata",
+  "num_q_tokens_per_head_k": 20,
+  "kv_len": 64,
+  "status": "process exited from CUDA extension before Python exception handling",
+  "exit_code": 1,
+  "stderr": "CUDA error (_deps/repo-flashmla-src/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu:217): no kernel image is available for execution on the device",
+  "build_config_source": "/sgl-workspace/sglang/python/sglang/kernels/aot/cmake/flashmla.cmake"
+}

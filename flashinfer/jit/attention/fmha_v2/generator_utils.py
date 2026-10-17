@@ -956,7 +956,7 @@ using Kernel_traits_nl_tiled_custom_mask = fmha::{kernel_traits}<
 
 extern "C"
 __global__
-void {kernel_name}_nl_tiled({params_type} params){{
+void {kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled>(params);
 }}
 
@@ -966,7 +966,7 @@ void {kernel_name}_nl_tiled({params_type} params){{
 
 extern "C"
 __global__
-void {causal_kernel_name}_nl_tiled({params_type} params){{
+void {causal_kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_causal>(params);
 }}
 
@@ -976,7 +976,7 @@ void {causal_kernel_name}_nl_tiled({params_type} params){{
 
 extern "C"
 __global__
-void {sliding_or_chunked_causal_kernel_name}_nl_tiled({params_type} params){{
+void {sliding_or_chunked_causal_kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_sliding_or_chunked_causal>(params);
 }}
 
@@ -986,23 +986,27 @@ void {sliding_or_chunked_causal_kernel_name}_nl_tiled({params_type} params){{
 
 extern "C"
 __global__
-void {custom_mask_kernel_name}_nl_tiled({params_type} params){{
+void {custom_mask_kernel_name}_nl_tiled({tiled_params_type} params){{
   fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_custom_mask>(params);
 }}
 
 #endif // custom mask
 
+{block_scaled_kernels}
+
 // Granular tiling
 void {launcher_name}_nl_tiled(
-    {const_fused_multihead_attention_params_v2_str} &params,
+    {const_fused_multihead_attention_params_v2_str} &input_params,
     const Launch_params &launch_params,
     cudaStream_t stream){{
+  {tma_launch_params}
   // runtime q_loop_iters
   using Cta_tile_o = typename Kernel_traits_nl_tiled::Cta_tile_o;
   int ctas_per_o_row = (params.d + Cta_tile_o::N - 1) / Cta_tile_o::N;
   int loop_iters = ( params.s + {noloop_step} - 1 )  / {noloop_step};
   dim3 grid(loop_iters * ctas_per_o_row, params.h, params.b);
   constexpr int smem_size = Kernel_traits_nl_tiled::BYTES_PER_SMEM;
+  {block_scaled_dispatch}
   if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {{
 #if {causal_mask} // causal_mask
     if( smem_size >= 48*1024 ) {{
@@ -2093,6 +2097,24 @@ def selected_mask_types(kspec: kernel_spec) -> tuple[str, str, str, str]:
     return padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask
 
 
+def _use_full_glm_tiles(kspec: kernel_spec) -> bool:
+    # Keep outer Q tiling, but avoid reloading Q/K in four 64-column pieces.
+    # Direct output leaves only the 48 KiB full Q/K/V tiles in shared memory.
+    return (
+        kspec.sm == 120
+        and kspec.dtype == "e4m3_fp32"
+        and kspec.output_dtype in ("bf16", "fp16")
+        and (kspec.head_size, kspec.head_size_v) == (256, 256)
+        and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
+        and kspec.tiled
+        and kspec.warps_m == 4
+        and kspec.warps_n == kspec.ctas_per_head == 1
+        and not kspec.is_mtp
+        and kspec.loop_step == kspec.kv_loop_step == 64
+        and kspec.sage_block_sizes is None
+    )
+
+
 def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     min_cuda_version = 0  # no restriction
 
@@ -2184,8 +2206,10 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
         pass
     if kspec.enable_attn_logit_softcapping:
         flags |= 2048
-    if kspec.tiled:
+    if kspec.tiled and not _use_full_glm_tiles(kspec):
         flags |= 4096
+    if _use_full_glm_tiles(kspec):
+        flags |= 16384 | 32768  # Direct output and SM120 TMA transport.
     if kspec.is_mtp:
         flags |= 8192
 
@@ -2203,6 +2227,7 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     else:
         return None
 
+    use_sm120_tma = _use_full_glm_tiles(kspec)
     kernel_flags = "0x{:02x}u".format(flags)
 
     heads_interleaved_flag = pythonBoolean2cpp[kspec.head_interleaved]
@@ -2335,6 +2360,39 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     local_ns_open = ns_open if generate_cu_trtllm else ""
     local_ns_close = ns_close if generate_cu_trtllm else ""
 
+    tiled_params_type = (
+        f"const __grid_constant__ fmha::Sm120_tma_params<{params_type}>"
+        if use_sm120_tma
+        else params_type
+    )
+    tma_launch_params = (
+        "auto params = fmha::make_sm120_tma_params(input_params, "
+        "launch_params.total_q_seqlen, launch_params.total_kv_seqlen);"
+        if use_sm120_tma
+        else "auto const& params = input_params;"
+    )
+    # Keep block scaling in separate entry points so the scalar-scale API does
+    # not pay for additional scale registers or branches in the KV loop.
+    block_scaled_kernels = ""
+    block_scaled_dispatch = ""
+    if use_sm120_tma:
+        for name, traits, mask in (
+            (causal_kernel_name, "Kernel_traits_nl_tiled_causal", "CAUSAL"),
+            (kernel_name, "Kernel_traits_nl_tiled", "PADDING"),
+        ):
+            block_scaled_kernels += f"""
+__global__ void {name}_block_scaled({tiled_params_type} params) {{
+  fused_multihead_attention::device_flash_attention_nl_tiled<{traits}, true>(params);
+}}
+"""
+            block_scaled_dispatch += f"""
+  if (params.sage.q.scales && launch_params.attention_mask_type == Attention_mask_type::{mask}) {{
+    FMHA_CHECK_CUDA(cudaFuncSetAttribute({name}_block_scaled,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    {name}_block_scaled<<<grid, {traits}::THREADS, smem_size, stream>>>(params);
+    return;
+  }}
+"""
     tmp = dict(locals(), **kspec._asdict())
 
     if effective_sm < 90:
@@ -2967,8 +3025,10 @@ def get_kernel_traits_code(specs_names: list[tuple[kernel_spec, str, str, str]])
             pass
         if kspec.enable_attn_logit_softcapping:
             flags |= 2048
-        if kspec.tiled:
+        if kspec.tiled and not _use_full_glm_tiles(kspec):
             flags |= 4096
+        if _use_full_glm_tiles(kspec):
+            flags |= 16384 | 32768
         if kspec.is_mtp:
             flags |= 8192
 
@@ -5561,6 +5621,8 @@ def enumerate_qmma_flash_kernels(
         # Standard self-attention with separate Q/K/V tensors.
         ((64, 64), (64, 64), 1),
         ((128, 128), (64, 64), 1),
+        # GLM-4.7-Flash expanded MLA prefill uses Q/K=192+64 and V=256.
+        ((256, 256), (64, 64), 1),
         # MLA kernels.
         ((192, 128), (64, 64), 1),
         ((576, 512), (64, 64), 1),
@@ -5581,14 +5643,21 @@ def enumerate_qmma_flash_kernels(
         else:
             head_size = head_size_params
             head_size_v = 0
+        # Keep the new GLM prefill specialization confined to the SM120
+        # separate-Q/K/V entry point; other layouts retain their existing tiles.
+        if (head_size, head_size_v) == (256, 256) and (
+            sm != 120 or input_layout != InputLayout.SEPARATE_Q_K_V
+        ):
+            continue
         # skip if head_size is not in head_sizes
         if head_sizes is not None and head_size not in head_sizes:
             continue
-        # Separate Q/K/V supports standard 64/64 and 128/128 attention plus
+        # Separate Q/K/V supports equal-dimension attention through 256 plus
         # the existing MLA specializations with V dimension 128 or 512.
         if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v not in (
             64,
             128,
+            256,
             512,
         ):
             continue

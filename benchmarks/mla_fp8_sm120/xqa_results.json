@@ -1,0 +1,16 @@
+[
+  {
+    "dtype": "torch.bfloat16",
+    "heads": 20,
+    "backend": "xqa",
+    "error_type": "ValueError",
+    "error": "XQA MLA only supports 128 query heads (head_group_ratio=128), got 20 query heads"
+  },
+  {
+    "dtype": "torch.float8_e4m3fn",
+    "heads": 20,
+    "backend": "xqa",
+    "error_type": "ValueError",
+    "error": "XQA MLA only supports 128 query heads (head_group_ratio=128), got 20 query heads"
+  }
+]
