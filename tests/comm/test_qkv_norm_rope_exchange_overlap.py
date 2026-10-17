@@ -99,7 +99,11 @@ def test_plan_writes_every_destination_element_once(
     geometry = plans.Geometry(
         world_size=world_size, batch=batch, s_local=s_local, hidden=hidden
     )
-    for arch in ("sm_90a", "sm_100a"):
+    # Every delivered architecture; SM107 has no 8-rank sessions (4-GPU nodes),
+    # so that geometry is skipped there instead of asserted.
+    for arch in sorted(set(loader.CAPABILITY_ARCH.values())):
+        if world_size not in loader.supported_world_sizes(arch):
+            continue
         for rank in range(world_size):
             _policy, plan = plans.plan_for(geometry, layout, rank, arch=arch)
             counts = _destination_writes(plan)
@@ -153,6 +157,12 @@ def test_plan_policy_rules():
     assert hopper.order == "grouped" and not hopper.pair
     assert hopper.group_m_scale == 1
     assert hopper == plans.plan_policy(large, arch="sm_90a", group_m_scale=1)
+    # SM107 follows the tcgen05 policy (pair tile) on the world sizes it supports.
+    rubin = plans.plan_policy(
+        plans.Geometry(world_size=4, batch=1, s_local=1024, hidden=4096), arch="sm_107a"
+    )
+    assert rubin.pair is True and rubin.bn == 256
+    assert "sm_107a" in plans.PAIR_ARCHES and "sm_90a" not in plans.PAIR_ARCHES
 
 
 def test_geometry_rejects_heads_not_divisible_by_world_size():
@@ -209,14 +219,31 @@ def test_barrier_flag_words():
         assert loader.barrier_flag_words(world_size) == 2 + 4 * world_size
 
 
+def test_supported_world_sizes_per_architecture():
+    assert (
+        set(loader.SUPPORTED_WORLD_SIZES_BY_ARCH)
+        == set(loader.ARCH_FLAGS)
+        == set(loader.CAPABILITY_ARCH.values())
+    )
+    for arch, sizes in loader.SUPPORTED_WORLD_SIZES_BY_ARCH.items():
+        assert loader.supported_world_sizes(arch) == sizes
+        assert set(sizes) <= set(loader.SUPPORTED_WORLD_SIZES)
+    assert loader.supported_world_sizes("sm_107a") == (2, 4)
+    assert loader.supported_world_sizes("sm_100a") == (2, 4, 8)
+    with pytest.raises(ValueError, match="no fused QKV exchange programs"):
+        loader.supported_world_sizes("sm_120a")
+
+
 def test_fold_barrier_default_table():
-    """The default launch path per architecture: the folded rendezvous on SM90, SM100 and SM103 alike; the
-    separate barrier kernel is the explicit ``fold_barrier=False`` path."""
+    """The default launch path per architecture: the folded rendezvous on SM90, SM100, SM103
+    and SM107 (Rubin, after its own measurement); the separate barrier kernel as
+    the explicit ``fold_barrier=False`` path everywhere."""
 
     assert loader.FOLD_BARRIER_DEFAULT_BY_ARCH == {
         "sm_90a": True,
         "sm_100a": True,
         "sm_103a": True,
+        "sm_107a": True,
     }
     assert set(loader.FOLD_BARRIER_DEFAULT_BY_ARCH) == set(loader.ARCH_FLAGS)
     for arch, fold in loader.FOLD_BARRIER_DEFAULT_BY_ARCH.items():
@@ -230,35 +257,52 @@ def test_fold_barrier_default_table():
 
 
 def test_fold_barrier_resolution(monkeypatch):
-    """Keyword over environment over architecture default; every delivered architecture folds by default and
-    delivers the folded producers; ``True`` fails closed on a route table without them."""
+    """Keyword over environment over architecture default; every delivered architecture folds
+    by default and delivers the folded producers (SM107 included); ``True`` fails closed on a
+    route table without them (modelled below by stripping one table)."""
 
     if not loader.ROUTES:
         pytest.skip("program tables are filled by the exporter")
     env = backend.FOLD_BARRIER_ENV
     for arch in loader.ROUTES:
-        assert loader.default_fold_barrier(arch) is True
-        assert loader.fold_producers_delivered(arch)
+        default = loader.default_fold_barrier(arch)
+        assert loader.fold_producers_delivered(arch) is default
         monkeypatch.delenv(env, raising=False)
-        assert backend.resolve_fold_barrier(arch) == (True, "default")
+        assert backend.resolve_fold_barrier(arch) == (default, "default")
         assert backend.resolve_fold_barrier(arch, False) == (False, "keyword")
         monkeypatch.setenv(env, "auto")
-        assert backend.resolve_fold_barrier(arch) == (True, "default")
+        assert backend.resolve_fold_barrier(arch) == (default, "default")
         monkeypatch.setenv(env, "0")
         assert backend.resolve_fold_barrier(arch) == (False, "env")
         monkeypatch.setenv(env, "1")
-        assert backend.resolve_fold_barrier(arch) == (True, "env")
+        if default:
+            assert backend.resolve_fold_barrier(arch) == (True, "env")
+        else:
+            with pytest.raises(
+                ValueError, match="no producer program with the folded rendezvous"
+            ):
+                backend.resolve_fold_barrier(arch)
         monkeypatch.setenv(env, "0")
-        assert backend.resolve_fold_barrier(arch, True) == (True, "keyword")
+        if default:
+            assert backend.resolve_fold_barrier(arch, True) == (True, "keyword")
+        else:
+            with pytest.raises(
+                ValueError,
+                match="pass fold_barrier=False to select the separate barrier kernel",
+            ):
+                backend.resolve_fold_barrier(arch, True)
         monkeypatch.setenv(env, "yes")
         with pytest.raises(ValueError, match=env):
             backend.resolve_fold_barrier(arch)
         monkeypatch.delenv(env, raising=False)
         with pytest.raises(ValueError, match="bool or None"):
             backend.resolve_fold_barrier(arch, 1)  # type: ignore[arg-type]
-    # A route table without folded producers (none delivered; a patched table): the default and the explicit
-    # ``True`` fail closed naming the opt-out, ``False`` resolves.
-    arch = next(iter(loader.ROUTES))
+    # A route table without folded producers (a patched table of a fold-default architecture):
+    # the default and the explicit ``True`` fail closed naming the opt-out, ``False`` resolves.
+    fold_arches = [arch for arch in loader.ROUTES if loader.default_fold_barrier(arch)]
+    if not fold_arches:
+        pytest.skip("no fold-default architecture in the delivered route tables")
+    arch = fold_arches[0]
     stripped = {
         key: value for key, value in loader.ROUTES[arch].items() if "_fold" not in key
     }
@@ -279,7 +323,8 @@ def test_fold_barrier_resolution(monkeypatch):
 def test_shape_gate_default_table():
     """The row-count gates per architecture: one readiness word per destination for calls of at most 4096 rows and one
     producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 the persistent
-    producer grid over every SM (no reserved SMs) for calls of at least 16384 rows and the other two gates off."""
+    producer grid over every SM (no reserved SMs) for calls of at least 16384 rows and the other two gates off; on
+    SM107 every gate is off."""
 
     assert plans.SHAPE_GATE_NAMES == (
         "words_capacity_small_m",
@@ -303,8 +348,15 @@ def test_shape_gate_default_table():
             "reserved_sms_large_m": 0,
             "per_dest_large_m": 16384,
         },
+        # SM107: no gate ships (none measured there); every call takes the ungated host plan.
+        "sm_107a": {
+            "words_capacity_small_m": 0,
+            "reserved_sms_large_m": 0,
+            "per_dest_large_m": 0,
+        },
     }
     assert set(plans.SHAPE_GATE_DEFAULT_BY_ARCH) == set(loader.ARCH_FLAGS)
+    assert not any(plans.SHAPE_GATE_DEFAULT_BY_ARCH["sm_107a"].values())
     for arch, table in plans.SHAPE_GATE_DEFAULT_BY_ARCH.items():
         assert tuple(table) == plans.SHAPE_GATE_NAMES
         assert (
@@ -443,8 +495,9 @@ def test_shape_gates_resolution(monkeypatch):
 
 def test_group_m_scale_default_table():
     """The group scaling per architecture and world size: the token-tile group of a grouped row with a hidden size of
-    at least 6144 is doubled on SM100 groups of 4 and 2 ranks and on SM103, kept on SM100 groups of 8 ranks and on
-    SM90; ``plan_policy`` without an explicit scale resolves the geometry's world size against the table."""
+    at least 6144 is doubled on SM100 groups of 4 and 2 ranks and on SM103, kept on SM100 groups of 8 ranks, on
+    SM90 and on SM107; ``plan_policy`` without an explicit scale resolves the geometry's world size against the
+    table."""
 
     assert plans.SUPPORTED_WORLD_SIZES == loader.SUPPORTED_WORLD_SIZES == (2, 4, 8)
     assert plans.GROUP_M_SCALES == (1, 2, 4) and plans.GROUP_M_SCALE_MIN_K == 6144
@@ -452,6 +505,8 @@ def test_group_m_scale_default_table():
         "sm_90a": {2: 1, 4: 1, 8: 1},
         "sm_100a": {2: 2, 4: 2, 8: 1},
         "sm_103a": {2: 2, 4: 2, 8: 2},
+        # the baseline plan on SM107 (not measured there)
+        "sm_107a": {2: 1, 4: 1, 8: 1},
     }
     assert set(plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD) == set(loader.ARCH_FLAGS)
     for arch, row in plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD.items():
@@ -494,7 +549,13 @@ def test_group_m_scale_default_table():
     for arch in plans.PAIR_ARCHES:
         scaled = plans.plan_policy(small_k, arch=arch)
         baseline = plans.plan_policy(small_k, arch=arch, group_m_scale=1)
-        assert scaled.group_m_scale == 2 and scaled.order == "grouped"
+        # SM100 / SM103 ship scale 2 at W = 2; SM107 keeps the baseline scale 1 on every W.
+        assert (
+            scaled.group_m_scale
+            == plans.default_group_m_scale(arch, 2)
+            == (1 if arch == "sm_107a" else 2)
+        )
+        assert scaled.order == "grouped"
         assert scaled.group_m == baseline.group_m
 
 
@@ -597,6 +658,8 @@ def test_producer_variant_default_table():
         "sm_90a": {2: "", 4: "", 8: ""},
         "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
         "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
+        # SM107 ships the baseline build only (no variant measured there)
+        "sm_107a": {2: "", 4: "", 8: ""},
     }
     assert set(table) == set(loader.ARCH_FLAGS) == set(loader.ROUTES)
     for arch, row in table.items():
@@ -804,8 +867,9 @@ def test_loader_tables_are_consistent():
                 assert record["args"][0] == "device_index"
             else:
                 assert record["args"][0] == "ready"
-        # Folded producers: both rendezvous phases of every delivered producer build on every architecture (the
-        # default launch path folds the rendezvous everywhere).
+        # Folded producers: both rendezvous phases of every delivered producer build where the
+        # architecture folds by default (every delivered architecture, SM107
+        # included); the ``else`` branch covers a table whose default is the barrier kernel.
         plain_keys = {
             key for key in table if key.startswith("producer_bn") and "_fold" not in key
         }
@@ -813,17 +877,23 @@ def test_loader_tables_are_consistent():
             f"{key}_fold{phase}" for key in plain_keys for phase in loader.FOLD_PHASES
         }
         fold_keys = {key for key in table if "_fold" in key}
-        assert loader.default_fold_barrier(arch) and fold_keys == complete
-        assert loader.fold_producers_delivered(arch)
+        if loader.default_fold_barrier(arch):
+            assert fold_keys == complete and loader.fold_producers_delivered(arch)
+        else:
+            assert not fold_keys and not loader.fold_producers_delivered(arch)
         # The policy never selects a producer the architecture does not deliver -- in the default build of the
-        # row's world size, with the baseline build delivered beside a variant.
+        # row's world size (for the world sizes the architecture supports), with the baseline build delivered
+        # beside a variant.
         for hidden, world_size, rows in (
             (3072, 8, 512),
             (3072, 8, 8192),
             (4096, 8, 512),
+            (3072, 4, 1024),
             (4096, 4, 512),
             (8192, 2, 65536),
         ):
+            if world_size not in loader.supported_world_sizes(arch):
+                continue
             geometry = plans.Geometry(
                 world_size=world_size, batch=1, s_local=rows, hidden=hidden
             )
@@ -1264,9 +1334,11 @@ def _run_worker(rank, world_size, port):
         finally:
             nccl.close()
 
-        # 5. Launch paths: the architecture default (the folded rendezvous on every architecture) against the
-        #    explicit barrier path -- bitwise-equal outputs, two versus three launches per call.
+        # 5. Launch paths: the architecture default (the folded rendezvous on every delivered
+        #    architecture, SM107 included) against the explicit barrier path --
+        #    bitwise-equal outputs; two versus three launches per call where the default folds.
         arch = loader.device_facts(device.index).arch
+        fold_default = loader.default_fold_barrier(arch)
         default_path = QkvNormRopeExchangeOverlap(
             group,
             hidden=hidden,
@@ -1289,17 +1361,22 @@ def _run_worker(rank, world_size, port):
         try:
             default_info = default_path.describe()
             barrier_info = barrier_path.describe()
-            assert (
-                default_info["fold_barrier"]
-                is loader.default_fold_barrier(arch)
-                is True
-            )
+            assert default_info["fold_barrier"] is fold_default
             assert default_info["fold_barrier_requested"] == "auto"
-            assert default_info["launches_per_call"] == 2
-            assert default_info["launch_sequence"] == ["producer_fold<phase>", "wait"]
+            assert default_info["launches_per_call"] == (2 if fold_default else 3)
+            assert default_info["launch_sequence"] == (
+                ["producer_fold<phase>", "wait"]
+                if fold_default
+                else ["barrier_p<phase>", "producer", "wait"]
+            )
             assert barrier_info["fold_barrier"] is False
             assert barrier_info["fold_barrier_requested"] is False
             assert barrier_info["launches_per_call"] == 3
+            assert barrier_info["launch_sequence"] == [
+                "barrier_p<phase>",
+                "producer",
+                "wait",
+            ]
             # The producer build and the group scaling of the architecture default for this world size.
             variant = loader.default_producer_variant(arch, world_size)
             assert default_info["producer_variant"] == {
@@ -1317,11 +1394,14 @@ def _run_worker(rank, world_size, port):
             assert default_info["reserved_sms"] == plans.RESERVED_SMS
             bound = default_path.bound_programs(batch, s_local)
             assert bound == barrier_path.bound_programs(batch, s_local)
-            assert "producer_fold0" in bound and "producer_fold1" in bound
             assert "barrier_p0" in bound and "producer" in bound
-            # Six delivered stages on a baseline-build row, nine where the default build is a variant (the baseline
-            # build's three programs ride along as the ``shipped`` opt-out).
-            assert len(bound) == (6 if variant == "" else 9)
+            if fold_default:
+                assert "producer_fold0" in bound and "producer_fold1" in bound
+                # Six delivered stages on a baseline-build row, nine where the default build is a variant (the
+                # baseline build's three programs ride along as the ``shipped`` opt-out).
+                assert len(bound) == (6 if variant == "" else 9)
+            else:
+                assert not any("_fold" in key for key in bound) and len(bound) == 4
             block_n = default_info["block_n"]
             row_policy = plans.plan_policy(
                 plans.Geometry(
@@ -1333,7 +1413,7 @@ def _run_worker(rank, world_size, port):
             assert bound["producer"] == loader.producer_program(
                 arch, block_n, row_policy.pair, variant
             )
-            for phase in loader.FOLD_PHASES:
+            for phase in loader.FOLD_PHASES if fold_default else ():
                 assert bound[f"producer_fold{phase}"] == loader.fold_producer_program(
                     arch, block_n, row_policy.pair, phase, variant
                 )
@@ -1342,7 +1422,7 @@ def _run_worker(rank, world_size, port):
                     arch, block_n, row_policy.pair
                 )
                 assert bound["producer_shipped"] != bound["producer"]
-                for phase in loader.FOLD_PHASES:
+                for phase in loader.FOLD_PHASES if fold_default else ():
                     shipped_fold = loader.fold_producer_program(
                         arch, block_n, row_policy.pair, phase
                     )
@@ -1372,9 +1452,9 @@ def _run_worker(rank, world_size, port):
                 row_plan["words_capacity_per_dest"] == verdict.words_capacity_per_dest
             )
             assert row_plan["reserved_sms"] is None and verdict.reserved_sms is None
-            assert (
-                row_plan["producer_parts"] == 1 and row_plan["launches_per_call"] == 2
-            )
+            assert row_plan["producer_parts"] == 1 and row_plan[
+                "launches_per_call"
+            ] == (2 if fold_default else 3)
             assert (
                 max(row_plan["part_grids"])
                 <= default_info["sm_count"] - plans.RESERVED_SMS
@@ -1710,7 +1790,10 @@ def test_qkv_norm_rope_exchange_overlap_multi_gpu(world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} GPUs")
     if not _supported_device():
-        pytest.skip("requires SM90, SM100 or SM103 devices")
+        pytest.skip("requires SM90, SM100, SM103 or SM107 devices")
+    arch = loader.device_facts(0).arch
+    if world_size not in loader.supported_world_sizes(arch):
+        pytest.skip(f"world size {world_size} is not supported on {arch}")
     _spawn(world_size)
 
 
