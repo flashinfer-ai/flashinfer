@@ -305,6 +305,47 @@ def _fake_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
     pass
 
 
+@register_custom_op(
+    "flashinfer::append_paged_kv_cache_with_slot_mapping",
+    mutates_args=("paged_k_cache", "paged_v_cache"),
+)
+def _append_paged_kv_cache_with_slot_mapping_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    num_valid_tokens: int,
+    page_size: int,
+    layout: int,
+) -> None:
+    slot_mapping = slot_mapping.contiguous()
+    get_page_module().append_paged_kv_cache_with_slot_mapping(
+        append_key,
+        append_value,
+        slot_mapping,
+        paged_k_cache,
+        paged_v_cache,
+        num_valid_tokens,
+        page_size,
+        layout,
+    )
+
+
+@register_fake_op("flashinfer::append_paged_kv_cache_with_slot_mapping")
+def _fake_append_paged_kv_cache_with_slot_mapping_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    num_valid_tokens: int,
+    page_size: int,
+    layout: int,
+) -> None:
+    pass
+
+
 @flashinfer_api
 def get_batch_indices_positions(
     append_indptr: torch.Tensor,
@@ -1023,5 +1064,150 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         v_scale_cache,
         k_scale_tensor,
         v_scale_tensor,
+        TensorLayout[kv_layout].value,
+    )
+
+
+@flashinfer_api
+def append_paged_kv_cache_with_slot_mapping(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    num_valid_tokens: Optional[int] = None,
+    page_size: Optional[int] = None,
+    kv_layout: str = "HND",
+) -> None:
+    r"""Write FP16/BF16 K/V rows into a paged KV cache by slot mapping.
+
+    This variant is intended for runtimes that already assign each token to a
+    flat cache slot. ``slot_mapping[i]`` is interpreted as
+    ``page_id * page_size + entry_idx``. Negative slots and slots at or beyond
+    ``max_num_pages * page_size`` are silently ignored. ``append_key`` and
+    ``append_value`` may contain additional padded rows; only the first
+    ``num_valid_tokens`` rows (default ``slot_mapping.shape[0]``) are written.
+
+    Parameters
+    ----------
+    append_key : torch.Tensor
+        The key tensor to write, shape ``[num_rows, num_kv_heads, head_dim]``
+        with dtype ``torch.float16`` or ``torch.bfloat16``. ``num_rows`` must be
+        at least ``slot_mapping.shape[0]``.
+    append_value : torch.Tensor
+        The value tensor to write, with the same shape and dtype as
+        ``append_key``.
+    slot_mapping : torch.Tensor
+        Flat cache slot for each row to write, shape ``[nnz]`` with dtype
+        ``torch.int32`` or ``torch.int64``. Negative entries and entries at or
+        beyond ``max_num_pages * page_size`` are silently ignored.
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned FP16/BF16 K/V cache. For tuple input, each tensor has
+        shape ``[max_num_pages, page_size, num_kv_heads, head_dim]`` when
+        ``kv_layout="NHD"`` and ``[max_num_pages, num_kv_heads, page_size,
+        head_dim]`` when ``kv_layout="HND"``. A stacked 5-D cache is also
+        accepted with K/V on the second dimension.
+    num_valid_tokens : Optional[int]
+        Number of valid tokens before padding. Defaults to ``slot_mapping.shape[0]``.
+    page_size : Optional[int]
+        Size of each page. Auto-detected from ``paged_kv_cache`` shape when
+        ``None``.
+    kv_layout : str
+        Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function updates ``paged_kv_cache`` in place.
+    """
+    _check_kv_layout(kv_layout)
+    if append_key.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"append_key must be float16 or bfloat16, got {append_key.dtype}"
+        )
+    if append_value.dtype != append_key.dtype:
+        raise ValueError(
+            f"append_key and append_value must have the same dtype, got "
+            f"{append_key.dtype} and {append_value.dtype}"
+        )
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
+        )
+    if num_valid_tokens is None:
+        num_valid_tokens = slot_mapping.shape[0]
+
+    if num_valid_tokens < 0:
+        raise ValueError(
+            f"num_valid_tokens must be non-negative, got {num_valid_tokens}"
+        )
+    if num_valid_tokens > slot_mapping.shape[0]:
+        raise ValueError(
+            f"num_valid_tokens={num_valid_tokens} must be <= slot_mapping.shape[0]={slot_mapping.shape[0]}"
+        )
+    if (
+        append_key.shape[0] < num_valid_tokens
+        or append_value.shape[0] < num_valid_tokens
+    ):
+        raise ValueError(
+            f"append_key and append_value must have at least num_valid_tokens={num_valid_tokens} rows, "
+            f"got append_key.shape[0]={append_key.shape[0]}, append_value.shape[0]={append_value.shape[0]}"
+        )
+
+    paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
+    if paged_k_cache.dtype != append_key.dtype:
+        raise ValueError(
+            f"paged_k_cache dtype {paged_k_cache.dtype} must match "
+            f"append_key dtype {append_key.dtype}"
+        )
+    if paged_v_cache.dtype != append_value.dtype:
+        raise ValueError(
+            f"paged_v_cache dtype {paged_v_cache.dtype} must match "
+            f"append_value dtype {append_value.dtype}"
+        )
+
+    # Auto-detect page_size from cache shape
+    if page_size is None:
+        if kv_layout == "HND":
+            page_size = paged_k_cache.shape[2]
+        else:
+            page_size = paged_k_cache.shape[1]
+
+    # Validate shapes
+    if kv_layout == "HND":
+        num_heads = paged_k_cache.shape[1]
+        head_dim = paged_k_cache.shape[3]
+    else:
+        head_dim = paged_k_cache.shape[3]
+        num_heads = paged_k_cache.shape[2]
+
+    if append_key.shape[1] != num_heads:
+        raise ValueError(
+            f"append_key.shape[1]={append_key.shape[1]} must match num_heads={num_heads}"
+        )
+    if append_key.shape[2] != head_dim:
+        raise ValueError(
+            f"append_key.shape[2]={append_key.shape[2]} must match head_dim={head_dim}"
+        )
+    if append_value.shape[1] != num_heads:
+        raise ValueError(
+            f"append_value.shape[1]={append_value.shape[1]} must match num_heads={num_heads}"
+        )
+    if append_value.shape[2] != head_dim:
+        raise ValueError(
+            f"append_value.shape[2]={append_value.shape[2]} must match head_dim={head_dim}"
+        )
+    if head_dim % 16 != 0:
+        raise ValueError(
+            f"head_dim={head_dim} must be a multiple of 16 for vectorized access"
+        )
+
+    _append_paged_kv_cache_with_slot_mapping_kernel(
+        append_key,
+        append_value,
+        slot_mapping,
+        paged_k_cache,
+        paged_v_cache,
+        int(num_valid_tokens),
+        int(page_size),
         TensorLayout[kv_layout].value,
     )
