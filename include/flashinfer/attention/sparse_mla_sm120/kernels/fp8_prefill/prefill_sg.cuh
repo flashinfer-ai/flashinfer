@@ -516,7 +516,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 }
 
 template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE,
-          typename GatherSchedule = Dsv41PrefillGatherSchedule>
+          typename GatherSchedule = Dsv41PrefillGatherSchedule<ModelType::DSV4_1>>
 __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS),
                                   1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -609,7 +609,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const int32_t* idx_base = indices + (size_t)s_i * topk;
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-    if constexpr (MT == ModelType::DSV4_1 && !GatherSchedule::RAW_PIPELINE) {
+    if constexpr (is_dsv41(MT) && !GatherSchedule::RAW_PIPELINE) {
       {
         auto issue_dual_tile = [&](int t) {
           const auto sec = prefill_section<Cfg::BI, PAGE_BLOCK_SIZE>(cold, KV_cache, indices, s_i,

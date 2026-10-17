@@ -359,7 +359,14 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     return_lse: bool,
     lse_scale: float,
     kv_scale_format: str,
-    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
+    kv_cache_format: Literal[
+        "fp8",
+        "nvfp4",
+        "fp8_dsv41",
+        "fp8_dsv41_fp4_ca",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
+    ] = "fp8",
     backend: Literal["sparse", "cake"] = "sparse",
     enable_pdl: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -500,7 +507,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
         lse=out_lse_arg,
         kv_scale_format=kv_scale_format,
         is_dsv4_nvfp4=(kv_cache_format == "nvfp4"),
-        extra_fp4=kv_cache_format == "fp8_dsv41_fp4_ca",
+        extra_fp4=kv_cache_format in _DSV41_FP4_CA_KV_CACHE_FORMATS,
         lse_scale=lse_scale,
     )
 
@@ -1148,7 +1155,16 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
-_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca")
+# DeepSeek-V4.1 storage forms. The ``_inline`` forms hold inline-scale records
+# (FlashMLA's V4.1 ABI as of its 2026.09.30 release: each token's data bytes
+# followed by its own scale bytes); the others keep the footer-scale pages.
+_DSV41_INLINE_KV_CACHE_FORMATS = ("fp8_dsv41_inline", "fp8_dsv41_inline_fp4_ca")
+_DSV41_FP4_CA_KV_CACHE_FORMATS = ("fp8_dsv41_fp4_ca", "fp8_dsv41_inline_fp4_ca")
+_DSV41_KV_CACHE_FORMATS = (
+    "fp8_dsv41",
+    "fp8_dsv41_fp4_ca",
+) + _DSV41_INLINE_KV_CACHE_FORMATS
+_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4") + _DSV41_KV_CACHE_FORMATS
 
 
 def _check_dsv4_kv_cache_format_backend(
@@ -1159,8 +1175,9 @@ def _check_dsv4_kv_cache_format_backend(
 ) -> None:
     """Pair a resolved DSv4 backend with the sparse-cache storage format.
 
-    ``fp8_dsv41`` is SM120/SM121 ``backend="sparse"`` only; ``fp8_dsv41_fp4_ca``
-    additionally accepts the Cake mixed-cache decode on SM120/SM121
+    ``fp8_dsv41`` and the inline-scale ``fp8_dsv41_inline`` /
+    ``fp8_dsv41_inline_fp4_ca`` are SM120/SM121 ``backend="sparse"`` only;
+    ``fp8_dsv41_fp4_ca`` additionally accepts the Cake mixed-cache decode on SM120/SM121
     (``sm120_cake=True``: ``backend="cake"`` resolved on an SM120-family
     device). The 384-byte NVFP4 ABI runs on SM120/SM121 through
     ``backend="sparse"`` or ``backend="cake"`` and on SM100/SM103 through the
@@ -1170,10 +1187,17 @@ def _check_dsv4_kv_cache_format_backend(
     if kv_cache_format not in _DSV4_KV_CACHE_FORMATS:
         raise ValueError(
             "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
-            f"or 'nvfp4', got {kv_cache_format!r}"
+            "'fp8_dsv41_inline', 'fp8_dsv41_inline_fp4_ca', or 'nvfp4', got "
+            f"{kv_cache_format!r}"
         )
     if kv_cache_format == "fp8_dsv41" and backend != "sparse":
         raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    if kv_cache_format in _DSV41_INLINE_KV_CACHE_FORMATS and backend != "sparse":
+        raise ValueError(
+            f"kv_cache_format={kv_cache_format!r} (inline-scale records) requires "
+            "backend='sparse'; backend='cake' reads the footer-scale "
+            "'fp8_dsv41_fp4_ca' cache only"
+        )
     if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
         if backend != "cake" or not sm120_cake:
             raise ValueError(
@@ -1250,7 +1274,14 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     lse_scale: float,
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
-    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"],
+    kv_cache_format: Literal[
+        "fp8",
+        "nvfp4",
+        "fp8_dsv41",
+        "fp8_dsv41_fp4_ca",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
+    ],
     backend: Literal["sparse", "cake"] = "sparse",
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
@@ -1261,8 +1292,8 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     if cake and kv_cache_format not in ("nvfp4", "fp8_dsv41_fp4_ca"):
         raise ValueError(
             "backend='cake' on SM120/SM121 serves the DSv4 NVFP4 cache "
-            "(kv_cache_format='nvfp4') and the DeepSeek-V4.1 mixed cache "
-            f"(kv_cache_format='fp8_dsv41_fp4_ca'); got {kv_cache_format!r}"
+            "(kv_cache_format='nvfp4') and the footer-scale DeepSeek-V4.1 mixed "
+            f"cache (kv_cache_format='fp8_dsv41_fp4_ca'); got {kv_cache_format!r}"
         )
     if query.ndim in (3, 4):
         num_heads, head_dim = query.shape[-2:]
@@ -1308,14 +1339,13 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
 
     # Packed FP8 row width per cache format: DSV4 is 584B (448B FP8 + 128B
     # BF16 rope + 8B UE8M0 footer); DSV4.1 is 528B (512B all-FP8 K + 16B
-    # 32-wide-group UE8M0 footer). The mixed "fp8_dsv41_fp4_ca" form keeps the
-    # 528B main (SWA) cache and carries the compressed cache as 288B V41_FP4
-    # rows (256B E2M1 + 32B E4M3-G16 scales).
-    packed_row_bytes = (
-        528 if kv_cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca") else 584
-    )
+    # 32-wide-group UE8M0 scales, as a page footer or inline after each token's
+    # data). The mixed "fp4_ca" forms keep the 528B main (SWA) cache and carry
+    # the compressed cache as 288B V41_FP4 rows (256B E2M1 + 32B E4M3-G16
+    # scales).
+    packed_row_bytes = 528 if kv_cache_format in _DSV41_KV_CACHE_FORMATS else 584
     packed_row_bytes_extra = (
-        288 if kv_cache_format == "fp8_dsv41_fp4_ca" else packed_row_bytes
+        288 if kv_cache_format in _DSV41_FP4_CA_KV_CACHE_FORMATS else packed_row_bytes
     )
 
     swa_kv_cache = _check_sm120_dsv4_kv_cache_layout(
@@ -1464,12 +1494,15 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             lse=None,
             return_lse=False,
             lse_scale=lse_scale,
-            # fp8_dsv41 (and the mixed fp4-ca form) selects the DSV4_1 model
-            # type (32-wide UE8M0 groups) in the SM120 runner; 'fp8' stays on
-            # the DSV4 default.
+            # The V4.1 forms select the DSV4_1 model types (32-wide UE8M0
+            # groups) in the SM120 runner: DSV4_1 for the footer-scale pages,
+            # DSV4_1_INLINE for the inline-scale records; 'fp8' stays on the
+            # DSV4 default.
             kv_scale_format=(
-                "ue8m0_g32"
-                if kv_cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca")
+                "ue8m0_g32_inline"
+                if kv_cache_format in _DSV41_INLINE_KV_CACHE_FORMATS
+                else "ue8m0_g32"
+                if kv_cache_format in _DSV41_KV_CACHE_FORMATS
                 else "auto"
             ),
             kv_cache_format=kv_cache_format,
@@ -1816,7 +1849,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     sparse_topk_lens_offset: int = 0,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     *,
-    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
+    kv_cache_format: Literal[
+        "fp8",
+        "nvfp4",
+        "fp8_dsv41",
+        "fp8_dsv41_fp4_ca",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
+    ] = "fp8",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -2126,7 +2166,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         launches and CUDA-graph replays. When ``None`` (default) a fresh buffer
         is allocated per call, which is not CUDA-graph friendly. Only used by
         ``backend="trtllm-gen"``.
-    kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"}
+    kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca", "fp8_dsv41_inline", "fp8_dsv41_inline_fp4_ca"}
         SM120/SM121 sparse-cache storage format. ``"fp8"`` preserves the
         existing 584-byte DSv4 cache ABI. ``"fp8_dsv41"`` selects the
         528-byte DeepSeek-V4.1 ABI (all-FP8 512-wide K with a 16-byte
@@ -2145,6 +2185,20 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         With ``backend="cake"`` on SM120/SM121 the ``fp8_dsv41_fp4_ca`` form
         selects the Cake mixed-cache decode instead (BF16 numerics route,
         both caches dequantized exactly on chip).
+        ``"fp8_dsv41_inline"`` and ``"fp8_dsv41_inline_fp4_ca"`` are the same
+        two V4.1 forms on inline-scale records, FlashMLA's V4.1 ABI as of its
+        2026.09.30 release: each token's 512 data bytes are followed by its own
+        16 scale bytes (V41_FP4: 256 data bytes then 32 scale bytes) instead
+        of a per-page scale footer. Inline records are rows of the whole cache
+        at a uniform row pitch (a 16-byte multiple of at least the record
+        size) with a page stride of whole rows; ``sparse_indices`` and
+        ``extra_sparse_indices`` then address row ``page * (page_stride //
+        row_pitch) + slot`` (the paged slot ID when pages carry no padding).
+        They take the same SM120 routes as the footer forms, reading each
+        record with one bulk copy (``backend="sparse"`` only; ``backend=
+        "cake"`` rejects them). Footer and inline caches cannot be told apart
+        from their shapes, so the format must name the layout the cache was
+        written in.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
