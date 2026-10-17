@@ -28,14 +28,52 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
-def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
+@pytest.mark.parametrize("nvcc_at_least_13", [False, True])
+def test_jit_uses_size_optimized_fatbin_compression(monkeypatch, nvcc_at_least_13):
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+    monkeypatch.setattr(core, "get_cuda_path", lambda: "/usr/local/cuda")
+    seen = {}
+
+    def fake_is_nvcc_at_least(nvcc_path, version_str):
+        seen["nvcc_path"] = nvcc_path
+        seen["version_str"] = version_str
+        return nvcc_at_least_13
+
+    monkeypatch.setattr(core, "is_nvcc_at_least", fake_is_nvcc_at_least)
 
     spec = core.gen_jit_spec(name="test_module", sources=[])
 
     assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
-    assert "--compress-mode=size" in spec.extra_cuda_cflags
+    # The gate must bind to the 13.0 boundary, not a free-form string.
+    assert seen["version_str"] == "13.0"
+    # `--compress-mode` is only supported by nvcc in CUDA 13.0+, so it must be
+    # omitted on older toolchains to avoid "nvcc fatal: Unknown option
+    # '--compress-mode=size'" failures.
+    # https://github.com/flashinfer-ai/flashinfer/issues/5479
+    assert ("--compress-mode=size" in spec.extra_cuda_cflags) is nvcc_at_least_13
+
+
+def test_jit_compress_mode_gate_uses_selected_nvcc_override(monkeypatch):
+    """The gate must inspect the nvcc that will actually run, honoring FLASHINFER_NVCC,
+    rather than the default toolkit, so an explicit override to an older nvcc does not
+    receive a flag it rejects."""
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+    monkeypatch.setenv("FLASHINFER_NVCC", "/opt/cuda-12.1/bin/nvcc")
+    monkeypatch.setattr(core, "get_cuda_path", lambda: "/usr/local/cuda")
+    seen = {}
+
+    def fake_is_nvcc_at_least(nvcc_path, version_str):
+        seen["nvcc_path"] = nvcc_path
+        return False
+
+    monkeypatch.setattr(core, "is_nvcc_at_least", fake_is_nvcc_at_least)
+
+    spec = core.gen_jit_spec(name="test_module", sources=[])
+
+    assert seen["nvcc_path"] == "/opt/cuda-12.1/bin/nvcc"
+    assert "--compress-mode=size" not in spec.extra_cuda_cflags
 
 
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
