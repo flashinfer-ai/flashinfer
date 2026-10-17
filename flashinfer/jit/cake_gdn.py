@@ -15,8 +15,9 @@
 """JIT loader for the source-only Cake GDN backend.
 
 Every variant in ``csrc/gdn/cake/manifest.json`` names one kernel source, the
-compile-time ``defines`` that specialize it, and one TVM-FFI host shim.  The
-kernel is compiled to a cubin with ``nvcc`` and embedded into the host shim.
+compile-time specialization it is built with (passed as ``-D`` defines), and
+the template and parameters of its TVM-FFI host shim.  The kernel is compiled
+to a cubin with ``nvcc`` and embedded into the rendered host shim.
 """
 
 from __future__ import annotations
@@ -206,10 +207,15 @@ def _compile_cubin(
 
 
 def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
-    """``-D`` flags for the variant's compile-time specialization."""
+    """``-D`` flags for the variant's compile-time specialization.
+
+    A record passes its ``specializations`` unless it spells out ``defines``:
+    a body with its constants in-file takes none (``{}``), and some bodies
+    take only a subset of the specialization keys.
+    """
 
     flags = []
-    for key, value in record.get("defines", {}).items():
+    for key, value in record.get("defines", record["specializations"]).items():
         if not _DEFINE_NAME.match(key):
             raise RuntimeError(f"invalid Cake GDN define name {key!r}")
         flags.append(f"-D{key}={value}")
@@ -217,7 +223,9 @@ def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
-    options = tuple(record.get("compile_options", ()))
+    """``nvcc`` options of the variant: ``--use_fast_math`` and its ``-D`` flags."""
+
+    options = tuple(record.get("compile_options", ("--use_fast_math",)))
     unsupported_options = set(options) - {"--use_fast_math"}
     if unsupported_options:
         raise RuntimeError(
@@ -268,6 +276,50 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
     return _cubin_path(cuda_path, arch=arch, digest=compile_digest)
 
 
+_HOST_SHIM_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+
+
+def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
+    """Render the TVM-FFI host shim of one variant from its class template.
+
+    ``host_binding.template`` names the template under ``host/templates/``.
+    ``@ENTRY@``, ``@MODULE_IDENT@``, ``@CUDA_SYMBOL@`` and ``@SHIM_NAMESPACE@``
+    come from ``host_binding``; every other ``@NAME@`` placeholder takes the
+    value of ``host_binding.params[NAME]``.  The result is byte-identical to
+    the per-variant shim file the template replaced.
+    """
+
+    host = record["host_binding"]
+    template = (_source_dir() / host["template"]).read_text(encoding="utf-8")
+    values = {
+        "ENTRY": host["entry"],
+        "MODULE_IDENT": host["module_ident"],
+        "CUDA_SYMBOL": host["cuda_symbol"],
+        "SHIM_NAMESPACE": host["shim_namespace"],
+    }
+    for key, value in host["params"].items():
+        if key in values:
+            raise RuntimeError(f"reserved Cake GDN host-shim parameter {key!r}")
+        values[key] = str(value)
+    unused = set(values)
+
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise RuntimeError(
+                f"{host['template']} needs {key!r}; {record['name']!r} lacks it"
+            )
+        unused.discard(key)
+        return values[key]
+
+    text = _HOST_SHIM_PLACEHOLDER.sub(substitute, template)
+    if unused:
+        raise RuntimeError(
+            f"unused host-shim parameters for {record['name']!r}: {sorted(unused)}"
+        )
+    return text
+
+
 @functools.cache
 def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     """Compile and load one Cake GDN host entrypoint."""
@@ -276,13 +328,13 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     record = _kernel_record(name)
     host = record["host_binding"]
     root = _source_dir()
-    host_path = root / host["path"]
-    module_digest = hashlib.sha256(
-        f"{cubin.stem}\0{_sha256(host_path)}".encode()
-    ).hexdigest()
+    host_source = render_cake_gdn_host_shim(record)
+    host_digest = hashlib.sha256(host_source.encode("utf-8")).hexdigest()
+    module_key = f"{cubin.stem}\0{host_digest}".encode()
+    module_digest = hashlib.sha256(module_key).hexdigest()
     module = cpp.load_inline(
         f"flashinfer_cake_gdn_{name}_{arch}_{module_digest[:12]}",
-        cpp_sources=host_path.read_text(encoding="utf-8"),
+        cpp_sources=host_source,
         embed_cubin={host["module_ident"]: cubin.read_bytes()},
         extra_include_paths=[
             str(Path(get_cuda_path()) / "include"),
@@ -772,23 +824,51 @@ def cake_gdn_prefill_geometries(
         "float8_e5m2",
     }:
         raise CakeGDNUnsupportedError(f"unsupported state dtype {state_dtype}")
-    # The base template of the contract: every performance twin the resolver
-    # may substitute on ``arch`` (sm_100a late state input, sm_103a role
-    # rebalance, gate-stream full) is exported for exactly the geometry
-    # triples of its base record, so the base records enumerate the contract.
-    schedule_attr = _prefill_schedule_attr(
-        dvsplit=dvsplit,
-        use_initial_state=use_initial_state,
-        io_dtype=io_dtype,
-        state_dtype=state_dtype,
-        single_chunk=False,
-        gatepipe4=False,
-        fullgrid_vhold=False,
-        sm100a_state_inp_late=False,
-        sm103a_role_rebalanced=False,
-        gate_stream_full=False,
+    # The schedules the resolver can select for the contract on ``arch``: the
+    # base template and the twin it is forced to substitute on this
+    # architecture.  On sm_100a the late-``state_inp_ready`` twin replaces the
+    # bf16-I/O DV-split bases for every geometry, so only the twin records
+    # list sm_100a; on sm_103a the role-rebalanced twin replaces the f16-I/O
+    # fp32-state stateful DV-split base for the one geometry it is exported
+    # for, so its records are read next to the base.  The contract fixes the
+    # remaining terms of both rules (packed state, no single chunk, no
+    # checkpoints); the geometry terms of the sm_103a rule are the twin
+    # record's own specializations.  The other performance twins (gatepipe4,
+    # fullgrid_vhold, gate-stream full) are exported for exactly the geometry
+    # triples of their base record.
+    sm100a_state_inp_late = (
+        arch == "sm_100a"
+        and dvsplit
+        and io_dtype == "bfloat16"
+        and state_dtype in ("float32", "bfloat16")
     )
-    expected_source = f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
+    sm103a_role_rebalanced = (
+        arch == "sm_103a"
+        and dvsplit
+        and use_initial_state
+        and store_final_state
+        and io_dtype == "float16"
+        and state_dtype == "float32"
+    )
+
+    def _source(*, role_rebalanced: bool) -> str:
+        schedule_attr = _prefill_schedule_attr(
+            dvsplit=dvsplit,
+            use_initial_state=use_initial_state,
+            io_dtype=io_dtype,
+            state_dtype=state_dtype,
+            single_chunk=False,
+            gatepipe4=False,
+            fullgrid_vhold=False,
+            sm100a_state_inp_late=sm100a_state_inp_late,
+            sm103a_role_rebalanced=role_rebalanced,
+            gate_stream_full=False,
+        )
+        return f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
+
+    expected_sources = {_source(role_rebalanced=False)}
+    if sm103a_role_rebalanced:
+        expected_sources.add(_source(role_rebalanced=True))
     fixed: dict[str, int] = {
         "ENABLE_CHECKPOINTS": 0,
         "SINGLE_CHUNK_NO_STATE": 0,
@@ -803,7 +883,7 @@ def cake_gdn_prefill_geometries(
         specializations = record["specializations"]
         if (
             record["domain"] != "prefill"
-            or record["source_schedule"] != expected_source
+            or record["source_schedule"] not in expected_sources
             or record["tma_abi"] != "grid_constant"
             or not _serves_arch(record, arch)
             or set(specializations) != set(fixed) | set(geometry_keys)
@@ -1350,6 +1430,7 @@ __all__ = [
     "cake_gdn_prefill_geometries",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
+    "render_cake_gdn_host_shim",
     "select_cake_gdn_decode_variant",
     "select_cake_gdn_prefill_variant",
 ]

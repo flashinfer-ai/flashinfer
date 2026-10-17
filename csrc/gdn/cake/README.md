@@ -10,17 +10,24 @@ with per-variant SASS equivalence checks against the generated originals.
 
 - `manifest.json` is the only registry. Each entry under `variants` names
   its kernel sources (`outputs[].path`, each shared by every specialization of
-  the same kernel body), the compile-time `defines` that specialize them
-  (passed as `-D` flags), the `specializations` the resolver matches, and
-  one host shim (`host_binding`).
+  the same kernel body), the `specializations` the resolver matches (also
+  passed as the `-D` flags that specialize the body, unless the entry spells
+  out its own `defines`: the decode bodies that bake their constants in-file
+  take none, and some bodies take only a subset of the keys), and the
+  template, kernel symbol and parameters of its host shim (`host_binding`).
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
   outputs of a record partition its `architectures`, and the loader
   compiles the one output that lists the device's architecture. Genuine
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
-  target other than exact SM100a; the seven `fullgrid_vhold` prefill variants
-  stay SM100a-only) or, when one architecture's lowering of a shared body
+  target other than exact SM100a; the eight `fullgrid_vhold` prefill variants
+  stay SM100a-only; a prefill body shared by all three architectures masks
+  its shared-memory descriptor addresses per architecture inside the one
+  file -- the per-file `CAKE_GDN_SMEM_DESC_MASK`, `0x7FFF` under
+  `#if __CUDA_ARCH__ == 1070` and `0x3FFF` otherwise, or an exact
+  `#if __CUDA_ARCH__ == 1030` guard -- so every prefill record carries one
+  output) or, when one architecture's lowering of a shared body
   differs from the shipped text, in that architecture's own output: the
   SM107a decode bodies scale q through `cake_f32_mul_f64const_rn` (an exact,
   FP64-free emulation of `(float)((double)x * SCALE)` defined in
@@ -29,7 +36,7 @@ with per-variant SASS equivalence checks against the generated originals.
   `cake_`) and are delivered as `sm_107a`-only outputs of the same records,
   while the SM100a/SM103a outputs keep the shipped text byte for byte. In the
   manifest this reads as follows: a decode record exported for SM107a together
-  with SM100a/SM103a (36 three-architecture decode records in the current
+  with SM100a/SM103a (23 three-architecture decode records in the current
   manifest) keeps its shipped body as `outputs[0]` with `architectures`
   reduced to `["sm_100a", "sm_103a"]` and gains an `sm_107a` output; a decode
   record exported for SM107a alone (the `_vpre` / `_pro` bodies; the fp32 T=1
@@ -41,23 +48,29 @@ with per-variant SASS equivalence checks against the generated originals.
   `csrc/`, shared with other Cake families, so the cubin compile adds `csrc`
   to its include path). No SM100a/SM103a kernel body and no kernel's
   behaviour changes.
-  `cuda/gdn_prefill_generated.cuh` and `../cake_gdn_common.cuh` are the
-  shared device headers.
-  Three prefill variants keep their own source with in-file defines
-  (`dvsplit_initial_bf16state_135bfa59984f`, `..._d8b5b50285af`,
-  `dvsplit_initial_f16io_f481beb70ea9`): compiled from the shared body with
-  the same values passed as `-D`, nvcc 13.4 (sm_103a) schedules them
-  differently (same instruction count; register assignment, instruction
-  order and one uniform address computation change), deterministically.
-  They stay as separate files so every variant compiles to the SASS of its
-  original under identical compile conditions.
-- `host/` holds one TVM-FFI launcher per variant. The helpers they share
-  (device guard, tensor checks, dynamic shared-memory opt-in) live in
-  `host/cake_gdn_host_common.h`.
+  `../cake_gdn_common.cuh` is the shared device header of the decode bodies
+  that do not include `cake_gdn_device_common.cuh`.
+  In-file defines and the same values passed as `-D` are not interchangeable:
+  for three prefill variants (`dvsplit_initial_bf16state_135bfa59984f`,
+  `..._d8b5b50285af`, `dvsplit_initial_f16io_f481beb70ea9`) compiled from the
+  shared body with their values passed as `-D`, nvcc 13.4 (sm_103a) schedules
+  the kernel differently from the in-file form (same instruction count;
+  register assignment, instruction order and one uniform address computation
+  change), deterministically.
+- `host/templates/` holds one TVM-FFI launcher template per shim class. The
+  former per-variant shims differed only in identifiers and literals, which
+  the templates take as `@NAME@` placeholders: `@ENTRY@`, `@MODULE_IDENT@`,
+  `@CUDA_SYMBOL@` and `@SHIM_NAMESPACE@` come from `host_binding` (`entry`,
+  `module_ident`, `cuda_symbol`, `shim_namespace`), every other placeholder
+  from `host_binding.params`. `flashinfer/jit/cake_gdn.py` renders the shim
+  text at load time; it is byte-identical to the former file
+  (`tests/gdn/cake_gdn_host_shim_sha256.json` pins it per variant). The
+  helpers the launchers share (device guard, tensor checks, dynamic
+  shared-memory opt-in) live in `host/cake_gdn_host_common.h`.
 
 `flashinfer/jit/cake_gdn.py` compiles the kernel to a cubin with `nvcc`,
-embeds it into the host shim, and resolves requests to exactly one listed
-variant; requests outside the listed routes fail closed.
+embeds it into the rendered host shim, and resolves requests to exactly one
+listed variant; requests outside the listed routes fail closed.
 
 ## Contracts
 
