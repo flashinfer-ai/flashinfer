@@ -48,13 +48,18 @@ inline size_t GetRadixTopKAvailableOrderedSmemBytes(size_t max_smem_per_block,
   constexpr size_t RADIX_TOPK_DETERMINISTIC_BLOCK_SCAN_SMEM =
       sizeof(typename RadixTopKDetBlockScanT::TempStorage);
   constexpr size_t RADIX_TOPK_LAUNCH_SMEM_HEADROOM = 2 * RADIX_TOPK_DETERMINISTIC_BLOCK_SCAN_SMEM;
+  // Static shared memory counts against the same opt-in limit as the dynamic allocation.
+  // RenormProb has two BlockReduce scratch buffers; leave room for bookkeeping and alignment
+  // as well. The other non-deterministic radix kernels need only bookkeeping scalars.
+  constexpr size_t RADIX_TOPK_STATIC_SMEM_RESERVE =
+      2 * sizeof(typename cub::BlockReduce<float, BLOCK_THREADS>::TempStorage) + 64;
+  static_assert(RADIX_TOPK_LAUNCH_SMEM_HEADROOM >= RADIX_TOPK_STATIC_SMEM_RESERVE);
   const size_t launch_headroom =
-      reserve_launch_headroom ? RADIX_TOPK_LAUNCH_SMEM_HEADROOM : size_t(0);
+      reserve_launch_headroom ? RADIX_TOPK_LAUNCH_SMEM_HEADROOM : RADIX_TOPK_STATIC_SMEM_RESERVE;
   if (max_smem_per_block <= fixed_smem_aligned + launch_headroom) {
     return 0;
   }
-  // Reserve enough launch-time headroom for deterministic radix kernels that
-  // instantiate additional static shared scratch such as BlockScan temp storage.
+  // Deterministic radix kernels need the larger reserve for BlockScan scratch.
   return max_smem_per_block - fixed_smem_aligned - launch_headroom;
 }
 
