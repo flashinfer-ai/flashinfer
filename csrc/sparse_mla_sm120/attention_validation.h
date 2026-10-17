@@ -217,13 +217,16 @@ ffi::Array<int64_t> inspect_attention_metadata(
   }
   if constexpr (IsDsv4Nvfp4)
     TVM_FFI_ICHECK(lse_stride == size_t(h)) << "NVFP4 LSE must be contiguous";
+  // extra_fp4 describes the extra cache's format; with no extra cache there is
+  // nothing to describe, so drop the flag to keep extra_fp4 == dual.
+  const bool packed_extra_fp4 = extra_fp4 && extra_indices.has_value();
   return execution::pack_metadata(
       {int(model), t, h, int(indices.size(-1)),
        extra_indices.has_value() ? int(extra_indices.value().size(-1)) : 0, layout.page_block_size,
        ex.page_block_size, layout.stride_kv_block, ex.stride_kv_block, layout.stride_kv_row,
        size_t(indices.stride(0)),
        extra_indices.has_value() ? size_t(extra_indices.value().stride(0)) : 0, lse_stride,
-       lengths.has_value(), extra_lengths.has_value(), sink.has_value(), extra_fp4, 0});
+       lengths.has_value(), extra_lengths.has_value(), sink.has_value(), packed_extra_fp4, 0});
 }
 
 }  // namespace flashinfer::sparse_mla_sm120
