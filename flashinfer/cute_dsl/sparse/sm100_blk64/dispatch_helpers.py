@@ -146,6 +146,24 @@ def sm100_blk64_requires_int64_kv_strides(
     return False
 
 
+def sm100_blk64_has_partial_kv_tail(
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    """Return whether the final physical KV block is shorter than 64 rows.
+
+    When seqlen_k is not divisible by 64, the packed rank-6 KV view used by
+    the Int32 TMA path declares ceil_div(seqlen_k, 64) full 64-token blocks.
+    TMA then treats the last partial block as having 64 valid rows and reads
+    beyond the actual buffer, producing address-dependent NaN/Inf outputs.
+
+    The fix routes these cases through use_exact_kv_layout=True, which builds
+    the TMA descriptor from the true seqlen_k extent so TMA hardware
+    zero-fills the out-of-bounds rows of the partial last block.
+    """
+    return k.shape[2] % 64 != 0 or v.shape[2] % 64 != 0
+
+
 def _tensor_dynamic_layout_compile_key(t: torch.Tensor, leading_dim: int = -1):
     """Match the static rank/dtype/broadcast parts of mark_layout_dynamic()."""
     if leading_dim == -1:
@@ -858,6 +876,11 @@ def validate_sm100_blk64_fp8_sage(
         raise ValueError(
             "Sage FP8 blk64 requires full 64-token KV blocks (block_sizes must "
             "be None); partial/padded KV blocks are not supported yet"
+        )
+    if seqlen_k % 64 != 0:
+        raise ValueError(
+            f"Sage FP8 blk64 requires seqlen_k divisible by 64 (got {seqlen_k}); "
+            "the D-major KV layout does not support partial 64-token tail blocks"
         )
     if (
         q_scale.dtype != torch.float32

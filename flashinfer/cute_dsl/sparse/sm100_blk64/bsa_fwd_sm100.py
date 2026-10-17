@@ -67,6 +67,7 @@ class BlockSparseAttnForwardSm100Blk64:
         has_block_sizes: cutlass.Constexpr[bool] = True,
         num_splits: cutlass.Constexpr[int] = 1,
         use_int64_kv_strides: cutlass.Constexpr[bool] = False,
+        use_exact_kv_layout: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -136,6 +137,7 @@ class BlockSparseAttnForwardSm100Blk64:
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
         self.use_int64_kv_strides = use_int64_kv_strides
+        self.use_exact_kv_layout = use_exact_kv_layout
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = pack_gqa
         if pack_gqa:
@@ -343,7 +345,10 @@ class BlockSparseAttnForwardSm100Blk64:
         # The fast rank-6 view matches the sparse-block layout. CuTe DSL
         # cannot lower an Int64 basis in that rank-6 TMA view, so layouts with
         # large active strides use a rank-5 Int64 view and divide it into
-        # sparse blocks in the device kernel instead.
+        # sparse blocks in the device kernel instead. When seqlen_k is not
+        # divisible by 64, the exact-boundary path (use_exact_kv_layout) also
+        # uses a rank-5 view with the true seqlen_k extent so TMA zero-fills
+        # the partial last block rather than reading beyond the buffer.
         k_dim_half = self.head_dim_padded // 2
         v_dim_part = self.head_dim_v_padded // 2
         if const_expr(self.use_int64_kv_strides):
@@ -374,6 +379,56 @@ class BlockSparseAttnForwardSm100Blk64:
             v_stride_d = Int64(mV_seq.layout.stride[1])
             v_stride_h = Int64(mV_seq.layout.stride[2])
             v_stride_b = Int64(mV_seq.layout.stride[3])
+            mV = cute.make_tensor(
+                mV_seq.iterator,
+                cute.make_layout(
+                    (
+                        v_dim_part,
+                        mV_seq.shape[0],
+                        2,
+                        mV_seq.shape[2],
+                        mV_seq.shape[3],
+                    ),
+                    stride=(
+                        v_stride_d,
+                        v_stride_s,
+                        v_dim_part * v_stride_d,
+                        v_stride_h,
+                        v_stride_b,
+                    ),
+                ),
+            )
+        elif const_expr(self.use_exact_kv_layout):
+            # Exact-boundary layout: true seqlen_k extent with Int32 strides.
+            # Same 5D shape as the Int64 path so the kernel body can share the
+            # zipped_divide code path, but strides stay Int32 for performance.
+            k_stride_s = Int32(mK_seq.layout.stride[0])
+            k_stride_d = Int32(mK_seq.layout.stride[1])
+            k_stride_h = Int32(mK_seq.layout.stride[2])
+            k_stride_b = Int32(mK_seq.layout.stride[3])
+            mK = cute.make_tensor(
+                mK_seq.iterator,
+                cute.make_layout(
+                    (
+                        mK_seq.shape[0],
+                        k_dim_half,
+                        2,
+                        mK_seq.shape[2],
+                        mK_seq.shape[3],
+                    ),
+                    stride=(
+                        k_stride_s,
+                        k_stride_d,
+                        k_dim_half * k_stride_d,
+                        k_stride_h,
+                        k_stride_b,
+                    ),
+                ),
+            )
+            v_stride_s = Int32(mV_seq.layout.stride[0])
+            v_stride_d = Int32(mV_seq.layout.stride[1])
+            v_stride_h = Int32(mV_seq.layout.stride[2])
+            v_stride_b = Int32(mV_seq.layout.stride[3])
             mV = cute.make_tensor(
                 mV_seq.iterator,
                 cute.make_layout(
@@ -1529,7 +1584,10 @@ class BlockSparseAttnForwardSm100Blk64:
                 if const_expr(not self.pack_gqa)
                 else head_idx
             )
-            if const_expr(self.use_int64_kv_strides):
+            if const_expr(self.use_int64_kv_strides or self.use_exact_kv_layout):
+                # Both the Int64-stride path and the exact-boundary Int32 path build a
+                # 5D tensor with true seqlen_k as the first dimension; zipped_divide
+                # partitions it into sparse blocks with the correct TMA extent.
                 mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
                 gK_tma = cute.zipped_divide(
