@@ -4975,6 +4975,7 @@ class TestWorkspaceBucketing:
     def test_workspace_stable_within_bucket(self):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
+        md._WORKSPACE_CACHE.clear()
         device = torch.device("cuda")
         kwargs = dict(
             backend="static",
