@@ -102,6 +102,10 @@ class _Program:
     program, one CTA per SM over item-major tile ranges) or ``chunkpar3``
     (the three-phase chunk-parallel program, one CTA per (chunk, head)
     tile); it fixes the host template and the main kernel's argument order.
+    ``variant`` is the schedule variant of the exact-scan families: ``""``
+    (the ring program), ``"noring"`` or ``"tail"`` (the two-kernel family's
+    2-CTA pair program, ``cluster_dims`` ``(2, 1, 1)``, launched on the even
+    grid :func:`_tail_grid_size`).
     """
 
     family: str
@@ -112,6 +116,8 @@ class _Program:
     main_smem_bytes: int
     host_template: Path
     main_args: tuple[str, ...]
+    variant: str = ""
+    cluster_dims: tuple[int, int, int] = (1, 1, 1)
 
     @property
     def kernels(self) -> tuple[_Kernel, _Kernel]:
@@ -138,7 +144,13 @@ class _Program:
 # variants of every program: the ring program (``<family>_<state>_<mode>``)
 # and the ``_noring`` program (the same kernel built with
 # ``epilogue_ring=False``, bitwise-identical outputs), selected per call by
-# :func:`_exact_scan_variant` from host-known shape quantities.
+# :func:`_exact_scan_variant` from host-known shape quantities.  The two-kernel
+# family also ships the ``_tail`` pair program (the ring kernel launched as
+# 2-CTA clusters that split an odd pair's first item at its middle chunk,
+# bitwise-identical outputs), selected by :func:`tail_selected` for long-item
+# two-kernel calls whose balanced persistent grid leaves a tail wave; no call
+# inside the fused window reaches the pair program's chunk floor, so the fused
+# family ships none.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_08c5aea4d0"
 # Retained start programs (the FlashInfer 36fd76859292 files): a literal the
 # Cake export does not fill.
@@ -191,6 +203,12 @@ _EXACTPRE_MODULES = {
     "exactpre_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring_069dc7a400",
     "exactpre_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_noring_91d6c527b2",
     "exactpre_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_noring_a3561e97e0",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_PENDINGEXPORT",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_PENDINGEXPORT",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_PENDINGEXPORT",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_PENDINGEXPORT",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_PENDINGEXPORT",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_PENDINGEXPORT",
 }
 _CHUNKPAR3_MODULES = {
     "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_f17431806f",
@@ -238,6 +256,11 @@ _EXACT_NORING_SMEM_BYTES = 232448
 # ``exactpre_*`` table entries (0 = not exported yet).
 _EXACTPRE_SMEM_BYTES = 232320
 _EXACTPRE_NORING_SMEM_BYTES = 232192
+# Main dynamic SMEM of the tail-wave pair programs (``exactpre_*_tail``: the
+# two-kernel ring programs launched as 2-CTA clusters, with the hand-off
+# mbarrier); refreshed by the Cake export with the ``exactpre_*_tail`` table
+# entries.
+_EXACTPRE_TAIL_SMEM_BYTES = 232320
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -477,6 +500,15 @@ _VARIANT_SMEM_BYTES = {
     ("exact", "noring"): _EXACT_NORING_SMEM_BYTES,
     ("exactfused", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactpre", "noring"): _EXACTPRE_NORING_SMEM_BYTES,
+    ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
+}
+# Cluster shape of the main kernels (the Cake export checks the generated
+# sources against it): the ``_tail`` pair programs launch as 2-CTA clusters
+# (``__cluster_dims__(2, 1, 1)`` in the device source, honored by a plain
+# launch, so the host templates are unchanged); every other program launches
+# without clusters.
+_VARIANT_CLUSTER_DIMS = {
+    ("exactpre", "tail"): (2, 1, 1),
 }
 
 
@@ -486,6 +518,7 @@ def _program(name: str, module: str) -> _Program:
     family, state_key, _mode, *variant = name.split("_")
     code, bits = _STATE_DTYPE_CODES[state_key]
     host_template, main_args, smem_bytes = _FAMILY_HOST[family]
+    variant_name = ""
     if variant:
         (variant_name,) = variant
         smem_bytes = _VARIANT_SMEM_BYTES[(family, variant_name)]
@@ -498,6 +531,8 @@ def _program(name: str, module: str) -> _Program:
         smem_bytes,
         host_template,
         main_args,
+        variant_name,
+        _VARIANT_CLUSTER_DIMS.get((family, variant_name), (1, 1, 1)),
     )
 
 
@@ -518,7 +553,8 @@ def _program_name(
 ) -> str:
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
-    family (``"noring"`` for the three exact-scan families)."""
+    family (``"noring"`` for the three exact-scan families, ``"tail"`` for
+    the two-kernel exact-scan family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -1159,6 +1195,20 @@ def fused_selected(
     )
 
 
+def host_chunks_per_item(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> int:
+    """Host-known chunks per (sequence, head) work item: batched calls
+    ``ceil(seqlen / 128)`` -- every item spans the same ``seqlen`` tokens;
+    varlen calls ``ceil(ceil(seqlen / num_sequences) / 128)`` with ``seqlen``
+    the packed token count -- the mean sequence length is the host-known
+    quantity (the per-sequence lengths live on the device).  A
+    ``num_sequences`` of 0 counts as 1."""
+
+    if not mode_varlen:
+        return -(-int(seqlen) // _CHUNK_SIZE)
+    mean_tokens = -(-int(seqlen) // max(int(num_sequences), 1))
+    return -(-mean_tokens // _CHUNK_SIZE)
+
+
 def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> str:
     """Two-kernel program family of a call the chunk-parallel and fused routes
     left on the two-kernel form: ``"exactpre"`` (the round-6 render) where the
@@ -1174,12 +1224,52 @@ def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> 
     fixed cost is amortized over.  A ``num_sequences`` of 0 counts as 1.
     """
 
-    if not mode_varlen:
-        chunks = -(-int(seqlen) // _CHUNK_SIZE)
-    else:
-        mean_tokens = -(-int(seqlen) // max(int(num_sequences), 1))
-        chunks = -(-mean_tokens // _CHUNK_SIZE)
+    chunks = host_chunks_per_item(
+        mode_varlen=mode_varlen, num_sequences=num_sequences, seqlen=seqlen
+    )
     return "exactpre" if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS else "exact"
+
+
+# Tail-wave pair program (``_tail``): the two-kernel exact-scan kernel launched
+# as 2-CTA clusters on an even grid; a pair with an odd item count splits its
+# first item at the middle chunk and hands the scan state to its partner, so
+# the half wave a balanced persistent grid leaves idle is filled.  The cluster
+# launch and the pair plan cost 2-5 us per launch and the hand-off about one
+# chunk per split item, so the pair program is taken only where the chunks per
+# item amortize both (measured floor: 16 chunks) and the pair makespan in
+# items beats the persistent program's.  Mirrors the Cake kernel-tests
+# ``tail_route`` for the two-kernel family; its fused clause (32 chunks, SM103
+# only) lies outside the fused window (:func:`fused_selected`), so the fused
+# family ships no pair program and the fused route is judged first.
+_TAIL_MIN_CHUNKS = 16
+
+
+def _tail_grid_size(*, sm_count: int) -> int:
+    """Grid of a ``_tail`` program: one 2-CTA cluster per SM pair."""
+
+    return 2 * (sm_count // 2)
+
+
+def tail_selected(*, total_work: int, chunks_per_item: int, sm_count: int) -> bool:
+    """Whether a two-kernel exact-scan call of ``total_work`` (sequence, head)
+    items with ``chunks_per_item`` host-known chunks per item
+    (:func:`host_chunks_per_item`) runs the ``_tail`` pair program on a device
+    of ``sm_count`` SMs: a tail wave exists (the balanced persistent grid is
+    below one CTA per SM), the chunk floor is met and ``ceil(items / pairs) /
+    2`` (half items count) is below the persistent program's ``ceil(items /
+    grid)``."""
+
+    pairs = sm_count // 2
+    if pairs < 1 or total_work <= sm_count:
+        return False
+    if chunks_per_item < _TAIL_MIN_CHUNKS:
+        return False
+    balanced_grid = _persistent_grid_size(total_work=total_work, sm_count=sm_count)
+    if balanced_grid >= sm_count:
+        return False
+    persistent_makespan = -(-total_work // balanced_grid)
+    pair_makespan = -(-total_work // pairs) / 2
+    return pair_makespan < persistent_makespan
 
 
 def _sequence_arguments(
@@ -1930,9 +2020,29 @@ class CakeSSDCombined:
                 total_tokens=batch * seqlen,
             )
         )
+        # The two-kernel pair program (``tail_selected``) is judged after the
+        # fused route and before the ring / noring choice; its route and the
+        # retained ``exact`` family are disjoint (16 chunks per item imply
+        # ``exactpre``).
+        tail = (
+            not chunk_parallel
+            and not fused
+            and tail_selected(
+                total_work=num_sequences * self.nheads,
+                chunks_per_item=host_chunks_per_item(
+                    mode_varlen=self.has_varlen,
+                    num_sequences=num_sequences,
+                    # packed varlen: x is [1, total tokens, nheads, 64]
+                    seqlen=batch * seqlen if self.has_varlen else seqlen,
+                ),
+                sm_count=sm_count,
+            )
+        )
         variant = (
             ""
             if chunk_parallel
+            else "tail"
+            if tail
             else _exact_scan_variant(
                 mode_varlen=self.has_varlen,
                 has_z=self.has_z,
@@ -2803,6 +2913,10 @@ class CakeSSDCombined:
             # cu_seqlens form may never address; the kernel reads the real
             # tile count from ``seq_chunk_cumsum[sequence_count]``.
             grid = max(1, min(num_segments * self.nheads, sm_count))
+        elif program.variant == "tail":
+            # One 2-CTA cluster per SM pair; the pair plan is computed in-kernel
+            # from this grid (``tail_selected`` chose the program).
+            grid = _tail_grid_size(sm_count=sm_count)
         else:
             grid = _persistent_grid_size(
                 total_work=num_sequences * self.nheads, sm_count=sm_count

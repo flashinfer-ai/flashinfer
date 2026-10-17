@@ -4489,20 +4489,25 @@ def test_source_program_table_names_shipped_sources():
         family, state_key, mode, *variant = name.split("_")
         template_path, main_args, smem_bytes = family_host[family]
         if variant:
-            assert variant == ["noring"] and family in (
-                "exact",
-                "exactfused",
-                "exactpre",
-            )
-            smem_bytes = module._VARIANT_SMEM_BYTES[(family, "noring")]
+            (variant_name,) = variant
+            assert variant_name in ("noring", "tail")
+            assert family in ("exact", "exactfused", "exactpre")
+            if variant_name == "tail":
+                assert family == "exactpre"
+            smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
             assert (
                 smem_bytes
                 == {
-                    "exact": module._EXACT_NORING_SMEM_BYTES,
-                    "exactfused": module._EXACTFUSED_NORING_SMEM_BYTES,
-                    "exactpre": module._EXACTPRE_NORING_SMEM_BYTES,
-                }[family]
+                    ("exact", "noring"): module._EXACT_NORING_SMEM_BYTES,
+                    ("exactfused", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
+                    ("exactpre", "noring"): module._EXACTPRE_NORING_SMEM_BYTES,
+                    ("exactpre", "tail"): module._EXACTPRE_TAIL_SMEM_BYTES,
+                }[(family, variant_name)]
             )
+        assert program.variant == (variant[0] if variant else "")
+        assert program.cluster_dims == module._VARIANT_CLUSTER_DIMS.get(
+            (family, program.variant), (1, 1, 1)
+        )
         assert program.family == family
         assert program.host_template == template_path
         assert program.main_args == main_args
@@ -4558,11 +4563,11 @@ def test_source_program_table_names_shipped_sources():
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
     # One shared source per physical kernel: twelve retained start ``exact``
     # main sources (six ring + six ``_noring``), twelve fused ``exactfused``
-    # main sources, twelve two-kernel ``exactpre`` main sources, six
-    # look-back (``chunkpar``) and six three-phase (``chunkpar3``)
-    # chunk-parallel main sources plus the one preprocess kernel, no
-    # architecture copies and no orphans.
-    assert len(device_sources) == 49
+    # main sources, eighteen two-kernel ``exactpre`` main sources (six ring,
+    # six ``_noring``, six ``_tail``), six look-back (``chunkpar``) and six
+    # three-phase (``chunkpar3``) chunk-parallel main sources plus the one
+    # preprocess kernel, no architecture copies and no orphans.
+    assert len(device_sources) == 55
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -6178,17 +6183,18 @@ def test_source_exact_scan_variant_programs():
                 assert b.main_smem_bytes == noring_smem
                 assert a.main.module != b.main.module
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 12
+    # the two-kernel family: six ring, six ``_noring`` and six ``_tail`` programs
     assert (
         len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 12
     )
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 12
+        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 18
     )
     assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
     assert (
         len([name for name in module._PROGRAMS if name.startswith("chunkpar3_")]) == 6
     )
-    assert len(module._PROGRAMS) == 48
+    assert len(module._PROGRAMS) == 54
 
 
 @pytest.mark.parametrize(
@@ -6625,3 +6631,117 @@ def test_source_fused_cu_seqlens_form_derives_the_metadata_in_kernel(monkeypatch
     assert launch["preprocess_grid"][0] >= 1
     assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
     assert launch["main"]["seq_chunk_cumsum"] is buffer
+
+
+def test_source_tail_route_mirrors_the_kernel_tests_rule():
+    """``tail_selected`` mirrors the Cake kernel-tests ``tail_route`` for the
+    two-kernel family: a two-kernel exact-scan call runs the ``_tail`` pair
+    program where its balanced persistent grid leaves a tail wave, the
+    host-known chunks per item reach 16 and the pair makespan in items
+    ``ceil(items / pairs) / 2`` is below the persistent program's ``ceil(items
+    / grid)``.  The expectation is recomputed here from the rule's definition
+    over a grid of item and chunk counts on both devices (148 / 152 SMs)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    route = module.tail_selected
+
+    assert module._TAIL_MIN_CHUNKS == 16
+    assert module._tail_grid_size(sm_count=148) == 148
+    assert module._tail_grid_size(sm_count=152) == 152
+    assert module._tail_grid_size(sm_count=147) == 146
+
+    def expected(items, chunks, sm_count):
+        pairs = sm_count // 2
+        grid = module._persistent_grid_size(total_work=items, sm_count=sm_count)
+        tail_wave = items > sm_count and grid < sm_count
+        return (
+            tail_wave
+            and chunks >= 16
+            and math.ceil(items / pairs) / 2 < math.ceil(items / grid)
+        )
+
+    for sm_count in (148, 152):
+        for items in (64, 128, 148, 152, 256, 296, 304, 384, 512, 640, 768, 1024, 2048):
+            for chunks in (1, 4, 8, 15, 16, 17, 31, 32, 64):
+                assert route(
+                    total_work=items, chunks_per_item=chunks, sm_count=sm_count
+                ) == expected(items, chunks, sm_count), (sm_count, items, chunks)
+        # the measured rows: 512 items (4 sequences x 128 heads)
+        assert route(total_work=512, chunks_per_item=16, sm_count=sm_count)
+        assert route(total_work=512, chunks_per_item=32, sm_count=sm_count)
+        assert not route(total_work=512, chunks_per_item=8, sm_count=sm_count)
+        # 256 items: pair makespan 2.0 equals the persistent program's 2
+        assert not route(total_work=256, chunks_per_item=32, sm_count=sm_count)
+        # 1024 items: a full wave (grid 148 / 152), no tail wave
+        assert not route(total_work=1024, chunks_per_item=32, sm_count=sm_count)
+    # the chunks per item are the two-kernel route's quantity
+    chunks = module.host_chunks_per_item
+    assert chunks(mode_varlen=False, num_sequences=4, seqlen=2048) == 16
+    assert chunks(mode_varlen=True, num_sequences=64, seqlen=64 * 4096) == 32
+    assert chunks(mode_varlen=True, num_sequences=3, seqlen=3 * 2048 - 1) == 16
+    assert chunks(mode_varlen=True, num_sequences=0, seqlen=128) == 1
+    assert module.two_kernel_family(
+        mode_varlen=False, num_sequences=4, seqlen=2048
+    ) == ("exactpre")
+    assert module.two_kernel_family(
+        mode_varlen=False, num_sequences=16, seqlen=128
+    ) == ("exact")
+    # no call inside the fused window reaches the pair program's floor with a
+    # tail wave: batched fused calls span at most 16 chunks only up to 2048
+    # chunk-items, varlen fused calls at most 256 items
+    assert not (
+        module.fused_selected(
+            nheads=128,
+            num_sequences=4,
+            nchunks=16,
+            mode_varlen=False,
+            total_tokens=8192,
+        )
+        and route(total_work=512, chunks_per_item=16, sm_count=148)
+    )
+    assert (
+        module.fused_selected(
+            nheads=128,
+            num_sequences=4,
+            nchunks=16,
+            mode_varlen=False,
+            total_tokens=8192,
+        )
+        is False
+    )
+
+
+def test_source_tail_programs_are_bound():
+    """The six ``_tail`` programs (two-kernel family, three state dtypes,
+    batched and varlen) bind the family's host template and main arguments,
+    the tail SMEM literal, the ``tail`` variant and the 2-CTA cluster shape;
+    the ring and ``_noring`` programs keep their variants, and the fused and
+    retained ``exact`` families have no pair program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    names = [
+        f"exactpre_{state}_{mode}_tail"
+        for state in ("bf16", "f16", "f32")
+        for mode in ("batched", "varlen")
+    ]
+    assert len(names) == 6
+    for name in names:
+        program = module._PROGRAMS[name]
+        ring = module._PROGRAMS[name.rsplit("_", 1)[0]]
+        assert program.variant == "tail"
+        assert program.family == ring.family == "exactpre"
+        assert (
+            program.main_smem_bytes == module._VARIANT_SMEM_BYTES[("exactpre", "tail")]
+        )
+        assert program.host_template == ring.host_template
+        assert program.main_args == ring.main_args
+        assert program.cluster_dims == (2, 1, 1) and ring.cluster_dims == (1, 1, 1)
+        assert ring.variant == ""
+        assert module._PROGRAMS[f"{name.rsplit('_', 1)[0]}_noring"].variant == "noring"
+    assert not any(name.endswith("_tail") for name in module._SCAN_MODULES)
+    assert not any(name.endswith("_tail") for name in module._EXACTFUSED_MODULES)
+    assert set(module._VARIANT_CLUSTER_DIMS) == {("exactpre", "tail")}
+    assert (
+        module._program_name("exactpre", torch.bfloat16, False, "tail")
+        == "exactpre_bf16_batched_tail"
+    )
