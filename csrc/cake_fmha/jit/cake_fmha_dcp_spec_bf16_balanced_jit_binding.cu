@@ -75,12 +75,7 @@ constexpr int64_t kStatsPerSlot = 2 * kMaxNRows;            // max[64] then sum[
 constexpr int64_t kCountersPerTile = 4;    // arrivals, two reduce-queue words, published flag
 constexpr int64_t kReduceSlicesMax = 8;    // reduce tickets per split tile at most
 
-void CheckSameDevice(TensorView query, TensorView tensor, const char* name) {
-  TVM_FFI_ICHECK_EQ(query.device().device_type, tensor.device().device_type)
-      << name << " must be on the query device";
-  TVM_FFI_ICHECK_EQ(query.device().device_id, tensor.device().device_id)
-      << name << " must be on the query device";
-}
+#include "include/cake_fmha_host_helpers.inc"
 
 // Query [batch * q_len, Hq, kHeadDim] read in place as a 4-D map (64 dims,
 // head, token, k-group) whose box (64, kGroup, kQBoxTokens, kQBoxKGroups) is one

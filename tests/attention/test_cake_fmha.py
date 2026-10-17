@@ -1400,18 +1400,93 @@ def test_cake_fmha_tma_adapters_track_descriptor_completion(
     relative_path,
     expected_records,
 ) -> None:
-    adapter = (get_cake_fmha_csrc_dir() / relative_path).read_text(encoding="utf-8")
+    csrc_dir = get_cake_fmha_csrc_dir()
+    adapter = (csrc_dir / relative_path).read_text(encoding="utf-8")
+    # The slot arena and the completion record are shared fragments; the
+    # adapter keeps the slot lookup and its per-launch record calls.
+    arena = (csrc_dir / "include/cake_fmha_tma_device_arena.inc").read_text(
+        encoding="utf-8"
+    )
+    record = (csrc_dir / "include/cake_fmha_tma_device_slot_uses.inc").read_text(
+        encoding="utf-8"
+    )
     normalized = " ".join(adapter.split())
     assert "TmaDeviceSlotLease" in adapter
-    assert "cudaEventQuery" in adapter
-    assert "cudaEventRecord" in adapter
+    assert "cudaEventQuery" in arena
+    assert "cudaEventRecord" in record
     assert "cuCtxGetId" in adapter
-    assert "size_t used = 0" not in adapter
-    assert "++arena.used" not in adapter
+    for text in (adapter, arena, record):
+        assert "size_t used = 0" not in text
+        assert "++arena.used" not in text
     for leases in expected_records:
         assert f"RecordTmaDeviceSlotUses( {leases}, stream);" in normalized or (
             f"RecordTmaDeviceSlotUses({leases}, stream);" in normalized
         )
+
+
+def test_cake_fmha_adapters_share_the_host_helper_fragments() -> None:
+    """Every adapter includes the host-helper fragments it used to define inline."""
+
+    csrc_dir = get_cake_fmha_csrc_dir()
+    adapters = sorted((csrc_dir / "jit").glob("*_jit_binding.cu"))
+    adapters.append(csrc_dir / "cake_fmha_jit_binding.cu")
+    assert len(adapters) == 17
+    tma_adapters = {
+        "cake_fmha_context_bf16_jit_binding.cu",
+        "cake_fmha_context_fp8_jit_binding.cu",
+        "cake_fmha_context_hd256_jit_binding.cu",
+        "cake_fmha_decode_native_bf16_jit_binding.cu",
+        "cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
+        "cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
+        "cake_fmha_decode_quant_bf16q_jit_binding.cu",
+        "cake_fmha_decode_quant_fp8_jit_binding.cu",
+    }
+    # fragment -> (the definitions it carries, the adapters that include it)
+    fragments = {
+        "include/cake_fmha_host_helpers.inc": (
+            ("void CheckSameDevice(",),
+            {adapter.name for adapter in adapters},
+        ),
+        "include/cake_fmha_tma_device_arena.inc": (
+            (
+                "struct TmaDeviceSlotState {",
+                "struct TmaDeviceArena {",
+                "struct TmaDeviceSlotLease {",
+                "bool TmaDeviceSlotReady(",
+                "void AddTmaDeviceSlotChunk(",
+                "std::mutex& TmaDeviceSlotMutex()",
+                "TmaDeviceArena>& TmaDeviceArenas()",
+            ),
+            tma_adapters,
+        ),
+        "include/cake_fmha_tma_device_slot_uses.inc": (
+            ("void RecordTmaDeviceSlotUses(",),
+            tma_adapters,
+        ),
+    }
+    for fragment, (definitions, _) in fragments.items():
+        text = (csrc_dir / fragment).read_text(encoding="utf-8")
+        assert text.count("#pragma once\n") == 1
+        # A textual fragment: it is included inside the adapter's anonymous
+        # namespace, so it brings no includes and opens no namespace of its own.
+        assert "#include" not in text
+        assert not any(line.startswith("namespace") for line in text.splitlines())
+        for definition in definitions:
+            assert text.count(definition) == 1
+    for adapter in adapters:
+        text = adapter.read_text(encoding="utf-8")
+        assert text.count("\nnamespace {\n") == 1
+        anonymous = text.split("\nnamespace {\n", 1)[1].split("\n}  // namespace\n", 1)[
+            0
+        ]
+        for fragment, (definitions, users) in fragments.items():
+            include = f'#include "{fragment}"\n'
+            if adapter.name in users:
+                assert text.count(include) == 1 and include in anonymous
+            else:
+                assert include not in text
+            for definition in definitions:
+                assert definition not in text
 
 
 @pytest.mark.parametrize(
