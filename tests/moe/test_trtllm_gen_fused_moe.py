@@ -2400,6 +2400,23 @@ def test_topk_sigmoid_weights_are_unnormalized(num_tokens):
             },
             id="MiniMax2_256e",
         ),
+        pytest.param(
+            {
+                # DeepSeek-V4.1-Flash geometry: sqrtsoftplus, ungrouped, 384/6, x1.5
+                "num_experts": 384,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": 1.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.SqrtSoftplus,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="SqrtSoftplus_384e",
+        ),
     ],
 )
 @pytest.mark.parametrize(
