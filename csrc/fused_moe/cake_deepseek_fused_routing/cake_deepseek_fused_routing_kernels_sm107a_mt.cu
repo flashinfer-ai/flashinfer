@@ -120,9 +120,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[2];
+  unsigned int p1x_first_encoded[2];
+  unsigned int p1x_first_max[2];
+  int p1x_first_expert[2];
+  unsigned int p1x_second_max[2];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 2; slot_1++) {
     int slot_token = bid * 2 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -136,17 +146,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 2; slot_2++) {
+    int slot_token_1 = bid * 2 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 2; slot_3++) {
+    int slot_token_2 = bid * 2 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -154,31 +180,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 2; slot_4++) {
+    int slot_token_3 = bid * 2 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 2; slot_5++) {
+    int slot_token_4 = bid * 2 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
@@ -455,9 +495,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[3];
+  unsigned int p1x_first_encoded[3];
+  unsigned int p1x_first_max[3];
+  int p1x_first_expert[3];
+  unsigned int p1x_second_max[3];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 3; slot_1++) {
     int slot_token = bid * 3 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -471,17 +521,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 3; slot_2++) {
+    int slot_token_1 = bid * 3 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 3; slot_3++) {
+    int slot_token_2 = bid * 3 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -489,31 +555,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 3; slot_4++) {
+    int slot_token_3 = bid * 3 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 3; slot_5++) {
+    int slot_token_4 = bid * 3 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
@@ -790,9 +870,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[4];
+  unsigned int p1x_first_encoded[4];
+  unsigned int p1x_first_max[4];
+  int p1x_first_expert[4];
+  unsigned int p1x_second_max[4];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 4; slot_1++) {
     int slot_token = bid * 4 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -806,17 +896,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 4; slot_2++) {
+    int slot_token_1 = bid * 4 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 4; slot_3++) {
+    int slot_token_2 = bid * 4 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -824,31 +930,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 4; slot_4++) {
+    int slot_token_3 = bid * 4 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 4; slot_5++) {
+    int slot_token_4 = bid * 4 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
@@ -1125,9 +1245,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[5];
+  unsigned int p1x_first_encoded[5];
+  unsigned int p1x_first_max[5];
+  int p1x_first_expert[5];
+  unsigned int p1x_second_max[5];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 5; slot_1++) {
     int slot_token = bid * 5 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -1141,17 +1271,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 5; slot_2++) {
+    int slot_token_1 = bid * 5 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 5; slot_3++) {
+    int slot_token_2 = bid * 5 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -1159,31 +1305,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 5; slot_4++) {
+    int slot_token_3 = bid * 5 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 5; slot_5++) {
+    int slot_token_4 = bid * 5 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
@@ -1460,9 +1620,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[6];
+  unsigned int p1x_first_encoded[6];
+  unsigned int p1x_first_max[6];
+  int p1x_first_expert[6];
+  unsigned int p1x_second_max[6];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 6; slot_1++) {
     int slot_token = bid * 6 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -1476,17 +1646,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 6; slot_2++) {
+    int slot_token_1 = bid * 6 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 6; slot_3++) {
+    int slot_token_2 = bid * 6 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -1494,31 +1680,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 6; slot_4++) {
+    int slot_token_3 = bid * 6 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 6; slot_5++) {
+    int slot_token_4 = bid * 6 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
@@ -1795,9 +1995,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[7];
+  unsigned int p1x_first_encoded[7];
+  unsigned int p1x_first_max[7];
+  int p1x_first_expert[7];
+  unsigned int p1x_second_max[7];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 7; slot_1++) {
     int slot_token = bid * 7 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -1811,17 +2021,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 7; slot_2++) {
+    int slot_token_1 = bid * 7 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 7; slot_3++) {
+    int slot_token_2 = bid * 7 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -1829,31 +2055,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 7; slot_4++) {
+    int slot_token_3 = bid * 7 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 7; slot_5++) {
+    int slot_token_4 = bid * 7 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
@@ -2130,9 +2370,19 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
   if (expert_active != 0) {
     bias_value = (float)bias[expert];
   }
+  float p1x_biased[8];
+  unsigned int p1x_first_encoded[8];
+  unsigned int p1x_first_max[8];
+  int p1x_first_expert[8];
+  unsigned int p1x_second_max[8];
 #pragma unroll
   for (int slot_1 = 0; slot_1 < 8; slot_1++) {
     int slot_token = bid * 8 + slot_1;
+    p1x_biased[slot_1] = -CAKE_INF;
+    p1x_first_encoded[slot_1] = 0;
+    p1x_first_max[slot_1] = 0;
+    p1x_first_expert[slot_1] = 0;
+    p1x_second_max[slot_1] = 0;
     if (slot_token < T) {
       float sigmoid_value = 0.0f;
       float biased_value = -CAKE_INF;
@@ -2146,17 +2396,33 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
         sigmoid_scores[slot_1 * 256 + expert] = sigmoid_value;
         biased_scores[slot_1 * 256 + expert] = biased_value;
       }
+      p1x_biased[slot_1] = biased_value;
       uint32_t _amf_u_0 = __float_as_uint(biased_value);
       uint32_t _amf_mask_0 = -int32_t(_amf_u_0 >> 31) | 0x80000000u;
       unsigned int _amf_enc_0 = _amf_u_0 ^ _amf_mask_0;
-      unsigned int first_encoded = _amf_enc_0;
+      p1x_first_encoded[slot_1] = _amf_enc_0;
+    }
+  }
+#pragma unroll
+  for (int slot_2 = 0; slot_2 < 8; slot_2++) {
+    int slot_token_1 = bid * 8 + slot_2;
+    if (slot_token_1 < T) {
+      unsigned int first_encoded = p1x_first_encoded[slot_2];
       unsigned int _warp_redux_u32_0;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_0)
                    : "r"(first_encoded));
-      unsigned int first_max_encoded = _warp_redux_u32_0;
+      p1x_first_max[slot_2] = _warp_redux_u32_0;
+    }
+  }
+#pragma unroll
+  for (int slot_3 = 0; slot_3 < 8; slot_3++) {
+    int slot_token_2 = bid * 8 + slot_3;
+    if (slot_token_2 < T) {
+      unsigned int first_encoded_1 = p1x_first_encoded[slot_3];
+      unsigned int first_max_encoded = p1x_first_max[slot_3];
       unsigned int first_index_candidate = 4294967295;
-      if (first_encoded == first_max_encoded) {
+      if (first_encoded_1 == first_max_encoded) {
         first_index_candidate = (unsigned int)expert;
       }
       unsigned int _warp_redux_u32_1;
@@ -2164,31 +2430,45 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped_k
                    : "=r"(_warp_redux_u32_1)
                    : "r"(first_index_candidate));
       unsigned int first_expert_u32 = _warp_redux_u32_1;
-      int first_expert = (int)first_expert_u32;
-      uint32_t _amf_u_1 = first_max_encoded;
-      uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
-      float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-      float group_first = _amf_dec_0;
-      float second_candidate = biased_value;
+      p1x_first_expert[slot_3] = (int)first_expert_u32;
+    }
+  }
+#pragma unroll
+  for (int slot_4 = 0; slot_4 < 8; slot_4++) {
+    int slot_token_3 = bid * 8 + slot_4;
+    if (slot_token_3 < T) {
+      float biased_value_1 = p1x_biased[slot_4];
+      int first_expert = p1x_first_expert[slot_4];
+      float second_candidate = biased_value_1;
       if (expert == first_expert) {
         second_candidate = -CAKE_INF;
       }
-      uint32_t _amf_u_2 = __float_as_uint(second_candidate);
-      uint32_t _amf_mask_2 = -int32_t(_amf_u_2 >> 31) | 0x80000000u;
-      unsigned int _amf_enc_1 = _amf_u_2 ^ _amf_mask_2;
+      uint32_t _amf_u_1 = __float_as_uint(second_candidate);
+      uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
+      unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
       unsigned int second_encoded = _amf_enc_1;
       unsigned int _warp_redux_u32_2;
       asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;"
                    : "=r"(_warp_redux_u32_2)
                    : "r"(second_encoded));
-      unsigned int second_max_encoded = _warp_redux_u32_2;
-      uint32_t _amf_u_3 = second_max_encoded;
+      p1x_second_max[slot_4] = _warp_redux_u32_2;
+    }
+  }
+#pragma unroll
+  for (int slot_5 = 0; slot_5 < 8; slot_5++) {
+    int slot_token_4 = bid * 8 + slot_5;
+    if (slot_token_4 < T) {
+      uint32_t _amf_u_2 = p1x_first_max[slot_5];
+      uint32_t _amf_mask_2 = ((_amf_u_2 >> 31) - 1u) | 0x80000000u;
+      float _amf_dec_0 = __uint_as_float(_amf_u_2 ^ _amf_mask_2);
+      float group_first = _amf_dec_0;
+      uint32_t _amf_u_3 = p1x_second_max[slot_5];
       uint32_t _amf_mask_3 = ((_amf_u_3 >> 31) - 1u) | 0x80000000u;
       float _amf_dec_1 = __uint_as_float(_amf_u_3 ^ _amf_mask_3);
       float group_second = _amf_dec_1;
       if (lane_0 == 0) {
         if (group < n_group) {
-          group_scores[slot_1 * 8 + group] = group_first + group_second;
+          group_scores[slot_5 * 8 + group] = group_first + group_second;
         }
       }
     }
