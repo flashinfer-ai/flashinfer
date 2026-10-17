@@ -359,6 +359,40 @@ __host__ __device__ __forceinline__ T_offset compute_padded_offset(T_offset offs
   return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
 }
 
+// Skips the groups whose blocks all precede `next_block_idx`. Walking them one at a time is a chain
+// of dependent global loads, which dominates small-M grouped GEMMs with many (mostly empty)
+// experts, so the offsets of kLookahead groups are loaded together. 8 was the best width in a
+// sweep over 4 to 32 on GH200; wider batches slowed large-M problems.
+template <uint32_t kNumGroups, uint32_t kBlockSize, uint32_t kNumBlocksPerRow>
+__device__ __forceinline__ void skip_finished_groups(int64_t const* problem_offsets,
+                                                     uint32_t const next_block_idx,
+                                                     uint32_t& curr_group_idx,
+                                                     uint32_t& curr_cumsum) {
+  constexpr uint32_t kLookahead = 8;
+  // Only called once the walk has left group 0, so nothing to skip with kLookahead groups or fewer
+  if constexpr (kNumGroups <= kLookahead) return;
+  while (curr_group_idx + kLookahead <= kNumGroups) {
+    int64_t offsets[kLookahead + 1];
+#pragma unroll
+    for (uint32_t i = 0; i <= kLookahead; ++i) {
+      offsets[i] = __ldg(problem_offsets + curr_group_idx + i);
+    }
+    uint32_t num_skipped = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kLookahead; ++i) {
+      auto const cumsum =
+          curr_cumsum + static_cast<uint32_t>(ceil_div(offsets[i + 1] - offsets[i],
+                                                       static_cast<int64_t>(kBlockSize)));
+      if (num_skipped == i && next_block_idx >= cumsum * kNumBlocksPerRow) {
+        num_skipped = i + 1;
+        curr_cumsum = cumsum;
+      }
+    }
+    curr_group_idx += num_skipped;
+    if (num_skipped < kLookahead) return;
+  }
+}
+
 template <uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups,
           uint32_t kNumTMAMulticast, uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
           uint32_t kNumNBlocksPerGroup = 16>
@@ -425,6 +459,8 @@ struct GroupedWithOffsetScheduler {
       // Move to check the next group
       curr_group_idx++;
       curr_cumsum = current_m_block_cumsum;
+      skip_finished_groups<kNumGroups, BLOCK_M, kNumNBlocks>(problem_m_offsets, next_block_idx,
+                                                             curr_group_idx, curr_cumsum);
     }
 
     get_swizzled_block_idx<kNumTMAMulticast, kNumNBlocks, kNumNBlocksPerGroup>(
@@ -503,6 +539,8 @@ struct GroupedWithOffsetSchedulerSwapAB {
       // Move to check the next group
       curr_group_idx++;
       curr_cumsum = current_n_block_cumsum;
+      skip_finished_groups<kNumGroups, BLOCK_N, kNumMBlocks>(problem_n_offsets, next_block_idx,
+                                                             curr_group_idx, curr_cumsum);
     }
 
     get_swizzled_block_idx<kNumTMAMulticast, kNumMBlocks, kNumMBlocksPerGroup>(

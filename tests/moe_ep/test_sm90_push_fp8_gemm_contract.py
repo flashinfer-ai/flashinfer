@@ -136,6 +136,7 @@ def test_private_fp8_jit_checks_exact_caches_before_nvcc() -> None:
             "".join(source.split())
             .replace("const", "")
             .replace("swap_ab", "swapAB")
+            .replace("deep_gemm::jit::", "")
             .replace("gemm_type_to_string(gemm_type)", '"GroupedWithOffset"')
             .replace('+"_"+"GroupedWithOffset"', '+"_GroupedWithOffset"')
         )
