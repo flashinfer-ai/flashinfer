@@ -111,7 +111,14 @@ backend, checks six changing inputs after graph replay, then measures paired
 warm CUDA Graphs with 128 public calls each and repeated original A/A controls.
 Each timing graph repeats the same routed input; it does not model cold weights
 or changing expert selection across serving steps.
-It includes scale conversion and combine. Weight preparation, input
+It includes scale conversion and combine. By default the precomputed routing
+weights are FP32; use `--routing-weights-dtype bf16` to measure a producer that
+already emits BF16 weights. Removing a conversion helps only when that
+conversion was required. For MXFP4 with BF16 routing weights, omit
+`--include-cutedsl`: that native W4A8 interface requires FP32 routing weights.
+This control compares the supported TRT-LLM and FROST paths; it does not insert
+an extra dtype conversion for CuTe DSL or claim an exhaustive original baseline.
+Weight preparation, input
 quantization and routing selection are excluded. Check A/A and cross-process
 stability before interpreting a small difference. These are kernel GPU times
 at model-relevant shapes, not model throughput measurements.

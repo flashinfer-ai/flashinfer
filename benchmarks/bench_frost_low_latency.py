@@ -53,6 +53,9 @@ def main():
         default=10.0,
         help="SwiGLU clamp; pass 0 for ordinary unclamped SwiGLU",
     )
+    parser.add_argument(
+        "--routing-weights-dtype", choices=("fp32", "bf16"), default="fp32"
+    )
     parser.add_argument("--reverse", action="store_true")
     parser.add_argument("--include-cutedsl", action="store_true")
     parser.add_argument("--include-native-default", action="store_true")
@@ -63,6 +66,16 @@ def main():
     parser.add_argument("--frost-tile-k", type=int, choices=(128, 256))
     parser.add_argument("--output", type=Path, required=True)
     a = parser.parse_args()
+    if (
+        a.include_cutedsl
+        and a.weight_format == "mxfp4"
+        and a.routing_weights_dtype == "bf16"
+    ):
+        raise ValueError(
+            "The native CuTe DSL W4A8 baseline requires FP32 routing weights. "
+            "Omit --include-cutedsl for the BF16-routing control; this benchmark "
+            "does not insert a routing dtype conversion for one backend."
+        )
     torch.cuda.set_device(0)
     torch.set_num_threads(1)
     torch.manual_seed(2107)
@@ -149,6 +162,8 @@ def main():
         torch.arange(t * k, device="cuda", dtype=torch.int32) * max(1, e // (t * k)) % e
     ).reshape(t, k)
     rw = torch.softmax(torch.randn(t, k, device="cuda"), -1)
+    if a.routing_weights_dtype == "bf16":
+        rw = rw.bfloat16()
     act = MoEActivationPack(q, sf, ids, rw)
     layers = {}
     for name, backend in backends:
