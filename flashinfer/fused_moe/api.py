@@ -2793,8 +2793,38 @@ class CudnnFrostMxfp8Mxfp4Config:
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
 
 
+@dataclass(frozen=True)
+class FrostLowLatencyConfig:
+    """Low-token MXFP8 x MXFP4/MXFP8 routed MoE on SM100/SM103.
+
+    Explicit opt-in; omitted from the default backend list. The fused GU,
+    SwiGLU and MXFP8 quantizer feeds a PDL-dependent Down GEMM. This is a
+    multi-kernel pipeline, with precomputed routing and no EP communication.
+    Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
+    Prepare other backend views as well to permit fallback for larger inputs.
+    """
+
+    max_num_tokens: int = 2
+
+    def __post_init__(self):
+        if not 1 <= self.max_num_tokens <= 8:
+            raise ValueError("max_num_tokens must be between 1 and 8")
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(w1, w1_scale, w2, w2_scale):
+        """Pack canonical prequantized MX weights without requantizing them."""
+        from .backends.frost_low_latency.prepare import prepare_weights
+
+        return prepare_weights(w1, w1_scale, w2, w2_scale)
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,
@@ -2839,6 +2869,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,
