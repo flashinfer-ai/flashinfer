@@ -684,6 +684,12 @@ def test_ep_shard_deepseekv3(
     [
         pytest.param(1, 16, 2, 8, RoutingMethodType.Renormalize, 0, 16, id="block"),
         pytest.param(
+            1, 128, 4, 8, RoutingMethodType.Renormalize, 0, 128, id="block-128e-m1"
+        ),
+        pytest.param(
+            4, 128, 4, 8, RoutingMethodType.Renormalize, 0, 128, id="block-128e-m4"
+        ),
+        pytest.param(
             9, 128, 4, 32, RoutingMethodType.Renormalize, 32, 64, id="dynblock"
         ),
         pytest.param(
