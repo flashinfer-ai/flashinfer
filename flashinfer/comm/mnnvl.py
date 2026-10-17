@@ -753,6 +753,7 @@ class SymmDeviceMemory:
         comm_backend_for_handle_transfer: Optional[CommBackend] = None,
         enable_multicast: bool = True,
         allocate_signal_pads: bool = True,
+        gpu_direct_rdma_capable: bool = True,
     ):
         cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
@@ -780,6 +781,7 @@ class SymmDeviceMemory:
         self.allocation_size = 0
         self.comm_backend = comm_backend_for_handle_transfer or MPIBackend()
         self._enable_multicast = enable_multicast
+        self._gpu_direct_rdma_capable = gpu_direct_rdma_capable
 
         # CUDA memory handles and pointers
         self.mc_ptr = 0  # CUdeviceptr mMcPtr
@@ -1017,7 +1019,9 @@ class SymmDeviceMemory:
             cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         )
         allocation_prop.location.id = self.device_idx
-        allocation_prop.allocFlags.gpuDirectRDMACapable = 1
+        allocation_prop.allocFlags.gpuDirectRDMACapable = int(
+            self._gpu_direct_rdma_capable
+        )
 
         # Get allocation granularity
         alloc_granularity = checkCudaErrors(
