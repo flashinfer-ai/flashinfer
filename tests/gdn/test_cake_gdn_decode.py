@@ -1620,9 +1620,13 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
         assert twin.variant_name.startswith(
             "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full"
         ), twin
-    # A missing base still fails closed: no architecture other than sm_100a / sm_103a ships the TP4 record.
-    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="sm_107a"):
-        _prefill(arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape)
+    # CC 10.7 ships the TP4 base record too: its sm_107a view is the shared body the other
+    # architectures already use, so the record lists sm_107a and the resolver runs the same
+    # base record there (no gatestream twin exists for any architecture).
+    seven = _prefill(arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape)
+    assert seven.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert seven.variant_name == base.variant_name, (seven, base)
+    assert "sm_107a" in cake_gdn._kernel_record(seven.variant_name)["architectures"]
 
 
 def test_prefill_schedule_attr_pins_the_gatestream_twin_names() -> None:
