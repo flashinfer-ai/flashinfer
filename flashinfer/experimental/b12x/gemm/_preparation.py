@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.buffers as _module__lib_dense_gemm_buffers
+
+
 from dataclasses import dataclass
 
 import torch
 
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x._lib.utils import cuda_stream_to_int
+from b12x._lib.utils.device import cuda_stream_to_int
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,
@@ -77,7 +80,7 @@ def _metadata_operands(query):
 def _lower_query(query, device, constraints):
     if device is None:
         raise ValueError("dense preparation requires a device SM count")
-    from b12x._lib.dense_gemm import _lower_dense_gemm
+    from b12x._lib.dense_gemm.preparation import _lower_dense_gemm
 
     lhs, rhs, out, alpha, options = _metadata_operands(query)
     return _lower_dense_gemm(
@@ -165,8 +168,6 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
         return lowered[key]
 
     def memory(config, device):
-        from b12x._lib import dense_gemm as dense
-
         p = lower(config, device)
         needed = _split_k_elements(p)
         scratch = ()
@@ -197,7 +198,9 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
                 )
             )
         if p.alpha_is_one:
-            resident = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
+            resident = _module__lib_dense_gemm_buffers._ALPHA_ONE_CACHE.get(
+                ("cuda", device.ordinal)
+            )
             persistent.append(
                 PersistentMemory(
                     ("dense.alpha_one", device.ordinal),
@@ -210,7 +213,7 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
         return MemoryRequirements(scratch, tuple(persistent))
 
     def materialize(selection, device):
-        from b12x._lib.dense_gemm import _materialize_dense
+        from b12x._lib.dense_gemm.preparation import _materialize_dense
 
         p = lower(selection.config, device)
         resolved_device = torch.device("cuda", device.ordinal)
@@ -241,7 +244,7 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
         shared=True,
         _compile_jobs=lambda config, device: (
             CompileJob.create(
-                "b12x._lib.dense_gemm:_compile_dense_lowering",
+                "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 lower(config, device).to_dict(),
                 device.ordinal,
             ),
@@ -252,7 +255,7 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
 
 
 def _result_metadata(a, b, output_dtype):
-    from b12x._lib.dense_gemm import _empty_dense_gemm_output
+    from b12x._lib.dense_gemm.buffers import _empty_dense_gemm_output
 
     return _empty_dense_gemm_output(
         a.shape[0], b.shape[0], a.shape[2], dtype=output_dtype, device=a.device

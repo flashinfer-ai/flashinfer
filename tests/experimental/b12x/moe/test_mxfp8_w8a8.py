@@ -515,7 +515,7 @@ def test_w8a8_weight_plan_lowers_to_the_mxfp8_engine() -> None:
 
 def test_dynamic_kernel_w8a8_shares_mxf8_geometry_without_fp6_packing() -> None:
     """w8a8_mx shares the MXF8 geometry without FP6 packing."""
-    from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+    from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
 
     backend = MoEDynamicKernelBackend(
         32, (128, 128), quant_recipe="w8a8_mx", activation="silu"
@@ -640,7 +640,7 @@ def test_mxfp8_scaled_roundtrip_matches_the_device_ue8m0_rule() -> None:
     region where ``ceil(log2(...))`` and exact IEEE bit extraction disagree,
     which would silently shift a whole block by 2x.
     """
-    from b12x._lib.intrinsics import quant_dequant_mxfp8_scaled_torch
+    from b12x._lib.intrinsics.reference import quant_dequant_mxfp8_scaled_torch
 
     codes = (
         torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
@@ -926,7 +926,7 @@ def test_w8a8_deterministic_reduction_replays_bit_exact() -> None:
 
 @pytest.mark.parametrize("cols", [64, 96])
 def test_mxfp8_scaled_roundtrip_supports_per_row_globals(cols):
-    from b12x._lib.intrinsics import quant_dequant_mxfp8_scaled_torch
+    from b12x._lib.intrinsics.reference import quant_dequant_mxfp8_scaled_torch
 
     x = torch.linspace(-4.0, 7.0, 3 * cols).reshape(3, cols)
     scales = torch.tensor([0.5, 2.0, 3.0])

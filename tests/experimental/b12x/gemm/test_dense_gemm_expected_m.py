@@ -8,27 +8,38 @@ kernel per (N,K,expected_m) be reused for all live M under frozen resolution.
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.launch as dense_launch
+import b12x._lib.dense_gemm.execution as dense_execution
+
+import b12x._lib.dense_gemm.compile as dense_compile
+import b12x._lib.dense_gemm.config as dense_config
+import b12x._lib.dense_gemm.kernel as dense_kernel
+
+
 import cutlass
 import pytest
 import torch
 
-import b12x._lib.dense_gemm as dense_module
-from b12x._lib.dense_gemm import (
+from b12x._lib.dense_gemm.compile import (
     _DenseGemmFusedQuantALaunch,
     _DenseGemmLaunch,
+    _dense_gemm_target_occupancy,
+)
+from b12x._lib.dense_gemm.config import (
     _DenseGemmPolicy,
     _dense_gemm_policy_for,
-    _dense_gemm_target_occupancy,
     _use_low_sm_dense_tactics,
     _tile_major_cluster_limit,
+    _select_block_fp8_decode_slices,
+)
+from b12x._lib.dense_gemm.policy import (
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
-    _select_block_fp8_decode_slices,
     _select_fp4_tile_k,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
-    dense_gemm,
 )
+from b12x._lib.dense_gemm.execution import dense_gemm
 
 HIGH_SM = 188
 LOW_SM = 48
@@ -781,7 +792,7 @@ def test_fp4_tile_k_override_reaches_compiler(
 
         return launch
 
-    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs, rhs = _packed_fp4_operands(1, 128, 512)
     out = torch.empty((1, 128, 1), dtype=torch.bfloat16)
 
@@ -833,7 +844,7 @@ def test_fp4_target_occupancy_override_reaches_compiler(
 
         return launch
 
-    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs, rhs = _packed_fp4_operands(1, 128, 512)
     out = torch.empty((1, 128, 1), dtype=torch.bfloat16)
 
@@ -887,7 +898,7 @@ def test_mxfp8_tile_k_override_reaches_compiler(
 
         return launch
 
-    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs, rhs = _unaligned_dense_operands(4, 4096, 4096, 1)
     out = torch.empty((4, 4096, 1), dtype=torch.bfloat16)
 
@@ -942,7 +953,7 @@ def test_mxfp8_large_m_unroll_override_reaches_compiler(
 
         return launch
 
-    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs, rhs = _unaligned_dense_operands(128, 4096, 4096, 1)
     out = torch.empty((128, 4096, 1), dtype=torch.bfloat16)
 
@@ -992,7 +1003,7 @@ def test_mxfp8_split_k_override_reaches_compiler(
 
         return launch
 
-    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs, rhs = _unaligned_dense_operands(4, 4096, 4096, 1)
     out = torch.empty((4, 4096, 1), dtype=torch.bfloat16)
 
@@ -1029,7 +1040,7 @@ def test_block_fp8_split_k_override_reaches_compiler(
 
         return launch
 
-    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compile_dense_gemm)
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs = (
         torch.empty((4, 4096, 1), dtype=torch.float8_e4m3fn),
         torch.empty((4, 32), dtype=torch.float32),
@@ -1209,11 +1220,7 @@ def test_wide_unaligned_output_uses_supported_bk128_plan(
 
         return launch
 
-    monkeypatch.setattr(
-        dense_module,
-        "_get_compiled_dense_gemm",
-        compile_dense_gemm,
-    )
+    _patch_dense_compiler(monkeypatch, compile_dense_gemm)
     lhs, rhs = _unaligned_dense_operands(2, 16386, 1024, 1)
     out = torch.empty((2, 16386, 1), dtype=torch.bfloat16)
     alpha = torch.ones(1, dtype=torch.float32)
@@ -1236,7 +1243,7 @@ def test_wide_unaligned_output_uses_supported_bk128_plan(
     assert recorded["tile_k"] == 128
     assert recorded["mma_tiler_mn"] == (128, 128)
     assert recorded["swap_ab"] is True
-    assert dense_module.DenseGemmKernel.can_implement(
+    assert dense_kernel.DenseGemmKernel.can_implement(
         recorded["ab_dtype"],
         recorded["sf_dtype"],
         recorded["sf_vec_size"],
@@ -1359,12 +1366,26 @@ def test_dense_compile_key_separates_replicated_sfb_reuse():
 
 
 def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
-    monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", False)
+    monkeypatch.setattr(dense_compile, "_B12X_DENSE_ATOM_24", False)
     atom_42 = _bk64_launch()
-    monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", True)
+    monkeypatch.setattr(dense_compile, "_B12X_DENSE_ATOM_24", True)
     atom_24 = _bk64_launch()
 
     assert _compile_key_differences(atom_42, atom_24) == [(False, True)]
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_mxfp6_compile_key_covers_resolved_expand_ahead(monkeypatch, packed):
+    from functools import partial
+
+    launch_type = partial(dense_compile._DenseGemmMxfp6Launch, b_packed=packed)
+    monkeypatch.setattr(dense_compile, "_PACKED_B_EXPAND_AHEAD", False)
+    disabled = _bk64_launch(launch_type=launch_type)
+    monkeypatch.setattr(dense_compile, "_PACKED_B_EXPAND_AHEAD", True)
+    enabled = _bk64_launch(launch_type=launch_type)
+    assert _compile_key_differences(disabled, enabled) == (
+        [(False, True)] if packed else []
+    )
 
 
 def test_fused_quant_compile_key_is_distinct_and_exhaustive():
@@ -1639,3 +1660,8 @@ def test_a16_compute_warps_specialize_the_compile_key():
     keys = {warps: _a16_launch(warps).compile_key() for warps in (None, 2, 4)}
     assert keys[2] != keys[4]
     assert len(set(keys.values())) == 3
+
+
+def _patch_dense_compiler(monkeypatch, compile_fn):
+    monkeypatch.setattr(dense_launch, "_get_compiled_dense_gemm", compile_fn)
+    monkeypatch.setattr(dense_execution, "_get_compiled_dense_gemm", compile_fn)

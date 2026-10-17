@@ -25,7 +25,8 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.attention._shared.contiguous.forward import (
     ContiguousAttentionForwardKernel,
 )

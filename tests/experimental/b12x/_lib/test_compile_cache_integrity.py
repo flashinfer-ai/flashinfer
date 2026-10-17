@@ -85,7 +85,7 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             )
         }
         self.modules["cutlass"].cute = self.modules["cutlass.cute"]
-        self.modules["cutlass.cute"].compile = Mock()
+        self.modules["cutlass.cute"].compile = object()
         self.modules[
             "cutlass.base_dsl.export.external_binary_module"
         ].ExternalBinaryModule = self.loader
@@ -136,6 +136,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             _DISK_CACHE_HITS=0,
             _COMPILE_MISSES=0,
             _OFFLINE_CUTE_NO_JIT=False,
+            _install_race_fuzz=lambda: None,
+            resolve_compile_options=lambda fn, *_args: fn,
         )
         load_functions(
             LIB / "compiler.py",

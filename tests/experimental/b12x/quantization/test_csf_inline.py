@@ -11,7 +11,8 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane, upload_csf_block_payload
 from b12x._lib.quant.csf_inline import CsfInlineReader, Nvfp4CsfStageReader
 from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from .test_csf_blocks import planes_and_native
 from ..conftest import require_b12x
 

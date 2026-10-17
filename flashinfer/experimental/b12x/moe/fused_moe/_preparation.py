@@ -137,7 +137,7 @@ def _control_snapshot() -> FrozenMapping:
         trellis_decode_table,
     )
 
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _FP32_TOPK_WEIGHTS,
         _w4a16_small_m_occupancy,
     )
@@ -515,16 +515,22 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     GPU invocation.
     """
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _DEFAULT_MAX_SHARED_MEM,
         _MAX_DIRECT_TOPK_ROUTE_M,
         _W4A16_SMALL_M_DIRECT_MAX_M,
+    )
+    from b12x.moe._shared.kernels.w4a16.kernel.types import (
         W4A16SmallMDirectCompileResult,
+    )
+    from b12x.moe._shared.kernels.w4a16.kernel.direct_launch import (
         _compile_w4a16_small_m_direct,
         _small_m_direct_supported,
-        compile_w4a16_fused_moe,
-        compile_w4a16_topk_sum,
     )
+    from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
+        compile_w4a16_fused_moe,
+    )
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
     from b12x.moe._shared.kernels.w4a16.route_pack import (
         compile_w4a16_route_pack_launches,
     )
@@ -893,7 +899,7 @@ def _compact_launches(plan, caps):
         _get_compiled_mxfp8_rows_quant,
         mxfp8_rows_quant_launch_options,
     )
-    from b12x._lib.utils import get_num_sm
+    from b12x._lib.utils.device import get_num_sm
     from b12x.moe._shared.kernels.w4a8_compact_micro import (
         _compiled_direct_w4a8_compact,
     )
@@ -1062,7 +1068,9 @@ def _program_carriers(
             )
             launches.append(launch)
         if plan.deterministic_output:
-            from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
+            from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import (
+                compile_w4a16_topk_sum,
+            )
 
             # The dynamic kernel writes one result per routed pair. Its
             # deterministic reduction is a separate retained launch.
@@ -1816,7 +1824,9 @@ def compile_fc2(query_payload, ordinal):
 
     query = MoeFC2Query(**dict(query_payload))
     FC2_TUNING.validate_query(query, None)
-    from b12x.moe._shared.kernels.w4a16.kernel import _compile_w4a16_fc2_direct
+    from b12x.moe._shared.kernels.w4a16.kernel.direct_launch import (
+        _compile_w4a16_fc2_direct,
+    )
 
     return _compile_w4a16_fc2_direct(
         hidden_size=query.hidden_size,

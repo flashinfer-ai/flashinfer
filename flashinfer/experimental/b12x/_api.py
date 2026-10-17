@@ -22,6 +22,9 @@ import importlib
 import sys
 from typing import Any
 
+# Registry dispatch selects entrypoints; compiled targets supply their source roots.
+__b12x_source_dependencies__ = ()
+
 from ._lib.meta import OpMeta
 from ._lib.runtime_control import (
     KernelResolutionFrozenError,

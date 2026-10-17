@@ -243,7 +243,7 @@ def _validate_block_moe_launch(query, config):
         raise ValueError("unsupported W4A16 tile geometry")
     if tiles[0] * tiles[1] != tiles[2] * tiles[3]:
         raise ValueError("fused W4A16 FC1/FC2 thread counts must match")
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _candidate_tile_fits,
         _DEFAULT_MAX_SHARED_MEM,
     )

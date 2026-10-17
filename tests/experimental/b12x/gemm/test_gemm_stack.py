@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.policy as dense_policy
+
+
 import pytest
 import torch
 import cutlass
 
-import b12x._lib.dense_gemm as dense_module
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-from b12x._lib.dense_gemm import (
-    DenseGemmKernel,
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
+from b12x._lib.dense_gemm.kernel import DenseGemmKernel
+from b12x._lib.dense_gemm.policy import (
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
-    dense_gemm,
 )
+from b12x._lib.dense_gemm.execution import dense_gemm
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
@@ -411,7 +413,7 @@ def test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales(
 
     # Force the normally shape-gated BK64 specialization so this compact test
     # covers its manual packed-scale address arithmetic for L>1.
-    monkeypatch.setattr(dense_module, "_select_mxfp8_tile_k", lambda *_: 64)
+    monkeypatch.setattr(dense_policy, "_select_mxfp8_tile_k", lambda *_: 64)
     out = dense_gemm(
         (a_q.values, a_q.scale_mma),
         (b_q.values, b_q.scale_mma),

@@ -6,6 +6,10 @@ retains checkpoint identity, source hashes, correctness and graph samples.
 
 from __future__ import annotations
 
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+import b12x.moe._shared.kernels.w4a16.kernel.sum_launch as w4a16_sum_launch
+
+
 import argparse
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -161,7 +165,6 @@ def qualify_capacity(
     """Exercise several live counts with compilation and kernel resolution frozen."""
     from b12x._lib import compiler
     from b12x._lib.runtime_control import kernel_resolution_guard
-    from b12x.moe._shared.kernels.w4a16 import kernel
     from b12x.moe.fused_moe import _preparation
 
     mapped = layer.expert_ids != tuple(range(layer.route_num_experts))
@@ -240,8 +243,12 @@ def qualify_capacity(
         frozen.enter_context(kernel_resolution_guard("IQ2_XS capacity qualification"))
         frozen.enter_context(patch.object(compiler, "compile", forbidden))
         frozen.enter_context(patch.object(_preparation, "compile_fused_moe", forbidden))
-        frozen.enter_context(patch.object(kernel, "compile_w4a16_fused_moe", forbidden))
-        frozen.enter_context(patch.object(kernel, "compile_w4a16_topk_sum", forbidden))
+        frozen.enter_context(
+            patch.object(w4a16_fused_launch, "compile_w4a16_fused_moe", forbidden)
+        )
+        frozen.enter_context(
+            patch.object(w4a16_sum_launch, "compile_w4a16_topk_sum", forbidden)
+        )
         for tokens in counts:
             inputs = make_inputs(layer, tokens, experts.device, mapped=mapped)
             binding = moe.bind(

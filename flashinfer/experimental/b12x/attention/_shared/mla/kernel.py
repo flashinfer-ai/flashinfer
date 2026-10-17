@@ -34,7 +34,8 @@ from b12x._lib.compiler import (
     run_compiled,
 )
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import shared_ptr_to_u32, st_shared_u32
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+from b12x._lib.intrinsics.atomics import st_shared_u32
 
 from .decode_math import (
     s0_load_q_bf16_to_smem,

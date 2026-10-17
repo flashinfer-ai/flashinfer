@@ -7,7 +7,7 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 from b12x.attention._shared.contiguous import layout_utils
-from b12x._lib.intrinsics import div_rn_f32
+from b12x._lib.intrinsics.math import div_rn_f32
 from b12x.attention._shared.cute import ops as cute_ops
 from b12x.attention._shared.contiguous.cute_dsl_utils import (
     ParamsBase,
@@ -34,7 +34,9 @@ class Softmax(ParamsBase):
     ):
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, prescaled)
+        return Softmax(
+            scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, prescaled
+        )
 
     def _row_layout(self) -> cute.Layout:
         return cute.make_layout((self.num_rows,), stride=(1,))
@@ -91,7 +93,9 @@ class Softmax(ParamsBase):
                 row_scale[r] = 1.0
             else:
                 if cutlass.const_expr(self.prescaled):
-                    row_scale[r] = cute.math.exp(row_max_prev - row_max_cur, fastmath=False)
+                    row_scale[r] = cute.math.exp(
+                        row_max_prev - row_max_cur, fastmath=False
+                    )
                 else:
                     row_scale[r] = cute.math.exp2(
                         (row_max_prev - row_max_cur) * self.scale_log2,
@@ -112,8 +116,12 @@ class Softmax(ParamsBase):
         """Apply retained row maxima and inverse sums before the BF16 PV cast."""
         scores = layout_utils.reshape_acc_to_mn(acc_S)
         for r in range(int(self.num_rows)):
-            maximum = cutlass.select_(self.row_max[r] == -Float32.inf, 0.0, self.row_max[r])
-            probabilities = cute.math.exp(scores[r, None].load() - maximum, fastmath=False)
+            maximum = cutlass.select_(
+                self.row_max[r] == -Float32.inf, 0.0, self.row_max[r]
+            )
+            probabilities = cute.math.exp(
+                scores[r, None].load() - maximum, fastmath=False
+            )
             scores[r, None].store(probabilities * self.row_sum[r])
 
     def finalize(

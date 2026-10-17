@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import b12x.moe._shared.kernels.w4a16.kernel.direct_launch as w4a16_direct_launch
+import b12x.moe._shared.kernels.w4a16.kernel.execution as w4a16_execution
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+
+
 from dataclasses import replace
 import gc
 import weakref
@@ -8,7 +13,7 @@ import pytest
 import torch
 
 from b12x.moe import fused_moe
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 
 
 def weight_plan(**kwargs):
@@ -229,7 +234,6 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
     counts,
 ):
     from b12x.preparation import PreparationSession, PreparedCall
-    from b12x.moe._shared.kernels.w4a16 import kernel
     from b12x.testing.reference.helpers import require_b12x
     from b12x.testing.reference.w4a16_reference import (
         compare_to_reference,
@@ -349,7 +353,7 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
                 bindings.append((m, binding, scratch))
 
         launched = []
-        launch_flat = kernel._w4a16_small_m_direct_launch_flat
+        launch_flat = w4a16_direct_launch._w4a16_small_m_direct_launch_flat
 
         def retained_launch(*args, launcher=None, **kwargs):
             assert launcher is not None
@@ -361,13 +365,15 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
                 "prepared replay resolved a kernel through a module cache"
             )
 
-        kernel.clear_w4a16_kernel_cache()
+        w4a16_execution.clear_w4a16_kernel_cache()
         monkeypatch.setattr(
-            kernel, "_compile_w4a16_small_m_direct", forbidden_resolution
+            w4a16_direct_launch, "_compile_w4a16_small_m_direct", forbidden_resolution
         )
-        monkeypatch.setattr(kernel, "compile_w4a16_fused_moe", forbidden_resolution)
         monkeypatch.setattr(
-            kernel, "_w4a16_small_m_direct_launch_flat", retained_launch
+            w4a16_fused_launch, "compile_w4a16_fused_moe", forbidden_resolution
+        )
+        monkeypatch.setattr(
+            w4a16_direct_launch, "_w4a16_small_m_direct_launch_flat", retained_launch
         )
         session.freeze()
         for m, binding, scratch in bindings:

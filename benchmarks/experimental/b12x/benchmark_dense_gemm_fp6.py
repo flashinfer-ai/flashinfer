@@ -18,7 +18,7 @@ from benchmarks.experimental.b12x.fp6_common import (
     make_l2_flush_fn,
 )
 from b12x._lib.fp6 import SF_VEC_SIZE_FP6, dequant_mxfp6_torch
-from b12x._lib.dense_gemm import _expand_packed_mxfp6_ab, dense_gemm
+from b12x._lib.dense_gemm.execution import _expand_packed_mxfp6_ab, dense_gemm
 
 from b12x.testing.reference.fp6 import _bf16_global_scale, _quantize_bf16_matrix
 

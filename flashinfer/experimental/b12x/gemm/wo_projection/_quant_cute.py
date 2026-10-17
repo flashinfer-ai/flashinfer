@@ -13,21 +13,20 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
 )
-from b12x._lib.intrinsics import (
-    FLOAT8_E4M3_MAX,
-    bfloat2_to_float2_scaled,
+from b12x._lib.intrinsics.constants import FLOAT8_E4M3_MAX
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
+from b12x._lib.intrinsics.conversion import (
     cvt_f32x4_to_e4m3x4,
-    fabs_f32,
-    fmax_f32,
-    get_ptr_as_int64,
-    ld_global_nc_u32,
     pow2_ceil_ue8m0,
     ue8m0_to_output_scale,
 )
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_u32
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 _THREADS = 256
 _GRID_CTAS_PER_SM = 4

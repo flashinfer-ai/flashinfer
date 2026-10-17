@@ -4,12 +4,10 @@ import cutlass
 import pytest
 import torch
 
-from b12x._lib.utils import (
+from b12x._lib.utils.fp6_geometry import (
     MXFP6_MMA_K,
     MXFP6_SF_DTYPE_STR,
     MXFP6_SF_VEC_SIZE,
-    cutlass_to_torch_dtype,
-    get_cutlass_dtype,
     is_mxfp6_ab_dtype,
     is_mxfp6_ab_dtype_string,
     mxfp6_logical_k_from_packed_bytes,
@@ -19,6 +17,7 @@ from b12x._lib.utils import (
     mxfp6_tile_shape_mnk,
     verify_mxfp6_smem_tile_k,
 )
+from b12x._lib.utils.dtypes import cutlass_to_torch_dtype, get_cutlass_dtype
 
 
 def test_get_cutlass_dtype_fp6() -> None:

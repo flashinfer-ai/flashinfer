@@ -1,4 +1,4 @@
-"""Versioned tuning decisions, independent of executable artifact caches."""
+"""Versioned tuning decisions indexed by candidate program identities."""
 
 from __future__ import annotations
 

@@ -16,17 +16,18 @@ import torch
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, run_compiled
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v4_u32,
     shared_ptr_to_u32,
     st_shared_v4_u32,
     u32_as_f32,
-    warp_reduce,
 )
+from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.nvgpu import warp, warpgroup
 from cutlass.utils import LayoutEnum

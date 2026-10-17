@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.config as dense_config
+import b12x._lib.dense_gemm.kernel as dense_kernel
+
+
 import pytest
 import torch
 
@@ -13,7 +17,6 @@ cuda_required = pytest.mark.skipif(
 @cuda_required
 @pytest.mark.parametrize("m", [32, 128, 256])
 def test_fp6_large_m_tile_bit_exact(m, monkeypatch):
-    import b12x._lib.dense_gemm as dg
     import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(0)
@@ -25,20 +28,19 @@ def test_fp6_large_m_tile_bit_exact(m, monkeypatch):
     args = (fp6w.scale_storage, fp6w.global_scale, fp6w.fmt, n, k)
     weight = fp6w.expanded_weight()
 
-    monkeypatch.setattr(dg, "_FP6_PREFILL_TILE", (128, 128))
+    monkeypatch.setattr(dense_config, "_FP6_PREFILL_TILE", (128, 128))
     y_wide = fdw.dense_fp6_linear_expanded(x, weight, *args)
-    monkeypatch.setattr(dg, "_FP6_PREFILL_TILE", (128, 64))
+    monkeypatch.setattr(dense_config, "_FP6_PREFILL_TILE", (128, 64))
     y_narrow = fdw.dense_fp6_linear_expanded(x, weight, *args)
 
     torch.testing.assert_close(y_narrow, y_wide, rtol=0.0, atol=0.0)
 
 
 def test_fp6_tile_regime_selection(monkeypatch):
-    import b12x._lib.dense_gemm as dg
-    from b12x._lib.dense_gemm import _select_default_mma_tiler_mn
+    from b12x._lib.dense_gemm.policy import _select_default_mma_tiler_mn
 
-    monkeypatch.setattr(dg, "_FP6_PREFILL_TILE", (128, 128))
-    monkeypatch.setattr(dg, "_FP6_DECODE_TILE", (16, 64))
+    monkeypatch.setattr(dense_config, "_FP6_PREFILL_TILE", (128, 128))
+    monkeypatch.setattr(dense_config, "_FP6_DECODE_TILE", (16, 64))
 
     common = dict(sm_count=188, is_mxfp8=False, is_mxfp6=True)
     # Decode uses a width-64 tile for all wide-N shapes.
@@ -65,7 +67,6 @@ def test_fp6_tile_regime_selection(monkeypatch):
 @pytest.mark.parametrize("m", [1, 2, 8, 16])
 def test_fp6_decode_tile_bit_exact(m, monkeypatch):
     """The default packed decode tile is bit-identical to 16x128."""
-    import b12x._lib.dense_gemm as dg
     import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(1)
@@ -76,9 +77,9 @@ def test_fp6_decode_tile_bit_exact(m, monkeypatch):
     x = (torch.randn(m, k, device="cuda") * 0.1).to(torch.bfloat16)
     args = (fp6w.scale_storage, fp6w.global_scale, fp6w.fmt, n, k)
 
-    monkeypatch.setattr(dg, "_FP6_DECODE_TILE", (16, 128))
+    monkeypatch.setattr(dense_config, "_FP6_DECODE_TILE", (16, 128))
     y_wide = fdw.dense_fp6_linear_expanded(x, fp6w.packed, *args)
-    monkeypatch.setattr(dg, "_FP6_DECODE_TILE", (16, 64))
+    monkeypatch.setattr(dense_config, "_FP6_DECODE_TILE", (16, 64))
     y_narrow = fdw.dense_fp6_linear_expanded(x, fp6w.packed, *args)
 
     torch.testing.assert_close(y_narrow, y_wide, rtol=0.0, atol=0.0)
@@ -86,9 +87,8 @@ def test_fp6_decode_tile_bit_exact(m, monkeypatch):
 
 def test_choose_epilogue_only_shrinks_to_buy_a_stage():
     """The full epilogue remains unless shrinking adds a mainloop stage."""
-    import b12x._lib.dense_gemm as dg
 
-    kernel = dg.DenseGemmKernel
+    kernel = dense_kernel.DenseGemmKernel
 
     # Keep the full epilogue when both candidates provide the same depth.
     seen = []
@@ -132,13 +132,14 @@ def test_choose_epilogue_refuses_sub_atom_tiles():
     it is silently NaN - so the guard is a hard precondition, not a heuristic.
     Decode's (16,64) on a 16x16 atom is the live case.
     """
-    import b12x._lib.dense_gemm as dg
 
     def probe_huge_gain(epi_tile, cap):
         return (1, 1) if cap == 0 else (99, 2)
 
     for tile in ((16, 64), (16, 128)):
-        assert dg.DenseGemmKernel._choose_epilogue(tile, (16, 16), probe_huge_gain) == (
+        assert dense_kernel.DenseGemmKernel._choose_epilogue(
+            tile, (16, 16), probe_huge_gain
+        ) == (
             tile,
             0,
         )
@@ -153,15 +154,14 @@ def test_choose_epilogue_refuses_the_m1_register_store_path():
     case: the narrow-N (n <= 1536) coarse (128,128) tile serving m=1, where the
     atom guard alone would happily allow (64,64).
     """
-    import b12x._lib.dense_gemm as dg
 
     def probe_gain(epi_tile, cap):
         return (1, 1) if cap == 0 else (2, 2)
 
-    assert dg.DenseGemmKernel._choose_epilogue(
+    assert dense_kernel.DenseGemmKernel._choose_epilogue(
         (128, 128), (64, 16), probe_gain, stages_through_smem=False
     ) == ((128, 128), 0)
     # ... and the same tile does shrink when the epilogue really is staged.
-    assert dg.DenseGemmKernel._choose_epilogue(
+    assert dense_kernel.DenseGemmKernel._choose_epilogue(
         (128, 128), (64, 16), probe_gain, stages_through_smem=True
     ) == ((64, 64), 2)

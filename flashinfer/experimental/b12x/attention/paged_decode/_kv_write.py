@@ -15,8 +15,8 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64
 
-from b12x._lib.intrinsics import (
-    cvt_f32x4_to_e4m3x4,
+from b12x._lib.intrinsics.conversion import cvt_f32x4_to_e4m3x4
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v4_u32,
     st_global_v4_u32,

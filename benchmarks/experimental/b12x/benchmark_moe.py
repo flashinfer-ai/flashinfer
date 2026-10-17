@@ -28,6 +28,10 @@ weighted routing scenarios. Tuning and evaluation use separate random seeds.
 
 from __future__ import annotations
 
+import b12x.moe._shared.kernels.w4a16.kernel.config as w4a16_config
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+
+
 from b12x._lib.quant.block_codec import IQ2_CODECS, block_codec
 
 import argparse
@@ -70,7 +74,7 @@ from b12x.moe._shared.kernels.activations import (
     moe_activation_w1_rows,
     normalize_moe_activation,
 )
-from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
+from b12x._lib.intrinsics.reference import as_grouped_scale_view, swizzle_block_scale
 from benchmarks.experimental.b12x.common import (
     make_l2_flush_fn,
     resolve_l2_flush_bytes,
@@ -2928,7 +2932,9 @@ def _clear_b12x_caches() -> None:
 
     clear_tp_moe_caches()
     try:
-        from b12x.moe._shared.kernels.w4a16.kernel import clear_w4a16_kernel_cache
+        from b12x.moe._shared.kernels.w4a16.kernel.execution import (
+            clear_w4a16_kernel_cache,
+        )
     except ImportError:
         return
     clear_w4a16_kernel_cache()
@@ -3935,25 +3941,23 @@ def bench_e2e() -> None:
     torch.empty(1, device="cuda")
     device = torch.device("cuda", torch.cuda.current_device())
     if args.w4a16_route_policy != "auto" or args.w4a16_tile_config is not None:
-        from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
-
         if args.w4a16_route_policy != "auto":
             force_direct = args.w4a16_route_policy == "direct"
 
             def forced_tc_decode_preferred(**_: int) -> bool:
                 return force_direct
 
-            w4a16_kernel._w4a16_tc_decode_preferred = forced_tc_decode_preferred
+            w4a16_config._w4a16_tc_decode_preferred = forced_tc_decode_preferred
 
         if args.w4a16_tile_config is not None:
-            real_compile = w4a16_kernel.compile_w4a16_fused_moe
+            real_compile = w4a16_fused_launch.compile_w4a16_fused_moe
             forced_tiles = tuple(args.w4a16_tile_config)
 
             def compile_with_forced_tiles(*compile_args, **compile_kwargs):
                 compile_kwargs["force_tile_config"] = forced_tiles
                 return real_compile(*compile_args, **compile_kwargs)
 
-            w4a16_kernel.compile_w4a16_fused_moe = compile_with_forced_tiles
+            w4a16_fused_launch.compile_w4a16_fused_moe = compile_with_forced_tiles
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
@@ -4118,8 +4122,6 @@ def bench_e2e() -> None:
         return cached_tuning_inputs[tokens]
 
     if args.raw_samples_jsonl is not None:
-        from b12x._lib.compiler import b12x_package_fingerprint
-
         args.raw_samples_jsonl.parent.mkdir(parents=True, exist_ok=True)
         payload_hashes = {}
         if weights.source_format in IQ2_CODECS:
@@ -4141,7 +4143,6 @@ def bench_e2e() -> None:
                         spec=vars(spec),
                         options=vars(args),
                         torch=torch.__version__,
-                        source_fingerprint=b12x_package_fingerprint(),
                         payload_sha256=payload_hashes,
                         benchmark_sha256=hashlib.sha256(
                             pathlib.Path(__file__).read_bytes()

@@ -23,6 +23,8 @@ from types import SimpleNamespace
 from typing import Any
 from filelock import FileLock
 from .cache_integrity import _mkdir_durable, atomic_write_bytes, valid_object
+from .source_dependencies import callable_sources, source_dependencies
+from .compile_options import clear_options_cache, resolve_compile_options
 
 from .compile_plan import _RETAINED_PROGRAMS
 from .runtime_patches import apply_cutlass_runtime_patches
@@ -31,8 +33,7 @@ from .race_fuzz import install_from_environment as _install_race_fuzz
 
 apply_cutlass_runtime_patches()
 
-# The package fingerprint hashes every source file under this root; it is
-# part of every disk-cache key.  Must resolve to b12x.
+# Source dependencies use canonical module names within this package.
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
@@ -1092,134 +1093,29 @@ def _toolchain_log_value(toolchain: tuple[object, ...]) -> dict[str, Any]:
     return summary
 
 
-def _environment_log_value(env: tuple[tuple[str, str], ...]) -> dict[str, str]:
-    return {name: value for name, value in env if value}
-
-
 def _compile_cache_payload_log_value(
     payload: tuple[object, ...] | None,
 ) -> dict[str, Any]:
     if payload is None:
         return {}
+    summary = {"target": _cache_key_log_value(payload[1], max_depth=7, max_items=80)}
     if _is_explicit_spec_payload(payload):
-        (
-            _version,
-            target_key,
-            _b12x_fingerprint,
-            toolchain_key,
-            _device_arch,
-            spec_hash,
-            spec_json,
-            kwargs_hash,
-            kwargs_json,
-            options_key,
-            env_key,
-        ) = payload
-
-        summary: dict[str, Any] = {
-            "target": _cache_key_log_value(target_key, max_depth=7, max_items=80),
-            "spec_hash": spec_hash,
-            "spec": spec_json,
-        }
-        if kwargs_hash:
-            summary["kwargs_hash"] = kwargs_hash
-            summary["kwargs"] = kwargs_json
-        if options_key:
-            summary["options"] = _cache_key_log_value(
-                options_key, max_depth=4, max_items=32
-            )
-        env_summary = (
-            _environment_log_value(env_key) if isinstance(env_key, tuple) else {}
-        )
-        if env_summary:
-            summary["env"] = env_summary
-        if isinstance(toolchain_key, tuple):
-            toolchain_summary = _toolchain_log_value(toolchain_key)
-            if toolchain_summary:
-                summary["toolchain"] = toolchain_summary
-        return summary
-
-    if len(payload) == 8 and payload[0] in {
-        "b12x_cute_compile_cache_v3_explicit_spec",
-        "b12x_cute_compile_cache_v4_explicit_spec",
-    }:
-        (
-            _version,
-            target_key,
-            _b12x_fingerprint,
-            toolchain_key,
-            spec_key,
-            kwargs_key,
-            options_key,
-            env_key,
-        ) = payload
-
-        summary: dict[str, Any] = {
-            "target": _cache_key_log_value(target_key, max_depth=7, max_items=80),
-            "spec": _cache_key_log_value(spec_key, max_depth=7, max_items=80),
-        }
-        if options_key:
-            summary["options"] = _cache_key_log_value(
-                options_key, max_depth=4, max_items=32
-            )
-        kwargs_summary = _cache_key_log_value(kwargs_key, max_depth=5, max_items=32)
-        if kwargs_summary:
-            summary["kwargs"] = kwargs_summary
-        env_summary = (
-            _environment_log_value(env_key) if isinstance(env_key, tuple) else {}
-        )
-        if env_summary:
-            summary["env"] = env_summary
-        if isinstance(toolchain_key, tuple):
-            toolchain_summary = _toolchain_log_value(toolchain_key)
-            if toolchain_summary:
-                summary["toolchain"] = toolchain_summary
-        return summary
-
-    if len(payload) != 9:
-        return {}
-    (
-        _version,
-        target_key,
-        _b12x_fingerprint,
-        toolchain_key,
-        _device_arch,
-        args_key,
-        kwargs_key,
-        options_key,
-        env_key,
-    ) = payload
-
-    summary: dict[str, Any] = {
-        "target": _cache_key_log_value(target_key, max_depth=7, max_items=80),
-        "args": _cache_key_log_value(args_key, max_depth=5, max_items=32),
-    }
-    kwargs_summary = _cache_key_log_value(kwargs_key, max_depth=5, max_items=32)
-    if kwargs_summary:
-        summary["kwargs"] = kwargs_summary
-    if options_key:
-        summary["options"] = _cache_key_log_value(
-            options_key, max_depth=4, max_items=32
-        )
-    env_summary = _environment_log_value(env_key) if isinstance(env_key, tuple) else {}
-    if env_summary:
-        summary["env"] = env_summary
-    if isinstance(toolchain_key, tuple):
-        toolchain_summary = _toolchain_log_value(toolchain_key)
-        if toolchain_summary:
-            summary["toolchain"] = toolchain_summary
+        summary.update(spec_hash=payload[5], spec=payload[6])
+        if payload[7]:
+            summary.update(kwargs_hash=payload[7], kwargs=payload[8])
+    else:
+        summary["args"] = _cache_key_log_value(payload[5])
+        summary["kwargs"] = _cache_key_log_value(payload[6])
+    summary["options"] = _cache_key_log_value(payload[-1])
+    summary["toolchain"] = _toolchain_log_value(payload[3])
     return summary
 
 
 def _is_explicit_spec_payload(payload: tuple[object, ...] | None) -> bool:
     return (
         payload is not None
-        and len(payload) == 11
-        and payload[0]
-        in {
-            "b12x_cute_compile_cache_v6_explicit_spec",
-            "b12x_cute_compile_cache_v7_explicit_spec",
-        }
+        and len(payload) == 10
+        and payload[0] == "b12x_cute_compile_cache_v8_explicit_spec"
     )
 
 
@@ -1438,41 +1334,6 @@ def _call_cute_compile(
     return compiled
 
 
-def _iter_fingerprint_files(root: Path) -> list[Path]:
-    files = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if "__pycache__" in path.parts:
-            continue
-        if path.suffix in {".pyc", ".pyo"}:
-            continue
-        files.append(path)
-    files.sort()
-    return files
-
-
-def _compute_b12x_package_fingerprint() -> str:
-    digest = hashlib.sha256()
-    for path in _iter_fingerprint_files(_PACKAGE_ROOT):
-        rel_path = str(path.relative_to(_PACKAGE_ROOT))
-        digest.update(rel_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-@lru_cache(maxsize=1)
-def _b12x_package_fingerprint() -> str:
-    return _compute_b12x_package_fingerprint()
-
-
-def b12x_package_fingerprint() -> str:
-    """Return the exact content fingerprint used by the CuTe object cache."""
-    return _b12x_package_fingerprint()
-
-
 def _distribution_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -1614,54 +1475,9 @@ def _runtime_toolchain_key() -> tuple[object, ...]:
     )
 
 
-@lru_cache(maxsize=1)
-def _compile_environment_key() -> tuple[tuple[str, str], ...]:
-    compile_env_vars = {
-        "CC",
-        "CXX",
-        "CUDA_HOME",
-        "CUDA_PATH",
-        "CUDA_TOOLKIT_PATH",
-        "CUDACXX",
-        "CUTE_DSL_ARCH",
-        "NVCC_APPEND_FLAGS",
-        "NVCC_PREPEND_FLAGS",
-    }
-    operational_env_vars = {
-        "B12X_AUTOTUNE",
-        "B12X_AUTOTUNE_EXHAUSTIVE",
-        "B12X_TUNING_CACHE_VERSION",
-        "B12X_COMPILE_CACHE_DIR",
-        "B12X_COMPILE_DISK_CACHE",
-        "B12X_COMPILE_MEMORY_CACHE",
-        "B12X_COMPILE_MEMORY_CACHE_SIZE",
-        "B12X_COMPILE_SPEC_MEMO",
-        "B12X_LOG_CUTE_COMPILES",
-        "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START",
-        "B12X_LOG_CUTE_COMPILE_ARGS",
-        "B12X_LOG_CUTE_COMPILE_STACK",
-        "B12X_LOG_CUTE_COMPILE_STACK_DEPTH",
-        "B12X_PRINT_COMPILE_PROGRESS",
-        "B12X_PREPARATION_TRACE_DIR",
-        "B12X_TIMING",
-        "B12X_TIMING_THRESHOLD_MS",
-        "CUTE_DSL_CACHE_DIR",
-    }
-    for name in os.environ:
-        if name.startswith(("B12X_", "CUTE_", "CUTLASS_")):
-            if name not in operational_env_vars:
-                compile_env_vars.add(name)
-    return tuple((name, os.environ.get(name, "")) for name in sorted(compile_env_vars))
-
-
 @lru_cache(maxsize=16)
 def _static_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
-    return (
-        _b12x_package_fingerprint(),
-        _runtime_toolchain_key(),
-        _compile_options_cache_key(compile_callable),
-        _compile_environment_key(),
-    )
+    return (_runtime_toolchain_key(), _compile_options_cache_key(compile_callable))
 
 
 def _device_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
@@ -1675,23 +1491,21 @@ def _device_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
         if cached is not None:
             return cached
 
-    (
-        package_fingerprint,
-        runtime_toolchain,
-        compile_options,
-        compile_environment,
-    ) = _static_compile_cache_context(compile_callable)
+    runtime_toolchain, compile_options = _static_compile_cache_context(compile_callable)
     device_arch = _device_arch_key(device_ordinal)
-    context = (
-        package_fingerprint,
-        runtime_toolchain,
-        device_arch,
-        compile_options,
-        compile_environment,
-    )
+    context = (runtime_toolchain, device_arch, compile_options)
     if context_key is not None and device_arch is not None:
         _DEVICE_COMPILE_CACHE_CONTEXTS[context_key] = context
     return context
+
+
+def _target_source_fingerprint(func: Any) -> str:
+    roots = (
+        *callable_sources(func, _PACKAGE_ROOT),
+        ("b12x._lib.compiler", Path(__file__).resolve()),
+        ("b12x._lib.runtime_patches", _PACKAGE_ROOT / "_lib" / "runtime_patches.py"),
+    )
+    return source_dependencies(_PACKAGE_ROOT).fingerprint(roots)
 
 
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
@@ -1700,8 +1514,8 @@ def _function_fingerprint(func: Any) -> tuple[str, str, str]:
     qualname = getattr(
         func, "__qualname__", getattr(func, "__name__", type(func).__qualname__)
     )
-    if module.startswith("b12x"):
-        return module, qualname, f"b12x:{_b12x_package_fingerprint()}"
+    if module.startswith(("b12x.", "flashinfer.experimental.b12x.")):
+        return module, qualname, _target_source_fingerprint(func)
     try:
         source = inspect.getsource(func)
         payload = source.encode("utf-8")
@@ -1978,6 +1792,9 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
 
 
 def _compile_options_cache_key(compile_callable: Any) -> tuple[str, ...]:
+    resolved = getattr(compile_callable, "_b12x_options_key", None)
+    if resolved is not None:
+        return resolved
     compile_options = getattr(compile_callable, "_compile_options", None)
     if compile_options is None:
         return ()
@@ -2003,19 +1820,16 @@ def _compile_disk_cache_payload(
     kwargs: dict[str, Any],
     compile_spec: KernelCompileSpec | None = None,
 ) -> tuple[object, ...]:
-    (
-        package_fingerprint,
-        runtime_toolchain,
-        device_arch,
-        compile_options,
-        compile_environment,
-    ) = _device_compile_cache_context(compile_callable)
+    runtime_toolchain, device_arch, compile_options = _device_compile_cache_context(
+        compile_callable
+    )
+    source_fingerprint = _target_source_fingerprint(func)
     if compile_spec is not None:
         kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         return (
-            "b12x_cute_compile_cache_v7_explicit_spec",
+            "b12x_cute_compile_cache_v8_explicit_spec",
             _explicit_spec_compile_target(func),
-            package_fingerprint,
+            source_fingerprint,
             runtime_toolchain,
             device_arch,
             compile_spec.hash_key,
@@ -2023,18 +1837,16 @@ def _compile_disk_cache_payload(
             kwargs_hash_key,
             kwargs_json_key,
             compile_options,
-            compile_environment,
         )
     return (
-        "b12x_cute_compile_cache_v4",
+        "b12x_cute_compile_cache_v5",
         _normalize_compile_target(func, set()),
-        package_fingerprint,
+        source_fingerprint,
         runtime_toolchain,
         device_arch,
         _structural_cache_key(args),
         _structural_cache_key(kwargs),
         compile_options,
-        compile_environment,
     )
 
 
@@ -2172,8 +1984,8 @@ def _semantic_compile_manifest_payload(
         "device_arch"
         if cache_format
         in {
-            "b12x_cute_compile_cache_v4",
-            "b12x_cute_compile_cache_v7_explicit_spec",
+            "b12x_cute_compile_cache_v5",
+            "b12x_cute_compile_cache_v8_explicit_spec",
         }
         else "device_uuid"
     )
@@ -2191,12 +2003,10 @@ def _semantic_compile_manifest_payload(
             except (TypeError, ValueError, json.JSONDecodeError):
                 semantic["compile_kwargs"] = str(cache_payload[8])
         semantic["compile_options"] = _manifest_json_value(cache_payload[9])
-        semantic["compile_environment"] = _manifest_json_value(cache_payload[10])
     else:
         semantic["args"] = _semantic_structural_key(cache_payload[5])
         semantic["kwargs"] = _semantic_structural_key(cache_payload[6])
         semantic["compile_options"] = _manifest_json_value(cache_payload[7])
-        semantic["compile_environment"] = _manifest_json_value(cache_payload[8])
     return semantic
 
 
@@ -2432,7 +2242,6 @@ def _build_compile_manifest(
     cache_format = str(cache_payload[0]) if cache_payload else "unknown"
     explicit = _is_explicit_spec_payload(cache_payload)
     options_index = 9 if explicit else 7
-    environment_index = 10 if explicit else 8
     launch_metadata = (
         _extract_launch_dynamic_smem_bytes(compiled)
         if compiled is not None
@@ -2457,7 +2266,7 @@ def _build_compile_manifest(
         allow_nan=False,
     )
     manifest: dict[str, Any] = {
-        "schema": "b12x._lib.compile_manifest.v3",
+        "schema": "b12x._lib.compile_manifest.v4",
         "cache_key": cache_key,
         "cache_format": cache_format,
         "cache_payload_repr": repr(cache_payload),
@@ -2468,10 +2277,9 @@ def _build_compile_manifest(
         "semantic_payload": semantic_payload,
         "target": _compile_target_name(func),
         "target_identity": _semantic_target_key(cache_payload[1]),
-        "package_fingerprint": str(cache_payload[2]),
+        "source_fingerprint": str(cache_payload[2]),
         "toolchain": _manifest_json_value(cache_payload[3]),
         "compile_options": _manifest_json_value(cache_payload[options_index]),
-        "compile_environment": _manifest_json_value(cache_payload[environment_index]),
         "launch_metadata": launch_metadata,
         "artifact_evidence_sha256": hashlib.sha256(
             artifact_evidence_json.encode("utf-8")
@@ -2634,7 +2442,8 @@ def clear_compile_cache() -> None:
     global _SPEC_MEMO_MISSES
     global _COMPILE_PROGRESS_COUNT
     global _COMPILE_PROGRESS_TOTAL_SECONDS
-    _compile_environment_key.cache_clear()
+    source_dependencies.cache_clear()
+    clear_options_cache()
     _static_compile_cache_context.cache_clear()
     _DEVICE_ARCH_KEYS.clear()
     _DEVICE_COMPILE_CACHE_CONTEXTS.clear()
@@ -2693,26 +2502,13 @@ def compile(
 
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
-    compile_callable = cute.compile
-    if dsl_compile_options is not None:
-        # Subscript-style DSL compile options (e.g. OptLevel(2): ptxas -O3's
-        # scheduler register-starves some scalar-heavy kernels; see the w4a8
-        # dynamic MoE recipe).
-        if hasattr(compile_callable, "__getitem__"):
-            compile_callable = compile_callable[dsl_compile_options]
-        else:
-            # Some embedded runtimes expose cutlass.cute.compile as a plain
-            # function instead of the CompileCallable instance installed by the
-            # top-level module import.  Recreate the callable explicitly so DSL
-            # options still take effect instead of crashing or silently falling
-            # back to the default compiler options.
-            from cutlass.base_dsl.compiler import CompileCallable
-
-            compile_callable = CompileCallable(dsl_compile_options)
+    compile_callable = resolve_compile_options(
+        cute.compile, dsl_compile_options, kwargs.get("options")
+    )
+    if getattr(compile_callable, "_b12x_options_key", None) is not None:
         kwargs = dict(kwargs)
-        kwargs["__dsl_compile_options_key"] = _dsl_compile_options_kwargs_key(
-            compile_callable
-        )
+        kwargs.pop("options", None)
+        kwargs["__dsl_compile_options_key"] = compile_callable._b12x_options_key
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )

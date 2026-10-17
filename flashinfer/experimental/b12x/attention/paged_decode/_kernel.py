@@ -34,10 +34,12 @@ from cutlass.cute.nvgpu import cpasync
 
 from b12x.attention._shared.cute import copy as cute_copy
 from b12x.attention._shared.cute import ops as attention_ops
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n16k16_f32,
+from b12x._lib.intrinsics.mma import bf16_mma_m16n16k16_f32
+from b12x._lib.intrinsics.packed import (
     bf16_rowsum_m16k16_f32,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
+)
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_nc_u32,
     ld_global_v4_f32,

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from b12x.moe import fused_moe as moe
-from b12x.moe._shared.kernels.w4a16.kernel import _select_tile_config
+from b12x.moe._shared.kernels.w4a16.kernel.config import _select_tile_config
 from b12x.preparation import PreparationSession, PreparedCall
 from ..conftest import require_b12x
 

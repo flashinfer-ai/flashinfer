@@ -4,14 +4,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import (
-    byte_perm,
+from b12x._lib.intrinsics.packed import byte_perm
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
-    ld_shared_u32,
-    st_shared_u32,
     st_shared_v4_u32,
 )
+from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
 from b12x._lib.quant.csf_blocks import CompactBlockStoragePlane
 
 

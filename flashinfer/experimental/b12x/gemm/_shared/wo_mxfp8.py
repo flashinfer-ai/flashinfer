@@ -10,19 +10,16 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x._lib.dense_gemm import (
-    _WO_SPARK_MAX_SMS,
-    _select_default_dense_gemm_plan,
-    dense_gemm,
-    dense_gemm_fused_quant_a,
-    dense_gemm_fused_quant_a_grouped,
-)
+from b12x._lib.dense_gemm.config import _WO_SPARK_MAX_SMS
+from b12x._lib.dense_gemm.policy import _select_default_dense_gemm_plan
+from b12x._lib.dense_gemm.execution import dense_gemm, dense_gemm_fused_quant_a
+from b12x._lib.dense_gemm.compile import dense_gemm_fused_quant_a_grouped
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import cuda_stream_to_int, get_num_sm
+from b12x._lib.utils.device import cuda_stream_to_int, get_num_sm
 from b12x.gemm.wo_projection._tuning import WoProjectionConfig
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache

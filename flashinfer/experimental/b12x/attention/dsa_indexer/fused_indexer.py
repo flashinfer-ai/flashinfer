@@ -36,13 +36,13 @@ from b12x._lib.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
-from b12x._lib.intrinsics import shared_ptr_to_u32
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 # Kept in lock-step with the source kernels we fuse.
 from b12x.attention.dsa_indexer._tuning import (
@@ -64,7 +64,7 @@ from b12x.attention.dsa_indexer.tiled_topk import (
     _smem_st,
     _smem_xadd,
 )
-from b12x._lib.intrinsics import ld_shared_f32
+from b12x._lib.intrinsics.atomics import ld_shared_f32
 from b12x.attention.dsa_indexer.kernel import (
     _to_kernel_tensor,
     _stream_issue_k_page_cp_async,
@@ -84,26 +84,30 @@ from b12x.attention.dsa_indexer.kernel import (
     _repack_k_page_to_permuted,
     _smem_addr_from_b128_offset,
 )
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_add_global_i32,
     atomic_add_global_u64,
-    fmax_f32,
+    red_add_global_i32,
+    red_add_global_release_i32,
+)
+from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
-    ld_global_acquire_i32,
     ld_global_cg_v4_u32,
     ld_global_nc_f32,
     ld_global_nc_u32,
     ld_global_v4_u32,
-    red_add_global_i32,
-    red_add_global_release_i32,
-    spin_wait_global_ge_i32,
     ldmatrix_m8n8x4_b16,
     ld_shared_v4_u32,
-    mxfp8_mma_m16n8k32_f32_e4m3,
     st_shared_u8,
     st_shared_v4_u32,
+)
+from b12x._lib.intrinsics.sync import (
+    ld_global_acquire_i32,
+    spin_wait_global_ge_i32,
     threadfence,
 )
+from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 
 # Triage kill-switch: B12X_INDEXER_DIRECT_K=0 forces every variant back to
 # the staged pipeline (which also restores the v2 cache keys), so serving can

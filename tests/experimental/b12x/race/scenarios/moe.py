@@ -50,7 +50,7 @@ def _routes(gen, m, num_experts, top_k, device):
 def _nvfp4_experts(gen, case, a, mode):
     """ModelOpt NVFP4 experts with signed random codes and per-block scales,
     prepared for ``mode`` (``w4a16``, ``nvfp4`` or ``w4a8_nvfp4``)."""
-    from b12x._lib.intrinsics import swizzle_block_scale
+    from b12x._lib.intrinsics.reference import swizzle_block_scale
     from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts
 
     device = a.device

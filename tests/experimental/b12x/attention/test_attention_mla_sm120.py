@@ -34,7 +34,7 @@ from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_sparse_mla_kv_cache_reference,
 )
-from b12x._lib.intrinsics import get_sm_version
+from b12x._lib.intrinsics.arch import get_sm_version
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLAScratchCaps,
     _compressed_sparse_mla_scratch_layout,

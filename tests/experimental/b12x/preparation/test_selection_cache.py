@@ -1,4 +1,4 @@
-"""Tuning decision versions and source-based compiled artifacts are independent."""
+"""Tuning choices track candidate programs and explicit tuning schema versions."""
 
 from contextlib import nullcontext
 from dataclasses import replace
@@ -255,59 +255,56 @@ def test_missing_device_name_fails_before_cache_access(cache_device, monkeypatch
         cache_identity({}, 0)
 
 
-def test_source_and_toolchain_changes_rekey_kernels_without_rekeying_decisions(
+def test_source_and_toolchain_changes_preserve_the_selection_file_partition(
     cache_device, tmp_path, monkeypatch
 ):
+    (tmp_path / "__init__.py").write_text("")
     source = tmp_path / "kernel.py"
     source.write_text("VALUE = 1\n")
-    monkeypatch.setattr(compiler, "_PACKAGE_ROOT", tmp_path)
-    monkeypatch.setattr(
-        compiler,
-        "_b12x_package_fingerprint",
-        compiler._compute_b12x_package_fingerprint,
-    )
+    from b12x._lib.source_dependencies import SourceDependencies
+
+    def source_key():
+        return SourceDependencies(tmp_path).fingerprint((("b12x.kernel", source),))
+
     monkeypatch.setattr(compiler, "_runtime_toolchain_key", lambda: ("compiler-a",))
 
     def compile_context():
         return compiler._static_compile_cache_context.__wrapped__(object())
 
-    compiler._compile_environment_key.cache_clear()
+    compiler.clear_compile_cache()
     try:
         decision = cache_identity({}, 0)
-        kernel = compile_context()
+        kernel = source_key()
         source.write_text("VALUE = 2\n")
-        changed_source = compile_context()
+        changed_source = source_key()
         assert changed_source != kernel
         assert cache_identity({}, 0) == decision
         monkeypatch.setattr(compiler, "_runtime_toolchain_key", lambda: ("compiler-b",))
         changed_toolchain = compile_context()
-        assert changed_toolchain != changed_source
+        assert changed_toolchain != ("compiler-a", ())
         assert cache_identity({}, 0) == decision
         monkeypatch.setenv("NVCC_APPEND_FLAGS", "-lineinfo")
-        compiler._compile_environment_key.cache_clear()
-        assert compile_context() != changed_toolchain
+        compiler.clear_compile_cache()
+        assert compile_context() == changed_toolchain
         assert cache_identity({}, 0) == decision
     finally:
-        compiler._compile_environment_key.cache_clear()
+        compiler.clear_compile_cache()
 
 
 def test_manual_tuning_version_does_not_change_kernel_compilation_context(
     cache_device, monkeypatch
 ):
-    monkeypatch.setattr(
-        compiler, "_b12x_package_fingerprint", lambda: "same-kernel-source"
-    )
     monkeypatch.setattr(compiler, "_runtime_toolchain_key", lambda: ("same-compiler",))
-    compiler._compile_environment_key.cache_clear()
+    compiler.clear_compile_cache()
     try:
         before = compiler._static_compile_cache_context.__wrapped__(object())
         decision = cache_identity({}, 0)
         monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", "2")
-        compiler._compile_environment_key.cache_clear()
+        compiler.clear_compile_cache()
         assert compiler._static_compile_cache_context.__wrapped__(object()) == before
         assert cache_identity({}, 0) != decision
     finally:
-        compiler._compile_environment_key.cache_clear()
+        compiler.clear_compile_cache()
 
 
 def test_matching_malformed_decision_still_fails_closed(cache_device, tmp_path):
@@ -356,17 +353,20 @@ def test_ranks_share_decisions_when_one_part_carries_two_product_labels(
     assert cache.get("shape")["assignment"]["width"] == 2
 
 
-def test_cached_choice_rebuilds_changed_program_without_racing(
+def test_changed_losing_candidate_retunes_and_reuses_unchanged_programs(
     cache_device, tmp_path, monkeypatch
 ):
     session_module = importlib.import_module("b12x.preparation.session")
     _deterministic_timer(monkeypatch)
     available, built = set(), []
-    source_version = "a"
+    source_versions = {1: "a", 2: "a", 4: "a"}
+    described = []
 
     def describe(job):
+        width = job.args[0]
+        described.append(width)
         return CompilationPlan(
-            job, (ProgramKey("cute", f"{source_version}-{job.args[0]}"),)
+            job, (ProgramKey("cute", f"{source_versions[width]}-{width}"),)
         )
 
     def build(plans):
@@ -385,7 +385,8 @@ def test_cached_choice_rebuilds_changed_program_without_racing(
 
     def prepare(ordinal=0):
         def materialize(selection, device):
-            program = ProgramKey("cute", f"{source_version}-{selection.config.width}")
+            width = selection.config.width
+            program = ProgramKey("cute", f"{source_versions[width]}-{width}")
             return SimpleNamespace(value=selection.config.width * 3, program=program)
 
         def factory(state):
@@ -418,15 +419,27 @@ def test_cached_choice_rebuilds_changed_program_without_racing(
 
     assert prepare() == ("tuned", 3)
     assert set(built) == {"a-1", "a-2", "a-4"}
-    source_version = "b"
+    assert sorted(described) == [1, 2, 4]
     built.clear()
+    described.clear()
     assert prepare(ordinal=1) == ("cached", 0)
-    assert built == ["b-2"]
-    monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", "2")
+    assert built == []
+    assert sorted(described) == [1, 2, 4]
+    # Width 4 lost the first race; changing only its program must still retune.
+    source_versions[4] = "b"
     built.clear()
+    described.clear()
     assert prepare() == ("tuned", 3)
-    assert set(built) == {"b-1", "b-4"}
-    monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", "3")
+    assert built == ["b-4"]
+    assert sorted(described) == [1, 2, 4]
+    built.clear()
+    monkeypatch.setenv("B12X_UNUSED_SETTING", "different")
+    assert prepare() == ("cached", 0)
+    assert built == []
+    source_versions.update({1: "b", 2: "b"})
+    assert prepare() == ("tuned", 3)
+    assert set(built) == {"b-1", "b-2"}
+    monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", "2")
     built.clear()
     assert prepare() == ("tuned", 3)
     assert built == []

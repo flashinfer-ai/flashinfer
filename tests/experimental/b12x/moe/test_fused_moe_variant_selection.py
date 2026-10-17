@@ -1,5 +1,12 @@
 """Host-only selection rules for prepared fused-MoE variants and W4A16 launches."""
 
+import b12x._lib.compiler as _module__lib_compiler
+import b12x._lib.utils.device as _module__lib_utils_device
+import b12x.moe._shared.kernels.w4a16.kernel.config as w4a16_config
+import b12x.moe._shared.kernels.w4a16.kernel.direct_launch as w4a16_direct_launch
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+
+
 from dataclasses import replace
 from inspect import signature
 from types import SimpleNamespace
@@ -44,7 +51,7 @@ def test_trellis_direct_table_preserves_cooperative_residency(
     expected,
     shared_limit,
 ):
-    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -384,11 +391,10 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
     monkeypatch,
 ):
     from b12x._lib.compile_plan import ProgramKey, program_keys
-    from b12x.moe._shared.kernels.w4a16 import kernel
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(kernel, "current_cuda_stream", lambda: None)
-    monkeypatch.setattr(kernel, "_FUSED_CACHE", {})
+    monkeypatch.setattr(_module__lib_utils_device, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(w4a16_fused_launch, "_FUSED_CACHE", {})
     compiled = []
 
     def compile_fused(*args, **kwargs):
@@ -409,11 +415,13 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
             ),
         )
 
-    monkeypatch.setattr(kernel, "b12x_compile", compile_fused)
-    monkeypatch.setattr(kernel, "_compile_w4a16_small_m_direct", compile_direct)
+    monkeypatch.setattr(_module__lib_compiler, "b12x_compile", compile_fused)
+    monkeypatch.setattr(
+        w4a16_direct_launch, "_compile_w4a16_small_m_direct", compile_direct
+    )
     packed_specializations = {}
     for m in (1, 2, 4, 8, 9, 8, 1):
-        launch = kernel.compile_w4a16_fused_moe(
+        launch = w4a16_fused_launch.compile_w4a16_fused_moe(
             size_m=m,
             hidden_size=256,
             intermediate_size=256,
@@ -425,7 +433,7 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
             moe_block_size=8,
             max_m_blocks=32,
             sms=188,
-            max_shared_mem=kernel._DEFAULT_MAX_SHARED_MEM,
+            max_shared_mem=w4a16_config._DEFAULT_MAX_SHARED_MEM,
             weight_layout="modelopt",
             force_tile_config=(128, 128, 128, 128),
         )

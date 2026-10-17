@@ -16,12 +16,9 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics import (
-    cvt_e8m0_to_f32,
-    fabs_f32,
-    fmax_f32,
-    swizzle_block_scale,
-)
+from b12x._lib.intrinsics.conversion import cvt_e8m0_to_f32
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.fp6 import (
     _decode_fp6_e2m3,
     _decode_fp6_e3m2,
@@ -44,13 +41,13 @@ from b12x.moe._shared.kernels.mxfp6_moe import moe_mxfp6_quantize_input_block_co
 # against b12x.moe.fused_moe (quant_mode="w6a8_mx") once the run path
 # lands. The decode/scale/quant primitive tests below remain live.
 try:
-    from b12x.moe._shared.kernels.micro import (
+    from b12x.moe._shared.kernels.micro.config import (
         MXFP6_BLOCK_SIZE,
         _MAX_DIRECT_K_SEGMENTS,
         _mxfp6_micro_k_segments_for_k,
         _mxfp6_micro_shapes_ok,
-        MoEMicroKernelBackend,
     )
+    from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
     from b12x.moe._shared.kernels.silu import MoEMicroKernelSilu
 
     _HAS_FP6_MICRO = True

@@ -16,7 +16,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x.attention.dsa_indexer.fused_indexer import (
     _COOP_STATE_WORDS,
     _fused_group_barrier,

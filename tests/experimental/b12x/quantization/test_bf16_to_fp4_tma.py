@@ -11,7 +11,10 @@ import sys
 import pytest
 import torch
 
-from b12x._lib.intrinsics import as_grouped_scale_view, quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics.reference import (
+    as_grouped_scale_view,
+    quantize_grouped_nvfp4_torch,
+)
 from b12x.quantization.nvfp4._impl import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
@@ -85,7 +88,7 @@ _RESOURCE_SHAPES = [
 ]
 
 
-def test_dsl_compile_option_provenance_is_fresh_process_stable(
+def test_dsl_compile_options_are_fresh_process_stable(
     tmp_path: Path,
 ) -> None:
     require_b12x()
@@ -106,11 +109,7 @@ from b12x._lib.compiler import (
     _compile_kwargs_json_key,
     _dsl_compile_options_kwargs_key,
 )
-from validation.cutlass_migration.core.comparison_identity import (
-    comparison_semantic_key_from_manifest,
-    normalize_comparison_compile_options,
-    normalize_comparison_compile_environment,
-)
+from b12x._lib.compile_options import resolve_compile_options
 from b12x.quantization.nvfp4._impl import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
@@ -119,7 +118,7 @@ from b12x.quantization.nvfp4._tuning import TUNING, Nvfp4QuantizationQuery
 
 result = {}
 for level in (1, 2):
-    compile_callable = cute.compile[OptLevel(level)]
+    compile_callable = resolve_compile_options(cute.compile, OptLevel(level))
     options_key = _dsl_compile_options_kwargs_key(compile_callable)
     kwargs_json, kwargs_hash = _compile_kwargs_json_key(
         {"__dsl_compile_options_key": options_key}
@@ -130,9 +129,7 @@ for level in (1, 2):
         "kwargs_hash": kwargs_hash,
     }
 
-# Exercise the compile provenance in the same fresh process that compiles and
-# launches a real migrated CuTe DSL kernel.  A CUDA availability check alone
-# would leave this as a CPU-only test.
+# Compile and execute a quantization kernel in each fresh process.
 device = torch.device("cuda")
 source = torch.ones((128, 128), dtype=torch.bfloat16, device=device)
 global_scale = torch.ones((1,), dtype=torch.float32, device=device)
@@ -159,65 +156,15 @@ manifests = [
 ]
 assert len(manifests) == 1
 manifest = manifests[0]
-raw_environment = dict(manifest["semantic_payload"]["compile_environment"])
-assert raw_environment == dict(manifest["compile_environment"])
-package_runtime_components = []
-for component in raw_environment.get("CUTE_DSL_LIBS", "").split(os.pathsep):
-    candidate = Path(component)
-    if (
-        candidate.name == "libcute_dsl_runtime.so"
-        and "nvidia_cutlass_dsl" in candidate.parts
-    ):
-        package_runtime_components.append(component)
-assert package_runtime_components
-assert "rdc=false" in manifest["compile_options"]
+assert "compile_environment" not in manifest
+assert "compile_environment" not in manifest["semantic_payload"]
+assert "source_fingerprint" in manifest
+assert "RDC=False" in manifest["compile_options"]
 assert manifest["semantic_payload"]["compile_options"] == manifest["compile_options"]
-raw_semantic_json = json.dumps(
-    manifest["semantic_payload"],
-    sort_keys=True,
-    separators=(",", ":"),
-    ensure_ascii=True,
-    allow_nan=False,
-)
-assert hashlib.sha256(raw_semantic_json.encode()).hexdigest() == manifest["semantic_key"]
-comparison_key = comparison_semantic_key_from_manifest(manifest)
-assert comparison_key != manifest["semantic_key"]
-
-package_runtime = (
-    "/tmp/site-packages/nvidia_cutlass_dsl/cu13/lib/"
-    "libcute_dsl_runtime.so"
-)
-custom_runtime = "/opt/b12x-custom/libserving_runtime.so"
-synthetic_raw_environment = [
-    ["CUDA_PATH", "/opt/cuda"],
-    ["CUTE_DSL_LIBS", package_runtime + os.pathsep + custom_runtime],
-]
-synthetic_environment = dict(normalize_comparison_compile_environment(
-    synthetic_raw_environment
-))
-assert synthetic_environment["CUTE_DSL_LIBS"] == custom_runtime
-assert dict(synthetic_raw_environment)["CUTE_DSL_LIBS"] == (
-    package_runtime + os.pathsep + custom_runtime
-)
-synthetic_raw_options = [
-    "opt-level=3",
-    "rdc=false",
-    "dump-ptx-path='/tmp/diagnostic-a.ptx'",
-]
-assert normalize_comparison_compile_options(synthetic_raw_options) == [
-    "opt-level=3"
-]
-assert synthetic_raw_options[-1] == "dump-ptx-path='/tmp/diagnostic-a.ptx'"
-result["semantic_environment"] = {
-    "actual": raw_environment,
-    "custom_runtime": synthetic_environment["CUTE_DSL_LIBS"],
-    "comparison_key": comparison_key,
-    "raw_semantic_key": manifest["semantic_key"],
-}
 print(json.dumps(result, sort_keys=True))
 """
     repo_root = Path(__file__).resolve().parents[4]
-    cache_dir = tmp_path / "provenance-compile-cache"
+    cache_dir = tmp_path / "compile-cache"
 
     def run_fresh_process() -> str:
         completed = subprocess.run(
@@ -235,10 +182,10 @@ print(json.dumps(result, sort_keys=True))
     assert "object at" not in first
 
     provenance = json.loads(first)
-    assert "opt-level=1" in provenance["1"]["options"]
-    assert "opt-level=2" in provenance["2"]["options"]
+    assert "OptLevel=1" in provenance["1"]["options"]
+    assert "OptLevel=2" in provenance["2"]["options"]
     for level in ("1", "2"):
-        assert "rdc=false" in provenance[level]["options"]
+        assert "RDC=False" in provenance[level]["options"]
         kwargs = json.loads(provenance[level]["kwargs_json"])
         assert kwargs["__dsl_compile_options_key"] == provenance[level]["options"]
         assert (

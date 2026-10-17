@@ -6,8 +6,8 @@ from cutlass.cute.runtime import from_dlpack
 import torch
 
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_kernel
-from b12x._lib.intrinsics import fp8_e4m3_to_f32, fp8_e4m3_to_f32_and_rcp
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics.conversion import fp8_e4m3_to_f32, fp8_e4m3_to_f32_and_rcp
+from b12x._lib.utils.device import current_cuda_stream
 
 from ..conftest import require_b12x
 

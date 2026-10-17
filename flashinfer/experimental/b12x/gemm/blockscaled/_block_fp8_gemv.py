@@ -23,17 +23,11 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
-from b12x._lib.intrinsics import (
-    get_ptr_as_int64,
-    ld_global_nc_v4_u32,
-    mxfp8_mma_m16n8k32_f32_e4m3,
-)
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
+from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 from b12x._lib.program_cache import program_cache
-from b12x._lib.utils import (
-    cuda_stream_from_int_or_current,
-    current_cuda_stream,
-    make_ptr,
-)
+from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.gemm.bf16_gemv._kernel import _flat
 
 MAX_ROWS = 8

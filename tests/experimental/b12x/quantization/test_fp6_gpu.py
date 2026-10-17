@@ -5,7 +5,7 @@ from b12x.testing.reference.fp6 import _bf16_global_scale, _quantize_bf16_matrix
 import pytest
 import torch
 
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.fp6 import (
     FLOAT6_E3M2_MAX,
     SF_VEC_SIZE_FP6,
@@ -14,8 +14,8 @@ from b12x._lib.fp6 import (
     dequant_mxfp6_torch,
     quantize_grouped_mxfp6_torch,
 )
-from b12x._lib.utils import mxfp6_packed_k_bytes
-from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
+from b12x._lib.dense_gemm.execution import dense_gemm
 from b12x.quantization.mxfp6 import (
     allocate_bf16_to_fp6_tma_outputs,
     compile_bf16_to_fp6_tma,

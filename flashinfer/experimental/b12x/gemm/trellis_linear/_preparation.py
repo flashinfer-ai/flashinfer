@@ -79,7 +79,7 @@ def query_from_weight(
 @program_cache(scope="preparation")
 def _compile_trellis(query_payload, config_payload, ordinal, sm_count):
     """Resolve exactly the native dense GEMM program selected by the session."""
-    from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_gemm
+    from b12x.moe._shared.kernels.w4a16.kernel.gemm_launch import compile_w4a16_gemm
 
     query = TrellisQuery(**dict(query_payload))
     config = TrellisConfig.from_config(FrozenMapping(config_payload))
@@ -112,7 +112,7 @@ def _compile_trellis(query_payload, config_payload, ordinal, sm_count):
 
 
 def _c_tmp_elements(query: TrellisQuery, config: TrellisConfig, sm_count: int) -> int:
-    from b12x.moe._shared.kernels.w4a16.kernel import packed_gemm_scratch_elements
+    from b12x.moe._shared.kernels.w4a16.host import packed_gemm_scratch_elements
 
     route_slots = (
         (query.max_rows + config.block_rows - 1) // config.block_rows
@@ -173,7 +173,7 @@ class _TrellisExecutionState:
         gemm_output_f16=None,
         output_f16=None,
     ):
-        from b12x.moe._shared.kernels.w4a16.kernel import run_trellis256_dense
+        from b12x.moe._shared.kernels.w4a16.kernel.execution import run_trellis256_dense
 
         if not isinstance(x, torch.Tensor) or x.device != self.device:
             raise ValueError("Trellis source device differs from prepared plan")
@@ -331,9 +331,11 @@ def plan(
         return MemoryRequirements(tuple(specs), tuple(persistent))
 
     def materialize(selection, device):
-        from b12x.moe._shared.kernels.w4a16.kernel import (
-            _W4A16GemmLaunch,
+        from b12x.moe._shared.kernels.w4a16.kernel.types import _W4A16GemmLaunch
+        from b12x.moe._shared.kernels.w4a16.kernel.execution import (
             _resolve_exl3_hadamard_128,
+        )
+        from b12x.moe._shared.kernels.w4a16.kernel.config import (
             _trellis256_execution_lut,
         )
 

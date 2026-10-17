@@ -9,7 +9,7 @@ from cutlass import Int32, Int64
 from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.compiler import KernelCompileSpec, launch
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 
 @cute.kernel

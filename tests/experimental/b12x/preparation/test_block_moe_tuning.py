@@ -60,7 +60,7 @@ def test_candidates_expose_tiles_routes_and_pipeline(codec, capacity):
 @pytest.mark.parametrize("codec", ("iq2_xs", "iq2_xxs", "q8_0"))
 def test_every_candidate_constructs_resource_valid_kernel(codec, monkeypatch):
     import torch
-    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
 
     # This is a metadata/resource check, never a GPU qualification or timing.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)

@@ -26,12 +26,11 @@ from b12x._lib.compile_plan import (
     record_program,
 )
 from b12x._lib.program_cache import register_program_cache
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n8k16_f32,
-    f32_to_raw_bits,
-)
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
+from b12x._lib.intrinsics.packed import f32_to_raw_bits
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 _CACHE: dict[tuple, object] = {}
 register_program_cache(_CACHE)

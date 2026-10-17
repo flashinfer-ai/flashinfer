@@ -234,7 +234,8 @@ def test_compact_offset_widths_into_native_byte_grid(
 
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
     from b12x._lib.quant.csf_blocks import CompactBlockStoragePlane
-    from b12x._lib.utils import current_cuda_stream, make_ptr
+    from b12x._lib.utils.device import current_cuda_stream
+    from b12x._lib.utils.pointers import make_ptr
 
     device = require_b12x()
     planes, expected = planes_and_native(

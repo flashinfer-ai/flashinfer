@@ -14,7 +14,7 @@ from b12x.preparation import PreparationSession, PreparedCall
 from b12x.preparation.device import detect_device
 from b12x.gemm.blockscaled import _preparation
 from b12x.gemm.blockscaled._tuning import BlockscaledConfig
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.testing.reference.helpers import require_b12x
 
@@ -96,7 +96,10 @@ def make_workspace(
 
 @pytest.mark.parametrize("n,k,group", [(37, 80, 16), (129, 160, 32)])
 def test_scale_storage_views_are_zero_copy(n, k, group):
-    from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
+    from b12x._lib.intrinsics.reference import (
+        as_grouped_scale_view,
+        as_grouped_scale_view_mx,
+    )
 
     physical = torch.empty(
         (n + 127) // 128 * 128, (k // group + 3) // 4 * 4, dtype=torch.uint8
@@ -483,8 +486,8 @@ def test_a16_frozen_callable_and_graph_replay(recipe, tile_m, monkeypatch):
 
 def test_quantized_nvfp4_activation_contract():
     require_b12x()
-    from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-    from b12x._lib.dense_gemm import dense_gemm
+    from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
+    from b12x._lib.dense_gemm.execution import dense_gemm
 
     weight, _, _ = make_weight("nvfp4", 128, 256)
     source = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
@@ -941,11 +944,12 @@ def test_native_weight_pairs_exhaustive(fp4):
     import cutlass
     import cutlass.cute as cute
     from b12x._lib.compiler import compile as compile_kernel
-    from b12x._lib.intrinsics import (
+    from b12x._lib.intrinsics.packed import (
         nvfp4_pair_to_bf16x2_sm120,
         mxfp8_pair_to_bf16x2_sm120,
     )
-    from b12x._lib.utils import make_ptr, current_cuda_stream
+    from b12x._lib.utils.pointers import make_ptr
+    from b12x._lib.utils.device import current_cuda_stream
 
     class Decode:
         def __init__(self, fp4):

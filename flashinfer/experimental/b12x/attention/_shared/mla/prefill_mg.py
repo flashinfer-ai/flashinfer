@@ -29,35 +29,36 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.compiler import launch as b12x_launch, run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_max_shared_f32_offset,
-    byte_perm,
-    create_l2_evict_first_policy,
-    cvt_e4m3_to_f32_via_f16,
-    dequant_kv_e4m3_pair_to_bf16x2,
-    f16x2_to_f32x2,
-    fmax_f32,
-    fmin_f32,
-    fp4_decode_2,
-    get_ptr_as_int64,
-    ld_global_b16,
-    ld_global_nc_u32,
-    ld_global_v4_f32,
     ld_shared_f32_offset,
-    ld_shared_u16_offset,
-    ld_shared_u8_offset,
-    ld_shared_v4_u32,
-    ldmatrix_m8n8x4_b16,
-    mma_m16n8k16_f32_bf16,
-    mma_m16n8k32_f32_e4m3,
-    pack_f32x2_to_bfloat2,
-    quantize_scaled_store_shared_v2_e4m3,
-    rcp_approx_ftz,
-    shared_ptr_to_u32,
     st_shared_bf16_from_f32,
     st_shared_f32_offset,
     st_shared_u32,
 )
+from b12x._lib.intrinsics.packed import byte_perm, pack_f32x2_to_bfloat2
+from b12x._lib.intrinsics.memory import (
+    create_l2_evict_first_policy,
+    get_ptr_as_int64,
+    ld_global_b16,
+    ld_global_nc_u32,
+    ld_global_v4_f32,
+    ld_shared_u16_offset,
+    ld_shared_u8_offset,
+    ld_shared_v4_u32,
+    ldmatrix_m8n8x4_b16,
+    quantize_scaled_store_shared_v2_e4m3,
+    shared_ptr_to_u32,
+)
+from b12x._lib.intrinsics.conversion import (
+    cvt_e4m3_to_f32_via_f16,
+    dequant_kv_e4m3_pair_to_bf16x2,
+    f16x2_to_f32x2,
+    fp4_decode_2,
+)
+from b12x._lib.intrinsics.math import fmax_f32, fmin_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
+from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
 
 from .decode_math import (
     EPILOGUE_FINAL_BF16,

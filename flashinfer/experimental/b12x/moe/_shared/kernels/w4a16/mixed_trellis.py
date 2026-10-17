@@ -25,25 +25,26 @@ from cutlass.base_dsl.compiler import OptLevel
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 from .host import (
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     route_pack_warmup_token_counts,
 )
-from .kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _LUT_E4M3_VALUE_TABLE_ENTRIES,
     _LUT_E4M3_SMEM_REGION_BYTES,
-    W4A16FusedMoeKernel,
     _cutlass_element_dtype,
     _fake_m_for_specialization,
     _trellis256_execution_lut,
-    compile_w4a16_topk_sum,
-    pack_topk_routes_by_expert,
 )
+from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
+from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
+from b12x.moe._shared.kernels.w4a16.kernel.execution import pack_topk_routes_by_expert
 
 
 @dataclass(frozen=True)

@@ -1712,7 +1712,7 @@ def test_compact_fc2_reduction_matches_ordered_bf16_routes(topk, ids_dtype):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from b12x._lib.utils import current_cuda_stream
+    from b12x._lib.utils.device import current_cuda_stream
     from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 
     capacity, n = 3, 192

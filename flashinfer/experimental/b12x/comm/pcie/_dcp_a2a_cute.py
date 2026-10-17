@@ -15,14 +15,11 @@ from cutlass._mlir.dialects import llvm
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
-from b12x._lib.intrinsics import (
-    fmax_f32,
-    ld_global_v4_u32,
-    st_global_v4_u32,
-    u32_as_f32,
-)
+from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 from ._dcp_cute_common import _membar_sys, block_pair_barrier
 from ._cute_intrinsics import (
@@ -636,14 +633,19 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     )
                     input_base = (
                         Int64(batch_index) * input_stride_batch
-                        + (Int64(destination) * Int64(heads_per_rank) + Int64(local_head))
+                        + (
+                            Int64(destination) * Int64(heads_per_rank)
+                            + Int64(local_head)
+                        )
                         * input_stride_head
                     )
                     staging_base = source_row * Int64(packs_per_head)
                     pack = lane
                     while pack < packs_per_head:
                         _copy_16b(
-                            local_output + input_base * Int64(4) + Int64(pack) * Int64(4),
+                            local_output
+                            + input_base * Int64(4)
+                            + Int64(pack) * Int64(4),
                             local_stage_words
                             + staging_base * Int64(4)
                             + Int64(pack) * Int64(4),

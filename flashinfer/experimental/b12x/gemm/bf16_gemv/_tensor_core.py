@@ -20,11 +20,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64
 
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n8k16_f32,
-    get_ptr_as_int64,
-    ld_global_nc_v4_u32,
-)
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
 
 TC_MAX_ROWS = 8
 TC_MAX_WARPS = 8

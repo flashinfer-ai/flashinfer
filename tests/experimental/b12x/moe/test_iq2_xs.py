@@ -63,7 +63,7 @@ def test_relu2_direct_route_workspace_covers_capacity():
 
 
 def test_iq2_xs_rejects_eight_way_warp_reduction():
-    from b12x.moe._shared.kernels.w4a16.kernel import _candidate_tile_fits
+    from b12x.moe._shared.kernels.w4a16.kernel.config import _candidate_tile_fits
 
     assert not _candidate_tile_fits(
         problem_n=1280,

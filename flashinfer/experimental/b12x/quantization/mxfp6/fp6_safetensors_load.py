@@ -22,7 +22,7 @@ from typing import Callable, Optional
 
 import torch
 
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from .fp6_checkpoint import (
     INPUT_SCALE_SUFFIX,
     WEIGHT_SCALE_2_SUFFIX,

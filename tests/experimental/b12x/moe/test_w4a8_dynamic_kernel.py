@@ -13,7 +13,10 @@ import pytest
 import torch
 from cutlass.cute.runtime import make_ptr
 
-from b12x._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
+from b12x._lib.intrinsics.reference import (
+    _fp4_encode_nibbles,
+    fp4_quantize_values_torch,
+)
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
@@ -24,7 +27,7 @@ from b12x.moe.fused_moe._impl import (
     _pad_w4a8_grid_rows,
     current_cuda_stream,
 )
-from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
 from b12x.moe._shared.kernels.reference import (
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
@@ -459,7 +462,7 @@ def _run_w4a8_dynamic(
     if capture_intermediate:
         if not return_debug:
             raise ValueError("capture_intermediate requires return_debug=True")
-        from b12x._lib.intrinsics import (
+        from b12x._lib.intrinsics.reference import (
             _ue8m0_output_scale_torch,
             pow2_ceil_ue8m0_torch,
         )

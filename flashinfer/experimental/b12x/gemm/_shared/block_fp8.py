@@ -12,7 +12,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import cuda_stream_to_int
+from b12x._lib.utils.device import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8_SCALE_K_TILE,
     MXFP8_SCALE_ROW_TILE,

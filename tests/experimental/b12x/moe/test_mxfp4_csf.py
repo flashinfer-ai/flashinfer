@@ -1,5 +1,8 @@
 """MXFP4-CSF preserves native W4A8 expert math and serialized scale scratch."""
 
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+
+
 from dataclasses import replace
 
 import pytest
@@ -653,16 +656,15 @@ def test_inline_poisoned_graph(h, n, tokens, backend, tile_m, layout, monkeypatc
 
 
 def test_w4a16_wide_inline_poisoned_graph(monkeypatch):
-    from b12x.moe._shared.kernels.w4a16 import kernel
     from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 
-    compile_moe = kernel.compile_w4a16_fused_moe
+    compile_moe = w4a16_fused_launch.compile_w4a16_fused_moe
 
     def compile_wide(*args, **kwargs):
         kwargs["force_tile_config"] = (64, 256, 64, 256)
         return compile_moe(*args, **kwargs)
 
-    monkeypatch.setattr(kernel, "compile_w4a16_fused_moe", compile_wide)
+    monkeypatch.setattr(w4a16_fused_launch, "compile_w4a16_fused_moe", compile_wide)
     test_expanded_scales_match_native_under_poisoned_replay(
         512,
         256,

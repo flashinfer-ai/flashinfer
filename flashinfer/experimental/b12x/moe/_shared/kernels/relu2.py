@@ -4,12 +4,8 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from b12x.moe._shared.kernels.dynamic import (
-    MoEDynamicKernelBackend,
-)
-from b12x.moe._shared.kernels.micro import (
-    MoEMicroKernelBackend,
-)
+from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
 
 
 class MoEMicroKernelRelu2(MoEMicroKernelBackend):

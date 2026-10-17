@@ -15,6 +15,9 @@ from multiprocessing.pool import Pool
 from threading import Condition, Lock
 from typing import Any, Iterable
 
+# Job factories select entrypoints whose source dependencies are keyed separately.
+__b12x_source_dependencies__ = ()
+
 from .compile_plan import (
     ProgramKey,
     observe_programs,

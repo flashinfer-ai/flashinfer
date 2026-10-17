@@ -59,9 +59,9 @@ from cutlass._mlir.dialects import llvm
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics import (
-    bfloat2_mul,
-    bf16_mma_m16n8k16_f32,
+from b12x._lib.intrinsics.packed import bfloat2_mul
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     get_ptr_as_int64,
@@ -75,7 +75,8 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 from b12x.preparation.types import plan_from_handle, require_prepared
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache
 
@@ -1042,7 +1043,9 @@ class _Mxfp8MlaQueryKernel(_Mxfp8Kernel):
     def __init__(self, *, output_fp8: bool, **kwargs):
         super().__init__(**kwargs)
         if self.m > 32:
-            raise ValueError("fused MXFP8 MLA query projection supports at most 32 rows")
+            raise ValueError(
+                "fused MXFP8 MLA query projection supports at most 32 rows"
+            )
         self.output_fp8 = bool(output_fp8)
 
     @property

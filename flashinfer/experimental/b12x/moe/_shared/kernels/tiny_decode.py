@@ -33,19 +33,21 @@ import torch
 from cutlass import Float32
 from cutlass.cutlass_dsl import Int32, Int64
 
-from b12x._lib.utils import current_cuda_stream, make_ptr
-from b12x._lib.intrinsics import (
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
+from b12x._lib.intrinsics.atomics import (
     cvt_bf16x2_to_f16x2,
-    cvt_e8m0x4_to_f32x4,
-    fp4_dot4_sum_f32acc,
+    red_add_global_f32,
+    scatter_add_bf16x2,
+)
+from b12x._lib.intrinsics.conversion import cvt_e8m0x4_to_f32x4, pack_f32x2_to_f16x2
+from b12x._lib.intrinsics.dot import fp4_dot4_sum_f32acc
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
-    pack_f32x2_to_f16x2,
-    red_add_global_f32,
-    scatter_add_bf16x2,
-    warp_reduce,
 )
+from b12x._lib.intrinsics.reduction import warp_reduce
 
 _BLOCK_THREADS = 256
 _FC1_KT_PER_TASK = 4

@@ -6,7 +6,7 @@ import torch
 
 from b12x.preparation import Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
-from b12x._lib.utils import cuda_stream_to_int
+from b12x._lib.utils.device import cuda_stream_to_int
 
 
 def _execute(

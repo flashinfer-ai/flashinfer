@@ -102,7 +102,7 @@ def validate_query(query):
 
 
 def validate_config(query, config, device):
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _candidate_tile_fits,
         _w4a16_num_regs,
     )
@@ -144,7 +144,9 @@ def validate_config(query, config, device):
 
 
 def default_config(query, device):
-    from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
+    from b12x.moe._shared.kernels.w4a16.kernel.execution import (
+        _trellis256_dense_launch_geometry,
+    )
 
     if device is None:
         raise ValueError("Trellis launch selection requires the device SM count")

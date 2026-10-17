@@ -51,27 +51,26 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Float32, Int32, Int64, T, Uint32, Uint64, dsl_user_op
 
-from b12x._lib.intrinsics import (
-    bfloat2_to_float2_scaled,
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled, pack_f32x2_to_bfloat2
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
-    fabs_f32,
-    fmax_f32,
-    fp8_e4m3_to_f32,
     get_ptr_as_int64,
     ld_global_nc_v4_u32,
-    ld_shared_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
-    nvfp4_mma_m16n8k64_f32_e2m1,
-    pack_f32x2_to_bfloat2,
-    quantize_block_fp4,
-    quantize_block_fp4_fast,
     shared_ptr_to_u32,
     st_global_u32,
     st_global_v4_u32,
-    st_shared_u32,
     st_shared_v4_u32,
+)
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.conversion import fp8_e4m3_to_f32
+from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
+from b12x._lib.intrinsics.mma import nvfp4_mma_m16n8k64_f32_e2m1
+from b12x._lib.intrinsics.quantization import (
+    quantize_block_fp4,
+    quantize_block_fp4_fast,
 )
 
 # Position m of a 16-group holds physical K offset PI[m].
@@ -1235,7 +1234,7 @@ def _compile_a4_kernels(
     swiglu_clamp_after_silu: bool = False,
 ):
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-    from b12x._lib.utils import current_cuda_stream
+    from b12x._lib.utils.device import current_cuda_stream
 
     key = (
         int(hidden_size),
@@ -1320,7 +1319,7 @@ def compile_w4a16_a4_prefill(
     swiglu_limit: float | None = None,
     swiglu_clamp_after_silu: bool = False,
 ) -> W4A16A4PrefillLaunches:
-    from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
     from b12x.moe._shared.kernels.w4a16.route_pack import (
         compile_w4a16_route_pack_launches,
     )
@@ -1433,8 +1432,10 @@ def run_w4a16_a4_prefill(
     """
     from cutlass.cute.runtime import make_ptr
 
-    from b12x._lib.utils import current_cuda_stream
-    from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
+    from b12x._lib.utils.device import current_cuda_stream
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import (
+        _w4a16_topk_sum_launch_flat,
+    )
     from b12x.moe._shared.kernels.w4a16.route_pack import pack_topk_routes_by_expert
 
     tokens = int(a.shape[0])

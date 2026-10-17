@@ -8,7 +8,8 @@ import numpy as np
 import torch
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, Uint32, Uint64
 
-from b12x._lib.intrinsics import byte_perm, ld_shared_v4_u32, st_shared_v4_u32
+from b12x._lib.intrinsics.packed import byte_perm
+from b12x._lib.intrinsics.memory import ld_shared_v4_u32, st_shared_v4_u32
 from b12x.loader._csf_blocks import (
     CsfBlockPlane,
     Quantization,
@@ -446,7 +447,8 @@ def prepare_csf_block_metadata(scales, source):
     indexes and records are released after preparation.
     """
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-    from b12x._lib.utils import current_cuda_stream, make_ptr
+    from b12x._lib.utils.device import current_cuda_stream
+    from b12x._lib.utils.pointers import make_ptr
 
     with torch.cuda.device(scales.storage.device):
         pointer = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)

@@ -14,8 +14,8 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import DimKey, KernelCompileSpec, launch, tensor_key
-from b12x._lib.intrinsics import bfloat2_to_float2_scaled
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
+from b12x._lib.utils.device import current_cuda_stream
 from ._kernels import _to_kernel_tensor, _warp_allreduce_sum, _compile_mhc_entry
 from b12x._lib.compiler import run_compiled
 

@@ -169,17 +169,18 @@ def test_mhc_declaration_captures_exhaustive_policy(monkeypatch):
 
 
 def test_exhaustive_policy_does_not_change_compiled_program_identity(monkeypatch):
-    from b12x._lib.compiler import _compile_environment_key
+    from b12x._lib.compiler import _static_compile_cache_context
+    import cutlass.cute as cute
 
     try:
         monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
-        _compile_environment_key.cache_clear()
-        pruned = _compile_environment_key()
+        _static_compile_cache_context.cache_clear()
+        pruned = _static_compile_cache_context(cute.compile)
         monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-        _compile_environment_key.cache_clear()
-        assert _compile_environment_key() == pruned
+        _static_compile_cache_context.cache_clear()
+        assert _static_compile_cache_context(cute.compile) == pruned
     finally:
-        _compile_environment_key.cache_clear()
+        _static_compile_cache_context.cache_clear()
 
 
 @pytest.mark.parametrize("capability,sm", [((12, 0), 188), ((12, 1), 48)])

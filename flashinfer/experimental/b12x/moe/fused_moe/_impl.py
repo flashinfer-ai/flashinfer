@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import b12x.moe._shared.kernels.w4a16.kernel.direct_launch as _module_moe__shared_kernels_w4a16_kernel_direct_launch
+
+
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
 import os
@@ -27,17 +30,14 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
 )
-from b12x._lib.intrinsics import (
-    align_up,
-    as_grouped_scale_view,
-    swizzle_block_scale,
-)
-from b12x._lib.utils import (
+from b12x._lib.intrinsics.math import align_up
+from b12x._lib.intrinsics.reference import as_grouped_scale_view, swizzle_block_scale
+from b12x._lib.utils.device import (
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
-    make_ptr,
 )
+from b12x._lib.utils.pointers import make_ptr
 from cutlass.cutlass_dsl import Int32
 from b12x.moe._shared.routing import (
     route_topk as triton_route_topk,
@@ -67,12 +67,12 @@ from b12x.moe._shared.kernels.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
-from b12x.moe._shared.kernels.micro import (
+from b12x.moe._shared.kernels.micro.config import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
-    MoEMicroKernelBackend,
     _direct_k_segments_for_k,
     _direct_k_segments_supported,
 )
+from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
 from b12x.moe._shared.execution import (
     MoEExecutionPlan,
     MoERegime,
@@ -2314,9 +2314,7 @@ def clear_tp_moe_caches() -> None:
     Explicit workspaces and workspace pools are caller-owned and intentionally
     unaffected by this helper.
     """
-    from b12x.moe._shared.kernels.w4a16.kernel import (
-        clear_w4a16_kernel_cache,
-    )
+    from b12x.moe._shared.kernels.w4a16.kernel.execution import clear_w4a16_kernel_cache
     from b12x.moe._shared.kernels.w4a8_compact_micro import (
         _compiled_direct_w4a8_compact,
     )
@@ -2736,9 +2734,7 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
         )
     )
     if weight_layout in BLOCK_CODECS:
-        from b12x.moe._shared.kernels.w4a16.kernel import (
-            _TC_DECODE_MAX_M,
-        )
+        from b12x.moe._shared.kernels.w4a16.kernel.config import _TC_DECODE_MAX_M
 
         capacity_supported = (
             query.activation in {"silu", "relu2"}
@@ -2753,8 +2749,8 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
         )
     if weight_layout == "trellis_t256":
         return False
-    from b12x.moe._shared.kernels.w4a16.kernel import (
-        _MAX_DIRECT_TOPK_ROUTE_M,
+    from b12x.moe._shared.kernels.w4a16.kernel.config import _MAX_DIRECT_TOPK_ROUTE_M
+    from b12x.moe._shared.kernels.w4a16.kernel.direct_launch import (
         _small_m_direct_supported,
     )
 
@@ -2806,7 +2802,7 @@ def _heuristic_w4a16_route_mode(
         == "modelopt"
     ):
         return "direct"
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _MAX_DIRECT_TOPK_ROUTE_M,
         _TC_DECODE_MAX_M,
         _w4a16_tc_decode_preferred,
@@ -3415,9 +3411,11 @@ def _plan_core_workspace(
             route_block_sizes_for_capacity,
             select_route_block_size_m,
         )
-        from b12x.moe._shared.kernels.w4a16.kernel import (
+        from b12x.moe._shared.kernels.w4a16.kernel.config import (
             _MAX_DIRECT_TOPK_ROUTE_M,
             _TC_DECODE_MAX_M,
+        )
+        from b12x.moe._shared.kernels.w4a16.kernel.direct_launch import (
             _small_m_direct_supported,
         )
 
@@ -7244,7 +7242,6 @@ def prepare_w4a16_fc2_e8m0(
 def prewarm_w4a16_fc2_e8m0(experts, *, route_ids_dtype: torch.dtype):
     """Resolve and return the native FC2 carrier before graph capture."""
 
-    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
     from b12x.moe._shared.kernels.w4a16.prepare import W4A16FC2Weights
 
     if isinstance(experts, W4A16FC2Weights):
@@ -7261,7 +7258,7 @@ def prewarm_w4a16_fc2_e8m0(experts, *, route_ids_dtype: torch.dtype):
         device = experts.w2_fp4.device
     else:
         raise TypeError("experts must carry a prepared W4A16 FC2 representation")
-    return w4a16_kernel._compile_w4a16_fc2_direct(
+    return _module_moe__shared_kernels_w4a16_kernel_direct_launch._compile_w4a16_fc2_direct(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -7355,7 +7352,7 @@ def run_w4a16_fc2_e8m0(
             int(current_cuda_stream()),
         )
     else:
-        _w4a16_kernel._w4a16_fc2_direct_launch_flat(
+        _module_moe__shared_kernels_w4a16_kernel_direct_launch._w4a16_fc2_direct_launch_flat(
             intermediate,
             experts.w2,
             experts.w2_scale,
@@ -7980,7 +7977,7 @@ def _w4a16_preplanned_launches(
     # Prefer a preplanned TC-decode launch for an exact small-M decode size. It
     # was compiled at this exact token count (its FC2 atomically sums per-route
     # partials into the output), so it only applies when m matches exactly.
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _TC_DECODE_MAX_M,
         _w4a16_tc_decode_preferred,
     )
@@ -8438,11 +8435,11 @@ def _plan_full_rotation_w4a16_launches(
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
-    from b12x.moe._shared.kernels.w4a16.kernel import (
-        _DEFAULT_MAX_SHARED_MEM,
+    from b12x.moe._shared.kernels.w4a16.kernel.config import _DEFAULT_MAX_SHARED_MEM
+    from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
         compile_w4a16_fused_moe,
-        compile_w4a16_topk_sum,
     )
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
 
     capacity_tokens = max(int(capacity_tokens), 1)
     if not core_plan.route_block_size_m:
@@ -8586,7 +8583,7 @@ def _plan_projection_mixed_trellis_launches(
         )
 
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
-    from b12x.moe._shared.kernels.w4a16.kernel import _DEFAULT_MAX_SHARED_MEM
+    from b12x.moe._shared.kernels.w4a16.kernel.config import _DEFAULT_MAX_SHARED_MEM
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
         MixedTrellisBuffers,
         compile_mixed_trellis3,
@@ -8946,7 +8943,7 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
     from b12x.moe._shared.kernels.w4a16.host import (
         route_block_sizes_for_capacity,
     )
-    from b12x.moe._shared.kernels.w4a16.kernel import _candidate_tile_fits
+    from b12x.moe._shared.kernels.w4a16.kernel.config import _candidate_tile_fits
 
     props = torch.cuda.get_device_properties(caps.device)
     budget = int(props.shared_memory_per_block_optin) - 512
@@ -9187,14 +9184,18 @@ def _prewarm_w4a16_planned_launches(
         route_pack_capacity,
         select_route_block_size_m,
     )
-    from b12x.moe._shared.kernels.w4a16.kernel import (
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _DEFAULT_MAX_SHARED_MEM,
         _MAX_DIRECT_TOPK_ROUTE_M,
-        _rot_scales_dummy,
         _TC_DECODE_MAX_M,
         _W4A16_SMALL_M_DIRECT_MAX_M,
+    )
+    from b12x.moe._shared.kernels.w4a16.kernel.buffers import _rot_scales_dummy
+    from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
         compile_w4a16_fused_moe,
-        compile_w4a16_topk_sum,
+    )
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
+    from b12x.moe._shared.kernels.w4a16.kernel.execution import (
         pack_topk_routes_by_expert,
     )
 
@@ -11813,7 +11814,7 @@ def _launch_dynamic_flat(
     trellis_intermediate_hadamard = False
     trellis_lut_tensor = None
     if w4a8_trellis:
-        from b12x.moe._shared.kernels.w4a16.kernel import (
+        from b12x.moe._shared.kernels.w4a16.kernel.config import (
             _trellis256_execution_lut,
         )
 
@@ -12636,9 +12637,7 @@ def _dynamic_topk_sum_op(
             "top-k reduction exceeds the planned route-output capacity: "
             f"need {m * num_topk * k} elements, got {route_output.numel()}"
         )
-    from b12x.moe._shared.kernels.w4a16.kernel import (
-        compile_w4a16_topk_sum,
-    )
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
 
     element_dtype = _w4a16_element_dtype(route_output.dtype)
     # Dynamic kernels write router-weighted routes: an unweighted sum.
@@ -12650,7 +12649,9 @@ def _dynamic_topk_sum_op(
         float32_output=output.dtype == torch.float32,
         apply_topk_weights=False,
     )
-    from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
+    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import (
+        _w4a16_topk_sum_launch_flat,
+    )
 
     _w4a16_topk_sum_launch_flat(
         route_output,
@@ -12735,7 +12736,7 @@ def _launch_compact_micro_flat(
                 "w4a8 trellis rotation extent must be E*3n or E*6n fp16 "
                 f"values, got {rot_elems} for E={weight_E}, n={n}"
             )
-        from b12x.moe._shared.kernels.w4a16.kernel import (
+        from b12x.moe._shared.kernels.w4a16.kernel.config import (
             _trellis256_execution_lut,
         )
 
@@ -13561,9 +13562,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         a1_gscale.numel() == 1 and a2_gscale.numel() == 1
     )
     if quant_mode == "w4a16":
-        from b12x.moe._shared.kernels.w4a16.kernel import (
-            run_w4a16_moe,
-        )
+        from b12x.moe._shared.kernels.w4a16.kernel.execution import run_w4a16_moe
 
         prepared = prepared_payload
         if inline_scales is not None:

@@ -4,7 +4,7 @@ import cutlass
 import pytest
 import torch
 
-from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
 from b12x.quantization.mxfp6 import (
     allocate_bf16_to_fp6_tma_outputs,
     compile_bf16_to_fp6_tma,

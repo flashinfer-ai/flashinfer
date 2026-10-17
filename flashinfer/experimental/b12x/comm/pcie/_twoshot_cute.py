@@ -22,15 +22,16 @@ from cutlass._mlir.dialects import llvm
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.intrinsics import (
-    cvt_e4m3x4_to_f32x4,
+from b12x._lib.intrinsics.conversion import cvt_e4m3x4_to_f32x4
+from b12x._lib.intrinsics.memory import (
     ld_global_nc_f32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
     st_global_v4_u32,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 from ._cute_intrinsics import (
     graph_epoch_arrive_serialized,

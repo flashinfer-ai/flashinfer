@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from b12x._lib.runtime_control import kernel_resolution_guard
-from b12x.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import (
     _w4a16_topk_sum_launch_flat,
     compile_w4a16_topk_sum,
 )

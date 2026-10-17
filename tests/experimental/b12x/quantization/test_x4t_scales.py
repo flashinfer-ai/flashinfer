@@ -9,7 +9,7 @@ from b12x._lib.quant.x4t_scales import (
     decode_x4t_tp12_w4a16_scales,
     make_x4t_scale_batch,
 )
-from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+from b12x.moe._shared.kernels.w4a16.kernel.execution import run_w4a16_moe
 from b12x.moe._shared.kernels.w4a16.prepare import (
     _pack_e8m0_k32_scales,
     make_w4a16_packed_buffers,

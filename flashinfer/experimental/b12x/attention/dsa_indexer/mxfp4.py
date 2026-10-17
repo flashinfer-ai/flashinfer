@@ -20,22 +20,23 @@ from cutlass._mlir.dialects import llvm
 
 from ..._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from ..._lib.program_cache import program_cache
-from ..._lib.intrinsics import (
+from b12x._lib.intrinsics.conversion import (
     cvt_fp32x2_to_e2m1x2,
     f16x2_to_f32x2,
-    fabs_f32,
-    fmax_f32,
     fp4_decode_2,
-    get_ptr_as_int64,
-    ld_global_nc_u32,
-    ld_shared_u32,
-    ldmatrix_m8n8x4_b16,
-    mma_m16n8k16_f32_bf16,
-    shared_ptr_to_u32,
     pow2_ceil_ue8m0,
-    u32_as_f32,
     ue8m0_to_output_scale,
 )
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import (
+    get_ptr_as_int64,
+    ld_global_nc_u32,
+    ldmatrix_m8n8x4_b16,
+    shared_ptr_to_u32,
+    u32_as_f32,
+)
+from b12x._lib.intrinsics.atomics import ld_shared_u32
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from ..._lib.runtime_control import raise_if_kernel_resolution_frozen
 from ..._lib.scratch import scratch_buffer_spec, scratch_tensor
 from ..._lib.scratch_layout import (
@@ -44,7 +45,8 @@ from ..._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
-from ..._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from .tiled_topk import run_row_topk
 
 MXFP4_INDEX_PAGE_SIZE = 64

@@ -128,7 +128,7 @@ def _prepare_weight(k: int, n: int, recipe: str, device: torch.device):
             global_scale_kind="reciprocal",
         )
         return replace(weight, in_features=k)
-    from b12x._lib.intrinsics import as_grouped_scale_view_mx
+    from b12x._lib.intrinsics.reference import as_grouped_scale_view_mx
     from b12x.quantization import mxfp8
 
     values = torch.empty((n, padded), device=device, dtype=torch.float8_e4m3fn)

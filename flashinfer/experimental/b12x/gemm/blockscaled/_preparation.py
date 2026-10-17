@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.buffers as _module__lib_dense_gemm_buffers
+import b12x._lib.dense_gemm.compile as _module__lib_dense_gemm_compile
+import b12x._lib.dense_gemm.config as _module__lib_dense_gemm_config
+import b12x._lib.dense_gemm.preparation as _module__lib_dense_gemm_preparation
+
+
 from b12x._lib.quant.block_codec import BLOCK_CODECS, IQ2_CODECS, block_codec
 
 from dataclasses import dataclass, replace
@@ -13,7 +19,8 @@ import triton
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
-from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
+from b12x._lib.utils.device import current_cuda_stream, cuda_stream_to_int
+from b12x._lib.utils.pointers import make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from ._tuning import (
@@ -90,7 +97,6 @@ def compile_packed(
     capability,
 ):
     import cutlass
-    from b12x._lib import dense_gemm as dense
     from . import _quantize, _reduce
 
     query = _decode_query(query_payload)
@@ -112,7 +118,7 @@ def compile_packed(
                     )
                 }
             bn, bk, slices = effective_a16_config(query, config)
-            gemm = dense._get_compiled_dense_gemm(
+            gemm = _module__lib_dense_gemm_compile._get_compiled_dense_gemm(
                 query.out_features,
                 query.padded_in_features,
                 1,
@@ -129,7 +135,9 @@ def compile_packed(
                 bk,
                 (config.tile_m or 16, bn),
                 (1, 1),
-                dense._DenseGemmPolicy(True, True, False, slices, False, False),
+                _module__lib_dense_gemm_config._DenseGemmPolicy(
+                    True, True, False, slices, False, False
+                ),
                 sm_count,
                 f"sm_{capability[0]}{capability[1]}a",
                 "tma",
@@ -165,12 +173,16 @@ def compile_packed(
                     enable_fp_fusion=False,
                 )
             return programs
-        programs = dict(dense._compile_dense_lowering(dense_payload, ordinal))
+        programs = dict(
+            _module__lib_dense_gemm_preparation._compile_dense_lowering(
+                dense_payload, ordinal
+            )
+        )
         if short_dense_payload is not None:
             programs.update(
                 {
                     "short_" + name: program
-                    for name, program in dense._compile_dense_lowering(
+                    for name, program in _module__lib_dense_gemm_preparation._compile_dense_lowering(
                         short_dense_payload, ordinal
                     ).items()
                 }
@@ -538,7 +550,7 @@ class _PackedExecutionState:
                 m,
                 *constants,
             )
-            from b12x._lib.intrinsics import (
+            from b12x._lib.intrinsics.reference import (
                 as_grouped_scale_view,
                 as_grouped_scale_view_mx,
             )
@@ -594,7 +606,6 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         )
 
     def memory(config, device):
-        from b12x._lib import dense_gemm as dense
         from b12x.preparation import current_plan, current_prepared_state
 
         needed = _workspace_bytes(query, config)
@@ -620,7 +631,9 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         if query.recipe in ("mxfp8", "iq2_xs", "iq2_xxs", "q8_0") and (
             config.mode == "a16" or functional_mxfp8_quantization(query, config)
         ):
-            resident = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
+            resident = _module__lib_dense_gemm_buffers._ALPHA_ONE_CACHE.get(
+                ("cuda", device.ordinal)
+            )
             persistent.append(
                 PersistentMemory(
                     ("dense.alpha_one", device.ordinal),
@@ -646,7 +659,6 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         return MemoryRequirements(scratch, tuple(persistent))
 
     def materialize(selection, device):
-        from b12x._lib import dense_gemm as dense
         from ._a16 import _layout
 
         config = selection.config
@@ -664,23 +676,25 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         core = (
             None
             if p is None
-            else dense._DenseExecutionState(
+            else _module__lib_dense_gemm_preparation._DenseExecutionState(
                 p,
                 resolved_device,
                 programs["gemm"],
                 programs.get("reduce"),
-                dense._cached_alpha_one(resolved_device) if p.alpha_is_one else None,
+                _module__lib_dense_gemm_buffers._cached_alpha_one(resolved_device)
+                if p.alpha_is_one
+                else None,
             )
         )
         short_core = (
             None
             if short is None
-            else dense._DenseExecutionState(
+            else _module__lib_dense_gemm_preparation._DenseExecutionState(
                 short,
                 resolved_device,
                 programs["short_gemm"],
                 programs.get("short_reduce"),
-                dense._cached_alpha_one(resolved_device)
+                _module__lib_dense_gemm_buffers._cached_alpha_one(resolved_device)
                 if short.alpha_is_one
                 else None,
             )
@@ -747,7 +761,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             resolved_device,
             programs,
             core,
-            dense._cached_alpha_one(resolved_device)
+            _module__lib_dense_gemm_buffers._cached_alpha_one(resolved_device)
             if query.recipe in ("mxfp8", "iq2_xs", "iq2_xxs", "q8_0")
             and config.mode == "a16"
             else None,
@@ -865,12 +879,15 @@ def _fixed_lowering(query, device):
 
 @program_cache(scope="preparation")
 def compile_fixed(query_payload, lowering_payload, ordinal, sm_count):
-    from b12x._lib import dense_gemm as dense
     from ._tuning import FixedBlockscaledQuery
 
     query = FixedBlockscaledQuery(**dict(query_payload))
     with torch.cuda.device(ordinal):
-        programs = dict(dense._compile_dense_lowering(lowering_payload, ordinal))
+        programs = dict(
+            _module__lib_dense_gemm_preparation._compile_dense_lowering(
+                lowering_payload, ordinal
+            )
+        )
         if (
             query.call_kind == "packed"
             and query.recipe == "mxfp8"
@@ -952,7 +969,10 @@ class _FixedExecutionState:
         stream,
     ):
         from ._a16 import _stream_context, scale_storage
-        from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
+        from b12x._lib.intrinsics.reference import (
+            as_grouped_scale_view,
+            as_grouped_scale_view_mx,
+        )
         from b12x.gemm._tuning import DenseGemmQuery, operand_options
 
         q = self.query
@@ -1203,13 +1223,14 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
         return cache[device.identity]
 
     def memory(config, device):
-        from b12x._lib import dense_gemm as dense
         from . import _linear
 
         p, use_block = lower(device)
         entries = []
         if p.alpha_is_one:
-            resident = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
+            resident = _module__lib_dense_gemm_buffers._ALPHA_ONE_CACHE.get(
+                ("cuda", device.ordinal)
+            )
             entries.append(
                 PersistentMemory(
                     ("dense.alpha_one", device.ordinal),
@@ -1246,7 +1267,6 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
         return MemoryRequirements(persistent=tuple(entries))
 
     def materialize(selection, device):
-        from b12x._lib import dense_gemm as dense
         from . import _linear
 
         p, use_block = lower(device)
@@ -1257,12 +1277,14 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
             device.identity.sm_count,
         )
         target = torch.device("cuda", device.ordinal)
-        core = dense._DenseExecutionState(
+        core = _module__lib_dense_gemm_preparation._DenseExecutionState(
             p,
             target,
             programs["gemm"],
             programs.get("reduce"),
-            dense._cached_alpha_one(target) if p.alpha_is_one else None,
+            _module__lib_dense_gemm_buffers._cached_alpha_one(target)
+            if p.alpha_is_one
+            else None,
         )
         scale = None
         if query.recipe == "tensor_fp8":

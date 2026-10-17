@@ -49,19 +49,20 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.intrinsics import (
-    block_reduce,
+from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
+from b12x._lib.intrinsics.math import (
     cvt_f32_to_bf16_bits,
     div_rn_f32,
     fabs_f32,
     fmax_f32,
+)
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v4_u32,
     st_global_f32,
     st_global_u8,
     st_global_u16,
     u32_as_f32,
-    warp_reduce,
 )
 from b12x._lib.fp6 import (
     mx_gs_numerator,
@@ -70,7 +71,8 @@ from b12x._lib.fp6 import (
     quantize_block_fp8_e4m3_bytes,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from .bf16_to_fp6_tma import moe_mxfp6_store_bytes_u64_global
 
 _FP6_BLOCK_ELEMS = 32

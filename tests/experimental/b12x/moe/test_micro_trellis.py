@@ -8,7 +8,7 @@ import torch
 from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table_cpu
 from cutlass.cute.runtime import from_dlpack
 
-from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend
+from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
 from b12x.testing.reference.helpers import require_b12x
 from b12x.testing.reference.trellis_moe import (
     build_trellis_weight,

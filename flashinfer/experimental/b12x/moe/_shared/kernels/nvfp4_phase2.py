@@ -31,17 +31,16 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     get_ptr_as_int64,
-    ld_shared_u32,
-    nvfp4_mma_m16n8k64_f32_e2m1,
-    pack_f32x2_to_bfloat2,
-    scatter_add_bf16x2,
     shared_ptr_to_u32,
     st_global_u32,
 )
+from b12x._lib.intrinsics.atomics import ld_shared_u32, scatter_add_bf16x2
+from b12x._lib.intrinsics.mma import nvfp4_mma_m16n8k64_f32_e2m1
+from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
 
 
 class Nvfp4MaterializedPhase2Kernel:

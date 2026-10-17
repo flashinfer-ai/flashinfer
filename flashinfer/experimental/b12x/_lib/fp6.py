@@ -20,16 +20,10 @@ from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from b12x._lib.intrinsics import (
-    align_up,
-    cvt_f32_to_ue8m0,
-    fabs_f32,
-    fmax_f32,
-    pack_f32x2_to_bfloat2,
-    rcp_approx_ftz,
-    swizzle_block_scale,
-    ue8m0_to_output_scale,
-)
+from b12x._lib.intrinsics.math import align_up, fabs_f32, fmax_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.conversion import cvt_f32_to_ue8m0, ue8m0_to_output_scale
+from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 
 # =============================================================================
 # Constants

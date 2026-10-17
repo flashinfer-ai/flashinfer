@@ -28,7 +28,7 @@ from b12x._lib.compiler import (
     compile as b12x_compile,
     run_compiled,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
 from b12x.attention.paged._scratch import (

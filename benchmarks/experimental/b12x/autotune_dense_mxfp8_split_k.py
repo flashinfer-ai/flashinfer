@@ -28,12 +28,12 @@ from benchmarks.experimental.b12x.dense_autotune_common import (
     make_mxfp8_operand,
 )
 from benchmarks.experimental.b12x.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from b12x._lib.dense_gemm import (
+from b12x._lib.dense_gemm.policy import (
     _select_default_dense_gemm_plan,
     _select_mxfp8_tile_k,
-    dense_gemm,
 )
-from b12x._lib.utils import get_num_sm
+from b12x._lib.dense_gemm.execution import dense_gemm
+from b12x._lib.utils.device import get_num_sm
 
 
 BASELINE_COSINE_THRESHOLD = 0.9999

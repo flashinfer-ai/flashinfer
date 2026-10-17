@@ -7,18 +7,16 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
-    e2m1x8_to_qmma_e2m1x8,
     get_ptr_as_int64,
-    ld_shared_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
-    mxfp8_mma_m16n8k32_f32_e2m1,
     shared_ptr_to_u32,
-    st_shared_u32,
 )
+from b12x._lib.intrinsics.mma import e2m1x8_to_qmma_e2m1x8, mxfp8_mma_m16n8k32_f32_e2m1
+from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
 
 
 class W4A8CompactMicroProjectionKernel:

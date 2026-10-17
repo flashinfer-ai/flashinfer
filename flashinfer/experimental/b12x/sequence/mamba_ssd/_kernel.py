@@ -10,15 +10,16 @@ from cutlass import BFloat16, Float32, Int32, Int64, Boolean
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n8k16_f32,
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
+from b12x._lib.intrinsics.memory import (
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x2_b16,
     shared_ptr_to_u32,
 )
 from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 
 class _Scan:

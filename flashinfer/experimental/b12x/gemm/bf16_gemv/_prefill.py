@@ -29,7 +29,7 @@ from b12x._lib.compiler import (
     run_compiled,
     tensor_key,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 
 def _to_kernel_tensor(tensor, dtype, *, dynamic_layout=False):
