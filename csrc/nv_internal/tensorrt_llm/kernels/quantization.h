@@ -97,5 +97,14 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
                              int multiProcessorCount, bool enable_pdl = false,
                              cudaStream_t stream = 0);
 
+// MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul (see
+// cvt_fp16_to_mxfp8_expert). n must be a positive multiple of 32 and padded_n a multiple of 128
+// that is at least n; input must be aligned to 16 * sizeof(T) bytes and output to 32 bytes.
+template <typename T>
+void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_n, T const* input,
+                                       int32_t const* mask, bool use_silu_and_mul, uint8_t* output,
+                                       uint32_t* SFOutput, int multiProcessorCount,
+                                       bool enable_pdl = false, cudaStream_t stream = 0);
+
 }  // namespace kernels
 }  // namespace tensorrt_llm
