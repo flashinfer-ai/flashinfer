@@ -120,7 +120,11 @@ def test_cross_block_rows_deduplicate_planes_and_preserve_compact_order(
         )
     assert output[-7:] == output_scales[-7:] == b"z" * 7
     stats = native.ple_reader_stats(reader)
-    block_bytes = 4096
+    # The fragment floor is per source file: statx(STATX_DIOALIGN) may report a
+    # 512 B logical block (ext4/NVMe) or nothing at all, which falls back to the
+    # 4 KiB reference split. Take the arithmetic from the reader itself so the
+    # expectations hold on either filesystem.
+    block_bytes = stats["dio_align"]
     blocks = _touched_blocks(
         block_bytes,
         (
@@ -172,7 +176,7 @@ def test_sparse_requests_never_read_gaps_and_cap_coalescing(tmp_path, reader_fac
     native.ple_reader_run(reader, ids, output, None, len(ids))
     assert output == b"".join(payload[row * 4096 : (row + 1) * 4096] for row in ids)
     stats = native.ple_reader_stats(reader)
-    block_bytes = 4096
+    block_bytes = stats["dio_align"]
     blocks = _touched_blocks(block_bytes, ((row * 4096, 4096) for row in set(ids)))
     assert stats["unique_blocks"] == len(blocks)
     assert stats["read_bytes"] == len(blocks) * block_bytes
@@ -314,3 +318,99 @@ def test_large_mixed_file_batches_preserve_order_and_reuse_allocations(
     after_short = native.ple_reader_stats(reader)
     assert after_short["staging_bytes"] == allocation["staging_bytes"]
     assert after_short["metadata_bytes"] == allocation["metadata_bytes"]
+
+
+def test_fragment_sort_is_skipped_only_when_no_merge_can_pay(tmp_path, reader_factory):
+    """Density gate (miss_io.md E2).
+
+    A wave is planned straight from fragment order only when no single file
+    holds enough fragments for two of them to land on neighbouring sectors,
+    because that is the only case where the sort can produce a merge. Rows are
+    laid out as adjacent-sector pairs separated from their neighbours, so the
+    sorted path provably merges every pair and the skipped path provably merges
+    nothing, while the bytes read are identical either way.
+    """
+    native, create = reader_factory
+    row_bytes, file_count, sector_count = 8, 32, 1024
+    paths = [tmp_path / f"shard-{index}" for index in range(file_count)]
+
+    def sparse(path, size):
+        with path.open("wb") as stream:
+            stream.truncate(size)
+
+    def rows_of(pair_count, stride):
+        # The two members of a pair are emitted far apart in wave order, so the
+        # adjacency exists in the file but not in the fragment array: only a
+        # sort can find it. Each pair starts two sectors after the previous
+        # one's second sector, so pairs never chain into longer runs.
+        low = [4 * pair * stride + 1 for pair in range(pair_count)]
+        high = [(4 * pair + 1) * stride + 1 for pair in range(pair_count)]
+        return low + high
+
+    # Ask the reader which fragment floor it will use before sizing the files,
+    # so the density arithmetic is exact for a 512 B and a 4 KiB floor alike.
+    for path in paths:
+        sparse(path, sector_count * 4096)
+    probe_rows = sector_count * 4096 // row_bytes
+    probe = create(
+        probe_rows, probe_rows * file_count, 0, probe_rows * file_count, row_bytes, 0, 2
+    )
+    for index, path in enumerate(paths):
+        native.ple_reader_add(probe, index, str(path), 0, False)
+    gran = native.ple_reader_stats(probe)["dio_align"]
+    probe = None
+
+    file_bytes = sector_count * gran
+    shard_rows = file_bytes // row_bytes
+    stride = gran // row_bytes
+    for path in paths:
+        sparse(path, file_bytes)
+    reader = create(
+        shard_rows,
+        shard_rows * file_count,
+        0,
+        shard_rows * file_count,
+        row_bytes,
+        0,
+        file_count * 64,
+    )
+    for index, path in enumerate(paths):
+        native.ple_reader_add(reader, index, str(path), 0, False)
+
+    def run(pair_count):
+        ids, expected = array("q"), bytearray()
+        for index, path in enumerate(paths):
+            with path.open("rb+") as stream:
+                for row in rows_of(pair_count, stride):
+                    stream.seek(row * row_bytes)
+                    payload = bytes(
+                        (17 * index + 91 * row + j) % 256 for j in range(row_bytes)
+                    )
+                    stream.write(payload)
+                    expected += payload
+                    ids.append(index * shard_rows + row)
+        output = bytearray(b"\xff" * (len(ids) * row_bytes))
+        native.ple_reader_run(reader, ids, output, None, len(ids))
+        assert bytes(output) == bytes(expected)
+        return native.ple_reader_stats(reader), len(ids)
+
+    # 32 fragments per file over 1025 sectors: 32 * 31 < 1025, so no file
+    # reaches even one expected merge and the sort is skipped although adjacency
+    # is on offer. 1024 fragments total keeps the wave past PLE_SORT_MIN.
+    stats, fragments = run(16)
+    assert fragments == file_count * 32
+    assert stats["read_calls"] == fragments
+    assert stats["coalesced_reads"] == 0
+
+    # 64 fragments per file: 64 * 63 >= 1025, so the sort runs and every pair
+    # pays for itself with one fewer command.
+    stats, fragments = run(32)
+    assert fragments == file_count * 64
+    assert stats["coalesced_reads"] == file_count * 32
+    assert stats["read_calls"] == fragments - file_count * 32
+
+    # The knobs that may silently fall back stay reported by stats.
+    assert stats["depth_requested"] == 4
+    assert 2 <= stats["depth_effective"] <= 256
+    assert stats["dio_align"] in (512, 1024, 2048, 4096)
+    assert stats["submit_calls"] > 0

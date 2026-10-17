@@ -13,10 +13,23 @@ if TYPE_CHECKING:
 
 
 class DiskTable:
-    """Own PLE file sources and decode a compact batch cache outside graphs."""
+    """Own PLE row sources and decode a compact batch cache outside graphs.
+
+    Rows come from checkpoint shards (``add_shard``) or, with ``host_rows``,
+    from this TP shard's rows already resident in host RAM. ``cache_rows``
+    and ``cache_tier`` configure the host-tier C S3-FIFO row cache; see
+    ``DiskRowCache``.
+    """
 
     def __init__(
-        self, layout: TableLayout, shard_rows: int, *, queue_depth: int = 64
+        self,
+        layout: TableLayout,
+        shard_rows: int,
+        *,
+        queue_depth: int = 64,
+        cache_rows: int | None = None,
+        cache_tier: str | None = None,
+        host_rows: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> None:
         from ._contracts import TableLayout
 
@@ -39,6 +52,9 @@ class DiskTable:
                 else 0
             ),
             queue_depth=queue_depth,
+            cache_rows=cache_rows,
+            cache_tier=cache_tier,
+            host_rows=host_rows,
         )
         self.weight = self._cache.weight.view(layout.weight_dtype)
         self.weight_host = (
