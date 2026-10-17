@@ -19,7 +19,7 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.attention import (
     block_sparse_attention_run_trace,
     variable_block_sparse_attention_run_trace,
@@ -40,6 +40,80 @@ from .utils import (
     get_compute_capability,
     is_float8,
 )
+
+
+@flashinfer_experimental_api(feature="union-GQA sparse prefill")
+def union_gqa_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    max_seqlen_q: Optional[int] = None,
+    causal: bool = True,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run causal union-GQA sparse prefill on SM100.
+
+    This specialization accepts contiguous, 16-byte-aligned BF16 Q/K/V and
+    output tensors with head dimension 128 and a Q/KV head ratio of 16. Each
+    entry in ``block_indices`` selects one sequence-local block of 64 KV
+    tokens; negative entries are padding.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor with shape ``(total_q, num_qo_heads, 128)``.
+    k, v : torch.Tensor
+        Key and value tensors with shape
+        ``(total_q, num_kv_heads, 128)``.
+    block_indices : torch.Tensor
+        Int32 tensor with shape
+        ``(total_q, num_kv_heads, topk_blocks)``. ``topk_blocks`` must be in
+        ``[1, 16]``. Negative entries are padding. The non-negative block IDs
+        of one query and KV head must be unique; duplicates are not detected
+        and can produce incorrect output.
+    cu_seqlens_q : torch.Tensor
+        Int32 cumulative sequence lengths with shape ``(batch_size + 1,)``.
+        Values must start at zero, end at ``total_q``, and be nondecreasing.
+        Invalid CPU values raise before launch; invalid CUDA values raise an
+        asynchronous device error.
+    softmax_scale : float, optional
+        Defaults to ``1 / sqrt(128)``. Must remain a positive normal float32
+        whose product with log2(e) is finite.
+    max_seqlen_q : int, optional
+        Upper bound on the represented sequence lengths. Supplying it avoids
+        a device-to-host synchronization and is required during CUDA graph
+        capture. The caller is responsible for providing a bound no smaller
+        than the actual maximum sequence length. Invalid CUDA bounds raise an
+        asynchronous device error.
+    causal : bool, default=True
+        Only causal attention is currently supported.
+    out : torch.Tensor, optional
+        Caller-owned contiguous, 16-byte-aligned BF16 output with the same
+        shape as ``q``. It must not overlap any input tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Sparse-attention output with the same shape and dtype as ``q``.
+    """
+
+    from .experimental.union_gqa import prefill
+
+    return prefill(
+        q,
+        k,
+        v,
+        block_indices,
+        cu_seqlens_q,
+        softmax_scale=softmax_scale,
+        max_seqlen_q=max_seqlen_q,
+        causal=causal,
+        out=out,
+    )
 
 
 def _bsr_to_vsa_index(
