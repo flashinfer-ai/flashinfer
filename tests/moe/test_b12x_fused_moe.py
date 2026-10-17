@@ -4943,10 +4943,6 @@ class TestUnroutedPairs:
             )
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
@@ -5018,3 +5014,7 @@ class TestWorkspaceBucketing:
         ws = md._get_cached_workspace(routed_rows=100, **kwargs)
         assert ws.routed_rows_capacity == 100
         assert md._get_cached_workspace(routed_rows=100, **kwargs) is ws
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
