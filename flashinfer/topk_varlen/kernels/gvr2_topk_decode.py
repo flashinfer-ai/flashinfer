@@ -7397,6 +7397,16 @@ class GvrRegClusKernel:
         out: cute.Tensor,
         n: cutlass.Int32,
     ):
+        rank, row, _ = cute.arch.block_idx()  # bx=rank
+        sbase = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()  # Int32 shared addr
+        self.row_topk(logits, pre_idx, kv_lens, out, n, row, rank, sbase)
+
+    @cute.jit
+    def row_topk(self, logits, pre_idx, kv_lens, out, n, row, rank, sbase):
+        """Top-K of row ``row`` by cluster rank ``rank``: the whole kernel body,
+        with the smem window (map in the family docstring) at byte address
+        ``sbase`` in every CTA of the cluster. Separate from ``kern`` so the main
+        family can call it for rows that fit a cluster's registers."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         CS = cutlass.const_expr(self.cs)
@@ -7407,7 +7417,6 @@ class GvrRegClusKernel:
             cute.arch.griddepcontrol_wait()  # knob default off
 
         tid, _, _ = cute.arch.thread_idx()
-        rank, row, _ = cute.arch.block_idx()  # bx=rank
         lane = tid & cutlass.Int32(31)
 
         # ============ per-row varlen prologue — shared contract lives in ======
@@ -7519,10 +7528,7 @@ class GvrRegClusKernel:
             x_addr = logits[row, None].iterator.toint()  # Int64 gmem byte base
             p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
 
-            # ---- shared-memory window (map in module docstring) ----
-            sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
-            sbase = sptr.toint()  # Int32 shared addr
-
+            # ---- shared-memory window at sbase (map in module docstring) ----
             s_res = _smem_view__regclus(cutlass.Int32, sbase, 0, 6)
             s_cnt = _smem_view__regclus(cutlass.Int32, sbase, 6, 2)  # [0]=s_o1 [1]=s_o2
             s_kmm = _smem_view__regclus(cutlass.Uint32, sbase, 8, 2)  # [0]=s_kmin [1]=s_kmax
