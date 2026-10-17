@@ -196,6 +196,18 @@ dense GEMM2 forms, which the 19-tile H = 3584 rows launch).
      - gemm1_swapab
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n8_k8_cs``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n32_cs``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n16_nol2_cs``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm2_dense_finalize_n192``
      - gemm2_dense
      - cake, cake_cute
@@ -305,6 +317,10 @@ dense GEMM2 forms, which the 19-tile H = 3584 rows launch).
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary_nol2``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_cs``
      - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
@@ -420,20 +436,16 @@ dense GEMM2 forms, which the 19-tile H = 3584 rows launch).
      - gemm2_swapab_partial
      - cake, cake_cute
      - ``plan_gate``
-   * - ``gemm1_swapab_situ_n16_nol2``
-     - gemm1_swapab
-     - cake, cake_cute
-     - ``plan_gate``
-   * - ``gemm1_swapab_situ_n32_nol2``
-     - gemm1_swapab
-     - cake, cake_cute
-     - ``plan_gate``
    * - ``gemm2_swapab_finalize_n16_k8_nol2``
      - gemm2_swapab
      - cake, cake_cute
      - ``plan_gate``
    * - ``gemm2_swapab_finalize_n32_k8_nol2``
      - gemm2_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_swapab_situ_n32_nol2_cs``
+     - gemm1_swapab
      - cake, cake_cute
      - ``plan_gate``
    * - ``routing_packed_c1``
@@ -674,6 +686,10 @@ dense GEMM2 forms, which the 19-tile H = 3584 rows launch).
      - ``plan_gate``
    * - ``dispatch_wide_narrow_lists``
      - dispatch
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_dense_situ_m128_n256_cs_nopdl``
+     - gemm1_dense
      - cake, cake_cute
      - ``plan_gate``
    * - ``gemm1_dense_situ_m128_n256_nopdl``

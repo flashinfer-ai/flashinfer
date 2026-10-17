@@ -56,6 +56,11 @@ MODES = tuple(
 
 
 def _runner(layout, **overrides):
+    """The wrapper under test.  On a CUDA device that is not an ``sm_103a`` part the host-side tests decide for
+    the contract's SM count: the package carries the forms the plan selects at 148 / 152 SMs, and another part's
+    count must not steer the selection (the ``_cs`` twin's item gate reads the SM count)."""
+    if "sm_count" not in overrides and torch.cuda.is_available() and not _sm_103a():
+        overrides["sm_count"] = plan.CONTRACT_SM_COUNT
     return plan.CakeMxfp4MoEWrapper(
         EXPERTS, TOP_K, HIDDEN, INTERMEDIATE, backend=BACKEND, **layout, **overrides
     )
@@ -263,6 +268,7 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
                 decision.gemm1.kbps,
                 pdl_trigger_after_wait=decision.gemm1.pdl_trigger_after_wait,
                 weight_l2_hint=decision.gemm1.weight_l2_hint is not None,
+                cluster_split=decision.gemm1.cluster_split,
             ).stage,
             kernels.select_gemm2(
                 decision.gemm2.n_tile,
@@ -348,7 +354,7 @@ def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
         assert decision.launches == plan.MIXED192_CHAIN_STEPS_SPLIT
     # The dense GEMM1 pair loads its weights without the EVICT_FIRST weight-stream hint from the plan's
     # MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS tokens (the ``_nol2`` modules; the hint-on pair below): the
-    # launch config resolves the 7-tuple and the package carries both variants.
+    # launch config resolves the 8-tuple (``cluster_split`` False on the zero-fill forms) and the package carries both variants.
     hint_on = T < plan.MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS
     nol2 = "" if hint_on else "_nol2"
     assert [form for form in forms if form.startswith("gemm1_dense_situ_m")] == [
@@ -363,8 +369,13 @@ def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
             and cfg["gemm2"][0] == 192
         )
     for args in (cfg["gemm1_dense"], cfg["gemm1_alt"]):
-        tile_m, n1, zero_fill, secondary, row_group, early, l2_hint = args
+        tile_m, n1, zero_fill, secondary, row_group, early, l2_hint, cluster_split = (
+            args
+        )
         assert l2_hint is hint_on and zero_fill and row_group and not early
+        assert (
+            cluster_split is False
+        )  # the zero-fill forms never take the cluster split-K twin
         item = kernels.find_form(
             kind="gemm1_dense",
             tile_m=tile_m,
@@ -374,6 +385,7 @@ def test_long_prefill_rows_are_served_by_the_mixed192_chain(T):
             row_group_list=row_group,
             pdl_trigger_early=early,
             weight_l2_hint=l2_hint,
+            cluster_split=cluster_split,
             use_pdl=decision.pdl,
         )
         assert item["route"]["stage"].endswith("_nol2") is (not hint_on)
@@ -397,8 +409,12 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
     served = set(contract["forms"]) | set(contract["sibling_backend_forms"])
     for name in (plan.init_form_name(sort), plan.coop_form_name(sort)):
         assert plan._k6_stage(name, sort.pdl) in served, name
-    tile_m, n1, zero_fill, secondary, row_group, early, l2_hint = cfg["gemm1"]
+    tile_m, n1, zero_fill, secondary, row_group, early, l2_hint, cluster_split = cfg[
+        "gemm1"
+    ]
     assert l2_hint is True  # the dense chain keeps the EVICT_FIRST weight-stream hint
+    # ep8 T = 2048 sits inside the cluster split-K window of the dense form (c): the plan switch decides the twin.
+    assert cluster_split is bool(plan.DENSE_GEMM1_CLUSTER_SPLIT_FORM)
     gemm1 = kernels.find_form(
         kind="gemm1_dense",
         tile_m=tile_m,
@@ -408,6 +424,7 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
         row_group_list=row_group,
         pdl_trigger_early=early,
         weight_l2_hint=l2_hint,
+        cluster_split=cluster_split,
         use_pdl=enable_pdl,
     )
     n2, cluster_n = cfg["gemm2"]
@@ -452,14 +469,24 @@ def test_plan_is_decided_for_the_device_sm_count():
     """The plan decides the cooperative ``moe_sort`` grid (``SMs - 8``) and its per-thread state from the device's
     SM count, read once at construction like the hand-written ``runPostTopKPipeline`` (B300 148 SMs, GB300 152);
     without CUDA the host-only decision table uses the contract's 148.  An explicit ``sm_count=`` is the caller's
-    decision.  The served rows' selections do not depend on the count across the ``sm_103a`` parts."""
+    decision.  The served rows' selections do not depend on the count across the ``sm_103a`` parts; on another
+    CUDA part the host-side tests pin the contract count (``_runner``), the wrapper itself reads the device."""
     runner = _runner(EP8)
-    if torch.cuda.is_available():
+    if _sm_103a():
         sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
         assert runner.sm_count_source == "device"
         assert runner.sm_count == runner.policy.sm_count == sms
+    elif torch.cuda.is_available():
+        assert runner.sm_count_source == "override"
+        assert runner.sm_count == runner.policy.sm_count
+        assert runner.sm_count == plan.CONTRACT_SM_COUNT == 148
+        direct = plan.CakeMxfp4MoEWrapper(
+            EXPERTS, TOP_K, HIDDEN, INTERMEDIATE, backend=BACKEND, **EP8
+        )
+        assert direct.sm_count_source == "device"
+        assert direct.sm_count == plan.device_sm_count()
     else:
         assert runner.sm_count_source == "contract"
         assert runner.sm_count == plan.CONTRACT_SM_COUNT == 148
@@ -558,15 +585,18 @@ def test_every_plan_selection_resolves_to_a_module():
     seen = set()
     for runner, decision in _served_decisions():
         g1, g2 = decision.gemm1, decision.gemm2
-        # The griddepcontrol placement and the weight-stream L2 policy are part of the module identity: the
-        # split chain's narrow forms exist under both placements (the registry's prefetch placement and the
-        # ``_nodp`` constructor default), the n16 / n32 forms under both policies (EVICT_FIRST and ``_nol2``).
+        # The griddepcontrol placement, the weight-stream L2 policy and the cluster split-K raster are part of
+        # the module identity: the split chain's narrow forms exist under both placements (the registry's
+        # prefetch placement and the ``_nodp`` constructor default), the n16 / n32 forms under both policies
+        # (EVICT_FIRST and ``_nol2``), the narrow plain forms as the single-CTA raster and as the 2-CTA
+        # cluster split-K twin (``_cs``) the plain chain launches.
         seen.add(
             kernels.select_gemm1(
                 g1.n_tile,
                 g1.kbps,
                 pdl_trigger_after_wait=g1.pdl_trigger_after_wait,
                 weight_l2_hint=g1.weight_l2_hint is not None,
+                cluster_split=g1.cluster_split,
             ).stage
         )
         if decision.two_stage:
@@ -659,7 +689,22 @@ def test_gemm_forms_carry_the_trace_time_constants():
         situ["kind"] == "gemm1_swapab" and situ["is_situ"] is True and situ["kbps"] == 8
     )
     assert situ["pdl_trigger_after_wait"] is True and situ["late_dep_wait"] is False
-    assert situ["weight_l2_hint"] is True
+    assert situ["weight_l2_hint"] is True and situ["cluster_split"] is False
+    # The 2-CTA cluster split-K twin of the same form (the plain chain's T <= 16 selection): a module of
+    # its own, cluster (2, 1, 1), selected on ``cluster_split``; the single-CTA raster is the default.
+    cs_kernel = kernels.select_gemm1(
+        8, 8, pdl_trigger_after_wait=True, cluster_split=True
+    )
+    assert cs_kernel.stage == "gemm1_swapab_situ_n8_k8_cs" and cs_kernel.cluster == (
+        2,
+        1,
+        1,
+    )
+    assert cs_kernel.form["cluster_split"] is True and cs_kernel.form["kbps"] == 8
+    assert (
+        kernels.select_gemm1(16, 4, weight_l2_hint=False, cluster_split=True).stage
+        == "gemm1_swapab_situ_n16_nol2_cs"
+    )
     nodp = kernels.select_gemm1(8, 8, pdl_trigger_after_wait=False).form
     assert nodp["pdl_trigger_after_wait"] is False and nodp["late_dep_wait"] is False
     with pytest.raises(KeyError, match="ambiguous"):
