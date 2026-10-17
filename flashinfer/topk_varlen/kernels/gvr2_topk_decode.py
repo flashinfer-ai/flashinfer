@@ -5476,6 +5476,16 @@ Cluster ops: merge = _merge_scan0_local, a LOCAL patched copy of
 Every rung/ladder decision is cluster-uniform by construction (identical
 sample locations on every rank; merged tot; block-uniform gather) — the
 conditional retry clus.sync cannot deadlock.
+
+FlashInfer-local: solo rows. U, and with it the STEPC chunk, comes from the
+capture capacity, so in a large-capacity graph (U = 8: 32K-column chunks) a
+row of <= one chunk already ran on rank 0 alone, while the other ranks idled
+through the sample, the merge and both cluster barriers. With `solo`, such a
+row (n4 <= STEPC float4s) runs on rank 0 alone outright: ranks != 0 exit
+before any cluster barrier or DSMEM access (a cluster-uniform branch, like
+the short-row skip), and rank 0, whose chunk 0 is the whole row, merges its
+own histogram and uses CTA barriers in place of the clus.sync. Rows of more
+than one chunk keep the cluster path unchanged.
 """
 
 
@@ -5522,11 +5532,14 @@ class GvrClusKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         pdl: bool = False,
+        solo: bool = False,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
         assert u in (1, 2, 4, 8) and cs in (2, 4, 8)
+        # solo rows: a row of at most one STEPC chunk runs on rank 0 alone
+        self.solo = bool(solo)
         # programmatic dependent launch (griddepcontrol.wait first, see GvrMainKernel)
         self.pdl = bool(pdl)
         # per-row varlen mode (production heuristicTopKDecode contract, same
@@ -5629,11 +5642,14 @@ class GvrClusKernel:
     # Semantics, the DSMEM v4 load spelling, the register accumulation and
     # the prefix-biased STS.128 cursor write are IDENTICAL to merge_scan0.
     # NO barrier inside (caller pays the merge-publish barrier).
+    # ncs: ranks merged, a compile-time CS, or 1 for a solo row (its peers
+    # have exited); a runtime bound would serialize the remote loads.
     # ------------------------------------------------------------------
     @cute.jit
-    def _merge_scan0_local(self, s_hist, s_mrg, rank, target, tidx, s_res):
+    def _merge_scan0_local(
+        self, s_hist, s_mrg, rank, target, tidx, s_res, ncs: cutlass.Constexpr
+    ):
         NBS = self.nbs
-        CS = self.cs
         BPT = NBS // 32
         NV = BPT // 4
         if tidx < cutlass.Int32(32):
@@ -5648,7 +5664,7 @@ class GvrClusKernel:
                 boff = (lane * cutlass.Int32(BPT) + cutlass.Int32(4 * q)) * cutlass.Int32(4)
                 t = [cutlass.Int32(0)] * 4
                 p = [cutlass.Int32(0)] * 4
-                for r in cutlass.range_constexpr(CS):
+                for r in cutlass.range_constexpr(ncs):
                     mapped = C._mapa_shared_cluster_addr(
                         hbase + boff, cutlass.Int32(r)
                     )  # per-use mapa
@@ -5974,11 +5990,24 @@ class GvrClusKernel:
             cute.make_layout((self.cmp,)),
         )
 
+        # ---- solo rows (see the family note): `n` is a pure function of
+        # `row` like `short`, so the flag is cluster-uniform and ranks != 0
+        # leave with the short rows, before any cluster barrier or DSMEM
+        # access; no rank ever waits on a peer that has exited ----
+        solo = cutlass.Int32(0)
+        if cutlass.const_expr(self.solo):
+            if (n >> cutlass.Int32(2)) <= cutlass.Int32(self.stepc):
+                solo = cutlass.Int32(1)
+        skip = short
+        if solo != cutlass.Int32(0):
+            if rank != cutlass.Int32(0):
+                skip = cutlass.Int32(1)
+
         # ---- whole-body short-row guard (cluster-uniform: `short` is a pure
         # function of `row`, identical across all CS ranks and threads, so
         # every cluster barrier below stays aligned; short rows already
         # emitted identity + -1 tail in the prologue) ----
-        if short == cutlass.Int32(0):
+        if skip == cutlass.Int32(0):
             # ---- row bases (pre_idx is request-level under varlen) ----
             row64 = cutlass.Int64(row)
             x_addr = logits.iterator.toint() + row64 * cutlass.Int64(npad) * cutlass.Int64(4)
@@ -6237,7 +6266,10 @@ class GvrClusKernel:
                             if ic >= n4:
                                 ic = lim4
                             C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
-                    C._cluster_sync_aligned()  # ==== clus.sync (retry) ====
+                    # solo: no peer reads this CTA's hist; the reset barrier
+                    # below orders the clear after the merge's local reads
+                    if solo == cutlass.Int32(0):
+                        C._cluster_sync_aligned()  # ==== clus.sync (retry) ====
                     if tidx < cutlass.Int32(NBS):
                         s_hist[tidx] = cutlass.Int32(0)
                     if tidx == cutlass.Int32(0):
@@ -6364,10 +6396,16 @@ class GvrClusKernel:
                             ) | cutlass.Uint64(C.u32_of_f32(x))
                     i = i + cutlass.Int32(BLK)
 
-                # ---- cluster merge ----
-                C._cluster_sync_aligned()  # ==== clus.sync (merge) ====
+                # ---- cluster merge (solo: this CTA's histogram alone) ----
+                if solo == cutlass.Int32(0):
+                    C._cluster_sync_aligned()  # ==== clus.sync (merge) ====
+                else:
+                    cute.arch.barrier()  # ---- barrier (solo row pass done) ----
                 myn = s_scal[0]
-                self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res)
+                if solo == cutlass.Int32(0):
+                    self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res, self.cs)
+                else:
+                    self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res, 1)
                 cute.arch.barrier()  # ---- barrier (merge publish) ----
                 tot = s_res[C.RES_TOT]
                 acc = cutlass.Int32(0)
@@ -6484,8 +6522,12 @@ class GvrClusKernel:
             # ============ EXIT RENDEZVOUS ============
             # all DSMEM traffic retired; the ONLY exit rendezvous. rank!=0
             # falls through to the kernel end (post-barrier asymmetric exit);
-            # NO later cluster barrier.
-            C._cluster_sync_aligned()  # ==== clus.sync (exit) ====
+            # NO later cluster barrier. Solo: rank 0's own candidate stores
+            # only need a CTA barrier before the refine reads them.
+            if solo == cutlass.Int32(0):
+                C._cluster_sync_aligned()  # ==== clus.sync (exit) ====
+            else:
+                cute.arch.barrier()  # ---- barrier (solo candidates staged) ----
 
             if rank == cutlass.Int32(0):
                 if degen == cutlass.Int32(0):
@@ -6806,10 +6848,12 @@ def get_compiled__clus(
     page_shift: int = 0,
     pt_smem: int = 0,
     pdl: bool = False,
+    solo: bool = False,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
-    reachable route has 8192/2048 — asserted by run__clus())."""
+    reachable route has 8192/2048 — asserted by run__clus()). solo: rows of
+    at most one BLK * U chunk run on rank 0 alone (see the family note)."""
     key = (
         tuple(tpl),
         scap,
@@ -6823,6 +6867,7 @@ def get_compiled__clus(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(pdl),
+        bool(solo),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -6847,6 +6892,7 @@ def get_compiled__clus(
         page_shift=int(page_shift) if paged else 0,
         pt_smem=int(pt_smem) if paged else 0,
         pdl=bool(pdl),
+        solo=bool(solo),
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6885,6 +6931,7 @@ def get_compiled__clus(
         + (f"_pg{int(page_shift)}" if paged else "")
         + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
         + ("_pdl1" if pdl else "")
+        + ("_solo" if solo else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
