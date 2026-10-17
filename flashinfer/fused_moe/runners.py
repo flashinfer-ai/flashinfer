@@ -7175,7 +7175,9 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             hidden_states_scale=moe_inputs.hidden_states_scale,
             gemm1_weights=static["gemm1_weights"],
             gemm1_weights_scale=static.get("gemm1_weights_scale"),
-            output1_scale_scalar=scalar("output1_scale_scalar", "output1_scales_scalar"),
+            output1_scale_scalar=scalar(
+                "output1_scale_scalar", "output1_scales_scalar"
+            ),
             output1_scale_gate_scalar=scalar(
                 "output1_scale_gate_scalar", "output1_scales_gate_scalar"
             ),
@@ -7183,7 +7185,9 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             per_token_scale=moe_inputs.per_token_scale,
             gemm2_weights=static["gemm2_weights"],
             gemm2_weights_scale=static.get("gemm2_weights_scale"),
-            output2_scale_scalar=scalar("output2_scale_scalar", "output2_scales_scalar"),
+            output2_scale_scalar=scalar(
+                "output2_scale_scalar", "output2_scales_scalar"
+            ),
             routing_logits=routing_logits,
             topk_ids=topk_ids,
             topk_weights=topk_weights,

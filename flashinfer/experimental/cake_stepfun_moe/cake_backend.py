@@ -222,8 +222,7 @@ def max_padded_tokens(
 ) -> int:
     """Row capacity of the permuted buffers: ``max_num_ctas * tile_tokens_dim``."""
     return (
-        max_num_ctas(num_tokens, top_k, num_experts, tile_tokens_dim)
-        * tile_tokens_dim
+        max_num_ctas(num_tokens, top_k, num_experts, tile_tokens_dim) * tile_tokens_dim
     )
 
 
@@ -245,7 +244,11 @@ def exported_tiles(stage: str, family: str) -> tuple[int, ...]:
     _family_facts(family)
     return tuple(
         sorted(
-            {int(unit["tile_n"]) for _, unit in _stage_units(stage) if unit["family"] == family}
+            {
+                int(unit["tile_n"])
+                for _, unit in _stage_units(stage)
+                if unit["family"] == family
+            }
         )
     )
 
@@ -314,7 +317,9 @@ def routing_plan(
 
 def routing_inputs() -> tuple[str, ...]:
     """Routing input kinds the package exports (``scores`` and / or ``topk_ids``)."""
-    return tuple(dict.fromkeys(str(unit["input"]) for _, unit in _stage_units("routing")))
+    return tuple(
+        dict.fromkeys(str(unit["input"]) for _, unit in _stage_units("routing"))
+    )
 
 
 def routing_logits_dtypes() -> tuple[str, ...]:
@@ -358,11 +363,15 @@ def finalize_program(kernel_variant: str, expert_weights_dtype: str) -> str:
 def finalize_weight_dtypes() -> tuple[str, ...]:
     """Expert-weight dtypes the exported finalize units read (``bfloat16`` / ``float32``)."""
     return tuple(
-        dict.fromkeys(str(unit["expert_weights_dtype"]) for _, unit in _stage_units("finalize"))
+        dict.fromkeys(
+            str(unit["expert_weights_dtype"]) for _, unit in _stage_units("finalize")
+        )
     )
 
 
-def _fc1_shape_error(program: str, hidden_size: int, intermediate_size: int) -> str | None:
+def _fc1_shape_error(
+    program: str, hidden_size: int, intermediate_size: int
+) -> str | None:
     unit = _unit(program)
     cluster_x = int(_record(program)["launch"]["cluster"][0])
     rows, block_k = int(unit["output_rows_per_cta"]), int(unit["block_k"])
@@ -378,7 +387,9 @@ def _fc1_shape_error(program: str, hidden_size: int, intermediate_size: int) -> 
     return None
 
 
-def _fc2_shape_error(program: str, hidden_size: int, intermediate_size: int) -> str | None:
+def _fc2_shape_error(
+    program: str, hidden_size: int, intermediate_size: int
+) -> str | None:
     unit = _unit(program)
     cluster_x = int(_record(program)["launch"]["cluster"][0])
     rows, block_k = int(unit["output_rows_per_cta"]), int(unit["block_k"])
@@ -422,14 +433,16 @@ def plans_for(
     _positive_int("num_tokens", num_tokens, minimum=0)
     _positive_int("hidden_size", hidden_size)
     _positive_int("intermediate_size", intermediate_size)
-    tiles = sorted(set(exported_tiles("fc1", family)) & set(exported_tiles("fc2", family)))
+    tiles = sorted(
+        set(exported_tiles("fc1", family)) & set(exported_tiles("fc2", family))
+    )
     plans: list[Plan] = []
     reasons: list[str] = []
     for tile in tiles:
         fc1, fc2 = fc1_program(family, tile), fc2_program(family, tile)
-        error = _fc1_shape_error(fc1, hidden_size, intermediate_size) or _fc2_shape_error(
-            fc2, hidden_size, intermediate_size
-        )
+        error = _fc1_shape_error(
+            fc1, hidden_size, intermediate_size
+        ) or _fc2_shape_error(fc2, hidden_size, intermediate_size)
         if error is not None:
             reasons.append(f"tile {tile}: {error}")
             continue
@@ -460,7 +473,11 @@ def default_plan(
 
 
 def _resolve_plan(
-    family: str, plan: Plan | int | None, num_tokens: int, hidden_size: int, intermediate_size: int
+    family: str,
+    plan: Plan | int | None,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
 ) -> Plan:
     plans = plans_for(family, num_tokens, hidden_size, intermediate_size)
     if plan is None:
@@ -468,7 +485,9 @@ def _resolve_plan(
         return next((p for p in plans if p.tile_n >= centre), plans[-1])
     if isinstance(plan, Plan):
         if plan.family != family:
-            raise ValueError(f"plan of family {plan.family!r} given for family {family!r}")
+            raise ValueError(
+                f"plan of family {plan.family!r} given for family {family!r}"
+            )
         if plan not in plans:
             raise ValueError(
                 f"{plan} is not servable for hidden_size {hidden_size} / intermediate_size "
@@ -476,7 +495,9 @@ def _resolve_plan(
             )
         return plan
     if isinstance(plan, bool) or not isinstance(plan, int):
-        raise TypeError(f"plan must be None, a tile or a Plan, got {type(plan).__name__}")
+        raise TypeError(
+            f"plan must be None, a tile or a Plan, got {type(plan).__name__}"
+        )
     for candidate in plans:
         if candidate.tile_n == plan:
             return candidate
@@ -517,9 +538,13 @@ def _tensor(
     if dim is not None and value.dim() != dim:
         raise ValueError(f"{name} must be {dim}-D, got shape {tuple(value.shape)}")
     if shape is not None and tuple(value.shape) != tuple(shape):
-        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(value.shape)}")
+        raise ValueError(
+            f"{name} must have shape {tuple(shape)}, got {tuple(value.shape)}"
+        )
     if min_numel is not None and value.numel() < min_numel:
-        raise ValueError(f"{name} must hold at least {min_numel} elements, got {value.numel()}")
+        raise ValueError(
+            f"{name} must hold at least {min_numel} elements, got {value.numel()}"
+        )
     return value
 
 
@@ -551,7 +576,9 @@ def _sf_block_view(
     ``layout``: ``r8c4`` -> ``(rows/8, cols/4, 32)``, ``r128c4`` -> ``(rows/128, cols/4, 2, 256)``."""
     block_rows = _constants()["requant"]["sf_block_rows"]
     if layout not in block_rows:
-        raise ValueError(f"{name}: unknown block-scale layout {layout!r}; known: {list(block_rows)}")
+        raise ValueError(
+            f"{name}: unknown block-scale layout {layout!r}; known: {list(block_rows)}"
+        )
     rows_per_block = int(block_rows[layout])
     if rows % rows_per_block or cols % 4:
         raise ValueError(
@@ -559,7 +586,9 @@ def _sf_block_view(
             f"columns % 4 == 0, got {rows} x {cols}"
         )
     if sf_flat.numel() < rows * cols:
-        raise ValueError(f"{name} holds {sf_flat.numel()} scale bytes, {rows * cols} needed")
+        raise ValueError(
+            f"{name} holds {sf_flat.numel()} scale bytes, {rows * cols} needed"
+        )
     flat = _bytes(sf_flat).reshape(-1)[: rows * cols]
     if layout == "r8c4":
         return flat.view(rows // 8, cols // 4, 32)
@@ -569,7 +598,9 @@ def _sf_block_view(
 def _compute_log2(tile_tokens_dim: int) -> int:
     exponent = tile_tokens_dim.bit_length() - 1
     if tile_tokens_dim <= 0 or (1 << exponent) != tile_tokens_dim:
-        raise ValueError(f"tile_tokens_dim must be a power of two, got {tile_tokens_dim}")
+        raise ValueError(
+            f"tile_tokens_dim must be a power of two, got {tile_tokens_dim}"
+        )
     return exponent
 
 
@@ -612,9 +643,11 @@ def _bind(
     if len(grid) != 3:
         raise ValueError(f"{stage} {program}: grid must have three entries, got {grid}")
     grid = tuple(int(g) for g in grid)
-    for axis, (extent, span) in enumerate(zip(grid, cluster)):
+    for axis, (extent, span) in enumerate(zip(grid, cluster, strict=True)):
         if extent <= 0:
-            raise ValueError(f"{stage} {program}: grid axis {axis} must be > 0, got {grid}")
+            raise ValueError(
+                f"{stage} {program}: grid axis {axis} must be > 0, got {grid}"
+            )
         if extent % span:
             raise ValueError(
                 f"{stage} {program}: grid axis {axis} ({extent}) is not a multiple of the "
@@ -807,14 +840,18 @@ def _geometry(
     num_tokens, packed_hidden = (int(s) for s in hidden_states.shape)
     hidden_size = packed_hidden * per_byte
     if gemm1_weights.dim() < 2 or gemm2_weights.dim() < 2:
-        raise ValueError("gemm1_weights and gemm2_weights must be at least 2-D [E, ...]")
+        raise ValueError(
+            "gemm1_weights and gemm2_weights must be at least 2-D [E, ...]"
+        )
     num_rows = int(gemm1_weights.shape[0])
     if int(gemm2_weights.shape[0]) != num_rows:
         raise ValueError(
             f"gemm2_weights has {gemm2_weights.shape[0]} expert rows, gemm1_weights {num_rows}"
         )
     if num_rows < 1 or hidden_size < 1:
-        raise ValueError("weights need at least one expert row and a positive hidden size")
+        raise ValueError(
+            "weights need at least one expert row and a positive hidden size"
+        )
     fc2_elements = gemm2_weights.numel() * per_byte
     if fc2_elements % (num_rows * hidden_size):
         raise ValueError(
@@ -823,7 +860,10 @@ def _geometry(
             f"hidden_size={hidden_size}"
         )
     intermediate_size = fc2_elements // (num_rows * hidden_size)
-    if gemm1_weights.numel() * per_byte != num_rows * 2 * intermediate_size * hidden_size:
+    if (
+        gemm1_weights.numel() * per_byte
+        != num_rows * 2 * intermediate_size * hidden_size
+    ):
         raise ValueError(
             f"gemm1_weights ({tuple(gemm1_weights.shape)}, {gemm1_weights.dtype}) does not "
             f"hold E x 2*intermediate_size x hidden_size elements for E={num_rows}, "
@@ -855,7 +895,13 @@ def _routing_tables_check(
     }
     for name, min_numel in extents.items():
         if tables.get(name) is not None:
-            _tensor(name, tables[name], device=device, dtype=torch.int32, min_numel=min_numel)
+            _tensor(
+                name,
+                tables[name],
+                device=device,
+                dtype=torch.int32,
+                min_numel=min_numel,
+            )
 
 
 def _fc1_values(
@@ -888,11 +934,25 @@ def _fc1_values(
     if unit["weight_layout"] == "BlockMajorK":
         weights = _reshape("gemm1_weights", weights, (E, H // 64, 2 * I, 64))
     else:
-        weights = _reshape("gemm1_weights", weights, (E, 2 * I, H // act_per_byte(family)))
-    clamp = _tensor("gemm1_clamp_limit", operands["gemm1_clamp_limit"], device=device, dtype=torch.float32, shape=(E,))
+        weights = _reshape(
+            "gemm1_weights", weights, (E, 2 * I, H // act_per_byte(family))
+        )
+    clamp = _tensor(
+        "gemm1_clamp_limit",
+        operands["gemm1_clamp_limit"],
+        device=device,
+        dtype=torch.float32,
+        shape=(E,),
+    )
     out_dtype = str(unit["dtypes"][2])
     out_cols = I // 2 if out_dtype == "E2m1" else I
-    gemm1_output = _tensor("gemm1_output", operands["gemm1_output"], device=device, dtype=_torch_dtype(unit["arg_dtypes"]["C"]), shape=(g.max_padded, out_cols))
+    gemm1_output = _tensor(
+        "gemm1_output",
+        operands["gemm1_output"],
+        device=device,
+        dtype=_torch_dtype(unit["arg_dtypes"]["C"]),
+        shape=(g.max_padded, out_cols),
+    )
     values: dict[str, Any] = {
         "A": weights,
         "B": operands["hidden_states"],
@@ -915,21 +975,59 @@ def _fc1_values(
         act_dtype = str(unit["dtypes"][0])
         block = _SF_BLOCK_ELEMENTS.get(act_dtype)
         if block is None:
-            raise ValueError(f"{context}: activation dtype {act_dtype} has no block-scale operand")
-        sfa = _bytes(_tensor("gemm1_weights_scale", operands["gemm1_weights_scale"], device=device))
-        values["SFA"] = _reshape("gemm1_weights_scale", sfa, (E * I // 64, H // (4 * block), 2, 256))
-        sfb = _bytes(_tensor("hidden_states_scale", operands["hidden_states_scale"], device=device))
+            raise ValueError(
+                f"{context}: activation dtype {act_dtype} has no block-scale operand"
+            )
+        sfa = _bytes(
+            _tensor(
+                "gemm1_weights_scale", operands["gemm1_weights_scale"], device=device
+            )
+        )
+        values["SFA"] = _reshape(
+            "gemm1_weights_scale", sfa, (E * I // 64, H // (4 * block), 2, 256)
+        )
+        sfb = _bytes(
+            _tensor(
+                "hidden_states_scale", operands["hidden_states_scale"], device=device
+            )
+        )
         values["SFB"] = _reshape("hidden_states_scale", sfb, (T, H // block))
     if per_token:
-        values["SFC"] = _tensor("per_token_scale", operands["per_token_scale"], device=device, dtype=torch.float32, min_numel=T)
+        values["SFC"] = _tensor(
+            "per_token_scale",
+            operands["per_token_scale"],
+            device=device,
+            dtype=torch.float32,
+            min_numel=T,
+        )
     elif needs["gemm1_output_scale"]:
         block = _SF_BLOCK_ELEMENTS.get(out_dtype)
         if block is None:
-            raise ValueError(f"{context}: output dtype {out_dtype} has no block-scale operand")
-        values["SFC"] = _tensor("gemm1_output_scale", operands["gemm1_output_scale"], device=device, dtype=torch.uint8, min_numel=g.max_padded * I // block)
+            raise ValueError(
+                f"{context}: output dtype {out_dtype} has no block-scale operand"
+            )
+        values["SFC"] = _tensor(
+            "gemm1_output_scale",
+            operands["gemm1_output_scale"],
+            device=device,
+            dtype=torch.uint8,
+            min_numel=g.max_padded * I // block,
+        )
     if needs["output1_scale_scalar"]:
-        values["scale_c"] = _tensor("output1_scale_scalar", operands["output1_scale_scalar"], device=device, dtype=torch.float32, shape=(E,))
-        values["scale_gate"] = _tensor("output1_scale_gate_scalar", operands["output1_scale_gate_scalar"], device=device, dtype=torch.float32, shape=(E,))
+        values["scale_c"] = _tensor(
+            "output1_scale_scalar",
+            operands["output1_scale_scalar"],
+            device=device,
+            dtype=torch.float32,
+            shape=(E,),
+        )
+        values["scale_gate"] = _tensor(
+            "output1_scale_gate_scalar",
+            operands["output1_scale_gate_scalar"],
+            device=device,
+            dtype=torch.float32,
+            shape=(E,),
+        )
     # The step epilogue ignores alpha / beta; the production host aliases them to a
     # valid per-expert vector (no allocation).
     alias = values.get("scale_c", clamp)
@@ -969,7 +1067,10 @@ def _fc2_values(
     act_dtype = str(unit["dtypes"][0])
     in_cols = I // 2 if act_dtype == "E2m1" else I
     gemm2_input = _tensor(
-        "gemm2_input", operands["gemm2_input"], device=device, shape=(g.max_padded, in_cols)
+        "gemm2_input",
+        operands["gemm2_input"],
+        device=device,
+        shape=(g.max_padded, in_cols),
     )
     gemm2_output = _tensor(
         "gemm2_output",
@@ -997,17 +1098,47 @@ def _fc2_values(
     if needs["gemm2_weights_scale"] or needs["gemm2_input_scale"]:
         block = _SF_BLOCK_ELEMENTS.get(act_dtype)
         if block is None:
-            raise ValueError(f"{context}: activation dtype {act_dtype} has no block-scale operand")
+            raise ValueError(
+                f"{context}: activation dtype {act_dtype} has no block-scale operand"
+            )
         if needs["gemm2_weights_scale"]:
-            sfa = _bytes(_tensor("gemm2_weights_scale", operands["gemm2_weights_scale"], device=device))
-            values["SFA"] = _reshape("gemm2_weights_scale", sfa, (E * H // 128, I // (4 * block), 2, 256))
+            sfa = _bytes(
+                _tensor(
+                    "gemm2_weights_scale",
+                    operands["gemm2_weights_scale"],
+                    device=device,
+                )
+            )
+            values["SFA"] = _reshape(
+                "gemm2_weights_scale", sfa, (E * H // 128, I // (4 * block), 2, 256)
+            )
         if needs["gemm2_input_scale"]:
-            scales = _tensor("gemm2_input_scale", operands["gemm2_input_scale"], device=device)
-            values["SFB"] = _sf_block_view("gemm2_input_scale", scales, rows=g.max_padded, cols=I // block, layout=str(unit["sf_layout_a"]))
+            scales = _tensor(
+                "gemm2_input_scale", operands["gemm2_input_scale"], device=device
+            )
+            values["SFB"] = _sf_block_view(
+                "gemm2_input_scale",
+                scales,
+                rows=g.max_padded,
+                cols=I // block,
+                layout=str(unit["sf_layout_a"]),
+            )
     if needs["output2_scale_scalar"]:
-        values["scale_c"] = _tensor("output2_scale_scalar", operands["output2_scale_scalar"], device=device, dtype=torch.float32, shape=(E,))
+        values["scale_c"] = _tensor(
+            "output2_scale_scalar",
+            operands["output2_scale_scalar"],
+            device=device,
+            dtype=torch.float32,
+            shape=(E,),
+        )
     if needs["per_token_scale"]:
-        token_sf = _tensor("per_token_scale", operands["per_token_scale"], device=device, dtype=torch.float32, min_numel=g.max_padded)
+        token_sf = _tensor(
+            "per_token_scale",
+            operands["per_token_scale"],
+            device=device,
+            dtype=torch.float32,
+            min_numel=g.max_padded,
+        )
         values["token_sf"] = token_sf
         values["per_token_scale"] = token_sf
     return values, (H // rows, g.max_ctas, int(unit["split_k"]))
@@ -1043,7 +1174,9 @@ def _routing_grid(
     elif rule == "coop_sms":
         sms = sm_count(device)
         if isinstance(reserved_sms, bool) or not isinstance(reserved_sms, int):
-            raise TypeError(f"reserved_sms must be an int, got {type(reserved_sms).__name__}")
+            raise TypeError(
+                f"reserved_sms must be an int, got {type(reserved_sms).__name__}"
+            )
         if not 0 <= reserved_sms < sms:
             raise ValueError(
                 f"reserved_sms {reserved_sms} must satisfy 0 <= value < SM count {sms}"
@@ -1157,7 +1290,9 @@ def _routing_checks(
     else:
         ids = _tensor("topk_ids", topk_ids, device=device, dtype=torch.int32, dim=2)
         if int(ids.shape[1]) != top_k:
-            raise ValueError(f"topk_ids must be [num_tokens, {top_k}], got {tuple(ids.shape)}")
+            raise ValueError(
+                f"topk_ids must be [num_tokens, {top_k}], got {tuple(ids.shape)}"
+            )
         num_tokens = int(ids.shape[0])
     if num_tokens < 1:
         raise ValueError("the exported routing programs launch for num_tokens >= 1")
@@ -1181,13 +1316,24 @@ def _requant_values(
             f"{unit['e4m3_max']} units exist; NVFP4 4over6 recipes are not exported)"
         )
     device = operands["gemm1_output"].device
-    gemm1_output = _tensor("gemm1_output", operands["gemm1_output"], device=device, dtype=torch.bfloat16, dim=2)
+    gemm1_output = _tensor(
+        "gemm1_output",
+        operands["gemm1_output"],
+        device=device,
+        dtype=torch.bfloat16,
+        dim=2,
+    )
     if int(gemm1_output.shape[0]) != max_padded:
         raise ValueError(
             f"gemm1_output must hold max_padded = {max_padded} rows, got {tuple(gemm1_output.shape)}"
         )
     intermediate_size = int(gemm1_output.shape[1])
-    expanded = _tensor("expanded_idx_to_permuted_idx", operands["expanded_idx_to_permuted_idx"], device=device, dtype=torch.int32).reshape(-1)
+    expanded = _tensor(
+        "expanded_idx_to_permuted_idx",
+        operands["expanded_idx_to_permuted_idx"],
+        device=device,
+        dtype=torch.int32,
+    ).reshape(-1)
     layout = str(unit["variant"])
     rows_per_block = int(constants["sf_block_rows"][layout])
     if max_padded % rows_per_block:
@@ -1195,13 +1341,33 @@ def _requant_values(
             f"the requantized {layout} scales need a padded row count divisible by "
             f"{rows_per_block}, got {max_padded}"
         )
-    sf_rows = -(-max_padded // int(constants["sf_rows_multiple"])) * int(constants["sf_rows_multiple"])
+    sf_rows = -(-max_padded // int(constants["sf_rows_multiple"])) * int(
+        constants["sf_rows_multiple"]
+    )
     values = {
         "input": gemm1_output,
         "expanded_idx_to_permuted_idx": expanded,
-        "out_fp4": _tensor("output", operands["output"], device=device, dtype=torch.uint8, shape=(max_padded, intermediate_size // 2)),
-        "out_sf": _tensor("output_scale", operands["output_scale"], device=device, dtype=torch.uint8, min_numel=sf_rows * intermediate_size // 16),
-        "per_token_scale": _tensor("per_token_scale", operands["per_token_scale"], device=device, dtype=torch.float32, min_numel=max_padded),
+        "out_fp4": _tensor(
+            "output",
+            operands["output"],
+            device=device,
+            dtype=torch.uint8,
+            shape=(max_padded, intermediate_size // 2),
+        ),
+        "out_sf": _tensor(
+            "output_scale",
+            operands["output_scale"],
+            device=device,
+            dtype=torch.uint8,
+            min_numel=sf_rows * intermediate_size // 16,
+        ),
+        "per_token_scale": _tensor(
+            "per_token_scale",
+            operands["per_token_scale"],
+            device=device,
+            dtype=torch.float32,
+            min_numel=max_padded,
+        ),
         "global_scale_inv": float(global_scale_inv),
         "m": int(expanded.numel()),
         "n": intermediate_size,
@@ -1215,20 +1381,39 @@ def _finalize_values(
 ) -> tuple[dict[str, Any], tuple[int, int, int]]:
     unit = _unit(program)
     device = operands["output"].device
-    output = _tensor("output", operands["output"], device=device, dtype=torch.bfloat16, dim=2)
+    output = _tensor(
+        "output", operands["output"], device=device, dtype=torch.bfloat16, dim=2
+    )
     num_tokens, hidden_size = (int(s) for s in output.shape)
-    gemm2_output = _tensor("gemm2_output", operands["gemm2_output"], device=device, dtype=torch.bfloat16, dim=2)
+    gemm2_output = _tensor(
+        "gemm2_output",
+        operands["gemm2_output"],
+        device=device,
+        dtype=torch.bfloat16,
+        dim=2,
+    )
     if int(gemm2_output.shape[1]) < hidden_size:
         raise ValueError(
             f"gemm2_output width {gemm2_output.shape[1]} is below the output width {hidden_size}"
         )
-    weights = _tensor("expert_weights", operands["expert_weights"], device=device, dtype=_torch_dtype(unit["arg_dtypes"]["expert_weights"]), dim=2)
+    weights = _tensor(
+        "expert_weights",
+        operands["expert_weights"],
+        device=device,
+        dtype=_torch_dtype(unit["arg_dtypes"]["expert_weights"]),
+        dim=2,
+    )
     if int(weights.shape[0]) != num_tokens:
         raise ValueError(
             f"expert_weights must be [num_tokens={num_tokens}, top_k], got {tuple(weights.shape)}"
         )
     top_k = int(weights.shape[1])
-    expanded = _tensor("expanded_idx_to_permuted_idx", operands["expanded_idx_to_permuted_idx"], device=device, dtype=torch.int32).reshape(-1)
+    expanded = _tensor(
+        "expanded_idx_to_permuted_idx",
+        operands["expanded_idx_to_permuted_idx"],
+        device=device,
+        dtype=torch.int32,
+    ).reshape(-1)
     if expanded.numel() != num_tokens * top_k:
         raise ValueError(
             f"expanded_idx_to_permuted_idx must hold num_tokens * top_k = {num_tokens * top_k} "
@@ -1378,7 +1563,9 @@ def prepare_stepfun_moe(
         num_experts_for_ctas=num_experts,
         tile_tokens_dim=1,
     )
-    resolved = _resolve_plan(family, plan, num_tokens, hidden_size, probe.intermediate_size)
+    resolved = _resolve_plan(
+        family, plan, num_tokens, hidden_size, probe.intermediate_size
+    )
     tile = resolved.tile_n
     g = _geometry(
         family,
@@ -1398,9 +1585,13 @@ def prepare_stepfun_moe(
             raise ValueError("topk_weights is required with topk_ids")
         weights = _tensor("topk_weights", topk_weights, device=device, dim=2)
         if tuple(weights.shape) != (T, top_k):
-            raise ValueError(f"topk_weights must be [{T}, {top_k}], got {tuple(weights.shape)}")
+            raise ValueError(
+                f"topk_weights must be [{T}, {top_k}], got {tuple(weights.shape)}"
+            )
         if weights.dtype not in _FINALIZE_WEIGHT_DTYPES:
-            raise ValueError(f"topk_weights must be bfloat16 or float32, got {weights.dtype}")
+            raise ValueError(
+                f"topk_weights must be bfloat16 or float32, got {weights.dtype}"
+            )
     elif topk_weights is not None:
         raise ValueError("topk_weights is taken with topk_ids only")
 
@@ -1435,7 +1626,9 @@ def prepare_stepfun_moe(
         )
         tables["permuted_idx_to_token_idx"].fill_(poison)
         tables["expanded_idx_to_permuted_idx"].fill_(-1)
-    expert_weights = topk_weights if topk_weights is not None else tables["topk_weights"]
+    expert_weights = (
+        topk_weights if topk_weights is not None else tables["topk_weights"]
+    )
 
     buffers: dict[str, torch.Tensor] = dict(tables)
     fc1_out_dtype = str(fc1_unit["dtypes"][2])
@@ -1466,11 +1659,15 @@ def prepare_stepfun_moe(
         buffers["gemm1_output_scale"] = gemm1_output_scale
     if "work_counter" in fc1_keys or "work_counter" in fc2_keys:
         buffers["work_counter"] = torch.zeros((1,), dtype=torch.int32, device=device)
-    buffers["gemm2_output"] = torch.empty((g.max_padded, H), dtype=torch.bfloat16, device=device)
+    buffers["gemm2_output"] = torch.empty(
+        (g.max_padded, H), dtype=torch.bfloat16, device=device
+    )
     if do_finalize:
         if output is None:
             output = torch.empty((T, H), dtype=torch.bfloat16, device=device)
-        buffers["output"] = _tensor("output", output, device=device, dtype=torch.bfloat16, shape=(T, H))
+        buffers["output"] = _tensor(
+            "output", output, device=device, dtype=torch.bfloat16, shape=(T, H)
+        )
     elif output is not None:
         raise ValueError("output is taken with do_finalize=True only")
 
@@ -1512,7 +1709,14 @@ def prepare_stepfun_moe(
     )
     values, grid = _fc1_values(resolved.fc1_program, family, g, fc1_operands)
     launches.append(
-        _bind(resolved.fc1_program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="fc1")
+        _bind(
+            resolved.fc1_program,
+            values,
+            grid,
+            enable_pdl=enable_pdl,
+            arch=arch,
+            stage="fc1",
+        )
     )
 
     gemm2_input = buffers["gemm1_output"]
@@ -1520,12 +1724,20 @@ def prepare_stepfun_moe(
     fc2_per_token_scale = None
     if facts["per_token"]:
         if resolved.requant_program is None:
-            raise ValueError(f"family {family!r} is per-token but the plan has no requant unit")
+            raise ValueError(
+                f"family {family!r} is per-token but the plan has no requant unit"
+            )
         sf_multiple = int(requant_constants["sf_rows_multiple"])
         sf_rows = -(-g.max_padded // sf_multiple) * sf_multiple
-        buffers["requant_output"] = torch.empty((g.max_padded, I // 2), dtype=torch.uint8, device=device)
-        buffers["requant_output_scale"] = torch.empty((sf_rows * I // 16,), dtype=torch.uint8, device=device)
-        buffers["requant_per_token_scale"] = torch.empty((g.max_padded,), dtype=torch.float32, device=device)
+        buffers["requant_output"] = torch.empty(
+            (g.max_padded, I // 2), dtype=torch.uint8, device=device
+        )
+        buffers["requant_output_scale"] = torch.empty(
+            (sf_rows * I // 16,), dtype=torch.uint8, device=device
+        )
+        buffers["requant_per_token_scale"] = torch.empty(
+            (g.max_padded,), dtype=torch.float32, device=device
+        )
         values, grid = _requant_values(
             resolved.requant_program,
             dict(
@@ -1539,7 +1751,14 @@ def prepare_stepfun_moe(
             global_scale_inv=global_scale_inv,
         )
         launches.append(
-            _bind(resolved.requant_program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="requant")
+            _bind(
+                resolved.requant_program,
+                values,
+                grid,
+                enable_pdl=enable_pdl,
+                arch=arch,
+                stage="requant",
+            )
         )
         gemm2_input = buffers["requant_output"]
         gemm2_input_scale = buffers["requant_output_scale"]
@@ -1561,7 +1780,14 @@ def prepare_stepfun_moe(
     )
     values, grid = _fc2_values(resolved.fc2_program, family, g, fc2_operands)
     launches.append(
-        _bind(resolved.fc2_program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="fc2")
+        _bind(
+            resolved.fc2_program,
+            values,
+            grid,
+            enable_pdl=enable_pdl,
+            arch=arch,
+            stage="fc2",
+        )
     )
 
     finalize_name = None
@@ -1578,7 +1804,14 @@ def prepare_stepfun_moe(
             ),
         )
         launches.append(
-            _bind(finalize_name, values, grid, enable_pdl=enable_pdl, arch=arch, stage="finalize")
+            _bind(
+                finalize_name,
+                values,
+                grid,
+                enable_pdl=enable_pdl,
+                arch=arch,
+                stage="finalize",
+            )
         )
     return StepFunMoeLaunch(
         family=family,
@@ -1640,17 +1873,43 @@ def prepare_routing(
     max_ctas = max_num_ctas(num_tokens, top_k, num_experts, tile_tokens_dim)
     max_padded = max_ctas * tile_tokens_dim
     tables = {
-        "topk_packed": _tensor("topk_packed", topk_packed, device=device, dtype=torch.int32, shape=(num_tokens, top_k)),
-        "topk_weights": _tensor("topk_weights", topk_weights, device=device, dtype=torch.bfloat16, shape=(num_tokens, top_k)),
-        "expert_count_histogram": _tensor("expert_count_histogram", expert_count_histogram, device=device, dtype=torch.int32, min_numel=2 * num_experts),
+        "topk_packed": _tensor(
+            "topk_packed",
+            topk_packed,
+            device=device,
+            dtype=torch.int32,
+            shape=(num_tokens, top_k),
+        ),
+        "topk_weights": _tensor(
+            "topk_weights",
+            topk_weights,
+            device=device,
+            dtype=torch.bfloat16,
+            shape=(num_tokens, top_k),
+        ),
+        "expert_count_histogram": _tensor(
+            "expert_count_histogram",
+            expert_count_histogram,
+            device=device,
+            dtype=torch.int32,
+            min_numel=2 * num_experts,
+        ),
         "total_num_padded_tokens": total_num_padded_tokens,
-        "expanded_idx_to_permuted_idx": _tensor("expanded_idx_to_permuted_idx", expanded_idx_to_permuted_idx, device=device, dtype=torch.int32, min_numel=num_tokens * top_k),
+        "expanded_idx_to_permuted_idx": _tensor(
+            "expanded_idx_to_permuted_idx",
+            expanded_idx_to_permuted_idx,
+            device=device,
+            dtype=torch.int32,
+            min_numel=num_tokens * top_k,
+        ),
         "permuted_idx_to_token_idx": permuted_idx_to_token_idx,
         "cta_idx_xy_to_batch_idx": cta_idx_xy_to_batch_idx,
         "cta_idx_xy_to_mn_limit": cta_idx_xy_to_mn_limit,
         "num_non_exiting_ctas": num_non_exiting_ctas,
     }
-    _routing_tables_check(tables, device=device, max_ctas=max_ctas, max_padded=max_padded)
+    _routing_tables_check(
+        tables, device=device, max_ctas=max_ctas, max_padded=max_padded
+    )
     programs, launches = _routing_launches(
         routing_logits=routing_logits,
         topk_ids=topk_ids,
@@ -1724,7 +1983,9 @@ def prepare_fc1(
         num_non_exiting_ctas=num_non_exiting_ctas,
         total_num_padded_tokens=total_num_padded_tokens,
     )
-    _routing_tables_check(tables, device=device, max_ctas=g.max_ctas, max_padded=g.max_padded)
+    _routing_tables_check(
+        tables, device=device, max_ctas=g.max_ctas, max_padded=g.max_padded
+    )
     work_counter = (
         torch.zeros((1,), dtype=torch.int32, device=device)
         if "work_counter" in _arg_keys(program)
@@ -1745,7 +2006,9 @@ def prepare_fc1(
         **tables,
     )
     values, grid = _fc1_values(program, family, g, operands)
-    return _stage_launch(program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="fc1")
+    return _stage_launch(
+        program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="fc1"
+    )
 
 
 def _fc2_probe(
@@ -1801,7 +2064,9 @@ def prepare_requant(
         max_padded=int(gemm1_output.shape[0]),
         global_scale_inv=global_scale_inv,
     )
-    return _stage_launch(program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="requant")
+    return _stage_launch(
+        program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="requant"
+    )
 
 
 def prepare_fc2(
@@ -1838,14 +2103,19 @@ def prepare_fc2(
     _positive_int("tile_tokens_dim", tile_tokens_dim)
     program = fc2_program(family, tile_tokens_dim)
     per_byte = act_per_byte(family)
-    output = _tensor("gemm2_output", gemm2_output, device=device, dtype=torch.bfloat16, dim=2)
+    output = _tensor(
+        "gemm2_output", gemm2_output, device=device, dtype=torch.bfloat16, dim=2
+    )
     hidden_size = int(output.shape[1])
     intermediate_size = int(gemm2_input.shape[1]) * per_byte
     weights = _tensor("gemm2_weights", gemm2_weights, device=device)
     if weights.dim() < 2:
         raise ValueError(f"gemm2_weights must be [E, ...], got {tuple(weights.shape)}")
     num_rows = int(weights.shape[0])
-    if num_rows < 1 or weights.numel() * per_byte != num_rows * hidden_size * intermediate_size:
+    if (
+        num_rows < 1
+        or weights.numel() * per_byte != num_rows * hidden_size * intermediate_size
+    ):
         raise ValueError(
             f"gemm2_weights ({tuple(weights.shape)}, {weights.dtype}) does not hold "
             f"E x hidden_size x intermediate_size elements for E={num_rows}, "
@@ -1872,7 +2142,9 @@ def prepare_fc2(
         num_non_exiting_ctas=num_non_exiting_ctas,
         total_num_padded_tokens=total_num_padded_tokens,
     )
-    _routing_tables_check(tables, device=device, max_ctas=max_ctas, max_padded=g.max_padded)
+    _routing_tables_check(
+        tables, device=device, max_ctas=max_ctas, max_padded=g.max_padded
+    )
     work_counter = (
         torch.zeros((1,), dtype=torch.int32, device=device)
         if "work_counter" in _arg_keys(program)
@@ -1890,7 +2162,9 @@ def prepare_fc2(
         **tables,
     )
     values, grid = _fc2_values(program, family, g, operands)
-    return _stage_launch(program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="fc2")
+    return _stage_launch(
+        program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="fc2"
+    )
 
 
 def prepare_finalize(
@@ -1909,7 +2183,13 @@ def prepare_finalize(
     device = _tensor("output", output, dim=2).device
     arch = arch_for(device)
     _positive_int("num_experts", num_experts)
-    _tensor("total_num_padded_tokens", total_num_padded_tokens, device=device, dtype=torch.int32, min_numel=1)
+    _tensor(
+        "total_num_padded_tokens",
+        total_num_padded_tokens,
+        device=device,
+        dtype=torch.int32,
+        min_numel=1,
+    )
     weights = _tensor("expert_weights", expert_weights, device=device, dim=2)
     program = _finalize_program_for(int(output.shape[1]), int(output.shape[0]), weights)
     values, grid = _finalize_values(
@@ -1922,7 +2202,9 @@ def prepare_finalize(
             output=output,
         ),
     )
-    return _stage_launch(program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="finalize")
+    return _stage_launch(
+        program, values, grid, enable_pdl=enable_pdl, arch=arch, stage="finalize"
+    )
 
 
 def routing(**kwargs: Any) -> None:
