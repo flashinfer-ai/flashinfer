@@ -1433,6 +1433,19 @@ def gen_batch_prefill_attention_sink_module(
         use_sliding_window,
     )
 
+    packed_fp4_kv = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if packed_fp4_kv and backend != "fa2":
+        raise NotImplementedError(
+            "packed FP4 KV is only supported by the fa2 attention-sink "
+            f"backend, got backend={backend!r}."
+        )
+
+    additional_tensor_names = ["sink"]
+    additional_tensor_dtypes = ["float"]
+    if packed_fp4_kv:
+        additional_tensor_names += ["maybe_k_cache_sf", "maybe_v_cache_sf"]
+        additional_tensor_dtypes += ["uint8_t", "uint8_t"]
+
     return gen_customize_batch_prefill_module(
         backend,
         uri,
@@ -1442,8 +1455,8 @@ def gen_batch_prefill_attention_sink_module(
         dtype_idx,
         head_dim_qk,
         head_dim_vo,
-        ["sink"],
-        ["float"],
+        additional_tensor_names,
+        additional_tensor_dtypes,
         ["sm_scale"],
         ["double"],
         "AttentionSink",
