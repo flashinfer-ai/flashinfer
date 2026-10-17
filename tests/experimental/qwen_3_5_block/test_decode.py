@@ -1,10 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """The DECODE form against the fp32 oracle: the two Qwen3.5 TP-1 shard geometries, q_len 1 and 4, a short / a long / a padded
-sequence, both FlashInfer cache layouts, the functional entry point and the wrapper; the routed q_len 8 / 32 cells, the
-``(k, v)`` pair at page 64 / 128, the explicit split and the unsplit tile (the gate as its own launch), the separate cache-write
-launch, the run-time typed declines, a cached step under ``set_sync_debug_mode("error")`` and the compiled-plan cache's reload
-path."""
+sequence, both FlashInfer cache layouts, the functional entry point and the wrapper; the routed cells of the vendored decode
+levers (the 64-column tile in one token unit at q_len 3 / 4, two token units at q_len 8, the unpacked tile at q_len 32, the paged
+prefill route of a part-filling batch), the lowered small-M decode chain against its fused-fork control arm, the ``(k, v)`` pair
+at page 64 / 128, the explicit split and the unsplit tile (the gate as its own launch), the separate cache-write launch, the
+run-time typed declines, a cached step under ``set_sync_debug_mode("error")`` and the compiled-plan cache's reload path."""
 
 import pytest
 import torch
@@ -152,11 +153,21 @@ def test_wrapper_plan_run_and_the_declaration_facts():
         plan.workspace_size <= ws.numel()
         and plan.declaration["decode_route"]["tile"] == "decode_d256_f16"
     )
+    # the vendored decode levers' default chain at decode row counts (batch x q_len <= 128): stage (1) lowered to the small-M
+    # slab GEMM, the norm + RoPE pass and the separate cache write; the sigmoid gate still rides the split combine
+    d = plan.declaration
     assert (
-        plan.declaration["gate_fused"]
-        and plan.declaration["cache_write_fused"]
-        and plan.declaration["decode_split_kv"] >= 2
-    )
+        d["gate_fused"]
+        and d["decode_split_kv"] >= 2
+        and d["fuse_norm_rope_effective"] is False
+    ), d
+    assert d["cache_write_fused"] is False and {"_QkNormRope", "_CacheWrite"} <= set(
+        d["stages"]
+    ), d
+    assert (
+        d["decode_route"]["kv_streams"] == 1
+        and d["decode_route"]["policy"] == "single_unit"
+    ), d["decode_route"]
     out = w.run(
         case.hidden_states,
         case.rope_cos,
@@ -273,22 +284,125 @@ def _run(plan, case, **kw):
     return out
 
 
-@pytest.mark.parametrize("q_len", [8, 32])
-def test_decode_past_the_packed_envelope_is_routed_on_the_unpacked_tile(q_len):
-    """q_len 5..32: routed on the unpacked decode tile (one Q head per CTA, ``claimed`` False) and declared; the oracle holds."""
+@pytest.mark.parametrize(
+    "q_len, expect",
+    [
+        (8, dict(pack_gqa=True, n_q=64, token_units=2, kv_streams=2)),
+        (32, dict(pack_gqa=False, n_q=32, token_units=1, kv_streams=12)),
+    ],
+    ids=["q8_two_units", "q32_unpacked"],
+)
+def test_decode_past_the_claimed_envelope_is_routed_and_declared(q_len, expect):
+    """q_len 5..32 past the claimed envelope at 24 / 2: 8 rides two token units of the 64-column decode tile with the group
+    packed (the vendored width table), 32 the 32-column tile unpacked (one Q head per CTA, a KV stream per head); both routed
+    and declared (``claimed`` False) with the kernel, width, token units and KV streams in the declaration; the oracle holds."""
     g = _geometry("24_2")
     case = PagedCase(g, (300, 77), (q_len, q_len), page_size=16, layout="NHD", seed=21)
     plan = _plan_decode(case, g, q_len_per_req=q_len)
     route = plan.declaration["decode_route"]
-    assert route["tile"] == "decode_d256_f16" and route["s_q"] == q_len
     assert (
-        route["pack_gqa"] is False
+        route["tile"] == "decode_d256_f16"
+        and route["s_q"] == q_len
         and route["claimed"] is False
-        and route["n_q"] >= q_len
-    )
+    ), route
+    assert {k: route[k] for k in expect} == expect, route
     out = _run(plan, case)
     case.check_out(out, label=f"decode q{q_len} routed")
     case.check_written_rows(label=f"decode q{q_len} routed")
+
+
+@pytest.mark.parametrize(
+    "name, q_len", [("24_2", 3), ("32_2", 4)], ids=["24_2_q3", "32_2_q4"]
+)
+def test_decode_64_column_tile_in_one_token_unit(name, q_len):
+    """The 64-column decode tile (36 / 64 packed rows) in ONE token unit -- the KV streamed once -- routed and declared, not
+    claimed (the measured widths are 16 and 32); the oracle holds and the pools' step rows are written."""
+    g = _geometry(name)
+    case = PagedCase(g, (300, 77), (q_len, q_len), page_size=16, layout="NHD", seed=41)
+    plan = _plan_decode(case, g, q_len_per_req=q_len)
+    route = plan.declaration["decode_route"]
+    assert (
+        route["tile"],
+        route["n_q"],
+        route["token_units"],
+        route["pack_gqa"],
+        route["kv_streams"],
+        route["claimed"],
+    ) == ("decode_d256_f16", 64, 1, True, 1, False), route
+    out = _run(plan, case)
+    case.check_out(out, label=f"decode {name} q{q_len} 64-column tile")
+    case.check_written_rows(label=f"decode {name} q{q_len} 64-column tile")
+
+
+def test_decode_lowered_chain_against_the_fused_fork_control_arm():
+    """At decode row counts the vendored declaration lowers stage (1) to the unfused chain (the small-M slab GEMM, the norm +
+    RoPE pass, the separate cache write: the step measured faster on the cuDNN Frontend side); ``fuse_norm_rope_small_m=True``
+    (through the adapter's test hook) keeps the fused fork with the write-through folded into its epilogue -- the control arm.
+    Both hold the oracle, the two chains agree (two roundings of stage (1): not bitwise), and the stage lists are the two
+    chains'."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+    from tests.test_helpers.qwen_3_5_block_reference import cosine
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=43)
+    common = dict(
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=2,
+        q_len_per_req=2,
+        block_table=case.block_table,
+    )
+    dflt = _api.prepare("decode", **common)
+    ctl = _api.prepare(
+        "decode", _declaration_overrides={"fuse_norm_rope_small_m": True}, **common
+    )
+    d, c = dflt.declaration, ctl.declaration
+    assert d["fuse_norm_rope_effective"] is False and d["cache_write_fused"] is False, d
+    assert d["stages"][:3] == ["_Projection", "_QkNormRope", "_CacheWrite"], d["stages"]
+    assert c["fuse_norm_rope_effective"] is True and c["cache_write_fused"] is True, c
+    assert c["stages"][0] == "_FusedQkvProjection" and not (
+        {"_QkNormRope", "_CacheWrite"} & set(c["stages"])
+    ), c["stages"]
+    a = _run(dflt, case)
+    case.check_out(a, label="decode lowered chain (default)")
+    case.check_written_rows(label="decode lowered chain (default)")
+    b = _run(ctl, case)
+    case.check_out(b, label="decode fused fork (control)")
+    case.check_written_rows(label="decode fused fork (control)")
+    assert cosine(a, b) > 0.9999, (
+        "the lowered chain and the fused fork compute the same function"
+    )
+
+
+def test_decode_prefill_route_when_the_step_fills_the_part():
+    """32 / 2 at batch 32 x q_len 8: 128 packed rows per (sequence, KV head) -- past the decode tile's single-unit widths -- and
+    ``batch x num_kv_heads = 64`` CTAs fill the part, so the default route policy declares the paged d256 PREFILL tile with the
+    group packed (the extend form's kernel at the dense step's own envelope: unsplit, the gate in its epilogue, one KV stream);
+    256 rows in all, so stage (1) keeps the fused fork; the oracle holds on every sequence and the pools' step rows are written."""
+    g = _geometry("32_2")
+    lens = tuple(40 + 9 * i for i in range(32))
+    case = PagedCase(g, lens, (8,) * 32, page_size=16, layout="NHD", seed=47)
+    plan = _plan_decode(case, g, q_len_per_req=8)
+    d = plan.declaration
+    route = d["decode_route"]
+    assert (
+        route["tile"],
+        route["pack_gqa"],
+        route["token_units"],
+        route["kv_streams"],
+        route["claimed"],
+    ) == ("prefill_d256_f16", True, 0, 1, False), route
+    assert d["decode_split_kv"] == 1 and d["gate_fused"] is True, d
+    assert (
+        "_SigmoidGate" not in d["stages"] and d["fuse_norm_rope_effective"] is True
+    ), d
+    out = _run(plan, case)
+    case.check_out(out, label="decode prefill route (batch 32, q8)")
+    case.check_written_rows(label="decode prefill route (batch 32, q8)")
 
 
 def test_decode_kv_pair_spelling_at_page_64_hnd():
@@ -362,8 +476,9 @@ def test_decode_unsplit_tile_runs_the_gate_as_its_own_launch():
 
 
 def test_decode_separate_cache_write_launch():
-    """The write-through as its own launch (``fuse_cache_write=False`` on the vendored declaration, through the adapter's test
-    hook): the vendored ``kernels/cache_write.py`` arm writes the pools the oracle predicts."""
+    """The write-through as its own launch: the default at decode row counts (the lowered chain) and, by the explicit
+    ``fuse_cache_write=False`` on the vendored declaration through the adapter's test hook, on every decode plan -- the vendored
+    ``kernels/cache_write.py`` arm writes the pools the oracle predicts."""
     from flashinfer.experimental.qwen_3_5_block import api as _api
 
     g = _geometry("24_2")
@@ -383,6 +498,7 @@ def test_decode_separate_cache_write_launch():
     )
     d = plan.declaration
     assert d["cache_write_fused"] is False and "_CacheWrite" in d["stages"], d
+    assert d["fuse_norm_rope_effective"] is False, d
     out = _run(plan, case)
     case.check_out(out, label="decode separate cache write")
     case.check_written_rows(label="decode separate cache write")

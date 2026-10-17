@@ -108,9 +108,9 @@ def test_version_probe_and_vendored_manifest_digests():
     src = support.source()
     assert src.origin == "https://github.com/NVIDIA/cudnn-frontend"
     assert (
-        src.commit.startswith("fe8b50da0")
+        src.commit.startswith("aba744cd6")
         and src.version == "1.32.0"
-        and src.files == 95
+        and src.files == 99
     )
     assert (
         src.validated_cutedsl == "4.8.0"

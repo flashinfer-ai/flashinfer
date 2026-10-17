@@ -12,7 +12,13 @@ adds what that implementation predates -- the per-call THD epilogue gate the EXT
 FE helpers read facts from and the two binder classes the vendored ``_compiled_module`` shim hands out.
 
 It is the explicit, documented and only binder of the vendored tree (never a silent fallback, cuDNN Frontend's own rule),
-and it serves the half (bf16 / f16) plans the Qwen 3.5 block declares; a quantized plan is a typed decline.
+and it serves the half (bf16 / f16) plans the Qwen 3.5 block declares; a quantized plan is a typed decline, and so is a split
+plan with an attention sink: cuDNN Frontend's dense binder (its ``sdpa_dense_binding.cpp`` since the Rubin decode levers) folds
+the sink in the split combine and appends the fp32 ``[H]`` sink pointer and, over padded query lengths, the int32 ``[B]``
+Q-length address to the combine frame (``DenseLaunchSpec.combine_q_lens``); this binder binds neither slot and says so by
+name (``supports_combine_q_lens`` is False, which the vendored ``prepared.py`` reads before it builds such a plan).  The Qwen
+3.5 block has no attention sink, and on cc 10.7 the adapter keeps the sink-free dense split contract, so the decline is never
+reached on the served device.
 """
 
 from __future__ import annotations
@@ -185,6 +191,11 @@ class SdpaDenseBinder:
 
     supports_epilogue_gate = True
     supports_paged_epilogue_gate = True
+    # The split attention-sink combine's frame slots (the extension appends the fp32 [H] sink pointer and, over padded query
+    # lengths, the int32 [B] Q-length address: ``DenseLaunchSpec.combine_q_lens``) are not bound here: a split plan with a sink is
+    # the typed decline below, and the vendored ``prepared.py`` reads this flag to decline the padded-Q form by name before it
+    # builds the plan.  The vendored shim's ``_SdpaDenseBinder`` carries the same value (``vendor.py``, ``PYTHON_BINDER_FLAGS``).
+    supports_combine_q_lens = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaDenseBinder")
@@ -192,8 +203,19 @@ class SdpaDenseBinder:
             raise NotImplementedError(
                 "SdpaDenseBinder: the ragged-Q decode leg is not served by the Python binder"
             )
+        if int(spec.split) < 1:
+            raise ValueError("cudnn.sdpa: a dense plan needs split >= 1")
         if int(spec.split) > 1 and spec.combine is None:
             raise ValueError("cudnn.sdpa: a split plan needs a combine artifact")
+        if int(spec.split) > 1 and (
+            bool(getattr(spec, "has_sink", False))
+            or bool(getattr(spec, "combine_q_lens", False))
+        ):
+            raise NotImplementedError(
+                "SdpaDenseBinder: a split plan with an attention sink is not served by the Python binder (the split combine's "
+                "sink pointer and per-batch Q-length frame slots are the native binder's); the Qwen 3.5 block declares no sink, "
+                "and cc 10.7 dense plans keep the sink-free split contract, so this form is never declared on the served device"
+            )
         self.spec = spec
 
     def execute(

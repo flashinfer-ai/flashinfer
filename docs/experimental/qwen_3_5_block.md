@@ -28,7 +28,7 @@ Three serving forms over the stack's own paged KV cache, each its own compiled p
 |---|---|---|---|
 | prefill | `qwen_3_5_block_bf16_prefill` | a uniform `[batch, seq]` step, no cached prefix | the step's own tokens |
 | extend | `qwen_3_5_block_bf16_extend` | a packed step of new tokens behind cached prefixes (chunked prefill, prefix-cache hit, speculative verify; an empty prefix is the prefill case), bounded by a token capacity | each sequence's whole logical range from the cache |
-| decode | `qwen_3_5_block_bf16_decode` | a uniform `[batch, q_len]` step, `q_len = 1 + drafts` | the cache (the Rubin d256 decode tile, split-KV; `decode_split_kv=1` runs it unsplit with the gate as its own launch) |
+| decode | `qwen_3_5_block_bf16_decode` | a uniform `[batch, q_len]` step, `q_len = 1 + drafts` | the cache (the Rubin d256 decode tile -- 16 / 32 / 64 columns in one token unit, two units past them -- split-KV with the gate in the split combine; the paged prefill tile with the group packed where a wider step fills the part; `decode_split_kv=1` runs the decode tile unsplit with the gate as its own launch) |
 
 `prepare_qwen_3_5_block_bf16(form, ...)` returns the plan behind each form (`Qwen35BlockPlan`: `run`, `workspace_size`,
 `declaration`, `supports`); `Qwen35BlockWrapper(workspace_buffer, kv_layout, geometry=...)` is the same thing in
@@ -121,8 +121,11 @@ No silent fallback: an unserved case never runs a slower path.
 - SM107 (Rubin, cc 10.7) only; `nvidia-cutlass-dsl >= 4.8.0` (the first wheel with the `sm_107a` target; the repository-wide
   floor is unchanged -- the kernels gate at runtime and decline by version); torch with CUDA 13; `cuda-python`.
 - bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; GQA groups as the Qwen3.5 shards have them
-  (32 / 2, 24 / 2, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed decode tile), up to 32
-  routed on the unpacked tile and declared, a typed decline past it; no LSE output, no sliding window, no soft-cap, no fp8
+  (32 / 2, 24 / 2, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed 16- / 32-column decode
+  tile), up to 32 routed and declared -- the 64-column tile in one or two token units, the paged prefill tile with the group packed
+  where the step fills the part (`batch x num_kv_heads >= 64`), the unpacked tile past a group's packed routes;
+  `plan.declaration["decode_route"]` names the kernel, its width, token units and KV streams -- and a typed decline past it; no LSE
+  output, no sliding window, no soft-cap, no fp8
   KV cache in this draft (the dtype suffix plan: `_fp8` / `_mxfp8` entry points later; the KV-cache dtype becomes an argument).
 - EXTEND plans of at most 128 tokens (`token_capacity <= 128`) run the out projection on the small-capacity GEMM tile, whose
   token rows are the kernel's epilogue-vector axis: every `num_actual_tokens` must be a multiple of `plan.live_rows_multiple`
@@ -157,12 +160,14 @@ is filtered: FlashInfer's `ExperimentalWarning` is this API's single opt-in sign
 ## Where the kernels come from
 
 The backend is a subset of the cuDNN Frontend Python package vendored byte-faithfully under `_cudnn_frost/`
-(95 files: the block's forward and its serving launches, the FROST SDPA adapter and its SM107 prefill / decode tiles and SM100
-split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX
-header, MIT or Apache-2.0), with only the import roots rewritten and four declared, exact-text patches (P0-P2 replace the
-nanobind extension's seams, P3 rewords eleven comment lines that named internal hosts or file paths; all listed in
+(99 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
+chain's norm + RoPE pass and cache write --, the FROST SDPA adapter and its SM107 prefill / decode tiles and SM100 split combine,
+the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
+Apache-2.0), with only the import roots rewritten and four declared, exact-text patches (P0-P2 replace the nanobind extension's
+seams, P3 rewords fourteen comment lines that named internal hosts, file paths or workflow vocabulary; all listed in
 `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`). Pinned revision: cuDNN Frontend
-`fe8b50da0` (1.32.0); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
+`aba744cd6` (1.32.0, with the Rubin decode levers: the 64-column decode tile, the decode-grid split combine and its lean group
+walk, the lowered small-M decode chain); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The
 kernels keep living in cuDNN Frontend and are re-vendored deliberately: the exporter, the closure list and the tracer live in
@@ -172,7 +177,9 @@ kernels keep living in cuDNN Frontend and are re-vendored deliberately: the expo
 
 `tests/experimental/qwen_3_5_block/`: the three forms against an fp32 torch oracle over the full sequences (Qwen3.5 24 / 2 at
 `d_model` 2560 and 32 / 2 at 4096, page 16 / 32 / 64 / 128, both cache layouts and the `(k, v)` pair spelling, short / long /
-padded sequences, decode `q_len` 1 and 4 on the packed tile and 8 / 32 routed on the unpacked one, the split model, an explicit
+padded sequences, decode `q_len` 1 and 4 on the packed tile, 3 / 4 on the 64-column tile in one token unit, 8 on two token units
+and 32 on the unpacked tile, the paged prefill route of a part-filling batch (32 / 2 at batch 32, `q_len` 8), the lowered small-M
+decode chain against its fused-fork control arm, the split model, an explicit
 split and the unsplit tile with the gate as its own launch, the separate cache-write launch, extend behind prefixes and as two
 chunks, the bounded token count and the small-capacity plans' live-row rule), CUDA-graph capture of the FIRST run of every form
 under `set_sync_debug_mode("error")` replayed bitwise (decode also over a new step), cached steps under the same mode, the typed
@@ -183,8 +190,9 @@ cudnn-frontend package; the public and internal CI matrices have no SM107 runner
 (support, weights, RoPE, isolation) run everywhere, including under the CI images' `nvidia-cutlass-dsl` 4.7.0, where the
 envelope declines by target.
 
-No performance number is claimed in this draft; the decode levers and a fused decode step are in flight on the cuDNN
-Frontend side and will be re-vendored before the final review.
+No performance number is claimed in this draft. The Rubin decode levers (the 64-column decode tile, the decode-grid split combine
+and its lean group walk, the lowered small-M decode chain) landed on the cuDNN Frontend side on 2026-10-16 and are vendored here;
+a fused decode step is still in flight there and will be re-vendored before the final review.
 
 Owner: @RomanAnders90. Tracking issue: TBD (opened with the PR). Graduation intent: re-vendor at each cuDNN Frontend
 release while the decode levers land, finalise the signatures with the vLLM integration, then graduate to a stable

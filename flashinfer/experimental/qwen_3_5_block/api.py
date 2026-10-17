@@ -979,11 +979,18 @@ def prepare(
         stages=[type(s).__name__ for s in blk._stages],
         gate_fused=bool(getattr(blk, "gate_fused", False)),
         cache_write_fused=bool(getattr(blk, "cache_write_fused", False)),
+        # what runs for stage (1): the fused norm + RoPE projection fork, or -- at decode row counts (B x q_len <= 128), the
+        # vendored declaration's own lowering -- the small-M slab GEMM, the norm + RoPE pass and the separate cache write
+        fuse_norm_rope_effective=bool(
+            getattr(
+                blk, "fuse_norm_rope_effective", getattr(blk, "fuse_norm_rope", False)
+            )
+        ),
         decode_split_kv=getattr(blk, "decode_split_kv", None),
         decode_route=None
         if route is None
         else {
-            k_: getattr(route, k_)
+            k_: getattr(route, k_, None)
             for k_ in (
                 "s_q",
                 "group",
@@ -992,6 +999,10 @@ def prepare(
                 "token_units",
                 "pack_gqa",
                 "claimed",
+                # appended with the Rubin decode levers: KV streams per (sequence, KV head), the route policy, the width cap
+                "kv_streams",
+                "policy",
+                "q_tile_max",
             )
         },
         out_proj_tile=out_proj_tile,
