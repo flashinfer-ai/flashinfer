@@ -467,7 +467,9 @@ def test_replayssm_verify_validation(invalid):
         cache["replayssm_rawv"] = cache["replayssm_rawv"].float()
     if invalid == "strides":
         cache["replayssm_g"] = cache["replayssm_g"].transpose(1, 2)
-    with pytest.raises((AssertionError, ValueError)):
+    # scatter trips the pre-existing ssm_state_indices assert before the ReplaySSM gate.
+    expected = AssertionError if invalid == "scatter" else ValueError
+    with pytest.raises(expected):
         gated_delta_rule_mtp(**args, cache_replayssm=invalid != "disabled", **cache)
 
 
