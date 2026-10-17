@@ -1846,6 +1846,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     the packed backend's final base-2 LSE and finite-sink semantics are
     documented in :meth:`SparseMLASm120Wrapper.run`.
 
+    On SM103, ``backend="auto"`` may select a CuTe DSL small-head kernel for
+    ordinary FP8 decode with 16 heads and 1/2/4 query rows, or 32 heads and 1/2
+    rows, using width-640 physical-offset sparse indices. This uses the caller's
+    workspace and requires CuTe DSL 4.8+ and PDL. Unsupported calls, a supplied
+    native counter, or a shape first seen during graph capture retain the native
+    route. Explicit ``backend="trtllm-gen"`` always retains the cubin backend.
+
     With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
@@ -2146,6 +2153,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         selects the Cake mixed-cache decode instead (BF16 numerics route,
         both caches dequantized exactly on chip).
     """
+    requested_backend = backend
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
         kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)
@@ -2660,6 +2668,40 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         remapped_sparse_indices_buffer = torch.empty_like(sparse_indices)
     else:
         remapped_sparse_indices_buffer = sparse_indices
+
+    # Keep explicit backend choice and the existing HCA contract unchanged.
+    # This bounded automatic route consumes already-physical sparse offsets;
+    # logical remapping and padded/ragged requests retain the native launcher.
+    if (
+        requested_backend == "auto"
+        and q_len_per_request == 1
+        and cum_seq_lens_q is None
+        and not rope_quant
+        and not needs_index_remap
+        and multi_ctas_kv_counter_buffer is None
+        and sparse_topk_lens_offset == 0
+        and extra_sparse_indices is None
+        and extra_sparse_topk_lens is None
+        and query.numel() == metadata_rows * query_flat.size(1) * 512
+        and out.is_contiguous()
+    ):
+        from ._smallhead import try_run as try_smallhead_decode
+
+        if try_smallhead_decode(
+            query=query_flat,
+            swa_kv_cache=swa_kv_cache,
+            compressed_kv_cache=compressed_kv_cache,
+            sparse_indices=sparse_indices,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            sinks=sinks,
+            workspace_buffer=workspace_buffer,
+            out=out.view(metadata_rows, query_flat.size(1), 512),
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            enable_pdl=enable_pdl,
+        ):
+            return out
 
     op = get_trtllm_gen_fmha_module()
     run_func = getattr(op, "trtllm_paged_attention_decode_sparse_mla_dsv4", None)
