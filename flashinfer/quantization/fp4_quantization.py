@@ -348,13 +348,9 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf_size = _compute_swizzled_layout_sf_size(
                 m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
             )
-            out_sf_size_padded = out_sf_size
         else:
             out_sf_size = m * k // sf_vec_size
-            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
-        out_sf = torch.empty(
-            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
-        )
+        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
         module.fp4_quantize(
             input,
             global_scale,
@@ -368,7 +364,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             enable_pdl,
             nvfp4_4over6_code,
         )
-        return out_val, out_sf[:out_sf_size]
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
