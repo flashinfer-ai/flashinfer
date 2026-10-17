@@ -109,10 +109,6 @@ constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 #define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads)
 #endif
 
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
-#define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
-#endif
-
 template <typename T>
 struct ValueCount {
   T value;
@@ -623,13 +619,8 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     }
 
     bool greater_than_u_diff[VEC_SIZE];
-#ifdef FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
         .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
-#else
-    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .template FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
-#endif
     __syncthreads();
 
 #pragma unroll
