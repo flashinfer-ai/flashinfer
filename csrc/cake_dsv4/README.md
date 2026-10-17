@@ -265,7 +265,9 @@ is launched as a programmatic dependent of the decode grid when `enable_pdl`
 is set (`None` = device default; the merge waits for the decode's memory before
 its first load, so both settings are bitwise identical). The names are distinct
 from the NVFP4 family above so the two generated kernel sets never share a
-translation unit, header, manifest or JIT module name. Without the manifest,
+translation unit, kernel header, manifest or JIT module name (the two host
+bindings share only the hand-written tensor checks in
+`cake_sparse_mla_sm120_host_checks.h`). Without the manifest,
 `flashinfer.mla.cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]`
 is `False`, the planners run on the provisional geometry and the first launch
 raises `FileNotFoundError` naming the expected manifest location.
