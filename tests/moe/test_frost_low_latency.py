@@ -269,10 +269,16 @@ def test_frost_capability_and_metadata_rejections():
         ep.check_support()
 
 
-def test_frost_declines_old_compiler(monkeypatch):
+@pytest.mark.parametrize("installed", ["4.7.1", "4.8.0.dev0", None])
+def test_frost_declines_unsupported_compiler(monkeypatch, installed):
     from flashinfer.fused_moe.backends.frost_low_latency import runner as module
 
-    monkeypatch.setattr(module, "version", lambda name: "4.7.1")
+    def probe(name):
+        if installed is None:
+            raise module.PackageNotFoundError(name)
+        return installed
+
+    monkeypatch.setattr(module, "version", probe)
     config = MoEConfig(
         RoutingConfig(8, 2),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),

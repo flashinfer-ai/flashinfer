@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Import-light adapter for the unified MoELayer API."""
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 from packaging.version import Version
@@ -40,7 +40,11 @@ class FrostLowLatencyRunner(MoERunner):
 
     def _check_support(self):
         super()._check_support()
-        if Version(version("nvidia-cutlass-dsl")) < Version("4.8"):
+        try:
+            installed = Version(version("nvidia-cutlass-dsl"))
+        except PackageNotFoundError:
+            installed = None
+        if installed is None or installed < Version("4.8"):
             raise NotImplementedError(
                 "frost_low_latency requires nvidia-cutlass-dsl >= 4.8"
             )
