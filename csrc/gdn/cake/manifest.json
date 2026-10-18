@@ -10,9 +10,6 @@
       "path": "../cake_gdn_common.cuh"
     },
     {
-      "path": "cuda/gdn_prefill_generated.cuh"
-    },
-    {
       "path": "cake_gdn_device_common.cuh"
     }
   ],
