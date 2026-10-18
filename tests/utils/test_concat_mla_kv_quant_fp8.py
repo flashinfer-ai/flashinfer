@@ -215,6 +215,35 @@ def test_every_head_count_has_a_delivered_route():
     assert mla_kv_pack_jit.head_groups() == (1, 2, 3, 4)
 
 
+def test_every_program_binds_the_shared_launcher():
+    """One binding serves the four head-group programs: every build names its
+    own kernel through ``-DCAKE_KERNEL_SYMBOL`` and keeps its kernel symbol.
+    Needs a visible CUDA architecture (a GPU or ``FLASHINFER_CUDA_ARCH_LIST``)
+    for the spec, not a GPU."""
+    csrc_dir = mla_kv_pack_jit._get_csrc_dir()
+    binding = csrc_dir / "cake_concat_mla_kv_quant_fp8_binding.cu"
+    text = binding.read_text(encoding="utf-8")
+    assert "#ifndef CAKE_KERNEL_SYMBOL\n#error " in text
+    assert text.count("CAKE_HOST_SHIM_NAMESPACE::Run") == 1
+    assert not (csrc_dir / "cake_concat_mla_kv_quant_fp8_host_common.cuh").exists()
+    symbols = set()
+    for name, record in mla_kv_pack_jit.MODULES.items():
+        assert record["sources"][1] == binding.name
+        assert record["kernel_symbol"] == f"kernel_{name}"
+        symbols.add(record["kernel_symbol"])
+    assert len(symbols) == len(mla_kv_pack_jit.MODULES) == 4
+    for target in ("sm100a", "sm103a"):
+        specs = mla_kv_pack_jit.gen_concat_mla_kv_quant_fp8_aot_modules(target)
+        assert len(specs) == 4
+        for head_group, spec in zip((1, 2, 3, 4), specs, strict=True):
+            route = mla_kv_pack_jit.ROUTES[mla_kv_pack_jit.route_key(head_group)]
+            record = mla_kv_pack_jit.MODULES[route["module"]]
+            assert spec.sources[1] == binding
+            define = f"-DCAKE_KERNEL_SYMBOL={record['kernel_symbol']}"
+            assert spec.extra_cuda_cflags.count(define) == 1
+            assert sum("CAKE_KERNEL_SYMBOL" in f for f in spec.extra_cuda_cflags) == 1
+
+
 @pytest.mark.parametrize(
     ("capability", "expected"),
     [((10, 0), "sm100a"), ((10, 3), "sm103a"), ((9, 0), None), ((12, 0), None)],

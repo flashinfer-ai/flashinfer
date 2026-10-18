@@ -21,7 +21,9 @@ limitations under the License.
 # ``(num_tokens, num_heads)`` by ``flashinfer.mla_kv_pack._plan_head_group`` --
 # and every program serves every token count and head count (both are runtime
 # launch arguments) on both exact targets, compiled with the exact flag set of
-# the device it runs on.  ``MODULES`` and ``ROUTES`` are written by the Cake
+# the device it runs on.  Every program compiles its own kernel source plus the
+# one shared binding, which takes the program's kernel symbol from
+# ``-DCAKE_KERNEL_SYMBOL``.  ``MODULES`` and ``ROUTES`` are written by the Cake
 # export; the empty tables are the source-only placeholder and every route
 # lookup fails until they are filled.
 
@@ -52,15 +54,18 @@ _TARGET_BY_CAPABILITY: dict[tuple[int, int], ConcatMlaKvQuantFp8Target] = {
 GENERATED_DIR = "cake_concat_mla_kv_quant_fp8"
 
 # program name -> {"sources": [kernel, binding] (relative to the csrc family
-# directory), "template", "ffi_entry", "compile_flags", "arg_plan",
-# "launch_block", "cluster", "dynamic_smem_bytes", "use_pdl", "head_group",
-# "min_blocks", "closure": {target: sealed closure identity}}.
+# directory; the binding is shared by every program and reads the program's
+# kernel symbol from -DCAKE_KERNEL_SYMBOL), "kernel_symbol", "template",
+# "ffi_entry", "compile_flags", "arg_plan", "launch_block", "cluster",
+# "dynamic_smem_bytes", "use_pdl", "head_group", "min_blocks",
+# "closure": {target: sealed closure identity}}.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5": {
         "sources": [
             "cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5",
         "template": "concat_mla_kv_quant_fp8_hg4",
         "head_group": 4,
         "min_blocks": 3,
@@ -92,8 +97,9 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e": {
         "sources": [
             "cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e",
         "template": "concat_mla_kv_quant_fp8_hg3",
         "head_group": 3,
         "min_blocks": 3,
@@ -125,8 +131,9 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41": {
         "sources": [
             "cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41",
         "template": "concat_mla_kv_quant_fp8_hg2",
         "head_group": 2,
         "min_blocks": 6,
@@ -158,8 +165,9 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c": {
         "sources": [
             "cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c",
         "template": "concat_mla_kv_quant_fp8_hg1",
         "head_group": 1,
         "min_blocks": 8,
@@ -291,7 +299,11 @@ def gen_concat_mla_kv_quant_fp8_module(
     spec = gen_jit_spec(
         name=f"cake_concat_mla_kv_quant_fp8_{target}_hg{int(head_group)}_{record['closure'][target][:20]}",
         sources=[csrc / source for source in record["sources"]],
-        extra_cuda_cflags=[*_TARGET_FLAGS[target], *record["compile_flags"]],
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            *record["compile_flags"],
+            f"-DCAKE_KERNEL_SYMBOL={record['kernel_symbol']}",
+        ],
         extra_include_paths=[csrc, csrc.parent, _get_include_dir()],
         needs_device_linking=True,
     )
