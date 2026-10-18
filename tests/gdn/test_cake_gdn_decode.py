@@ -96,11 +96,36 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
             served.extend(output["architectures"])
         assert sorted(served) == sorted(record["architectures"])
         assert (root / record["host_binding"]["path"]).is_file()
-        for key, value in record["defines"].items():
+        # A record spells out ``defines`` only where its -D flags are not its
+        # specializations (see test_manifest_defines_default_to_specializations).
+        for key, value in record.get("defines", {}).items():
             assert key.isidentifier()
             assert isinstance(value, str) and value
-        assert set(record["defines"]) <= set(record["specializations"])
+        assert set(record.get("defines", {})) <= set(record["specializations"])
     assert included_headers == header_names
+
+
+def test_manifest_defines_default_to_specializations() -> None:
+    # The -D flags of a record are its specializations unless it spells out
+    # ``defines``: the decode bodies that bake their constants in-file take
+    # none, and some bodies take only a subset of the specialization keys.  A
+    # record never repeats its specializations as ``defines``.
+    variants = cake_gdn._manifest()["variants"]
+    explicit = 0
+    for record in variants:
+        flags = cake_gdn._define_flags(record)
+        from_specializations = tuple(
+            f"-D{key}={value}" for key, value in record["specializations"].items()
+        )
+        if "defines" in record:
+            explicit += 1
+            assert flags == tuple(
+                f"-D{key}={value}" for key, value in record["defines"].items()
+            )
+            assert flags != from_specializations
+        else:
+            assert flags == from_specializations
+    assert 0 < explicit < len(variants)
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:

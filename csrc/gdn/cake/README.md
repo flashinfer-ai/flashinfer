@@ -10,9 +10,11 @@ with per-variant SASS equivalence checks against the generated originals.
 
 - `manifest.json` is the only registry. Each entry under `variants` names
   its kernel sources (`outputs[].path`, each shared by every specialization of
-  the same kernel body), the compile-time `defines` that specialize them
-  (passed as `-D` flags), the `specializations` the resolver matches, and
-  one host shim (`host_binding`).
+  the same kernel body), the `specializations` the resolver matches (also
+  passed as the `-D` flags that specialize the body, unless the entry spells
+  out its own `defines`: the decode bodies that bake their constants in-file
+  take none, and some bodies take only a subset of the keys), and one host
+  shim (`host_binding`).
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
   outputs of a record partition its `architectures`, and the loader
