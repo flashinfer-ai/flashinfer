@@ -3,6 +3,7 @@
 import importlib
 import inspect
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -340,3 +341,122 @@ def test_dcp_static_uri_names_the_program_target_and_constants(target) -> None:
         )
     with pytest.raises(ValueError):
         get_dcp_spec_static_uri("bf16_v1", "retain0", target, constants)
+
+
+# ---------------------------------------------------------------------------
+# Folded static program sources
+# ---------------------------------------------------------------------------
+#
+# The programs of a static family compile one kernel source
+# (``cuda/dcp_spec/<family>_kernel.cu``; fp8_d256 one per architecture) and one
+# binding source (``cuda/dcp_spec/<family>_binding.cu``).  The
+# ``-DCAKE_FMHA_DCP_*`` values in a program's ``compile_flags`` select its text:
+# the retain flag, the split class (1, 2, or 0 for the NUM_SPLIT-generic text)
+# and, for the per-architecture fp8_d256 binding, the architecture.
+
+_DCP_STATIC_SPLIT_CLASS = {"split1": 1, "split2": 2, "splitn": 0}
+_DCP_STATIC_NUM_SPLIT = {"split1": 1, "split2": 2, "splitn": 4}
+
+
+def _dcp_static_program_knobs(program) -> dict[str, int]:
+    """The compile-line knobs a static program's family, instance and arches imply."""
+
+    family, instance = program["family"], program["instance"]
+    knobs = {}
+    if family in ("bf16_v1", "fp8_d128"):
+        knobs["CAKE_FMHA_DCP_RETAIN_KV_L2"] = int(instance.rsplit("retain", 1)[1])
+    if family != "bf16_v1":
+        knobs["CAKE_FMHA_DCP_SPLIT_CLASS"] = _DCP_STATIC_SPLIT_CLASS[
+            instance.split("_")[0]
+        ]
+    if family == "fp8_d256":
+        (arch,) = program["arches"]
+        knobs["CAKE_FMHA_DCP_ARCH"] = int(arch[3:-1])  # "sm_100a" -> 100
+    return knobs
+
+
+def _dcp_static_sources(program) -> list[str]:
+    family = program["family"]
+    kernel = f"cuda/dcp_spec/{family}_kernel.cu"
+    if family == "fp8_d256":
+        (arch,) = program["arches"]
+        kernel = f"cuda/dcp_spec/{family}_{arch}_kernel.cu"
+    return [kernel, f"cuda/dcp_spec/{family}_binding.cu"]
+
+
+def test_dcp_static_programs_share_one_folded_source_per_family() -> None:
+    """Each program compiles its family's folded sources; its flags pin the text."""
+
+    programs = get_dcp_spec_registry()["programs"]
+    csrc_dir = Path(get_cake_fmha_csrc_dir())
+    texts = {}
+    for name, program in programs.items():
+        assert program["sources"] == _dcp_static_sources(program), name
+        knobs = _dcp_static_program_knobs(program)
+        assert program["compile_flags"] == [
+            "--use_fast_math",
+            *(f"-D{knob}={value}" for knob, value in sorted(knobs.items())),
+        ], name
+        kernel, binding = program["sources"]
+        for source in (kernel, binding):
+            texts.setdefault(source, (csrc_dir / source).read_text(encoding="utf-8"))
+        assert f"\nkernel_{name}(" in texts[kernel], name
+        assert f'extern "C" __global__ void kernel_{name}(' in texts[binding], name
+    for source, text in texts.items():
+        knobs = {
+            knob
+            for program in programs.values()
+            if source in program["sources"]
+            for knob in _dcp_static_program_knobs(program)
+        }
+        if source.endswith("_kernel.cu"):
+            knobs.discard("CAKE_FMHA_DCP_ARCH")  # per-arch kernel files, no guard
+        assert knobs, source
+        for knob in sorted(knobs):
+            macro = knob
+            if knob == "CAKE_FMHA_DCP_RETAIN_KV_L2" and source.endswith("_kernel.cu"):
+                macro = "RETAIN_KV_L2"
+                assert f"#define {macro} {knob}\n" in text, source
+                assert not re.search(rf"^#define {macro} \d+$", text, re.M), source
+            # the fold tool's guard forms: #if M, #if !M, #if M == v, #if M != v
+            guard = rf"^#if !?{macro}(?: (?:==|!=) -?\d+)?$"
+            opened = len(re.findall(guard, text, re.M))
+            assert opened == text.count(f"#endif  // {macro}\n") > 0, (source, knob)
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
+def test_dcp_static_jit_passes_the_program_knobs_and_folded_sources(
+    monkeypatch, target
+) -> None:
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
+    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
+    monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        jit_dcp, "gen_jit_spec", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    registry = get_dcp_spec_registry()
+    arch = jit_dcp._TARGET_MANIFEST_ARCH[target]
+    for family, instances in registry["static_routes"].items():
+        for instance, by_arch in instances.items():
+            name = by_arch[arch]
+            program = registry["programs"][name]
+            constants = {
+                "Q_LEN": 4,
+                "CP_WORLD": 4,
+                "NUM_Q_HEADS": 64,
+                "NUM_KV_HEADS": 8,
+            }
+            if "NUM_SPLIT" in program["specializations"]:
+                constants["NUM_SPLIT"] = _DCP_STATIC_NUM_SPLIT[instance.split("_")[0]]
+            spec = jit_dcp.gen_dcp_spec_static_module(
+                family, instance, target, constants
+            )
+            assert spec.name == get_dcp_spec_static_uri(
+                family, instance, target, constants
+            )
+            assert [
+                source.relative_to(source_dir).as_posix() for source in spec.sources
+            ] == _dcp_static_sources(program)
+            assert "--use_fast_math" in spec.extra_cuda_cflags
+            for knob, value in _dcp_static_program_knobs(program).items():
+                assert f"-D{knob}={value}" in spec.extra_cuda_cflags, (name, knob)
