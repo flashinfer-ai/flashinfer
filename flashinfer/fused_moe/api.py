@@ -2797,9 +2797,11 @@ class CudnnFrostMxfp8Mxfp4Config:
 class FrostLowLatencyConfig:
     """Low-token MXFP8 x MXFP4/MXFP8 routed MoE on SM100/SM103.
 
-    Explicit opt-in; omitted from the default backend list. The fused GU,
-    SwiGLU and MXFP8 quantizer feeds a PDL-dependent Down GEMM. This is a
-    multi-kernel pipeline, with precomputed routing and no EP communication.
+    Explicit opt-in; omitted from the default backend list. Autotuning selects
+    Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
+    prepared weights and numerical contract. Both are multi-kernel pipelines,
+    with precomputed routing and no EP communication. The Tensor Core path
+    overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
     Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
     Prepare other backend views as well to permit fallback for larger inputs.
     """

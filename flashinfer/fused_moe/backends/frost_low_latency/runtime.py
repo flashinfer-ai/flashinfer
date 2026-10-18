@@ -20,6 +20,10 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if tile_k == ("ffma", 1):
+        from .fma.runtime import execute as execute_fma
+
+        return execute_fma(inputs, config)
     with torch.cuda.device(inputs[0].device):
         return _execute(inputs, config, tile_k)
 
@@ -112,9 +116,11 @@ def _execute(inputs, config, tile_k):
                     cute.compile(pack_scale, *sfargs, stream),
                     cute.compile(pipeline.gate_up, p1, activation, stream),
                     cute.compile(pipeline.down_project, p2, stream),
-                    cute.compile(combine, *reduceargs, narrow_weights, stream)
-                    if config.finalize.do_finalize
-                    else None,
+                    (
+                        cute.compile(combine, *reduceargs, narrow_weights, stream)
+                        if config.finalize.do_finalize
+                        else None
+                    ),
                 )
                 _COMPILED[key] = compiled
     compiled[0](*sfargs, stream)

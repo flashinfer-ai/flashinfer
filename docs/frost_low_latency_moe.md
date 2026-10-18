@@ -4,6 +4,39 @@
 SM100/SM103. It uses CuTe DSL and the existing FlashInfer low-latency blockscaled
 GEMM's TMA producers and epilogue. It does not depend on cuDNN.
 
+The backend owns both scalar FMA and Tensor Core tactics. FMA reuses the device
+implementation previously embedded in `cudnn_frost`, while reading the same
+prepared weights as the Tensor Core tactic. Switching tactics needs no second
+weight copy, requantization, or per-call layout conversion. Autotuning compares
+the complete pipelines; the untuned default remains Tensor Core.
+
+```mermaid
+flowchart TD
+  W[One prepared MX weight view] --> A[Low-latency runner and per-call workspace]
+  A --> T[Tensor Core tactic: tile K 128 or 256]
+  A --> F[FMA tactic: top-k at most 32]
+  T --> S[Shared FP32 SwiGLU and MXFP8 intermediate contract]
+  F --> S
+  S --> O[BF16 expert results and ordered FP32 FMA combine]
+  L[Legacy cudnn_frost callers] --> C[Compatibility adapters: original numerics]
+  C --> D[Shared FMA device source]
+  F --> D
+```
+
+Code sharing does not make the old and new numerical contracts interchangeable:
+
+| Boundary | Low-latency FMA and TC | Legacy MX FMA adapter |
+|---|---|---|
+| Activation before MXFP8 quantization | FP32 | Rounded to BF16 first |
+| Activation parameters | Layer's SwiGLU alpha/beta/limit | Existing admitted defaults |
+| Expert result | BF16 | BF16 |
+| Weighted combine | Slot-ordered FP32 FMA | Separate FP32 multiply and slot-ordered add |
+
+Legacy entry points preserve these behaviors. Their compatibility mode is fixed
+by the adapter and is never an autotuning choice in the low-latency backend.
+Dot-product accumulation order may differ between FMA and Tensor Core; the
+independent reference tests enforce the documented numerical tolerances.
+
 ```mermaid
 flowchart LR
   X[MXFP8 input + linear UE8M0 scales] --> S[Pack input scales]
@@ -76,7 +109,7 @@ config = MoEConfig(
 layer = MoELayer(config)
 act = MoEActivationPack(x_q, x_linear_ue8m0_scale, topk_ids, topk_weights)
 with autotune(True):
-    y = layer(act, weights)  # select tile K and warm up before CUDA Graph capture
+    y = layer(act, weights)  # select tactic and warm up before CUDA Graph capture
 ```
 
 For cross-backend selection, include e.g. `TrtllmFp4Config()` in `BackendOptions`
@@ -169,6 +202,9 @@ numerical/stability controls. Use the commands with the recorded source/compiler
 versions: native tactic IDs are version dependent. `--trtllm-tactic`,
 `--cute-tactic` and `--frost-tile-k` pin the recorded configurations; omitting them
 allows fresh autotuning. `--include-native-default` retains the original heuristic.
+Use `--frost-ffma` to pin the FMA tactic for a paired comparison with a pinned
+Tensor Core tile. The performance table above records the original Tensor Core
+pipeline; it does not attribute those gains to the newly unified FMA tactic.
 
 ## Extension opportunities
 

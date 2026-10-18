@@ -60,10 +60,19 @@ def main():
     parser.add_argument("--include-cutedsl", action="store_true")
     parser.add_argument("--include-native-default", action="store_true")
     parser.add_argument(
+        "--include-frost-tactics",
+        action="store_true",
+        help="Also measure both TC tiles and FFMA separately through MoELayer",
+    )
+    parser.add_argument(
         "--trtllm-tactic", help="Pin a previously measured tactic tuple"
     )
     parser.add_argument("--cute-tactic", help="Pin a previously measured tactic tuple")
-    parser.add_argument("--frost-tile-k", type=int, choices=(128, 256))
+    frost = parser.add_mutually_exclusive_group()
+    frost.add_argument("--frost-tile-k", type=int, choices=(128, 256))
+    frost.add_argument(
+        "--frost-ffma", action="store_true", help="Pin the scalar FMA tactic"
+    )
     parser.add_argument("--output", type=Path, required=True)
     a = parser.parse_args()
     if (
@@ -188,10 +197,25 @@ def main():
             default_layer._winners[key] = (runner, -1)
         default_layer(act, weights)
         layers["trtllm_default"] = default_layer
+    if a.include_frost_tactics:
+        for name, tactic in (
+            ("frost_tc128", 128),
+            ("frost_tc256", 256),
+            ("frost_ffma", ("ffma", 1)),
+        ):
+            layer = MoELayer(layers["frost"].config)
+            layer(act, weights)
+            for key, (runner, _) in list(layer._winners.items()):
+                packed = runner.pack_inputs(act, weights)
+                if tactic not in runner.get_valid_tactics(packed, None):
+                    raise ValueError(f"{name} does not support this geometry")
+                layer._winners[key] = (runner, tactic)
+            layer(act, weights)
+            layers[name] = layer
     for name, requested in (
         ("trtllm", a.trtllm_tactic),
         ("cute_dsl", a.cute_tactic),
-        ("frost", a.frost_tile_k),
+        ("frost", ("ffma", 1) if a.frost_ffma else a.frost_tile_k),
     ):
         if requested is None:
             continue
@@ -290,7 +314,9 @@ def main():
     medians = {
         name: median([v for row in rows for v in row]) for name, rows in samples.items()
     }
-    best_original = min((name for name in medians if name != "frost"), key=medians.get)
+    best_original = min(
+        (name for name in medians if not name.startswith("frost")), key=medians.get
+    )
     result = dict(
         args={**vars(a), "output": str(a.output)},
         gpu=torch.cuda.get_device_name(),

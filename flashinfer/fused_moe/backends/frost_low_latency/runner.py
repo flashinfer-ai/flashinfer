@@ -77,13 +77,17 @@ class FrostLowLatencyRunner(MoERunner):
 
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
+            "unified-fma-tc-v1",
             self.options.max_num_tokens,
             self.config.execution.enable_pdl,
         )
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
-        return [k for k in (128, 256) if inputs[0].shape[1] % k == 0]
+        tactics = [k for k in (128, 256) if inputs[0].shape[1] % k == 0]
+        if self.config.routing.top_k <= 32:
+            tactics.append(("ffma", 1))
+        return tactics
 
     def pack_inputs(self, act, weights):
         self._require_built()

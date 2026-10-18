@@ -1340,6 +1340,63 @@ def test_bf16_fma_tactic_is_limited_to_sm107(monkeypatch):
             assert (tactic is not None) == expected
 
 
+@pytest.mark.parametrize("family", ["bf16", "mxfp8", "nvfp4"])
+def test_fma_shared_source_identity(family):
+    """Legacy source verification must cover the relocated device bodies."""
+    adapter = importlib.import_module(
+        f"flashinfer.fused_moe.backends.cudnn_frost.{family}.fma"
+    )
+    assert len(adapter.source_digest()) == 64
+    requirements = dict(adapter._requirements())
+    for name in adapter._KERNELS:
+        path = adapter._DEVICE_ROOT / name
+        assert path in requirements
+        assert requirements[path] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@frost_gpu
+@pytest.mark.parametrize("tokens", [1, 4])
+@pytest.mark.parametrize("name", ["swiglu", "situ", "relu2"])
+def test_legacy_bf16_fma_shared_pipeline(tokens, name):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("legacy FMA admission is SM107 only")
+    torch.manual_seed(813)
+    activation = ACTIVATIONS[name]()
+    cfg = replace(
+        bf16_config(topk=6, experts=64, intermediate=1408), activation=activation
+    )
+    act, weights = bf16_packs(
+        tokens=tokens, topk=6, experts=64, hidden=2048, intermediate=1408
+    )
+    view = weights.get_view("cutlass_bf16")
+    if not activation.is_gated:
+        view["fc1_expert_weights"] = view["fc1_expert_weights"][:, :1408].contiguous()
+    if name == "situ":
+        act.hidden_states_q.mul_(8)
+        view["fc1_expert_weights"].mul_(16)
+    runner = bf16_moe.CudnnFrostBf16MoeRunner(cfg, "cuda")
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    tactics = [v for v in runner.get_valid_tactics(inputs, None) if "fma" in str(v[0])]
+    assert len(tactics) == 1
+    output = runner.forward(inputs, tactics[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs, tactics[0])
+    for _step in range(3):
+        act.topk_ids.copy_((act.topk_ids + 13) % 64)
+        act.topk_weights.mul_(0.5)
+        act.hidden_states_q.mul_(0.5)
+        output.fill_(float("nan"))
+        graph.replay()
+        reference = _bf16_moe_reference(act, weights, activation)
+        assert torch.isfinite(output).all() and reference.float().norm() > 0
+        assert (
+            output.float() - reference.float()
+        ).norm() / reference.float().norm() < 0.01
+
+
 def test_bf16_shortlist_survives_autotuner_plain_tensor_profiles(
     monkeypatch, frost_engine_cpu
 ):
@@ -2317,6 +2374,22 @@ def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, fc1_outp
     )
 
 
+@frost_gpu
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_legacy_mx_fma_shared_pipeline(mixed, tokens, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("legacy FMA admission is SM107 only")
+    _assert_mxfp8_moe_full_pipeline_and_graph(
+        "swiglu",
+        False,
+        monkeypatch,
+        mixed=mixed,
+        geometry=(tokens, 2048, 1408, 64, 6),
+        require_fma=True,
+    )
+
+
 def _assert_mxfp8_moe_full_pipeline_and_graph(
     name,
     swizzled,
@@ -3001,7 +3074,12 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
 def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
-    name, swizzled, fc1_output, monkeypatch, geometry=(17, 256, 256, 4, 2)
+    name,
+    swizzled,
+    fc1_output,
+    monkeypatch,
+    geometry=(17, 256, 256, 4, 2),
+    require_fma=False,
 ):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
@@ -3090,7 +3168,9 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
     runner.build()
     inputs = runner.pack_inputs(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) == 4
+    assert len(tactics) == 4 + int(require_fma)
+    if require_fma:
+        assert "fma" in tactics[-1][0]
     assert inputs[6] is view["fc1_weight_block_scale"]
     assert runner.get_valid_tactics(list(inputs), None) == tactics
 
@@ -3132,8 +3212,14 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         with torch.cuda.graph(graph):
             runner.forward(list(inputs), tactic, launch_state=inputs.launch_state)
         ids.fill_(e - 1)
-        ids[::3] = -1
-        ids[1::3] = e
+        if t == 1:
+            # Retain one valid slot so the T1 replay reference is nonzero.
+            ids[0, 1] = -1
+            if k > 2:
+                ids[0, 2] = e
+        else:
+            ids[::3] = -1
+            ids[1::3] = e
         scores.mul_(0.5)
         xq.bitwise_xor_(0x88)
         xsf.view(torch.uint8).add_(1)
@@ -3148,6 +3234,21 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         check(out)
     with pytest.raises(ValueError, match="launch_state"):
         runner.forward(list(inputs))
+
+
+@frost_gpu
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_legacy_nvfp4_fma_shared_pipeline(tokens, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("legacy FMA admission is SM107 only")
+    test_nvfp4_moe_full_pipeline_and_dynamic_graph(
+        "swiglu",
+        False,
+        "bf16",
+        monkeypatch,
+        geometry=(tokens, 2048, 1408, 64, 6),
+        require_fma=True,
+    )
 
 
 @frost_gpu

@@ -115,7 +115,7 @@ def _require_gpu():
 @pytest.mark.parametrize("weight_format", [QuantFormat.MXFP4, QuantFormat.MXFP8])
 @pytest.mark.parametrize(
     "tokens,hidden,intermediate,topk",
-    [(1, 1024, 512, 4), (2, 2048, 576, 6), (8, 1024, 256, 4)],
+    [(1, 1024, 512, 4), (2, 2048, 576, 6), (4, 1024, 256, 4), (8, 1024, 256, 4)],
 )
 def test_frost_graph_reference(weight_format, tokens, hidden, intermediate, topk):
     _require_gpu()
@@ -173,7 +173,7 @@ def test_frost_graph_reference(weight_format, tokens, hidden, intermediate, topk
             runner.check_support()
             runner.build()
             inputs = runner.pack_inputs(act, pack)
-            for tile in (128, 256):
+            for tile in runner.get_valid_tactics(inputs, None):
                 runner.forward(inputs, tactic=tile)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -209,9 +209,11 @@ def test_frost_graph_reference(weight_format, tokens, hidden, intermediate, topk
                         w2,
                         s2,
                         ids,
-                        inputs[3].bfloat16()
-                        if mode == RoutingInputMode.PackedPrecomputed
-                        else inputs[3],
+                        (
+                            inputs[3].bfloat16()
+                            if mode == RoutingInputMode.PackedPrecomputed
+                            else inputs[3]
+                        ),
                         cfg.activation,
                     )
                     _assert_near(
@@ -251,6 +253,22 @@ def test_frost_graph_reference(weight_format, tokens, hidden, intermediate, topk
     with torch.cuda.graph(graph):
         original_output = layer(act, pack)
         negative_output = layer(other_act, other_weights)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(negative_output, -original_output, rtol=0, atol=0)
+
+    # Rebinding must also hold for the shared FMA executable cache.
+    fma_runner = FrostLowLatencyRunner(config, device)
+    fma_runner.check_support()
+    fma_runner.build()
+    original_inputs = fma_runner.pack_inputs(act, pack)
+    negative_inputs = fma_runner.pack_inputs(other_act, other_weights)
+    fma_runner.forward(original_inputs, tactic=("ffma", 1))
+    fma_runner.forward(negative_inputs, tactic=("ffma", 1))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        original_output = fma_runner.forward(original_inputs, tactic=("ffma", 1))
+        negative_output = fma_runner.forward(negative_inputs, tactic=("ffma", 1))
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(negative_output, -original_output, rtol=0, atol=0)
@@ -305,7 +323,8 @@ def test_frost_declines_unsupported_compiler(monkeypatch, installed):
         runner.check_support()
 
 
-def test_frost_binds_noncurrent_device():
+@pytest.mark.parametrize("tactic", [128, ("ffma", 1)])
+def test_frost_binds_noncurrent_device(tactic):
     _require_gpu()
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two GPUs to check a noncurrent device")
@@ -334,7 +353,11 @@ def test_frost_binds_noncurrent_device():
         backend=BackendOptions((FrostLowLatencyConfig(),)),
     )
     layer = MoELayer(config, device=device)
-    result = layer(MoEActivationPack(q, sf, ids, rw), weights)
+    act = MoEActivationPack(q, sf, ids, rw)
+    layer(act, weights)
+    for key, (runner, _) in list(layer._winners.items()):
+        layer._winners[key] = (runner, tactic)
+    result = layer(act, weights)
     assert torch.cuda.current_device() == previous
     _, reference = _reference(dq, w1, s1, w2, s2, ids, rw.bfloat16(), config.activation)
     _assert_near(result, reference)

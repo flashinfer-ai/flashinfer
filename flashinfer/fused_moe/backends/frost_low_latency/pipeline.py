@@ -15,6 +15,7 @@ from .quantization import (
     float_to_ue8m0_fast,
     cvt_f32_to_e4m3,
 )
+from .activation import swiglu
 
 
 @dataclass(frozen=True)
@@ -76,19 +77,7 @@ def activate_tile(
             up = partials[route, tile * 128 + tid + 64]
             value = cutlass.Float32(0)
             if col < logical:
-                if cutlass.const_expr(limit is not None):
-                    gate = cutlass.min(gate, cutlass.Float32(limit))
-                    up = cutlass.max(
-                        cutlass.min(up, cutlass.Float32(limit)), cutlass.Float32(-limit)
-                    )
-                gate_exp = gate
-                if cutlass.const_expr(alpha != 1.0):
-                    gate_exp = _mul(gate, cutlass.Float32(alpha))
-                if cutlass.const_expr(beta != 0.0):
-                    up = up + cutlass.Float32(beta)
-                value = _mul(
-                    gate / (1.0 + cute.math.exp(-gate_exp, fastmath=False)), up
-                )
+                value = swiglu(up, gate, limit, alpha, beta)
             maximum = cute.arch.warp_reduction_max(abs(value))
             scale = float_to_ue8m0_fast(_mul(maximum, cutlass.Float32(1.0 / 448.0)))
             code = cvt_f32_to_e4m3(_mul(value, _inverse_scale(scale)))
