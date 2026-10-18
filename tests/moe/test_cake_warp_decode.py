@@ -1128,15 +1128,22 @@ class _GpuGeometry:
         return self.activation.is_gated and self.activation != SwiGLU()
 
 
-# Token counts are the schedule / route-packer boundaries of each geometry.
+# Token counts are the schedule / route-packer boundaries of each geometry plus
+# the rows that reach kernels no boundary row launches (named by the short hash
+# of their generated source file).
 _GPU_GEOMETRIES = (
     _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
     _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
     _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
-    _GpuGeometry("e128_i768_k8", 2048, 768, 128, 8, (1, 2, 8, 9, 10, 16, 32)),
+    # T7: sm100 FC2 5c23234a. T11: sm103 FC1 5304d683. T18: sm100 finalize
+    # f5eac8f9. T21: sm103 FC2 c5afe5ba.
+    _GpuGeometry(
+        "e128_i768_k8", 2048, 768, 128, 8, (1, 2, 7, 8, 9, 10, 11, 16, 18, 21, 32)
+    ),
     _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
-    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 32)),
+    # T16: sm103 FC1 57d9c60c and FC2 8acc0c77.
+    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 16, 32)),
     _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
     _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 2, 32)),
     _GpuGeometry(
@@ -1145,7 +1152,8 @@ _GPU_GEOMETRIES = (
         3072,
         128,
         4,
-        (1, 2, 32),
+        # T5: sm100 FC1 5312a738 and FC2 8acc0c77; sm103 FC2 8acc0c77.
+        (1, 2, 5, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     _GpuGeometry(
@@ -1154,7 +1162,8 @@ _GPU_GEOMETRIES = (
         3072,
         896,
         16,
-        (1, 2, 32),
+        # T3: sm100 finalize fc64115f.
+        (1, 2, 3, 32),
         SiTU(gate_scale=4.0, linear_scale=25.0),
     ),
     # Sharded per-partition slices (fused route packing on every token count).
