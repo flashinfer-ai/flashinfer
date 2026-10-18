@@ -371,9 +371,11 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.schedule_id: Optional[int] = schedule_id
         from ..jit.cake_bgmv_moe import (
             CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS,
+            CAKE_BGMV_MOE_PDL_MODES,
             CAKE_BGMV_MOE_SCHEDULE_IDS,
             CAKE_BGMV_MOE_SHRINK_FORM_PREFILL,
             CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3,
+            cake_bgmv_moe_arch_for_capability,
             cake_bgmv_moe_route_index_numel,
         )
 
@@ -402,6 +404,20 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
                 "form 0 (two-stage prefill) or 2 (three-stage prefill), got "
                 f"{shrink_launch}"
             )
+        # The plain launch (pdl_mode 0) is an sm_90a form: the generic bundles of
+        # the other targets render the PDL kernel forms only (the host policy never
+        # selects mode 0 there), so a direct construction asking for it fails here,
+        # before the binding rejects it.
+        if variant == "generic" and x.device.type == "cuda":
+            arch = cake_bgmv_moe_arch_for_capability(
+                torch.cuda.get_device_capability(x.device)
+            )
+            if arch is not None and self.pdl_mode not in CAKE_BGMV_MOE_PDL_MODES[arch]:
+                raise ValueError(
+                    f"pdl_mode {self.pdl_mode} is not a launch mode of the generic "
+                    f"Cake BGMV MoE bundle for {arch}; valid modes are "
+                    f"{list(CAKE_BGMV_MOE_PDL_MODES[arch])}"
+                )
 
         # Token->pair route index: published by the shrink kernels and read by
         # the expand kernels (arbitrary pair order in O(1) per CTA), followed,

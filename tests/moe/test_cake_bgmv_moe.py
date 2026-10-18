@@ -448,6 +448,48 @@ def test_cake_plan_rejects_the_retired_schedule_and_shrink_form():
         BGMVMoECakePlan(None, schedule_id=1, variant="generic", **kwargs)
 
 
+def test_generic_plan_rejects_the_plain_launch_off_sm90():
+    # The plain launch (pdl_mode 0) is an sm_90a form: the SM100/SM103/SM107
+    # generic bundles render the PDL kernel forms only, prepare_bgmv_moe never
+    # selects mode 0 there, and both the plan constructor and the binding reject
+    # a direct request for it. On SM90 the plain forms run and match the reference.
+    _require_cake_arch()
+    from flashinfer.jit.cake_bgmv_moe import CAKE_BGMV_MOE_PDL_MODES
+
+    inputs = _make_inputs(3072, 8, torch.bfloat16, rank=16)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+    assert plan.variant == "generic"
+    modes = CAKE_BGMV_MOE_PDL_MODES[_device_arch()]
+    assert plan.pdl_mode in modes
+    kwargs = dict(
+        y_accum=plan.y_accum,
+        shrink_out=plan.shrink_out,
+        x=plan.x,
+        lora_a=plan.lora_a,
+        lora_b=plan.lora_b,
+        sorted_token_ids=plan.sorted_token_ids,
+        expert_ids=plan.expert_ids,
+        lora_indices=plan.lora_indices,
+        topk_weights=plan.topk_weights,
+        schedule_id=plan.schedule_id,
+        variant="generic",
+        shrink_launch=plan.shrink_launch,
+    )
+    if 0 in modes:
+        plain = BGMVMoECakePlan(plan._module, pdl_mode=0, **kwargs)
+        torch.testing.assert_close(plain.run(), expected, atol=1e-2, rtol=1e-2)
+        plain.close()
+    else:
+        with pytest.raises(ValueError, match="pdl_mode 0"):
+            BGMVMoECakePlan(plan._module, pdl_mode=0, **kwargs)
+        # The binding rejects the mode as well (the plan is not replayed after).
+        plan.pdl_mode = 0
+        with pytest.raises(RuntimeError, match="pdl_mode"):
+            plan.run()
+    plan.close()
+
+
 def test_cake_plan_reports_backend_used():
     _require_cake_arch()
     plan = prepare_bgmv_moe(*_make_inputs(2688, 4, torch.bfloat16), backend="cake")

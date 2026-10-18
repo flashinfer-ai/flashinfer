@@ -56,21 +56,26 @@ _RANK_SYMBOL_RE = re.compile(
 )
 _KERNEL_DECL_RE = re.compile(r"\bvoid (kernel_flashinfer_bgmv_moe_\w+)\(")
 _RANK_IF_RE = re.compile(r"#(if|elif) CAKE_BGMV_MOE_RANK == (\d+)$")
+# Every generic body also gates the kernel forms a target cannot launch behind
+# ``#if CAKE_BGMV_MOE_CC_MAJOR == 9`` (sm_90a) / ``>= 10`` (sm_100a and later).
+_CC_IF_RE = re.compile(r"#if CAKE_BGMV_MOE_CC_MAJOR (==|>=) (\d+)$")
 
 
-def _rank_view(body, rank):
-    """``body`` with the inactive ``#if CAKE_BGMV_MOE_RANK == N`` branches removed."""
+def _directive_view(body, evaluate):
+    """``body`` with the ``#if`` blocks ``evaluate`` decides resolved.
+
+    ``evaluate(line)`` returns True/False for an ``#if``/``#elif`` line it owns
+    and None for any other one, whose block passes through unchanged.
+    """
     out = []
-    stack = []  # [is_rank_block, a_branch_was_taken, this_branch_is_active]
+    stack = []  # [is_ours, a_branch_was_taken, this_branch_is_active]
     for line in body.split("\n"):
         if line.startswith("#if"):
-            m = _RANK_IF_RE.match(line)
-            hit = bool(m) and int(m.group(2)) == rank
-            stack.append([bool(m), hit, hit or not m])
+            hit = evaluate(line)
+            stack.append([hit is not None, bool(hit), hit is None or hit])
         elif line.startswith("#elif"):
-            m = _RANK_IF_RE.match(line)
             if stack and stack[-1][0]:
-                hit = bool(m) and int(m.group(2)) == rank and not stack[-1][1]
+                hit = bool(evaluate(line)) and not stack[-1][1]
                 stack[-1][1:] = [stack[-1][1] or hit, hit]
         elif line == "#else":
             if stack and stack[-1][0]:
@@ -81,6 +86,29 @@ def _rank_view(body, rank):
         elif all(frame[2] for frame in stack):
             out.append(line)
     return "\n".join(out)
+
+
+def _rank_view(body, rank):
+    """``body`` with the inactive ``#if CAKE_BGMV_MOE_RANK == N`` branches removed."""
+
+    def evaluate(line):
+        m = _RANK_IF_RE.match(line)
+        return None if m is None else int(m.group(2)) == rank
+
+    return _directive_view(body, evaluate)
+
+
+def _cc_view(body, cc_major):
+    """``body`` as compiled for ``CAKE_BGMV_MOE_CC_MAJOR == cc_major``."""
+
+    def evaluate(line):
+        m = _CC_IF_RE.match(line)
+        if m is None:
+            return None
+        value = int(m.group(2))
+        return cc_major == value if m.group(1) == "==" else cc_major >= value
+
+    return _directive_view(body, evaluate)
 
 
 def _generic_symbol_sites(body, rank):
@@ -444,6 +472,22 @@ def test_pdl_mode_policy():
     assert pdl("sm107a", 512, 3072, 212, "specialized") == 0
     assert pdl("sm100a", 32, 3072, 148, "specialized") == 0
     assert pdl("sm90a", 32, 3072, 132, "specialized") == 0
+    # The plain launch exists on sm_90a only; every other target always runs
+    # with PDL, so its bundles omit the plain kernel forms and reject mode 0.
+    modes = cake_bgmv_moe.CAKE_BGMV_MOE_PDL_MODES
+    assert set(modes) == set(cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
+    assert modes["sm90a"] == (0, 1, 2)
+    for arch in ("sm100a", "sm103a", "sm107a"):
+        assert modes[arch] == (1, 2)
+    for arch, sms in (
+        ("sm90a", 132),
+        ("sm100a", 148),
+        ("sm103a", 148),
+        ("sm107a", 212),
+    ):
+        for num_tokens in (1, 8, 32, 128, 512, 4096):
+            for hidden in (736, 2944, 8192):
+                assert pdl(arch, num_tokens, hidden, sms) in modes[arch]
 
 
 def test_generic_selector_rejects_unsupported_inputs():
@@ -617,6 +661,61 @@ def test_generic_bodies_fold_the_ranks():
             assert set(sites) == set(m[1:])
 
 
+def _target_gated_symbols(metadata, dtype, cc_major):
+    """Kernels of a generic body that its per-target gates drop for ``cc_major``."""
+    bf16 = cake_bgmv_moe._dtype_tag(dtype) == "bf16"
+    if cc_major == 9:
+        # sm_90a: no mixed-precision form (GROUP_SHRINK_MIXED is 0; no
+        # fma.rn.f32.bf16) and, with the ring on every row (RING_SINGLE_TILE 1),
+        # no register-direct grouped shrink.
+        if bf16:
+            return {
+                metadata.shrink_grouped_ring_mixed_symbol,
+                metadata.shrink_grouped_ring_mixed_single_symbol,
+            }
+        return {metadata.shrink_grouped_symbol}
+    # sm_100a and later: pdl_mode is never 0 (no plain shrink / expand forms)
+    # and the bf16 bundles run every ring row in its mixed-precision form.
+    gated = {
+        metadata.shrink_prefill_symbol,
+        metadata.shrink_prefill_s3_symbol,
+        metadata.shrink_prefill_remap_symbol,
+        metadata.expand_t64_symbol,
+        metadata.expand_t128_symbol,
+    }
+    if bf16:
+        gated |= {
+            metadata.shrink_grouped_ring_symbol,
+            metadata.shrink_grouped_ring_single_symbol,
+        }
+    return gated
+
+
+@pytest.mark.parametrize("cc_major", (9, 10))
+@pytest.mark.parametrize("rank", cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS)
+@pytest.mark.parametrize("dtype", cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES)
+def test_generic_bodies_gate_the_per_target_forms(dtype, rank, cc_major):
+    # Each generic body compiles, per target, only the kernels that target's
+    # launch selection can reach: the plain-launch forms (pdl_mode 0), which
+    # cake_bgmv_moe_pdl_mode selects on sm_90a only, and the grouped-shrink forms
+    # the binding's RING_SINGLE_TILE / GROUP_SHRINK_MIXED switches exclude. The
+    # gates wrap whole kernel segments, so the kept kernels' text is unchanged.
+    metadata = cake_bgmv_moe._generic_metadata(rank, dtype)
+    body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
+    assert "#ifndef CAKE_BGMV_MOE_CC_MAJOR" in body
+    every = set(metadata[1:])
+    gated = _target_gated_symbols(metadata, dtype, cc_major)
+    assert gated <= every
+    compiled = _generic_symbols(_cc_view(body, cc_major), rank)
+    assert compiled == every - gated
+    other_target = _generic_symbols(_cc_view(body, 10 if cc_major == 9 else 9), rank)
+    assert compiled | other_target == every
+    # The plain forms go exactly where the host policy cannot ask for mode 0.
+    arch = "sm90a" if cc_major == 9 else "sm100a"
+    plain = {metadata.shrink_prefill_symbol, metadata.expand_t64_symbol}
+    assert (plain <= compiled) == (0 in cake_bgmv_moe.CAKE_BGMV_MOE_PDL_MODES[arch])
+
+
 def test_generic_and_specialized_modules_do_not_share_a_uri():
     specialized = {
         cake_bgmv_moe.get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
@@ -682,6 +781,17 @@ def test_generic_binding_preserves_graph_and_tensor_contracts():
     )
     assert "cudaLaunchAttributeProgrammaticStreamSerialization" in binding
     assert "programmaticStreamSerializationAllowed = pdl_mode != 0 ? 1 : 0" in binding
+    # Per-target forms: the plain-launch kernels (pdl_mode 0) and the grouped
+    # shrink forms a target cannot select are compiled out of its module, so the
+    # binding guards their attribute setup and launch sites on the same switches
+    # and rejects mode 0 off sm_90a.
+    assert "#if CAKE_BGMV_MOE_CC_MAJOR == 9" in binding
+    assert "#if CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0" in binding
+    assert "pdl_mode == 1 || pdl_mode == 2" in binding
+    assert (
+        "(CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE != 0) == "
+        "(CAKE_BGMV_MOE_CC_MAJOR == 9)" in binding
+    )
     # clang-format may wrap the signature; match across whitespace.
     assert re.search(r"int64_t pdl_mode,\s*int64_t cuda_stream\)", binding)
     assert re.search(r"kRouteAdvance,\s*hidden\)", binding)

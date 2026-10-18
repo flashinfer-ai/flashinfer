@@ -561,6 +561,17 @@ CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM: Dict[CakeBGMVMoEArch, int] = {
     "sm107a": 8,
 }
 CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL = 128
+# Launch modes each target's generic bundle renders. The plain-launch forms
+# (mode 0: shrink without griddepcontrol, expand without the register
+# prefetch) are compiled for sm_90a only, where cake_bgmv_moe_pdl_mode
+# selects them on large expand grids; the other targets always launch with
+# PDL, so their bundles omit the plain forms and their binding rejects mode 0.
+CAKE_BGMV_MOE_PDL_MODES: Dict[CakeBGMVMoEArch, Tuple[int, ...]] = {
+    "sm90a": (0, 1, 2),
+    "sm100a": (1, 2),
+    "sm103a": (1, 2),
+    "sm107a": (1, 2),
+}
 
 
 def cake_bgmv_moe_pdl_mode(
@@ -1075,6 +1086,7 @@ __all__ = [
     "CAKE_BGMV_MOE_SCHEDULE_IDS",
     "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX",
     "CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL",
+    "CAKE_BGMV_MOE_PDL_MODES",
     "CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM",
     "CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW",
     "cake_bgmv_moe_pdl_mode",

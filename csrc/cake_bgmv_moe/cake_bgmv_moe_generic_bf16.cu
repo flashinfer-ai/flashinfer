@@ -80,6 +80,17 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_BGMV_MOE_RANK_SYMBOL_FORM(prefix, form) \
   CAKE_BGMV_MOE_PASTE(CAKE_BGMV_MOE_RANK_SYMBOL(prefix), form)
 
+// Per-target kernel forms. The generated binding defines CAKE_BGMV_MOE_CC_MAJOR (9 for sm_90a, 10
+// for sm_100a, sm_103a and sm_107a) before it includes this file, and the kernels its launch
+// selection cannot reach on that target sit behind #if CAKE_BGMV_MOE_CC_MAJOR gates: the
+// plain-launch shrink and expand forms (pdl_mode 0) and the operand-ring grouped shrink without
+// mixed precision are selected on sm_90a only; the mixed-precision ring forms on sm_100a and later
+// only.
+#ifndef CAKE_BGMV_MOE_CC_MAJOR
+#error "CAKE_BGMV_MOE_CC_MAJOR must be defined before including this body"
+#endif
+
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_X_SMEM_OFF 0
@@ -480,6 +491,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
 #undef SMEM_X_SMEM_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rNN_p1_s2
+#endif
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -889,6 +901,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rN
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rNN_p1_s2_pdl
 
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_X_SMEM_OFF 0
@@ -1289,6 +1302,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
 #undef SMEM_X_SMEM_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rNN_p1_s3
+#endif
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -1698,6 +1712,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rN
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rNN_p1_s3_pdl
 
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_X_SMEM_OFF 0
@@ -2111,6 +2126,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rN
 #undef SMEM_X_SMEM_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rNN_p1_s2_remap
+#endif
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -2532,6 +2548,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rN
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_generic_bf16_rNN_p1_s2_remap_pdl
 
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_ROUTE_LIST_OFF 0
@@ -2859,7 +2876,9 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
 #undef SMEM_TOTAL
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_expand_generic_token_t64_bf16_rNN
+#endif
 
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_ROUTE_LIST_OFF 0
@@ -3187,6 +3206,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
 #undef SMEM_TOTAL
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_expand_generic_token_t128_bf16_rNN
+#endif
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -5321,6 +5341,7 @@ __global__ __launch_bounds__(1024, 1) void kernel_flashinfer_bgmv_moe_order_buil
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_order_build_bf16_rNN
 
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WARP_PARTIALS_OFF 0
@@ -6083,7 +6104,9 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
 #undef SMEM_X_RING_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_grouped_ring_bf16_rNN
+#endif
 
+#if CAKE_BGMV_MOE_CC_MAJOR >= 10
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WARP_PARTIALS_OFF 0
@@ -6533,7 +6556,9 @@ __launch_bounds__(128, 6) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mi
 #undef SMEM_X_RING_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_bf16_rNN
+#endif
 
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WARP_PARTIALS_OFF 0
@@ -7281,7 +7306,9 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
 #undef SMEM_X_RING_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_grouped_ring_single_bf16_rNN
+#endif
 
+#if CAKE_BGMV_MOE_CC_MAJOR >= 10
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WARP_PARTIALS_OFF 0
@@ -7713,6 +7740,7 @@ __launch_bounds__(128, 6) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mi
 #undef SMEM_X_RING_STRIDE
 #undef THREADS
 #undef kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_single_bf16_rNN
+#endif
 
 #undef CAKE_BGMV_MOE_RANK_SYMBOL_FORM
 #undef CAKE_BGMV_MOE_RANK_SYMBOL
