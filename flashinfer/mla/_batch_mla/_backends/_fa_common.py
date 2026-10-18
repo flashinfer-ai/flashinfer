@@ -11,6 +11,7 @@ from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union
 
 import torch
 
+from ....autotuner import TunableRunner
 from ....jit import gen_batch_mla_module
 from ....utils import (
     MaskMode,
@@ -26,6 +27,7 @@ from ._capabilities import (
     plan_capability_rejection_reason,
 )
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
+from .._contracts import _resolve_structural_mla_input
 
 
 class _GeneratedBatchMLAModule(Protocol):
@@ -593,6 +595,17 @@ class _BatchMLAGeneratedFaMechanics:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
         kv_len_arr_host = kv_len_arr.to("cpu")
+        batch_size = kv_len_arr_host.numel()
+        planned_query_shape = (int(qo_indptr_host[batch_size].item()), num_heads)
+        # Ignore unused capacity in legacy CSR index buffers. Native execution
+        # uses only the page ranges belonging to the planned KV batch.
+        page_start = int(kv_indptr_host[0].item())
+        page_end = int(kv_indptr_host[batch_size].item())
+        if page_start < page_end:
+            page_min, page_max = torch.aminmax(kv_indices[page_start:page_end])
+            planned_kv_page_range = (int(page_min.item()), int(page_max.item()) + 1)
+        else:
+            planned_kv_page_range = (0, 0)
         plan_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -633,6 +646,8 @@ class _BatchMLAGeneratedFaMechanics:
         self._use_profiler = use_profiler
         self._plan_info = plan_info
         self._staged_int_workspace_bytes = staged_int_workspace_bytes
+        self._planned_query_shape = planned_query_shape
+        self._planned_kv_page_range = planned_kv_page_range
 
     def _validate_run_input_dtypes(
         self,
@@ -786,7 +801,9 @@ class _BatchMLAGeneratedFaMechanics:
 _FaBackendT = TypeVar("_FaBackendT", bound="_BatchMLAPagedAttentionFaBackendBase")
 
 
-class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
+class _BatchMLAPagedAttentionFaBackendBase(
+    _BatchMLAGeneratedFaMechanics, TunableRunner
+):
     _plan_capabilities: ClassVar[Optional[MLAPlanCapabilities]] = None
 
     def __init__(
@@ -889,6 +906,26 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             cls._plan_capabilities.backend_name,
             args.kv_data_type,
         )
+        # Mirror scheduler.cuh MLAPlan's two 16-byte-aligned partial buffers.
+        # Classify capacity before JIT/native planning so other candidates can
+        # use a smaller shared workspace instead of seeing allocator failures.
+        offsets = csr.qo_indptr.to(device="cpu", dtype=torch.int64)
+        batch_size = csr.kv_len_arr.numel()
+        total_q = int(offsets[batch_size] - offsets[0])
+        cluster_size = 2 if total_q * args.num_heads // batch_size > 64 else 1
+        num_clusters = (
+            get_device_sm_count(args._float_workspace_buffer.device) // cluster_size
+        )
+        partial_rows = 2 * num_clusters * cluster_size * 64
+        workspace = args._float_workspace_buffer
+        required_bytes = (-workspace.data_ptr()) % 16 + partial_rows * (
+            2 * args.head_dim_ckv + 4
+        )
+        if workspace.numel() * workspace.element_size() < required_bytes:
+            raise _BackendPlanUnsupportedError(
+                f"{cls._plan_capabilities.backend_name} MLA needs {required_bytes} "
+                "float workspace bytes for partial outputs and LSE."
+            )
 
     @classmethod
     @_audit_plan_from_wrapper_arguments
@@ -1006,4 +1043,134 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             ckv_scale=ckv_scale,
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
+        )
+
+    # Both generated FA backends tune the already prepared wrapper workload.
+    # Native scheduling remains in plan(); there are no functional FA routes.
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def configure_tuning(self, *, cache_key: tuple, run_options: dict) -> None:
+        """Bind host options without retaining request or profiling tensors."""
+        if any(isinstance(value, torch.Tensor) for value in run_options.values()):
+            raise TypeError("Planned tuning options must not contain tensors.")
+        self._planned_tuning_key = cache_key
+        self._planned_run_options = dict(run_options)
+
+    def get_valid_tactics(self, inputs, profile):
+        return [-1] if self._prepare_planned_inputs(inputs) is not None else []
+
+    def _prepare_planned_inputs(self, inputs):
+        query = _resolve_structural_mla_input(
+            inputs[0], desired="split", widths=self._query_split_widths, name="query"
+        )
+        cache = _resolve_structural_mla_input(
+            inputs[1], desired="split", widths=self._kv_split_widths, name="KV cache"
+        )
+        # Native scheduling retains the planned query offsets/head count and
+        # page geometry. Validate those immutable facts before any automatic
+        # preparation or profile can launch with current request tensors.
+        for tensor, width, name in zip(
+            query, self._query_split_widths, ("q_nope", "q_pe"), strict=True
+        ):
+            check_shape_dtype_device(
+                tensor,
+                (*self._planned_query_shape, width),
+                self._q_data_type,
+                self.device,
+                name,
+            )
+        for tensor, width, name in zip(
+            cache, self._kv_split_widths, ("ckv_cache", "kpe_cache"), strict=True
+        ):
+            check_shape_dtype_device(
+                tensor,
+                (cache[0].shape[0], self._page_size, width),
+                self._kv_data_type,
+                self.device,
+                name,
+            )
+        page_min, required_pages = self._planned_kv_page_range
+        if page_min < 0 or cache[0].shape[0] < required_pages:
+            raise ValueError("KV cache does not cover the planned CSR page indices.")
+        if inputs[2] is not None:
+            check_shape_dtype_device(
+                inputs[2],
+                (*self._planned_query_shape, self._head_dim_ckv),
+                self._q_data_type,
+                self.device,
+                "out",
+            )
+        if inputs[3] is not None:
+            # Native FA receives a supplied LSE buffer even when the caller
+            # does not request it in the return value.
+            check_shape_dtype_device(
+                inputs[3], self._planned_query_shape, torch.float32, self.device, "lse"
+            )
+        # Limit automatic profiling to validated native FA3 widths.
+        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
+            return None
+        # Native FA forwards only outer strides. Q/KV loads and output stores
+        # operate in 16-byte vectors, including for noncompact outer layouts.
+        for tensor in (*query, *cache, inputs[2]):
+            if tensor is None or tensor.numel() == 0:
+                continue
+            if (
+                tensor.ndim != 3
+                or tensor.stride(-1) != 1
+                or tensor.data_ptr() % 16
+                or any(
+                    tensor.shape[axis] > 1
+                    and tensor.stride(axis) * tensor.element_size() % 16
+                    for axis in (0, 1)
+                )
+            ):
+                return None
+        out = inputs[2]
+        if out is not None:
+            span = 1
+            for stride, size in sorted(zip(out.stride(), out.shape, strict=True)):
+                if size > 1:
+                    if stride < span:
+                        return None
+                    span += (size - 1) * stride
+        # The native final-LSE pointer has no stride arguments.
+        if inputs[3] is not None and not inputs[3].is_contiguous():
+            return None
+        return query, cache
+
+    def get_cache_key_extras(self, inputs):
+        return ("planned", self._planned_tuning_key)
+
+    def forward(
+        self,
+        inputs,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        run_options=None,
+        **kwargs,
+    ):
+        if tactic != -1:
+            raise ValueError(f"Unsupported {self._backend} MLA tactic: {tactic!r}.")
+        query, kv_cache, out, lse, sinks = inputs[:5]
+        # Selection lasts for the plan. Validate current tensors here as well
+        # as during profiling, before native code uses its fixed plan geometry.
+        prepared = self._prepare_planned_inputs(inputs)
+        if prepared is None:
+            raise ValueError(
+                f"Current tensor layout is unsupported by the selected {self._backend} MLA backend."
+            )
+        query, kv_cache = prepared
+        return self.run_from_wrapper(
+            query=query,
+            kv_cache=kv_cache,
+            out=out,
+            lse=lse,
+            sinks=sinks,
+            profiler_buffer=None,
+            kv_len=None,
+            page_table=None,
+            ckv_scale_arr=None,
+            **(self._planned_run_options if run_options is None else run_options),
         )

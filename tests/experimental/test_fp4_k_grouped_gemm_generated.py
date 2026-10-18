@@ -88,8 +88,8 @@ _CASES = [
 
 
 # (arch, SM count) of the SM100a / SM103a parts the host may run on: the catalog
-# devices (B200, GB300) and GB200, whose 152 SMs reach the BM240 schedule the
-# export never measured on SM100a.
+# devices (B200, GB300) and GB200, whose 152 SMs reach the BM240 schedule in
+# BF16, which the export never measured on SM100a.
 _DEVICE_PROFILES = {
     "B200": ("sm_100a", 148),
     "GB200": ("sm_100a", 152),
@@ -127,7 +127,46 @@ def test_every_device_profile_resolves_a_measured_program(device):
             assert arch in _runtime.MODULES[program]["arches"]
             assert candidates[-1].split(":")[0].startswith("general_s")
             seen.add(route.split(":")[0])
-    assert seen >= {"general_s1", "general_s2", "n256", "small", "small_2x8x3"}
+    assert seen >= {
+        "general_s1",
+        "general_s2",
+        "n256",
+        "n256_rot",
+        "small",
+        "small_2x8x3",
+    }
+
+
+@pytest.mark.parametrize("device", sorted(_DEVICE_PROFILES))
+def test_fp32_accumulate_l2_geometry_takes_the_n256_schedule(device):
+    """CPU-only: on the (5120, 2304) geometry FP32-accumulate prefers the N256 schedule on every
+    profile (BM240 is not in its chain) -- with the tail-balanced tile order first on the three-group
+    condition, the shipped order next; BF16 and FP32 keep BM240 on 152 SMs."""
+    arch, sm_count = _DEVICE_PROFILES[device]
+    candidates = _runtime.route_candidates(
+        5120, 2304, [12288, 0, 6144], sm_count, "fp32", True
+    )
+    assert candidates[:2] == ["n256_rot:fp32_acc", "n256:fp32_acc"]
+    assert "swapped:fp32_acc" not in candidates
+    assert (
+        _runtime.select_route(
+            arch, 5120, 2304, [12288, 0, 6144], sm_count, "fp32", True
+        )[0]
+        == "n256_rot:fp32_acc"
+    )
+    assert (
+        _runtime.route_key(5120, 2304, [9216, 7168], sm_count, "fp32", True)
+        == "n256:fp32_acc"
+    )
+    if sm_count == 152:
+        assert (
+            _runtime.route_key(5120, 2304, [8192, 0, 4096], sm_count, "bf16", False)
+            == "swapped:bf16"
+        )
+        assert (
+            _runtime.route_key(5120, 2304, [16384, 0, 8192], sm_count, "fp32", False)
+            == "swapped:fp32"
+        )
 
 
 def _skip_unless_supported():

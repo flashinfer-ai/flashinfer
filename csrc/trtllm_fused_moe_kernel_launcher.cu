@@ -41,6 +41,15 @@
 namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
+
+// Routing stage of the fused-MoE launchers: the trtllm-gen router, or the exported Cake StepFun
+// routing kernels when the module is built with -DCAKE_STEPFUN_FULL (the Cake router serves
+// RoutingMethodType::Renormalize from logits and rejects every other configuration).
+#ifdef CAKE_STEPFUN_FULL
+using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::cake_stepfun::RoutingRunner;
+#else
+using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner;
+#endif
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
@@ -1009,6 +1018,15 @@ inline bool hasOptionalGemm1ActivationParams(Optional<TensorView> const& gemm1_a
   return gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value();
 }
 
+inline void validateStepGemm1ActivationParams(Optional<TensorView> const& gemm1_alpha,
+                                              Optional<TensorView> const& gemm1_beta,
+                                              ActivationType activation_type) {
+  if (activation_type == ActivationType::SwigluStep) {
+    TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+        << "SwigluStep accepts gemm1_clamp_limit only; gemm1_alpha and gemm1_beta must be absent.";
+  }
+}
+
 // MxFp8 applies these in the fused FC1 epilogue of the trtllm-gen cubins; DeepSeekFp8 has no
 // fused activation and applies them in the separate activation kernel
 // (moe::dev::activation::run). Both consume the values as-is: FP8 block scaling carries no
@@ -1017,6 +1035,10 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
+  validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
+  TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
+                 quantization_type == Fp8QuantizationType::MxFp8)
+      << "SwigluStep requires the fused MxFp8 GEMM1 epilogue.";
   if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
     return;
   }
@@ -1026,9 +1048,12 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "Fp8QuantizationType::MxFp8 and Fp8QuantizationType::DeepSeekFp8 in FP8 block scale "
          "MoE, got "
       << fp8QuantizationTypeToString(quantization_type) << ".";
-  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                 (activation_type == ActivationType::SwigluStep &&
+                  quantization_type == Fp8QuantizationType::MxFp8))
       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
-         "ActivationType::Swiglu.";
+         "ActivationType::Swiglu, or gemm1_clamp_limit alone for "
+         "ActivationType::SwigluStep with MxFp8.";
 }
 
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
@@ -1105,6 +1130,41 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
 
   return {tile_N, config};
 }
+
+#ifdef CAKE_STEPFUN_FC1
+// The trtllm-gen tile ladder restricted to the tiles whose Cake kernels this module exports for the
+// family in every Cake stage (FC1; FC2 as well on the full path). The tactic windows
+// (computeSelectedTileN) and the default-tactic fallback (selectDefaultTileN) run on this ladder,
+// so neither names a tile without a kernel; a ladder without any exported tile is an error (the
+// Cake StepFun backend has no native fallback). The runner is built exactly as the launcher builds
+// it for the forward, so the answer is the one prepare_moe() would reach.
+std::vector<int32_t> cakeStepFunTileLadder(std::vector<int32_t> const& ladder, btg::Dtype dtypeAct,
+                                           btg::Dtype dtypeWeights, bool useDeepSeekFp8,
+                                           ActivationType activationType, bool useShuffledMatrix,
+                                           batchedGemm::gemm::MatrixLayout weightLayout,
+                                           batchedGemm::gemm::BiasType gemm1BiasType,
+                                           bool usePerTokenScalingGemm1,
+                                           bool usePerTokenScalingGemm2) {
+  std::vector<int32_t> exported;
+  std::string ladderText;
+  for (int32_t tile : ladder) {
+    ladderText += (ladderText.empty() ? "" : ", ") + std::to_string(tile);
+    tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner runner(
+        dtypeAct, dtypeWeights, useDeepSeekFp8, tile, activationType, useShuffledMatrix,
+        weightLayout, gemm1BiasType, usePerTokenScalingGemm1, usePerTokenScalingGemm2, false,
+        false);
+    if (runner.hasPassingConfigs()) exported.push_back(tile);
+  }
+  TVM_FFI_ICHECK(!exported.empty())
+      << "The Cake StepFun module exports no kernel for any tile of the trtllm-gen ladder {"
+      << ladderText << "} for dtype_act=" << static_cast<int>(dtypeAct)
+      << ", dtype_weights=" << static_cast<int>(dtypeWeights)
+      << ", activation_type=" << static_cast<int>(activationType)
+      << ", per_token_scaling=" << usePerTokenScalingGemm1
+      << " (the Cake StepFun backend has no native fallback).";
+  return exported;
+}
+#endif
 
 // Validate the FC1 bias tensor against the selected BiasType. Currently only
 // BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
@@ -1614,7 +1674,7 @@ class FusedMoeLauncher {
     prepare_routing();
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     int32_t* expert_ids_param = precomputed_expert_ids();
@@ -1829,10 +1889,13 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     check_optional_per_expert_float_tensor(gemm1_alpha, "gemm1_alpha");
     check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
     check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
     if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
-      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                     activation_type == ActivationType::SwigluStep)
           << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
-             "ActivationType::Swiglu.";
+             "ActivationType::Swiglu, or gemm1_clamp_limit alone for "
+             "ActivationType::SwigluStep.";
     }
 
     TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
@@ -1910,9 +1973,13 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
                                                                              : btg::Dtype::Bfloat16;
     prepare_moe_runner(moe_tactic);
     prepared.bind(workspace);
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     cudaStream_t stream = get_stream(hidden_states.device());
     moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
                     enable_pdl);
@@ -1928,6 +1995,17 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
+#ifdef CAKE_STEPFUN_FC1
+    // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
+    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung:
+    // cakeStepFunTileLadder keeps it only where both stages export the unit, and the ladder stays
+    // sorted for computeSelectedTileN.
+    supported_tile_nums.push_back(256);
+    supported_tile_nums = cakeStepFunTileLadder(
+        supported_tile_nums, btg::Dtype::Bfloat16, btg::Dtype::Bfloat16, false,
+        static_cast<ActivationType>(act_type), use_shuffled_weight,
+        static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type, false, false);
+#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -2049,7 +2127,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
   void prepare_moe(int64_t& /*moe_tactic*/) override {}
 
   void run_routing_kernel(bool enable_pdl, bool use_routing_scales_on_input = false) {
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
     bool const has_precomputed_indices = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
     bool const has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
@@ -3346,6 +3424,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                        TensorView const& gemm1_weights, TensorView const& output1_scales_scalar,
                        TensorView const& output1_scales_gate_scalar,
                        TensorView const& gemm2_weights, TensorView const& output2_scales_scalar,
+                       Optional<TensorView> const& gemm1_clamp_limit,
                        Optional<TensorView> const& expert_indices = Optional<TensorView>(),
                        Optional<TensorView> const& expert_weights = Optional<TensorView>(),
                        RoutingInputMode routing_input_mode = RoutingInputMode::FromLogits)
@@ -3356,6 +3435,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                          routing_input_mode),
         expert_indices(expert_indices),
         expert_weights(expert_weights),
+        gemm1_clamp_limit(gemm1_clamp_limit),
         use_routing_scales_on_input(false) {}
 
   bool has_precomputed_routing() const {
@@ -3474,6 +3554,10 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
 
+    check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    TVM_FFI_ICHECK(!gemm1_clamp_limit.has_value() || activation_type == ActivationType::SwigluStep)
+        << "FP8 per-tensor gemm1_clamp_limit is supported for SwigluStep only.";
+
     TVM_FFI_ICHECK(output1_scales_scalar.has_value())
         << "output1_scales_scalar is required for FP8 MoE";
     TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().dtype(), dl_float32)
@@ -3556,6 +3640,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     args->output1_scales_gate_scalar =
         static_cast<float*>(output1_scales_gate_scalar.value().data_ptr());
     args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
   }
 
   /** Allocate graph-stable FP8 per-tensor buffers for one exact routed body. */
@@ -3591,6 +3678,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     args->output1_scales_gate_scalar =
         static_cast<float*>(output1_scales_gate_scalar.value().data_ptr());
     args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     // Preserve Llama4's routing-scale convention while launching through the typed FP8 ABI.
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
       workspace.token_scales = workspace.expert_weights;
@@ -3603,6 +3693,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
  private:
   Optional<TensorView> expert_indices;
   Optional<TensorView> expert_weights;
+  Optional<TensorView> gemm1_clamp_limit;
   bool use_routing_scales_on_input;
   Tensor gemm1_output_scale;
   Tensor activation_output_scale;
@@ -3620,6 +3711,17 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
+#ifdef CAKE_STEPFUN_FC1
+    // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
+    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung:
+    // cakeStepFunTileLadder keeps it only where both stages export the unit, and the ladder stays
+    // sorted for computeSelectedTileN.
+    supported_tile_nums.push_back(256);
+    supported_tile_nums = cakeStepFunTileLadder(
+        supported_tile_nums, dtype_act, dtype_weights, false, static_cast<ActivationType>(act_type),
+        use_shuffled_weight, static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+        batchedGemm::gemm::BiasType::None, use_routing_scales_on_input, false);
+#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -4364,9 +4466,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
     // Launch the complete body after every dtype-specific scale pointer is bound.
     cudaStream_t stream = get_stream(hidden_states.device());
@@ -4398,7 +4504,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     prepare_routing();
 
     cudaStream_t routing_stream = get_stream(hidden_states.device());
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
 
     bool use_precomputed = has_precomputed(expert_indices);
     // When using pre-computed routing, pass nullptr as routing_logits to tell the
@@ -4461,6 +4567,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     auto activation_type = validateAndCastActivationType(act_type);
 
     auto supported_tile_nums = getSupportedTileNums(quantization_type);
+#ifdef CAKE_STEPFUN_FC1
+    supported_tile_nums = cakeStepFunTileLadder(
+        supported_tile_nums, dtype_act, dtype_weights,
+        quantization_type == Fp8QuantizationType::DeepSeekFp8, activation_type, use_shuffled_weight,
+        static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type, false, false);
+#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -4850,6 +4962,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   void check_moe() const override {
+    validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
+    TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
+                   (mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1))
+        << "FP4 SwigluStep requires NVFP4 activations and weights.";
     TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::Bfloat16 ||
                    mDtypeAct == btg::Dtype::E4m3 || mDtypeAct == btg::Dtype::MxE4m3)
         << "Only E2m1, Bfloat16, MxE4m3 and E4m3 are supported by Fp4 block scale MoE";
@@ -4888,6 +5004,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float8_e4m3fn)
         << "gemm2_weights_scale must be fp8.";
     // FP4 packs two 4-bit weights per byte along K, so only the M extent is checked.
+
+    if (activation_type == ActivationType::SwigluStep) {
+      check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    }
 
     if (args->num_fused_shared_experts > 0) {
       int64_t const totalLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
@@ -5078,7 +5198,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     prepare_routing();
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     // Set routing kernel parameters based on mode (see RoutingInputMode enum for documentation)
@@ -5159,6 +5279,12 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
+#ifdef CAKE_STEPFUN_FC1
+    tile_sizes = cakeStepFunTileLadder(
+        tile_sizes, dtype_act, dtype_weights, false, static_cast<ActivationType>(act_type), true,
+        batchedGemm::gemm::MatrixLayout::MajorK, gemm1_bias_type, use_per_token_scaling,
+        use_per_token_scaling && dtype_act == btg::Dtype::E2m1);
+#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
 
@@ -5230,6 +5356,17 @@ Array<Tensor> trtllm_bf16_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
                                        Bf16MoeLauncher::mSupportedTileNums.end());
+#ifdef CAKE_STEPFUN_FC1
+  // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
+  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
+  // keeps it only where both stages export the unit, and the ladder stays sorted for
+  // computeSelectedTileN.
+  mSupportedTileN.push_back(256);
+  mSupportedTileN = cakeStepFunTileLadder(
+      mSupportedTileN, btg::Dtype::Bfloat16, btg::Dtype::Bfloat16, false, activation,
+      use_shuffled_weight, static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+      gemm1_bias_type_enum, false, false);
+#endif
   // Build launchers for ALL supported tiles (not just the computeSelectedTileN subset)
   // so that autotuner-cached tactics always find their tile_N in the map.
   // Launcher creation is cheap (no GPU allocation until run()), so this is safe.
@@ -5312,7 +5449,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
-    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Optional<TensorView> gemm1_clamp_limit) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -5344,6 +5482,17 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
+#ifdef CAKE_STEPFUN_FC1
+  // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
+  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
+  // keeps it only where both stages export the unit, and the ladder stays sorted for
+  // computeSelectedTileN.
+  mSupportedTileN.push_back(256);
+  mSupportedTileN = cakeStepFunTileLadder(
+      mSupportedTileN, btg::Dtype::E4m3, btg::Dtype::E4m3, false, activation, use_shuffled_weight,
+      static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+      batchedGemm::gemm::BiasType::None, use_routing_scales_on_input, false);
+#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -5372,7 +5521,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
         Optional<TensorView>(routing_logits), routing_bias, hidden_states, gemm1_weights,
-        output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar);
+        output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar,
+        gemm1_clamp_limit);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout, use_routing_scales_on_input, activation, norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
@@ -5418,8 +5568,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
     Optional<double> routed_scaling_factor, bool use_routing_scales_on_input,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
     int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
-    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace,
-    bool is_da_body_preparation) {
+    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Optional<TensorView> gemm1_clamp_limit) {
   // Basic type validation
   auto const dtype = hidden_states.dtype();
   auto const activation = validateAndCastActivationType(activation_type);
@@ -5463,6 +5613,17 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
+#ifdef CAKE_STEPFUN_FC1
+  // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
+  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
+  // keeps it only where both stages export the unit, and the ladder stays sorted for
+  // computeSelectedTileN.
+  mSupportedTileN.push_back(256);
+  mSupportedTileN = cakeStepFunTileLadder(
+      mSupportedTileN, btg::Dtype::E4m3, btg::Dtype::E4m3, false, activation, use_shuffled_weight,
+      static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+      batchedGemm::gemm::BiasType::None, use_routing_scales_on_input, false);
+#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -5488,7 +5649,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
 
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
         Optional<TensorView>(), routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
-        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar,
+        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, gemm1_clamp_limit,
         Optional<TensorView>(expert_indices), Optional<TensorView>(expert_weights),
         static_cast<RoutingInputMode>(routing_input_mode));
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
@@ -5674,6 +5835,13 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   int64_t const totalLocalExperts = local_num_experts + nFusedShared;
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
+#ifdef CAKE_STEPFUN_FC1
+  supported_tile_nums = cakeStepFunTileLadder(
+      supported_tile_nums, dtype_act, dtype_weights,
+      quantization_type == Fp8QuantizationType::DeepSeekFp8, activation_type, use_shuffled_weight,
+      static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type_enum, false,
+      false);
+#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -5864,6 +6032,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
       FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
+#ifdef CAKE_STEPFUN_FC1
+  mSupportedTileN = cakeStepFunTileLadder(
+      mSupportedTileN, mDtypeAct, mDtypeWeights, false, static_cast<ActivationType>(act_type), true,
+      batchedGemm::gemm::MatrixLayout::MajorK, gemm1_bias_type_enum, per_token_scales.has_value(),
+      per_token_scales.has_value() && mDtypeAct == btg::Dtype::E2m1);
+#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -6292,7 +6466,7 @@ void trtllm_moe_canonicalize_routing(
       routing_logits.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
   // Run the production router into graph-stable storage, including its native int16 replay IDs.
-  tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+  RoutingRunner routing_runner(tile_tokens_dim);
   cudaStream_t stream = get_stream(routing_logits.device());
   routing_runner.run(
       const_cast<void*>(routing_logits.data_ptr()),

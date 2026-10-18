@@ -19,6 +19,7 @@
 #include <cuda.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
@@ -49,12 +50,16 @@ enum class ActType {
   GeGlu = 1,
   SiTuGlu = 2,
   None = 3,
+  // StepFun applies the gate cap after SiLU: clamp(up, -L, L) * min(silu(gate), L).
+  SwiGluStep = 4,
 };
 
 static_assert(static_cast<int>(ActType::SwiGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::SwiGlu));
 static_assert(static_cast<int>(ActType::GeGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
+// SwiGluStep is value 4 in trtllm-gen export 7.0.5.0.4.0. The public 7.0.4
+// headers omit it; retain source compatibility until the new cubins are pinned.
 #ifndef TLLM_RUBIN_FEATURES
 // Historically the separate Rubin BMM pin predated SiTuGlu: its
 // gemmGatedAct::ActType was {SwiGlu, GeGlu, None} with None == 2, so these two
@@ -108,6 +113,13 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   // whether to apply row-wise scaling factors to the weights
   bool usePerChannelScaling{false};
 };
+
+// Ordinal of the batched-GEMM configuration whose kernel function is named `functionName` (full
+// string comparison) in
+// the metainfo table this module was built with (the FC1 / FC2 coordinate space of the fused-MoE
+// factorized tactics), or -1 when the artifact has no such kernel. Defined in
+// trtllm_batched_gemm_runner.cu so that only that translation unit instantiates the table.
+[[nodiscard]] int64_t getBatchedGemmConfigIndexByName(std::string const& functionName);
 
 class TrtllmGenBatchedGemmRunner {
  public:

@@ -21,8 +21,8 @@ import torch
 from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; validation of the backend contract, the
-# workspace policy, launch binding and JIT registration live in
-# flashinfer.experimental.cake_dsa_indexer.
+# host dispatch and workspace policy, launch binding and JIT registration live
+# in flashinfer.experimental.cake_dsa_indexer.
 
 _FEATURE = "DSA indexer top-k selection (32 heads x 128, SM100/SM103/SM107)"
 
@@ -88,13 +88,19 @@ def dsa_indexer_topk(
         without visible keys are defined (the row is all padding).
     ratio : int
         Key compression ratio, ``>= 1`` (normally 1).
-    max_seqlen_q, max_seqlen_k : Optional[int]
-        Host mirrors of the longest segments; accepted for signature parity and
-        not read by any launch decision.
+    max_seqlen_q : Optional[int]
+        Host mirror of the longest query segment; accepted for signature parity
+        and not read by any launch decision.
+    max_seqlen_k : Optional[int]
+        The caller's bound on every key segment (``max(cu_seqlens_k[1:] -
+        cu_seqlens_k[:-1])``).  When given it sizes the rank finalize's bitmap
+        pool and so selects the finalize program variant; the results are
+        bitwise identical with and without it.  A value above ``Tkv`` or below
+        ``ceil(Tkv / S)`` is rejected.
     workspace_buffer : Optional[torch.Tensor]
-        Scratch of at least :func:`dsa_indexer_topk_workspace_size` bytes
-        (uint8, 8-byte aligned); allocated through the caching allocator when
-        omitted.  The bound is independent of ``T``, ``Tkv`` and ``S``.
+        Scratch of at least :func:`dsa_indexer_topk_workspace_size` bytes for
+        the call's geometry (uint8, 8-byte aligned); allocated through the
+        caching allocator when omitted.
     indices, scores : Optional[torch.Tensor]
         Caller-owned ``[T, top_k]`` int32 / float32 outputs; allocated when
         omitted.
@@ -111,11 +117,12 @@ def dsa_indexer_topk(
         bits; a selected ``-0.0`` is not normalized); tail slots hold ``-inf``.
 
     Identical inputs give identical ids and score bits; the result does not
-    depend on the internal query / key partition.  No ``[T, Tkv]`` matrix is
-    materialized and the call performs no host synchronization, so it can be
-    captured into a CUDA graph.  Finite inputs are the normal domain: with
-    NaN / inf / overflowing inputs the computed bits are returned, NaN scores
-    rank below every other score and the kernels never hang.
+    depend on the internal query / key partition or on the program the host
+    dispatches for the geometry.  No ``[T, Tkv]`` matrix is materialized and
+    the call performs no host synchronization, so it can be captured into a
+    CUDA graph.  Finite inputs are the normal domain: with NaN / inf /
+    overflowing inputs the operator returns with the output structure intact
+    and the kernels never hang.
     """
     if backend == "cake":
         from .experimental.cake_dsa_indexer.cake_backend import (
@@ -142,15 +149,25 @@ def dsa_indexer_topk(
 
 
 def dsa_indexer_topk_workspace_size(
-    top_k: int = 2048, device: Optional[torch.device] = None
+    num_queries: int,
+    num_keys: int,
+    num_segments: int,
+    *,
+    top_k: int = 2048,
+    ratio: int = 1,
+    device: Optional[torch.device] = None,
 ) -> int:
-    r"""Explicit workspace bound of :func:`dsa_indexer_topk` in bytes.
+    r"""Explicit workspace bound of :func:`dsa_indexer_topk` in bytes for one call geometry.
 
-    ``grid x queries_per_cta x candidate_capacity(top_k) x entry_bytes`` with
-    ``grid`` = the SM count of ``device`` (the persistent grid) and the
-    candidate-buffer policy of the program registered for the device;
-    independent of ``T``, ``Tkv`` and the segment count (for example about
-    37 MiB at ``top_k = 2048`` on a 148-SM device).  Raises
+    The host dispatch picks the scan program (unit geometry, key-range split,
+    CTA pair) from ``T = num_queries``, ``Tkv = num_keys``, ``S =
+    num_segments``, ``ratio`` and ``top_k`` together with the SM count of
+    ``device``, and the bound follows that choice: ``grid x queries_per_unit
+    x candidate_capacity(top_k) x 8`` bytes of persistent candidate buffers
+    (for example about 37 MiB at ``top_k = 2048`` with four queries per unit
+    on a 148-SM device, 74 MiB with eight) plus ``T x n_split x top_k x 8``
+    bytes of staging when the dispatch splits the key ranges.  Size a reused
+    buffer for the largest bound over the geometries it serves.  Raises
     ``NotImplementedError`` while no generated program is registered for the
     device's architecture.
     """
@@ -158,4 +175,6 @@ def dsa_indexer_topk_workspace_size(
         dsa_indexer_workspace_size as cake_dsa_indexer_workspace_size,
     )
 
-    return cake_dsa_indexer_workspace_size(top_k, device)
+    return cake_dsa_indexer_workspace_size(
+        num_queries, num_keys, num_segments, top_k=top_k, ratio=ratio, device=device
+    )

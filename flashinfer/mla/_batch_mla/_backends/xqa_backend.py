@@ -14,6 +14,7 @@ from typing import ClassVar, Optional, Union
 
 import torch
 
+from flashinfer.autotuner import TunableRunner
 from flashinfer.utils import (
     _check_block_tables_shape,
     check_shape_dtype_device,
@@ -23,6 +24,7 @@ from flashinfer.utils import (
     is_sm12x_supported,
 )
 
+from ..._utils import _check_mla_dense_page_table_shape, _check_mla_query_kv_shape
 from .._contracts import _resolve_structural_mla_input
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 from ._capabilities import (
@@ -172,10 +174,13 @@ def _validate_scalar_bmm_scales(
             )
 
 
-class _BatchMLAPagedAttentionXqaBackend:
-    """Planned XQA MLA execution with a launch-only hot path."""
+class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
+    """Functional, planned and tunable XQA MLA execution."""
 
     _plan_capability_error_type = _BackendPlanUnsupportedError
+    _bmm1_scale: Union[float, torch.Tensor]
+    _bmm2_scale: Union[float, torch.Tensor]
+    _kv_cache: torch.Tensor
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="XQA",
         lse_modes=frozenset({"none"}),
@@ -191,6 +196,9 @@ class _BatchMLAPagedAttentionXqaBackend:
         self._backend = "xqa"
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._is_planned = True
+
+    # Wrapper preparation and execution.
 
     @classmethod
     @_audit_plan_from_wrapper_arguments
@@ -339,6 +347,11 @@ class _BatchMLAPagedAttentionXqaBackend:
         self._semaphore = semaphore
         self._scratch = scratch
 
+    def prepare_for_tuning(self) -> None:
+        # Other candidates may overwrite any part of the shared scratch buffer.
+        # XQA semaphores must start at zero and stay private between launches.
+        self._semaphore = torch.zeros_like(self._semaphore)
+
     def run_from_wrapper(
         self,
         *,
@@ -455,20 +468,224 @@ class _BatchMLAPagedAttentionXqaBackend:
 
         query_4d = query.view(self._batch_size, 1, self._num_heads, self._head_dim)
         kv_cache_4d = kv_cache.unsqueeze(2)
-        self._module.xqa_mla(
-            self._sm_count,
-            float(resolved_bmm1_scale),
-            out,
+        return self._execute(
             query_4d,
             kv_cache_4d,
-            kv_cache_4d,
             self._block_tables,
-            self._max_seq_len,
             self._seq_lens_2d,
-            self._batch_size,
+            out,
+            float(resolved_bmm1_scale),
             float(resolved_bmm2_scale),
+        )
+
+    # Functional preparation. Metadata stays on the device; no wrapper plan or
+    # device-to-host reads are needed for this invocation.
+
+    @classmethod
+    def from_functional(
+        cls,
+        *,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        block_tables: torch.Tensor,
+        bmm1_scale: Union[float, torch.Tensor],
+        bmm2_scale: Union[float, torch.Tensor],
+        sinks: object,
+        enable_pdl: Optional[bool],
+    ) -> "_BatchMLAPagedAttentionXqaBackend":
+        q_len_per_request = query.size(1)
+        if q_len_per_request != 1:
+            raise ValueError(
+                f"XQA MLA only supports q_len_per_request == 1, got {q_len_per_request}"
+            )
+        if not is_sm12x_supported(query.device):
+            raise ValueError(
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
+            )
+        if query.dtype != kv_cache.dtype or query.dtype not in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ):
+            raise ValueError(
+                "XQA MLA supports (fp8, fp8) or (bfloat16, bfloat16) only, "
+                f"got {query.dtype} and {kv_cache.dtype}"
+            )
+        if sinks is not None:
+            raise ValueError("XQA MLA does not support sinks")
+        page_size = kv_cache.shape[-2]
+        kv_cache = _check_mla_query_kv_shape(
+            query, kv_cache, kv_lora_rank, qk_rope_head_dim
+        )
+        _check_mla_dense_page_table_shape(
+            block_tables, query.shape[0], page_size, True, True
+        )
+        num_heads = query.shape[-2]
+        if num_heads != 128:
+            raise ValueError(
+                "XQA MLA only supports 128 query heads (head_group_ratio=128), "
+                f"got {num_heads} query heads"
+            )
+        backend = cls(workspace_buffer)
+        backend._is_planned = False
+        backend._module = get_xqa_module_mla(
+            query.dtype, kv_cache.dtype, page_size, query.shape[-1], num_heads, False
+        )
+        # Rebuild the singleton KV head axis to preserve the native strides.
+        backend._kv_cache = kv_cache.squeeze(1).unsqueeze(2)
+        backend._page_size = page_size
+        backend._max_seq_len = block_tables.shape[-1] * page_size
+        backend._bmm1_scale = bmm1_scale
+        backend._bmm2_scale = bmm2_scale
+        backend._enable_pdl = (
+            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+        )
+        backend._sm_count = get_device_sm_count(query.device)
+        workspace_u8 = workspace_buffer.view(torch.uint8)
+        backend._semaphore = workspace_u8[:_XQA_SEMAPHORE_BYTES]
+        backend._scratch = workspace_u8[_XQA_SEMAPHORE_BYTES:]
+        return backend
+
+    # Shared native execution. Tensor scales pass through unchanged, matching
+    # the existing functional XQA convention; the wrapper accepts scalars only.
+
+    def _execute(
+        self, query, kv_cache, block_tables, seq_lens, out, bmm1_scale, bmm2_scale
+    ) -> torch.Tensor:
+        self._module.xqa_mla(
+            self._sm_count,
+            bmm1_scale,
+            out,
+            query,
+            kv_cache,
+            kv_cache,
+            block_tables,
+            self._max_seq_len,
+            seq_lens,
+            query.shape[0],
+            bmm2_scale,
             self._semaphore,
             self._scratch,
             self._enable_pdl,
         )
         return out
+
+    # Autotuning support for functional execution and the current wrapper plan.
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def get_valid_tactics(self, inputs, profile):
+        if self._is_planned:
+            widths = (self._kv_lora_rank, self._qk_rope_head_dim)
+            query = _resolve_structural_mla_input(
+                inputs[0], desired="packed", widths=widths, name="query"
+            )
+            kv_cache = _resolve_structural_mla_input(
+                inputs[1], desired="packed", widths=widths, name="KV cache"
+            )
+            out = inputs[2]
+            # Invalid contracts must still fail instead of silently removing a
+            # candidate. Only a valid but unsupported layout is an admission miss.
+            check_shape_dtype_device(
+                query,
+                (self._batch_size, self._num_heads, self._head_dim),
+                self._q_dtype,
+                self.device,
+                "query",
+            )
+            check_shape_dtype_device(
+                kv_cache,
+                (kv_cache.shape[0], self._page_size, self._head_dim),
+                self._kv_dtype,
+                self.device,
+                "kv_cache",
+            )
+            check_shape_dtype_device(
+                out,
+                (self._batch_size, self._num_heads, self._kv_lora_rank),
+                torch.bfloat16,
+                self.device,
+                "out",
+            )
+            if not all(tensor.is_contiguous() for tensor in (query, kv_cache, out)):
+                return []
+        return [-1]
+
+    def get_cache_key_extras(self, inputs):
+        if self._is_planned:
+            return ("planned", self._planned_tuning_key)
+        query, _, _, out = inputs[:4]
+        scale_keys = tuple(
+            (tuple(scale.shape), tuple(scale.stride()), scale.dtype)
+            if isinstance(scale, torch.Tensor)
+            else scale
+            for scale in (self._bmm1_scale, self._bmm2_scale)
+        )
+        return (
+            "functional",
+            query.dtype,
+            tuple(query.stride()),
+            self._kv_cache.dtype,
+            tuple(self._kv_cache.shape),
+            tuple(self._kv_cache.stride()),
+            out.dtype,
+            tuple(out.stride()),
+            self._page_size,
+            self._max_seq_len,
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size(),
+            self._enable_pdl,
+            scale_keys,
+        )
+
+    def configure_tuning(self, *, cache_key: tuple, run_options: dict) -> None:
+        if any(isinstance(value, torch.Tensor) for value in run_options.values()):
+            raise ValueError(
+                "XQA planned tuning options must contain only host values."
+            )
+        self._planned_tuning_key = cache_key
+        self._planned_run_options = dict(run_options)
+
+    def forward(
+        self,
+        inputs,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        run_options=None,
+        **kwargs,
+    ):
+        if tactic != -1:
+            raise ValueError(f"Unsupported XQA MLA tactic: {tactic!r}.")
+        if self._is_planned:
+            query, kv_cache, out, lse, sinks = inputs[:5]
+            options = self._planned_run_options if run_options is None else run_options
+            if len(inputs) == 7:
+                options = dict(options, bmm1_scale=inputs[5], bmm2_scale=inputs[6])
+            return self.run_from_wrapper(
+                query=query,
+                kv_cache=kv_cache,
+                out=out,
+                lse=lse,
+                sinks=sinks,
+                profiler_buffer=None,
+                kv_len=None,
+                page_table=None,
+                ckv_scale_arr=None,
+                **options,
+            )
+        query, block_tables, seq_lens, out = inputs[:4]
+        bmm1_scale, bmm2_scale = (
+            inputs[4:6] if len(inputs) > 4 else (self._bmm1_scale, self._bmm2_scale)
+        )
+        return self._execute(
+            query,
+            self._kv_cache,
+            block_tables,
+            seq_lens.unsqueeze(1),
+            out,
+            bmm1_scale,
+            bmm2_scale,
+        )

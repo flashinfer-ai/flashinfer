@@ -203,6 +203,44 @@ def test_mtp_variable_q(num_heads, q_lens, kv_lens):
     _check(out, _reference(case), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "num_heads,kv_lens",
+    [
+        (12, [770]),  # one request: the 16-row tile, 7 KV tiles, three splits
+        (
+            12,
+            [770, 768, 785, 802, 812, 738, 889, 741],
+        ),  # the Kimi-K3 layer-91 band (11-14 pages)
+        (96, [6000, 5000]),  # 96-row tile, always-exact path
+        (96, [9000]),  # two-CTA wide route
+    ],
+)
+def test_decode_sink_key_rows(num_heads, kv_lens):
+    """A sink key ~150 octaves above every other key for most heads of a row tile, flat scores for the others.
+
+    The lazy E4M3 reference of the row-tile programs is re-referenced per tile for every column of an exceeding
+    warpgroup; before the bounded-drop rule a sink-less column's later move pulled the sink columns ~120 octaves
+    down and the FP32 rescale overflowed (Inf / NaN rows in Kimi-K3 serving).  The output must be finite and match
+    the FP32 reference.
+    """
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    case = _make_case(
+        len(kv_lens), [1] * len(kv_lens), kv_lens, num_heads, seed=645011, device=device
+    )
+    sink_heads = [h for h in range(num_heads) if h % 4 != 3]
+    for b in range(len(kv_lens)):
+        page = int(case["block_tables"][b, 0].item())
+        case["kv_cache"][page, 0] = _fp8(torch.full((QK_DIM,), 2.0, device=device))
+        case["query"][b, sink_heads] = _fp8(torch.full((QK_DIM,), 1.25, device=device))
+    out = _run(case, fixed_q_len=1)
+    _check(out, _reference(case), atol=0.1, rtol=0.1)
+    rel = (out.float() - _reference(case).float()).norm(dim=-1) / _reference(
+        case
+    ).float().norm(dim=-1).clamp_min(1e-6)
+    assert float(rel.max()) <= 0.05
+
+
 def test_incremental_prefill_prefix_reuse():
     _skip_unless_sm100_family()
     device = torch.device("cuda")

@@ -89,13 +89,18 @@ with ``w2_scale`` ``[L, H, I_shard/32]`` (``uint8``).
 
 ``plan`` refuses two classes of rows, both with ``NotImplementedError``.
 ``decision.supported`` is ``False`` only when the hand-written selection needs
-an IR form this chain has not traced (the wide 192-row ``mixed192`` form, MoE-TP
-rows of 8192 tokens and above); ``decision.reason`` names the missing form.
-Every other row reports ``decision.supported`` as ``True``, but ``plan`` also
-refuses a row whose ``decision.path`` is not in ``EXECUTABLE_PATHS`` (the
-``two_stage`` finalize on MoE-TP rows of 17 to 127 tokens is traced but not
-enqueued by this chain).  Callers that need a hard answer before ``plan``
-check ``decision.path in EXECUTABLE_PATHS`` as well as ``decision.supported``.
+an IR form this chain has not traced; ``decision.reason`` names the missing
+form (no contract row is in this class).  Every other row reports
+``decision.supported`` as ``True``, but ``plan`` also refuses a row whose
+``decision.path`` is not in ``EXECUTABLE_PATHS`` (the ``two_stage`` finalize
+on MoE-TP rows of 17 to 127 tokens is traced but not enqueued by this chain).
+The two-stream ``mixed192`` chain serves the MoE-TP rows of 8192 tokens and
+above; from 16384 tokens its finalize stage is static and decided on the
+device: a one-warp ``gemm2_gate`` kernel after ``moe_sort`` reads the sort
+tables and writes the item count every finalize launch of both paths keys off,
+so the unselected path's kernels exit on zero items and the host enqueues the
+same kernels on every run.  Callers that need a hard answer before ``plan`` check
+``decision.path in EXECUTABLE_PATHS`` as well as ``decision.supported``.
 The dense grouped-GEMM path above ``swapab_max_tokens``, the split two-stage
 path and the hybrid path run through their own executable chains (see
 ``executed_chains`` in the manifest).
@@ -109,9 +114,16 @@ the ``RoutingConfig`` fields for the routing forms); module file names are
 content fingerprints.  ``gate`` names the validation each form went through in
 Cake: ``e2e_registry`` (compile, static analysis and GPU correctness on both
 backends in Cake's kernel registry), ``plan_gate`` (selected by the plan on the
-contract rows and validated end to end through the plan), ``plan_variant`` (a
-routing-mode variant of a plan-gated form, reachable through the public API but
-not on a contract row).
+contract rows; the contract routing mode, BF16 ``topk_weights``, is validated end
+to end through the plan and the contract evaluator, the packed-ids and FP32
+route layouts by this package's tests, in the contract's accumulation class
+against the BF16-weights run of the same routing: bit-identical on tokens with
+at most one local contribution, within the BF16 accumulation budget where the
+finalize's ``red.add.bf16x2`` reduces more).  The routing and route-preprocess forms are carried for
+every route layout the operands select (``contract.routing_modes``).  A form's
+``registry_geometry_gates`` name the registry entries that gate the same module
+at a second problem geometry (the odd weight-tile count of the cluster (1, 2)
+dense GEMM2 forms, which the 19-tile H = 3584 rows launch).
 
 .. list-table:: Generated kernel forms (``route.stage``)
    :header-rows: 1
@@ -136,28 +148,8 @@ not on a contract row).
      - gemm2_swapab
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``gemm2_swapab_finalize_n64``
+   * - ``gemm2_swapab_finalize_n192_2cta_cm4``
      - gemm2_swapab
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``gemm2_swapab_finalize_n128``
-     - gemm2_swapab
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``gemm2_swapab_finalize_n192_2cta``
-     - gemm2_swapab
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``gemm2_swapab_partial_n8_m2``
-     - gemm2_swapab_partial
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``gemm2_swapab_partial_n16_m2``
-     - gemm2_swapab_partial
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``gemm2_swapab_partial_n32_m2``
-     - gemm2_swapab_partial
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm1_swapab_situ_n32``
@@ -180,11 +172,19 @@ not on a contract row).
      - gemm1_swapab
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``gemm2_dense_finalize_n192``
-     - gemm2_dense
+   * - ``gemm1_swapab_situ_n8_k8_cs``
+     - gemm1_swapab
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``gemm2_dense_finalize_n128``
+   * - ``gemm1_swapab_situ_n32_cs``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n16_nol2_cs``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192``
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
@@ -204,11 +204,39 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``gemm2_dense_finalize_n256_rg``
+   * - ``gemm2_dense_finalize_n256_rg_early``
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``gemm2_dense_finalize_n256_rg_early``
+   * - ``gemm2_dense_finalize_n192_c12_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_2cta_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_c12_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_2cta_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_c12_rg_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_2cta_rg_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192_c12_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192_c12_rg_rauto``
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
@@ -217,10 +245,6 @@ not on a contract row).
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n256_rowgroup``
-     - gemm1_dense
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``gemm1_dense_situ_m128_n128_rowgroup``
      - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
@@ -240,32 +264,32 @@ not on a contract row).
      - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``routing_ep8_decode``
-     - routing
+   * - ``gemm1_dense_situ_m128_n256_rowgroup_zero_fill``
+     - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``routing_cluster8``
-     - routing
+   * - ``gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_rowgroup_zero_fill_nol2``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary_nol2``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_cs``
+     - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
    * - ``routing_split``
      - routing
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``token_index_top8``
-     - token_index
-     - cake, cake_cute
-     - ``e2e_registry``
    * - ``route_preprocess_packed``
      - route_preprocess
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``dispatch_mixed_lists``
-     - dispatch
-     - cake, cake_cute
-     - ``e2e_registry``
-   * - ``dispatch_mixed192_dual``
-     - dispatch_mixed
      - cake, cake_cute
      - ``e2e_registry``
    * - ``moe_sort_init_t384``
@@ -300,12 +324,12 @@ not on a contract row).
      - moe_sort_coop
      - cake
      - ``e2e_registry``
-   * - ``finalize_top8``
+   * - ``finalize_top8_split``
      - finalize
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``finalize_top8_split``
-     - finalize
+   * - ``gemm2_gate``
+     - gemm2_gate
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm2_swapab_finalize_n8_m2``
@@ -348,20 +372,84 @@ not on a contract row).
      - gemm2_swapab_partial
      - cake, cake_cute
      - ``plan_gate``
-   * - ``gemm1_swapab_situ_n16_nol2``
-     - gemm1_swapab
-     - cake, cake_cute
-     - ``plan_gate``
-   * - ``gemm1_swapab_situ_n32_nol2``
-     - gemm1_swapab
-     - cake, cake_cute
-     - ``plan_gate``
    * - ``gemm2_swapab_finalize_n16_k8_nol2``
      - gemm2_swapab
      - cake, cake_cute
      - ``plan_gate``
    * - ``gemm2_swapab_finalize_n32_k8_nol2``
      - gemm2_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_swapab_situ_n32_nol2_cs``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c1``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c1_single``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c2``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c2_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c3``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c3_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c4``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c4_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c5``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c5_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c6``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c6_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c7``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c7_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c8``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c8_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_packed_c8_split_l16384``
+     - routing
      - cake, cake_cute
      - ``plan_gate``
    * - ``routing_separate_bf16_c1``
@@ -436,11 +524,95 @@ not on a contract row).
      - routing
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_separate_fp32_c1``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c1_single``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c2``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c2_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c3``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c3_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c4``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c4_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c5``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c5_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c6``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c6_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c7``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c7_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_fp32_c8_split_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_packed_noclear``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``route_preprocess_separate_bf16``
      - route_preprocess
      - cake, cake_cute
      - ``plan_gate``
    * - ``route_preprocess_separate_bf16_noclear``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_separate_fp32``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_separate_fp32_noclear``
      - route_preprocess
      - cake, cake_cute
      - ``plan_gate``
@@ -450,6 +622,10 @@ not on a contract row).
      - ``plan_gate``
    * - ``dispatch_wide_narrow_lists``
      - dispatch
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_dense_situ_m128_n256_cs_nopdl``
+     - gemm1_dense
      - cake, cake_cute
      - ``plan_gate``
    * - ``gemm1_dense_situ_m128_n256_nopdl``

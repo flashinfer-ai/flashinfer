@@ -545,7 +545,7 @@ def test_cpu_auto_dispatches_shared_policy(_cpu_planners, monkeypatch, capabilit
 def test_auto_candidates_cover_each_concrete_backend_once():
     from flashinfer.mla._batch_mla._wrapper import _BACKEND_TYPES
 
-    expected = set(_BACKEND_TYPES) - {"auto", "cute-dsl"}
+    expected = set(_BACKEND_TYPES) - {"auto", "autotune", "cute-dsl"}
     args, _ = _request((1,), (512,))
     for candidates in (
         _auto_policy._AUTO_BACKEND_CANDIDATES,

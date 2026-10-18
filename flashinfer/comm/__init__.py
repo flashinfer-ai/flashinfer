@@ -1,3 +1,5 @@
+import contextlib
+
 from .cuda_ipc import CudaRTLibrary, create_shared_buffer, free_shared_buffer
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
@@ -98,6 +100,9 @@ from .ulysses_topology import (
     probe_ulysses_rank_topology as probe_ulysses_rank_topology,
 )
 from .ulysses_topology import resolve_ulysses_backend as resolve_ulysses_backend
+from .qkv_norm_rope_exchange_overlap import (
+    QkvNormRopeExchangeOverlap as QkvNormRopeExchangeOverlap,
+)
 
 # Unified AllReduce Fusion API
 from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace
@@ -110,8 +115,18 @@ from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
 
+with contextlib.suppress(ImportError, AttributeError):
+    from .tp_moe_finalize_rmsnorm import (
+        init_tp_moe_finalize_rmsnorm as init_tp_moe_finalize_rmsnorm,
+    )
+    from .tp_moe_finalize_rmsnorm import (
+        supports_tp_moe_finalize_rmsnorm as supports_tp_moe_finalize_rmsnorm,
+    )
+    from .tp_moe_finalize_rmsnorm import (
+        tp_moe_finalize_rmsnorm as tp_moe_finalize_rmsnorm,
+    )
+
 # MNNVL A2A (Throughput Backend)
-from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_alltoall import moe_a2a_active_rank_mask as moe_a2a_active_rank_mask
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
@@ -140,8 +155,6 @@ from .dcp_lse_reduce import (
 from .dcp_lse_reduce import (
     decode_cp_a2a_lse_reduce_workspace_size as decode_cp_a2a_lse_reduce_workspace_size,
 )
-
-# from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
 from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (

@@ -36,6 +36,13 @@ _HEADS = 12
 _HEAD_DIM = 128
 _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
 
+# Qualified variants that run faster from the native sm_107a compile than from the
+# SM100-family cubin on compute capability 10.7 (same kernel source; the output and
+# state pool are bitwise identical). Every other variant keeps the family target.
+_SM107_NATIVE_VARIANTS: frozenset[str] = frozenset(
+    {"cpasync_tile64_register_pipeline_early_publish"}
+)
+
 
 def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
     """Select the legacy exact target or the SM100-family target."""
@@ -53,11 +60,33 @@ def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
                 "packed KDA T=1 on compute capability 10.3 requires CUDA 12.9 or newer"
             )
         return "sm100f"
+    if compute_capability == (10, 7):
+        if not is_cuda_version_at_least("13.0"):
+            raise RuntimeError(
+                "packed KDA T=1 on compute capability 10.7 requires CUDA 13.0 or newer"
+            )
+        return "sm100f"
     raise RuntimeError(
-        "packed KDA T=1 requires compute capability 10.0 "
-        "or 10.3 in the SM100 family; got "
+        "packed KDA T=1 requires compute capability 10.0, 10.3 or 10.7 "
+        "in the SM100 family; got "
         f"{compute_capability[0]}.{compute_capability[1]}"
     )
+
+
+def _target_for_variant(device: torch.device, variant: str) -> CakeKDAPackedT1Target:
+    """Select the target for a qualified Cake variant.
+
+    Compute capability 10.7 compiles the variants in ``_SM107_NATIVE_VARIANTS``
+    natively for sm_107a; everything else uses ``_target_for_device``.
+    """
+
+    target = _target_for_device(device)
+    if variant in _SM107_NATIVE_VARIANTS and get_compute_capability(device) == (
+        10,
+        7,
+    ):
+        return "sm107a"
+    return target
 
 
 def _optimized_alignment_flags(
@@ -144,6 +173,7 @@ def run_packed_kda_decode(
     )
     optimized_variant = select_cake_kda_packed_t1_variant(
         batch,
+        compute_capability=get_compute_capability(mixed_qkv.device),
         state_aligned=state_aligned,
         aux_vec4_aligned=aux_vec4_aligned,
     )
@@ -151,7 +181,9 @@ def run_packed_kda_decode(
         legacy_variant = _legacy_variant_for_batch(batch)
         module = get_flash_kda_packed_t1_module(legacy_variant, target)
     else:
-        module = get_cake_kda_packed_t1_module(optimized_variant, target)
+        module = get_cake_kda_packed_t1_module(
+            optimized_variant, _target_for_variant(mixed_qkv.device, optimized_variant)
+        )
     module.run(
         mixed_qkv,
         raw_gate,

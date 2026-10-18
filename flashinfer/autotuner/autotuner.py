@@ -1143,9 +1143,9 @@ def set_autotune_process_group(
     number of times in the same order, or the reduction itself deadlocks. Across
     ranks that requires identical: ``get_valid_tactics`` and shape buckets;
     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
-    reduces); and ``profiling_cache`` / loaded ``autotune(cache=...)`` at entry
-    (a cache hit skips that profile's reduce) -- so set the group from the first
-    ``choose_one`` with identical (ideally empty) starting caches. Input
+    reduces). Cache hits are coordinated per profile: if any rank misses,
+    every rank profiles again. Set the group from the first ``choose_one``;
+    distributed tuning must run outside CUDA Graph capture. Input
     synthesis and ``do_preparation`` OOMs are reduced across the group before
     tactic profiling, giving every rank the same fallback decision.
 
@@ -1179,6 +1179,24 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     oom_flag = torch.tensor([int(local_oom)], dtype=torch.int32, device=device)
     dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX, group=_tune_process_group)
     return bool(oom_flag.item())
+
+
+def _all_ranks_hit_cache(local_hit: bool) -> bool:
+    if _tune_process_group is None:
+        return local_hit
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "Distributed autotuning cannot synchronize cache hits during "
+            "an active CUDA Graph capture"
+        )
+
+    import torch.distributed as dist
+
+    backend = str(dist.get_backend(_tune_process_group)).lower()
+    device = "cuda" if backend == "nccl" else "cpu"
+    hit = torch.tensor([int(local_hit)], dtype=torch.int32, device=device)
+    dist.all_reduce(hit, op=dist.ReduceOp.MIN, group=_tune_process_group)
+    return bool(hit.item())
 
 
 @dataclass(frozen=True)
@@ -2359,7 +2377,15 @@ class AutoTuner:
                         inputs=inputs,
                         require_profiling_policy=True,
                     )
-                    if not is_cache_hit:
+                    if not _all_ranks_hit_cache(is_cache_hit):
+                        if _tune_process_group is not None:
+                            self._discard_profile_cache(
+                                custom_op,
+                                runners,
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                inputs,
+                            )
                         input_preparation_oom = False
                         try:
                             # Active capture is safe for skipped operations and warm cache hits, but
@@ -2608,6 +2634,35 @@ class AutoTuner:
 
             return runners[runner_id], tactic
 
+    def _discard_profile_cache(
+        self, custom_op, runners, input_shapes, tuning_config, inputs
+    ) -> None:
+        """Remove old candidates before a coordinated re-profile.
+
+        Another runner may win this time. Its new entry must take precedence
+        both now and after reloading the store, including on ranks that hit.
+        """
+        winners = self._winner_cache()
+        identity = self._winner_cache_identity()
+        store = self._active_managed_store
+        for runner in runners:
+            key = self._get_cache_key(
+                custom_op,
+                runner,
+                input_shapes,
+                tuning_config,
+                runner.get_cache_key_extras(inputs),
+            )
+            winners.pop(key, None)
+            self._profiling_cache_policies.pop((identity, key), None)
+            self._file_configs.pop(key.file_key, None)
+            self._file_config_policies.pop(key.file_key, None)
+            if store is not None:
+                self._managed_decoded.pop(
+                    (str(store.root), store.env_hash, key.key_fields), None
+                )
+                store.discard(key.file_key)
+
     def rank_tactics(
         self,
         custom_op: str,
@@ -2684,8 +2739,10 @@ class AutoTuner:
             )
             policy = self._profiling_policy(tuning_config)
             cached = self._ranked_tactics_cache.get(cache_key)
-            if cached is not None and cached[0] == policy:
+            if _all_ranks_hit_cache(cached is not None and cached[0] == policy):
+                assert cached is not None
                 return list(cached[1][:k])
+            self._ranked_tactics_cache.pop(cache_key, None)
 
             tensors = None
             input_preparation_oom = False
@@ -3850,7 +3907,7 @@ class AutoTuner:
         inputs: list[Any],
         tuning_config: TuningConfig,
     ) -> list[list[Any]]:
-        """Create multiple input copies to flush the L2 cache between profiling iterations."""
+        """Prepare arena schedules or reuse inputs for explicitly flushed profiling."""
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
@@ -3913,34 +3970,11 @@ class AutoTuner:
             )
             return batches
 
-        one_buffer_bytes = sum(
-            input.numel() * input.element_size()
-            if isinstance(input, torch.Tensor)
-            else 0
-            for input in inputs
-        )
-        if one_buffer_bytes <= 0:
-            logger.debug(
-                "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
-            )
-            return [inputs]
-
-        num_buffers = self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1
-        num_buffers = min(num_buffers, profiling_repeat + 1)
-        # Avoid reusing a warmed batch within the timed graph.
-        if tuning_config.use_cuda_graph and tuning_config.use_cold_l2_graph_replay:
-            num_buffers = max(num_buffers, profiling_repeat)
-
-        inputs_list = [inputs]
-        for _ in range(num_buffers - 1):
-            inputs_list.append(
-                [t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]
-            )
-
-        logger.debug(
-            f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
-        )
-        return inputs_list
+        # Each measured invocation already follows an explicit L2 flush. Reuse
+        # the original tensors so profiling preserves strides, pointer alignment,
+        # and aliases (including nested split views). Tensor.clone() can compact
+        # gapped views and would measure a different layout from the caller's.
+        return [inputs]
 
     def _get_profiling_repeat(self, tuning_config: TuningConfig) -> int:
         profiling_repeat = tuning_config.profiling_repeat

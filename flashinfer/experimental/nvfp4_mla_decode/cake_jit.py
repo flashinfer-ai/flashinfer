@@ -84,26 +84,26 @@ ARG_PLANS: dict[str, list[list[str]]] = {
     ],
 }
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_nvfp4_mla_decode_8bec898f3f4f8f29be51": {
-        "role": "reduce",
+    "cake_nvfp4_mla_decode_bc60071d5e5ff6d89cd9": {
+        "role": "main",
         "sources": [
-            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_8bec898f3f4f8f29be51_kernel.cu",
-            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_8bec898f3f4f8f29be51_binding.cu",
+            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_bc60071d5e5ff6d89cd9_kernel.cu",
+            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_bc60071d5e5ff6d89cd9_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_nvfp4_mla_decode_b777c32b356f30dc993a": {
-        "role": "main",
+    "cake_nvfp4_mla_decode_c8af9a62d9e2cceb7d2a": {
+        "role": "reduce",
         "sources": [
-            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_b777c32b356f30dc993a_kernel.cu",
-            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_b777c32b356f30dc993a_binding.cu",
+            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_c8af9a62d9e2cceb7d2a_kernel.cu",
+            "cake_nvfp4_mla_decode/cake_nvfp4_mla_decode_c8af9a62d9e2cceb7d2a_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
 }
 STAGE_PROGRAMS: dict[str, str] = {
-    "main": "cake_nvfp4_mla_decode_b777c32b356f30dc993a",
-    "reduce": "cake_nvfp4_mla_decode_8bec898f3f4f8f29be51",
+    "main": "cake_nvfp4_mla_decode_bc60071d5e5ff6d89cd9",
+    "reduce": "cake_nvfp4_mla_decode_c8af9a62d9e2cceb7d2a",
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5780"
 
