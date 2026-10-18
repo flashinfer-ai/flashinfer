@@ -47,19 +47,12 @@ def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2, equal_nan=True)
 
 
-def _kernel_table(arch: str) -> dict[str, str]:
-    table = gdn_cp_jit.KERNELS
-    if any(isinstance(value, dict) for value in table.values()):
-        table = table[arch]
-    return table
-
-
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_registry_maps_every_logical_kernel_to_a_program_for_the_arch(
     arch: str,
 ) -> None:
     csrc = _source_root().parents[1]
-    table = _kernel_table(arch)
+    table = gdn_cp_jit.KERNELS[arch]
     assert table, "the generated registry lists the kernels the host dispatches on"
     for name in table:
         program = gdn_cp_jit.program_for(name, arch)
@@ -758,32 +751,6 @@ def test_build_plan_selects_cu32_before_the_gb300_alias(
             max_seqlen=max_seqlen,
             cu_seqlens_dtype=torch.float32,
         )
-
-
-def test_has_gdn_cp_kernel_handles_flat_and_per_arch_tables(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    modules = {
-        "p100": {"arches": ["sm_100a"]},
-        "pall": {"arches": ["sm_100a", "sm_103a"]},
-    }
-    monkeypatch.setattr(gdn_cp_jit, "MODULES", modules)
-    monkeypatch.setattr(gdn_cp_jit, "KERNELS", {"a": "p100", "b": "pall"})
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_100a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_103a") is False
-    assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_103a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("missing", "sm_100a") is False
-    monkeypatch.setattr(
-        gdn_cp_jit,
-        "KERNELS",
-        {"sm_100a": {"a": "p100", "b": "pall"}, "sm_103a": {"b": "pall"}},
-    )
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_100a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_103a") is False
-    assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_103a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_107a") is False
-    with pytest.raises(ValueError):
-        gdn_cp_jit.program_for("a", "sm_103a")
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])

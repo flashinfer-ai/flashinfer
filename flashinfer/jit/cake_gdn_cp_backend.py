@@ -14,12 +14,12 @@
 
 """JIT registry and loader for the Cake GDN CP-prefill kernels.
 
-One generated program (device source + thin TVM-FFI launcher) compiles for every
-architecture it lists; the exact architecture flag set is chosen per device and
-is part of the JIT library name, so two architectures never share one cached
-library.  ``KERNELS`` maps each logical kernel the host dispatches on to its
-program (one table when both architectures agree, otherwise one table per
-architecture).  A loaded kernel is the program's TVM-FFI entry itself: the host
+One generated program (device source + thin TVM-FFI launcher) compiles
+for every architecture it lists; the exact architecture flag set is
+chosen per device and is part of the JIT library name, so two
+architectures never share one cached library.  ``KERNELS`` maps each
+logical kernel the host dispatches on to its program, one table per
+architecture.  A loaded kernel is the program's TVM-FFI entry itself: the host
 calls it positionally with the arguments of ``MODULES[program]["arg_plan"]``
 (grid triple last); the launcher validates them, encodes its tensor maps by
 value and derives the CP-prefill fast-division constants from the plain divisor
@@ -1381,13 +1381,8 @@ def _include_dirs() -> list[Path]:
 def program_for(name: str, arch: GDNCPArch) -> str:
     """Program implementing logical kernel ``name`` on ``arch``."""
 
-    table = (
-        KERNELS.get(arch, KERNELS)
-        if any(isinstance(v, dict) for v in KERNELS.values())
-        else KERNELS
-    )
     try:
-        program = table[name]
+        program = KERNELS[arch][name]
     except KeyError as error:
         raise ValueError(
             f"unknown GDN CP-prefill kernel {name!r} for {arch}"
@@ -1400,9 +1395,9 @@ def program_for(name: str, arch: GDNCPArch) -> str:
 def has_gdn_cp_kernel(name: str, arch: GDNCPArch) -> bool:
     """Whether logical kernel ``name`` has a program for ``arch``.
 
-    Same flat / per-architecture ``KERNELS`` lookup as :func:`program_for`,
-    answering ``False`` where that raises, so the host can select an optional
-    program (the cu32 Stage-1 variants) only on the architectures that ship it.
+    Same per-architecture ``KERNELS`` lookup as :func:`program_for`, answering
+    ``False`` where that raises, so the host can select an optional program
+    (the cu32 Stage-1 variants) only on the architectures that ship it.
     """
 
     try:
@@ -1442,11 +1437,6 @@ def load_gdn_cp_kernel_module(program: str, arch: GDNCPArch):
     return gen_gdn_cp_spec(program, arch).build_and_load()
 
 
-# Logical kernel name per launcher handed out by ``load_gdn_cp_kernel`` (the
-# cache below keeps every launcher alive, so its identity is stable).
-_KERNEL_NAMES: dict[int, str] = {}
-
-
 @functools.cache
 def load_gdn_cp_kernel(name: str, arch: GDNCPArch):
     """Compile (once per process) and return the launcher of one logical kernel.
@@ -1461,28 +1451,7 @@ def load_gdn_cp_kernel(name: str, arch: GDNCPArch):
     launcher = getattr(
         load_gdn_cp_kernel_module(program, arch), MODULES[program]["ffi_entry"]
     )
-    _KERNEL_NAMES[id(launcher)] = name
     return launcher
-
-
-def kernel_name(launcher) -> str:
-    """Logical kernel name of a launcher returned by ``load_gdn_cp_kernel``."""
-
-    try:
-        return _KERNEL_NAMES[id(launcher)]
-    except KeyError:
-        raise ValueError("not a launcher returned by load_gdn_cp_kernel") from None
-
-
-def prepare_gdn_cp_kernel(name: str, arch: GDNCPArch, *, device) -> tuple[Any, tuple]:
-    """Load one kernel for a launcher instance.
-
-    Tensor maps travel by value in kernel parameters, so no per-instance
-    descriptor workspace exists; the second element is always empty.
-    """
-
-    del device
-    return load_gdn_cp_kernel(name, arch), ()
 
 
 __all__ = [
@@ -1491,9 +1460,7 @@ __all__ = [
     "MODULES",
     "gen_gdn_cp_spec",
     "has_gdn_cp_kernel",
-    "kernel_name",
     "load_gdn_cp_kernel",
     "load_gdn_cp_kernel_module",
-    "prepare_gdn_cp_kernel",
     "program_for",
 ]

@@ -37,7 +37,6 @@ from ...jit.cake_gdn_cp_backend import (
     GDNCPArch,
     has_gdn_cp_kernel,
     load_gdn_cp_kernel,
-    prepare_gdn_cp_kernel,
 )
 
 _BLOCK = 64
@@ -849,12 +848,8 @@ class GDNCPPrefill:
             else None
         )
         self._t = load_gdn_cp_kernel(plan.t_kernel, plan.arch)
-        self._mn, self._mn_workspaces = prepare_gdn_cp_kernel(
-            plan.mn_kernel, plan.arch, device=q.device
-        )
-        self._fixup, self._fixup_workspaces = prepare_gdn_cp_kernel(
-            plan.fixup_kernel, plan.arch, device=q.device
-        )
+        self._mn = load_gdn_cp_kernel(plan.mn_kernel, plan.arch)
+        self._fixup = load_gdn_cp_kernel(plan.fixup_kernel, plan.arch)
         self._prefill = load_gdn_cp_kernel(plan.prefill_kernel, plan.arch)
         self._gather = None
         self._gather_source = None
@@ -970,8 +965,6 @@ class GDNCPPrefill:
             self.fixed_state,
             self.initial_state_workspace,
             self.tensormap_workspace,
-            *self._mn_workspaces,
-            *self._fixup_workspaces,
             self._gather_source,
             self._scatter_output,
         )
