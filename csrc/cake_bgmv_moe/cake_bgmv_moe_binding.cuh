@@ -91,8 +91,9 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
 }
 
 // Each module is compiled for exactly one target (sm_90a for H100/H200,
-// sm_100a for B200/GB200, sm_103a for B300/GB300). The device must match it;
-// anything else fails closed instead of silently running another cubin.
+// sm_100a for B200/GB200, sm_103a for B300/GB300, sm_107a for Rubin R200).
+// The device must match it; anything else fails closed instead of silently
+// running another cubin.
 inline void CheckCompiledArch(int32_t device_id) {
   int major = 0;
   int minor = 0;

@@ -317,8 +317,9 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
 
     Runs the generated Cake programs (one owner per output token, no output
     atomics, bitwise-reproducible replays). ``backend_used`` is ``"cake"``;
-    ``variant`` is ``"specialized"`` for the hidden 2688/3072 x rank 32 bodies (up to 2048 tokens)
-    and ``"generic"`` for the runtime-hidden rank 8/16/32/64 bundles.
+    ``variant`` is ``"specialized"`` for the hidden 2688/3072 x rank 32 bodies at
+    32 to 1024 tokens on SM100, SM103 and SM107 (SM90 always takes the generic
+    bundles) and ``"generic"`` for the runtime-hidden rank 8/16/32/64 bundles.
     """
 
     backend_used: BGMVMoEBackendUsed = "cake"
@@ -615,9 +616,6 @@ class BGMVMoEPortablePlan(_BGMVMoEGraphPlan):
         )
 
 
-# Compatible alias for the name exported by the first release of this backend.
-BGMVMoEBlackwellPlan = BGMVMoECakePlan
-
 BGMVMoEPlan = Union[BGMVMoECakePlan, BGMVMoEPortablePlan]
 
 
@@ -698,10 +696,10 @@ def prepare_bgmv_moe(
     64, any hidden size that is a positive multiple of 8 (LoRA-B feat_out equal
     to it), BF16/FP16 inputs, and exact SM90 (H100/H200), SM100 (B200/GB200),
     SM103 (B300/GB300) or SM107 (Rubin R200) devices; each target runs its own
-    cubin. Hidden sizes
-    2688 and 3072 at rank 32 use the specialized measured bodies at up to 2048
-    tokens (``plan.variant == "specialized"``); everything else, including those
-    shapes at larger token counts, uses the runtime-hidden generic bundles
+    cubin. Hidden sizes 2688 and 3072 at rank 32 use the specialized measured
+    bodies at 32 to 1024 tokens on SM100, SM103 and SM107
+    (``plan.variant == "specialized"``); everything else, including those shapes
+    at other token counts and on SM90, uses the runtime-hidden generic bundles
     (``plan.variant == "generic"``). Routing may be arbitrary; each output has one owner that accumulates
     routes in fixed input order, so identical prepared replays are bitwise
     reproducible. The contiguous top-k=2 layout takes the optimized fast path;

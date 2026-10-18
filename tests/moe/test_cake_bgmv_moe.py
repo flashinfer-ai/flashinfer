@@ -335,10 +335,7 @@ def test_invalid_routing_indices_rejected(tensor_index, value, message):
         prepare_bgmv_moe(*inputs, backend="cake")
 
 
-def test_plan_alias_kept_and_blackwell_backend_rejected():
-    from flashinfer.fused_moe import BGMVMoEBlackwellPlan, BGMVMoECakePlan
-
-    assert BGMVMoEBlackwellPlan is BGMVMoECakePlan
+def test_blackwell_backend_rejected():
     x = torch.empty((1, 2688), dtype=torch.bfloat16)
     empty_i64 = torch.empty((1,), dtype=torch.int64)
     empty_f32 = torch.empty((1,), dtype=torch.float32)
@@ -363,7 +360,7 @@ def test_y_accum_may_be_a_column_slice_of_a_wider_buffer(hidden_size, rank):
     expected = _reference(inputs)
     num_tokens = int(inputs[0].shape[0])
     # The bundle follows the per-arch selector (specialized 2688/3072 x 32 only
-    # inside the Blackwell token window; generic everywhere else).
+    # inside the SM100/SM103/SM107 token window; generic everywhere else).
     variant = _expected_variant(hidden_size, num_tokens, rank)
     wide = torch.full(
         (num_tokens, hidden_size + 64), float("nan"), dtype=torch.float32, device="cuda"
@@ -869,7 +866,8 @@ def test_specialized_variant_window_at_rank_32(hidden_size):
     _require_cake_arch()
     # Decode-sized launches take the generic bundle on every architecture
     # (hidden-split shrink + programmatic dependent launch); the specialized
-    # bodies are used only inside the per-arch token window (Blackwell 128..512).
+    # bodies are used only inside the per-arch token window (32..1024 tokens on
+    # SM100/SM103/SM107; SM90 has no window and always takes the generic bundle).
     plan = prepare_bgmv_moe(
         *_make_inputs(hidden_size, 4, torch.bfloat16), backend="cake"
     )
