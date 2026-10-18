@@ -158,15 +158,7 @@ CLUSTER_VARIANTS = (
 # ``{csize: clusters}`` resolved from ``cuOccupancyMaxActiveClusters`` at one
 # CTA per SM (:func:`cluster_capacity`).  A per-GPC model (8 GPCs x 16 SMs)
 # over-counted four-CTA clusters on the 132-SM H100 (32 vs 30) and sent
-# 31-32-tile problems into a second cluster wave.  The reference table below
-# is that device's measured capacity, for tests only — planning resolves it.
-REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {
-    2: 66,
-    3: 39,
-    4: 30,
-    6: 17,
-    8: 15,
-}
+# 31-32-tile problems into a second cluster wave.
 CLUSTER_MERGE_COST = 0.3
 CLUSTER_PAD_COST = 0.15
 

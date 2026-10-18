@@ -1702,7 +1702,7 @@ class VariableBlockSparseAttentionWrapper:
             grid that fits one wave) route to a one-CTA-per-query-block kernel with the
             plan passed in the kernel parameter bank, everything else to the persistent
             kernel), or ``cake_cute`` (the same kernels and planner, built from their
-            CuTe DSL rendering; needs the optional ``nvidia-cutlass-dsl`` package).
+            CuTe DSL rendering with the ``nvidia-cutlass-dsl`` package).
             Defaults to ``auto``. Automatic selection never selects ``cake`` or
             ``cake_cute``.  If set to ``auto``, the function will automatically choose the
             backend based on the device architecture and kernel availability.

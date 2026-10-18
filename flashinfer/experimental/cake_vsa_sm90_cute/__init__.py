@@ -337,20 +337,9 @@ def load_stage(stage: str) -> CuteStage:
     return CuteStage(stage)
 
 
-def compile_all() -> Dict[str, int]:
-    """Compile every stage (warm-up / CI); returns dynamic SMEM per stage."""
-    result = {}
-    for stage in STAGES:
-        loaded = load_stage(stage)
-        loaded.entry  # noqa: B018 - compiles
-        result[stage] = loaded.dynamic_smem_bytes
-    return result
-
-
 __all__ = [
     "STAGES",
     "CuteStage",
-    "compile_all",
     "is_available",
     "load_stage",
     "manifest",

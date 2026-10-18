@@ -26,7 +26,6 @@ import torch
 from flashinfer.cake_vsa_sm90 import (
     MAX_NSPLIT,
     PLAN_HALFWORDS,
-    REFERENCE_CLUSTER_CAPACITY_H100_SXM,
     CLUSTER_VARIANTS,
     PLAN_META_SPLIT,
     PLAN_META_UNSPLIT,
@@ -55,7 +54,17 @@ from flashinfer.cake_vsa_sm90 import (
 )
 
 
-CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM  # measured co-resident cluster capacity of the 132-SM H100 SXM
+# Measured co-resident cluster capacity ``{csize: clusters}`` of the 132-SM H100
+# SXM (``cuOccupancyMaxActiveClusters`` at one CTA per SM).  Planning resolves
+# the live device's table through ``cluster_capacity``; these tests pin this one.
+REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {
+    2: 66,
+    3: 39,
+    4: 30,
+    6: 17,
+    8: 15,
+}
+CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM
 
 
 def _random_mask(h, mb, nb, capacity, seed=0, ragged=True, device="cpu"):

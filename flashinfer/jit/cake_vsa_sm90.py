@@ -137,11 +137,6 @@ def _source_path(relative_path: str) -> Path:
     return path
 
 
-def cake_vsa_sm90_launch(stage: str = "attention") -> dict[str, Any]:
-    """Launch record of one generated module (block, dynamic SMEM, PDL/cooperative flags)."""
-    return dict(_record(stage)["launch"])
-
-
 @functools.cache
 def gen_cake_vsa_sm90_module(stage: str = "attention") -> JitSpec:
     record = _record(stage)
@@ -171,24 +166,8 @@ def load_cake_vsa_sm90_module(stage: str = "attention"):
     return module, _record(stage)
 
 
-def build_all_cake_vsa_sm90_modules() -> dict[str, str]:
-    built = {}
-    for stage in STAGES:
-        spec = gen_cake_vsa_sm90_module(stage)
-        module = spec.build_and_load()
-        record = _record(stage)
-        if not hasattr(module, str(record["ffi_entry"])):
-            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
-        built[f"{record['name']}_{_ARCH}"] = str(
-            spec.get_library_path().resolve(strict=True)
-        )
-    return built
-
-
 __all__ = [
     "STAGES",
-    "build_all_cake_vsa_sm90_modules",
-    "cake_vsa_sm90_launch",
     "gen_cake_vsa_sm90_module",
     "load_cake_vsa_sm90_module",
 ]
