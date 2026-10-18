@@ -20,6 +20,11 @@ import pytest
 
 from flashinfer.jit import cake_gdn as cake_gdn
 
+# The -D knobs a record passes when it shares its body with a schedule twin
+# (its kernel symbol and the constant its deleted clone body baked in); the
+# resolver key (``specializations``) does not carry them.
+_BODY_SHARING_DEFINES = {"CAKE_GDN_KERNEL_SYMBOL", "LAUNCH_MIN_BLOCKS", "T_STEPS"}
+
 
 def _prefill(**overrides):
     params = {
@@ -101,7 +106,11 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
         for key, value in record.get("defines", {}).items():
             assert key.isidentifier()
             assert isinstance(value, str) and value
-        assert set(record.get("defines", {})) <= set(record["specializations"])
+        # A record sharing its body with a schedule twin passes the knobs
+        # its own text used to bake in on the compile line; those are not
+        # specializations of the resolver key.
+        extra_defines = set(record.get("defines", {})) - set(record["specializations"])
+        assert extra_defines <= _BODY_SHARING_DEFINES
     assert included_headers == header_names
 
 

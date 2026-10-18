@@ -4853,6 +4853,15 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "2",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "64"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_1a2020c60e52",
@@ -4866,7 +4875,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -4885,6 +4894,15 @@
         "sm_103a",
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "8",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "32"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_2b435b5b66ce",
@@ -4899,7 +4917,7 @@
             "sm_103a",
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -4917,6 +4935,15 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "16",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "64"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_2d4d52366065",
@@ -4930,7 +4957,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -4949,6 +4976,15 @@
         "sm_103a",
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "16",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "32"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_45d94ac47fdc",
@@ -4963,7 +4999,7 @@
             "sm_103a",
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -4982,6 +5018,15 @@
         "sm_103a",
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "8",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "32"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_4d6485b290bf",
@@ -4996,7 +5041,7 @@
             "sm_103a",
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5014,6 +5059,15 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "4",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "64"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_53ad1af382c9",
@@ -5027,7 +5081,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5045,6 +5099,15 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "8",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "64"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_801e173acab7",
@@ -5058,7 +5121,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5076,6 +5139,15 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "4",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "64"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_83f49627adfa",
@@ -5089,7 +5161,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5108,6 +5180,15 @@
         "sm_103a",
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "2",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "32"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_a3e615772627",
@@ -5122,7 +5203,7 @@
             "sm_103a",
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5141,6 +5222,15 @@
         "sm_103a",
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "4",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "32"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_a782c901f21e",
@@ -5155,7 +5245,7 @@
             "sm_103a",
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5173,6 +5263,15 @@
         "sm_100a",
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "8",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "64"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_c6292ad3e9ca",
@@ -5186,7 +5285,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5205,6 +5304,15 @@
         "sm_103a",
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "4",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "32"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_ea0da33a3ec1",
@@ -5219,7 +5327,7 @@
             "sm_103a",
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5236,6 +5344,15 @@
       "architectures": [
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d547d751c50040665077",
+        "H": "4",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "9",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_2af99ac8bac0",
@@ -5248,7 +5365,7 @@
           "architectures": [
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_d547d751c50040665077_c841d98cd0e8.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8r56",
@@ -5265,6 +5382,15 @@
       "architectures": [
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d547d751c50040665077",
+        "H": "2",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "9",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_3542e4b0d216",
@@ -5277,7 +5403,7 @@
           "architectures": [
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_d547d751c50040665077_c841d98cd0e8.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8r56",
@@ -5294,6 +5420,15 @@
       "architectures": [
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d547d751c50040665077",
+        "H": "8",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "9",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_3faebd11b036",
@@ -5306,7 +5441,7 @@
           "architectures": [
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_d547d751c50040665077_c841d98cd0e8.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8r56",
@@ -5323,6 +5458,15 @@
       "architectures": [
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d547d751c50040665077",
+        "H": "4",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "9",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_6eaa53b99a7e",
@@ -5335,7 +5479,7 @@
           "architectures": [
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_d547d751c50040665077_c841d98cd0e8.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8r56",
@@ -5352,6 +5496,15 @@
       "architectures": [
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d547d751c50040665077",
+        "H": "8",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "9",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_72590b84e150",
@@ -5364,7 +5517,7 @@
           "architectures": [
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_d547d751c50040665077_c841d98cd0e8.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8r56",
@@ -5381,6 +5534,15 @@
       "architectures": [
         "sm_103a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_d547d751c50040665077",
+        "H": "16",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "9",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8r56_fdc1fc6e27f0",
@@ -5393,7 +5555,7 @@
           "architectures": [
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_d547d751c50040665077_c841d98cd0e8.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8r56",
@@ -5849,6 +6011,15 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "16",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_c82051d9ff56",
@@ -5861,7 +6032,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5907,6 +6078,15 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "8",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_53a33fc57112",
@@ -5919,7 +6099,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5936,6 +6116,15 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "4",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_364e002bfdff",
@@ -5948,7 +6137,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -5994,6 +6183,15 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "8",
+        "HV": "32",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_c0d35f36a0b5",
@@ -6006,7 +6204,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -6052,6 +6250,15 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "4",
+        "HV": "16",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_a496cc65e217",
@@ -6064,7 +6271,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -6081,6 +6288,15 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_3c946c068a265505fc87",
+        "H": "2",
+        "HV": "8",
+        "LAUNCH_MIN_BLOCKS": "0",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "TILE_V": "16"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t1_bf16state_vec8occ_1e5e2afe22a3",
@@ -6093,7 +6309,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_3c946c068a265505fc87_d757178e68b0.cu"
+          "path": "cuda/cake_gdn_dbf93df380565abaf39c_873e69e2228c.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t1_bf16state_vec8occ",
@@ -6110,6 +6326,16 @@
       "architectures": [
         "sm_107a"
       ],
+      "defines": {
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_6cccf2a74af8e7ccd2e3",
+        "H": "4",
+        "HV": "8",
+        "INTERMEDIATE_BATCH_STRIDE": "524288",
+        "INTERMEDIATE_TOKEN_STRIDE": "131072",
+        "SCALE": "0.08838834764831845",
+        "STRIDED_INPUTS": "1",
+        "T_STEPS": "4"
+      },
       "domain": "decode",
       "host_binding": {
         "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_28bb7b95db1d",
@@ -6122,7 +6348,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_6cccf2a74af8e7ccd2e3_0a6f3b392299.cu"
+          "path": "cuda/cake_gdn_9bcb9df4c269767ffee7_d4326b69b9ad.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t4_bf16state_tile16_vpre",
@@ -6204,12 +6430,14 @@
       ],
       "defines": {
         "CACHE_INTERMEDIATE_STATES": "1",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_23b1dd923d28be021748",
         "H": "16",
         "HV": "64",
         "INTERMEDIATE_BATCH_STRIDE": "4194304",
         "INTERMEDIATE_TOKEN_STRIDE": "1048576",
         "SCALE": "0.08838834764831845",
         "STRIDED_INPUTS": "1",
+        "TILE_V_WIDE": "64",
         "T_STEPS": "4",
         "UPDATE_STATE": "0"
       },
@@ -6225,7 +6453,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_23b1dd923d28be021748_99d46896cfe6.cu"
+          "path": "cuda/cake_gdn_eaf1e8b244cd4ba498be_7f3845a33c38.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
@@ -6249,12 +6477,14 @@
       ],
       "defines": {
         "CACHE_INTERMEDIATE_STATES": "1",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_23b1dd923d28be021748",
         "H": "16",
         "HV": "64",
         "INTERMEDIATE_BATCH_STRIDE": "5242880",
         "INTERMEDIATE_TOKEN_STRIDE": "1048576",
         "SCALE": "0.08838834764831845",
         "STRIDED_INPUTS": "1",
+        "TILE_V_WIDE": "64",
         "T_STEPS": "4",
         "UPDATE_STATE": "0"
       },
@@ -6270,7 +6500,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_23b1dd923d28be021748_99d46896cfe6.cu"
+          "path": "cuda/cake_gdn_eaf1e8b244cd4ba498be_7f3845a33c38.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
@@ -6474,12 +6704,14 @@
       ],
       "defines": {
         "CACHE_INTERMEDIATE_STATES": "1",
+        "CAKE_GDN_KERNEL_SYMBOL": "kernel_cake_gdn_23b1dd923d28be021748",
         "H": "16",
         "HV": "64",
         "INTERMEDIATE_BATCH_STRIDE": "3145728",
         "INTERMEDIATE_TOKEN_STRIDE": "1048576",
         "SCALE": "0.08838834764831845",
         "STRIDED_INPUTS": "1",
+        "TILE_V_WIDE": "64",
         "T_STEPS": "3",
         "UPDATE_STATE": "0"
       },
@@ -6495,7 +6727,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_23b1dd923d28be021748_99d46896cfe6.cu"
+          "path": "cuda/cake_gdn_eaf1e8b244cd4ba498be_7f3845a33c38.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre",
