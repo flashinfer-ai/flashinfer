@@ -71,6 +71,76 @@ smaller tensor-memory allocation reduce resources per independent route tile.
 PDL lets the Down weight producer start early while its activation producer
 waits for the preceding kernel to finish. This remains a multi-kernel pipeline.
 
+## Current B300 kernel results
+
+Each comparison holds GPU, shape, activation, cache and routing pattern fixed.
+These are local routed-MoE GPU measurements. Model-shaped kernel tests are not
+model-throughput tests, and TP-local weight slices do not measure communication.
+The two dtype cohorts below have different numerical boundaries.
+
+### BF16
+
+These unquantized BF16 shape proxies are measured with
+`benchmarks/bench_frost_low_latency_bf16.py`. Each row compares complete routed
+MoE GPU calls on the same B300, shape, activation, cache and expert-reuse
+condition. This includes GPU adapters and combine; it excludes host submission,
+weight preparation, router selection, shared experts and communication.
+Model-shaped kernel measurements are not model throughput tests.
+
+| Activation | H / I / E / K | T | Cache / reuse | Fastest tested original | Original µs | Frost µs | Speedup |
+|---|---|---:|---|---|---:|---:|---:|
+| swiglu | 2048 / 512 / 512 / 10 | 1 | warm / disjoint | trtllm_default | 27.736 | 15.460 | 1.794× |
+| swiglu | 2048 / 512 / 512 / 10 | 2 | warm / disjoint | trtllm | 44.144 | 31.872 | 1.385× |
+| situ | 2048 / 1408 / 64 / 6 | 2 | warm / disjoint | cutlass | 60.424 | 46.056 | 1.312× |
+
+The SwiGLU rows admit TRT-LLM, CUTLASS, Prims-TS and cuDNN grouped GEMM,
+including defaults. For SiTU, CUTLASS is the only admitted native candidate in
+this B300/software configuration. cuTile and legacy cuDNN Frost decline this
+architecture; all requested but unsupported/failing candidates remain recorded. The JSON records
+which backends were admitted in each row, search counts and numerical checks.
+Runner-advertised spaces can be factorized shortlists; this is not a claim
+against every possible FlashInfer configuration. Selection is frozen before
+separate normal/reverse validation processes. Only qualified comparisons are
+shown, and sub-1% differences mean parity. A selected-pair qualification does
+not imply every slower candidate is stable.
+
+Software: B300/SM103, PyTorch 2.13.0+cu130, CUDA 13.0, CuTe DSL 4.8.0,
+CUDA Python bindings 13.4.3 and cuDNN 9.27. The benchmark records the exact source
+hash. See [BF16 results and controls](frost_low_latency_bf16_b300.json), including
+excluded comparisons and an independent comparison against the best prior
+FC2=4 tuning space. BF16 uses a separate numerical contract from the MX
+performance tables; do not combine their ratios.
+
+### MXFP4/MXFP8 with clamped SwiGLU
+
+This separate cohort uses H2048/I512/E512/K10, MXFP8 activations, BF16 output,
+warm/disjoint routes and SwiGLU limit=10. Its benchmark source is `7caaa1802e44`.
+Runner-advertised searches completed for TRT-LLM (2,401 candidates), CUTLASS
+(5), Prims-TS (1,074 W4 / 1,007 W8), Frost (4), and native CuTe DSL
+(33 W4 candidates). Factorized runners expose stage-ranked shortlists rather
+than every theoretical configuration.
+
+| Weights | T | Measured original set, including defaults | Fastest named original | Original µs | Frost µs | Speedup |
+|---|---:|---|---|---:|---:|---:|
+| MXFP4 | 1 | TRT / CuTe / CUTLASS / Prims | CuTe DSL default | 21.616 | 13.440 | 1.608× |
+| MXFP4 | 4 | TRT / CUTLASS / Prims | TRT-LLM tuned | 31.852 | 21.632 | 1.472× |
+| MXFP8 | 4 | TRT / CUTLASS / Prims | TRT-LLM default | 40.008 | 31.816 | 1.257× |
+
+These displayed pairs pass normal/reverse-process controls and six changed-input
+plus post-timing correctness checks. The W4/T1 selected pair is stable while a
+slower default candidate varies across processes. Both displayed T4 rows pass
+all-candidate controls within their listed native sets. The separate W4/T4 run
+including CuTe fails the exact-winner agreement rule; the narrower 1.472× row
+therefore makes no claim against native CuTe. Other failed comparisons remain
+excluded, with their raw samples and controls preserved.
+
+Native backends use their declared intermediate-rounding references and unchanged
+tolerances; only the new Frost FMA/TC tactics share one numerical contract.
+Software is B300/SM103, PyTorch 2.13.0+cu130, CUDA 13.0 and CuTe DSL 4.8.0.
+[Results, candidate counts, commands and controls](frost_low_latency_b300_native.json)
+record the exact source and comparison scope. Do not combine these ratios with
+the BF16 table or the earlier unclamped-SwiGLU cohort.
+
 ## Supported contract
 
 | Property | Support |
@@ -337,12 +407,17 @@ quantization and routing selection are excluded. Check A/A and cross-process
 stability before interpreting a small difference. These are kernel GPU times
 at model-relevant shapes, not model throughput measurements.
 
-## Individual-call B300 latency
+## Earlier measurements
+
+<details>
+<summary>Earlier native sets, activation contracts and amortized timing</summary>
+
+### Earlier individual-call B300 latency
 
 These paired measurements bracket each complete call with external events
 inside a CUDA Graph. They are separate from the historical amortized table
 below. H/I/E/K denotes hidden size, physical intermediate size, expert count
-and top-k. The current matrix uses H=2048, I=512, E=512 and K=10 unless shown
+and top-k. That cohort uses H=2048, I=512, E=512 and K=10 unless shown
 otherwise; rows with failed controls are omitted. These results qualify the
 stated capture configuration. Alternate graph granularities remain under
 investigation; no unqualified timing-method change is included.
@@ -374,7 +449,7 @@ The subsequent production dispatcher fixes are validated separately. See the
 [results and control metrics](frost_low_latency_b300_latency.json) for exact
 tactics, cache policy, numerical tolerances and excluded cases.
 
-## Historical B300 performance: amortized warm replay
+### Earlier B300 performance: amortized warm replay
 
 Single B300/SM103, FlashInfer 0.7.2 at base `3184bbea`, PyTorch 2.13.0+cu130,
 CUDA 13.0 and CuTe DSL 4.8.0. These are **synthetic MX quantized model shapes**,
@@ -420,6 +495,9 @@ Use `--frost-ffma` to pin the FMA tactic for a paired comparison with a pinned
 Tensor Core tile. The performance table above records the original Tensor Core
 pipeline; it does not attribute those gains to the newly unified FMA tactic.
 
+
+</details>
+
 ## Extension opportunities
 
 The same route-wise schedule supports MXFP8 weights without changing the
@@ -454,34 +532,3 @@ geometry without MX requantization; checkpoint integration still needs its own
 validation. The MX tables above measure quantized shape proxies and do not
 establish performance for the original checkpoints. Qwen3-Next's shared expert
 also remains outside this routed-only backend.
-
-## BF16 B300 public-call results
-
-These are synthetic model-shaped expert weights, measured with
-`benchmarks/bench_frost_low_latency_bf16.py`. Each row compares complete routed
-MoE GPU calls on the same B300, shape, activation, cache and expert-reuse
-condition. This includes GPU adapters and combine; it excludes host submission,
-weight preparation, router selection, shared experts and communication.
-Model-shaped kernel measurements are not model throughput tests.
-
-| Activation | H / I / E / K | T | Cache / reuse | Fastest tested original | Original µs | Frost µs | Speedup |
-|---|---|---:|---|---|---:|---:|---:|
-| swiglu | 2048 / 512 / 512 / 10 | 1 | warm / disjoint | trtllm_default | 27.736 | 15.460 | 1.794× |
-| swiglu | 2048 / 512 / 512 / 10 | 2 | warm / disjoint | trtllm | 44.144 | 31.872 | 1.385× |
-| situ | 2048 / 1408 / 64 / 6 | 2 | warm / disjoint | cutlass | 60.424 | 46.056 | 1.312× |
-
-The search includes applicable TRT-LLM, CUTLASS, Prims-TS, cuDNN grouped,
-cuTile and legacy cuDNN Frost candidates, plus their defaults. The JSON records
-which backends were admitted in each row, search counts and numerical checks.
-Runner-advertised spaces can be factorized shortlists; this is not a claim
-against every possible FlashInfer configuration. Selection is frozen before
-separate normal/reverse validation processes. Only qualified comparisons are
-shown, and sub-1% differences mean parity. A selected-pair qualification does
-not imply every slower candidate is stable.
-
-Software: B300/SM103, PyTorch 2.13.0+cu130, CUDA 13.0, CuTe DSL 4.8.0,
-CUDA Python bindings 13.4.3 and cuDNN 9.27. The benchmark records the exact source
-hash. See [BF16 results and controls](frost_low_latency_bf16_b300.json), including
-excluded comparisons and an independent comparison against the best prior
-FC2=4 tuning space. BF16 uses a separate numerical contract from the MX
-performance tables; do not combine their ratios.
