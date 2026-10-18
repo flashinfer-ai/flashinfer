@@ -78,13 +78,17 @@ def test_clamped_sources_keep_target_and_compile_options(target):
     spec = jit.gen_cake_fused_moe_warp_decode_module(target)
     assert len(spec.sources) == len(set(spec.sources))
     if target == "sm100a":
-        assert len(clamped) == 15
+        assert [source.name for source in clamped] == list(jit._CLAMPED_E256_SOURCES)
+        assert len(clamped) == len(set(clamped)) == 15
+        assert all(source.parent.name == "dsv4_clamped_e256" for source in clamped)
         assert set(clamped) <= set(spec.sources)
         assert (
             "-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256=1" in spec.extra_cuda_cflags
         )
         for source in clamped:
             assert "--use_fast_math" in spec.extra_cuda_cflags_by_source[source]
+        with pytest.raises(FileNotFoundError, match="clamped E256 sources not found"):
+            jit._load_clamped_e256_sources(csrc / "missing", target)
     else:
         assert not clamped
         assert not any(
