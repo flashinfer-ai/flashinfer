@@ -1,7 +1,7 @@
 {
   "scope": "Individual-call warm/cold CUDA Graph GPU latency for complete public routed MoE. Excludes cache eviction, input quantization, routing selection, shared experts, communication, attention, and host submission. Not serving/model throughput.",
   "benchmark_source_commit": "bed1b997e6f63885a3f6e52f4a4ddac445247db6",
-  "kernel_note": "Device kernels match the current common-cache-policy commit 4ef610c13; production tuning changes postdate this matrix. Every reported tactic was independently retuned and pinned by the latency benchmark.",
+  "kernel_note": "MX device kernels match common-cache-policy commit 4ef610c13; the subsequent BF16 address fix does not change these MX tactics; production tuning changes postdate this matrix. Every reported tactic was independently retuned and pinned by the latency benchmark.",
   "method": "Six changing-input graph checks plus post-timing reference checks; independent normal/reverse processes; 16 event-delimited calls per graph; two sweeps of nine timed replays per backend. Show only selected pairs passing repeat, cross-process, native A/A, and same-tactic controls within 1%. A stable selected pair does not imply all other candidate timings were stable.",
   "cold_cache": "Read/write sweep of at least 512 MiB and twice queried L2 before every measured call, outside events.",
   "numerics": "Same canonical quantized weights, activation and routing inputs. Packed Frost/TRT narrows routing weights to BF16; native CuTe keeps FP32. Relative L2 < 1%, normalized max < 3%; not bitwise identity.",
@@ -2287,6 +2287,227 @@
         "cee4a7bf54fdb7d225761984c0ecd23910a4dea54aa4d1176917cf1ef74c2818"
       ],
       "case": "mxfp8-h2048-i512-e512-k10-t4-cold-disjoint"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 25.704000145196915,
+        "frost": 21.6240007430315,
+        "trtllm_default": 25.72000026702881,
+        "frost_tc128": 21.616000682115555,
+        "frost_tc256": 25.72000026702881,
+        "frost_ffma": 58.48799832165241
+      },
+      "best_original_backend": "trtllm",
+      "speedup": 1.1886792111529234,
+      "baseline_aa": [
+        0.0012453394909258027,
+        0.0012453394909258027
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0006226697454629013,
+        "frost": 0.0007401980628697867,
+        "trtllm_default": 0.0006222822691207818,
+        "frost_tc128": 0.0,
+        "frost_tc256": 0.0006222822691207818,
+        "frost_ffma": 0.0002735999026634107
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0012453394909258027,
+          "frost": 0.0007401980628697867,
+          "trtllm_default": 0.0006226697454629013,
+          "frost_tc128": 0.0007401980628697867,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0002735999026634107
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0007401980628697867,
+          "trtllm_default": 0.0012453394909258027,
+          "frost": 0.0007401980628697867,
+          "trtllm": 0.0012453394909258027
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 22)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 22)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.002025431536709506,
+          22.52072070911474,
+          218.72722996769437,
+          0.0020657692543229883,
+          22.491969321457457,
+          256.3920051361785
+        ],
+        [
+          0.002025431536709506,
+          22.52072070911474,
+          218.72722996769437,
+          0.0020657692543229883,
+          22.491969321457457,
+          256.3920051361785
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm",
+          "speedup": 1.1886792111529234,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm",
+          "speedup": 1.189119140177658,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "trtllm",
+          "speedup": 0.9993779112882668,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm",
+          "speedup": 0.4394747791476602,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0007401980628697867,
+        0.0
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 25.696000084280968,
+          "frost": 21.63200080394745,
+          "trtllm_default": 25.71200020611286,
+          "frost_tc128": 21.616000682115555,
+          "frost_tc256": 25.728000327944756,
+          "frost_ffma": 58.479998260736465
+        },
+        {
+          "frost_ffma": 58.49599838256836,
+          "frost_tc256": 25.71200020611286,
+          "frost_tc128": 21.616000682115555,
+          "trtllm_default": 25.728000327944756,
+          "frost": 21.616000682115555,
+          "trtllm": 25.71200020611286
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 4,
+        "cache_mode": "warm",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "shared",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 22)",
+        "cute_tactic": null,
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "c61d9660c9420ee3fcefefe865c35e35acca2cbc620a478e250702da2e234f91",
+        "be2aeb33c416d5df64e8e6bce072014a2e4e5f8751d2bed59bbde6cd7eb98b08"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t4-warm-shared"
     }
   ],
   "excluded_cases": [
@@ -2304,6 +2525,18 @@
     },
     {
       "case": "mxfp8-h2048-i512-e512-k10-t1-cold-disjoint",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    },
+    {
+      "case": "mxfp4-h2048-i512-e512-k10-t4-warm-shared",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    },
+    {
+      "case": "mxfp4-h5120-i1152-e384-k6-t1-warm-disjoint",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    },
+    {
+      "case": "mxfp4-h5120-i1152-e384-k6-t4-warm-disjoint",
       "reason": "repeat, cross-process, or identical-tactic control failed"
     }
   ]

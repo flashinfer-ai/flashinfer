@@ -220,6 +220,7 @@ investigation; no unqualified timing-method change is included.
 | 2048 / 512 / 512 / 10 | MXFP8 | 4 | cold / shared | trtllm | 30.72 | 24.58 | 1.250× |
 | 2048 / 512 / 512 / 10 | MXFP4 | 4 | cold / disjoint | cute_dsl | 36.88 | 30.72 | 1.201× |
 | 2048 / 512 / 512 / 10 | MXFP8 | 4 | cold / disjoint | trtllm | 51.20 | 40.96 | 1.250× |
+| 2048 / 512 / 512 / 10 | MXFP8 | 4 | warm / shared | trtllm | 25.70 | 21.62 | 1.189× |
 
 The original set includes tuned and default TRT-LLM, plus native CuTe DSL for
 MXFP4. All selected Frost tactics in this table use Tensor Cores. † The displayed
