@@ -723,16 +723,28 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
     # Called by Math WGs (tidx >= 128) for one block iteration.
 
     @cute.jit
-    def _gemm_upper_triangular_b(self, t_a, t_b, t_acc):
-        """Multiply with the upper-triangular B used by NewV/O2 (K16, N8)."""
-        atom = cute.make_mma_atom(
-            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
-        )
-        # partition_B stores (N,K). A tile is all zero when 8*n+7 < 16*k.
-        # Keep increasing K order for each output, including diagonal tiles.
+    def _gemm_upper_triangular_b(self, tiled_mma, t_a, t_b, t_acc, b_shape):
+        """Compute C += A @ B.T; B[n,k] == 0 for n < k, so B.T is upper triangular."""
+        atom = cute.make_mma_atom(tiled_mma.op)
+        cB = cute.make_identity_tensor(cute.product_each(b_shape))
+        # M groups share B coordinates; inspect one M group to avoid duplicate work.
+        b_thread_layout = cute.slice_(tiled_mma.thr_layout_vmnk, (None, 0, None, None))
+        b_coords = [
+            tiled_mma.get_slice(b_thread_layout(tid)).partition_B(cB)
+            for tid in range(cute.size(b_thread_layout))
+        ]
+        # qk_or_kk_mask zeros n < k for QK/KK in partition_B's (N,K) coordinates.
+        # CollectiveInverse updates only diagonal/lower blocks; beta scaling and
+        # dtype conversion also preserve these zeros.
         for k in cutlass.range_constexpr(cute.size(t_b, mode=[2])):
             for n in cutlass.range_constexpr(cute.size(t_b, mode=[1])):
-                if cutlass.const_expr(n >= 2 * k):
+                if cutlass.const_expr(
+                    any(
+                        thread_coords[i, n, k][0] >= thread_coords[i, n, k][1]
+                        for thread_coords in b_coords
+                        for i in range(cute.size(t_b, mode=[0]))
+                    )
+                ):
                     b = t_b[None, n, k]
                     b = cute.make_tensor(
                         b.iterator, cute.append(b.layout, cute.make_layout(1))
@@ -1039,7 +1051,9 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         self._math_order_wait(wg_idx)
         cute.copy(newv_tiled_copy_B, tNewVsB, tNewVrB_cv)
         tNewVrC.fill(self.acc_dtype(0.0))
-        self._gemm_upper_triangular_b(tNewVrA, tNewVrB, tNewVrC)
+        self._gemm_upper_triangular_b(
+            newv_tiled_mma, tNewVrA, tNewVrB, tNewVrC, sKK_opd.shape
+        )
         self._math_order_notify(wg_idx)
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
@@ -1048,7 +1062,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tOrNewV = SM80.make_acc_into_op(tNewVrC, o2_tiled_mma, self.dtype)
         self._math_order_wait(wg_idx)
         cute.copy(o2_tiled_copy_B, tOsQK, tOrQK_cv)
-        self._gemm_upper_triangular_b(tOrNewV, tOrQK, tOrO)
+        self._gemm_upper_triangular_b(o2_tiled_mma, tOrNewV, tOrQK, tOrO, sQK.shape)
         self._math_order_notify(wg_idx)
 
         # ── O store to smem ───────────────────────────────────────────────────
