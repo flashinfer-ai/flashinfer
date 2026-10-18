@@ -43,6 +43,36 @@ _HEAD_DIM = 128
 _MEAN_CONFIG = VCAttentionConfig()
 
 
+def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
+    """Torch reference of the packed bf16 mean operands the preparation writes.
+
+    Each group of 16 tiles gives two operands in unswizzled tcgen05 K-major
+    core-matrix order. K slots 2i and 2i+1 of operand o hold mean / v_scale of
+    tile 8o+i and the tiles past the sequence are zero.
+    """
+    b, h, t, d = mean.shape
+    vs = v_scale.reshape(b, h, 1, d)
+    m = (mean.float() / vs).to(torch.bfloat16)
+    g = -(-t // vca.VC_MEAN_GROUP_TILES)
+    tiles_per_operand = vca.VC_MEAN_MMA_K // 2
+    rows = torch.zeros(
+        (b, h, g * vca.VC_MEAN_GROUP_TILES, d), dtype=torch.bfloat16, device=mean.device
+    )
+    rows[:, :, :t] = m
+    # Operand o of a group holds its tiles 8o to 8o+7 in K slots 2i and 2i+1.
+    rows = rows.view(
+        b, h, g, vca.VC_MEAN_OPERANDS, tiles_per_operand, d // 8, 8
+    ).permute(0, 1, 2, 3, 5, 6, 4)
+    tile = torch.stack((rows, rows), dim=-1).reshape(
+        b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, vca.VC_MEAN_MMA_K
+    )
+    # Core-matrix order of 8-row group, K core matrix, row and k.
+    tile = tile.view(
+        b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, 2, vca.VC_MEAN_MMA_K // 2
+    ).permute(0, 1, 2, 3, 4, 6, 5, 7)
+    return tile.reshape(b, h, g, *vca.vc_mean_group_shape(d)).contiguous()
+
+
 @pytest.fixture(autouse=True)
 def _exact_fp32_matmul():
     """The torch reference needs true fp32 matmuls; NGC containers export
@@ -190,7 +220,7 @@ def test_vc_mean_step():
     outs = {}
     for name, value in (("zero", 0.0), ("one", 1.0)):
         mean = torch.full_like(ops.mean, value)
-        mu = vca.pack_vc_tile_means(mean, ops.v_scale)
+        mu = _pack_tile_means(mean, ops.v_scale)
         outs[name] = wrapper.run(q, ops.k, ops.v, vc=replace(ops.params, tile_means=mu))
     torch.testing.assert_close(
         outs["one"].float() - outs["zero"].float(),
@@ -211,7 +241,7 @@ def test_vc_mean_step():
         ),
     )
     out_off = wrapper_off.run(q, plain.k, plain.v, vc=plain.params)
-    zero_mu = vca.pack_vc_tile_means(torch.zeros_like(ops.mean), plain.v_scale)
+    zero_mu = _pack_tile_means(torch.zeros_like(ops.mean), plain.v_scale)
     out_on = wrapper.run(
         q, plain.k, plain.v, vc=replace(plain.params, tile_means=zero_mu)
     )

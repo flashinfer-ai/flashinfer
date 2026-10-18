@@ -33,8 +33,6 @@ This module provides the preprocessing:
 * ``vc_quantize_repair`` -- V repair rows instead of tile means;
 * ``VCAttentionPreprocessor`` -- the paper's V-Smooth schedule over the
   denoising steps on top of ``vc_quantize``;
-* ``pack_vc_tile_means`` -- the bf16 mean operand layout the kernel's
-  unswizzled K-major descriptor expects;
 * ``vc_reference`` -- the fp32 attention over the dequantized operands.
 
 The kernel takes the means and the per-channel V scale through
@@ -133,9 +131,9 @@ class VCAttentionParams:
 
     ``v_scale`` is the ``[B, Hkv, D]`` fp32 per-channel E4M3 residual scale.
     ``tile_means`` is the packed bf16 mean operand ``[B, Hkv,
-    ceil(num_kv_tiles / 16), 16, 256]`` from ``pack_vc_tile_means`` (means already divided by
-    ``v_scale``). The scale must be positive and finite. The kernel does not
-    check it. A plan with demean off takes no ``tile_means``.
+    ceil(num_kv_tiles / 16), 16, 256]`` the preparation writes, the means
+    already divided by ``v_scale``. The scale must be positive and finite. The
+    kernel does not check it. A plan with demean off takes no ``tile_means``.
     """
 
     v_scale: torch.Tensor
@@ -242,16 +240,8 @@ def _blocks(length: int, block: int) -> int:
     return (length + block - 1) // block
 
 
-def _pad_tokens(x: torch.Tensor, block: int) -> torch.Tensor:
-    """Zero-pad the token axis (dim 1) of ``[B, S, H, D]`` up to a block multiple."""
-    pad = _blocks(x.shape[1], block) * block - x.shape[1]
-    if pad == 0:
-        return x
-    return torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
-
-
 @torch.no_grad()
-def vc_token_permutation_with_centroids(
+def vc_token_permutation(
     v: torch.Tensor,
     *,
     num_clusters: int | None = None,
@@ -259,11 +249,13 @@ def vc_token_permutation_with_centroids(
     generator: torch.Generator | None = None,
     init_centroids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """k-means per (batch, head) over value rows, returning ``(perm, centroids)``.
+    """Group similar value rows by k-means per batch and head, then argsort the labels.
 
-    ``init_centroids`` (``[B*H, k, D]`` from a previous call) warm-starts the
-    clustering, as the paper does when the grouping is refreshed a few
-    denoising steps later.
+    Returns the int64 permutation ``[B, H, S]`` and the ``[B*H, k, D]`` centroids.
+    ``V[b, perm[b, h], h]`` lists the tokens cluster by cluster, so 128-token K/V
+    tiles hold similar values and their tile means remove most of the value
+    energy. ``init_centroids`` from a previous call warm-starts the clustering,
+    as the paper does when the grouping is refreshed a few denoising steps later.
     """
     b, s, h, d = v.shape
     if num_clusters is None:
@@ -330,72 +322,6 @@ def vc_token_permutation_with_centroids(
             cent_out[g0 : g0 + gsz] = centroids
             del x, x_sq
     return perm_out, cent_out
-
-
-@torch.no_grad()
-def vc_token_permutation(
-    v: torch.Tensor,
-    *,
-    num_clusters: int | None = None,
-    iters: int = VC_KMEANS_ITERS,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    """Group similar value rows by k-means per (batch, head), then argsort labels.
-
-    Returns an int64 permutation ``[B, H, S]`` such that ``V[b, perm[b, h], h]``
-    lists the tokens cluster by cluster, so 128-token K/V tiles hold similar
-    values and their tile means remove most of the value energy.
-    """
-    return vc_token_permutation_with_centroids(
-        v, num_clusters=num_clusters, iters=iters, generator=generator
-    )[0]
-
-
-def pack_vc_tile_means(
-    mean: torch.Tensor, v_scale: torch.Tensor | float
-) -> torch.Tensor:
-    """Pack ``[B, H, T, D]`` tile means into the kernel's bf16 UMMA operands,
-    ``VC_MEAN_OPERANDS`` per group of ``VC_MEAN_GROUP_TILES`` consecutive tiles.
-
-    ``v_scale`` is the per-channel residual scale ``[B, H, D]`` (or a scalar);
-    the means are stored divided by it.
-
-    Operand ``o`` of a group covers its tiles ``8o`` to ``8o+7``. The kernel
-    multiplies a ``[128 x 16]`` row-sum operand (``k=2i`` bf16 high part,
-    ``k=2i+1`` bf16 remainder of each row's sum over tile ``8o+i``) by the
-    ``[D x 16]`` K-major operand, so rows ``k=2i`` and ``k=2i+1`` both carry
-    ``mean / v_scale`` of that tile; tiles past the end of the sequence are zero.
-    Each operand is laid out as the unswizzled tcgen05 K-major core-matrix order:
-    8-row groups of 256 bytes, two 128-byte core matrices (k 0-7, k 8-15) of 8
-    rows x 16 bytes.
-    """
-    b, h, t, d = mean.shape
-    if d % 8 != 0:
-        raise ValueError("head_dim must be a multiple of 8")
-    vs = (
-        v_scale.reshape(b, h, 1, d)
-        if isinstance(v_scale, torch.Tensor) and v_scale.dim() == 3
-        else v_scale
-    )
-    m = (mean.float() / vs).to(torch.bfloat16)
-    g = _blocks(t, VC_MEAN_GROUP_TILES)
-    tiles_per_operand = VC_MEAN_MMA_K // 2
-    rows = torch.zeros(
-        (b, h, g * VC_MEAN_GROUP_TILES, d), dtype=torch.bfloat16, device=mean.device
-    )
-    rows[:, :, :t] = m
-    # Operand o of a group holds its tiles 8o..8o+7; K slots 2i and 2i+1 hold tile i.
-    rows = rows.view(b, h, g, VC_MEAN_OPERANDS, tiles_per_operand, d // 8, 8).permute(
-        0, 1, 2, 3, 5, 6, 4
-    )
-    tile = torch.stack((rows, rows), dim=-1).reshape(
-        b, h, g, VC_MEAN_OPERANDS, d // 8, 8, VC_MEAN_MMA_K
-    )
-    # [8-row group, K core matrix, row, k] in core-matrix order.
-    tile = tile.view(
-        b, h, g, VC_MEAN_OPERANDS, d // 8, 8, 2, VC_MEAN_MMA_K // 2
-    ).permute(0, 1, 2, 3, 4, 6, 5, 7)
-    return tile.reshape(b, h, g, *vc_mean_group_shape(d)).contiguous()
 
 
 @torch.no_grad()
@@ -467,7 +393,7 @@ def vc_quantize(
     from .kernels.vc_prepare import vc_prepare
 
     if perm is None:
-        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
+        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
     k_p, v8, v_scale, mean, mu, _ = vc_prepare(
         k.contiguous(),
         v.contiguous(),
@@ -553,7 +479,7 @@ class VCAttentionPreprocessor:
             )
         if smooth:
             if refresh:
-                perm, centroids = vc_token_permutation_with_centroids(
+                perm, centroids = vc_token_permutation(
                     v,
                     num_clusters=self.kmeans_clusters,
                     iters=self.kmeans_iters,
@@ -627,7 +553,6 @@ __all__ = [
     "VCAttentionOperands",
     "VCAttentionParams",
     "VCAttentionPreprocessor",
-    "pack_vc_tile_means",
     "validate_vc_params",
     "vc_quantize",
     "vc_mean_group_shape",
@@ -640,5 +565,4 @@ __all__ = [
     "vc_repair_tiles",
     "vc_scale_shapes",
     "vc_token_permutation",
-    "vc_token_permutation_with_centroids",
 ]

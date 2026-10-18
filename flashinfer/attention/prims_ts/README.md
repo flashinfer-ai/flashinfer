@@ -477,7 +477,7 @@ afterwards. `vc_quantize` runs the same preparation without the schedule, and
 
 `v_scale` is the `[B, Hkv, D]` fp32 per-channel residual scale and
 `tile_means` the packed bf16 `[B, Hkv, ceil(Skv / 2048), 16, 256]` mean operands
-from `pack_vc_tile_means`; both are contiguous and 16-byte aligned on the run
+the preparation writes; both are contiguous and 16-byte aligned on the run
 device, and a validating `run()` checks them against the plan. The plan's
 `VCAttentionConfig` sets `demean`. It is off after the V-Smooth window, when
 the means are zero, so a caller holds one plan of each kind and picks by
