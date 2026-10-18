@@ -124,7 +124,10 @@ with autotune(True):
 ```
 
 For cross-backend selection, include e.g. `TrtllmFp4Config()` in `BackendOptions`
-and prepare its weight view too. A missing fallback does not silently choose an
+and prepare its weight view too. All eligible candidates then use the same
+warm-cache latency objective by default, including native runners whose own
+default tuning policy uses cold L2. An explicit `MeasurementPolicy` overrides
+that common default for all candidates. A missing fallback does not silently choose an
 unprepared backend; the layer rejects calls with no eligible candidate. The
 same activation pack is reusable across these candidates.
 Both candidates must also accept the shared `MoEConfig` geometry. If a native

@@ -113,7 +113,10 @@ def test_moe_candidates_use_one_latency_objective(policy_kind):
             super().__init__()
             self.backend_key = name
             self.config = TuningConfig(
-                use_cuda_graph=True, use_cuda_graph_individual_timing=individual
+                use_cuda_graph=True,
+                use_cuda_graph_individual_timing=individual,
+                # TRT runners use cold L2 by default; Frost uses warm L2.
+                use_cold_l2_cache=not individual,
             )
             if individual:
                 self.tuning_config = self.config
@@ -158,9 +161,11 @@ def test_moe_candidates_use_one_latency_objective(policy_kind):
     winner, tactic = layer._select_winner(torch.zeros(1), None, [original, frost])
     assert winner is frost and tactic == 0
     assert len(tuned) == 2 and all(c.use_cuda_graph_individual_timing for c in tuned)
+    assert not any(c.use_cold_l2_cache for c in tuned)
     assert len(measured) == 2 and all(
         c.use_cuda_graph_individual_timing for c in measured
     )
     assert all(c.use_cold_l2_cache == (policy_kind == "cold") for c in measured)
     assert all(c.use_cuda_graph == (policy_kind != "eager") for c in measured)
     assert not original.config.use_cuda_graph_individual_timing
+    assert original.config.use_cold_l2_cache

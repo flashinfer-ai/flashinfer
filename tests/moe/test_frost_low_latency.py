@@ -160,7 +160,12 @@ def test_frost_cross_backend_latency_tuning(monkeypatch):
     original_profile = tuner.profile_tactic
 
     def record_profile(runner, inputs, tactic, tuning_config, batches, **kwargs):
-        measured.append(tuning_config.use_cuda_graph_individual_timing)
+        measured.append(
+            (
+                tuning_config.use_cuda_graph_individual_timing,
+                tuning_config.use_cold_l2_cache,
+            )
+        )
         return original_profile(
             runner, inputs, tactic, tuning_config, batches, **kwargs
         )
@@ -168,7 +173,7 @@ def test_frost_cross_backend_latency_tuning(monkeypatch):
     monkeypatch.setattr(tuner, "profile_tactic", record_profile)
     with autotune(True):
         layer(act, weights)
-    assert measured == [True, True]
+    assert measured == [(True, False), (True, False)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = layer(act, weights)

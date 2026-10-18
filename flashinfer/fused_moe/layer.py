@@ -510,6 +510,10 @@ class MoELayer:
                     tuning_config,
                     use_cuda_graph=True,
                     use_cuda_graph_individual_timing=True,
+                    # Native runners can default to cold L2 while Frost is
+                    # warm. Compare all candidates under one cache policy;
+                    # an explicit MeasurementPolicy still overrides this.
+                    use_cold_l2_cache=False,
                 )
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
