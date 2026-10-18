@@ -46,14 +46,19 @@ def prepare_sparse_mqa_metadata(
 
 @flashinfer_experimental_api
 def prepare_sparse_mqa_logits(
-    q, sf_q, kv, sf_kv, weights, metadata_plan, *, output=None
+    q, sf_q, kv, sf_kv, weights, metadata_plan, *, output=None, use_pdl=None
 ):
     """Prepare compressed logits with metadata generation included in run().
 
     Packed MXFP4/MXFP8 inputs produce BF16[Q,capacity*sparse_block_kv]. Only
     selected valid slots are written. Reuse a metadata plan produced by
     prepare_sparse_mqa_metadata; caller-provided output is retained in place.
+    use_pdl selects the logits launch form: None takes the exported default of
+    the (architecture, format, layout), True / False force programmatic
+    dependent launch on / off (identical output either way).
     """
     from .experimental.deepgemm_sparse_mqa.sparse_mqa import SparseMqaPlan
 
-    return SparseMqaPlan(q, sf_q, kv, sf_kv, weights, metadata_plan, output=output)
+    return SparseMqaPlan(
+        q, sf_q, kv, sf_kv, weights, metadata_plan, output=output, use_pdl=use_pdl
+    )

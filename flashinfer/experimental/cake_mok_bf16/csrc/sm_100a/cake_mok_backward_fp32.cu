@@ -133,6 +133,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
+// UMMA shared-memory descriptor address mask: 14 bits on SM100a/SM103a, 15 bits on SM107a.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
+#define CAKE_MOK_UMMA_ADDR_MASK 0x7FFF
+#else
+#define CAKE_MOK_UMMA_ADDR_MASK 0x3FFF
+#endif
 
 __device__ __forceinline__ uint32_t elect_sync() {
     uint32_t pred = 0;
@@ -1235,8 +1241,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                     for (int idx_1 = 0; idx_1 < iterations; idx_1++) {
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_1) * 8, 98304);
                                         mbarrier_wait(gemm_arrived_addr + (ring_1) * 8, phase_bits_2 >> (unsigned int)ring_1 & 1);
-                                        int _mma_a_lo_0 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
-                                        int _mma_b_lo_0 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_1) * 1024;
+                                        int _mma_a_lo_0 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_1) * 1024;
+                                        int _mma_b_lo_0 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_1) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -1271,8 +1277,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accumulator), "r"(((idx_1 == 0) ? 0 : 1)));
-                                        int _mma_a_lo_1 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
-                                        int _mma_b_lo_1 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_1) * 1024;
+                                        int _mma_a_lo_1 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_1) * 1024;
+                                        int _mma_b_lo_1 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_1) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -1832,8 +1838,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                         for (int idx_3 = 0; idx_3 < iterations_1; idx_3++) {
                                             mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_3) * 8, 98304);
                                             mbarrier_wait(gemm_arrived_addr + (ring_3) * 8, phase_bits_4 >> (unsigned int)ring_3 & 1);
-                                            int _mma_a_lo_2 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
-                                            int _mma_b_lo_2 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_3) * 1024;
+                                            int _mma_a_lo_2 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_3) * 1024;
+                                            int _mma_b_lo_2 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_3) * 1024;
                                             asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -1868,8 +1874,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accumulator), "r"(((idx_3 == 0) ? 0 : 1)));
-                                            int _mma_a_lo_3 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
-                                            int _mma_b_lo_3 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_3) * 1024;
+                                            int _mma_a_lo_3 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_3) * 1024;
+                                            int _mma_b_lo_3 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_3) * 1024;
                                             asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2157,8 +2163,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                         for (int idx_5 = 0; idx_5 < iterations_2; idx_5++) {
                                             mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_5) * 8, 98304);
                                             mbarrier_wait(gemm_arrived_addr + (ring_5) * 8, phase_bits_5 >> (unsigned int)ring_5 & 1);
-                                            int _mma_a_lo_4 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_5) * 1024;
-                                            int _mma_b_lo_4 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_5) * 1024;
+                                            int _mma_a_lo_4 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_5) * 1024;
+                                            int _mma_b_lo_4 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_5) * 1024;
                                             asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2193,8 +2199,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_accumulator), "r"(((idx_5 == 0) ? 0 : 1)));
-                                            int _mma_a_lo_5 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_5) * 1024;
-                                            int _mma_b_lo_5 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_5) * 1024;
+                                            int _mma_a_lo_5 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_5) * 1024;
+                                            int _mma_b_lo_5 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_5) * 1024;
                                             asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2425,8 +2431,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                             for (int idx_7 = 0; idx_7 < iterations_3; idx_7++) {
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_7) * 8, 98304);
                                                 mbarrier_wait(gemm_arrived_addr + (ring_7) * 8, phase_bits_6 >> (unsigned int)ring_7 & 1);
-                                                int _mma_a_lo_6 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_7) * 1024;
-                                                int _mma_b_lo_6 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_7) * 1024;
+                                                int _mma_a_lo_6 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_7) * 1024;
+                                                int _mma_b_lo_6 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_7) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2461,8 +2467,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"(tmem_accumulator), "r"(((idx_7 == 0) ? 0 : 1)));
-                                                int _mma_a_lo_7 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_7) * 1024;
-                                                int _mma_b_lo_7 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_7) * 1024;
+                                                int _mma_a_lo_7 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_7) * 1024;
+                                                int _mma_b_lo_7 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_7) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2692,8 +2698,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                             for (int idx_9 = 0; idx_9 < iterations_4; idx_9++) {
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_9) * 8, 98304);
                                                 mbarrier_wait(gemm_arrived_addr + (ring_9) * 8, phase_bits_7 >> (unsigned int)ring_9 & 1);
-                                                int _mma_a_lo_8 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_9) * 1024;
-                                                int _mma_b_lo_8 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_9) * 1024;
+                                                int _mma_a_lo_8 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_9) * 1024;
+                                                int _mma_b_lo_8 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_9) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2728,8 +2734,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_8), "r"(tmem_accumulator), "r"(((idx_9 == 0) ? 0 : 1)));
-                                                int _mma_a_lo_9 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_9) * 1024;
-                                                int _mma_b_lo_9 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_9) * 1024;
+                                                int _mma_a_lo_9 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_9) * 1024;
+                                                int _mma_b_lo_9 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_9) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2962,8 +2968,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                 for (int idx_11 = 0; idx_11 < iterations_5; idx_11++) {
                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_11) * 8, 98304);
                                     mbarrier_wait(gemm_arrived_addr + (ring_11) * 8, phase_bits_8 >> (unsigned int)ring_11 & 1);
-                                    int _mma_a_lo_10 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_11) * 1024;
-                                    int _mma_b_lo_10 = (((b_nt_addr) >> 4) & 0x3FFF) + (ring_11) * 1024;
+                                    int _mma_a_lo_10 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_11) * 1024;
+                                    int _mma_b_lo_10 = (((b_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_11) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -2998,8 +3004,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_10), "r"(tmem_accumulator), "r"(((idx_11 == 0) ? 0 : 1)));
-                                    int _mma_a_lo_11 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_11) * 1024;
-                                    int _mma_b_lo_11 = (((b_nt_hi_addr) >> 4) & 0x3FFF) + (ring_11) * 1024;
+                                    int _mma_a_lo_11 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_11) * 1024;
+                                    int _mma_b_lo_11 = (((b_nt_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_11) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -3305,8 +3311,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                     for (int idx_13 = 0; idx_13 < iterations_6; idx_13++) {
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_13) * 8, 98304);
                                         mbarrier_wait(gemm_arrived_addr + (ring_13) * 8, phase_bits_9 >> (unsigned int)ring_13 & 1);
-                                        int _mma_a_lo_12 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_13) * 1024;
-                                        int _mma_b_lo_12 = (((b_nt_addr) >> 4) & 0x3FFF) + (ring_13) * 1024;
+                                        int _mma_a_lo_12 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_13) * 1024;
+                                        int _mma_b_lo_12 = (((b_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_13) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -3341,8 +3347,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_12), "r"(_mma_b_lo_12), "r"(tmem_accumulator), "r"(((idx_13 == 0) ? 0 : 1)));
-                                        int _mma_a_lo_13 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_13) * 1024;
-                                        int _mma_b_lo_13 = (((b_nt_hi_addr) >> 4) & 0x3FFF) + (ring_13) * 1024;
+                                        int _mma_a_lo_13 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_13) * 1024;
+                                        int _mma_b_lo_13 = (((b_nt_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_13) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -3820,8 +3826,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                         for (int idx_15 = 0; idx_15 < iterations_7; idx_15++) {
                                             mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_15) * 8, 98304);
                                             mbarrier_wait(gemm_arrived_addr + (ring_15) * 8, phase_bits_11 >> (unsigned int)ring_15 & 1);
-                                            int _mma_a_lo_14 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_15) * 1024;
-                                            int _mma_b_lo_14 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_15) * 1024;
+                                            int _mma_a_lo_14 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_15) * 1024;
+                                            int _mma_b_lo_14 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_15) * 1024;
                                             asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -3856,8 +3862,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_14), "r"(_mma_b_lo_14), "r"(tmem_accumulator), "r"(((idx_15 == 0) ? 0 : 1)));
-                                            int _mma_a_lo_15 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_15) * 1024;
-                                            int _mma_b_lo_15 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_15) * 1024;
+                                            int _mma_a_lo_15 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_15) * 1024;
+                                            int _mma_b_lo_15 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_15) * 1024;
                                             asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -4398,8 +4404,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                             for (int idx_17 = 0; idx_17 < iterations_8; idx_17++) {
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_17) * 8, 98304);
                                                 mbarrier_wait(gemm_arrived_addr + (ring_17) * 8, phase_bits_13 >> (unsigned int)ring_17 & 1);
-                                                int _mma_a_lo_16 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_17) * 1024;
-                                                int _mma_b_lo_16 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_17) * 1024;
+                                                int _mma_a_lo_16 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_17) * 1024;
+                                                int _mma_b_lo_16 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_17) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -4434,8 +4440,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_16), "r"(_mma_b_lo_16), "r"(tmem_accumulator), "r"(((idx_17 == 0) ? 0 : 1)));
-                                                int _mma_a_lo_17 = (((a_nt_addr) >> 4) & 0x3FFF) + (ring_17) * 1024;
-                                                int _mma_b_lo_17 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_17) * 1024;
+                                                int _mma_a_lo_17 = (((a_nt_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_17) * 1024;
+                                                int _mma_b_lo_17 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_17) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -4776,8 +4782,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                             for (int idx_19 = 0; idx_19 < iterations_9; idx_19++) {
                                                 mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_19) * 8, 98304);
                                                 mbarrier_wait(gemm_arrived_addr + (ring_19) * 8, phase_bits_14 >> (unsigned int)ring_19 & 1);
-                                                int _mma_a_lo_18 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_19) * 1024;
-                                                int _mma_b_lo_18 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_19) * 1024;
+                                                int _mma_a_lo_18 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_19) * 1024;
+                                                int _mma_b_lo_18 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_19) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -4812,8 +4818,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_18), "r"(_mma_b_lo_18), "r"(tmem_accumulator), "r"(((idx_19 == 0) ? 0 : 1)));
-                                                int _mma_a_lo_19 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_19) * 1024;
-                                                int _mma_b_lo_19 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_19) * 1024;
+                                                int _mma_a_lo_19 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_19) * 1024;
+                                                int _mma_b_lo_19 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_19) * 1024;
                                                 asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -5080,8 +5086,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                                 for (int idx_21 = 0; idx_21 < iterations_10; idx_21++) {
                                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_21) * 8, 98304);
                                                     mbarrier_wait(gemm_arrived_addr + (ring_21) * 8, phase_bits_15 >> (unsigned int)ring_21 & 1);
-                                                    int _mma_a_lo_20 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_21) * 1024;
-                                                    int _mma_b_lo_20 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_21) * 1024;
+                                                    int _mma_a_lo_20 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_21) * 1024;
+                                                    int _mma_b_lo_20 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_21) * 1024;
                                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -5116,8 +5122,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_20), "r"(_mma_b_lo_20), "r"(tmem_accumulator), "r"(((idx_21 == 0) ? 0 : 1)));
-                                                    int _mma_a_lo_21 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_21) * 1024;
-                                                    int _mma_b_lo_21 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_21) * 1024;
+                                                    int _mma_a_lo_21 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_21) * 1024;
+                                                    int _mma_b_lo_21 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_21) * 1024;
                                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -5383,8 +5389,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
                                                 for (int idx_23 = 0; idx_23 < iterations_11; idx_23++) {
                                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_23) * 8, 98304);
                                                     mbarrier_wait(gemm_arrived_addr + (ring_23) * 8, phase_bits_16 >> (unsigned int)ring_23 & 1);
-                                                    int _mma_a_lo_22 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_23) * 1024;
-                                                    int _mma_b_lo_22 = ((((b_ab_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_23) * 1024;
+                                                    int _mma_a_lo_22 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_23) * 1024;
+                                                    int _mma_b_lo_22 = ((((b_ab_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_23) * 1024;
                                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -5419,8 +5425,8 @@ kernel_cake_mok_backward_fp32(const __grid_constant__ CUtensorMap dy_s, const __
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_22), "r"(_mma_b_lo_22), "r"(tmem_accumulator), "r"(((idx_23 == 0) ? 0 : 1)));
-                                                    int _mma_a_lo_23 = ((((a_atb_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_23) * 1024;
-                                                    int _mma_b_lo_23 = ((((b_ab_hi_addr) >> 4) & 0x3FFF) | 0x2000000) + (ring_23) * 1024;
+                                                    int _mma_a_lo_23 = ((((a_atb_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_23) * 1024;
+                                                    int _mma_b_lo_23 = ((((b_ab_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) | 0x2000000) + (ring_23) * 1024;
                                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"

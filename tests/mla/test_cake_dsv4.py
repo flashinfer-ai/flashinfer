@@ -1210,8 +1210,19 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
 @pytest.mark.parametrize(
     "num_heads,batch_size,page_size,expected",
     [
-        (64, 1, 64, "fp8_lowhead_prefill"),
-        (64, 2, 2, "fp8_lowhead_prefill"),
+        # FP8 prefill rows of 16, 32 and 64 heads run the single-CTA M64 body
+        # (heads past num_heads predicated) for every batch size and cache
+        # layout: 2.1-5.2x faster than the low-head prefill producer on the
+        # contract's 512-8192-token rows (GB300).
+        (64, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (64, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (32, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (32, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (16, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (16, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        # 8-head prefill rows keep the low-head prefill producer (unmeasured
+        # on the M64 body).
+        (8, 1, 64, "fp8_lowhead_prefill"),
         # FP8/H128 rows with 16+ tokens use the persistent body for every
         # batch size and cache layout (measured 1.12-1.75x vs trtllm-gen on
         # the 16-256 token MTP rows, topk4x and topk128x alike).

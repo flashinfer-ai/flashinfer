@@ -351,8 +351,8 @@ def test_same_workspace_serves_different_kv_caches(h_q, dtype):
     """Two calls with one workspace but different KV caches (consecutive layers).
 
     The prefill routes of these shapes (``bf16_h64_prefill``,
-    ``fp8_lowhead_prefill``) are the ones whose SM103 bindings read their TMA
-    descriptors from the workspace slab; the slab must follow the call, not the
+    ``fp8_h64_prefill_source_persistent_m64_multi_tile``): a binding that reads
+    its TMA descriptors from the workspace slab must follow the call, not the
     first descriptors uploaded for that workspace.
     """
     _skip_unless_cake_gpu()
@@ -368,7 +368,12 @@ def test_same_workspace_serves_different_kv_caches(h_q, dtype):
 
 _SLAB_ROUTES = [
     pytest.param(64, torch.bfloat16, "bf16_h64_prefill", id="bf16-h64-prefill"),
-    pytest.param(32, torch.float8_e4m3fn, "fp8_lowhead_prefill", id="fp8-h32-prefill"),
+    pytest.param(
+        32,
+        torch.float8_e4m3fn,
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        id="fp8-h32-prefill",
+    ),
 ]
 
 

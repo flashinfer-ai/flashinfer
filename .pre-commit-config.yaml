@@ -76,11 +76,11 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
-        files: ^(?!csrc/kda/cake_fused_kda_decode_(?:.*\.cu|binding\.cuh)$).*
+        files: ^(?!csrc/kda/cake_fused_kda_decode_(?:.*\.cu|templates/.*\.cu\.in|binding\.cuh)$).*
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break their static source-registry identities.
         exclude: |
-          (?x)^(3rdparty/.*|csrc/cake_device_helpers/.*|csrc/cake_bf16_bmm/.*|csrc/cake_batch_deepgemm_fp8/.*|csrc/fused_moe/warp_decode/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/cake_fused_qk_rope_append/.*|csrc/cake_sage_block_sparse_attention/(?:sm_100a|sm_103a)/.*|csrc/gdn/cake/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*|csrc/alphamoe_nvfp4_(?:sm100|c[0-9]+_[a-z_]+)\.cu)$
+          (?x)^(3rdparty/.*|csrc/cake_device_helpers/.*|csrc/cake_bf16_bmm/.*|csrc/cake_batch_deepgemm_fp8/.*|csrc/fused_moe/warp_decode/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_vsa_sm90/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/cake_fused_qk_rope_append/.*|csrc/cake_sage_block_sparse_attention/(?:sm_100a|sm_103a)/.*|csrc/gdn/cake/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*|csrc/alphamoe_nvfp4_(?:sm100|c[0-9]+_[a-z_]+)\.cu)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at

@@ -250,10 +250,10 @@ PageAttention for MLA
 
 .. note::
 
-    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), one
-    query token runs the Cake split decode kernel and several tokens run the
-    decode or the single-launch prefill kernel as chosen by
-    ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` (DeepSeek-V4 sparse MLA
+    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every
+    call runs the Cake split decode kernel or the single-launch prefill kernel
+    as chosen by ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` from the
+    token, head and candidate counts and the SM count (DeepSeek-V4 sparse MLA
     SM120 tracker: flashinfer#4254).
 
 .. note::

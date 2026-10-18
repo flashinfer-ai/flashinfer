@@ -768,7 +768,6 @@ GEMM2_DENSE_TRACED_N = (128, 192, 256)                              # gemm2_dens
 GEMM1_DENSE_FORMS = {
     "gemm1_dense_situ_m128_n256": (128, 256, False, False, False, False, True, False),
     "gemm1_dense_situ_m128_n256_rowgroup": (128, 256, False, False, True, False, True, False),
-    "gemm1_dense_situ_m128_n128_rowgroup": (128, 128, False, False, True, False, True, False),
     "gemm1_dense_situ_m128_n256_zero_fill": (128, 256, True, False, False, False, True, False),
     "gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary": (256, 256, True, True, False, False, True, False),
     "gemm1_dense_situ_m128_n256_rowgroup_early": (128, 256, False, False, True, True, True, False),
@@ -777,8 +776,6 @@ GEMM1_DENSE_FORMS = {
     # (mxfp4.py:1552-1676; base (128, 256) / (1, 1) primary, alternate (256, 256) / (2, 1) secondary).
     "gemm1_dense_situ_m128_n256_rowgroup_zero_fill": (128, 256, True, False, True, False, True, False),
     "gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary": (256, 256, True, True, True, False, True, False),
-    # Lever L13: the plain 2-CTA row-group alternate for SWAP_WIDE192_ZERO_FILL = "route".
-    "gemm1_dense_situ_m256_n256_2cta_rowgroup": (256, 256, False, False, True, False, True, False),
     # Lever c10 (``MIXED192_DENSE_WEIGHT_L2_HINT_OFF_MIN_TOKENS``): the mixed192 zero-fill pair without the
     # weight-stream hint (``_nol2``, same bodies; ``SWAP_WIDE192_ZERO_FILL = "dense"``, the default placement -- the
     # one the lever was measured on). The L13 ``"route"`` placement's plain row-group pair keeps the hint: not measured,
@@ -4355,6 +4352,15 @@ class _GemmModule:
     m_chunks_of = staticmethod(m_chunks_of)
     _unused_situ_operands = staticmethod(_unused_situ_operands)
     cluster_split_grid = staticmethod(swapab_cluster_split_grid)
+
+    @staticmethod
+    def pack_g1_geom(*, items_per_group: int, grid: int, split_form: bool) -> int:
+        """The plain chain's GEMM1 launch geometry packed for the finalize kernel's late-item first-box L2 prefetch
+        (decoded device-side as ``grid = g1_geom & 4095``, ``items_per_group = g1_geom >> 12 & 4095`` and
+        ``split_form = g1_geom >> 24 & 1``); 0 is the unknown geometry (nothing prefetched, same output)."""
+        if not (0 <= int(grid) <= 4095 and 0 <= int(items_per_group) <= 4095):
+            raise ValueError(f"g1_geom field out of range: grid={grid}, items_per_group={items_per_group}")
+        return int(grid) | (int(items_per_group) << 12) | (int(bool(split_form)) << 24)
 
     @staticmethod
     def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
