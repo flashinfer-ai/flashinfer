@@ -36,8 +36,23 @@ def apply_activation(
     gate,
     activation: cutlass.Constexpr,
     approximate_swiglu: cutlass.Constexpr = False,
+    parameters: cutlass.Constexpr = None,
 ):
-    if cutlass.const_expr(activation == "swiglu"):
+    if cutlass.const_expr(parameters is not None and activation == "swiglu"):
+        alpha, beta, limit = parameters
+        gate = cutlass.min(gate, cutlass.Float32(limit))
+        up = cutlass.max(
+            cutlass.min(up, cutlass.Float32(limit)), cutlass.Float32(-limit)
+        )
+        value = (gate / (1.0 + cute.math.exp(-gate * alpha, fastmath=True))) * (
+            up + beta
+        )
+    elif cutlass.const_expr(parameters is not None and activation == "swiglu_step"):
+        limit = parameters[0]
+        value = cutlass.min(gate * _sigmoid(gate), limit) * cutlass.max(
+            cutlass.min(up, limit), -limit
+        )
+    elif cutlass.const_expr(activation == "swiglu"):
         # Preserve the existing SwiGLU arithmetic in each dtype family.
         if cutlass.const_expr(approximate_swiglu):
             sigmoid = cute.rcp(

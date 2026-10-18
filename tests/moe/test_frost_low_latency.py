@@ -107,8 +107,9 @@ def _require_gpu():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("requires SM100/SM103")
+        pytest.skip("requires SM100/SM103/SM107")
     pytest.importorskip("cutlass")
     if Version(version("nvidia-cutlass-dsl")) < Version("4.8"):
         pytest.skip("requires nvidia-cutlass-dsl >= 4.8")

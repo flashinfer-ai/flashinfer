@@ -76,3 +76,32 @@ def prepare_weights(w1, w1_scale, w2, w2_scale):
         w2_weight=dw.view(w2.dtype),
         w2_weight_sf=_pack_scales(ds),
     )
+
+
+def prepare_bf16_weights(w1, w2, activation):
+    """Prepare canonical BF16 [up, gate] or non-gated weights without rounding.
+
+    Logical I is padded to 128 for the shared FC2 reduction. Weight preparation
+    is outside execution/capture; no activation values or pointers are cached.
+    """
+    from .fma.activation_config import lower_activation
+
+    lower_activation(activation)
+    if w1.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
+        raise TypeError("BF16 preparation requires two bfloat16 weight tensors")
+    if w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError("weights must be 3-D")
+    e, h, i = w2.shape
+    branches = 2 if activation.is_gated else 1
+    if e < 1 or h < 128 or h % 128 or i < 32 or i % 32:
+        raise ValueError("require positive E, H divisible by 128 and I divisible by 32")
+    if w1.shape != (e, branches * i, h):
+        raise ValueError(f"expected w1 shape {(e, branches * i, h)}")
+    if not w1.is_cuda or w2.device != w1.device:
+        raise ValueError("weights must be CUDA tensors on the same device")
+    physical = (i + 127) // 128 * 128
+    first = torch.zeros((e, branches, physical, h), dtype=w1.dtype, device=w1.device)
+    first[:, :, :i].copy_(w1.reshape(e, branches, i, h))
+    second = torch.zeros((e, h, physical), dtype=w2.dtype, device=w2.device)
+    second[:, :, :i].copy_(w2)
+    return dict(w1_weight=first.view(e, branches * physical, h), w2_weight=second)

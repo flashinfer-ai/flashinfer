@@ -33,6 +33,9 @@ def _kernel(
     ids: cute.Tensor,
     scores: cute.Tensor,
     out: cute.Tensor,
+    narrow: cutlass.Constexpr = False,
+    finalize: cutlass.Constexpr = True,
+    outputs: cutlass.Constexpr = 4,
 ):
     bid, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
@@ -41,15 +44,15 @@ def _kernel(
     h = cute.size(out, mode=[1])
     i = cute.size(mid, mode=[1])
     k = cute.size(ids, mode=[1])
-    token = bid // (h // 4)
-    row = (bid % (h // 4)) * 4
+    token = bid // (h // outputs)
+    row = (bid % (h // outputs)) * outputs
     route = token * k + slot
     # Large expert tables can exceed signed 32-bit word indexing.
     expert = ids[token, slot].to(cutlass.Int64)
-    acc = cute.make_rmem_tensor((4, 4), cutlass.Float32)
+    acc = cute.make_rmem_tensor((4, outputs), cutlass.Float32)
     acc.fill(0.0)
     shared = utils.SmemAllocator().allocate_tensor(
-        cutlass.Float32, cute.make_layout((4, k)), byte_alignment=16
+        cutlass.Float32, cute.make_layout((outputs, k)), byte_alignment=16
     )
     if expert >= 0 and expert < cute.size(weights, mode=[0]):
         xp = cute.recast_ptr(mid.iterator, dtype=cutlass.Uint64)
@@ -57,26 +60,33 @@ def _kernel(
         for group in range(i // 128):
             col = group * 32 + lane
             xv = _bf16x4(xp[route * (i // 4) + col])
-            for o in cutlass.range_constexpr(4):
+            for o in cutlass.range_constexpr(outputs):
                 wv = _bf16x4(wp[(expert * h + row + o) * (i // 4) + col])
                 for c in cutlass.range_constexpr(4):
                     acc[c, o] = acc[c, o] + xv[c] * wv[c]
-    for o in cutlass.range_constexpr(4):
+    for o in cutlass.range_constexpr(outputs):
         value = cute.arch.warp_reduction_sum(
             acc[0, o] + acc[1, o] + acc[2, o] + acc[3, o]
         )
         if lane == 0:
-            weighted = cutlass.Float32(0.0)
-            if expert >= 0 and expert < cute.size(weights, mode=[0]):
-                value = value.to(cutlass.BFloat16).to(cutlass.Float32)
-                weighted = _mul(value, scores[token, slot])
-            shared[o, slot] = weighted
-    cute.arch.sync_threads()
-    if tid < 4:
-        total = cutlass.Float32(0.0)
-        for s in cutlass.range_constexpr(k):
-            total = total + shared[tid, s]
-        out[token, row + tid] = total.to(cutlass.BFloat16)
+            if cutlass.const_expr(finalize):
+                weighted = cutlass.Float32(0.0)
+                if expert >= 0 and expert < cute.size(weights, mode=[0]):
+                    value = value.to(cutlass.BFloat16).to(cutlass.Float32)
+                    score = scores[token, slot].to(cutlass.Float32)
+                    if cutlass.const_expr(narrow):
+                        score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                    weighted = _mul(value, score)
+                shared[o, slot] = weighted
+            else:
+                out[route, row + o] = value.to(cutlass.BFloat16)
+    if cutlass.const_expr(finalize):
+        cute.arch.sync_threads()
+        if tid < outputs:
+            total = cutlass.Float32(0.0)
+            for s in cutlass.range_constexpr(k):
+                total = total + shared[tid, s]
+            out[token, row + tid] = total.to(cutlass.BFloat16)
 
 
 @cute.jit

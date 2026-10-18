@@ -20,6 +20,10 @@ _COMPILE_LOCK = threading.Lock()
 
 
 def execute(inputs, config, tile_k):
+    if config.quant.weight is QuantFormat.BF16:
+        from .fma.bf16.runtime import execute as execute_bf16
+
+        return execute_bf16(inputs, config, tile_k)
     if tile_k == ("ffma", 1):
         from .fma.runtime import execute as execute_fma
 

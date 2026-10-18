@@ -1,14 +1,16 @@
 # FROST low-latency routed MoE
 
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
-SM100/SM103. It uses CuTe DSL and the existing FlashInfer low-latency blockscaled
+SM100/SM103/SM107. The MX Tensor Core path uses CuTe DSL and the existing FlashInfer low-latency blockscaled
 GEMM's TMA producers and epilogue. It does not depend on cuDNN.
 
 The backend owns both scalar FMA and Tensor Core tactics. FMA reuses the device
-implementation previously embedded in `cudnn_frost`, while reading the same
-prepared weights as the Tensor Core tactic. Switching tactics needs no second
+implementation previously embedded in `cudnn_frost`. For MX, both tactics read
+the same prepared weights. Switching MX tactics needs no second
 weight copy, requantization, or per-call layout conversion. Autotuning compares
-the complete pipelines; the untuned default remains Tensor Core.
+the complete pipelines. The MX untuned default remains Tensor Core; BF16 uses
+shared FMA kernels and independently tunes one, two, four or eight output
+columns per warp in FC1 and FC2.
 
 When Frost is an eligible candidate, `MoELayer` tunes every candidate's tactics
 and the cross-backend choice using individual-call CUDA Graph GPU latency.
@@ -73,10 +75,13 @@ waits for the preceding kernel to finish. This remains a multi-kernel pipeline.
 
 | Property | Support |
 |---|---|
-| Input | E4M3 MXFP8, group-32 UE8M0 scales in the common linear layout |
-| Weights | Packed E2M1 MXFP4 or E4M3 MXFP8, group-32 UE8M0 |
+| Input | E4M3 MXFP8 with linear group-32 UE8M0 scales, or unquantized BF16 |
+| Weights | MX input: packed E2M1 MXFP4 or E4M3 MXFP8, group-32 UE8M0; BF16 input: BF16 |
 | Output | BF16, finalized or raw token/slot-ordered expert rows |
-| Activation | `SwiGLU(alpha, beta, limit)` |
+| MX activation | `SwiGLU(alpha, beta, limit)` |
+| BF16 activation | SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep, GELU, ReLU, ReLU2, SiLU, Identity |
+| BF16 parameters | SwiGLU alpha/beta/limit and SwiGLUStep limit; other activations require their default parameters |
+| BF16 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
 | Geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
 | Token rows | 1–2 by default; explicitly configurable up to 8 |
 | Routing | Packed or unpacked precomputed IDs; valid IDs in `[0, E)` |
@@ -123,6 +128,80 @@ with autotune(True):
     y = layer(act, weights)  # select tactic and warm up before CUDA Graph capture
 ```
 
+For unquantized BF16, prepare `[E, 2I, H]` **[up, gate]** weights for gated
+activations or `[E, I, H]` for non-gated activations, plus `[E, H, I]` Down
+weights. Use the same typed activation in preparation and configuration:
+
+```python
+from flashinfer.fused_moe import SiTU
+
+activation = SiTU()
+weights = MoEWeightPack()
+weights.prepare_for(
+    "frost_low_latency",
+    FrostLowLatencyConfig.prepare_bf16_weights(w1_bf16, w2_bf16, activation=activation),
+)
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=E, top_k=K),
+    quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+    experts=ExpertConfig(intermediate_size=I),
+    activation=activation,
+    backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
+)
+layer = MoELayer(config)
+act = MoEActivationPack(x_bf16, None, topk_ids, topk_weights)
+with autotune(True):
+    y = layer(act, weights)
+```
+
+The finalized BF16 path has two launches: FC1 with activation, then FC2 with
+combine. Raw output also materializes the route-row mapping and, for packed
+routing, converts scores to BF16. It uses FP32 dot products, BF16
+intermediate/expert outputs, and
+separate FP32 multiply/add in slot order. These are the shared legacy BF16
+numerics, not the MX intermediate quantizer or FMA-combine contract. Different
+BF16 tile candidates preserve this same numerical boundary. This extension is
+functional coverage; the MX performance tables below do not establish BF16 gains.
+
+```mermaid
+flowchart LR
+  W[Canonical BF16 expert weights] --> P[Prepare once: pad I to 128]
+  X[BF16 tokens + precomputed routes] --> A[FC1: FP32 dot + activation]
+  P --> A
+  A --> M[BF16 intermediate]
+  M --> D[FC2: FP32 dot]
+  P --> D
+  D --> C[BF16 expert results + ordered FP32 combine]
+  C --> O[BF16 output]
+  T[Autotune FC1 and FC2 columns: 1 / 2 / 4 / 8] -.-> A
+  T -.-> D
+```
+
+Use `benchmarks/bench_frost_low_latency_bf16.py` to compare this public entry
+with applicable native BF16 backends. The selection process ranks the tactics
+exposed by each runner, including its default; factorized runners may expose a
+stage-ranked shortlist rather than the full Cartesian product. Failures and
+unsupported backends remain explicit exclusions in the JSON.
+
+```bash
+python benchmarks/bench_frost_low_latency_bf16.py --select --tokens 1 \
+  --hidden 2048 --intermediate 512 --experts 512 --top-k 10 \
+  --output bf16-selection.json
+python benchmarks/bench_frost_low_latency_bf16.py --selection bf16-selection.json \
+  --tokens 1 --output bf16-first.json
+python benchmarks/bench_frost_low_latency_bf16.py --selection bf16-selection.json \
+  --tokens 1 --reverse --output bf16-reverse.json
+```
+
+Keep all workload arguments identical across these processes. The frozen
+selection checks source and workload identity; the validation processes do not
+repeat the search. `--activation`, `--cache-mode` and `--expert-reuse` select
+separate cohorts. Individual CUDA-event intervals inside the graph measure GPU
+execution, including routing adapters and combine. They exclude host submission
+and preparation; cold-cache eviction is also outside the interval. Changed-input
+graph checks and independent A/A captures accompany the timing. Inspect their
+stability before reporting a speedup; a successful run alone is not qualification.
+
 For cross-backend selection, include e.g. `TrtllmFp4Config()` in `BackendOptions`
 and prepare its weight view too. All eligible candidates then use the same
 warm-cache latency objective by default, including native runners whose own
@@ -130,6 +209,12 @@ default tuning policy uses cold L2. An explicit `MeasurementPolicy` overrides
 that common default for all candidates. A missing fallback does not silently choose an
 unprepared backend; the layer rejects calls with no eligible candidate. The
 same activation pack is reusable across these candidates.
+Cross-backend inputs must satisfy every selected backend's routing contract.
+In particular, use distinct expert IDs within each token when selecting or
+falling back to TRT-LLM. Frost can compute repeated slots independently, but
+the native TRT routing map retains only one slot per `(token, expert)`; repeated
+IDs are therefore not an equivalent cross-backend input. Signed routing weights
+with distinct IDs are covered by the fallback check.
 Both candidates must also accept the shared `MoEConfig` geometry. If a native
 candidate requires I divisible by 128, prepare both views from the same
 explicitly zero-padded canonical weights and use that padded I in their shared
@@ -340,23 +425,23 @@ pipeline; it does not attribute those gains to the newly unified FMA tactic.
 The same route-wise schedule supports MXFP8 weights without changing the
 pipeline. Hidden size, expert count, top-k and logical intermediate size are
 parameters; they are not tied to one checkpoint. A model can use it only when
-its activation and quantization semantics match this contract. SiTU, BF16 and
+its activation and quantization semantics match the selected dtype contract. MX SiTU and
 NVFP4 need separate implementation and qualification. They are not dtype aliases
 for the MX path.
 
 | Extension | What carries over | Remaining work |
 |---|---|---|
 | Other MXFP4/MXFP8 SwiGLU models | Route addressing, fused activation/quantization, PDL, weight preparation | Qualify the checkpoint's scale conventions, activation parameters and workload |
-| SiTU activation | Route schedule, weight loads and Down dependency | Implement and validate its distinct activation arithmetic |
+| MX SiTU activation | Route schedule, weight loads and Down dependency | Extend the MX epilogue; BF16 already uses the shared SiTU FMA epilogue |
 | NVFP4 | Route schedule and dependency design | Group-16 E4M3 scales, global scales, FP4 activation quantization and MMA layout |
-| BF16 | Shared FFMA device bodies, route schedule and fusion boundaries | Qualify runtime bindings, activation parameters and rounding; a TC path also needs non-blockscaled MMA |
+| BF16 Tensor Core | Prepared BF16 view, numerical contract and routing | Add non-blockscaled MMA, preserving the BF16 intermediate and combine contract |
 | More token rows | API and correctness contract | Expert reuse/grouping; the current per-route schedule can lose to native |
 
 The shared BF16 FFMA kernels widen expert indices before stride multiplication.
 Device-body regressions use actual 32-GiB-plus FC1 and 16-GiB-plus FC2 weight
 tables and replay changing expert IDs and inputs. The old FC1 indexing wrapped
 to expert zero in this test. This fixes the shared implementation's addressing;
-it does not add BF16 admission to `FrostLowLatencyConfig` or change legacy
+the generic BF16 binding uses that fix while preserving legacy
 activation and combine rounding.
 
 For concrete shape candidates, the published
@@ -364,7 +449,39 @@ For concrete shape candidates, the published
 has H=4096, expert I=1536, E=128 and top-k=8; the
 [Qwen3-Next-80B-A3B configuration](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json)
 has H=2048, expert I=512, E=512 and top-k=10. Their dimensions fit this schedule.
-These configurations declare BF16, so this is a compatibility opportunity for
-a separately qualified MX quantized variant, not support for those original
-checkpoints or a measured model speedup. Qwen3-Next's shared expert also remains
-outside this routed-only backend.
+These configurations declare BF16. The BF16 entry can use their routed-expert
+geometry without MX requantization; checkpoint integration still needs its own
+validation. The MX tables above measure quantized shape proxies and do not
+establish performance for the original checkpoints. Qwen3-Next's shared expert
+also remains outside this routed-only backend.
+
+## BF16 B300 public-call results
+
+These are synthetic model-shaped expert weights, measured with
+`benchmarks/bench_frost_low_latency_bf16.py`. Each row compares complete routed
+MoE GPU calls on the same B300, shape, activation, cache and expert-reuse
+condition. This includes GPU adapters and combine; it excludes host submission,
+weight preparation, router selection, shared experts and communication.
+Model-shaped kernel measurements are not model throughput tests.
+
+| Activation | H / I / E / K | T | Cache / reuse | Fastest tested original | Original µs | Frost µs | Speedup |
+|---|---|---:|---|---|---:|---:|---:|
+| swiglu | 2048 / 512 / 512 / 10 | 1 | warm / disjoint | trtllm_default | 27.736 | 15.460 | 1.794× |
+| swiglu | 2048 / 512 / 512 / 10 | 2 | warm / disjoint | trtllm | 44.144 | 31.872 | 1.385× |
+| situ | 2048 / 1408 / 64 / 6 | 2 | warm / disjoint | cutlass | 60.424 | 46.056 | 1.312× |
+
+The search includes applicable TRT-LLM, CUTLASS, Prims-TS, cuDNN grouped,
+cuTile and legacy cuDNN Frost candidates, plus their defaults. The JSON records
+which backends were admitted in each row, search counts and numerical checks.
+Runner-advertised spaces can be factorized shortlists; this is not a claim
+against every possible FlashInfer configuration. Selection is frozen before
+separate normal/reverse validation processes. Only qualified comparisons are
+shown, and sub-1% differences mean parity. A selected-pair qualification does
+not imply every slower candidate is stable.
+
+Software: B300/SM103, PyTorch 2.13.0+cu130, CUDA 13.0, CuTe DSL 4.8.0,
+CUDA Python bindings 13.4.3 and cuDNN 9.27. The benchmark records the exact source
+hash. See [BF16 results and controls](frost_low_latency_bf16_b300.json), including
+excluded comparisons and an independent comparison against the best prior
+FC2=4 tuning space. BF16 uses a separate numerical contract from the MX
+performance tables; do not combine their ratios.

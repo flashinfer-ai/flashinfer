@@ -33,6 +33,7 @@ def _kernel(
     outputs: cutlass.Constexpr,
     activation: cutlass.Constexpr,
     gated: cutlass.Constexpr,
+    parameters: cutlass.Constexpr = None,
 ):
     bid, _, _ = cute.arch.block_idx()
     lane = cute.arch.lane_idx()
@@ -75,7 +76,7 @@ def _kernel(
                 gate[0, o] + gate[1, o] + gate[2, o] + gate[3, o]
             )
         if lane == 0:
-            value = apply_activation(u, g, activation)
+            value = apply_activation(u, g, activation, parameters=parameters)
             mid[route, row + o] = value.to(cutlass.BFloat16)
 
 

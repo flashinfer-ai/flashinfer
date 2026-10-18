@@ -10,6 +10,7 @@ from packaging.version import Version
 from ....autotuner import TuningConfig
 from ...api import FrostLowLatencyConfig, QuantFormat, RoutingInputMode, SwiGLU
 from ...runners import MoERunner, _validate_prerouted_inputs
+from .fma.activation_config import ACTIVATIONS, lower_activation
 
 
 class FrostLowLatencyRunner(MoERunner):
@@ -21,8 +22,14 @@ class FrostLowLatencyRunner(MoERunner):
     supported_quant_variants = (
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        (QuantFormat.BF16, QuantFormat.BF16),
     )
     supported_activation_classes = (SwiGLU,)
+    supported_activation_classes_by_quant = {
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU,),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU,),
+        (QuantFormat.BF16, QuantFormat.BF16): tuple(ACTIVATIONS),
+    }
     supports_expert_parallelism = False
 
     def __init__(self, config, device):
@@ -52,8 +59,19 @@ class FrostLowLatencyRunner(MoERunner):
             )
         from ....utils import get_compute_capability
 
-        if get_compute_capability(self.device) not in ((10, 0), (10, 3)):
-            raise NotImplementedError("frost_low_latency requires SM100 or SM103")
+        if get_compute_capability(self.device) not in ((10, 0), (10, 3), (10, 7)):
+            raise NotImplementedError(
+                "frost_low_latency requires SM100, SM103 or SM107"
+            )
+        if self.config.quant.weight is QuantFormat.BF16:
+            name, _ = lower_activation(self.config.activation)
+            if self.config.routing.top_k > 32:
+                raise NotImplementedError("Frost BF16 FMA requires top_k <= 32")
+            if name in ("geglu", "gelu"):
+                from cutlass import cute
+
+                if not callable(getattr(cute.math, "erf", None)):
+                    raise NotImplementedError("Frost GELU/GeGLU requires cute.math.erf")
         if self.config.quant.swizzled_scale_factors:
             raise NotImplementedError(
                 "frost_low_latency requires linear UE8M0 activation scales"
@@ -79,13 +97,19 @@ class FrostLowLatencyRunner(MoERunner):
 
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
-            "unified-fma-tc-individual-latency-v2",
+            "unified-fma-tc-individual-latency-v4",
             self.options.max_num_tokens,
             self.config.execution.enable_pdl,
         )
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
+        if self.config.quant.weight is QuantFormat.BF16:
+            return [
+                ("ffma", first, second)
+                for first in (1, 2, 4, 8)
+                for second in (1, 2, 4, 8)
+            ]
         tactics = [k for k in (128, 256) if inputs[0].shape[1] % k == 0]
         if self.config.routing.top_k <= 32:
             tactics.append(("ffma", 1))
@@ -106,6 +130,8 @@ class FrostLowLatencyRunner(MoERunner):
             allowed_weights_dtypes=(torch.float32, torch.bfloat16),
             require_contiguous=True,
         )
+        if self.config.quant.weight is QuantFormat.BF16:
+            return self._pack_bf16(act, weights)
         q, sf = act.hidden_states_q, act.hidden_states_scale
         t, h = q.shape
         e, k = self.config.routing.num_experts, self.config.routing.top_k
@@ -187,8 +213,66 @@ class FrostLowLatencyRunner(MoERunner):
             narrow_in_combine,
         ]
 
+    def _pack_bf16(self, act, weights):
+        x, ids, scores = act.hidden_states_q, act.topk_ids, act.topk_weights
+        t, h = x.shape
+        e, k = self.config.routing.num_experts, self.config.routing.top_k
+        p = (self.config.experts.intermediate_size + 127) // 128 * 128
+        branches = 2 if self.config.activation.is_gated else 1
+        if act.hidden_states_scale is not None:
+            raise ValueError("BF16 Frost does not consume activation scales")
+        if (
+            not x.is_cuda
+            or x.device != self.device
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or x.data_ptr() % 16
+        ):
+            raise ValueError(
+                "BF16 input must be contiguous, 16-byte aligned and on the runner device"
+            )
+        view = weights.get_view(self.backend_key)
+        for name, shape in (
+            ("w1_weight", (e, branches * p, h)),
+            ("w2_weight", (e, h, p)),
+        ):
+            value = view[name]
+            if (
+                value.shape != shape
+                or value.dtype != torch.bfloat16
+                or value.device != x.device
+                or not value.is_contiguous()
+                or value.data_ptr() % 16
+            ):
+                raise ValueError(
+                    f"{name} must be aligned contiguous BF16 {shape} on {x.device}"
+                )
+        packed = act.routing_input_mode == RoutingInputMode.PackedPrecomputed
+        narrow = packed and self.config.finalize.do_finalize
+        if packed and not narrow:
+            scores = scores.to(torch.bfloat16)
+
+        def empty(shape):
+            return torch.empty(shape, device=x.device, dtype=torch.bfloat16)
+
+        return [
+            x,
+            ids,
+            scores,
+            view["w1_weight"],
+            view["w2_weight"],
+            empty((t * k, p)),
+            empty((t * k, h)),
+            empty((t, h)),
+            narrow,
+        ]
+
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         self._require_built()
         from .runtime import execute
 
-        return execute(inputs, self.config, 128 if tactic == -1 else tactic)
+        if tactic == -1:
+            tactic = (
+                ("ffma", 1) if self.config.quant.weight is QuantFormat.BF16 else 128
+            )
+        return execute(inputs, self.config, tactic)
