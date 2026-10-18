@@ -151,11 +151,6 @@ def _source_path(relative_path: str) -> Path:
     return path
 
 
-def cake_fused_qk_rope_fp8_append_record(stage: str, arch: str) -> dict[str, Any]:
-    """Manifest record of one generated module (arg plan, launch block, specialization)."""
-    return dict(_record(stage, arch))
-
-
 def _kernel_symbol_flag(record: dict[str, Any]) -> str:
     """``-D`` flag binding the shared sources to this module's kernel symbol."""
     symbol = record.get("kernel_symbol")
@@ -191,15 +186,3 @@ def load_cake_fused_qk_rope_fp8_append_module(stage: str, arch: str):
     spec = gen_cake_fused_qk_rope_fp8_append_module(stage, arch)
     module = spec.build_and_load()
     return module, _record(stage, arch)
-
-
-def build_all_cake_fused_qk_rope_fp8_append_modules(arch: str) -> dict[str, str]:
-    built = {}
-    for stage in STAGES:
-        spec = gen_cake_fused_qk_rope_fp8_append_module(stage, arch)
-        module = spec.build_and_load()
-        record = _record(stage, arch)
-        if not hasattr(module, str(record["ffi_entry"])):
-            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
-        built[stage] = spec.name
-    return built

@@ -323,12 +323,6 @@ def load_concat_mla_kv_quant_fp8_build(
     return gen_concat_mla_kv_quant_fp8_module(target, head_group).build_and_load()
 
 
-def load_concat_mla_kv_quant_fp8_module(device: torch.device, head_group: int):
-    return load_concat_mla_kv_quant_fp8_build(
-        concat_mla_kv_quant_fp8_target(device), head_group
-    )
-
-
 def gen_concat_mla_kv_quant_fp8_aot_modules(
     target: ConcatMlaKvQuantFp8Target,
 ) -> tuple[JitSpec, ...]:
@@ -354,6 +348,5 @@ __all__ = [
     "gen_concat_mla_kv_quant_fp8_module",
     "head_groups",
     "load_concat_mla_kv_quant_fp8_build",
-    "load_concat_mla_kv_quant_fp8_module",
     "route_key",
 ]

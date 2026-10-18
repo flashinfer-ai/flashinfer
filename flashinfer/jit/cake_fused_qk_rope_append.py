@@ -51,23 +51,10 @@ _PACKAGE = "cake_fused_qk_rope_append"
 _GENERATED_ROOT = f"csrc/{_PACKAGE}"
 _MANIFEST_NAME = f"{_PACKAGE}_manifest.json"
 
-#: Legacy single-build stage names (one per head configuration).  Since the round-2 export the manifest ships
-#: one stage per build the Cake host policy can select (``contract.stages_by_arch``); :func:`stage_for` picks it.
-STAGES = ("hq8_hkv1", "hq64_hkv8")
 ARCHES = ("sm_90a", "sm_100a", "sm_103a")
 HEAD_DIM = 128
 _VEC = 8
 _CLEAR_UNIT_CHUNKS = 256
-#: Fallback for manifests without ``contract.stage_policy`` (mirrors Cake ``POLICY_EXPORT`` of 2026-10-03).
-_DEFAULT_POLICY_CONSTANTS = {
-    "direct_min_requests": 257,
-    "sm100_decode_8_1_min_requests": 128,
-    "clear_ctas_per_free_sm": 16,
-    "w20": 20,
-    "w20_v_sub_base": 18,
-    "v_sub_base_8_1": 3,
-    "sm100_u2_min_clear_ctas": 2048,
-}
 _NVCC_FLAGS = {
     "sm_90a": sm90a_nvcc_flags,
     "sm_100a": sm100a_nvcc_flags,
@@ -91,12 +78,8 @@ def clear_units_per_request(page_size: int, num_kv_heads: int) -> int:
 
 
 def policy_constants() -> dict[str, int]:
-    try:
-        policy = _manifest().get("contract", {}).get("stage_policy") or {}
-        constants = dict(policy.get("constants") or {})
-    except (FileNotFoundError, RuntimeError):
-        constants = {}
-    return {**_DEFAULT_POLICY_CONSTANTS, **constants}
+    """Constants of the Cake stage policy (``contract.stage_policy.constants``)."""
+    return dict(_manifest()["contract"]["stage_policy"]["constants"])
 
 
 def policy_knobs(
@@ -165,11 +148,7 @@ def stage_name(num_q_heads: int, num_kv_heads: int, knobs: dict[str, int]) -> st
 
 def stages_for(arch: str) -> tuple[str, ...]:
     """Stage names the manifest ships for ``arch``."""
-    contract = _manifest().get("contract", {})
-    by_arch = contract.get("stages_by_arch")
-    if isinstance(by_arch, dict) and by_arch.get(arch):
-        return tuple(by_arch[arch])
-    return tuple(contract.get("stages") or STAGES)
+    return tuple(_manifest()["contract"]["stages_by_arch"][arch])
 
 
 def stage_for(
@@ -307,11 +286,6 @@ def _source_path(relative_path: str) -> Path:
     return path
 
 
-def cake_fused_qk_rope_append_record(stage: str, arch: str) -> dict[str, Any]:
-    """Manifest record of one generated module (arg plan, launch block, specialization)."""
-    return dict(_record(stage, arch))
-
-
 def _module_defines(record: dict[str, Any], arch: str) -> list[str]:
     """``-D`` flags that instantiate the shared sources for one (stage, arch) module.
 
@@ -351,15 +325,3 @@ def load_cake_fused_qk_rope_append_module(stage: str, arch: str):
     spec = gen_cake_fused_qk_rope_append_module(stage, arch)
     module = spec.build_and_load()
     return module, _record(stage, arch)
-
-
-def build_all_cake_fused_qk_rope_append_modules(arch: str) -> dict[str, str]:
-    built = {}
-    for stage in stages_for(arch):
-        spec = gen_cake_fused_qk_rope_append_module(stage, arch)
-        module = spec.build_and_load()
-        record = _record(stage, arch)
-        if not hasattr(module, str(record["ffi_entry"])):
-            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
-        built[stage] = spec.name
-    return built
