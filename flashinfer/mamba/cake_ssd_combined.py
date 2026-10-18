@@ -1000,6 +1000,19 @@ _THREE_PHASE_COST_MODEL_US = {
 _THREE_PHASE_MAX_TILES = 256
 _THREE_PHASE_MIN_ITEMS = 32
 _THREE_PHASE_MIN_CHUNKS = 64
+# Rubin (sm_107a, 212 SMs) measured the opposite ordering over most of the
+# chunk-parallel regime (three-phase / look-back 0.90-0.97 at 8 items x
+# 64-128 chunks, 16 items x 32-128 chunks and 32 items x 32 chunks, main
+# kernel, cold L2); the look-back stays ahead only at 32 items x 16 chunks
+# (1.01-1.02) and 8 items x 256 chunks (1.01).  Its rule: three-phase for
+# batched calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or at least
+# ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks per item, except calls of at most
+# ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at least
+# ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks; varlen calls stay on the look-back.
+_RUBIN_THREE_PHASE_CAPABILITIES = ((10, 7),)
+_RUBIN_THREE_PHASE_MIN_CHUNKS = 32
+_RUBIN_LOOKBACK_MAX_ITEMS = 8
+_RUBIN_LOOKBACK_MIN_CHUNKS = 256
 # Chunk-parallel workspace per (chunk, head) tile: the f32 [64, 128] state
 # increments (32 KB) plus the bf16 [64, 128] state operand (16 KB).
 _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
@@ -1297,16 +1310,34 @@ def selection_quantities(
 
 
 def three_phase_preferred(
-    *, work_items: int, chunks: int, tiles: int, mode_varlen: bool
+    *,
+    work_items: int,
+    chunks: int,
+    tiles: int,
+    mode_varlen: bool,
+    capability: tuple[int, int],
 ) -> bool:
     """Inside the chunk-parallel regime: the three-phase family for batched
     calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or with at least
     ``_THREE_PHASE_MIN_ITEMS`` work items and ``_THREE_PHASE_MIN_CHUNKS``
-    chunks per item; the look-back family otherwise."""
+    chunks per item; the look-back family otherwise.  On the
+    ``_RUBIN_THREE_PHASE_CAPABILITIES`` the three-phase family also serves
+    every batched call of at least ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks
+    per item, except at most ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at
+    least ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks."""
 
     if mode_varlen:
         return False
-    return int(tiles) <= _THREE_PHASE_MAX_TILES or (
+    if int(tiles) <= _THREE_PHASE_MAX_TILES:
+        return True
+    if tuple(capability) in _RUBIN_THREE_PHASE_CAPABILITIES:
+        if (
+            int(work_items) <= _RUBIN_LOOKBACK_MAX_ITEMS
+            and int(chunks) >= _RUBIN_LOOKBACK_MIN_CHUNKS
+        ):
+            return False
+        return int(chunks) >= _RUBIN_THREE_PHASE_MIN_CHUNKS
+    return (
         int(work_items) >= _THREE_PHASE_MIN_ITEMS
         and int(chunks) >= _THREE_PHASE_MIN_CHUNKS
     )
@@ -1366,6 +1397,7 @@ def chunk_parallel_family(
         chunks=quantities["chunks"],
         tiles=quantities["tiles"],
         mode_varlen=quantities["mode_varlen"],
+        capability=capability,
     ):
         return "chunkpar3"
     return "chunkpar"

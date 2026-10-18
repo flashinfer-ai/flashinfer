@@ -5324,10 +5324,91 @@ def test_source_chunk_parallel_family_rule(
             chunks=nchunks,
             tiles=batch * nheads * nchunks,
             mode_varlen=varlen,
+            capability=capability,
         )
         is (expected == "chunkpar3")
         or expected == "exact"
     )
+
+
+@pytest.mark.parametrize(
+    "batch,nheads,nchunks,varlen,expected",
+    (
+        (1, 8, 16, False, "chunkpar3"),  # perf_batched_1x16: 128 tiles
+        (1, 8, 64, False, "chunkpar3"),  # perf_batched_1x64: 64 chunks (measured 0.90)
+        (1, 8, 128, False, "chunkpar3"),  # 8 items x 128 chunks (0.94)
+        (1, 8, 256, False, "chunkpar"),  # perf_batched_1x256: 8 items x 256 chunks (1.01)
+        (4, 8, 16, False, "chunkpar"),  # perf_batched_4x16: 32 items x 16 chunks (1.02)
+        (4, 8, 64, False, "chunkpar3"),  # perf_batched_4x64: 32 items x 64 chunks (0.92)
+        (1, 32, 16, False, "chunkpar"),  # cp_b1h32c16: 512 tiles, 16 chunks (1.01)
+        (1, 32, 32, False, "chunkpar3"),  # 32 items x 32 chunks (0.97)
+        (1, 16, 32, False, "chunkpar3"),  # 16 items x 32 chunks (0.94)
+        (1, 16, 128, False, "chunkpar3"),  # 16 items x 128 chunks (0.90)
+        (4, 8, 16, True, "chunkpar"),  # varlen never routes three-phase
+        (1, 8, 8, False, "exact"),  # 8 chunks: the exact scan (Rubin constants)
+        (1, 128, 32, False, "exact"),  # 128 heads: the exact scan
+    ),
+    ids=(
+        "1x8x16",
+        "1x8x64",
+        "1x8x128",
+        "1x8x256",
+        "4x8x16",
+        "4x8x64",
+        "1x32x16",
+        "1x32x32",
+        "1x16x32",
+        "1x16x128",
+        "v4x8x16",
+        "1x8x8",
+        "1x128x32",
+    ),
+)
+def test_source_chunk_parallel_family_rule_rubin(
+    batch, nheads, nchunks, varlen, expected
+):
+    """The family rule with the Rubin (10, 7) constants at 212 SMs: inside
+    the chunk-parallel regime the three-phase program serves every batched
+    call with at most 256 tiles or at least 32 chunks per item (measured
+    three-phase / look-back 0.90-0.97 on Rubin), except at most 8 items with
+    at least 256 chunks (1.01); 32 items x 16 chunks and varlen calls stay on
+    the look-back."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._RUBIN_THREE_PHASE_CAPABILITIES == ((10, 7),)
+    assert module._RUBIN_THREE_PHASE_MIN_CHUNKS == 32
+    assert module._RUBIN_LOOKBACK_MAX_ITEMS == 8 and module._RUBIN_LOOKBACK_MIN_CHUNKS == 256
+    family = _family(
+        batch, nheads, nchunks, varlen=varlen, capability=(10, 7), sm_count=_RUBIN_SM_COUNT
+    )
+    assert family == expected
+    # The Blackwell rule at the same geometry: the same verdict except where
+    # the Rubin measurements reversed the two chunk-parallel families.
+    blackwell = module.three_phase_preferred(
+        work_items=batch * nheads,
+        chunks=nchunks,
+        tiles=batch * nheads * nchunks,
+        mode_varlen=varlen,
+        capability=(10, 0),
+    )
+    rubin = module.three_phase_preferred(
+        work_items=batch * nheads,
+        chunks=nchunks,
+        tiles=batch * nheads * nchunks,
+        mode_varlen=varlen,
+        capability=(10, 7),
+    )
+    if expected == "exact":
+        return  # the cost rule never reaches the family rule
+    assert rubin is (expected == "chunkpar3")
+    reversed_on_rubin = (batch, nheads, nchunks, varlen) in {
+        (1, 8, 64, False),
+        (1, 8, 128, False),
+        (1, 32, 32, False),
+        (1, 16, 32, False),
+        (1, 16, 128, False),
+    }
+    assert (rubin != blackwell) is reversed_on_rubin
 
 
 def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
