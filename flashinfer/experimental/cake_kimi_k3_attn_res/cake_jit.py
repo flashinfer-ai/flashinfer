@@ -3089,11 +3089,6 @@ def _nvcc_flags(arches: list[str]) -> list[str]:
     return flags
 
 
-def registered_kernel_keys(arch: str) -> tuple[str, ...]:
-    """Every logical kernel key registered for ``arch`` (empty without programs)."""
-    return tuple(sorted(KERNELS.get(arch, {})))
-
-
 def route_available(arch: str, required_keys: tuple[str, ...] = ()) -> bool:
     table = KERNELS.get(arch)
     if not table:

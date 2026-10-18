@@ -23,10 +23,10 @@ ported and checked row by row by the export):
 | --- | --- | --- |
 | `small_m_direct:k{K}` | one token per 256-thread CTA, every source register-resident (the first three unpacked to f32 once), no TMA / mbarrier / TMEM; one cross-warp exchange for all K+1 statistics pairs | `M <= _SMALL_M_DIRECT_MAX_M[arch][K]` (256 / 512 for K0-K3, 128 for K4-K7, 64 for K8); selected ahead of every other dense program |
 | `small_m_cluster{2,4}:k{K}` | the same program split over a cluster of 2 or 4 CTAs per token (128 / 64 threads each); each warp pushes its statistics pairs into every CTA's table over DSM, one cluster barrier per exchange, identical reduction order | the `(K, M band)` entries of the per-architecture table `_SMALL_M_CLUSTER` (K4-K8 at the smallest `M`; absent `K` or `M` above the last band -> one CTA per token) |
-| `native_{k5,k6,k7,k8,m128}` | installed native ports, one 288-thread CTA per SM (grid = the device's SM count: 148 on B200 / B300, 152 on GB300), three sources per chunk, depth 2 | the measured cells on the qualified SM counts `NATIVE_SM_COUNTS` (`M = 1` for K5 / K6 / K7, `M <= 256` cells for K4, small `M` / `M = 256` for K8) |
+| `native_{k8,m128}` | installed native ports, one 288-thread CTA per SM (grid = the device's SM count: 148 on B200 / B300, 152 on GB300), three sources per chunk, depth 2 | the measured cells above the small-M table on the qualified SM counts `NATIVE_SM_COUNTS`: `M = 1024` (`sm_100a`) / `M = 256` (`sm_103a`) for K4 (`native_m128`), `M = 256` for K8 (`native_k8`) |
 | `k0_tma` | exact `K = 0` persistent path (bulk-copy fed, no TMEM); grid 2x/3x the SM count at `M` 256-1024 | `num_blocks == 0` |
 | `persistent` | persistent TMEM common path, 288 threads, `nc` sources per chunk (1..5), depth 2 or 3, retraced per cell | every other dense call with `delta` and `output_norm_weight` and no snapshot write |
-| `direct` | one 256-thread CTA per token | no `delta`, snapshot write, no output norm, or row-padded layouts |
+| `direct` | one 256-thread CTA per token (bootstrap program) | a call outside the dense path (no `delta`, a snapshot write below `K`, no output norm, or a row-padded layout); the key encodes the semantics and three variants are registered (`direct:k0_d0_w1_n1`, `direct:k4_d0_w0_n1`, `direct:k8_d1_w0_n0`). Every other variant has no registered program and raises `NotImplementedError`. The registered bindings require contiguous tensors: a row-padded layout that maps onto a registered variant is rejected by the binding's contiguity check at launch |
 
 `KERNELS[arch][kernel_key]` in `cake_jit.py` names the registered module of a
 plan.  The checkout registers the programs measured on the Kimi-K3 evaluation
@@ -75,6 +75,7 @@ Output within `atol 8e-2 / rtol 3e-2` of the independent FP32 reference
 
 ## Generated sources
 
-`csrc/cake_kimi_k3_attn_res/<arch>/*.cu` (device + TVM-FFI binding per module)
+`csrc/cake_kimi_k3_attn_res/*.cu` (device + TVM-FFI binding per module, one
+source compiled for every architecture its record lists)
 and the `MODULES` / `KERNELS` literals of `cake_jit.py` are receipt-bound
 exporter output: do not edit by hand.
