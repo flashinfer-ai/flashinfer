@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Paired warm CUDA-Graph GPU time for the public routed-MoE contract.
+"""Paired CUDA-Graph GPU time for the public routed-MoE contract.
 
 Example: python benchmarks/bench_frost_low_latency.py --hidden 5120 \
   --intermediate 1152 --experts 384 --top-k 6 --tokens 1 --output result.json
@@ -46,6 +46,18 @@ def main():
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--tokens", type=int, default=1)
+    parser.add_argument("--cache-mode", choices=("warm", "cold"), default="warm")
+    parser.add_argument(
+        "--retune-cache",
+        action="store_true",
+        help="Rank all runner-advertised tactics using this routing/cache condition",
+    )
+    parser.add_argument(
+        "--route-pattern",
+        choices=("disjoint", "shared"),
+        default="disjoint",
+        help="Distinct experts across tokens, or the same top-k experts per token",
+    )
     parser.add_argument("--weight-format", choices=("mxfp4", "mxfp8"), default="mxfp4")
     parser.add_argument(
         "--activation-limit",
@@ -89,6 +101,19 @@ def main():
     torch.set_num_threads(1)
     torch.manual_seed(2107)
     t, h, i, e, k = a.tokens, a.hidden, a.intermediate, a.experts, a.top_k
+    unique_experts = t * k if a.route_pattern == "disjoint" else k
+    if unique_experts > e:
+        raise ValueError("The requested routing pattern needs more experts than E")
+
+    def route_ids(step):
+        slots = torch.arange(unique_experts, device="cuda", dtype=torch.int32)
+        values = (slots * max(1, e // unique_experts) + e - 1 + step * 7) % e
+        return (
+            values.reshape(t, k)
+            if a.route_pattern == "disjoint"
+            else values.expand(t, k)
+        )
+
     if i % 128:
         raise ValueError("Original unified baselines require I divisible by 128")
     weight_format = (
@@ -167,13 +192,66 @@ def main():
     backends.append(("frost", FrostLowLatencyConfig(max_num_tokens=8)))
     x = torch.randn(t, h, device="cuda").bfloat16()
     q, sf = native_config.prepare_activations(x, quant=quant)
-    ids = (
-        torch.arange(t * k, device="cuda", dtype=torch.int32) * max(1, e // (t * k)) % e
-    ).reshape(t, k)
+    ids = route_ids(0).contiguous()
     rw = torch.softmax(torch.randn(t, k, device="cuda"), -1)
     if a.routing_weights_dtype == "bf16":
         rw = rw.bfloat16()
     act = MoEActivationPack(q, sf, ids, rw)
+    l2_bytes = 0
+    flush = None
+    if a.cache_mode == "cold":
+        from cuda.bindings import driver
+
+        err, l2_bytes = driver.cuDeviceGetAttribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0
+        )
+        if err != driver.CUresult.CUDA_SUCCESS or l2_bytes <= 0:
+            raise RuntimeError("Cannot determine L2 capacity for the cold-cache test")
+        flush = torch.zeros(
+            max(512 * 1024**2, 2 * l2_bytes), device="cuda", dtype=torch.uint8
+        )
+
+    def capture_timing(layer):
+        graph = torch.cuda.CUDAGraph()
+        intervals = (
+            [
+                (
+                    torch.cuda.Event(enable_timing=True, external=True),
+                    torch.cuda.Event(enable_timing=True, external=True),
+                )
+                for _ in range(16)
+            ]
+            if flush is not None
+            else []
+        )
+        with torch.cuda.graph(graph):
+            if flush is None:
+                for _ in range(128):
+                    output = layer(act, weights)
+            else:
+                # External event nodes exclude both eviction and host enqueue.
+                for start, end in intervals:
+                    flush.add_(1)
+                    start.record()
+                    output = layer(act, weights)
+                    end.record()
+        return graph, intervals, output
+
+    def sample(graph, intervals):
+        if intervals:
+            graph.replay()
+            intervals[-1][1].synchronize()
+            return median(start.elapsed_time(end) * 1000 for start, end in intervals)
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) * 1000 / 128
+
     layers = {}
     for name, backend in backends:
         cfg = MoEConfig(
@@ -188,6 +266,50 @@ def main():
         with autotune(True):
             layer(act, weights)
         layers[name] = layer
+    cache_tuning = {}
+    if a.retune_cache:
+        ref = layers["trtllm"](act, weights).double()
+        assert ref.norm() > 1e-12
+        for name, layer in layers.items():
+            assert len(layer._winners) == 1, "Expected one exact input geometry"
+            key, (runner, selected) = next(iter(layer._winners.items()))
+            candidates = list(
+                dict.fromkeys(
+                    [
+                        selected,
+                        -1,
+                        *runner.get_valid_tactics(
+                            runner.pack_inputs(act, weights), None
+                        ),
+                    ]
+                )
+            )
+            ranked = []
+            for tactic in candidates:
+                layer._winners[key] = (runner, tactic)
+                layer(act, weights)
+                graph, intervals, output = capture_timing(layer)
+                graph.replay()
+                values = [sample(graph, intervals) for _ in range(5)]
+                diff = output.double() - ref
+                l2 = float(diff.norm() / ref.norm())
+                mx = float(diff.abs().max() / ref.abs().max())
+                assert torch.isfinite(output).all() and l2 < 0.01 and mx < 0.03, (
+                    name,
+                    tactic,
+                    l2,
+                    mx,
+                )
+                ranked.append((median(values), tactic))
+            winner = min(ranked, key=lambda item: item[0])[1]
+            layer._winners[key] = (runner, winner)
+            cache_tuning[name] = [
+                {"tactic": repr(tactic), "median_us": us} for us, tactic in ranked
+            ]
+            print(
+                f"{name}: ranked {len(ranked)} tactics in {a.cache_mode} cache; selected {winner}",
+                flush=True,
+            )
     if a.include_native_default:
         # A fresh layer may still hit the process-wide autotune cache. Pin -1
         # explicitly to test the native heuristic through the same public call.
@@ -243,17 +365,7 @@ def main():
         qn, sn = native_config.prepare_activations(x, quant=quant)
         q.copy_(qn)
         sf.copy_(sn)
-        ids.copy_(
-            (
-                (
-                    torch.arange(t * k, device="cuda", dtype=torch.int32)
-                    + e
-                    - 1
-                    + step * 7
-                )
-                % e
-            ).reshape(t, k)
-        )
+        ids.copy_(route_ids(step))
         rw.copy_(torch.softmax(torch.randn_like(rw), -1))
         for graph in graphs.values():
             graph.replay()
@@ -283,13 +395,12 @@ def main():
     names = list(graphs)
     if a.reverse:
         names.reverse()
-    timing_graphs = {}
+    timing_graphs, timing_events, timing_outputs = {}, {}, {}
     for name, layer in layers.items():
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for _ in range(128):
-                layer(act, weights)
+        graph, intervals, output = capture_timing(layer)
         timing_graphs[name] = graph
+        timing_events[name] = intervals
+        timing_outputs[name] = output
     samples = {name: [] for name in names}
     controls = []
     for _sweep in range(2):
@@ -299,18 +410,17 @@ def main():
                 graph.replay()
             row = []
             for _ in range(9):
-                start, end = (
-                    torch.cuda.Event(enable_timing=True),
-                    torch.cuda.Event(enable_timing=True),
-                )
-                start.record()
-                graph.replay()
-                end.record()
-                end.synchronize()
-                row.append(start.elapsed_time(end) * 1000 / 128)
+                row.append(sample(graph, timing_events[name]))
             if name == "trtllm":
                 controls.append(median(row))
             samples[name].append(row)
+    post_timing_checks = {}
+    for name, out in timing_outputs.items():
+        diff = out.double() - ref
+        l2 = float(diff.norm() / ref.norm().clamp_min(1e-30))
+        mx = float(diff.abs().max() / ref.abs().max().clamp_min(1e-30))
+        assert torch.isfinite(out).all() and l2 < 0.01 and mx < 0.03, (name, l2, mx)
+        post_timing_checks[name] = dict(relative_l2=l2, normalized_max=mx)
     medians = {
         name: median([v for row in rows for v in row]) for name, rows in samples.items()
     }
@@ -325,9 +435,15 @@ def main():
         flashinfer=flashinfer.__version__,
         flashinfer_base_commit=flashinfer.__git_commit__,
         cuda=torch.version.cuda,
-        scope="Warm CUDA-Graph public routed-MoE call GPU time. Includes adapters and combine; excludes input quantization, routing selection, shared experts, communication, attention and serving.",
+        scope=f"{a.cache_mode} CUDA-Graph public routed-MoE call GPU time. Includes adapters and combine; excludes cache eviction, input quantization, routing selection, shared experts, communication, attention and serving.",
+        cache_eviction_bytes=flush.numel() if flush is not None else 0,
+        l2_bytes=l2_bytes,
+        distinct_experts=unique_experts,
+        expert_reuse=t * k / unique_experts,
+        cache_tuning=cache_tuning,
         quant=f"{weight_format.name} weights / MXFP8 activations / BF16 output",
         checks=checks,
+        post_timing_checks=post_timing_checks,
         reference_norms=reference_norms,
         baseline_controls_us=controls,
         baseline_aa=(max(controls) - min(controls)) / min(controls),

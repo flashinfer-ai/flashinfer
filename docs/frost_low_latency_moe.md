@@ -147,11 +147,26 @@ the same quantizer, expert IDs, routing-weight inputs and activation parameters.
 FROST and TRT-LLM narrow packed routing weights to BF16; the native CuTe DSL
 interface retains FP32 weights. Comparisons allow the numerical tolerances below
 rather than requiring bitwise equality across those rounding boundaries.
-It autotunes each original
-backend, checks six changing inputs after graph replay, then measures paired
-warm CUDA Graphs with 128 public calls each and repeated original A/A controls.
-Each timing graph repeats the same routed input; it does not model cold weights
-or changing expert selection across serving steps.
+It autotunes each original backend, checks six changing inputs after graph
+replay, and verifies outputs again after timing. The default warm mode uses
+CUDA Graphs with 128 public calls each and repeated original A/A controls.
+Use `--route-pattern disjoint` for distinct experts across tokens or `shared`
+for the same top-k set per token. Both modes retain distinct experts within a
+token. Each timing graph repeats that routed input; it is not a serving trace.
+
+`--cache-mode cold` sweeps a separate read/write buffer of at least 512 MiB and
+twice the device's L2 capacity before each measured call. External CUDA event
+nodes inside the graph bracket only MoE, excluding eviction and host enqueue.
+The result records the buffer size and queried L2 capacity. Cold and warm
+results must be compared separately.
+
+For a selection run, `--retune-cache` ranks every tactic advertised by each
+runner with the selected cache and routing pattern, including the native
+heuristic and the initial warm-autotuned winner. Every candidate is checked
+against the reference. The JSON records candidate timings in `cache_tuning`.
+Freeze the selected tactics with the flags below for independent normal and
+reverse-order measurements. This enumerates the runner's exposed candidates,
+not every configuration its underlying kernel could theoretically implement.
 It includes scale conversion and combine. By default the precomputed routing
 weights are FP32; use `--routing-weights-dtype bf16` to measure a producer that
 already emits BF16 weights. Removing a conversion helps only when that
