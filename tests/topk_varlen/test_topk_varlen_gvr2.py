@@ -1265,6 +1265,29 @@ def _hard_logits(pattern, n_r, width, top_k, seed):
             for s in pos[: max(1, top_k // (8 if pattern == "runs" else 32))].tolist():
                 e = min(s + 16, n)
                 row[s:e] = 4.0 + torch.rand(e - s, generator=gen, device=_DEV)
+        elif pattern in ("tail_win", "tail_tie"):
+            # one finite score, so the register bodies' bracket (finite scores
+            # only) collapses and the row takes their key-space escape; its tail
+            # element (the last n % 4 columns, outside the float4 batch) is a
+            # winner, or a tie that is kept
+            t = n % 4
+            body = pos[pos < n - t]
+            if pattern == "tail_win":
+                # +inf at the tail and at k - t more columns (odd rows k / 2 - t)
+                row.fill_(1.5)
+                row[n - t :] = float("inf")
+                row[body[: (top_k if r % 2 == 0 else top_k // 2) - t]] = float("inf")
+            else:
+                # -inf except k / 2 +inf and k / 2 + 1 ties at 1.5 for the k / 2
+                # slots left (one is dropped): the tail, column 124 (warp 0's lane
+                # 31, ordered after the tail's lanes 0-2, so the dropped tie is
+                # never the tail's) and random columns
+                body = body[body != 124]
+                row.fill_(float("-inf"))
+                row[body[: top_k // 2]] = float("inf")
+                row[body[top_k // 2 : top_k - t]] = 1.5
+                row[124] = 1.5
+                row[n - t :] = 1.5
         x[r, n:] = 3e38
     return x
 
@@ -2013,6 +2036,47 @@ def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
             col = (pages - 1 - q) * 64 + (out.to(torch.int64) & 63)
             got = torch.where(out >= 0, col, out.to(torch.int64)).to(torch.int32)
         _check_varlen_rows(logits, got, lens, top_k)
+
+
+# (rows, width, top_k, row lengths, family): launches whose rows all run one
+# register body: the 1024-thread VPT 4 body of the SPLIT and one-CTA main engines,
+# the SPLIT engines' VPT 2 body, and the register kernel at 512 threads with
+# VPT 1 and VPT 4. Each length leaves 1-3 columns past the float4 batch (the tail
+# element of threads 0-2).
+_TAIL_CASES = [
+    (9, 131136, 1024, (16381, 16382, 16383), "main"),
+    (128, 131136, 1024, (16381, 16382, 16383), "main"),
+    (16, 131136, 512, (2045, 2046, 2047), "main"),
+    (16, 2048, 512, (2045, 2046, 2047), "reg"),
+    (160, 8192, 512, (8189, 8190, 8191), "reg"),
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows,width,top_k,lens,family", _TAIL_CASES)
+@pytest.mark.parametrize("pattern", ["tail_win", "tail_tie"])
+@pytest.mark.parametrize("page_size", [None, 64], ids=["unpaged", "paged64"])
+def test_gvr2_register_escape_tail_element(
+    rows, width, top_k, lens, family, pattern, page_size
+):
+    """The register bodies' key-space escape places a thread's winners and kept
+    ties from two bit masks over its slots and its tail element: rows whose tail
+    element is a winner (with exactly k winners on even rows, so no ties are
+    placed) or a kept tie, hint-free and (unpaged) hinted."""
+    n_r = [lens[r % len(lens)] for r in range(rows)]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + top_k)
+    _run_hard(logits, n_r, top_k, n_r, family, page_size=page_size)
+    if page_size is None:  # paged output is hint-free only
+        gen = torch.Generator(device=_DEV).manual_seed(rows)
+        hint = torch.randint(
+            0, min(lens), (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+        )
+        seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_gvr2(logits, seq_lens, top_k, hint, out_indices=out)
+        torch.cuda.synchronize()
+        _assert_family(rows, width, top_k, 1, 1, family)
+        _check_varlen_rows(logits, out, n_r, top_k)
 
 
 # ---------------------------------------------------------------------------

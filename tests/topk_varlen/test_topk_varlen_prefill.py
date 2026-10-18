@@ -461,6 +461,55 @@ def test_prefill_register_rung_hinted(top_k, bound):
 
 
 @requires_gvr2
+@pytest.mark.parametrize("pattern", ["tail_win", "tail_tie"])
+def test_prefill_register_escape_tail_element(pattern):
+    """K = 2048 windows on the VPT 4 register rung (bound 6001) with one finite
+    score, so the rung's bracket collapses and it ranks them through the
+    key-space escape, whose emit places a thread's winners and kept ties from bit
+    masks over its slots and its tail element (the last (lead + length) % 4
+    window columns, on threads 0-2). tail_win: +inf at the tail and at k (odd
+    rows k / 2) columns in all, ties elsewhere; tail_tie: -inf except k / 2 +inf
+    and k / 2 + 1 ties for k / 2 slots, at the tail, on lane 31 of warp 0 (so the
+    one tie dropped is never the tail's) and at random columns."""
+    top_k, bound = 2048, 6001
+    leads = [0, 1, 2, 3, 0, 1]
+    lens = [6001, 6001, 6001, 5998, 4099, 4097]
+    rows = len(lens)
+    plan = _host._prefill_reg_route(rows, top_k, bound)
+    assert plan is not None and plan["tpl"][:2] == (512, 4)
+    ks = [64 + lead for lead in leads]
+    lg, rs, le = _make_case(rows, max(ks) + bound + 4, ks, lens, seed=0, dist="equal")
+    gen = torch.Generator(device=_DEV).manual_seed(top_k)
+    for r, (lead, n) in enumerate(zip(leads, lens, strict=True)):
+        win = lg[r, ks[r] : ks[r] + n]
+        t = (n + lead) % 4
+        assert t != 0
+        pos = torch.randperm(n - t, generator=gen, device=_DEV)
+        if pattern == "tail_win":
+            win[n - t :] = float("inf")
+            win[pos[: (top_k if r % 2 == 0 else top_k // 2) - t]] = float("inf")
+        else:
+            pos = pos[pos != 124 - lead]  # window column of lane 31's first slot
+            win.fill_(float("-inf"))
+            win[pos[: top_k // 2]] = float("inf")
+            win[pos[top_k // 2 : top_k - t]] = 1.0
+            win[124 - lead] = 1.0
+            win[n - t :] = 1.0
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    flashinfer.top_k_varlen(
+        lg,
+        le,
+        top_k,
+        row_starts=rs,
+        out_indices=out,
+        backend="gvr_2",
+        max_window_len=bound,
+    )
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+
+
+@requires_gvr2
 @pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
 def test_prefill_bound_violation_reports_minus_one(top_k):
     """``max_window_len`` is a contract: on a register rung, a row whose scan
