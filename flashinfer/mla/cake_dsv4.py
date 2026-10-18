@@ -124,12 +124,13 @@ and the tile64 member (``t64``, 64 heads per CTA); a one-tile row with
 ``H <= 64`` whose grid gives 2 or 4 CTAs per work item runs the H64 tile member
 (``tile_h64``: 64-row Q boxes, same grid and output as ``tile``). The one-tile
 members run ``o_chunks`` CTAs per work item; the split merge runs on
-``merge_heads_per_cta`` heads per CTA. Each (member, retrace knobs) pair is one
-registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
-``nvfp4_decode_cluster``, ``nvfp4_decode_t64_n64_oc1``,
-``nvfp4_decode_pv_n{16,32}_oc1``, ``nvfp4_decode_swap_n{16,32}_oc{1,2,4}``,
-``nvfp4_decode_tile_oc{1,2,4}``, ``nvfp4_decode_tile_h64_oc{2,4}``) plus
-``nvfp4_merge``, bound through the same
+``merge_heads_per_cta`` heads per CTA. Each member is one registered variant
+(``_nvfp4_variant_name``: ``nvfp4_decode_persistent``, ``nvfp4_decode_cluster``,
+``nvfp4_decode_t64_n64_oc1``, ``nvfp4_decode_pv``, ``nvfp4_decode_swap``,
+``nvfp4_decode_tile``, ``nvfp4_decode_tile_h64``) plus ``nvfp4_merge``; the
+templated members take their retrace knobs (``tile_n``: heads on the MMA N side,
+``o_chunks``: CTAs per work item) as launch arguments and their launcher switches
+over the explicit instantiations of the kernel unit. All are bound through the same
 registration machinery as the BF16/FP8 routes from the generated sources under
 ``csrc/cake_dsv4/{sm_100a,sm_103a,common}``; a plan that selects
 an unexported variant raises ``NotImplementedError``. Splits write
@@ -893,6 +894,9 @@ _SCALAR_VALUE_NAMES = frozenset(
         "main_page_stride",
         "extra_page_stride",
         "heads_per_cta",
+        # Retrace knobs of the templated NVFP4 members (runtime instantiation switch).
+        "tile_n",
+        "o_chunks",
         *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
@@ -2241,62 +2245,35 @@ class NVFP4Plan:
 
     @property
     def variant(self) -> str:
-        return _nvfp4_variant_name(
-            self.member, tile_n=self.tile_n, o_chunks=self.o_chunks
-        )
+        return _nvfp4_variant_name(self.member)
 
 
-# Retrace knobs each member's generated program is specialised on, in variant-name order (Cake
-# flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program.MEMBER_VARIANT_KNOBS).
-_NVFP4_VARIANT_KNOBS: Mapping[str, tuple[str, ...]] = {
-    "persistent": (),
-    "cluster": (),
-    "t64": ("tile_n", "o_chunks"),
-    "pv": ("tile_n", "o_chunks"),
-    "swap": ("tile_n", "o_chunks"),
-    "tile": ("o_chunks",),
-    "tile_h64": ("o_chunks",),
+# Registered program of each family member (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program).  The
+# templated members (pv, swap, tile, tile_h64) take their retrace knobs -- ``tile_n`` (heads on the MMA N side)
+# and ``o_chunks`` (CTAs per work item) -- as launch arguments of one program each; its launcher switches over
+# the explicit instantiations of the kernel unit (swap: n{16,32} x oc{1,2,4}, tile: oc{1,2,4}, tile_h64:
+# oc{2,4}, pv: n{16,32}).  The standalone tile64 program keeps its exported knob suffix.
+_NVFP4_MEMBER_VARIANTS: Mapping[str, str] = {
+    "persistent": _NVFP4_VARIANT_PERSISTENT,
+    "cluster": _NVFP4_VARIANT_CLUSTER,
+    "t64": "nvfp4_decode_t64_n64_oc1",
+    "pv": "nvfp4_decode_pv",
+    "swap": "nvfp4_decode_swap",
+    "tile": "nvfp4_decode_tile",
+    "tile_h64": "nvfp4_decode_tile_h64",
 }
-_NVFP4_KNOB_TAGS = {"tile_n": "n", "o_chunks": "oc"}
 
 
-def _nvfp4_variant_name(
-    member: str, *, tile_n: Optional[int] = None, o_chunks: int = 1
-) -> str:
-    """Registered variant name of a member's physical program:
-    ``nvfp4_decode_<member>[_n<tile_n>][_oc<o_chunks>]`` (the merge is ``nvfp4_merge``)."""
-    if member not in _NVFP4_VARIANT_KNOBS:
+def _nvfp4_variant_name(member: str) -> str:
+    """Registered variant name of a member's program (the merge is ``nvfp4_merge``)."""
+    if member not in _NVFP4_MEMBER_VARIANTS:
         raise ValueError(f"unknown NVFP4 family member {member!r}")
-    values = {"tile_n": tile_n, "o_chunks": o_chunks}
-    tags = []
-    for knob in _NVFP4_VARIANT_KNOBS[member]:
-        if values[knob] is None:
-            raise ValueError(f"{member}: variant knob {knob} is required")
-        tags.append(f"_{_NVFP4_KNOB_TAGS[knob]}{int(values[knob])}")
-    return "nvfp4_decode_" + member + "".join(tags)
+    return _NVFP4_MEMBER_VARIANTS[member]
 
 
 # Every decode variant a plan can select (the host names them statically so the export can check that each
-# generated program is bindable): persistent, cluster, t64 n64, pv n16 / n32, swap n{16,32} x oc{1,2,4},
-# tile oc{1,2,4}, tile_h64 oc{2,4} (the H64 tile member has no 1-CTA form).
-_NVFP4_DECODE_VARIANTS = (
-    _NVFP4_VARIANT_PERSISTENT,
-    _NVFP4_VARIANT_CLUSTER,
-    "nvfp4_decode_t64_n64_oc1",
-    "nvfp4_decode_pv_n16_oc1",
-    "nvfp4_decode_pv_n32_oc1",
-    "nvfp4_decode_swap_n16_oc1",
-    "nvfp4_decode_swap_n16_oc2",
-    "nvfp4_decode_swap_n16_oc4",
-    "nvfp4_decode_swap_n32_oc1",
-    "nvfp4_decode_swap_n32_oc2",
-    "nvfp4_decode_swap_n32_oc4",
-    "nvfp4_decode_tile_oc1",
-    "nvfp4_decode_tile_oc2",
-    "nvfp4_decode_tile_oc4",
-    "nvfp4_decode_tile_h64_oc2",
-    "nvfp4_decode_tile_h64_oc4",
-)
+# generated program is bindable).
+_NVFP4_DECODE_VARIANTS = tuple(_NVFP4_MEMBER_VARIANTS.values())
 _NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
 
 
@@ -2935,6 +2912,8 @@ def run_cake_dsv4_nvfp4(
         "extra_page_stride": int(extra_page_stride),
         "has_sinks": int(sinks is not None),
         "heads_per_cta": plan.merge_heads_per_cta,
+        "tile_n": plan.tile_n,
+        "o_chunks": plan.o_chunks,
         "lse_partial_scale": float(lse_partial_scale),
         "lse_scale": lse_scale,
     }
