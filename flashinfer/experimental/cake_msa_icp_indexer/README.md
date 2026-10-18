@@ -139,3 +139,11 @@ with CUPTI under `torchrun`.
   `compile_flags` fix `BLOCK_Q` (`4 * query_len`) and its kernel symbol
   (`-DCAKE_PROGRAM_KERNEL`). This fold is a hand edit of the exported clones
   pending its regeneration by the exporter.
+- The 26 records build two host bindings, one per role:
+  `cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_binding.cu` (scorer) and
+  `cake_msa_icp_indexer_6c9de96daa7d9ac678d6_binding.cu` (merge). A record's
+  `compile_flags` select its kernel symbol and host-shim namespace
+  (`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`) and the launch constants
+  its own binding carried as literals (`-DBLOCK_Q`, `-DCAKE_BIND_*`). This
+  fold is a hand edit of the exported bindings pending its regeneration by
+  the exporter.

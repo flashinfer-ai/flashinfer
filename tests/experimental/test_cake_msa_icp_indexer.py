@@ -232,6 +232,61 @@ def test_public_api_rejects_other_backends_before_touching_cuda() -> None:
         destroy_msa_icp_indexer_workspace(object())
 
 
+def test_shared_role_bindings_take_each_record_from_its_compile_flags() -> None:
+    """One host binding per role; each record selects itself through -D flags."""
+    root = cake_jit._csrc_root()
+    package = cake_jit.SOURCE_PACKAGE
+    binding_of_role = {
+        "scorer": f"{package}/{package}_a8101e4dbbf1639b3bbd_binding.cu",
+        "merge": f"{package}/{package}_6c9de96daa7d9ac678d6_binding.cu",
+    }
+    required: dict[str, set[str]] = {}
+    for role, relative in binding_of_role.items():
+        lines = (root / relative).read_text(encoding="utf-8").splitlines()
+        required[role] = {
+            line.split()[1]
+            for line, after in zip(lines, lines[1:], strict=False)
+            if line.startswith("#ifndef ") and after.startswith("#error ")
+        }
+        assert required[role], role
+        # TVM_FFI_CHECK stringizes its condition unexpanded; a macro there would
+        # change the failure message, so the shared bindings keep them out.
+        for line in lines:
+            if line.lstrip().startswith("TVM_FFI_CHECK("):
+                tokens = set(line.replace("(", " ").replace(",", " ").split())
+                assert not tokens & required[role], line
+    kernels: set[str] = set()
+    shims: set[str] = set()
+    for name, record in cake_jit.PROGRAMS.items():
+        role = record["role"]
+        assert record["sources"][1] == binding_of_role[role], name
+        defines = dict(
+            flag[2:].split("=", 1)
+            for flag in record["compile_flags"]
+            if flag.startswith("-D")
+        )
+        assert required[role] <= set(defines), (name, required[role] - set(defines))
+        assert defines["CAKE_PROGRAM_KERNEL"] == f"kernel_{name}", name
+        kernels.add(defines["CAKE_PROGRAM_KERNEL"])
+        shims.add(defines["CAKE_PROGRAM_SHIM"])
+        kernel_lines = (root / record["sources"][0]).read_text(encoding="utf-8")
+        kernel_defines = {
+            parts[1]: parts[2]
+            for parts in (line.split() for line in kernel_lines.splitlines())
+            if len(parts) == 3 and parts[0] == "#define"
+        }
+        smem = int(defines["CAKE_BIND_SMEM"])
+        assert smem == int(kernel_defines["SMEM_TOTAL"]), name
+        if role == "scorer":
+            assert int(defines["BLOCK_Q"]) == 4 * int(record["query_len"]), name
+            assert int(defines["CAKE_BIND_KBOX_ROWS"]) == int(record["rows_per_rank"])
+        else:
+            assert int(defines["CAKE_BIND_THREADS"]) == 32 * int(record["warps"]), name
+            assert int(defines["CAKE_BIND_THREADS"]) == int(kernel_defines["THREADS"])
+            assert int(defines["CAKE_BIND_WORLD"]) == int(record["world_size"]), name
+    assert len(kernels) == len(cake_jit.PROGRAMS) == len(shims)
+
+
 # ---------------------------------------------------------------------------
 # GPU helpers
 # ---------------------------------------------------------------------------
