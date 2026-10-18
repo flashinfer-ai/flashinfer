@@ -46,6 +46,53 @@ def _specialized_bodies():
     )
 
 
+# The folded generic bodies (ranks 16, 32 and 64) paste CAKE_BGMV_MOE_RANK into
+# every kernel symbol through a per-kernel macro written with ``rNN`` in place of
+# the rank, and keep the rank-64 grouped expand behind
+# ``#if CAKE_BGMV_MOE_RANK == 64``. Derive the symbols the way the preprocessor
+# does; the rank-8 bodies still declare their symbols literally.
+_RANK_SYMBOL_RE = re.compile(
+    r"CAKE_BGMV_MOE_RANK_SYMBOL(?:_FORM)?\((kernel_\w+_r)(?:, (_\w+))?\)"
+)
+_KERNEL_DECL_RE = re.compile(r"\bvoid (kernel_flashinfer_bgmv_moe_\w+)\(")
+_RANK_IF_RE = re.compile(r"#(if|elif) CAKE_BGMV_MOE_RANK == (\d+)$")
+
+
+def _rank_view(body, rank):
+    """``body`` with the inactive ``#if CAKE_BGMV_MOE_RANK == N`` branches removed."""
+    out = []
+    stack = []  # [is_rank_block, a_branch_was_taken, this_branch_is_active]
+    for line in body.split("\n"):
+        if line.startswith("#if"):
+            m = _RANK_IF_RE.match(line)
+            hit = bool(m) and int(m.group(2)) == rank
+            stack.append([bool(m), hit, hit or not m])
+        elif line.startswith("#elif"):
+            m = _RANK_IF_RE.match(line)
+            if stack and stack[-1][0]:
+                hit = bool(m) and int(m.group(2)) == rank and not stack[-1][1]
+                stack[-1][1:] = [stack[-1][1] or hit, hit]
+        elif line == "#else":
+            if stack and stack[-1][0]:
+                stack[-1][1:] = [True, not stack[-1][1]]
+        elif line == "#endif":
+            if stack:
+                stack.pop()
+        elif all(frame[2] for frame in stack):
+            out.append(line)
+    return "\n".join(out)
+
+
+def _generic_symbol_sites(body, rank):
+    """Kernel symbols a generic body declares for ``rank``, in body order."""
+    pasted = [f"{prefix}{rank}{form}" for prefix, form in _RANK_SYMBOL_RE.findall(body)]
+    return pasted or _KERNEL_DECL_RE.findall(body)
+
+
+def _generic_symbols(body, rank):
+    return set(_generic_symbol_sites(_rank_view(body, rank), rank))
+
+
 @pytest.mark.parametrize("arch", cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
 @pytest.mark.parametrize(
     ("hidden_size", "num_tokens", "expected"),
@@ -451,11 +498,15 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     assert gencode in spec.extra_cuda_cflags
     assert "-use_fast_math" in spec.extra_cuda_cflags
     body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
-    for symbol in metadata[1:]:
-        assert symbol in body
     if shared_body:
+        assert _generic_symbols(body, rank) == set(metadata[1:])
         assert "_p4_s3" not in body
         assert "SMEM_SHRINK_DECODE" not in body
+    else:
+        # The unfolded sm107a record declares its symbols literally, next to the
+        # kernels the shared bodies dropped.
+        for symbol in metadata[1:]:
+            assert symbol in body
     for macro in (
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_PDL 37120",
@@ -499,6 +550,8 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     assert metadata.body.endswith("_sm107a.cu") == bool(merge_in_expand)
     assert f"#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND {merge_in_expand}" in binding
     assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
+    input_dtype = {"bfloat16": "dl_bfloat16", "float16": "dl_float16"}[dtype]
+    assert f"#define CAKE_BGMV_MOE_INPUT_DTYPE {input_dtype}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
     assert "SHRINK_DECODE" not in binding
@@ -536,6 +589,32 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         )
     assert '#include "cake_bgmv_moe_generic_binding.cuh"' in binding
     cake_bgmv_moe.gen_cake_bgmv_moe_generic_module.cache_clear()
+
+
+def test_generic_bodies_fold_the_ranks():
+    # Ranks 16, 32 and 64 share one body per dtype; rank 8 keeps its own. The
+    # rank enters the shared body only through CAKE_BGMV_MOE_RANK: no literal
+    # rank symbol survives, the pasted symbols reproduce the loader's table for
+    # every rank, and each kernel is declared once per rank (the rank-64 grouped
+    # expand is a distinct kernel behind its own #if).
+    for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES:
+        metadata = {
+            rank: cake_bgmv_moe._generic_metadata(rank, dtype)
+            for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS
+        }
+        shared = {m.body for rank, m in metadata.items() if rank != 8}
+        assert len(shared) == 1
+        body_name = shared.pop()
+        assert body_name != metadata[8].body
+        body = (cake_bgmv_moe._get_csrc_dir() / body_name).read_text()
+        assert not re.search(r"_r(?:16|32|64)(?![0-9])", body)
+        assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED 75904" in body
+        for rank, m in metadata.items():
+            if rank == 8:
+                continue
+            sites = _generic_symbol_sites(_rank_view(body, rank), rank)
+            assert len(sites) == len(set(sites))
+            assert set(sites) == set(m[1:])
 
 
 def test_generic_and_specialized_modules_do_not_share_a_uri():
@@ -766,6 +845,7 @@ def test_grouped_workspace_sizing_and_selector():
         for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS:
             metadata = cake_bgmv_moe._generic_metadata(rank, dtype)
             body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
+            sites = _generic_symbol_sites(_rank_view(body, rank), rank)
             # Every kernel the grouped pipeline can launch is defined exactly once
             # (aliased macros name another kernel of this list).
             for symbol in (
@@ -782,7 +862,7 @@ def test_grouped_workspace_sizing_and_selector():
                 metadata.combine_grouped_symbol,
                 metadata.order_build_symbol,
             ):
-                assert body.count(f"{symbol}(") == 1, symbol
+                assert sites.count(symbol) == 1, symbol
             # The register-direct grouped shrink is rendered for fp16 only: the
             # bf16 bundles always select a ring form (lever 3c on sm90a, lever 34
             # elsewhere), so their alias resolves to the ring kernel. No bundle
@@ -791,17 +871,17 @@ def test_grouped_workspace_sizing_and_selector():
             # single-tile ring kernel (bf16) or the direct kernel (fp16).
             prefix = "kernel_flashinfer_bgmv_moe_shrink_grouped"
             direct = f"{prefix}_{tag}_r{rank}"
-            assert f"{prefix}_single_{tag}_r{rank}(" not in body
+            assert f"{prefix}_single_{tag}_r{rank}" not in sites
             direct_smem = "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED "
             ring = metadata.shrink_grouped_ring_symbol
             ring_single = metadata.shrink_grouped_ring_single_symbol
             if tag == "bf16":
-                assert f"{direct}(" not in body
+                assert direct not in sites
                 assert metadata.shrink_grouped_symbol == ring
                 assert metadata.shrink_grouped_single_symbol == ring_single
                 assert direct_smem not in body
             else:
-                assert body.count(f"{direct}(") == 1
+                assert sites.count(direct) == 1
                 assert metadata.shrink_grouped_symbol == direct
                 assert metadata.shrink_grouped_single_symbol == direct
                 # 512 B reduction scratch of the direct form.
@@ -873,7 +953,7 @@ def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
         )
     assert (
         cake_bgmv_moe._generic_metadata(32, "bfloat16").body
-        == "cake_bgmv_moe_generic_bf16_r32.cu"
+        == "cake_bgmv_moe_generic_bf16.cu"
     )
     # The generic bf16 rank-32 record (merge-in-expand) serves on compute capability 10.7 only;
     # its binding passes the shrink's per-split partials to the expand kernels.
@@ -881,25 +961,26 @@ def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
     assert generic_sm107a.body == "cake_bgmv_moe_generic_bf16_r32_sm107a.cu"
     assert (
         cake_bgmv_moe._generic_metadata(32, "float16", "sm107a").body
-        == "cake_bgmv_moe_generic_f16_r32.cu"
+        == "cake_bgmv_moe_generic_f16.cu"
     )
     for rank in (8, 16, 64):
-        assert (
-            cake_bgmv_moe._generic_metadata(rank, "bfloat16", "sm107a").body
-            == f"cake_bgmv_moe_generic_bf16_r{rank}.cu"
+        assert cake_bgmv_moe._generic_metadata(rank, "bfloat16", "sm107a").body == (
+            "cake_bgmv_moe_generic_bf16_r8.cu"
+            if rank == 8
+            else "cake_bgmv_moe_generic_bf16.cu"
         )
     for arch in ("sm90a", "sm100a", "sm103a", None):
         assert (
             cake_bgmv_moe._generic_metadata(32, "bfloat16", arch).body
-            == "cake_bgmv_moe_generic_bf16_r32.cu"
+            == "cake_bgmv_moe_generic_bf16.cu"
         )
     target = cake_bgmv_moe._check_arch("sm107a")
     assert "#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND 1\n" in (
-        cake_bgmv_moe._generic_binding_source(generic_sm107a, 32, target)
+        cake_bgmv_moe._generic_binding_source(generic_sm107a, 32, "bfloat16", target)
     )
     assert "#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND 0\n" in (
         cake_bgmv_moe._generic_binding_source(
-            cake_bgmv_moe._generic_metadata(32, "bfloat16"), 32, target
+            cake_bgmv_moe._generic_metadata(32, "bfloat16"), 32, "bfloat16", target
         )
     )
     generic_body = (csrc_dir / generic_sm107a.body).read_text()

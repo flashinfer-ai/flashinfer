@@ -630,9 +630,19 @@ def _generic_metadata(
 ) -> CakeBGMVMoEGenericMetadata:
     _check_generic_rank(rank)
     tag = _dtype_tag(dtype)
+    # Ranks 16, 32 and 64 share one body per dtype: the generated binding defines
+    # CAKE_BGMV_MOE_RANK and the body pastes it into every kernel symbol. Rank 8
+    # keeps its own body (one rank tile: the generator specialised its kernels).
+    # The compute-capability-10.7 record keeps its own unfolded body.
     suffix = _body_suffix(arch, (dtype, rank) in _SM107A_GENERIC_BODIES)
+    if suffix:
+        body = f"cake_bgmv_moe_generic_{tag}_r{rank}{suffix}.cu"
+    elif rank == 8:
+        body = f"cake_bgmv_moe_generic_{tag}_r8.cu"
+    else:
+        body = f"cake_bgmv_moe_generic_{tag}.cu"
     return CakeBGMVMoEGenericMetadata(
-        body=f"cake_bgmv_moe_generic_{tag}_r{rank}{suffix}.cu",
+        body=body,
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2"
         ),
@@ -873,10 +883,11 @@ def _generic_merge_in_expand(metadata: CakeBGMVMoEGenericMetadata) -> bool:
 def _generic_binding_source(
     metadata: CakeBGMVMoEGenericMetadata,
     rank: int,
+    dtype: CakeBGMVMoEDType,
     target: CakeBGMVMoEArchTarget,
     merge_in_expand: Optional[bool] = None,
 ) -> str:
-    input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
+    input_dtype = "dl_bfloat16" if dtype == "bfloat16" else "dl_float16"
     major, minor = target.capability
     if merge_in_expand is None:
         merge_in_expand = _generic_merge_in_expand(metadata)
@@ -957,7 +968,7 @@ def gen_cake_bgmv_moe_generic_module(
 
     uri = get_cake_bgmv_moe_generic_uri(rank, dtype, arch)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_bgmv_moe_generic_binding.cu"
-    write_if_different(binding, _generic_binding_source(metadata, rank, target))
+    write_if_different(binding, _generic_binding_source(metadata, rank, dtype, target))
     spec = gen_jit_spec(
         name=uri,
         sources=[binding],
