@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -69,7 +70,8 @@ def _decode(**overrides):
 def test_manifest_lists_loadable_source_only_variants() -> None:
     # The manifest is the only registry: every variant names one kernel source
     # (shared with the other specializations of the same body), the -D defines
-    # that specialize it, and one host shim.  Nothing is pinned by checksum.
+    # that specialize it, and its host-shim template.  Nothing is pinned by
+    # checksum.
     manifest = cake_gdn._manifest()
     root = cake_gdn._source_dir()
     variants = manifest["variants"]
@@ -100,7 +102,7 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
             )
             served.extend(output["architectures"])
         assert sorted(served) == sorted(record["architectures"])
-        assert (root / record["host_binding"]["path"]).is_file()
+        assert (root / record["host_binding"]["template"]).is_file()
         # A record spells out ``defines`` only where its -D flags are not its
         # specializations (see test_manifest_defines_default_to_specializations).
         for key, value in record.get("defines", {}).items():
@@ -112,6 +114,29 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
         extra_defines = set(record.get("defines", {})) - set(record["specializations"])
         assert extra_defines <= _BODY_SHARING_DEFINES
     assert included_headers == header_names
+
+
+def test_host_shims_render_to_the_former_per_variant_text() -> None:
+    # Every variant's host shim is rendered from a class template under
+    # host/templates/; the sidecar pins the rendered text to the sha256 of the
+    # per-variant shim file it replaced.  A record that shares its body with a
+    # schedule twin passes its shim's kernel symbol as CAKE_GDN_KERNEL_SYMBOL.
+    pinned_path = Path(__file__).with_name("cake_gdn_host_shim_sha256.json")
+    pinned = json.loads(pinned_path.read_text(encoding="utf-8"))
+    variants = cake_gdn._manifest()["variants"]
+    assert sorted(pinned) == sorted(record["name"] for record in variants)
+    for record in variants:
+        host = record["host_binding"]
+        text = cake_gdn.render_cake_gdn_host_shim(record)
+        assert "@" not in text, record["name"]
+        assert f"TVM_FFI_EMBED_CUBIN({host['module_ident']});" in text
+        assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({host['entry']}, " in text
+        assert f'"{host["cuda_symbol"]}"' in text
+        defines = record.get("defines", {})
+        if "CAKE_GDN_KERNEL_SYMBOL" in defines:
+            assert defines["CAKE_GDN_KERNEL_SYMBOL"] == host["cuda_symbol"]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        assert digest == pinned[record["name"]], record["name"]
 
 
 def test_manifest_defines_default_to_specializations() -> None:
