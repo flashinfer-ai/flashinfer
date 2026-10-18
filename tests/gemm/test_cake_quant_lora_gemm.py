@@ -2590,7 +2590,7 @@ def test_fp8_sm90_dispatch_rule():
     assert (
         (default["group_m"], gated["group_m"])
         == (constants["default_group_m"], constants["gated_group_m"])
-        == (8, 1)
+        == (8, 2)
     )
     assert default["form"] != gated["form"]
     assert default["block_n"] == gated["block_n"] == constants["block_n"] == 192
@@ -2688,7 +2688,13 @@ def test_launch_grid_rules():
         PROGRAMS["fp8_blackwell_n256_clc_blocked"], 32768, 8192, 148
     ) == (2 * 128 * 32, 1, 1)
     assert launch_grid(PROGRAMS["fp8_sm90"], 129, 3072, 132) == (132, 1, 1)
-    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (132, 1, 1)
+    # The gated program launches four cluster tiles per cluster: 512 m-pairs x 43 n-tiles = 22016 tiles -> 5504 clusters.
+    assert PROGRAMS["fp8_sm90"]["tiles_per_cluster"] is None
+    assert PROGRAMS["fp8_sm90_hint"]["tiles_per_cluster"] == 4
+    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (2 * 5504, 1, 1)
+    # A tail m-tile adds n_pairs single-m-tile tiles: 4097 rows = 33 m-tiles = 16 pairs + 1 tail, 3072 = 16 n-tiles
+    # -> 256 + 8 = 264 cluster tiles -> 66 clusters.
+    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 4097, 3072, 132) == (2 * 66, 1, 1)
 
 
 # --------------------------------------------------------------------------- #
