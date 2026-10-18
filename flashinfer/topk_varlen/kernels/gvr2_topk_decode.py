@@ -2967,6 +2967,14 @@ class GvrMainKernel:
                                     nlo = cutlass.Uint32(rlo) + (cutlass.Uint32(sB) << sh2u)
                                     if sB != cutlass.Int32(NBS - 1):
                                         rhi = nlo + ((cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1))
+                                        # FlashInfer-local: the range starts at the
+                                        # least staged key, so a 2^24-key bin holding
+                                        # keys of scores above 2^127 (+inf) can end
+                                        # past 0xFFFFFFFF. Wrapped, rhi fell below
+                                        # rlo and the descent stopped under the
+                                        # crossing keys: nothing was emitted.
+                                        if cutlass.Uint32(rhi) < nlo:
+                                            rhi = cutlass.Uint32(0xFFFFFFFF)
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):
@@ -6443,6 +6451,10 @@ class GvrClusKernel:
                                         rhi = nlo + (
                                             (cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1)
                                         )
+                                        # FlashInfer-local: saturate a wrapped rhi
+                                        # (as in gvr_main's P6 narrowing)
+                                        if cutlass.Uint32(rhi) < nlo:
+                                            rhi = cutlass.Uint32(0xFFFFFFFF)
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):
