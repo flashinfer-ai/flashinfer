@@ -600,46 +600,6 @@ TensorRT-LLM MNNVL AllReduce
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
 
-MNNVL A2A (Throughput Backend)
--------------------------------
-
-These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
-For the dispatch/combine interface shared by all expert-parallel communication
-backends, use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`, which runs
-newer one-sided kernels (CFT counted writes, up to 256 ranks), or
-:class:`flashinfer.moe_ep.CakeAlltoAll`, which runs these ops with
-``backend="cake"``.
-
-.. currentmodule:: flashinfer.comm
-
-.. autosummary::
-    :toctree: ../generated
-
-    moe_a2a_initialize
-    moe_a2a_dispatch
-    moe_a2a_combine
-    moe_a2a_sanitize_expert_ids
-    moe_a2a_get_workspace_size_per_rank
-    moe_a2a_wrap_payload_tensor_in_workspace
-
-``NVLinkOneSidedAlltoAll`` and ``CakeAlltoAll`` preserve their workspace's CUDA
-virtual addresses across process checkpoint/restore.  After quiescing all work,
-call ``checkpoint_prepare`` to release the non-checkpointable physical MNNVL
-handles, and for ``NVLinkOneSidedAlltoAll`` its CFT logical endpoints.  Then
-call ``checkpoint_restore`` with a fresh communication backend before replaying
-a captured CUDA graph:
-
-.. code-block:: python
-
-    communication.checkpoint_prepare()
-    communication.checkpoint_restore(comm_backend)
-
-Both methods are collective.  Every rank must call them in the same order, and
-``comm_backend`` must reproduce the original rank and world size.
-Repeated calls are no-ops after the workspace reaches the requested state.
-If an exception occurs after physical handle unmapping or remapping begins,
-do not retry or reuse the workspace; restart the affected rank.
-
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------
 
