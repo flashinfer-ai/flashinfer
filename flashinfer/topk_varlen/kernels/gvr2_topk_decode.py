@@ -6795,19 +6795,22 @@ class GvrClusKernel:
                                     )
                                 i = i + cutlass.Int32(BLK)
                         else:
-                            # key-space narrowing over ck64c
+                            # key-space narrowing over ck64c. This arm and the degen
+                            # fallback below are rare (wide crossing bins, degenerate
+                            # rows), and their loops stay rolled (unroll=1). In serving
+                            # the kernel's code is cold, and the register path is laid
+                            # out after this streaming body: LLVM's unrolled ballot
+                            # emits put it ~6 KiB further from the entry.
                             if tidx == cutlass.Int32(0):
                                 s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
                                 s_kmm[1] = cutlass.Uint32(0)
                             if tidx < cutlass.Int32(NBS):  # cleared ONCE
                                 s_hist[tidx] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (narrowing init) ----
-                            i = tidx
-                            while i < mc:
+                            for i in cutlass.range(tidx, mc, BLK, unroll=1):
                                 kk = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32))
                                 C.atomic_min_cta(s_kmm.iterator + 0, kk)
                                 C.atomic_max_cta(s_kmm.iterator + 1, kk)
-                                i = i + cutlass.Int32(BLK)
                             cute.arch.barrier()  # ---- barrier (key range) ----
                             rlo = s_kmm[0]
                             rhi = s_kmm[1]
@@ -6838,8 +6841,7 @@ class GvrClusKernel:
                                     if sh2 < cutlass.Int32(0):
                                         sh2 = cutlass.Int32(0)
                                     sh2u = cutlass.Uint32(sh2)
-                                    i = tidx
-                                    while i < mc:  # re-bin
+                                    for i in cutlass.range(tidx, mc, BLK, unroll=1):  # re-bin
                                         uq = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32))
                                         if uq >= cutlass.Uint32(rlo):
                                             if uq <= cutlass.Uint32(rhi):
@@ -6850,7 +6852,6 @@ class GvrClusKernel:
                                                     s_hist.iterator + cutlass.Int32(du),
                                                     cutlass.Int32(1),
                                                 )
-                                        i = i + cutlass.Int32(BLK)
                                     cute.arch.barrier()  # ---- barrier (level hist) ----
                                     C.scan_cross0(
                                         s_hist,
@@ -6884,8 +6885,7 @@ class GvrClusKernel:
                                 s_scal[2] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (emit counters) ----
                             it2 = (mc + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                            it = cutlass.Int32(0)
-                            while it < it2:  # ballot emit
+                            for it in cutlass.range(it2, unroll=1):  # ballot emit
                                 i = it * cutlass.Int32(BLK) + tidx
                                 p1 = cutlass.Int32(0)
                                 p2 = cutlass.Int32(0)
@@ -6914,10 +6914,10 @@ class GvrClusKernel:
                                     pre_idx,
                                     s_pt,
                                 )
-                                it = it + cutlass.Int32(1)
                 else:
                     # ---- degen fallback: whole-row key-space narrowing
                     # (per-level clear + scan_cross w/ ws) ----
+                    # Its loops stay rolled too (see the narrowing above).
                     rlo = cutlass.Uint32(0)
                     rhi = cutlass.Uint32(0xFFFFFFFF)
                     above2 = cutlass.Int32(0)
@@ -6952,8 +6952,7 @@ class GvrClusKernel:
                             if tidx < cutlass.Int32(NBS):  # per-level clear
                                 s_hist[tidx] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (level clear) ----
-                            i = tidx
-                            while i < n:  # whole row
+                            for i in cutlass.range(tidx, n, BLK, unroll=1):  # whole row
                                 uq = C.fkey(C.ldg_f32(x_addr, i))
                                 if uq >= cutlass.Uint32(rlo):
                                     if uq <= cutlass.Uint32(rhi):
@@ -6963,7 +6962,6 @@ class GvrClusKernel:
                                         C.atomic_add_cta(
                                             s_hist.iterator + cutlass.Int32(du), cutlass.Int32(1)
                                         )
-                                i = i + cutlass.Int32(BLK)
                             cute.arch.barrier()  # ---- barrier (level hist) ----
                             # block-parallel scan (ONE internal barrier; only
                             # use of ws in this kernel)
@@ -6998,8 +6996,7 @@ class GvrClusKernel:
                         nA = above2
                         nT = need2
                     it2 = (n + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                    it = cutlass.Int32(0)
-                    while it < it2:
+                    for it in cutlass.range(it2, unroll=1):
                         i = it * cutlass.Int32(BLK) + tidx
                         p1 = cutlass.Int32(0)
                         p2 = cutlass.Int32(0)
@@ -7014,7 +7011,6 @@ class GvrClusKernel:
                         self._ballot_pair_emit(
                             p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane, pre_idx, s_pt
                         )
-                        it = it + cutlass.Int32(1)
         else:
             # ---- in-kernel register path (see the family note). Here, after the
             # streaming body, it leaves that body's SASS as compiled without it
