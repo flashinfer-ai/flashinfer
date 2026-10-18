@@ -4779,7 +4779,7 @@ def test_source_program_table_names_shipped_sources():
     } == module._EXACTMETA_MODULES
     # The exactone programs are the SM103 render of the same six fused varlen
     # entries: their own device modules, never the exactfused files (on
-    # sm_107a the three programs of a suffix share the one-launch render).
+    # sm_107a too: the one-launch render beside the exactfused one).
     assert set(module._EXACTONE_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exactone_")
     }
@@ -4805,19 +4805,26 @@ def test_source_program_table_names_shipped_sources():
     # retained start ``exact_*`` programs, each entry the fold module's stem
     # under its own identity (the export's content hash, or the pending token
     # before the export fills it); an ``exactmeta_*`` entry equals its
-    # ``exactfused_*`` varlen twin, and both equal the ``exactone_*`` entry of
-    # the suffix: the sm_107a fused varlen render is the one-launch form, one
-    # source for the three programs.
+    # ``exactfused_*`` varlen twin, and the ``exactone_*`` entry of the suffix
+    # is a source of its own (the one-launch render beside the SM100-form
+    # render), as on SM103.
     assert set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if not name.startswith("exact_")
     }
     assert len(module._SM107_MODULES) == 54
-    # Until the export fills an ``exactone_*`` entry (the pending token) its
-    # ``exactfused_*`` twin keeps the module a previous export gave it.
-    for name, shared in module._SM107_MODULES.items():
+    for name, own in module._SM107_MODULES.items():
         if name.startswith("exactone_"):
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
-            assert module._PENDING_EXPORT in shared or twin == shared, (name, twin)
+            assert module._PENDING_EXPORT in own or twin != own, (name, twin)
+    assert len(
+        {
+            identity
+            for identity in module._SM107_MODULES.values()
+            if module._PENDING_EXPORT not in identity
+        }
+    ) == len(module._SM107_MODULES) - sum(
+        1 for name in module._SM107_MODULES if name.startswith("exactmeta_")
+    )
     for name, identity in module._SM107_MODULES.items():
         stem, suffix = identity.rsplit("_", 1)
         assert stem == module._PROGRAMS[name].main.module.rsplit("_", 1)[0], name
