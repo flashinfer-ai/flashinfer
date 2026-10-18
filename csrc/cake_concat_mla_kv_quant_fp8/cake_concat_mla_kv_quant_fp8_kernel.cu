@@ -20,12 +20,20 @@
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
-#define LAUNCH_MIN_BLOCKS 3
+#ifndef HEAD_GROUP
+#error "HEAD_GROUP must be this build's head group, the consecutive head pairs one warp owns (the loader passes -DHEAD_GROUP=<MODULES head_group>)"
+#endif
+#ifndef LAUNCH_MIN_BLOCKS
+#error "LAUNCH_MIN_BLOCKS must be this build's __launch_bounds__ minimum blocks per SM (the loader passes -DLAUNCH_MIN_BLOCKS=<MODULES min_blocks>)"
+#endif
+#ifndef CAKE_KERNEL_SYMBOL
+#error "CAKE_KERNEL_SYMBOL must name this build's kernel (the loader passes -DCAKE_KERNEL_SYMBOL=<MODULES kernel_symbol>)"
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5(const __nv_bfloat16* __restrict__ kv_nope, const __nv_bfloat16* __restrict__ k_pe, uint8_t* __restrict__ key, uint8_t* __restrict__ value, int num_tokens, int num_heads, int head_pairs, int warps_per_token, int k_pe_row_stride)
+CAKE_KERNEL_SYMBOL(const __nv_bfloat16* __restrict__ kv_nope, const __nv_bfloat16* __restrict__ k_pe, uint8_t* __restrict__ key, uint8_t* __restrict__ value, int num_tokens, int num_heads, int head_pairs, int warps_per_token, int k_pe_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -48,7 +56,11 @@ kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5(const __nv_bfloat16* __
     int rope_piece = lane_0 & 3;
     int warp_global = bid * 8 + warp;
     int token = warp_global / warps_per_token;
-    int pair0 = (warp_global - token * warps_per_token) * 4;
+#if HEAD_GROUP > 1
+    int pair0 = (warp_global - token * warps_per_token) * HEAD_GROUP;
+#else
+    int pair0 = warp_global - token * warps_per_token;
+#endif
     if (token < num_tokens) {
         long long kv_elems_per_token = (long long)num_heads * 256;
         long long key_elems_per_token = (long long)num_heads * 192;
@@ -60,11 +72,11 @@ kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5(const __nv_bfloat16* __
         long long rope_src = (long long)token * (long long)k_pe_row_stride + (long long)(rope_piece * 16);
         long long rope_dst = (long long)token * key_elems_per_token + (long long)(pair0 * 2 + rope_hsel) * 192 + (long long)(128 + rope_piece * 16);
         int head0 = pair0 * 2 + head_select;
-        unsigned int words[32];
+        unsigned int words[8 * HEAD_GROUP];
         unsigned int rope_words[8];
         float vals[16];
         #pragma unroll
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < HEAD_GROUP; i++) {
             if (head0 + 2 * i < num_heads) {
                 {
                     asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
@@ -77,7 +89,7 @@ kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5(const __nv_bfloat16* __
                 : "=r"(rope_words[0 + 0]), "=r"(rope_words[0 + 1]), "=r"(rope_words[0 + 2]), "=r"(rope_words[0 + 3]), "=r"(rope_words[0 + 4]), "=r"(rope_words[0 + 5]), "=r"(rope_words[0 + 6]), "=r"(rope_words[0 + 7]) : "l"((const void*)((const char*)(k_pe + rope_src) + 0)) : "memory");
         }
         #pragma unroll
-        for (int i_1 = 0; i_1 < 4; i_1++) {
+        for (int i_1 = 0; i_1 < HEAD_GROUP; i_1++) {
             if (head0 + 2 * i_1 < num_heads) {
                 vals[0] = __uint_as_float(words[i_1 * 8] << 16);
                 vals[1] = __uint_as_float(words[i_1 * 8] & 4294901760u);
@@ -148,7 +160,7 @@ kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5(const __nv_bfloat16* __
         #pragma unroll
         for (int k = 0; k < 1; k++) {
             int slot = k * 4 + rope_slot;
-            if (slot < 4 && pair0 * 2 + rope_hsel + 2 * slot < num_heads) {
+            if (slot < HEAD_GROUP && pair0 * 2 + rope_hsel + 2 * slot < num_heads) {
                 {
                     unsigned int _fp8_pk[4];
                     asm("{\n\t"
