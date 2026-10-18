@@ -54,7 +54,7 @@ def _kernel_table(arch: str) -> dict[str, str]:
     return table
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_registry_maps_every_logical_kernel_to_a_program_for_the_arch(
     arch: str,
 ) -> None:
@@ -146,6 +146,7 @@ def test_long_row_dispatch_is_exact(
             "cp_prefill_equal_head_checkpoint",
         ),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
+        ("sm_107a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
         (
