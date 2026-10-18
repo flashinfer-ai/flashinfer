@@ -257,6 +257,12 @@ well as FP8 inputs. Test non-unit Q/K scales with nontrivial logits, V scales
 against O and unchanged LSE, and GPU scalar changes before replay. A plan-time
 predicate cannot exclude arguments supplied only to `run()`.
 
+Refining auto admission must also preserve the explicit-bound, device-length
+no-readback path. Declining cuDNN can itself cause FA2 to stage KV metadata back
+to the host. Use per-request work only when its lengths are already on CPU;
+otherwise retain the existing bound-based policy. Check with a busy GPU stream
+and synchronization debugging, not just a predicate-level test.
+
 ## Benchmarking
 
 For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, use

@@ -2421,9 +2421,11 @@ def _blackwell_paged_auto_cudnn(
     max_kv,
     page_size,
     total_q,
+    qo_indptr_host,
+    kv_lens,
 ):
     """Measured D128 prefix domain; feature compatibility is checked by plan."""
-    return (
+    if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype == torch.bfloat16
         and head_dim_qk == head_dim_vo == 128
@@ -2436,12 +2438,25 @@ def _blackwell_paged_auto_cudnn(
         and 64 <= max_q <= 1024
         and 2048 <= max_kv <= 32768
         and max_kv >= 4 * max_q
-        # Amortize paged setup and split/combine cost. Count live query rows
-        # rather than B * max_q, which overestimates uneven batches.
+        # Cheap upper-bound rejection before querying optional runtime support.
         and total_q * hq * max_kv >= 8 * 1024 * 1024
         and get_compute_capability(device) == (10, 0)
         and _cudnn_supports_paged_auto()
+    ):
+        return False
+    # Pair Q with its own KV length when host metadata is already available.
+    # For device-only lengths, preserve the existing upper-bound policy:
+    # declining to FA2 would itself stage KV metadata back to the host.
+    if kv_lens is None or kv_lens.device.type != "cpu":
+        return True
+    q_bounds = qo_indptr_host.tolist()
+    work = hq * sum(
+        (end - start) * length
+        for start, end, length in zip(
+            q_bounds, q_bounds[1:], kv_lens.flatten().tolist(), strict=False
+        )
     )
+    return work >= 8 * 1024 * 1024
 
 
 # Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
@@ -3634,6 +3649,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._max_kv_len,
                     page_size,
                     total_num_rows,
+                    qo_indptr_host,
+                    kv_lens_arr_host if kv_lens_arr_host is not None else seq_lens,
                 )
             ):
                 self._backend = "cudnn"

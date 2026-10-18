@@ -686,6 +686,69 @@ def test_paged_prefill_plan_stages_device_lengths_without_sync(
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
+def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
+    if (
+        torch.cuda.get_device_capability() != (10, 0)
+        or not prefill._cudnn_supports_paged_auto()
+    ):
+        pytest.skip("requires the qualified SM100 paged-auto runtime")
+    device = torch.device("cuda")
+    q = torch.randn(128, 16, 128, device=device, dtype=torch.bfloat16)
+    k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    table = torch.arange(512, device=device, dtype=torch.int32).reshape(1, -1)
+    params = dict(
+        qo_indptr=torch.tensor([0, 128], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 512], dtype=torch.int32),
+        paged_kv_indices=table[0],
+        paged_kv_last_page_len=torch.tensor([16], dtype=torch.int32),
+        seq_lens=torch.tensor([8192], dtype=torch.int32),
+        block_tables=table,
+        max_token_per_sequence=128,
+        max_sequence_kv=8192,
+        num_qo_heads=16,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        page_size=16,
+        causal=True,
+        q_data_type=q.dtype,
+    )
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=device, dtype=torch.uint8),
+        "HND",
+        backend="auto",
+    )
+    w.plan(**params)
+    # Exercise the no-readback contract only when the current policy admits
+    # the CPU-metadata call. Do not pin a heuristic winner as a golden.
+    if w._backend != "cudnn":
+        pytest.skip("current auto policy does not admit this control")
+    ref_o, ref_lse = w.run(q, (k, v), return_lse=True)
+    params["seq_lens"] = params["seq_lens"].to(device)
+    params["seq_lens_q"] = torch.tensor([128], device=device, dtype=torch.int32)
+    for key in ("paged_kv_indptr", "paged_kv_last_page_len"):
+        params[key] = params[key].to(metadata_device)
+    # Warm every selected provider before checking for host synchronization.
+    w.plan(**params)
+    w.run(q, (k, v))
+    torch.cuda.synchronize()
+    torch.cuda._sleep(1 << 28)
+    busy = torch.cuda.Event()
+    busy.record()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        w.plan(**params)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)
+    assert not busy.query(), "auto plan() waited for queued GPU work"
+    out, lse = w.run(q, (k, v), return_lse=True)
+    torch.testing.assert_close(out, ref_o, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(lse, ref_lse, atol=0.004, rtol=0.004)
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 def test_paged_single_token_gqa_writes_every_lse_head():
     """cuDNN < 9.27 mis-stores a ragged Stats tensor for single-token GQA
     (NVBug 6783545); the plan then binds the packed LSE through the unragged
