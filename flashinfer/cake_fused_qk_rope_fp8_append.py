@@ -54,10 +54,12 @@ pointer, no host synchronisation, workspace or extra kernel is involved.
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Any, Optional, Tuple
 
 import torch
+import tvm_ffi
 
 from .jit.cake_fused_qk_rope_fp8_append import (
     STAGES,
@@ -84,6 +86,16 @@ def launch_plan(num_rows: int, num_requests: int, num_kv_heads: int) -> dict[str
 def _check(cond: bool, message: str) -> None:
     if not cond:
         raise ValueError(message)
+
+
+@functools.cache
+def _call_plan(arch: str) -> tuple[Any, tuple[str, ...]]:
+    """Launch entry and argument order of the ``arch`` build (once per build)."""
+    module, record = load_cake_fused_qk_rope_fp8_append_module(_STAGE, arch)
+    return (
+        getattr(module, str(record["ffi_entry"])),
+        tuple(str(name) for _kind, name in record["arg_plan"]),
+    )
 
 
 def _heads_from_packed_qkv(
@@ -334,10 +346,10 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
         _check(t.is_contiguous(), f"{name} must be contiguous")
         _check(t.device == device, f"{name} must be on {device}")
 
-    arch = arch_for(get_compute_capability(device))
-    module, record = load_cake_fused_qk_rope_fp8_append_module(_STAGE, arch)
+    entry, arg_names = _call_plan(arch_for(get_compute_capability(device)))
     plan = launch_plan(num_rows, num_requests, num_kv_heads)
-    scalars = {
+    values = {
+        **tensors,
         "num_rows": num_rows,
         "num_requests": num_requests,
         "num_q_heads": num_q_heads,
@@ -355,20 +367,14 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
         "grid_y": plan["grid"][1],
         "grid_z": plan["grid"][2],
     }
-    args = []
-    for kind, name in record["arg_plan"]:
-        if name in tensors:
-            args.append(tensors[name])
-        elif name in scalars:
-            args.append(scalars[name])
-        else:
-            raise RuntimeError(
-                f"generated module expects unknown argument {name!r} ({kind})"
-            )
-    import tvm_ffi
-
+    try:
+        args = [values[name] for name in arg_names]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"generated module expects unknown argument {exc.args[0]!r}"
+        ) from None
     with torch.cuda.device(device), tvm_ffi.use_torch_stream():
-        getattr(module, str(record["ffi_entry"]))(*args)
+        entry(*args)
     return out_q, q_scale, split_k_flag
 
 

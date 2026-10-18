@@ -77,6 +77,7 @@ def clear_units_per_request(page_size: int, num_kv_heads: int) -> int:
     return 2 * ((chunks + _CLEAR_UNIT_CHUNKS - 1) // _CLEAR_UNIT_CHUNKS)
 
 
+@functools.cache
 def policy_constants() -> dict[str, int]:
     """Constants of the Cake stage policy (``contract.stage_policy.constants``)."""
     return dict(_manifest()["contract"]["stage_policy"]["constants"])
@@ -153,6 +154,7 @@ def stage_name(num_q_heads: int, num_kv_heads: int, knobs: dict[str, int]) -> st
     return "_".join(parts)
 
 
+@functools.cache
 def stages_for(arch: str) -> tuple[str, ...]:
     """Stage names the manifest ships for ``arch``."""
     return tuple(_manifest()["contract"]["stages_by_arch"][arch])

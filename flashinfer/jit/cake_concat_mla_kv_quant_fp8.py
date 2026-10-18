@@ -266,6 +266,7 @@ def _route(head_group: int) -> dict[str, Any]:
         ) from exc
 
 
+@functools.cache
 def concat_mla_kv_quant_fp8_route_record(
     device: torch.device, head_group: int
 ) -> dict[str, Any]:
@@ -273,7 +274,8 @@ def concat_mla_kv_quant_fp8_route_record(
 
     ``module`` is the generated program record plus its ``name``; the public
     operation binds the launch arguments from its ``arg_plan`` and passes the
-    host-planned grid.
+    host-planned grid.  Memoised per ``(device, head_group)``: the exact-target
+    capability query and the record copy run once per entry, not per call.
     """
     target = concat_mla_kv_quant_fp8_target(device)
     route = _route(head_group)

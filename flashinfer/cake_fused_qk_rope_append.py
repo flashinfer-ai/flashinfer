@@ -52,9 +52,11 @@ replays the same build.
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Optional
 
 import torch
+import tvm_ffi
 
 from .jit.cake_fused_qk_rope_append import (
     arch_for,
@@ -62,7 +64,7 @@ from .jit.cake_fused_qk_rope_append import (
     load_cake_fused_qk_rope_append_module,
     stage_for,
 )
-from .utils import get_compute_capability
+from .utils import get_compute_capability, get_device_sm_count
 
 HEAD_DIM = 128
 _THREADS = 128
@@ -96,6 +98,19 @@ def launch_plan(
 def _check(cond: bool, message: str) -> None:
     if not cond:
         raise ValueError(message)
+
+
+@functools.cache
+def _call_plan(stage: str, arch: str) -> tuple[Any, int, int, tuple[str, ...]]:
+    """Launch entry, stage knobs and argument order of one build (once per build)."""
+    module, record = load_cake_fused_qk_rope_append_module(stage, arch)
+    specialization = dict(record["route"]).get("specialization", {})
+    return (
+        getattr(module, str(record["ffi_entry"])),
+        int(specialization.get("WARPS_PER_ROW", 1)),
+        int(specialization.get("CLEAR_UNITS_PER_WARP", 1)),
+        tuple(str(name) for _kind, name in record["arg_plan"]),
+    )
 
 
 def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
@@ -256,7 +271,6 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         _check(t.device == device, f"{name} must be on {device}")
 
     arch = arch_for(get_compute_capability(device))
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     stage = stage_for(
         num_q_heads,
         num_kv_heads,
@@ -264,19 +278,19 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         num_rows=num_rows,
         num_requests=num_requests,
         page_size=page_size,
-        num_sms=num_sms,
+        num_sms=get_device_sm_count(device),
     )
-    module, record = load_cake_fused_qk_rope_append_module(stage, arch)
-    specialization = dict(record["route"]).get("specialization", {})
+    entry, warps_per_row, clear_units_per_warp, arg_names = _call_plan(stage, arch)
     plan = launch_plan(
         num_rows,
         num_requests,
         page_size,
         num_kv_heads,
-        int(specialization.get("WARPS_PER_ROW", 1)),
-        int(specialization.get("CLEAR_UNITS_PER_WARP", 1)),
+        warps_per_row,
+        clear_units_per_warp,
     )
-    scalars = {
+    values = {
+        **tensors,
         "num_rows": num_rows,
         "num_requests": num_requests,
         "max_pages": int(page_indices.shape[1]),
@@ -294,20 +308,14 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         "grid_y": 1,
         "grid_z": 1,
     }
-    args = []
-    for kind, name in record["arg_plan"]:
-        if name in tensors:
-            args.append(tensors[name])
-        elif name in scalars:
-            args.append(scalars[name])
-        else:
-            raise RuntimeError(
-                f"generated module expects unknown argument {name!r} ({kind})"
-            )
-    import tvm_ffi
-
+    try:
+        args = [values[name] for name in arg_names]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"generated module expects unknown argument {exc.args[0]!r}"
+        ) from None
     with torch.cuda.device(device), tvm_ffi.use_torch_stream():
-        getattr(module, str(record["ffi_entry"]))(*args)
+        entry(*args)
     return out_q
 
 
