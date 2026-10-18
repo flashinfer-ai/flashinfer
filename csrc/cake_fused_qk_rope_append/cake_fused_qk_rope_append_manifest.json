@@ -34,7 +34,7 @@
         "w20": 20,
         "w20_v_sub_base": 18
       },
-      "rule": "decode = (num_rows == num_requests); hopper = arch sm_90*; w20 = (Hq,Hkv)==(64,8) and num_rows <= num_sms and clear_ctas_v3 <= (num_sms - num_rows) * clear_ctas_per_free_sm -> WARPS_PER_ROW=w20, V_SUB_BASE=w20_v_sub_base; direct = num_requests >= direct_min_requests or (hopper and ((Hq,Hkv)==(8,1) or w20)) or (not hopper and ((Hq,Hkv)==(64,8) and decode or (Hq,Hkv)==(8,1) and decode and num_requests >= sm100_decode_8_1_min_requests)) -> L_DIRECT_LOOKUP=1; (Hq,Hkv)==(8,1) and (hopper or direct) -> V_SUB_BASE=v_sub_base_8_1; not hopper and (Hq,Hkv)==(64,8) and clear_ctas_v3 >= sm100_u2_min_clear_ctas -> CLEAR_UNITS_PER_WARP=2; clear_ctas_v3 = ceil(num_requests * clear_units_per_request_for(page_size, Hkv, 256) / 4)",
+      "rule": "decode = (num_rows == num_requests); hopper = arch sm_90*; w20 = (Hq,Hkv)==(64,8) and num_rows <= num_sms and clear_ctas_v3 <= (num_sms - num_rows) * clear_ctas_per_free_sm -> WARPS_PER_ROW=w20, V_SUB_BASE=w20_v_sub_base; direct = num_requests >= direct_min_requests or (hopper and ((Hq,Hkv)==(8,1) or w20)) or (not hopper and ((Hq,Hkv)==(64,8) and decode or (Hq,Hkv)==(8,1) and decode and num_requests >= sm100_decode_8_1_min_requests)) -> L_DIRECT_LOOKUP=1; (Hq,Hkv)==(8,1) and (hopper or direct) -> V_SUB_BASE=v_sub_base_8_1; not hopper and (Hq,Hkv)==(64,8) and not w20 and clear_ctas_v3 >= sm100_u2_min_clear_ctas -> CLEAR_UNITS_PER_WARP=2; clear_ctas_v3 = ceil(num_requests * clear_units_per_request_for(page_size, Hkv, 256) / 4)",
       "version": "cake892-r2-2026-10-03"
     },
     "stages": [

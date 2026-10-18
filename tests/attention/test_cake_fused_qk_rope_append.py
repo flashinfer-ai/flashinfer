@@ -530,12 +530,11 @@ def test_stage_policy_only_selects_shipped_builds(arch):
 
     shipped = set(stages_for(arch))
     for hq, hkv in ((8, 1), (64, 8)):
-        for page in (16, 32, 64, 128):
-            for reqs in (1, 2, 8, 32, 64, 128, 256, 257, 512, 1024):
+        for page in (16, 32, 64, 128, 256, 512, 1024, 2048):
+            for reqs in (1, 2, 4, 8, 16, 32, 64, 128, 256, 257, 512, 1024):
+                # rows < reqs: requests without rows in this step
                 for rows in sorted({reqs, 1, 32, 128, 148, 256, 512, 4096}):
-                    if rows < reqs:
-                        continue
-                    for sms in (132, 148):
+                    for sms in (132, 148, 160):
                         stage = stage_for(
                             hq,
                             hkv,
@@ -555,6 +554,48 @@ def test_stage_policy_only_selects_shipped_builds(arch):
                             sms,
                             stage,
                         )
+
+
+# Points where the w20 condition (the clearing grid fits beside the row CTAs)
+# and the CLEAR_UNITS_PER_WARP=2 condition (a large clearing grid) both hold:
+# few rows, many pages to clear.  No shipped build combines the two levers,
+# so w20 wins and the policy must still select a shipped build.
+_W20_U2_TABLE = {
+    # (arch, Hq, Hkv, num_rows, num_requests, page_size, num_sms) -> stage
+    ("sm_100a", 64, 8, 16, 16, 512, 148): "hq64_hkv8_w20_vsub18_d",
+    ("sm_100a", 64, 8, 8, 4, 2048, 160): "hq64_hkv8_w20_vsub18",
+    ("sm_100a", 64, 8, 1, 257, 32, 132): "hq64_hkv8_w20_vsub18_d",
+    ("sm_103a", 64, 8, 32, 32, 256, 160): "hq64_hkv8_w20_vsub18_d",
+    ("sm_103a", 64, 8, 16, 16, 512, 148): "hq64_hkv8_w20_vsub18_d",
+    ("sm_103a", 64, 8, 8, 4, 2048, 160): "hq64_hkv8_w20_vsub18",
+}
+
+
+@pytest.mark.parametrize("key,expected", sorted(_W20_U2_TABLE.items()))
+def test_stage_policy_w20_and_u2_overlap_selects_shipped_build(key, expected):
+    from flashinfer.jit.cake_fused_qk_rope_append import (
+        clear_units_per_request,
+        policy_constants,
+        policy_knobs,
+        stage_for,
+        stages_for,
+    )
+
+    arch, hq, hkv, rows, reqs, page, sms = key
+    shape = dict(
+        arch=arch, num_rows=rows, num_requests=reqs, page_size=page, num_sms=sms
+    )
+    c = policy_constants()
+    clear_ctas = (reqs * clear_units_per_request(page, hkv) + 3) // 4
+    # both lever conditions hold at this point
+    assert clear_ctas >= c["sm100_u2_min_clear_ctas"]
+    assert clear_ctas <= (sms - rows) * c["clear_ctas_per_free_sm"]
+    knobs = policy_knobs(hq, hkv, **shape)
+    assert knobs.get("WARPS_PER_ROW") == c["w20"]
+    assert "CLEAR_UNITS_PER_WARP" not in knobs
+    stage = stage_for(hq, hkv, **shape)
+    assert stage in stages_for(arch)
+    assert stage == expected
 
 
 def test_stage_for_without_shape_is_the_base_build():

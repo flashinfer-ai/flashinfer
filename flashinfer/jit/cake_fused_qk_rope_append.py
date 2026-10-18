@@ -127,7 +127,14 @@ def policy_knobs(
         out["L_DIRECT_LOOKUP"] = 1
     if cfg == (8, 1) and (hopper or direct):
         out["V_SUB_BASE"] = c["v_sub_base_8_1"]
-    if not hopper and cfg == (64, 8) and clear_ctas >= c["sm100_u2_min_clear_ctas"]:
+    # No shipped build combines WARPS_PER_ROW=w20 with CLEAR_UNITS_PER_WARP=2
+    # (``contract.stages_by_arch``): when both conditions hold, w20 wins.
+    if (
+        not hopper
+        and cfg == (64, 8)
+        and not w20
+        and clear_ctas >= c["sm100_u2_min_clear_ctas"]
+    ):
         out["CLEAR_UNITS_PER_WARP"] = 2
     return out
 
