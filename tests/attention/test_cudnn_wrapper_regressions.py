@@ -1324,22 +1324,29 @@ def test_ragged_rejects_invalid_cpu_prefix_mirror(name, bad):
         w.plan(qo.cuda(), kv.cuda(), 8, 8, 128, q_data_type=torch.bfloat16, **hints)
 
 
-@pytest.mark.parametrize("counts", [[0, 3, 1], [257, 1, 0, 513], [0, 0, 0], [4097]])
+@pytest.mark.parametrize(
+    "counts", [[0, 3, 1], [257, 1, 0, 513], [0, 0, 0], [4097], [32, 32]]
+)
 @pytest.mark.parametrize("index_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("strided", [False, True])
-def test_page_table_staging_capacity_and_strided_indices(counts, index_device, strided):
+@pytest.mark.parametrize("start_offset", [0, 3])
+def test_page_table_staging_capacity_and_strided_indices(
+    counts, index_device, strided, start_offset
+):
     from flashinfer.prefill import _build_block_tables_from_paged_kv_indices
 
     step = 2 if strided else 1
-    offsets = torch.tensor([0, *counts], dtype=torch.int64).cumsum(0)
+    offsets = torch.tensor([start_offset, *counts], dtype=torch.int64).cumsum(0)
     host_storage = torch.full(((len(offsets) + 1) * step,), -1, dtype=torch.int64)
     host_storage[: len(offsets) * step : step] = offsets
     host_storage[-step] = int(offsets[-1]) + 3
     host = host_storage[::step]
     idx_storage = torch.arange(
-        (sum(counts) + 1) * step, dtype=torch.int64, device=index_device
+        (start_offset + sum(counts) + 1) * step,
+        dtype=torch.int64,
+        device=index_device,
     )
-    indices = idx_storage[::step][: sum(counts)]
+    indices = idx_storage[::step][: start_offset + sum(counts)]
     expected = torch.zeros((len(counts), max(counts)), dtype=torch.int32)
     for b, n in enumerate(counts):
         expected[b, :n] = indices.cpu()[int(offsets[b]) : int(offsets[b + 1])]
@@ -1347,18 +1354,25 @@ def test_page_table_staging_capacity_and_strided_indices(counts, index_device, s
         host, indices, len(counts), torch.device("cuda")
     )
     torch.testing.assert_close(got.cpu(), expected)
-    # Reuse larger capacity, with nontrivial row stride and poisoned tails.
-    backing = torch.full(
-        (len(counts), max(counts) + 7), -777, device="cuda", dtype=torch.int32
-    )
-    out = backing[:, : max(counts) + 3]
-    same = _build_block_tables_from_paged_kv_indices(
-        host, indices, len(counts), torch.device("cuda"), out=out
-    )
-    assert same.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(out[:, : max(counts)].cpu(), expected)
-    assert torch.count_nonzero(out[:, max(counts) :]).item() == 0
-    assert (backing[:, max(counts) + 3 :] == -777).all().item()
+    # Cover exact rectangles and retained capacity with poisoned row/column tails.
+    for extra_rows, extra_cols in [(0, 0), (0, 3), (1, 0), (1, 3)]:
+        width = max(counts) + extra_cols
+        backing = torch.full(
+            (len(counts) + extra_rows, width * step + 7),
+            -777,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        out = backing[:, : width * step : step]
+        same = _build_block_tables_from_paged_kv_indices(
+            host, indices, len(counts), torch.device("cuda"), out=out
+        )
+        assert same.data_ptr() == out.data_ptr()
+        expected_backing = torch.full_like(backing, -777, device="cpu")
+        expected_out = expected_backing[:, : width * step : step]
+        expected_out.zero_()
+        expected_out[: len(counts), : max(counts)] = expected
+        torch.testing.assert_close(backing.cpu(), expected_backing)
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")

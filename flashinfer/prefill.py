@@ -2474,9 +2474,21 @@ def _build_block_tables_from_paged_kv_indices(
     if out is None:
         max_pages = max(end - start for start, end in spans)
         out = torch.empty((batch_size, max_pages), dtype=torch.int32, device=device)
+    indices = paged_kv_indices.to(device)
+    rows, width = out.shape
+    if (
+        len(spans) == batch_size == rows
+        and offsets[-1] - offsets[0] == batch_size * width
+        and all(end - start == width for start, end in spans)
+    ):
+        # Every destination cell is overwritten. A single rectangular copy
+        # also preserves the owned table's pointer for retained captures.
+        out.copy_(
+            indices[offsets[0] : offsets[-1]].view(batch_size, width), non_blocking=True
+        )
+        return out
     # Clear unused row tails, including retained capacity after a shorter replan.
     out.zero_()
-    indices = paged_kv_indices.to(device)
     dst, src = [], []
     for i, (start, end) in enumerate(spans):
         if end > start:
