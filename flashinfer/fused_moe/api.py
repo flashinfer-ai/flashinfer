@@ -2671,8 +2671,8 @@ class SM12xNvfp4Bf16Config:
     128x4-swizzled E4M3 block scales and per-expert FP32 global scales. The
     same view serves :class:`CuTileNvfp4Config` (W4A4) and
     :class:`CuTileNvfp4Bf16Config`, so no second weight copy is needed.
-    Supports ``SwiGLU`` with default scalars and ``ReLU2``. Expert
-    parallelism and fused shared experts are not supported.
+    Supports ``SwiGLU`` with default scalars, ``GeGLUTanh`` and ``ReLU2``.
+    Expert parallelism and fused shared experts are not supported.
     """
 
     @classmethod
@@ -2730,8 +2730,8 @@ class SM12xNvfp4Config:
     and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
     ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
     and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
-    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
-    supported.
+    scalars, ``GeGLUTanh`` and ``ReLU2``. Expert parallelism and fused shared
+    experts are not supported.
     """
 
     @classmethod

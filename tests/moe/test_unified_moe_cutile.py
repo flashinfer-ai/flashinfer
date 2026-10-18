@@ -2477,8 +2477,14 @@ def _make_sm12x_nvfp4_bf16_case(
     num_experts: int,
     top_k: int,
     seed: int = 0,
+    up_scale: float = 1.0,
 ):
-    """Random routing and weights; the reference uses the dequantized weights."""
+    """Random routing and weights; the reference uses the dequantized weights.
+
+    ``up_scale`` multiplies the up half of a gated w1 (and divides the w2
+    global scales, keeping the output scale) so that the gate and up halves
+    also differ in magnitude.
+    """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     w1_rows = intermediate_size * (2 if activation.is_gated else 1)
@@ -2490,9 +2496,14 @@ def _make_sm12x_nvfp4_bf16_case(
             num_experts, rows, cols, dtype=torch.bfloat16, device=device
         )
         weight /= cols**0.5
+        is_w1 = not packed
+        if is_w1 and activation.is_gated:
+            weight[:, :intermediate_size] *= up_scale  # w1 rows are [up, gate]
         q, scale, dequant = _quantize_weights(weight)
         del weight
         global_scale = torch.rand(num_experts, device=device) + 0.5
+        if not is_w1 and activation.is_gated:
+            global_scale /= up_scale  # keeps the output scale
         packed.append((q, scale))
         global_scales.append(global_scale)
         dequantized.append(dequant * global_scale.to(dequant.dtype)[:, None, None])
@@ -2523,14 +2534,24 @@ def _make_sm12x_nvfp4_bf16_case(
             torch.softmax(top.values, dim=-1),
         )
 
-    def reference(act: MoEActivationPack) -> torch.Tensor:
+    def reference(
+        act: MoEActivationPack,
+        *,
+        ref_activation: ActivationConfig | None = None,
+        swap_gate_up: bool = False,
+    ) -> torch.Tensor:
+        # The keywords build negative controls: another activation, or the gate
+        # and up halves of w1 exchanged.
+        w1 = dequantized[0]
+        if swap_gate_up:
+            w1 = torch.cat(w1.split(intermediate_size, dim=1)[::-1], dim=1)
         return compute_reference_moe(
             act.hidden_states_q,
             act.topk_ids,
             act.topk_weights,
-            dequantized[0],
+            w1,
             dequantized[1],
-            activation,
+            activation if ref_activation is None else ref_activation,
         )
 
     return view, make_activations, reference
@@ -2589,7 +2610,7 @@ def test_sm12x_nvfp4_bf16_candidate_accepts_shared_weight_view():
 
 
 @sm12x_nvfp4_bf16_required
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("activation", (SwiGLU(), GeGLUTanh(), ReLU2()))
 def test_sm12x_nvfp4_bf16_reads_the_shared_cutile_view(activation):
     view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
         activation,
@@ -2644,6 +2665,11 @@ _SM12X_NVFP4_BF16_GEOMETRIES = (
     ("mixtral_8x7b", 256, 4096, 14336, 8, 2, SwiGLU()),
     ("b12x_swiglu_k22", 1024, 1024, 2688, 512, 22, SwiGLU()),
     ("b12x_relu2_k22", 1, 1024, 2688, 512, 22, ReLU2()),
+    # Gemma-4 26B-A4B: gated tanh-GELU, I = 704 (I % 128 == 64)
+    # (persistent kernel, activation fused into GEMM2 staging, separate pass)
+    ("gemma4_26b_a4b_t1", 1, 2816, 704, 128, 8, GeGLUTanh()),
+    ("gemma4_26b_a4b_t48", 48, 2816, 704, 128, 8, GeGLUTanh()),
+    ("gemma4_26b_a4b_t128", 128, 2816, 704, 128, 8, GeGLUTanh()),
 )
 
 
@@ -2846,6 +2872,7 @@ def test_sm12x_nvfp4_bf16_layers_do_not_share_scratch():
         (4, 2560, 640, 512, 10, SwiGLU()),
         (64, 2048, 512, 256, 8, SwiGLU()),
         (8, 2688, 1856, 128, 6, ReLU2()),
+        (32, 2816, 704, 128, 8, GeGLUTanh()),
     ),
 )
 def test_sm12x_nvfp4_bf16_cuda_graph_replays_new_inputs_and_routing(
@@ -2957,8 +2984,16 @@ def _make_sm12x_nvfp4_case(
     top_k: int,
     seed: int = 0,
     activation_global_scales: tuple[float, float] | None = None,
+    up_scale: float = 1.0,
 ):
-    """Random routing and weights; the reference fake-quantizes activations."""
+    """Random routing and weights; the reference fake-quantizes activations.
+
+    The reference emulates the kernel's numerics exactly, so unlike FP32 or
+    BF16-weight references (about 20% off either way) it tells a wrong
+    activation or swapped gate/up halves apart. ``up_scale`` multiplies the up
+    half of a gated w1 (and divides the w2 global scales, keeping the output
+    scale) so that the two halves also differ in magnitude.
+    """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     w1_rows = intermediate_size * (2 if activation.is_gated else 1)
@@ -2970,9 +3005,14 @@ def _make_sm12x_nvfp4_case(
             num_experts, rows, cols, dtype=torch.bfloat16, device=device
         )
         weight /= cols**0.5
+        is_w1 = not packed
+        if is_w1 and activation.is_gated:
+            weight[:, :intermediate_size] *= up_scale  # w1 rows are [up, gate]
         q, scale, dequant = _quantize_weights(weight)
         del weight
         global_scale = torch.rand(num_experts, device=device) + 0.5
+        if not is_w1 and activation.is_gated:
+            global_scale /= up_scale  # keeps the output scale
         packed.append((q, scale))
         global_scales.append(global_scale)
         # E2M1 x E4M3 products are exact in BF16; the FP32 global scale is
@@ -3009,7 +3049,16 @@ def _make_sm12x_nvfp4_case(
             torch.softmax(top.values, dim=-1),
         )
 
-    def reference(act: MoEActivationPack) -> torch.Tensor:
+    def reference(
+        act: MoEActivationPack,
+        *,
+        ref_activation: ActivationConfig | None = None,
+        swap_gate_up: bool = False,
+    ) -> torch.Tensor:
+        # The keywords build negative controls: another activation, or the gate
+        # and up halves of w1 exchanged.
+        if ref_activation is None:
+            ref_activation = activation
         x = _nvfp4_fake_quant(act.hidden_states_q.float(), g1)
         out = torch.zeros_like(x)
         ids = act.topk_ids.long()
@@ -3018,10 +3067,15 @@ def _make_sm12x_nvfp4_case(
                 continue
             token, slot = (ids == e).nonzero(as_tuple=True)
             h = x[token] @ (dequantized[0][e].float() * global_scales[0][e]).T
-            if activation.is_gated:
+            if ref_activation.is_gated:
                 # Checkpoint w1 rows are [up, gate]; the prepared view reorders them.
                 up, gate = h.split(intermediate_size, dim=-1)
-                a = torch.nn.functional.silu(gate) * up
+                if swap_gate_up:
+                    up, gate = gate, up
+                if isinstance(ref_activation, GeGLUTanh):
+                    a = torch.nn.functional.gelu(gate, approximate="tanh") * up
+                else:
+                    a = torch.nn.functional.silu(gate) * up
             else:
                 a = torch.relu(h).square()
             a = _nvfp4_fake_quant(a.to(torch.bfloat16).float(), g2)
@@ -3096,7 +3150,7 @@ def test_sm12x_nvfp4_rejects_relu2_narrower_than_one_n_tile():
 
 
 @sm12x_nvfp4_bf16_required
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("activation", (SwiGLU(), GeGLUTanh(), ReLU2()))
 def test_sm12x_nvfp4_reads_the_shared_cutile_view(activation):
     view, make_activations, reference = _make_sm12x_nvfp4_case(
         activation,
@@ -3156,6 +3210,14 @@ _SM12X_NVFP4_GEOMETRIES = (
     ("mixtral_8x7b", 256, 4096, 14336, 8, 2, SwiGLU()),
     ("b12x_swiglu_k22", 1024, 1024, 2688, 512, 22, SwiGLU()),
     ("b12x_relu2_k22", 1, 1024, 2688, 512, 22, ReLU2()),
+    # GeGLU-tanh whose up half starts mid 128-row scale block
+    ("geglu_tanh_i192", 64, 1024, 192, 64, 4, GeGLUTanh()),
+    # Gemma-4 26B-A4B: gated tanh-GELU, I = 704 (I % 128 == 64)
+    ("gemma4_26b_a4b_t1", 1, 2816, 704, 128, 8, GeGLUTanh()),
+    ("gemma4_26b_a4b_t8", 8, 2816, 704, 128, 8, GeGLUTanh()),
+    ("gemma4_26b_a4b_t64", 64, 2816, 704, 128, 8, GeGLUTanh()),
+    ("gemma4_26b_a4b_t512", 512, 2816, 704, 128, 8, GeGLUTanh()),
+    ("gemma4_26b_a4b_t2048", 2048, 2816, 704, 128, 8, GeGLUTanh()),
 )
 
 
@@ -3196,7 +3258,7 @@ def test_sm12x_nvfp4_matches_reference(
 
 
 @sm12x_nvfp4_bf16_required
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("activation", (SwiGLU(), GeGLUTanh(), ReLU2()))
 def test_sm12x_nvfp4_uses_activation_global_scales(activation):
     # ModelOpt-style calibrated scales (448 * 6 / amax) from the weight view.
     view, make_activations, reference = _make_sm12x_nvfp4_case(
@@ -3271,6 +3333,7 @@ def test_sm12x_nvfp4_ignores_out_of_range_expert_ids(num_tokens):
         (4, 2560, 640, 512, 10, SwiGLU()),
         (256, 2048, 768, 128, 8, SwiGLU()),
         (8, 2688, 1856, 128, 6, ReLU2()),
+        (24, 2816, 704, 128, 8, GeGLUTanh()),
     ),
 )
 def test_sm12x_nvfp4_cuda_graph_replays_new_inputs_and_routing(
@@ -3310,6 +3373,171 @@ def test_sm12x_nvfp4_cuda_graph_replays_new_inputs_and_routing(
         graph.replay()
         torch.cuda.synchronize()
         _assert_w4a4_close(captured, reference(update))
+
+
+def _sm12x_nvfp4_variant(config_type):
+    """(case factory, config factory, closeness check, runner) of W4A4 / W4A16."""
+    if config_type is SM12xNvfp4Config:
+        return (
+            _make_sm12x_nvfp4_case,
+            _sm12x_nvfp4_config,
+            _assert_w4a4_close,
+            SM12xNvfp4Runner,
+        )
+    return (
+        _make_sm12x_nvfp4_bf16_case,
+        _sm12x_nvfp4_bf16_config,
+        _assert_moe_close,
+        SM12xNvfp4Bf16Runner,
+    )
+
+
+def _sm12x_nvfp4_layer(config_type, view, activation, **shape):
+    _, make_config, _, runner_type = _sm12x_nvfp4_variant(config_type)
+    weights = MoEWeightPack()
+    weights.prepare_for(runner_type.backend_key, view)
+    layer = MoELayer(
+        make_config(activation, backends=(config_type(),), **shape),
+        torch.device("cuda"),
+    )
+    return layer, weights
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("config_type", (SM12xNvfp4Config, SM12xNvfp4Bf16Config))
+def test_sm12x_nvfp4_gated_activations_do_not_share_kernels(config_type):
+    # SwiGLU and GeGLU-tanh have the same w13 geometry (N13 == 2*I) and token
+    # bucket, so only the activation in the kernel cache key separates them.
+    make_case, _, assert_close, _ = _sm12x_nvfp4_variant(config_type)
+    num_tokens, hidden, inter, experts, top_k = 16, 1024, 192, 32, 4
+    for activation in (SwiGLU(), GeGLUTanh(), SwiGLU()):
+        view, make_activations, reference = make_case(
+            activation,
+            num_tokens=num_tokens,
+            hidden_size=hidden,
+            intermediate_size=inter,
+            num_experts=experts,
+            top_k=top_k,
+        )
+        layer, weights = _sm12x_nvfp4_layer(
+            config_type,
+            view,
+            activation,
+            num_experts=experts,
+            top_k=top_k,
+            intermediate_size=inter,
+            max_num_tokens=num_tokens,
+        )
+        act = make_activations(0)
+        assert_close(layer(act, weights), reference(act))
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("config_type", (SM12xNvfp4Config, SM12xNvfp4Bf16Config))
+def test_sm12x_nvfp4_geglu_tanh_applies_gelu_to_the_gate_half(config_type):
+    # The up half of w1 is scaled 4x, so gelu_tanh(up) * gate is far from
+    # gelu_tanh(gate) * up. The output must match the latter, and the same check
+    # must reject both negative controls (swapped halves, SwiGLU): the
+    # tolerance used by these tests pins the half order and the activation.
+    # Coarse FP32 / BF16-weight references could not: for W4A4 they are about
+    # 20% off whichever the activation.
+    make_case, _, assert_close, _ = _sm12x_nvfp4_variant(config_type)
+    activation = GeGLUTanh()
+    num_tokens, hidden, inter, experts, top_k = 64, 1024, 192, 32, 4
+    view, make_activations, reference = make_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        num_experts=experts,
+        top_k=top_k,
+        up_scale=4.0,
+    )
+    layer, weights = _sm12x_nvfp4_layer(
+        config_type,
+        view,
+        activation,
+        num_experts=experts,
+        top_k=top_k,
+        intermediate_size=inter,
+        max_num_tokens=num_tokens,
+    )
+    act = make_activations(0)
+    actual = layer(act, weights)
+    assert_close(actual, reference(act))
+    for control in (
+        reference(act, swap_gate_up=True),
+        reference(act, ref_activation=SwiGLU()),
+    ):
+        with pytest.raises(AssertionError):
+            assert_close(actual, control)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("config_type", (SM12xNvfp4Config, SM12xNvfp4Bf16Config))
+def test_sm12x_nvfp4_kernels_infer_the_activation_by_default(config_type, activation):
+    # Direct kernel callers that do not pass ``activation`` still get SwiGLU or
+    # ReLU2 from w13's row count: the same cached kernels as the explicit name
+    # and the same numerics, pinned by the reference at the usual tolerance
+    # (BF16 output atomics rule out a bitwise comparison between runs).
+    if config_type is SM12xNvfp4Config:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_nvfp4_w4a4
+
+        entry, run = moe_nvfp4_w4a4._entry, moe_nvfp4_w4a4.run_moe_w4a4
+    else:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_nvfp4_w4a16
+
+        entry, run = moe_nvfp4_w4a16._entry, moe_nvfp4_w4a16.run_moe_w4a16
+    make_case, _, assert_close, _ = _sm12x_nvfp4_variant(config_type)
+    num_tokens, hidden, inter, experts, top_k = 16, 1024, 256, 32, 4
+    view, make_activations, reference = make_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        num_experts=experts,
+        top_k=top_k,
+    )
+    layer, weights = _sm12x_nvfp4_layer(
+        config_type,
+        view,
+        activation,
+        num_experts=experts,
+        top_k=top_k,
+        intermediate_size=inter,
+        max_num_tokens=num_tokens,
+    )
+    runner = layer.runners[0]
+    name = runner._kernel_activation
+    assert name == ("silu" if activation.is_gated else "relu2")
+    act = make_activations(0)
+    out, *inputs = runner.pack_inputs(act, weights)
+    geometry = (num_tokens, hidden, inter, inputs[3].shape[1], experts, top_k)
+    assert entry(*geometry, out.device) is entry(*geometry, out.device, name)
+    expected = reference(act)
+    assert_close(run(*inputs, torch.empty_like(out)), expected)
+    assert_close(run(*inputs, torch.empty_like(out), activation=name), expected)
+
+
+@sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_kernels_validate_the_activation_name():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a16 import (
+        resolve_activation,
+    )
+
+    inter = 192
+    assert resolve_activation(None, 2 * inter, inter) == "silu"
+    assert resolve_activation(None, inter, inter) == "relu2"
+    assert resolve_activation("geglu_tanh", 2 * inter, inter) == "geglu_tanh"
+    # "gelu_tanh" names the element-wise function, not the gated unit.
+    for name in ("gelu_tanh", "swiglu", "gelu"):
+        with pytest.raises(ValueError, match="must be one of"):
+            resolve_activation(name, 2 * inter, inter)
+    with pytest.raises(ValueError, match="needs w13 with 2\\*I rows"):
+        resolve_activation("geglu_tanh", inter, inter)
+    with pytest.raises(ValueError, match="needs w13 with I rows"):
+        resolve_activation("relu2", 2 * inter, inter)
 
 
 @sm12x_nvfp4_bf16_required

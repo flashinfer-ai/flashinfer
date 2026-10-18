@@ -42,6 +42,56 @@ KPT = 32  # K values per thread per step
 REGCAP = 128  # per-thread register target of the persistent kernel
 GMUL = 10  # persistent grid = SM count * GMUL, capped by the tile count
 
+# Kernel activation names: the ``activation`` argument of ``run_moe_w4a16`` and
+# of ``moe_nvfp4_w4a4.run_moe_w4a4``. The gated ones compute ``act(gate) * up``
+# from w13 rows ``[gate; up]`` (2*I rows); ReLU2 reads I rows. The kernels
+# below take two constexprs: ``SWIGLU`` (w13 is gated) and ``GELU_TANH`` (the
+# gate nonlinearity is tanh-GELU rather than SiLU).
+ACTIVATIONS = ("silu", "geglu_tanh", "relu2")
+GATED_ACTIVATIONS = ("silu", "geglu_tanh")
+# tanh-approximated GELU in sigmoid form, 0.5 * (1 + tanh(z)) == sigmoid(2 * z)
+# with z = sqrt(2 / pi) * (g + 0.044715 * g^3): GeGLU-tanh is the SwiGLU
+# expression with a different sigmoid argument.
+GELU_TANH_C1 = 2.0 * math.sqrt(2.0 / math.pi)
+GELU_TANH_C3 = GELU_TANH_C1 * 0.044715
+
+
+def resolve_activation(activation: Optional[str], N13: int, I: int) -> str:
+    """Validate a kernel activation name against the w13 row count.
+
+    ``None`` keeps the inference from the geometry: ``"silu"`` (SwiGLU) when
+    ``N13 == 2 * I``, else ``"relu2"``.
+    """
+    gated = N13 == 2 * I
+    if activation is None:
+        return "silu" if gated else "relu2"
+    if activation not in ACTIVATIONS:
+        raise ValueError(
+            f"SM12x NVFP4 MoE activation must be one of {ACTIVATIONS}, "
+            f"got {activation!r}."
+        )
+    if (activation in GATED_ACTIVATIONS) != gated:
+        rows = "2*I" if activation in GATED_ACTIVATIONS else "I"
+        raise ValueError(
+            f"activation {activation!r} needs w13 with {rows} rows, "
+            f"got {N13} for I={I}."
+        )
+    return activation
+
+
+def _glu(g, u, gelu_tanh):
+    """FP32 ``act(g) * u``: SiLU, or tanh-GELU when ``gelu_tanh`` (a constexpr).
+
+    The SiLU branch is the original SwiGLU expression; tanh-GELU only changes
+    the sigmoid argument (three extra FP32 operations).
+    """
+    s = g
+    if cutlass.const_expr(gelu_tanh):
+        s = g * (
+            cutlass.Float32(GELU_TANH_C1) + cutlass.Float32(GELU_TANH_C3) * (g * g)
+        )
+    return g / (cutlass.Float32(1.0) + cute.math.exp(-s)) * u
+
 
 def _sc_views(gSC, S, BMAX):
     # [stok(S)][be(BMAX)][bm0(BMAX)][bc(BMAX)][nb(1)] inside one int32 allocation
@@ -485,7 +535,7 @@ def k_gemm1(
 
 
 # ======================================================================================
-# activation: a[slot, 0:I] = bf16(SwiGLU / ReLU^2 of h)
+# activation: a[slot, 0:I] = bf16(SwiGLU / GeGLU-tanh / ReLU^2 of h)
 # ======================================================================================
 @cute.kernel
 def k_act(
@@ -495,6 +545,7 @@ def k_act(
     N13: cutlass.Constexpr,
     NEL4: cutlass.Constexpr,
     SWIGLU: cutlass.Constexpr,
+    GELU_TANH: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -524,10 +575,7 @@ def k_act(
                 fu,
             )
             for q in cutlass.range_constexpr(4):
-                g = fg[q]
-                ob[q] = (g / (cutlass.Float32(1.0) + cute.math.exp(-g)) * fu[q]).to(
-                    cutlass.BFloat16
-                )
+                ob[q] = _glu(fg[q], fu[q], GELU_TANH).to(cutlass.BFloat16)
         else:
             for q in cutlass.range_constexpr(4):
                 r = cutlass.max(fg[q], cutlass.Float32(0.0))
@@ -568,6 +616,7 @@ def k_gemm2(
     S: cutlass.Constexpr,
     AFUSE: cutlass.Constexpr,
     SWIG2: cutlass.Constexpr,
+    GELU_TANH: cutlass.Constexpr,
     N13: cutlass.Constexpr,
     DOTC: cutlass.Constexpr = 0,
 ):
@@ -671,7 +720,7 @@ def k_gemm2(
                     row = m0 + cutlass.min(m, mc - 1)
                     sidx = m * KTP + kk + (kk // 32) * 8
                     if cutlass.const_expr(AFUSE):
-                        # SwiGLU / ReLU^2 applied while staging h, so the standalone
+                        # the activation is applied while staging h, so the standalone
                         # activation pass and the bf16 intermediate buffer both disappear
                         hb = cutlass.Int64(row) * cutlass.Int64(N13) + cutlass.Int64(
                             kt + kk
@@ -701,12 +750,9 @@ def k_gemm2(
                                 fu,
                             )
                             for q in cutlass.range_constexpr(8):
-                                g = fg[q]
-                                ab[q] = (
-                                    g
-                                    / (cutlass.Float32(1.0) + cute.math.exp(-g))
-                                    * fu[q]
-                                ).to(cutlass.BFloat16)
+                                ab[q] = _glu(fg[q], fu[q], GELU_TANH).to(
+                                    cutlass.BFloat16
+                                )
                         else:
                             for q in cutlass.range_constexpr(8):
                                 r = cutlass.max(fg[q], cutlass.Float32(0.0))
@@ -844,6 +890,7 @@ def k_fused(
     N13: cutlass.Constexpr,
     E: cutlass.Constexpr,
     SWIGLU: cutlass.Constexpr,
+    GELU_TANH: cutlass.Constexpr,
     CP13: cutlass.Constexpr,
     NSF13: cutlass.Constexpr,
     CP2: cutlass.Constexpr,
@@ -1174,10 +1221,7 @@ def k_fused(
                             fu,
                         )
                         for q in cutlass.range_constexpr(8):
-                            g = fg[q]
-                            ab[q] = (
-                                g / (cutlass.Float32(1.0) + cute.math.exp(-g)) * fu[q]
-                            ).to(cutlass.BFloat16)
+                            ab[q] = _glu(fg[q], fu[q], GELU_TANH).to(cutlass.BFloat16)
                     else:
                         for q in cutlass.range_constexpr(8):
                             rr = cutlass.max(fg[q], cutlass.Float32(0.0))
@@ -1287,6 +1331,7 @@ def moe_jitA(
     N13: cutlass.Constexpr,
     E: cutlass.Constexpr,
     SWIGLU: cutlass.Constexpr,
+    GELU_TANH: cutlass.Constexpr,
     CP13: cutlass.Constexpr,
     NSF13: cutlass.Constexpr,
     CP2: cutlass.Constexpr,
@@ -1335,6 +1380,7 @@ def moe_jitA(
         N13,
         E,
         SWIGLU,
+        GELU_TANH,
         CP13,
         NSF13,
         CP2,
@@ -1397,6 +1443,7 @@ def moe_jit(
     TOPK: cutlass.Constexpr,
     BM: cutlass.Constexpr,
     SWIGLU: cutlass.Constexpr,
+    GELU_TANH: cutlass.Constexpr,
     N13: cutlass.Constexpr,
     CP13: cutlass.Constexpr,
     CP2: cutlass.Constexpr,
@@ -1469,7 +1516,7 @@ def moe_jit(
         smem=BM * KTP1 * 2,
     )
     if cutlass.const_expr(not AFUSE):
-        k_act(gFS, gA, I, N13, NEL4, SWIGLU).launch(
+        k_act(gFS, gA, I, N13, NEL4, SWIGLU, GELU_TANH).launch(
             stream=stream, grid=((NEL4 + RTPB - 1) // RTPB, 1, 1), block=(RTPB, 1, 1)
         )
     k_gemm2(
@@ -1501,6 +1548,7 @@ def moe_jit(
         S,
         AFUSE,
         SWIGLU,
+        GELU_TANH,
         N13,
         DOTC,
     ).launch(
@@ -1640,7 +1688,7 @@ def _planA(H, N13, I, S):
 _COMPILED: dict = {}
 
 
-def _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2):
+def _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2, act):
     """Plan for the single persistent kernel (one routed slot per expert tile)."""
     tiles = _planA(H, N13, I, S)
     if tiles is None:
@@ -1662,6 +1710,7 @@ def _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2):
         N13=N13,
         E=sf13[0],
         SWIGLU=N13 == 2 * I,
+        GELU_TANH=act == "geglu_tanh",
         CP13=sf13[2],
         NSF13=sf13[1] * sf13[2],
         CP2=sf2[2],
@@ -1695,7 +1744,7 @@ def _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2):
     return consts, OOF + T * H, 4 + S + T
 
 
-def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2):
+def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2, act):
     """Plan for the separate routing, GEMM, activation and finalize launches."""
     nblk = min(min(E, S) + (S // BM if BM > 1 else 0), S)
     noroute = BM == 1
@@ -1714,6 +1763,7 @@ def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2):
         TOPK=TOPK,
         BM=BM,
         SWIGLU=N13 == 2 * I,
+        GELU_TANH=act == "geglu_tanh",
         N13=N13,
         CP13=sf13[2],
         CP2=sf2[2],
@@ -1749,20 +1799,24 @@ def _scale_shape(E: int, rows: int, k: int) -> tuple[int, int, int]:
     return (E, (rows + 127) // 128 * 128, ((k // 16) + 3) // 4 * 4)
 
 
-def _entry(T, H, I, N13, E, TOPK, dev):
+def _entry(T, H, I, N13, E, TOPK, dev, activation=None):
+    act = resolve_activation(activation, N13, I)
     sf13 = _scale_shape(E, N13, H)
     sf2 = _scale_shape(E, H, I)
-    key = (dev, T, H, I, N13, E, TOPK)
+    # SwiGLU and GeGLU-tanh share the geometry but not the compiled kernels.
+    key = (dev, T, H, I, N13, E, TOPK, act)
     entry = _COMPILED.get(key)
     if entry is None:
         S = T * TOPK
         BM = _pick_bm(S, E)
         plan = (
-            _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2) if BM == 1 else None
+            _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2, act)
+            if BM == 1
+            else None
         )
         persistent = plan is not None
         if not persistent:
-            plan = _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2)
+            plan = _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2, act)
         consts, fp32_elems, int32_elems = plan
         sizes = (fp32_elems, int32_elems, max(1, S * I))
         entry = [persistent, consts, sizes, None]
@@ -1778,12 +1832,14 @@ def allocate_workspace(
     top_k: int,
     is_gated: bool,
     device: torch.device,
+    activation: Optional[str] = None,
 ) -> list[torch.Tensor]:
     """Scratch for one ``run_moe_w4a16`` token count.
 
     A workspace must not be used by two launches that can run concurrently.
     It is zero-initialized once: the persistent kernel restores its counters
-    and FP32 combine slice to zero on exit.
+    and FP32 combine slice to zero on exit. ``activation`` is as in
+    ``run_moe_w4a16``; the sizes depend only on ``is_gated``.
     """
     N13 = intermediate_size * (2 if is_gated else 1)
     _, _, sizes, _ = _entry(
@@ -1794,6 +1850,7 @@ def allocate_workspace(
         num_experts,
         top_k,
         torch.device(device),
+        activation,
     )
     return [
         torch.zeros(sizes[0], dtype=torch.float32, device=device),
@@ -1815,6 +1872,7 @@ def run_moe_w4a16(
     w2_gs: torch.Tensor,
     out: torch.Tensor,
     workspace: Optional[list[torch.Tensor]] = None,
+    activation: Optional[str] = None,
 ) -> torch.Tensor:
     """Routed-expert W4A16 MoE forward into ``out``.
 
@@ -1823,18 +1881,21 @@ def run_moe_w4a16(
         topk_ids: int32 ``[T, TOPK]`` expert ids; slots with an id outside
             ``[0, E)`` contribute nothing.
         topk_weights: FP32 ``[T, TOPK]`` router weights.
-        w13: uint8 ``[E, N13, H/2]``; ``N13 == 2*I`` is SwiGLU with gate rows
-            first, ``N13 == I`` is ReLU2.
+        w13: uint8 ``[E, N13, H/2]``; ``N13 == 2*I`` is a gated activation
+            (SwiGLU or GeGLU-tanh) with gate rows first, ``N13 == I`` is ReLU2.
         w13_sf: E4M3 ``[E, pad128(N13), pad4(H/16)]`` 128x4-swizzled scales.
         w13_gs: FP32 ``[E]`` global scales.
         w2, w2_sf, w2_gs: the same for the ``[E, H, I/2]`` down projection.
         out: BF16 ``[T, H]`` output.
         workspace: from ``allocate_workspace`` for this token count; a fresh
             one is allocated when omitted.
+        activation: ``"silu"`` (SwiGLU) or ``"geglu_tanh"`` (tanh-GELU GLU),
+            both with ``N13 == 2*I``, or ``"relu2"`` with ``N13 == I``;
+            ``None`` infers ``"silu"`` / ``"relu2"`` from ``N13``.
 
-    Kernels are specialized and cached per token count and weight geometry;
-    the first call for a new shape compiles and must not run under CUDA graph
-    capture.
+    Kernels are specialized and cached per token count, weight geometry and
+    activation; the first call for a new shape compiles and must not run under
+    CUDA graph capture.
     """
     T, H = hidden_states.shape
     E, N13, _ = w13.shape
@@ -1845,14 +1906,14 @@ def run_moe_w4a16(
         w2_sf.shape
     ):
         raise ValueError("w13_sf / w2_sf must be [E, pad128(rows), pad4(K/16)].")
-    entry = _entry(T, H, I, N13, E, TOPK, dev)
+    entry = _entry(T, H, I, N13, E, TOPK, dev, activation)
     persistent, consts, sizes, compiled = entry
     if compiled is None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "SM12x W4A16 MoE must be compiled for this shape before graph capture."
         )
     if workspace is None:
-        workspace = allocate_workspace(T, H, I, E, TOPK, N13 == 2 * I, dev)
+        workspace = allocate_workspace(T, H, I, E, TOPK, N13 == 2 * I, dev, activation)
     elif tuple(t.numel() for t in workspace) != sizes:
         raise ValueError("workspace was allocated for a different shape.")
     scratch = workspace

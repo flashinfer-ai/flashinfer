@@ -16,17 +16,17 @@
 
 Weights are read in place from the canonical NVFP4 storage shared with the
 W4A16 kernels in ``moe_nvfp4_w4a16``: packed E2M1 nibbles (``[gate; up]`` rows
-for SwiGLU), 128x4-swizzled E4M3 block scales and a per-expert FP32 global
-scale. Nothing is repacked.
+for the gated activations SwiGLU and GeGLU-tanh), 128x4-swizzled E4M3 block
+scales and a per-expert FP32 global scale. Nothing is repacked.
 
 All launches run on the caller's stream without host synchronization:
 
 1. route: histogram, scan and scatter of (token, expert) pairs into expert-major
    order plus the ragged M-tile work list of both grouped GEMMs; the other CTAs
    quantize ``hidden_states`` to NVFP4 once per token and zero the output;
-2. GEMM1: grouped NVFP4 x NVFP4 tensor-core GEMM (K = H); for SwiGLU the
-   activation and the NVFP4 quantization of the intermediate are fused into its
-   epilogue;
+2. GEMM1: grouped NVFP4 x NVFP4 tensor-core GEMM (K = H); for the gated
+   activations the activation and the NVFP4 quantization of the intermediate
+   are fused into its epilogue;
 3. ReLU2 only: activation and NVFP4 quantization of the intermediate;
 4. GEMM2: grouped NVFP4 x NVFP4 GEMM (K = I, N = H) whose router-weighted BF16
    partials are reduced into the output.
@@ -50,6 +50,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.experimental import primitives as prims
 
+from .moe_nvfp4_w4a16 import GELU_TANH_C1, GELU_TANH_C3, resolve_activation
+
 FP4 = cutlass.Float4E2M1FN
 E4M3 = cutlass.Float8E4M3FN
 F32 = cutlass.Float32
@@ -62,6 +64,18 @@ U32 = cutlass.Uint32
 BN = 128
 NTHR = 256
 NTR = 256
+
+
+def _glu(g, u, gelu_tanh):
+    """FP32 ``act(g) * u``: SiLU, or tanh-GELU when ``gelu_tanh`` (trace time).
+
+    The SiLU branch is the original SwiGLU expression; tanh-GELU only changes
+    the sigmoid argument (see ``moe_nvfp4_w4a16.GELU_TANH_C1``).
+    """
+    s = g
+    if cutlass.const_expr(gelu_tanh):
+        s = g * (F32(GELU_TANH_C1) + F32(GELU_TANH_C3) * (g * g))
+    return (g / (cute.exp(-s) + F32(1.0))) * u
 
 
 _PTX_F4X8 = (
@@ -134,7 +148,10 @@ def _sf_mma_layout(rows, TK, stages):
     )
 
 
-def _build(T, H, I, N13, E, TOPK, swiglu):
+def _build(T, H, I, N13, E, TOPK, swiglu, gelu_tanh):
+    # swiglu: w13 is gated ([gate; up], SwiGLU or GeGLU-tanh) and act(gate) * up
+    # is fused into GEMM1's epilogue; gelu_tanh: the gate nonlinearity is
+    # tanh-GELU rather than SiLU.
     P = T * TOPK
     # Rows per expert average P/E (about 20 for a 1024-token prefill with 512
     # experts and top-10), so a 32-row M tile keeps one tile per expert (identical weight traffic) while halving
@@ -396,8 +413,7 @@ def _build(T, H, I, N13, E, TOPK, swiglu):
                     cute.make_tensor(mH.iterator + (base + I), cute.make_layout(32)), ru
                 )
                 for j in cutlass.range_constexpr(32):
-                    x = v[j]
-                    v[j] = ((x / (cute.exp(-x) + F32(1.0))) * ru[j]).to(BF16).to(F32)
+                    v[j] = _glu(v[j], ru[j], gelu_tanh).to(BF16).to(F32)
             else:
                 for j in cutlass.range_constexpr(32):
                     x = cute.arch.fmax(v[j], F32(0.0))
@@ -978,10 +994,13 @@ def _build(T, H, I, N13, E, TOPK, swiglu):
                     MN = BN // 32
                     VM = (BM * BN // NTHR) // MN
                     cute.arch.sync_threads()
+                    # Fragment values [0, 2*VM) are the 64 gate columns of this
+                    # N tile and [2*VM, 4*VM) the matching up columns (B rows
+                    # n0.. and I+n0.. stacked into one 128-row tile).
                     for i in cutlass.range_constexpr(2 * VM):
                         gv = acc[i] * scale
                         uv = acc[i + 2 * VM] * scale
-                        av = (gv / (cute.exp(-gv) + F32(1.0))) * uv
+                        av = _glu(gv, uv, gelu_tanh)
                         sEp[idt[i][0], idt[i][1]] = av.to(BF16)
                     cute.arch.sync_threads()
                     mq = tid // 4
@@ -1162,13 +1181,16 @@ def _check_shape(H: int, I: int, N13: int) -> None:
         )
 
 
-def _entry(T, H, I, N13, E, TOPK, dev):
+def _entry(T, H, I, N13, E, TOPK, dev, activation=None):
     _check_shape(H, I, N13)
-    key = (dev, T, H, I, N13, E, TOPK)
+    act = resolve_activation(activation, N13, I)
+    # SwiGLU and GeGLU-tanh share the geometry (N13 == 2*I) and the workspace
+    # shapes but not the GEMM1 epilogue, so the activation is part of the key.
+    key = (dev, T, H, I, N13, E, TOPK, act)
     entry = _COMPILED.get(key)
     if entry is None:
         swiglu = N13 == 2 * I
-        prog, meta = _build(T, H, I, N13, E, TOPK, swiglu)
+        prog, meta = _build(T, H, I, N13, E, TOPK, swiglu, act == "geglu_tanh")
         P, PA, WMAX = meta["P"], meta["PA"], meta["WMAX"]
         shapes = (
             ((P,), torch.int32),  # token of each expert-major pair
@@ -1194,11 +1216,13 @@ def allocate_workspace(
     top_k: int,
     is_gated: bool,
     device: torch.device,
+    activation: Optional[str] = None,
 ) -> list[torch.Tensor]:
     """Scratch for one ``run_moe_w4a4`` token count.
 
     Every byte is rewritten from the inputs on each call, but a workspace must
-    not be used by two launches that can run concurrently.
+    not be used by two launches that can run concurrently. ``activation`` is
+    as in ``run_moe_w4a4``; the shapes depend only on ``is_gated``.
     """
     N13 = intermediate_size * (2 if is_gated else 1)
     _, shapes, _ = _entry(
@@ -1209,6 +1233,7 @@ def allocate_workspace(
         num_experts,
         top_k,
         torch.device(device),
+        activation,
     )
     return [torch.empty(shape, dtype=dtype, device=device) for shape, dtype in shapes]
 
@@ -1228,6 +1253,7 @@ def run_moe_w4a4(
     a2_gs: torch.Tensor,
     out: torch.Tensor,
     workspace: Optional[list[torch.Tensor]] = None,
+    activation: Optional[str] = None,
 ) -> torch.Tensor:
     """Routed-expert W4A4 MoE forward into ``out``.
 
@@ -1236,8 +1262,8 @@ def run_moe_w4a4(
         topk_ids: int32 ``[T, TOPK]`` expert ids; slots with an id outside
             ``[0, E)`` contribute nothing.
         topk_weights: FP32 ``[T, TOPK]`` router weights.
-        w13: uint8 ``[E, N13, H/2]``; ``N13 == 2*I`` is SwiGLU with gate rows
-            first, ``N13 == I`` is ReLU2.
+        w13: uint8 ``[E, N13, H/2]``; ``N13 == 2*I`` is a gated activation
+            (SwiGLU or GeGLU-tanh) with gate rows first, ``N13 == I`` is ReLU2.
         w13_sf: E4M3 ``[E, pad128(N13), pad4(H/16)]`` 128x4-swizzled scales.
         w13_gs: FP32 ``[E]`` global scales.
         w2, w2_sf, w2_gs: the same for the ``[E, H, I/2]`` down projection.
@@ -1247,10 +1273,13 @@ def run_moe_w4a4(
         out: BF16 ``[T, H]`` output; overwritten.
         workspace: from ``allocate_workspace`` for this token count; a fresh
             one is allocated when omitted.
+        activation: ``"silu"`` (SwiGLU) or ``"geglu_tanh"`` (tanh-GELU GLU),
+            both with ``N13 == 2*I``, or ``"relu2"`` with ``N13 == I``;
+            ``None`` infers ``"silu"`` / ``"relu2"`` from ``N13``.
 
     Requires ``H % 128 == 0`` and ``I % 64 == 0``. Kernels are specialized and
-    cached per token count and geometry; the first call for a new shape
-    compiles and must not run under CUDA graph capture.
+    cached per token count, geometry and activation; the first call for a new
+    shape compiles and must not run under CUDA graph capture.
     """
     T, H = hidden_states.shape
     E, N13, _ = w13.shape
@@ -1262,14 +1291,14 @@ def run_moe_w4a4(
         w2_sf.shape
     ) != (E, pad(H, 128), pad(I // 16, 4)):
         raise ValueError("w13_sf / w2_sf must be [E, pad128(rows), pad4(K/16)].")
-    entry = _entry(T, H, I, N13, E, TOPK, dev)
+    entry = _entry(T, H, I, N13, E, TOPK, dev, activation)
     prog, shapes, compiled = entry
     if compiled is None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "SM12x W4A4 MoE must be compiled for this shape before graph capture."
         )
     if workspace is None:
-        workspace = allocate_workspace(T, H, I, E, TOPK, N13 == 2 * I, dev)
+        workspace = allocate_workspace(T, H, I, E, TOPK, N13 == 2 * I, dev, activation)
     elif [tuple(t.shape) for t in workspace] != [s for s, _ in shapes]:
         raise ValueError("workspace was allocated for a different shape.")
     pt, pw, wk, mt, aq1, sf1, hb, aq2, sf2 = workspace
