@@ -294,8 +294,15 @@ for the MX path.
 | Other MXFP4/MXFP8 SwiGLU models | Route addressing, fused activation/quantization, PDL, weight preparation | Qualify the checkpoint's scale conventions, activation parameters and workload |
 | SiTU activation | Route schedule, weight loads and Down dependency | Implement and validate its distinct activation arithmetic |
 | NVFP4 | Route schedule and dependency design | Group-16 E4M3 scales, global scales, FP4 activation quantization and MMA layout |
-| BF16 | Route schedule and fusion boundaries | A non-blockscaled MMA implementation and a new resource configuration |
+| BF16 | Shared FFMA device bodies, route schedule and fusion boundaries | Qualify runtime bindings, activation parameters and rounding; a TC path also needs non-blockscaled MMA |
 | More token rows | API and correctness contract | Expert reuse/grouping; the current per-route schedule can lose to native |
+
+The shared BF16 FFMA kernels widen expert indices before stride multiplication.
+Device-body regressions use actual 32-GiB-plus FC1 and 16-GiB-plus FC2 weight
+tables and replay changing expert IDs and inputs. The old FC1 indexing wrapped
+to expert zero in this test. This fixes the shared implementation's addressing;
+it does not add BF16 admission to `FrostLowLatencyConfig` or change legacy
+activation and combine rounding.
 
 For concrete shape candidates, the published
 [Qwen3-235B-A22B configuration](https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json)

@@ -430,6 +430,74 @@ def test_frost_fma_large_expert_weight_offsets(weight_format):
             _assert_near(output, expected)
 
 
+@pytest.mark.parametrize("stage", ["fc1", "fc2"])
+def test_shared_bf16_fma_large_expert_weight_offsets(stage):
+    """Exercise shared device bodies without admitting a new public dtype."""
+    _require_gpu()
+    if torch.cuda.mem_get_info()[0] < 60 * 1024**3:
+        pytest.skip("BF16 expert-offset regression requires 60 GiB free memory")
+    from cutlass import cute
+    from cutlass.cute.runtime import from_dlpack
+    from cuda.bindings import driver
+    from flashinfer.fused_moe.backends.frost_low_latency.fma.bf16.fma_fc1 import (
+        _kernel as fc1,
+    )
+    from flashinfer.fused_moe.backends.frost_low_latency.fma.bf16.fma_fc2 import (
+        _kernel as fc2,
+    )
+
+    @cute.jit
+    def first(x, w, ids, mid, stream):
+        fc1(x, w, ids, mid, 2, "swiglu", True).launch(
+            grid=(cute.size(mid) // 16, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    @cute.jit
+    def second(mid, w, ids, scores, out, stream):
+        fc2(mid, w, ids, scores, out).launch(
+            grid=(cute.size(out) // 4, 1, 1), block=(32, 1, 1), stream=stream
+        )
+
+    e, h, i = 513, 4096, 4096
+    ids = torch.full((1, 1), e - 1, device="cuda", dtype=torch.int32)
+    x = torch.ones((1, h), device="cuda", dtype=torch.bfloat16)
+    shape = (e, 2 * i, h) if stage == "fc1" else (e, h, i)
+    w = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    w[-1].fill_(1 / h)
+    assert (e - 1) * w[0].numel() // 4 >= 2**31
+    out = torch.empty_like(x)
+    scores = torch.ones((1, 1), device="cuda")
+    tensors = (x, w, ids, out) if stage == "fc1" else (x, w, ids, scores, out)
+    args = tuple(from_dlpack(v) for v in tensors)
+    major, minor = torch.cuda.get_device_capability()
+    compiled = cute.compile(
+        first if stage == "fc1" else second,
+        *args,
+        driver.CUstream(torch.cuda.current_stream().cuda_stream),
+        options=f"--gpu-arch sm_{major}{minor}a",
+    )
+
+    def run():
+        compiled(*args, driver.CUstream(torch.cuda.current_stream().cuda_stream))
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for expert, scale in ((e - 1, 1), (0, 1), (e - 1, 2)):
+        ids.fill_(expert)
+        x.fill_(scale)
+        graph.replay()
+        expected = torch.tensor(float(scale), dtype=torch.float64)
+        if stage == "fc1":
+            expected = expected * torch.nn.functional.silu(expected)
+        if expert == 0:
+            expected.zero_()
+        torch.testing.assert_close(
+            out, torch.full_like(out, expected.item()), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("installed", ["4.7.1", "4.8.0.dev0", None])
 def test_frost_declines_unsupported_compiler(monkeypatch, installed):
     from flashinfer.fused_moe.backends.frost_low_latency import runner as module

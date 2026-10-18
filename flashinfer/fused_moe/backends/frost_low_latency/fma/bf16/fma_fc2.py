@@ -44,7 +44,8 @@ def _kernel(
     token = bid // (h // 4)
     row = (bid % (h // 4)) * 4
     route = token * k + slot
-    expert = ids[token, slot]
+    # Large expert tables can exceed signed 32-bit word indexing.
+    expert = ids[token, slot].to(cutlass.Int64)
     acc = cute.make_rmem_tensor((4, 4), cutlass.Float32)
     acc.fill(0.0)
     shared = utils.SmemAllocator().allocate_tensor(

@@ -43,7 +43,8 @@ def _kernel(
     tiles = i // (8 * outputs)
     route = bid // tiles
     row = (bid % tiles) * 8 * outputs + warp * outputs
-    expert = ids[route // k, route % k]
+    # Widen before forming the expert stride in 64-bit weight words.
+    expert = ids[route // k, route % k].to(cutlass.Int64)
     up = cute.make_rmem_tensor((4, outputs), cutlass.Float32)
     branches = 2 if gated else 1
     gate = cute.make_rmem_tensor((4, outputs), cutlass.Float32)
