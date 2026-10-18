@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -19,6 +20,11 @@ from pathlib import Path
 import pytest
 
 from flashinfer.jit import cake_gdn as cake_gdn
+
+# The -D knobs a record passes when it shares its body with a schedule twin
+# (its kernel symbol and the constant its deleted clone body baked in); the
+# resolver key (``specializations``) does not carry them.
+_BODY_SHARING_DEFINES = {"CAKE_GDN_KERNEL_SYMBOL", "LAUNCH_MIN_BLOCKS", "T_STEPS"}
 
 
 def _prefill(**overrides):
@@ -64,7 +70,8 @@ def _decode(**overrides):
 def test_manifest_lists_loadable_source_only_variants() -> None:
     # The manifest is the only registry: every variant names one kernel source
     # (shared with the other specializations of the same body), the -D defines
-    # that specialize it, and one host shim.  Nothing is pinned by checksum.
+    # that specialize it, and its host-shim template.  Nothing is pinned by
+    # checksum.
     manifest = cake_gdn._manifest()
     root = cake_gdn._source_dir()
     variants = manifest["variants"]
@@ -74,8 +81,12 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
     assert manifest["binary_artifacts"] is False
     assert "sha256" not in json.dumps(manifest)
     architectures = set(manifest["architectures"])
+    # Every shared header's sha256 enters every variant's compile-cache digest,
+    # so the manifest lists only headers that a listed kernel body includes.
+    header_names = {Path(header["path"]).name for header in manifest["cuda_headers"]}
     for header in manifest["cuda_headers"]:
         assert (root / header["path"]).is_file()
+    included_headers: set[str] = set()
     for record in variants:
         # One body per architecture: a kernel whose lowering differs on one
         # architecture (the sm_107a F64-free q scale) carries that architecture
@@ -85,13 +96,70 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
             assert output["architectures"]
             assert set(output["architectures"]) <= architectures
             assert (root / output["path"]).is_file()
+            source = (root / output["path"]).read_text(encoding="utf-8")
+            included_headers.update(
+                name for name in header_names if f'#include "{name}"' in source
+            )
             served.extend(output["architectures"])
         assert sorted(served) == sorted(record["architectures"])
-        assert (root / record["host_binding"]["path"]).is_file()
-        for key, value in record["defines"].items():
+        assert (root / record["host_binding"]["template"]).is_file()
+        # A record spells out ``defines`` only where its -D flags are not its
+        # specializations (see test_manifest_defines_default_to_specializations).
+        for key, value in record.get("defines", {}).items():
             assert key.isidentifier()
             assert isinstance(value, str) and value
-        assert set(record["defines"]) <= set(record["specializations"])
+        # A record sharing its body with a schedule twin passes the knobs
+        # its own text used to bake in on the compile line; those are not
+        # specializations of the resolver key.
+        extra_defines = set(record.get("defines", {})) - set(record["specializations"])
+        assert extra_defines <= _BODY_SHARING_DEFINES
+    assert included_headers == header_names
+
+
+def test_host_shims_render_to_the_former_per_variant_text() -> None:
+    # Every variant's host shim is rendered from a class template under
+    # host/templates/; the sidecar pins the rendered text to the sha256 of the
+    # per-variant shim file it replaced.  A record that shares its body with a
+    # schedule twin passes its shim's kernel symbol as CAKE_GDN_KERNEL_SYMBOL.
+    pinned_path = Path(__file__).with_name("cake_gdn_host_shim_sha256.json")
+    pinned = json.loads(pinned_path.read_text(encoding="utf-8"))
+    variants = cake_gdn._manifest()["variants"]
+    assert sorted(pinned) == sorted(record["name"] for record in variants)
+    for record in variants:
+        host = record["host_binding"]
+        text = cake_gdn.render_cake_gdn_host_shim(record)
+        assert "@" not in text, record["name"]
+        assert f"TVM_FFI_EMBED_CUBIN({host['module_ident']});" in text
+        assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({host['entry']}, " in text
+        assert f'"{host["cuda_symbol"]}"' in text
+        defines = record.get("defines", {})
+        if "CAKE_GDN_KERNEL_SYMBOL" in defines:
+            assert defines["CAKE_GDN_KERNEL_SYMBOL"] == host["cuda_symbol"]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        assert digest == pinned[record["name"]], record["name"]
+
+
+def test_manifest_defines_default_to_specializations() -> None:
+    # The -D flags of a record are its specializations unless it spells out
+    # ``defines``: the decode bodies that bake their constants in-file take
+    # none, and some bodies take only a subset of the specialization keys.  A
+    # record never repeats its specializations as ``defines``.
+    variants = cake_gdn._manifest()["variants"]
+    explicit = 0
+    for record in variants:
+        flags = cake_gdn._define_flags(record)
+        from_specializations = tuple(
+            f"-D{key}={value}" for key, value in record["specializations"].items()
+        )
+        if "defines" in record:
+            explicit += 1
+            assert flags == tuple(
+                f"-D{key}={value}" for key, value in record["defines"].items()
+            )
+            assert flags != from_specializations
+        else:
+            assert flags == from_specializations
+    assert 0 < explicit < len(variants)
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
@@ -1184,8 +1252,9 @@ def test_prefill_schedule_attr_pins_the_sm100a_late_state_inp_twin_names() -> No
             assert base.startswith("flashinfer_blackwell_gdn_prefill_dvsplit")
             assert twin == f"{base}_sm100a_state_inp_late"
     # The rule never fires for sm_103a / sm_107a, f16 I/O, single-chunk or indexed-state routes.
-    # Hq16/Hv32 (Qwen3.5-35B TP1): the FP32-state DV-split record that lists all three
-    # architectures; the FP32-state TP2/TP4/TP8 records ship for sm_100a / sm_103a only.
+    # Hq16/Hv32 (Qwen3.5-35B TP1): the FP32-state DV-split base record lists sm_103a
+    # and sm_107a; the FP32-state TP2/TP4/TP8 base records list sm_103a only (sm_100a
+    # runs the late-state-input twins, which are the only records listing it).
     for arch in ("sm_103a", "sm_107a"):
         assert (
             "state_inp_late"
