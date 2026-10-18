@@ -217,7 +217,9 @@ def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
-    options = tuple(record.get("compile_options", ()))
+    """``nvcc`` options of the variant: ``--use_fast_math`` and its ``-D`` flags."""
+
+    options = tuple(record.get("compile_options", ("--use_fast_math",)))
     unsupported_options = set(options) - {"--use_fast_math"}
     if unsupported_options:
         raise RuntimeError(
