@@ -4805,7 +4805,7 @@ def test_source_program_table_names_shipped_sources():
     assert set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if not name.startswith("exact_")
     }
-    assert len(module._SM107_MODULES) == 54
+    assert len(module._SM107_MODULES) == 45
     for name, own in module._SM107_MODULES.items():
         if name.startswith("exactone_"):
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
@@ -5018,10 +5018,9 @@ def test_source_program_table_names_shipped_sources():
     # look-back (``chunkpar``) and six three-phase (``chunkpar3``)
     # chunk-parallel main sources plus the segment preprocess and the
     # packed-varlen metadata kernel; plus one sm_107a (Rubin) render per
-    # filled ``_SM107_MODULES`` identity (42 once the export has filled the
-    # table: the six ``exactfused`` varlen entries and the six ``exactmeta``
-    # entries share the ``exactone`` files), no other architecture copies and
-    # no orphans.
+    # filled ``_SM107_MODULES`` identity (an ``exactmeta`` entry shares its
+    # ``exactfused`` varlen twin's file; the nine retired programs have no
+    # sm_107a entry either), no other architecture copies and no orphans.
     rubin_sources = {
         identity
         for identity in module._SM107_MODULES.values()
