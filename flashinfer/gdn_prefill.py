@@ -674,8 +674,10 @@ def chunk_gated_delta_rule(
         Keys of shape ``[total_seq_len, num_k_heads, head_size]``.  Must be
         contiguous and on CUDA.
     v : torch.Tensor
-        Values of shape ``[total_seq_len, num_v_heads, head_size]``.  Must
-        be contiguous and on CUDA.
+        Values of shape ``[total_seq_len, num_v_heads, head_size_v]``.  Must
+        be contiguous and on CUDA.  ``head_size_v`` must not exceed
+        ``head_size``; ``head_size_v < head_size`` (a rectangular state) is
+        implemented by the SM90 and SM100 chunked kernels only.
     g : torch.Tensor, optional
         Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]``
         where ``num_sab_heads = max(num_q_heads, num_v_heads)``.  Must be
@@ -688,11 +690,11 @@ def chunk_gated_delta_rule(
         ``1 / sqrt(head_size)`` when ``None``.
     initial_state : torch.Tensor, optional
         Initial KV state. Packed, sequence-ordered shape
-        ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
+        ``[num_seqs, num_sab_heads, head_size_v, head_size]``.  Must be
         float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
         when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
-        head_size, head_size]`` and sequence ``i`` reads its initial state
+        head_size_v, head_size]`` and sequence ``i`` reads its initial state
         from row ``state_indices[i]``; on SM100/SM103 every rank-4 positive,
         non-overlapping stride layout is accepted.
     output_final_state : bool
@@ -708,12 +710,12 @@ def chunk_gated_delta_rule(
         dtype before the chunked kernel. Default: ``False``.
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape
-        ``[total_seq_len, num_o_heads, head_size]`` where ``num_o_heads =
+        ``[total_seq_len, num_o_heads, head_size_v]`` where ``num_o_heads =
         max(num_q_heads, num_v_heads)``.  Allocated automatically when
         ``None``.
     output_state : torch.Tensor, optional
         Pre-allocated output state tensor. Packed, sequence-ordered shape
-        ``[num_seqs, num_sab_heads, head_size, head_size]``. May be float32,
+        ``[num_seqs, num_sab_heads, head_size_v, head_size]``. May be float32,
         bfloat16, float16, float8_e4m3fn, or float8_e5m2. Required when
         ``output_final_state=True``.  When ``state_indices`` is given it is
         instead the output state **pool** ``[N_pool, ...]`` and sequence
@@ -725,7 +727,7 @@ def chunk_gated_delta_rule(
         layouts as ``initial_state``.
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
-        num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
+        num_sab_heads, head_size_v, head_size]``. May be float32, bfloat16,
         float16, float8_e4m3fn, or float8_e5m2. Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
         currently supported on SM90, SM100, and SM120.
@@ -792,9 +794,9 @@ def chunk_gated_delta_rule(
     -------
     torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
         When ``output_final_state=False``, the output tensor of shape
-        ``[total_seq_len, num_o_heads, head_size]``.  Otherwise a tuple
+        ``[total_seq_len, num_o_heads, head_size_v]``.  Otherwise a tuple
         ``(output, final_state)`` where ``final_state`` has shape
-        ``[num_seqs, num_sab_heads, head_size, head_size]`` — or, when
+        ``[num_seqs, num_sab_heads, head_size_v, head_size]`` — or, when
         ``state_indices`` is given, the state pool ``[N_pool, ...]`` itself
         (i.e. ``output_state``), whose rows named by ``state_indices`` now
         hold the updated final states.
@@ -875,7 +877,8 @@ def chunk_gated_delta_rule(
     num_v_heads = v.size(1)
     head_size = q.size(2)
     # Rectangular state: the value and output head dim may be narrower than the
-    # key one. Only the SM100 kernel implements head_size_v < head_size.
+    # key one. Only the SM90 and SM100 chunked kernels implement
+    # head_size_v < head_size; CP and SM120 reject it below.
     head_size_v = v.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
@@ -928,7 +931,7 @@ def chunk_gated_delta_rule(
         if state_checkpoints.ndim != 4:
             raise ValueError(
                 f"state_checkpoints must be 4D "
-                f"[total_checkpoints, num_sab_heads, head_size, head_size], "
+                f"[total_checkpoints, num_sab_heads, head_size_v, head_size], "
                 f"got {state_checkpoints.ndim}D"
             )
         if not is_integer_dtype(checkpoint_cu_starts.dtype):
@@ -1082,7 +1085,7 @@ def chunk_gated_delta_rule(
         else:
             if output_final_state and output_state is None:
                 output_state = torch.empty(
-                    (num_seqs, num_sab_heads, head_size, head_size),
+                    (num_seqs, num_sab_heads, head_size_v, head_size),
                     dtype=torch.float32,
                     device=device,
                 )
@@ -1197,13 +1200,15 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm100 is None:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
-        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
-        assert head_size in (64, 128), (
-            f"Blackwell GDN prefill requires head_size=64 or 128, got {head_size}"
-        )
-        assert head_size_v in (64, 128), (
-            f"Blackwell GDN prefill requires head_size_v=64 or 128, got {head_size_v}"
-        )
+        # Blackwell SM100 and SM103 path (CuTe DSL kernel). With the
+        # head_size_v <= head_size check above this admits exactly (128, 128),
+        # (128, 64) and (64, 64). A raise, not an assert: nothing else guards
+        # this path, and asserts vanish under python -O.
+        if head_size not in (64, 128) or head_size_v not in (64, 128):
+            raise NotImplementedError(
+                "Blackwell GDN prefill requires head_size and head_size_v of 64 "
+                f"or 128, got head_size={head_size}, head_size_v={head_size_v}"
+            )
 
         # Allocate output_state only when needed
         if not output_final_state:
@@ -1261,7 +1266,7 @@ def chunk_gated_delta_rule(
             output_state_shape = (
                 initial_state.shape
                 if state_indices is not None and initial_state is not None
-                else (num_seqs, num_sab_heads, head_size, head_size)
+                else (num_seqs, num_sab_heads, head_size_v, head_size)
             )
             output_state = torch.empty(
                 output_state_shape, dtype=torch.float32, device=device
