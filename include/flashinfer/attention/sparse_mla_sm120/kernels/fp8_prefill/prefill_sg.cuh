@@ -32,6 +32,7 @@
 #include "../../arch/mma_sm120.cuh"
 #include "../../common/d2_load_b.cuh"
 #include "../../common/lse.cuh"
+#include "../../common/nvfp4_to_fp8.cuh"
 #include "../../compute/online_softmax.cuh"
 #include "../../compute/q_rope.cuh"
 #include "../../compute/q_stage.cuh"
@@ -579,7 +580,13 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
   auto sm = SmemPtrs<MT, QkMode, Cfg::BI, Cfg::MATH_WARPS>::init(smem_raw);
 
   if (threadIdx.x == 0) {
-    flashinfer::sparse_mla_sm120::pipeline::BulkReady::init_slots<2>(sm.mbar_kv);
+    if constexpr (MT == ModelType::GLM_NSA_NVFP4) {
+      flashinfer::sparse_mla_sm120::pipeline::CountedHandoff<Cfg::IO_THREADS>::template init_slots<
+          2>(sm.mbar_kv);
+      BulkReady::init_slots<2>(reinterpret_cast<uint64_t*>(smem_raw + L::OFF_MBAR_RAW));
+    } else {
+      BulkReady::init_slots<2>(sm.mbar_kv);
+    }
     if constexpr (GatherSchedule::RAW_PIPELINE)
       flashinfer::sparse_mla_sm120::pipeline::BulkReady::init_slots<2>(
           GatherSchedule::ready(smem_raw + L::TOTAL));
@@ -605,7 +612,8 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
   // ── IO warps ────────────────────────────────────────────────────
   if (warp_rank >= Cfg::MATH_WARPS) {
     if constexpr (Cfg::REG_REALLOC) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(32));
+      asm volatile(
+          "setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(MT == ModelType::GLM_NSA_NVFP4 ? 48 : 32));
     }
 
     const int io_tid = threadIdx.x - Cfg::MATH_THREADS;
@@ -645,6 +653,20 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // the bulk completion event.
     auto issue_tile = [&](int t, int staged) {
       const int buf = t & 1;
+      if constexpr (MT == ModelType::GLM_NSA_NVFP4) {
+        uint64_t* raw = reinterpret_cast<uint64_t*>(smem_raw + L::OFF_MBAR_RAW);
+        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
+            sm.kv_buf(buf), staged, KV_cache, raw + buf, io_tid, kv_stride_bytes, kv_l2_policy, pg);
+        BulkReady::wait(raw + buf, (t >> 1) & 1);
+        asm volatile("" ::: "memory");
+        expand_nvfp4_kv_tile<MT, Cfg::BI, Cfg::IO_THREADS>(sm.kv_buf(buf), io_tid,
+                                                           cold.kv_global_scale);
+        bar_sync_t<4, Cfg::IO_THREADS>();
+        asm volatile("" ::: "memory");
+        flashinfer::sparse_mla_sm120::pipeline::CountedHandoff<Cfg::IO_THREADS>::publish(
+            sm.mbar_kv + buf);
+        return;
+      }
       io_gather_scales<MT, PAGE_BLOCK_SIZE, Cfg::BI, Cfg::IO_THREADS>(
           sm.kv_scale_buf(buf), staged, KV_cache, io_tid, kv_stride_bytes, pg);
       __threadfence_block();
@@ -677,7 +699,8 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // ── Math warps ──────────────────────────────────────────────────
   } else {
     if constexpr (Cfg::REG_REALLOC) {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(Cfg::MATH_MAXNREG));
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(
+          MT == ModelType::GLM_NSA_NVFP4 ? 224 : Cfg::MATH_MAXNREG));
     }
 
     if constexpr (Cfg::SPLIT_QK_XV) {
@@ -895,7 +918,40 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       {
         const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
-        if constexpr (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32) {
+        if constexpr (MT == ModelType::GLM_NSA_NVFP4) {
+          static_assert(CT::N_V_CHUNKS == 1 && !Cfg::SPLIT_QK_XV);
+          float* vc_sc = sm.w_head_sc_all;
+          float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+          float wn00 = w0 * vsc_cache[0][0] * si0;
+          float wn01 = w1 * vsc_cache[0][1] * si0;
+          float wn10 = w2 * vsc_cache[0][0] * si1;
+          float wn11 = w3 * vsc_cache[0][1] * si1;
+#pragma unroll
+          for (int wpass = 0; wpass < 2; ++wpass) {
+            uint8_t* wfp8 = sm.w_fp8 + wpass * L::SMEM_W_FP8_ONE;
+            Fp8WeightQuad wq =
+                quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+            wfp8[gid * CT::W_FP8_STRIDE + e0i] = wq.h0_e0;
+            wfp8[gid * CT::W_FP8_STRIDE + e1i] = wq.h0_e1;
+            wfp8[(gid + 8) * CT::W_FP8_STRIDE + e0i] = wq.h1_e0;
+            wfp8[(gid + 8) * CT::W_FP8_STRIDE + e1i] = wq.h1_e1;
+          }
+          bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
+
+#pragma unroll
+          for (int nt = 0; nt < CT::NT_PER_WARP_XV; ++nt) {
+            float xv[4] = {};
+            const int dim = mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+#pragma unroll
+            for (int pass = 0; pass < 2; ++pass)
+              pv_fp8_d2_16x8<KV::KV_SMEM_STRIDE, CT::W_FP8_STRIDE, CT::XV_KSTEPS>(
+                  xv, sm.w_fp8 + pass * L::SMEM_W_FP8_ONE, kv_smem, dim, lane);
+            acc_o[nt][0] += xv[0] * vc_sc[gid];
+            acc_o[nt][1] += xv[1] * vc_sc[gid];
+            acc_o[nt][2] += xv[2] * vc_sc[gid + 8];
+            acc_o[nt][3] += xv[3] * vc_sc[gid + 8];
+          }
+        } else if constexpr (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32) {
           // This variant interleaves W quantization with the MMA across two
           // passes, so the register-dependent and smem-only halves cannot be
           // separated — every math warp must own candidates.
