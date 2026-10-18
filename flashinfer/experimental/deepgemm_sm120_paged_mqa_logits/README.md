@@ -281,13 +281,11 @@ selects from the second table (16384), and `selection_long["h<H>:n<N>"]`, the
 same shape as `selection`, used when the hint is at least that bound and
 differing from `selection` in batch class 1 only), `max_batch` (the scheduler's shared-memory request
 ceiling), `logits_stride_alignment` (`[128, 256]`), `clean_logits` (`"raw"`),
-`metadata_program`, `metadata_route`, `threads` and per-program `programs`
-records keyed `h<H>:p<P>:n<N>:a<A>` (`atom_variant`, `atom_tokens`,
-`next_n_atom`, `num_atoms`, `last_atom_tokens`, `num_q_stages`, `hoist_b`,
-tile size, group count, KV stages, shared-memory bytes). A program record
-carries `kind` (`"module"` or `"sequence"`), `role`, `sources`, `standalone`,
-`compile_flags`, `ffi_entry`, `arg_plan` and the per-architecture
-`closure_sha256`. Every route record has `stages` (`[[stage, program], ...]`),
-`sequence` (the prepared-sequence binding, `null` for the metadata route),
-`kernel_launches`, `num_heads`, `page_kv`, `next_n`, `next_n_atom`,
-`atom_variant` and `clean_logits`.
+`metadata_route` and `threads`. `programs` holds the standalone scheduler module
+and one prepared-sequence record per logits route; a record carries `kind`
+(`"module"` or `"sequence"`), `role`, `sources` (a sequence lists the scheduler
+kernel, its logits kernel and its own binding), `standalone`, `compile_flags`,
+`ffi_entry` and `arg_plan`. A logits route record has `sequence` (the
+prepared-sequence binding), `kernel_launches` (2), `num_heads`, `page_kv`,
+`next_n`, `next_n_atom`, `atom_variant` and `clean_logits`; the metadata route
+has `stages` (`[["metadata", program]]`) and `sequence: null`.

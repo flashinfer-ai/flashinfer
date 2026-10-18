@@ -806,11 +806,6 @@ class Sm120PagedIndexerPlan:
             num_heads, page_kv, next_n, batch, logits_dtype, max_context_hint
         )
         self.route = _catalog()["routes"][self.route_name]
-        stages = list(self.route["stages"])
-        if [stage for stage, _program in stages] != ["metadata", "logits"]:
-            raise ValueError(
-                f"route {self.route_name} must be the ordered (metadata, logits) pair, catalog has {stages}"
-            )
         bindings = {
             "metadata": metadata_bindings(
                 context_lens,

@@ -647,16 +647,16 @@ def test_sm120_paged_host_helpers_and_rejections():
                 record["next_n"],
                 _batch_of_variant(record["num_heads"], record["next_n"], name),
             )
-    # Every logits route is the ordered (metadata, logits) pair behind one
-    # prepared sequence; the metadata route is the standalone scheduler.
+    # Every logits route is one prepared sequence (the scheduler then the logits
+    # program, two kernel launches); the metadata route is the standalone
+    # scheduler stage.
     metadata_route = _runtime.metadata_route_name()
     for name, record in catalog["routes"].items():
-        stages = [stage for stage, _program in record["stages"]]
         if name == metadata_route:
+            stages = [stage for stage, _program in record["stages"]]
             assert stages == ["metadata"] and not record["sequence"]
         else:
-            assert stages == ["metadata", "logits"] and record["sequence"]
-            assert record["kernel_launches"] == 2
+            assert record["sequence"] and record["kernel_launches"] == 2
     # The Q-atom rule is catalog data over (heads, next_n, batch class).  Table
     # check: every (heads, next_n, class) resolves to the catalog's variant and
     # atom count, and the head-count-free form resolves exactly where the

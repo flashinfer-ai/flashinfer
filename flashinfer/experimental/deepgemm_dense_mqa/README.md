@@ -145,7 +145,7 @@ programs keep 256 -- each route record refines it per architecture, see below), 
 query-block ceilings of the 32-head metadata programs, named per head count by their token ceiling, so the
 32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tier names `le8 / le64 / le1024 / any`
 are aliases -- the 64-head routes have no metadata stage and no query bound),
-the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, -- v9 -- the FP8
+the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv`, -- v9 -- the FP8
 in-kernel scan classes `fused_scan_ceilings` (`[32, 768]` query blocks) with one KV bound each
 (`fused_scan32_max_kv`, `fused_scan768_max_kv`) and the `fp4` block (`fused_q1_max_kv`, `fused_scan_ceilings`
 `[32, 1024]`, `fused_scan32_max_kv`, `fused_scan1024_max_kv`) that bound the single-launch 32-head routes, -- v10 --
@@ -168,9 +168,10 @@ the static program instead of the static route itself -- `paged:fp8:h64:p64:n2:h
 must know every key); `sched_state`: per such route `{base_words, words_per_sm, max_sms}`, the scheduler-state words its program
 binds -- `base_words + words_per_sm * num_sms` with `num_sms <= max_sms`; routes absent keep the `u32[2]` state), and -- v7 -- `dense_short` (`max_kv` 256, `min_q_blocks` 2, `fallback`
 `"tier"`: the shape-only gate of the 64-head one-split `:short` routes and where a withheld one is served). Every route record
-has `stages` (`[[stage, {arch: program}], ...]`: the program the stage launches on each catalogued architecture --
-the names coincide where the architectures share one text and differ where the production text is chosen per
-architecture, as for the 64-head tier and `q1` routes since v8 -- their `:short` routes share one text), `sequence` (a prepared sequence binding or `null`),
+has `stages` (`[[stage, program], ...]`: the program the stage launches -- one name where the architectures share
+one text, a `{arch: program}` map where the production text is chosen per architecture, as for the 64-head tier and
+`q1` routes since v8 -- their `:short` routes share one text; the FP4 two-stage routes list no stages, their prepared
+sequence launches both kernels), `sequence` (a prepared sequence binding or `null`),
 `num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
 `clean_logits=False` semantics, the 64-head and paged programs), `kv_alignment` (-- v10 -- a map `{arch: 256 | 1}`:
@@ -179,7 +180,7 @@ K per architecture where the producer measured it, so the same route may read 1 
 `route_kv_alignment(route, arch)`, `dense_route_available(..., arch=)`) and `kv_min` (-- v10 -- the smallest KV length the
 route's programs accept: 256 where the KV boxes are fitted to one 256-row block, the shipped two-stage 32-head programs and
 the v9 scan classes; 1 where they may extend past the tensor, the fused `fp8:qle128:short` / `fp8:qle2048:short` and the
-64-head programs; `null` on paged routes).
+64-head programs). A paged route record carries `stages` and `sequence` only; its geometry is the route name.
 Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
 `fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` writing the tiered schedule in-kernel for
 `1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the

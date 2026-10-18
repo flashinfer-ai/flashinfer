@@ -106,15 +106,27 @@ def _nvcc_flags(arch):
 
 
 def stage_program(stage, arch):
-    """The program one route stage launches on ``arch``; ``stage`` is one ``[name, {arch: program}]`` entry
-    of a route record's ``stages`` (the catalog binds a stage's program per architecture)."""
+    """The program one route stage launches on ``arch``; ``stage`` is one ``[name, program]`` entry of a route
+    record's ``stages`` -- a plain program name where the architectures share one text, a ``{arch: program}``
+    map where the production text is chosen per architecture."""
     name, by_arch = stage
+    if isinstance(by_arch, str):
+        return by_arch
     try:
         return by_arch[arch]
     except KeyError:
         raise RuntimeError(
             f"route stage {name} has no program for {arch}; catalogued architectures: {sorted(by_arch)}"
         ) from None
+
+
+def stage_programs(stage, arches):
+    """``{arch: program}`` of one route stage: the record's own map, or -- for a stage that names one
+    program -- that program on every architecture in ``arches``."""
+    _name, by_arch = stage
+    if isinstance(by_arch, str):
+        return dict.fromkeys(arches, by_arch)
+    return dict(by_arch)
 
 
 def program_names(route=None, arch=None):
@@ -125,8 +137,13 @@ def program_names(route=None, arch=None):
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
     if arch is None:
-        stages = record["stages"]
-        names = sorted({p for _stage, by_arch in stages for p in by_arch.values()})
+        names = sorted(
+            {
+                program
+                for stage in record["stages"]
+                for program in stage_programs(stage, catalog["arches"]).values()
+            }
+        )
     else:
         names = [stage_program(stage, arch) for stage in record["stages"]]
     if record.get("sequence"):
@@ -134,28 +151,17 @@ def program_names(route=None, arch=None):
     return names
 
 
-def program_definitions(record, num_sms):
-    """Compile-line definitions of a program record: ``SM_COUNT`` is the launch grid of the logits
-    consumers (the SM count, or a plan's CTA-budget override)."""
-    values = {"SM_COUNT": int(num_sms)}
-    unknown = sorted(set(record["definitions"]) - set(values))
-    if unknown:
-        raise RuntimeError(
-            f"catalog program requires definitions this runtime cannot supply: {unknown}"
-        )
-    return {name: values[name] for name in record["definitions"]}
-
-
 def program_spec(arch, name, num_sms):
     """FlashInfer JIT build specification of one generated program for ``arch`` and the launch grid ``num_sms``
-    (a compile-line definition of every program; the name carries every supplied value)."""
+    (the compile-line definition ``SM_COUNT`` of every program -- the SM count, or a plan's CTA-budget
+    override; the name carries every supplied value)."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
     record = _catalog()["programs"][name]
     if arch not in record["arches"]:
         raise RuntimeError(f"program {name} is not exported for {arch}")
-    definitions = program_definitions(record, num_sms)
+    definitions = {"SM_COUNT": int(num_sms)}
     suffix = "".join(
         f"_{key.lower()}{value}" for key, value in sorted(definitions.items())
     )

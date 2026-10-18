@@ -607,11 +607,8 @@ def test_dense_mqa_sm_count_definition(sm_count):
     )
     assert plan.route_name == "fp8:q1:short"
     assert plan.num_sms == sm_count
-    program = dict(plan.route["stages"])["logits"][arch]
+    program = _runtime.stage_program(plan.route["stages"][0], arch)
     assert plan.program_names == [program]
-    record = _runtime._catalog()["programs"][program]
-    assert record["definitions"] == ["SM_COUNT"]
-    assert _runtime.program_definitions(record, sm_count) == {"SM_COUNT": sm_count}
     assert _runtime.program_spec(arch, program, sm_count).name.endswith(
         f"_sm_count{sm_count}"
     )
@@ -1102,7 +1099,7 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
 def test_catalog_programs_are_delivered_and_distinct():
     """Host-only: every program a dense or paged route names is catalogued on exactly the architectures
     the route is delivered on, its generated units exist under FlashInfer's ``csrc`` (a module: its own
-    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 module kernels + its own binding),
+    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 kernels + its own binding),
     no two generated kernel units are byte-identical and no generated unit is unreferenced -- a route
     table pointing at a program hash whose units were regenerated under a new hash fails here, not at
     JIT build time."""
@@ -1127,7 +1124,8 @@ def test_catalog_programs_are_delivered_and_distinct():
     for table in ("routes", "paged_routes"):
         for route, record in catalog.get(table, {}).items():
             expected = sorted(text_route_arches.get(route, catalog["arches"]))
-            for _stage, by_arch in record["stages"]:
+            for stage in record["stages"]:
+                by_arch = _runtime.stage_programs(stage, catalog["arches"])
                 where = (table, route, by_arch, expected)
                 assert sorted(by_arch) == expected, where
                 for arch, program in by_arch.items():
@@ -1144,11 +1142,6 @@ def test_catalog_programs_are_delivered_and_distinct():
             assert source.startswith("csrc/"), (name, source)
             assert (csrc / source.removeprefix("csrc/")).is_file(), (name, source)
             referenced.add(source)
-        if record.get(
-            "standalone", True
-        ):  # an omitted-binding module carries no closure digest
-            for arch in record["arches"]:
-                assert arch in (record.get("closure_sha256") or {}), (name, arch)
         if record["kind"] == "module":
             expected = {f"{generated}/{name}_kernel.cu"}
             if record["standalone"]:
@@ -1163,8 +1156,7 @@ def test_catalog_programs_are_delivered_and_distinct():
                 and f"{generated}/{name}_binding.cu" in record["sources"]
             ), name
             for device in devices:
-                owner = device.rsplit("/", 1)[1].removesuffix("_kernel.cu")
-                assert programs.get(owner, {}).get("kind") == "module", (name, device)
+                kernels.setdefault(device, name)
     digests = {}
     for source, name in sorted(kernels.items()):
         digest = hashlib.sha256(
@@ -1386,9 +1378,11 @@ def test_dense_bindings_cover_every_program_argument():
         else:
             # Every program a stage launches on any architecture binds the same way.
             selections = [
-                (stage, program)
-                for stage, by_arch in record["stages"]
-                for program in sorted(set(by_arch.values()))
+                (stage[0], program)
+                for stage in record["stages"]
+                for program in sorted(
+                    set(_runtime.stage_programs(stage, catalog["arches"]).values())
+                )
             ]
         for stage, program in selections:
             missing = []

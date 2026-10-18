@@ -379,7 +379,7 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
     _check(plan.logical_output, ref, ctx_2d, max_len, plan.output)
     assert plan.launch_count == 1 and plan.program_names == [
-        plan.route["stages"][0][1][plan.arch]
+        _runtime.stage_program(plan.route["stages"][0], plan.arch)
     ]
     # One-shot entries on the same operands: identical bits. The metadata entry is a no-launch
     # placeholder of the DeepGEMM signature (zeros of the CTA-budget shape).
@@ -604,7 +604,10 @@ def test_paged_bindings_cover_every_program_argument():
     the launch grid (an earlier export left it unbound); no program binds a schedule buffer."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
-    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import (
+        _catalog,
+        stage_programs,
+    )
 
     catalog = _catalog()
     device = torch.device("cuda")
@@ -644,9 +647,11 @@ def test_paged_bindings_cover_every_program_argument():
         }
         assert [stage for stage, _programs in route["stages"]] == ["logits"], route_name
         for stage, program in (
-            (stage, program)
-            for stage, by_arch in route["stages"]
-            for program in sorted(set(by_arch.values()))
+            (stage[0], program)
+            for stage in route["stages"]
+            for program in sorted(
+                set(stage_programs(stage, catalog["arches"]).values())
+            )
         ):
             arg_plan = catalog["programs"][program]["arg_plan"]
             missing = [name for _kind, name in arg_plan if name not in bindings[stage]]
@@ -665,7 +670,10 @@ def test_paged_dynamic_scheduler_routes():
     catalog with one logits stage whose programs differ; ``paged_route_name(..., batch=)`` selects the dynamic
     route up to ``max_batch`` and the static route above it (and without a batch); every program of a dynamic
     route binds the scheduler state ``sched_counters``."""
-    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import (
+        _catalog,
+        stage_programs,
+    )
 
     catalog = _catalog()
     dynamic = _runtime.paged_dynamic_scheduler()
@@ -676,8 +684,12 @@ def test_paged_dynamic_scheduler_routes():
         assert static in catalog["paged_routes"] and dyn in catalog["paged_routes"]
         assert dyn == f"{static}:dyn"
         for arch in sorted(catalog["arches"]):
-            static_program = catalog["paged_routes"][static]["stages"][0][1][arch]
-            dyn_program = catalog["paged_routes"][dyn]["stages"][0][1][arch]
+            static_program = _runtime.stage_program(
+                catalog["paged_routes"][static]["stages"][0], arch
+            )
+            dyn_program = _runtime.stage_program(
+                catalog["paged_routes"][dyn]["stages"][0], arch
+            )
             # Program ids are content hashes of the generated text: the two routes serve distinct programs on
             # every architecture, and only the dynamic one binds the scheduler state.
             assert dyn_program != static_program, (static, arch)
@@ -729,7 +741,9 @@ def test_paged_dynamic_scheduler_routes():
                     route,
                     window,
                 )
-                programs = catalog["paged_routes"][route]["stages"][0][1]
+                programs = stage_programs(
+                    catalog["paged_routes"][route]["stages"][0], catalog["arches"]
+                )
                 assert arch in programs, (route, arch)
                 for other in catalog["arches"]:
                     named = any(
@@ -741,10 +755,13 @@ def test_paged_dynamic_scheduler_routes():
                     )
                     assert (other in programs) == named, (route, other)
                 program = programs[arch]
-                static_program = catalog["paged_routes"][static]["stages"][0][1][arch]
-                dyn_program = catalog["paged_routes"][dynamic["routes"][static]][
-                    "stages"
-                ][0][1][arch]
+                static_program = _runtime.stage_program(
+                    catalog["paged_routes"][static]["stages"][0], arch
+                )
+                dyn_program = _runtime.stage_program(
+                    catalog["paged_routes"][dynamic["routes"][static]]["stages"][0],
+                    arch,
+                )
                 assert program not in (static_program, dyn_program), route
                 assert "sched_counters" in {
                     name for _kind, name in catalog["programs"][program]["arg_plan"]
