@@ -135,6 +135,12 @@ candidate requires I divisible by 128, prepare both views from the same
 explicitly zero-padded canonical weights and use that padded I in their shared
 config. A FROST-only configuration can retain the smaller logical I.
 
+Selection is cached by token bucket, routing input mode and eligible candidates.
+Changing expert IDs within that bucket does not automatically select a new
+backend. Warm up with representative expert reuse and cache conditions; the
+benchmark's condition-specific sweeps do not imply a distribution-aware
+dispatcher on every decode step.
+
 The compile cache stores executable metadata. `pack_inputs` owns each call's
 scratch tensors, and execution binds current pointers and stream. The packed
 routing contract rounds weights to BF16; the unpacked contract preserves BF16
@@ -186,6 +192,35 @@ against the reference. The JSON records candidate timings in `cache_tuning`.
 Freeze the selected tactics with the flags below for independent normal and
 reverse-order measurements. This enumerates the runner's exposed candidates,
 not every configuration its underlying kernel could theoretically implement.
+For factorized backends such as CUTLASS and cuDNN grouped GEMM, enumeration
+must run inside `autotune(True)` to obtain the stage-ranked candidate pairs;
+outside tuning mode their inner tuner returns only a cached or default pair.
+Optional `--include-cutlass` and `--include-prims-ts` add the corresponding
+original MX backends. `--include-cudnn-grouped` adds the cuDNN grouped-GEMM
+backend for `--weight-format mxfp8 --activation-limit 0`; its default SwiGLU
+contract cannot replace a clamped-SwiGLU comparison. Requested backends must
+pass their architecture, dependency and numerical checks; they are not silently
+omitted. `--include-native-default` measures the default of every included
+original backend. Pin their measured winners with `--cutlass-tactic`,
+`--prims-ts-tactic` or `--cudnn-grouped-tactic`, alongside the existing TRT/CuTe
+flags. These options expand reproducible baseline coverage; the tables below
+retain their explicitly named original-backend sets.
+When a tactic is pinned, initial preparation avoids a redundant full autotune;
+the default and requested configuration are still initialized before capture.
+`--retune-cache` explicitly requests the candidate sweep even if pins are given.
+
+Ordinary MX SwiGLU in CUTLASS and cuDNN grouped GEMM rounds GEMM1 and
+post-activation values to BF16 before intermediate MXFP8 quantization; the
+low-latency paths keep FP32 through that quantizer input. By default, all
+included backends must pass the same TRT-LLM comparison. To study the former
+contracts, explicitly add `--backend-references`: the benchmark computes their
+BF16-intermediate references outside timed regions, using the same 1% relative
+L2 and 3% normalized-max limits, and records disagreement with TRT separately.
+The JSON labels these comparisons as different intermediate rounding. Compare
+their absolute kernel times with that qualification; they are not interchangeable
+Frost autotuning tactics. Changing-input graph and post-timing checks use each
+backend's declared reference, including its default-tactic control.
+
 It includes scale conversion and combine. By default the precomputed routing
 weights are FP32; use `--routing-weights-dtype bf16` to measure a producer that
 already emits BF16 weights. Removing a conversion helps only when that

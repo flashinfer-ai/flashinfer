@@ -21,7 +21,10 @@ from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     BackendOptions,
+    CudnnGroupedGemmMxfp8Config,
     CuteDslConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
     ExecutionConfig,
     ExpertConfig,
     FrostLowLatencyConfig,
@@ -29,6 +32,7 @@ from flashinfer.fused_moe import (
     MoEConfig,
     MoELayer,
     MoEWeightPack,
+    PrimsTsConfig,
     QuantConfig,
     QuantFormat,
     RoutingConfig,
@@ -36,6 +40,68 @@ from flashinfer.fused_moe import (
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
 )
+
+
+def _decode_mx(payload, scales):
+    if payload.dtype == torch.uint8:
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=payload.device,
+            dtype=torch.float64,
+        )
+        values = torch.stack(
+            (lut[(payload & 15).long()], lut[(payload >> 4).long()]), dim=-1
+        ).reshape(*payload.shape[:-1], -1)
+    else:
+        values = payload.double()
+    return (
+        values.reshape(*values.shape[:-1], -1, 32)
+        * torch.exp2(scales.view(torch.uint8).double() - 127)[..., None]
+    ).reshape(values.shape)
+
+
+def _bf16_intermediate_reference(q, sf, w1, s1, w2, s2, ids, scores, activation):
+    """Model CUTLASS/cuDNN grouped MX SwiGLU rounding outside timed regions.
+
+    Both write BF16 GEMM1 and activation values before MXFP8 quantization.
+    FP64 dots and ordered FP32 combine provide a tolerance-based reference;
+    they do not model the native reduction order bit for bit.
+    """
+    x = _decode_mx(q, sf)
+    result = torch.zeros_like(x, dtype=torch.float32)
+    for token in range(ids.shape[0]):
+        for slot, expert in enumerate(ids[token].tolist()):
+            gu = (
+                (x[token] @ _decode_mx(w1[expert], s1[expert]).T)
+                .float()
+                .bfloat16()
+                .float()
+            )
+            up, gate = gu.chunk(2)
+            gate = gate.clamp_max(activation.limit)
+            up = up.clamp(-activation.limit, activation.limit)
+            mid = (
+                (
+                    gate
+                    / (1 + torch.exp(-gate * activation.alpha))
+                    * (up + activation.beta)
+                )
+                .bfloat16()
+                .float()
+                .reshape(-1, 32)
+            )
+            exponent = torch.ceil(
+                torch.log2(
+                    mid.abs().amax(-1).clamp_min(torch.finfo(torch.float32).tiny) / 448
+                )
+            ).clamp(-127, 127)
+            scale = torch.exp2(exponent)[..., None]
+            dq = ((mid / scale).to(torch.float8_e4m3fn).float() * scale).flatten()
+            down = (
+                (dq.double() @ _decode_mx(w2[expert], s2[expert]).T).bfloat16().float()
+            )
+            result[token] = result[token] + down * scores[token, slot].float()
+    return result.bfloat16().double()
 
 
 def main():
@@ -76,7 +142,19 @@ def main():
     )
     parser.add_argument("--reverse", action="store_true")
     parser.add_argument("--include-cutedsl", action="store_true")
+    parser.add_argument("--include-cutlass", action="store_true")
+    parser.add_argument("--include-prims-ts", action="store_true")
+    parser.add_argument(
+        "--include-cudnn-grouped",
+        action="store_true",
+        help="Include cuDNN grouped GEMM (MXFP8 weights, default SwiGLU only)",
+    )
     parser.add_argument("--include-native-default", action="store_true")
+    parser.add_argument(
+        "--backend-references",
+        action="store_true",
+        help="Validate CUTLASS/cuDNN grouped against their BF16 intermediate contract; record disagreement with TRT separately",
+    )
     parser.add_argument(
         "--include-frost-tactics",
         action="store_true",
@@ -86,6 +164,11 @@ def main():
         "--trtllm-tactic", help="Pin a previously measured tactic tuple"
     )
     parser.add_argument("--cute-tactic", help="Pin a previously measured tactic tuple")
+    parser.add_argument("--cutlass-tactic", help="Pin a measured CUTLASS tactic")
+    parser.add_argument("--prims-ts-tactic", help="Pin a measured Prims-TS tactic")
+    parser.add_argument(
+        "--cudnn-grouped-tactic", help="Pin a measured cuDNN grouped-GEMM tactic"
+    )
     frost = parser.add_mutually_exclusive_group()
     frost.add_argument("--frost-tile-k", type=int, choices=(128, 256))
     frost.add_argument(
@@ -93,8 +176,25 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     a = parser.parse_args()
+    requested_tactics = {
+        "trtllm": a.trtllm_tactic,
+        "cute_dsl": a.cute_tactic,
+        "cutlass": a.cutlass_tactic,
+        "prims_ts": a.prims_ts_tactic,
+        "cudnn_grouped": a.cudnn_grouped_tactic,
+        "frost": ("ffma", 1) if a.frost_ffma else a.frost_tile_k,
+    }
     if a.cache_mode == "cold" and a.timing_mode == "amortized":
         raise ValueError("Cold-cache measurement requires timing-mode latency")
+    if a.include_cutedsl and a.weight_format != "mxfp4":
+        raise ValueError("--include-cutedsl requires --weight-format mxfp4")
+    if a.include_cudnn_grouped and (
+        a.weight_format != "mxfp8" or a.activation_limit != 0
+    ):
+        raise ValueError(
+            "--include-cudnn-grouped requires --weight-format mxfp8 "
+            "and --activation-limit 0; clamped SwiGLU is not the same operation."
+        )
     if (
         a.include_cutedsl
         and a.weight_format == "mxfp4"
@@ -175,26 +275,48 @@ def main():
     backends = [("trtllm", native_config())]
     if a.include_cutedsl and weight_format == QuantFormat.MXFP4:
         backends.append(("cute_dsl", CuteDslConfig()))
+    if a.include_cutlass:
+        cutlass_config = (
+            CutlassMxfp8Mxfp4Config
+            if weight_format == QuantFormat.MXFP4
+            else CutlassMxfp8Config
+        )
+        backends.append(("cutlass", cutlass_config()))
+    if a.include_prims_ts:
+        backends.append(("prims_ts", PrimsTsConfig()))
+    if a.include_cudnn_grouped:
+        backends.append(("cudnn_grouped", CudnnGroupedGemmMxfp8Config()))
+    weight_keys = {
+        "trtllm": (
+            "trtllm_fp4_routed"
+            if weight_format == QuantFormat.MXFP4
+            else "trtllm_fp8_block"
+        ),
+        "cute_dsl": "cute_dsl",
+        "cutlass": (
+            "cutlass_mxfp8_mxfp4"
+            if weight_format == QuantFormat.MXFP4
+            else "cutlass_mxfp8"
+        ),
+        "prims_ts": "prims_ts",
+        "cudnn_grouped": "cudnn_grouped_gemm_mxfp8",
+    }
     for name, backend in backends:
-        key = (
-            (
-                "trtllm_fp4_routed"
-                if weight_format == QuantFormat.MXFP4
-                else "trtllm_fp8_block"
-            )
-            if name == "trtllm"
-            else name
+        # CUTLASS and cuDNN config classes each describe one quant pair; their
+        # preparation methods therefore do not accept a separate quant config.
+        quant_kwargs = (
+            {"quant": quant} if name in ("trtllm", "cute_dsl", "prims_ts") else {}
         )
         weights.prepare_for(
-            key,
+            weight_keys[name],
             backend.prepare_weights(
                 w1,
                 w2,
-                quant=quant,
                 num_local_experts=e,
                 hidden_size=h,
                 intermediate_size=i,
                 activation=activation,
+                **quant_kwargs,
             ),
         )
     backends.append(("frost", FrostLowLatencyConfig(max_num_tokens=8)))
@@ -272,9 +394,28 @@ def main():
             execution=ExecutionConfig(tune_max_num_tokens=t),
         )
         layer = MoELayer(cfg)
-        with autotune(True):
+        # A frozen-tactic validation must not recompile/tune the entire space.
+        # The initial default call still establishes the normal runner binding;
+        # the requested tactic is applied before capture below.
+        with autotune(a.retune_cache or requested_tactics.get(name) is None):
             layer(act, weights)
         layers[name] = layer
+
+    def backend_references():
+        references = {}
+        if a.backend_references:
+            for name in ("cutlass", "cudnn_grouped"):
+                if name not in layers:
+                    continue
+                # This benchmark constructs a PackedPrecomputed activation
+                # pack. Both adapters narrow these routing scores to BF16.
+                scores = rw.bfloat16()
+                references[name] = _bf16_intermediate_reference(
+                    q, sf, q1, s1, q2, s2, ids, scores, activation
+                )
+        return references
+
+    references = backend_references()
     cache_tuning = {}
     if a.retune_cache:
         ref = layers["trtllm"](act, weights).double()
@@ -282,17 +423,18 @@ def main():
         for name, layer in layers.items():
             assert len(layer._winners) == 1, "Expected one exact input geometry"
             key, (runner, selected) = next(iter(layer._winners.items()))
-            candidates = list(
-                dict.fromkeys(
-                    [
-                        selected,
-                        -1,
-                        *runner.get_valid_tactics(
-                            runner.pack_inputs(act, weights), None
-                        ),
-                    ]
+            # Factorized backends rank each GEMM inside get_valid_tactics.
+            # Outside tuning mode they return only a cached/default pair.
+            with autotune(True):
+                valid_tactics = runner.get_valid_tactics(
+                    runner.pack_inputs(act, weights), None
                 )
-            )
+            # Prims-TS tactics contain lists; preserve their original types.
+            candidates = []
+            for tactic in [selected, -1, *valid_tactics]:
+                if tactic not in candidates:
+                    candidates.append(tactic)
+            check_ref = references.get(name, ref)
             ranked = []
             for tactic in candidates:
                 layer._winners[key] = (runner, tactic)
@@ -300,9 +442,9 @@ def main():
                 graph, intervals, output = capture_timing(layer)
                 graph.replay()
                 values = [sample(graph, intervals) for _ in range(5)]
-                diff = output.double() - ref
-                l2 = float(diff.norm() / ref.norm())
-                mx = float(diff.abs().max() / ref.abs().max())
+                diff = output.double() - check_ref
+                l2 = float(diff.norm() / check_ref.norm())
+                mx = float(diff.abs().max() / check_ref.abs().max())
                 assert torch.isfinite(output).all() and l2 < 0.01 and mx < 0.03, (
                     name,
                     tactic,
@@ -322,12 +464,15 @@ def main():
     if a.include_native_default:
         # A fresh layer may still hit the process-wide autotune cache. Pin -1
         # explicitly to test the native heuristic through the same public call.
-        default_layer = MoELayer(layers["trtllm"].config)
-        default_layer(act, weights)
-        for key, (runner, _) in list(default_layer._winners.items()):
-            default_layer._winners[key] = (runner, -1)
-        default_layer(act, weights)
-        layers["trtllm_default"] = default_layer
+        for name in tuple(layers):
+            if name == "frost":
+                continue
+            default_layer = MoELayer(layers[name].config)
+            default_layer(act, weights)
+            for key, (runner, _) in list(default_layer._winners.items()):
+                default_layer._winners[key] = (runner, -1)
+            default_layer(act, weights)
+            layers[name + "_default"] = default_layer
     if a.include_frost_tactics:
         for name, tactic in (
             ("frost_tc128", 128),
@@ -343,11 +488,7 @@ def main():
                 layer._winners[key] = (runner, tactic)
             layer(act, weights)
             layers[name] = layer
-    for name, requested in (
-        ("trtllm", a.trtllm_tactic),
-        ("cute_dsl", a.cute_tactic),
-        ("frost", ("ffma", 1) if a.frost_ffma else a.frost_tile_k),
-    ):
+    for name, requested in requested_tactics.items():
         if requested is None:
             continue
         if name not in layers:
@@ -367,7 +508,7 @@ def main():
             outputs[name] = layer(act, weights)
         graphs[name] = graph
     assert len({out.data_ptr() for out in outputs.values()}) == len(outputs)
-    checks, reference_norms = [], []
+    checks, reference_norms, cross_reference_checks = [], [], []
     previous_reference = None
     for step in range(6):
         x = (torch.randn(t, h, device="cuda") * (0.01, 1.0, 3.0)[step % 3]).bfloat16()
@@ -388,11 +529,26 @@ def main():
             )
         previous_reference = ref.clone()
         reference_norms.append(norm)
+        references = backend_references()
+        cross_reference_checks.append(
+            {
+                name: dict(
+                    relative_l2=float(
+                        (outputs[name].double() - ref).norm() / ref.norm()
+                    ),
+                    normalized_max=float(
+                        (outputs[name].double() - ref).abs().max() / ref.abs().max()
+                    ),
+                )
+                for name in references
+            }
+        )
         metrics = {}
         for name, out in outputs.items():
-            diff = out.double() - ref
-            l2 = float(diff.norm() / ref.norm().clamp_min(1e-30))
-            mx = float(diff.abs().max() / ref.abs().max().clamp_min(1e-30))
+            check_ref = references.get(name.removesuffix("_default"), ref)
+            diff = out.double() - check_ref
+            l2 = float(diff.norm() / check_ref.norm().clamp_min(1e-30))
+            mx = float(diff.abs().max() / check_ref.abs().max().clamp_min(1e-30))
             assert torch.isfinite(out).all() and l2 < 0.01 and mx < 0.03, (
                 name,
                 step,
@@ -425,9 +581,10 @@ def main():
             samples[name].append(row)
     post_timing_checks = {}
     for name, out in timing_outputs.items():
-        diff = out.double() - ref
-        l2 = float(diff.norm() / ref.norm().clamp_min(1e-30))
-        mx = float(diff.abs().max() / ref.abs().max().clamp_min(1e-30))
+        check_ref = references.get(name.removesuffix("_default"), ref)
+        diff = out.double() - check_ref
+        l2 = float(diff.norm() / check_ref.norm().clamp_min(1e-30))
+        mx = float(diff.abs().max() / check_ref.abs().max().clamp_min(1e-30))
         assert torch.isfinite(out).all() and l2 < 0.01 and mx < 0.03, (name, l2, mx)
         post_timing_checks[name] = dict(relative_l2=l2, normalized_max=mx)
     medians = {
@@ -436,6 +593,11 @@ def main():
     best_original = min(
         (name for name in medians if not name.startswith("frost")), key=medians.get
     )
+    cudnn_backend_version = None
+    if a.include_cudnn_grouped:
+        import cudnn
+
+        cudnn_backend_version = cudnn.backend_version()
     result = dict(
         args={**vars(a), "output": str(a.output)},
         gpu=torch.cuda.get_device_name(),
@@ -444,12 +606,27 @@ def main():
         flashinfer=flashinfer.__version__,
         flashinfer_base_commit=flashinfer.__git_commit__,
         cuda=torch.version.cuda,
+        cudnn_backend_version=cudnn_backend_version,
         scope=f"{a.cache_mode} CUDA-Graph public routed-MoE {a.timing_mode} GPU time. Includes adapters and combine; excludes cache eviction, input quantization, routing selection, shared experts, communication, attention and serving.",
         cache_eviction_bytes=flush.numel() if flush is not None else 0,
         l2_bytes=l2_bytes,
         distinct_experts=unique_experts,
         expert_reuse=t * k / unique_experts,
         cache_tuning=cache_tuning,
+        numerical_references={
+            name: (
+                "BF16 GEMM1 and activation before MXFP8; BF16 expert output; ordered FP32 combine reference"
+                if name.removesuffix("_default") in references
+                else "TRT-LLM output"
+            )
+            for name in layers
+        },
+        comparison_scope=(
+            "Different intermediate rounding: absolute kernel latency comparison, not interchangeable numerical contracts."
+            if references
+            else "Cross-backend outputs checked against TRT-LLM with unchanged tolerances."
+        ),
+        cross_reference_checks=cross_reference_checks,
         quant=f"{weight_format.name} weights / MXFP8 activations / BF16 output",
         checks=checks,
         post_timing_checks=post_timing_checks,
