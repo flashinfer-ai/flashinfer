@@ -363,7 +363,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0",
       "kind": "sequence",
@@ -478,15 +479,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=4"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_1898b94a8466fd77e45c",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_981f32d1339649953441_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_1898b94a8466fd77e45c_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -593,15 +595,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_255f1462006e65d5bc73",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_9c38a9fc2258fab81517_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_255f1462006e65d5bc73_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_8855d5e0ab804616a3d0_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -823,15 +826,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=3"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_36a1938625d68329ab91",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f226809c7eb14d82590f_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_36a1938625d68329ab91_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -938,15 +943,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_3b0b9cb3d990043cf58e",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_de4c4dab3c64e1081042_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_3b0b9cb3d990043cf58e_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_e7d6f4b1aa3768885743_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1053,15 +1059,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=6"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_3c3c9d5d200214010b02",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_6d434c007d52a2d48dc4_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_3c3c9d5d200214010b02_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1168,15 +1176,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=5"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_499b8f66bab82c047c43",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_e45fed87591d52bf2023_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_499b8f66bab82c047c43_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1283,15 +1292,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=6"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_5d0b4c0e859bbf7b7261",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f1f65bb5c88948f7ad6a_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_5d0b4c0e859bbf7b7261_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1398,15 +1409,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=5"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_601c3e046a836742eea7",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_a30073f58f9216dce21c_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_601c3e046a836742eea7_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1513,7 +1525,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001",
       "kind": "sequence",
@@ -1628,15 +1641,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_6f9829ec75257d994654",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_92d2350398167818a833_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_6f9829ec75257d994654_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_aac105fc5eb587e97c96_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1858,15 +1872,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=4"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_7690df62a6e1d64458eb",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4299a4cc747e7b2e43e3_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_7690df62a6e1d64458eb_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -1973,15 +1989,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=5"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_9228798cfefc7d3002ef",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_914d22a1a6471c5ead33_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_9228798cfefc7d3002ef_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2088,15 +2106,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_a0583be4cd06f2395bbb",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_e366fc94e6cbc5bfbd74_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_a0583be4cd06f2395bbb_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_52522722d895ca31177d_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2203,15 +2222,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=3"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_a0d49fe972c682195134",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_2e8f1397447bac0479e5_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_a0d49fe972c682195134_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2318,15 +2338,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=4"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ac4af50cebcd5a7b807c",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_fe33f48c482d06204e6e_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ac4af50cebcd5a7b807c_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2433,15 +2455,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=6"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_b4d4bfaeee5c4ea75166",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_8ac5cd02a150f3e88152_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_b4d4bfaeee5c4ea75166_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2548,15 +2571,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=3"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ba36b370436793a6b094",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_7815fd7569dfb2d23562_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ba36b370436793a6b094_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2663,7 +2688,9 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=2"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
@@ -2778,15 +2805,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=5"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_da417b52416eff7c48b5",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_66fc6cf67f2ab2d9b47a_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_da417b52416eff7c48b5_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -2893,7 +2922,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca",
       "kind": "sequence",
@@ -3008,7 +3038,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=3"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191",
       "kind": "sequence",
@@ -3123,15 +3154,17 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=2"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_e1ce7daca2c2dbbea0e3",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_8d79b478f63f44cb7d98_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_e1ce7daca2c2dbbea0e3_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -3238,15 +3271,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=6"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_e73160f1f8e0e3079f7e",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_11441487320e5669a56d_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_e73160f1f8e0e3079f7e_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -3353,7 +3387,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DNEXT_N=2"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
       "kind": "sequence",
@@ -3468,7 +3503,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f",
       "kind": "sequence",
@@ -3583,15 +3619,16 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=128"
       ],
-      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_fd408a78059d20662c22",
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca",
       "kind": "sequence",
       "role": "sequence",
       "sources": [
         "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_a01d9cb34eb024910169_kernel.cu",
-        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_fd408a78059d20662c22_binding.cu"
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca_binding.cu"
       ],
       "stages": [
         "metadata",
@@ -3698,7 +3735,8 @@
         ]
       ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DPAGE_KV=64"
       ],
       "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c",
       "kind": "sequence",

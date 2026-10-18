@@ -339,9 +339,11 @@ def program_names(route=None):
 def program_spec(arch, name):
     """FlashInfer JIT build specification of one generated program.
 
-    The programs take no compile-line definitions: the CTA budget is the launch
-    grid.  The architecture is part of the spec name so two architectures never
-    share one cached library.
+    The CTA budget is the launch grid, never a definition.  The only
+    compile-line definitions are a route's page size and ``next_n`` for the
+    texts several routes share (``-DPAGE_KV`` / ``-DNEXT_N`` in the record's
+    ``compile_flags``).  The architecture is part of the spec name so two
+    architectures never share one cached library.
     """
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec

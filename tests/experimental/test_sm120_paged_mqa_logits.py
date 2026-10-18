@@ -16,6 +16,8 @@ or the device is not an exported architecture; the host-only helpers and the
 architecture-target gate run everywhere.
 """
 
+import re
+
 import pytest
 import torch
 from flashinfer.experimental.deepgemm_sm120_paged_mqa_logits import (
@@ -902,3 +904,118 @@ def test_sm120_bindings_cover_every_program_argument():
         assert not missing, f"{name}: unbound arguments {missing}"
         checked += 1
     assert checked == len(catalog["routes"])
+
+
+def _compile_definitions(record):
+    """``{NAME: value}`` of the ``-DNAME=value`` flags of a catalogued program."""
+    return {
+        flag[2:].split("=", 1)[0]: int(flag.split("=", 1)[1])
+        for flag in record["compile_flags"]
+        if flag.startswith("-D")
+    }
+
+
+_LADDER = re.compile(
+    r"^#(?:el)?if (.+)\n#define CAKE_PROGRAM_KERNEL (\w+)(?:\n#define CAKE_PROGRAM_SHIM (\w+))?",
+    re.MULTILINE,
+)
+
+
+def _program_identity(kernel_text, binding_text, definitions):
+    """``(kernel symbol, host-shim namespace)`` a JIT module built from the two units with
+    ``definitions`` exports: the literal names of a per-route text, or the branch of a shared
+    text's program-identity ladder whose ``MACRO == value`` conjunction holds for exactly these
+    definitions (one branch in the kernel and one in the binding, naming the same kernel)."""
+
+    def select(text, what):
+        branches = _LADDER.findall(text)
+        if not branches:
+            return None
+        hits = [
+            (kernel, shim)
+            for condition, kernel, shim in branches
+            if {k: int(v) for k, v in re.findall(r"(\w+) == (\d+)", condition)}
+            == definitions
+        ]
+        assert len(hits) == 1, (what, definitions, hits)
+        return hits[0]
+
+    kernel, binding = select(kernel_text, "kernel"), select(binding_text, "binding")
+    if kernel is None and binding is None:
+        symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
+        shim = re.search(
+            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+        ).group(1)
+        return symbol, shim
+    assert kernel is not None and binding is not None and kernel[0] == binding[0], (
+        kernel,
+        binding,
+    )
+    return binding
+
+
+def test_sm120_sequence_programs_share_one_text_per_atom_variant():
+    """Host-only: one logits kernel and one sequence binding per (heads, atom).
+
+    The page size and ``next_n`` of a route are compile-line definitions of the
+    shared text -- ``PAGE_KV`` on the 32-head texts (64 or 128), ``NEXT_N`` on
+    the two-token texts (2 to 6) and on the 64-head three-token text (3, 5, 6)
+    -- so every sequence record names the scheduler kernel, its text's kernel
+    and its text's binding, passes exactly the definitions those sources
+    require (``#ifndef`` guards), exports the binding's entry, and no generated
+    unit is left unreferenced.  Every record's module also exports its own kernel
+    symbol and host-shim namespace: the per-route names, which a shared text
+    selects for each definition set through its program-identity ladder.
+    """
+
+    from flashinfer.jit import env
+
+    csrc = env.FLASHINFER_CSRC_DIR
+    catalog = _runtime._catalog()
+    generated = "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated"
+    metadata_route = catalog["routes"][_runtime.metadata_route_name()]
+    scheduler = catalog["programs"][metadata_route["stages"][0][1]]
+    guard = re.compile(r"^#ifndef (\w+)$", re.M)
+
+    def required(source):
+        path = csrc / source.removeprefix("csrc/")
+        assert path.is_file(), source
+        return set(guard.findall(path.read_text()))
+
+    texts, referenced, identities = {}, set(scheduler["sources"]), {}
+    for name, route in catalog["routes"].items():
+        if not route["sequence"]:
+            continue
+        record = catalog["programs"][route["sequence"]]
+        scheduler_kernel, kernel, binding = record["sources"]
+        assert scheduler_kernel == scheduler["sources"][0], name
+        referenced.update(record["sources"])
+        heads, atom = int(route["num_heads"]), route["atom_variant"]
+        expected = {}
+        if heads == 32:
+            expected["PAGE_KV"] = int(route["page_kv"])
+        if atom == "a2" or (heads, atom) == (64, "a3"):
+            expected["NEXT_N"] = int(route["next_n"])
+        assert _compile_definitions(record) == expected, name
+        assert required(kernel) == set(expected), (name, kernel)
+        assert required(binding) == set(expected) & {"PAGE_KV"}, (name, binding)
+        entry = binding.rsplit("/", 1)[1].removesuffix("_binding.cu")
+        assert record["ffi_entry"] == entry, name
+        texts.setdefault((heads, atom), set()).add((kernel, binding))
+        identity = _program_identity(
+            (csrc / kernel.removeprefix("csrc/")).read_text(),
+            (csrc / binding.removeprefix("csrc/")).read_text(),
+            expected,
+        )
+        assert identity not in identities.values(), (name, identity, identities)
+        identities[name] = identity
+    assert texts and all(len(units) == 1 for units in texts.values()), texts
+    kernels = {next(iter(units))[0] for units in texts.values()}
+    assert len(kernels) == len(texts), sorted(kernels)
+    generated_dir = csrc / generated.removeprefix("csrc/")
+    orphans = sorted(
+        p.name
+        for p in generated_dir.iterdir()
+        if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
+    )
+    assert not orphans, f"generated units not referenced by the catalog: {orphans}"

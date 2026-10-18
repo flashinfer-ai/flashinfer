@@ -27,6 +27,10 @@
 
 #include "tvm_ffi_utils.h"
 
+// Stringise the expansion of a macro argument (launch-error messages name the selected kernel symbol).
+#define CAKE_STRINGIZE_(x) #x
+#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
+
 namespace cake_host_shim_common {
 
 // Opt the linked kernel into its dynamic shared memory once for every device
