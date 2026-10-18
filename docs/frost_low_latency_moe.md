@@ -140,6 +140,14 @@ Changing expert IDs within that bucket does not automatically select a new
 backend. Warm up with representative expert reuse and cache conditions; the
 benchmark's condition-specific sweeps do not imply a distribution-aware
 dispatcher on every decode step.
+Enter `autotune(True)` on the layer's first call for the target bucket. Re-entering
+that context does not invalidate an existing `MoELayer` backend/tactic winner.
+A fresh `MoELayer` re-runs cross-backend selection before graph capture and can
+reuse the prepared weight pack, but it may reuse per-runner autotuner records.
+To reprofile the same metadata with different routing values, also use fresh
+tuning state, for example an isolated process without loading previous tuning
+records. Autotuner measurement provenance applies when selection runs, not as
+automatic invalidation of this layer-level cache.
 
 The compile cache stores executable metadata. `pack_inputs` owns each call's
 scratch tensors, and execution binds current pointers and stream. The packed
