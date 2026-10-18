@@ -15,11 +15,14 @@
 
 One source-only manifest lives under ``csrc/cake_fused_qk_rope_append``
 (``cake_fused_qk_rope_append_manifest.json``, schema ``cake.library_export.v5``):
-for every architecture (``sm_90a`` H100/H200, ``sm_100a`` B200, ``sm_103a`` B300)
-one stage per build the Cake host policy can select for the two head
-configurations ``(Hq, Hkv) = (8, 1)`` / ``(64, 8)`` (``contract.stages_by_arch``;
-the base build ``hq8_hkv1`` / ``hq64_hkv8`` plus lever builds such as
-``hq8_hkv1_vsub3_d`` or ``hq64_hkv8_w20_vsub18_d``).  The kernel source of a
+one record per stage, i.e. per build the Cake host policy can select for the
+two head configurations ``(Hq, Hkv) = (8, 1)`` / ``(64, 8)`` (the base build
+``hq8_hkv1`` / ``hq64_hkv8`` plus lever builds such as ``hq8_hkv1_vsub3_d`` or
+``hq64_hkv8_w20_vsub18_d``).  ``contract.stages_by_arch`` lists the stages
+shipped for ``sm_90a`` (H100/H200), ``sm_100a`` (B200) and ``sm_103a`` (B300);
+a record's ``builds[arch]`` holds the module name and kernel symbol of that
+(stage, arch) library, and ``contract.arg_plan`` the binding's argument order
+shared by every build.  The kernel source of a
 stage and the tvm-ffi binding are shared by all architectures: every module
 compiles them with ``-DCAKE_KERNEL_SYMBOL=<its kernel_symbol>`` and its own
 host-shim namespace (:func:`_module_defines`), so the per-(stage, arch)
@@ -252,7 +255,14 @@ def _manifest() -> dict[str, Any]:
     return value
 
 
+def arg_plan() -> tuple[tuple[str, str], ...]:
+    """Binding arguments ``(kind, name)`` in call order (``contract.arg_plan``)."""
+    plan = _manifest()["contract"]["arg_plan"]
+    return tuple((str(kind), str(name)) for kind, name in plan)
+
+
 def _record(stage: str, arch: str) -> dict[str, Any]:
+    """Per-module view of a stage record: its shared fields plus ``builds[arch]``."""
     if arch not in ARCHES:
         raise ValueError(f"unknown arch {arch!r}; expected one of {ARCHES}")
     shipped = stages_for(arch)
@@ -260,17 +270,17 @@ def _record(stage: str, arch: str) -> dict[str, Any]:
         raise ValueError(
             f"unknown stage {stage!r} for {arch}; expected one of {shipped}"
         )
-    matches = [
-        item
-        for item in _manifest()["modules"]
-        if item.get("arch") == arch
-        and dict(item.get("route", {})).get("stage") == stage
-    ]
+    matches = [item for item in _manifest()["modules"] if item.get("stage") == stage]
     if len(matches) != 1:
         raise RuntimeError(
-            f"expected one generated Cake module for ({arch}, {stage}), got {len(matches)}"
+            f"expected one Cake stage record for {stage!r}, got {len(matches)}"
         )
-    return matches[0]
+    record = matches[0]
+    build = dict(record.get("builds", {})).get(arch)
+    if not isinstance(build, dict):
+        raise RuntimeError(f"stage {stage!r} ships no build for {arch}")
+    view = {key: value for key, value in record.items() if key != "builds"}
+    return {**view, **build, "arch": arch}
 
 
 def _source_path(relative_path: str) -> Path:

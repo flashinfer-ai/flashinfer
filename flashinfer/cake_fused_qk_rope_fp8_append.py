@@ -64,6 +64,7 @@ import tvm_ffi
 from .jit.cake_fused_qk_rope_fp8_append import (
     STAGES,
     arch_for,
+    arg_plan,
     load_cake_fused_qk_rope_fp8_append_module,
 )
 from .utils import get_compute_capability
@@ -94,7 +95,7 @@ def _call_plan(arch: str) -> tuple[Any, tuple[str, ...]]:
     module, record = load_cake_fused_qk_rope_fp8_append_module(_STAGE, arch)
     return (
         getattr(module, str(record["ffi_entry"])),
-        tuple(str(name) for _kind, name in record["arg_plan"]),
+        tuple(str(name) for _kind, name in arg_plan()),
     )
 
 

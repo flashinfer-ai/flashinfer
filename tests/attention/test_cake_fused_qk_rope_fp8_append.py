@@ -70,6 +70,80 @@ def test_shared_sources_bind_one_kernel_symbol_per_module(monkeypatch):
         assert symbol not in kernel_text and symbol not in binding_text
 
 
+# The 20-hex digest identifies the architecture's build in the Cake export: module
+# name ``cake_fused_qk_rope_fp8_append_<digest>``, spec name ``<module>_<arch>``,
+# kernel symbol ``kernel_<module>``.
+_MODULE_DIGESTS = {
+    "sm_90a": "31cb02d023f2ccb40a0b",
+    "sm_100a": "caf9bdb5445726a94bed",
+    "sm_103a": "f2873a52b7d6a3954655",
+}
+
+_ARG_NAMES = [
+    "qkv",
+    "cos_sin",
+    "seq_lens",
+    "q_indptr",
+    "page_indices",
+    "q_norm_weight",
+    "k_norm_weight",
+    "k_scale",
+    "v_scale",
+    "q_scale_inv",
+    "out_q",
+    "key_cache",
+    "value_cache",
+    "out_k",
+    "out_v",
+    "q_scale",
+    "split_k_flag",
+    "num_rows",
+    "num_requests",
+    "num_q_heads",
+    "num_kv_heads",
+    "page_size",
+    "max_pages_per_request",
+    "max_seqlen",
+    "max_seqlen_aligned",
+    "quant_policy",
+    "norm_policy",
+    "is_prefill",
+    "has_out_kv",
+    "upper_max",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+]
+
+
+def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
+    """CPU-only: spec name, sources and loader flags of every architecture's module
+    against the manifest's module table (``builds`` of the one stage record)."""
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    arch_flags = {
+        "sm_90a": jit_core.sm90a_nvcc_flags,
+        "sm_100a": jit_core.sm100a_nvcc_flags,
+        "sm_103a": jit_core.sm103a_nvcc_flags,
+    }
+    assert set(_MODULE_DIGESTS) == set(jit_fp8.ARCHES)
+    csrc = jit_fp8._get_csrc_dir()
+    for arch, digest in sorted(_MODULE_DIGESTS.items()):
+        module = f"cake_fused_qk_rope_fp8_append_{digest}"
+        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module("fp8_e4m3", arch)
+        assert spec.name == f"{module}_{arch}"
+        assert spec.sources == [
+            csrc / "cake_fused_qk_rope_fp8_append_kernel.cu",
+            csrc / "cake_fused_qk_rope_fp8_append_binding.cu",
+        ]
+        added = [*arch_flags[arch], f"-DCAKE_KERNEL_SYMBOL=kernel_{module}"]
+        assert spec.extra_cuda_cflags[-len(added) :] == added
+        generic = spec.extra_cuda_cflags[: -len(added)]
+        assert not any(flag.startswith(("-gencode", "-DCAKE_")) for flag in generic)
+    assert [name for _kind, name in jit_fp8.arg_plan()] == _ARG_NAMES
+
+
 def rotary_cos_sin_table(
     max_positions: int, device, base: float = 10000.0
 ) -> torch.Tensor:

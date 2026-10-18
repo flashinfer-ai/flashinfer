@@ -60,6 +60,7 @@ import tvm_ffi
 
 from .jit.cake_fused_qk_rope_append import (
     arch_for,
+    arg_plan,
     clear_units_per_request,
     load_cake_fused_qk_rope_append_module,
     stage_for,
@@ -104,12 +105,12 @@ def _check(cond: bool, message: str) -> None:
 def _call_plan(stage: str, arch: str) -> tuple[Any, int, int, tuple[str, ...]]:
     """Launch entry, stage knobs and argument order of one build (once per build)."""
     module, record = load_cake_fused_qk_rope_append_module(stage, arch)
-    specialization = dict(record["route"]).get("specialization", {})
+    specialization = record["specializations"]
     return (
         getattr(module, str(record["ffi_entry"])),
         int(specialization.get("WARPS_PER_ROW", 1)),
         int(specialization.get("CLEAR_UNITS_PER_WARP", 1)),
-        tuple(str(name) for _kind, name in record["arg_plan"]),
+        tuple(str(name) for _kind, name in arg_plan()),
     )
 
 

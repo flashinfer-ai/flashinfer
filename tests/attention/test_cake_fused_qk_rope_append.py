@@ -655,3 +655,98 @@ def test_jit_spec_shares_sources_and_keeps_distinct_symbols(monkeypatch):
     assert len(symbols) == 20
     assert len(set(symbols.values())) == len(symbols)
     assert len(set(shims.values())) == len(shims)
+
+
+# ----------------------------------------------------------------------------------------------
+# Manifest module table (CPU): the JIT spec of every shipped (stage, arch) module -
+# its name, its two sources and the flags the loader adds - against an explicit
+# table.  The 20-hex digest identifies the (stage, arch) build in the Cake export:
+# module name ``cake_fused_qk_rope_append_<digest>``, spec name ``<module>_<arch>``,
+# kernel symbol ``kernel_<module>``, host-shim namespace
+# ``cake_host_shim_<module>_<arch>``.
+
+_MODULE_DIGESTS = {
+    ("hq8_hkv1", "sm_100a"): "63134a7b435c3dac735e",
+    ("hq8_hkv1", "sm_103a"): "4231efe21f308c439dd2",
+    ("hq8_hkv1_vsub3_d", "sm_90a"): "687c34e8f4f9d0c0a3d5",
+    ("hq8_hkv1_vsub3_d", "sm_100a"): "d374e1c215a49809c71a",
+    ("hq8_hkv1_vsub3_d", "sm_103a"): "1304107f91c79a69be6a",
+    ("hq64_hkv8", "sm_90a"): "c0c88fcd149a9670fc01",
+    ("hq64_hkv8", "sm_100a"): "7b9625ff653ff7ae2feb",
+    ("hq64_hkv8", "sm_103a"): "43c1aaca2d00f74d875f",
+    ("hq64_hkv8_u2", "sm_100a"): "e535b6bb00b9bfa0548f",
+    ("hq64_hkv8_u2", "sm_103a"): "2b21e8094430d468bd02",
+    ("hq64_hkv8_d_u2", "sm_100a"): "d3c33d4c6b33e645e252",
+    ("hq64_hkv8_d_u2", "sm_103a"): "e787e64af28a9466a76b",
+    ("hq64_hkv8_d", "sm_90a"): "0fd497d5c3f9b5153b38",
+    ("hq64_hkv8_d", "sm_100a"): "97bef5f0cc2815a74f0f",
+    ("hq64_hkv8_d", "sm_103a"): "d924443b15909234aba1",
+    ("hq64_hkv8_w20_vsub18_d", "sm_90a"): "8b18e8f71ff010e37860",
+    ("hq64_hkv8_w20_vsub18_d", "sm_100a"): "878eafa5087d58ce2289",
+    ("hq64_hkv8_w20_vsub18_d", "sm_103a"): "2e9094287bc1c12acfce",
+    ("hq64_hkv8_w20_vsub18", "sm_100a"): "d4bd5170b6193fbfe1c0",
+    ("hq64_hkv8_w20_vsub18", "sm_103a"): "6dc02f5530780f401310",
+}
+
+_ARG_NAMES = [
+    "qkv",
+    "cos_sin",
+    "q_indptr",
+    "seq_lens",
+    "page_table",
+    "k_cache",
+    "v_cache",
+    "out_q",
+    "out_k",
+    "out_v",
+    "q_norm_weight",
+    "k_norm_weight",
+    "num_rows",
+    "num_requests",
+    "max_pages",
+    "page_size",
+    "k_page_stride",
+    "v_page_stride",
+    "num_row_ctas",
+    "clear_units_per_request",
+    "qk_norm_policy",
+    "eps",
+    "use_out_k",
+    "use_out_v",
+    "clear_last_page",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+]
+
+
+def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
+    from flashinfer.jit import cake_fused_qk_rope_append as jit
+    from flashinfer.jit import core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    arch_flags = {
+        "sm_90a": jit_core.sm90a_nvcc_flags,
+        "sm_100a": jit_core.sm100a_nvcc_flags,
+        "sm_103a": jit_core.sm103a_nvcc_flags,
+    }
+    shipped = {(stage, arch) for arch in jit.ARCHES for stage in jit.stages_for(arch)}
+    assert shipped == set(_MODULE_DIGESTS)
+    csrc = jit._get_csrc_dir()
+    for (stage, arch), digest in sorted(_MODULE_DIGESTS.items()):
+        module = f"cake_fused_qk_rope_append_{digest}"
+        spec = jit.gen_cake_fused_qk_rope_append_module(stage, arch)
+        assert spec.name == f"{module}_{arch}"
+        assert spec.sources == [
+            csrc / f"cake_fused_qk_rope_append_{stage}_kernel.cu",
+            csrc / "cake_fused_qk_rope_append_binding.cu",
+        ]
+        added = [
+            *arch_flags[arch],
+            f"-DCAKE_KERNEL_SYMBOL=kernel_{module}",
+            f"-DCAKE_HOST_SHIM_NAMESPACE=cake_host_shim_{module}_{arch}",
+        ]
+        assert spec.extra_cuda_cflags[-len(added) :] == added
+        generic = spec.extra_cuda_cflags[: -len(added)]
+        assert not any(flag.startswith(("-gencode", "-DCAKE_")) for flag in generic)
+    assert [name for _kind, name in jit.arg_plan()] == _ARG_NAMES
