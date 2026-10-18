@@ -5353,9 +5353,21 @@ def test_source_chunk_parallel_family_rule(
         (1, 8, 16, False, "chunkpar3"),  # perf_batched_1x16: 128 tiles
         (1, 8, 64, False, "chunkpar3"),  # perf_batched_1x64: 64 chunks (measured 0.90)
         (1, 8, 128, False, "chunkpar3"),  # 8 items x 128 chunks (0.94)
-        (1, 8, 256, False, "chunkpar"),  # perf_batched_1x256: 8 items x 256 chunks (1.01)
+        (
+            1,
+            8,
+            256,
+            False,
+            "chunkpar",
+        ),  # perf_batched_1x256: 8 items x 256 chunks (1.01)
         (4, 8, 16, False, "chunkpar"),  # perf_batched_4x16: 32 items x 16 chunks (1.02)
-        (4, 8, 64, False, "chunkpar3"),  # perf_batched_4x64: 32 items x 64 chunks (0.92)
+        (
+            4,
+            8,
+            64,
+            False,
+            "chunkpar3",
+        ),  # perf_batched_4x64: 32 items x 64 chunks (0.92)
         (1, 32, 16, False, "chunkpar"),  # cp_b1h32c16: 512 tiles, 16 chunks (1.01)
         (1, 32, 32, False, "chunkpar3"),  # 32 items x 32 chunks (0.97)
         (1, 16, 32, False, "chunkpar3"),  # 16 items x 32 chunks (0.94)
@@ -5393,9 +5405,17 @@ def test_source_chunk_parallel_family_rule_rubin(
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     assert module._RUBIN_THREE_PHASE_CAPABILITIES == ((10, 7),)
     assert module._RUBIN_THREE_PHASE_MIN_CHUNKS == 32
-    assert module._RUBIN_LOOKBACK_MAX_ITEMS == 8 and module._RUBIN_LOOKBACK_MIN_CHUNKS == 256
+    assert (
+        module._RUBIN_LOOKBACK_MAX_ITEMS == 8
+        and module._RUBIN_LOOKBACK_MIN_CHUNKS == 256
+    )
     family = _family(
-        batch, nheads, nchunks, varlen=varlen, capability=(10, 7), sm_count=_RUBIN_SM_COUNT
+        batch,
+        nheads,
+        nchunks,
+        varlen=varlen,
+        capability=(10, 7),
+        sm_count=_RUBIN_SM_COUNT,
     )
     assert family == expected
     # The Blackwell rule at the same geometry: the same verdict except where
