@@ -172,6 +172,7 @@ from .fmha_resources import (
     SmemKVResource,
     SmemOResource,
     SmemPageOffsetsKvResource,
+    SmemSageKScalesResource,
     SmemQResource,
     TmemOResource,
     TmemPResource,
@@ -1191,6 +1192,26 @@ def build_context_task_manager(
             for index in range(cfg.num_qkv_instances)
         ]
     smem_p0, smem_p1 = smem_p_resources
+    # Sage K blocks under 16 tokens: the load warp stages each K tile's sfK
+    # words in a ring both softmax groups read in place.
+    smem_sage_k: SmemSageKScalesResource | None = None
+    if cfg.sage_stages_k_scales:
+        smem_sage_k = SmemSageKScalesResource(
+            pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=cfg.sage_k_scale_stages,
+                producer_group=pipeline.CooperativeGroup(Agent.Thread, warp_size),
+                consumer_group=pipeline.CooperativeGroup(
+                    Agent.Thread,
+                    cfg.num_qkv_instances * num_softmax_warps * warp_size,
+                ),
+                cta_layout_vmnk=cluster_shape_vmnk,
+                producer_op=pipeline.PipelineOp.AsyncLoad,
+            ),
+            cfg=cfg,
+            sage_scales=sage_scales,
+            num_kv_heads=num_kv_heads,
+            name="smem_sage_k",
+        )
     tmem_sp0 = TmemSPResource(
         pipeline_config=tmem_sp0_pipeline_cfg,
         cfg=cfg,
@@ -1390,6 +1411,7 @@ def build_context_task_manager(
         work_queue,
         smem_page_offsets_kv=smem_page_offsets_kv,
         smem_page_offsets_v=smem_page_offsets_v,
+        smem_sage_k=smem_sage_k,
         **domain_n_kwargs,
     )
     mma_task = create_mma_task(
@@ -1422,6 +1444,7 @@ def build_context_task_manager(
         work_queue,
         tmem_p_prefix_ready=tmem_p_prefix_ready_0,
         smem_p=smem_p0,
+        smem_sage_k=smem_sage_k,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1437,6 +1460,7 @@ def build_context_task_manager(
             work_queue,
             tmem_p_prefix_ready=tmem_p_prefix_ready_1,
             smem_p=smem_p1,
+            smem_sage_k=smem_sage_k,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1605,6 +1629,8 @@ def build_context_task_manager(
         resource_dependency_graph[work_queue] = [work_queue] if is_clc_dynamic else []
     if smem_page_offsets_kv is not None:
         resource_dependency_graph[smem_page_offsets_kv] = scheduler_deps(gmem_qkv)
+    if smem_sage_k is not None:
+        resource_dependency_graph[smem_sage_k] = scheduler_deps(gmem_qkv)
     if smem_page_offsets_v is not None:
         resource_dependency_graph[smem_page_offsets_v] = scheduler_deps(gmem_qkv)
 
@@ -1626,6 +1652,7 @@ def build_context_task_manager(
         add_smem_resource(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
         add_smem_resource(smem_page_offsets_v)
+    add_smem_resource(smem_sage_k)
     # Register every pipeline resource, including pipeline-only TMEM handoffs,
     # with the unified allocator.  Otherwise CUTLASS materializes those
     # barriers as separate dynamic-SMEM arrays that the capacity selector
@@ -1823,6 +1850,7 @@ def _context_pipeline_stage_counts(
         ),
         "tmem_sp": cfg.mma_softmax_stage * cfg.num_qkv_instances,
         "tmem_p": cfg.mma_softmax_stage if cfg.has_tmem_p_pipeline else 0,
+        "smem_sage_k": cfg.sage_k_scale_stages if cfg.sage_stages_k_scales else 0,
         "tmem_vec": cfg.softmax_corr_stage * cfg.num_qkv_instances,
         "tmem_o": cfg.mma_corr_stage,
         "smem_o": cfg.num_qkv_instances,
@@ -1843,8 +1871,9 @@ def _kv_ring_smem_budget_bytes(
 ) -> int:
     """Return the SMEM left for the K/V ring(s) after every fixed allocation.
 
-    Fixed terms are Q, O, correction statistics, page-ID rings, control
-    records, and one 16-byte barrier per stage. The task manager still checks.
+    Fixed terms are Q, O, correction statistics, page-ID rings, the Sage sfK
+    ring, control records, and one 16-byte barrier per stage. The task
+    manager still checks.
     """
     q_row_bytes = (cfg.q_dtype.width * cfg.smem_q_head_dim + 7) // 8
     q_row_bytes = (
@@ -1892,6 +1921,9 @@ def _kv_ring_smem_budget_bytes(
         smem_p_bytes = (
             (cfg.smem_p_bytes + align - 1) // align * align * cfg.num_qkv_instances
         )
+    sage_k_bytes = 0
+    if cfg.sage_stages_k_scales:
+        sage_k_bytes = cfg.sage_k_scale_stages * cfg.sage_k_tile_bytes
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
@@ -1908,6 +1940,7 @@ def _kv_ring_smem_budget_bytes(
         + smem_p_bytes
         + (stats_bytes + 15) // 16 * 16
         + (page_offsets_bytes + 15) // 16 * 16
+        + (sage_k_bytes + 15) // 16 * 16
         + (control_bytes + 7) // 8 * 8
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
@@ -2162,13 +2195,14 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
     cfg.num_regs_other = 112
 
 
-def _configure_sage_attention(cfg: FmhaConfig, layout: _SageScaleLayout) -> None:
-    """Bind a Sage plan's scale layout to the dense query-paired FP8 schedule.
+def _check_sage_attention(cfg: FmhaConfig) -> None:
+    """Check a Sage plan's scale layout against the dense query-paired FP8 schedule.
 
     Sage attention runs on the dense query-paired D128 schedule with FP8 P
     staged in SMEM, in its single-CTA or two-CTA UMMA form. Its row max
     reduces 16-column score blocks, with LDTM.STAT where the hardware has it.
     """
+    layout = cfg.sage_scale_layout
     validate_context_sage_layout(layout, cfg.kv_tile_n)
     if (
         cfg.single_qkv_instance
@@ -2189,7 +2223,6 @@ def _configure_sage_attention(cfg: FmhaConfig, layout: _SageScaleLayout) -> None
         or layout.q_tokens_per_tile != cfg.q_tile_m
     ):
         raise ValueError("the Sage scale layout does not match the kernel's tiles")
-    cfg.sage_scale_layout = layout
 
 
 def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
@@ -3014,6 +3047,10 @@ class FmhaTs:
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         cfg.p_in_smem = _uses_smem_p(cfg, has_variable_window=has_variable_window)
         _configure_head_dim_staging(cfg)
+        # The Sage layout decides whether an sfK ring takes shared memory, so
+        # it is bound before the K/V ring is sized; its schedule checks follow
+        # the pipeline configuration below.
+        cfg.sage_scale_layout = sage_scale_layout
         _configure_pipeline_stages(
             cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
         )
@@ -3093,8 +3130,8 @@ class FmhaTs:
             window_size_left=window_size_left,
             has_variable_window=has_variable_window,
         )
-        if sage_scale_layout is not None:
-            _configure_sage_attention(cfg, sage_scale_layout)
+        if cfg.sage_scale_layout is not None:
+            _check_sage_attention(cfg)
 
     # ---------------------------------------------------------------------------
     # Host entry point

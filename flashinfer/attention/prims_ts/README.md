@@ -406,18 +406,20 @@ launches the scale prepare on the current stream, then attention.
 | `q_block_size`, `k_block_size`, `v_mean` | As for the decode kernel |
 | Geometry | `head_dim=128`, `mask_type="dense"`, fixed `packed=False` storage, `window_left=-1` |
 
-The softmax reads the K scales straight from the prepared buffer. With
-16-token or coarser K blocks it scales each 16-column block's maximum and
-exp2 multiplier; 4- and 1-token blocks dequantize the scores in place, which
-costs more. On one dense layer (B=2, S=75600, 40 heads, D=128, attention
-kernel only, GPC-clock Mcycles per call) the context kernel measured:
+With 16-token or coarser K blocks the softmax reads the K scales straight
+from the prepared buffer and scales each 16-column block's maximum and exp2
+multiplier. Finer blocks dequantize the scores in place, which costs more:
+4-token blocks load the tile's multipliers before the score wait, and for
+1-token blocks the load warp stages each tile's scales in shared memory. On
+one dense layer (B=2, S=75600, 40 heads, D=128, attention kernel only,
+GPC-clock Mcycles per call) the context kernel measured:
 
 | Plan | GB300 | B200 |
 | --- | ---: | ---: |
 | Per-tensor FP8 (no Sage) | 162 | 261 |
 | Sage, 16-token K blocks | 169 | 252 |
 | Sage, 4-token K blocks | 209 | 295 |
-| Sage, 1-token K blocks | 336 | 430 |
+| Sage, 1-token K blocks | 229 | 332 |
 
 The decode kernel's dense Sage plan on the same layer takes 202, 220 and 260
 Mcycles on GB300 for the three block sizes.
