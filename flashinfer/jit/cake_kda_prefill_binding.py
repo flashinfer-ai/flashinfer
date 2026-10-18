@@ -89,6 +89,9 @@ void $entry($entry_params) {
 """,
     "contiguous": """  check_contiguous(arg_$name, "$name");
 """,
+    "pitched": """  TVM_FFI_CHECK(arg_$name.stride(-1) == 1, ValueError)
+      << "$name must have unit innermost stride; the kernel reads its token pitch from ${name}_token_stride";
+""",
     "strided": """  TVM_FFI_CHECK(arg_$name.ndim() >= 3, ValueError)
       << "$name must have at least 3 dimensions";
   TVM_FFI_CHECK(arg_$name.stride(-1) == 1, ValueError)
@@ -241,11 +244,13 @@ _WRAPPERS = (("Run", 2), ("PrepareTma", 1), ("RunPrepared", 0))
 # Argument signatures. ``tensors`` gives the dtype code of every tensor argument
 # of the plan, ``layouts`` lists the arguments that are not required to be
 # contiguous ("strided": at least three dimensions and a unit innermost stride,
-# the kernel reads the token stride; "unchecked": a TMA operand view whose
-# layout the descriptor encoder validates), ``scalars`` gives the C type code of
-# every scalar argument and ``current_device_check`` adds the check that the
-# current device is the tensors' device. ``like`` starts from another signature
-# and adds or overrides entries.
+# the kernel reads the token stride; "pitched": a unit innermost stride, the
+# kernel addresses token rows through the plan's ``<name>_token_stride`` scalar;
+# "unchecked": a TMA operand view whose layout the descriptor encoder
+# validates), ``scalars`` gives the C type code of every scalar argument and
+# ``current_device_check`` adds the check that the current device is the
+# tensors' device. ``like`` starts from another signature and adds or overrides
+# entries.
 _SIGNATURES = {
     "P00": {
         "plan": "P00",
@@ -288,7 +293,9 @@ _SIGNATURES = {
             "final_state_f32": "f32",
         },
         "layouts": {
+            "g": "pitched",
             "g_tma": "unchecked",
+            "beta": "pitched",
             "beta_tma": "unchecked",
         },
         "scalars": {
@@ -319,6 +326,21 @@ _SIGNATURES = {
             "k_tma": "unchecked",
             "v": "strided",
             "v_tma": "unchecked",
+        },
+    },
+    # Bodies exported without the serving ABI read beta at the head-count pitch
+    # (``beta_token_stride`` is declared but not read); their beta stays
+    # contiguous.
+    "P00_dense_beta": {
+        "like": "P00",
+        "layouts": {
+            "beta": "contiguous",
+        },
+    },
+    "P00_strided_dense_beta": {
+        "like": "P00_strided",
+        "layouts": {
+            "beta": "contiguous",
         },
     },
     "P00_f32_checkpoints": {
@@ -399,7 +421,9 @@ _SIGNATURES = {
             "k_tma": "unchecked",
             "v": "strided",
             "v_tma": "unchecked",
+            "g": "pitched",
             "g_tma": "unchecked",
+            "beta": "pitched",
             "beta_tma": "unchecked",
         },
         "scalars": {
@@ -640,22 +664,20 @@ _SIGNATURES = {
 # cudaLaunchKernelExC with programmatic stream serialization ("exc_pdl_bare":
 # the same launch without the explanatory comment line).
 _LAUNCH_GROUPS = {
-    ("P00", 227968, 1024, "exc"): {
+    ("P00_dense_beta", 227968, 1024, "exc"): {
         "cake_kda_bf16_d22df3843e4ae69e26a7": ((1, 3, 1, 1, 3, 2, 2), ()),
     },
-    ("P00", 227968, 1024, "exc_pdl"): {
+    ("P00_dense_beta", 227968, 1024, "exc_pdl"): {
         "cake_kda_bf16_73414b477c864609350c": ((1, 3, 1, 1, 3, 2, 2), ()),
     },
     ("P00_strided", 230528, 1024, "exc_pdl"): {
         "cake_kda_bf16_82dff1c305abe6367034": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_96dd33788d497a79e142": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_acd84ad6d68fb21576b7": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_ce67a310d4f8a80a2cbf": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
     },
     ("P00_strided", 230528, 1024, "kernel"): {
         "cake_kda_bf16_898e5dc6fc0e2cc2ac9e": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_9a336afc613e4f9ee1c7": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_c4f30cd09e56ce40d46c": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_d3fc3337b10cdf6bf7d6": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
     },
     ("P00_strided", 229376, 1024, "kernel"): {
@@ -666,13 +688,9 @@ _LAUNCH_GROUPS = {
         "cake_kda_bf16_f7cf9b795943c5803edb": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
     },
     ("P00_strided", 227968, 1024, "exc_pdl"): {
-        "cake_kda_bf16_03ea50d078dbf34830bb": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_14d1b3745aa9f0079482": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_2b5f2c6b7cfc10ffa244": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_5639519f5c942ed86e4f": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_8e9c0962021058a3005d": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_db50c13c6d4aa462575c": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_eeb61146f150d9e0d825": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_f66adfecf2022fc198b6": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_f74a288bb51b335a1ccf": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
     },
@@ -685,14 +703,28 @@ _LAUNCH_GROUPS = {
         "cake_kda_bf16_7386cf449b08cfe77567": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_9556ac079590cd311172": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
         "cake_kda_bf16_c410d3932af8bc84666e": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_c528a0e1a9896ea82166": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
-        "cake_kda_bf16_d1ce1e4b43672482991c": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
     },
     ("P00_strided", 218752, 864, "kernel"): {
         "cake_kda_bf16_fd04381524dba62b317d": ((0, 0, 5, 1, 0, 2, 2), ("v", "q", "k")),
     },
     ("P00_strided", 163456, 1024, "kernel"): {
         "cake_kda_bf16_b7a36d7e13872a35abe8": ((2, 4, 3, 0, 1, 0, 2), ("q", "k", "v")),
+    },
+    ("P00_strided_dense_beta", 230528, 1024, "exc_pdl"): {
+        "cake_kda_bf16_ce67a310d4f8a80a2cbf": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
+    },
+    ("P00_strided_dense_beta", 230528, 1024, "kernel"): {
+        "cake_kda_bf16_c4f30cd09e56ce40d46c": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
+    },
+    ("P00_strided_dense_beta", 227968, 1024, "exc_pdl"): {
+        "cake_kda_bf16_03ea50d078dbf34830bb": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
+        "cake_kda_bf16_14d1b3745aa9f0079482": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
+        "cake_kda_bf16_8e9c0962021058a3005d": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
+        "cake_kda_bf16_eeb61146f150d9e0d825": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
+    },
+    ("P00_strided_dense_beta", 227968, 1024, "kernel"): {
+        "cake_kda_bf16_c528a0e1a9896ea82166": ((0, 0, 5, 1, 0, 2, 2), ("q", "k", "v")),
+        "cake_kda_bf16_d1ce1e4b43672482991c": ((0, 0, 5, 1, 3, 2, 2), ("q", "k", "v")),
     },
     ("P00_f32_checkpoints", 227968, 1024, "exc_pdl"): {
         "cake_kda_bf16_5926ccfc26ae75ec8391": ((1, 3, 1, 1, 3, 2, 0), ()),

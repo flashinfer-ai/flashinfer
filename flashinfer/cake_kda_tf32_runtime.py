@@ -784,12 +784,15 @@ def _flatten_beta_rows(beta, *, logical_tokens_per_batch: int, num_heads: int):
 def _ffi_raw_pointer_carrier(tensor):
     """Return a contiguous zero-copy TensorView carrier for a raw pointer.
 
-    The standalone serving kernel consumes the physical beta row pitch through
-    its explicit ``beta_token_stride`` scalar.  The generic FFI shim only
-    needs the tensor's dtype, device, and data pointer for that argument, but a
-    raw pointer has a contiguous-by-default host contract.  A one-element view
-    preserves the exact data pointer while satisfying that transport contract;
-    the caller-owned strided tensor remains alive and is the device data source.
+    Bindings that keep the contiguous-by-default host contract for a raw
+    pointer argument (the TF32 ``raw_gate`` / ``beta_logits``, TMA-only q / k /
+    v pointers, state pools) only need the tensor's dtype, device and data
+    pointer.  A one-element view preserves the exact data pointer while
+    satisfying that contract; the caller-owned strided tensor remains alive and
+    is the device data source.  The BF16 fused bodies take ``g`` and ``beta``
+    in place: their bindings accept any unit-innermost-stride view and the
+    kernels address token rows through ``g_token_stride`` /
+    ``beta_token_stride``.
     """
     if tensor.is_contiguous():
         return tensor
@@ -803,10 +806,10 @@ def _ffi_raw_pointer_carrier(tensor):
 # dereference the raw pointer argument of the same name.  The generated FFI
 # shim still applies the contiguous-by-default host contract to that pointer,
 # so a strided packed-row q / k / v view travels through the one-element
-# carrier above (the ``beta`` precedent) while the TMA view carries the token
-# pitch.  Every other body reads the pitch from the TensorView itself (a hidden
-# int64 argument expanded by the shim) and needs the strided view.  Mirrors
-# the source runtime's table of the same name.
+# carrier above while the TMA view carries the token pitch.  Every other body
+# reads the pitch from the TensorView itself (a hidden int64 argument expanded
+# by the shim) and needs the strided view.  Mirrors the source runtime's table
+# of the same name.
 QKV_TMA_ONLY_RAW_POINTERS = {
     "compiled_bf16_bt16_prepare": ("q", "k"),
     "compiled_bf16_bt16_prepare_beta_tma": ("q", "k"),
@@ -2276,6 +2279,12 @@ class FlashKDABlackwellBF16FusedLaunch:
         g_flat, g_refresh = _flatten_gate_rows(
             g, logical_tokens_per_batch=tokens_per_batch, num_heads=num_heads
         )
+        # The BF16 bodies take ``g_flat`` / ``beta_abi_source`` in place: their
+        # bindings accept any unit-innermost-stride view and the kernels address
+        # token rows through ``g_token_stride`` / ``beta_token_stride``.  The
+        # one-element carriers built here stay for the TF32 bodies (contiguous
+        # raw-pointer contract of ``raw_gate`` / ``beta_logits``) and for the
+        # keep-alive tuple.
         g_pointer = _ffi_raw_pointer_carrier(g_flat)
         out_flat = out.reshape(total_tokens, num_heads, HEAD_DIM)
         beta_flat, beta_refresh = _flatten_beta_rows(
@@ -2946,9 +2955,9 @@ class FlashKDABlackwellBF16FusedLaunch:
             "k_tma": k_flat,
             "v": _qkv_raw_pointer_arg(v_flat, "v", qkv_carriers),
             "v_tma": v_flat,
-            "g": g_pointer,
+            "g": g_flat,
             "g_tma": g_flat,
-            "beta": beta_pointer,
+            "beta": beta_abi_source,
             "beta_tma": beta_tma,
             "A_log": A_log,
             "dt_bias": dt_bias,
