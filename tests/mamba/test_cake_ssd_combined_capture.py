@@ -21,7 +21,7 @@ limitations under the License.
 # outputs from the graph's private pool; a captured call refuses with
 # ``CakeSSDCombinedCaptureError`` only for a shape this runner never ran or
 # prepared and for a program never launched in this process; the workspace a
-# graph recorded is pinned.  GPU tests need SM100/SM103; the registry and the
+# graph recorded is pinned.  GPU tests need SM100, SM103 or SM107; the registry and the
 # capture logic are also exercised on CPU through a runner whose launcher is
 # captured and whose capture status is faked.
 
@@ -46,11 +46,12 @@ def _supported_device() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
         (10, 0),
         (10, 3),
+        (10, 7),
     )
 
 
 requires_blackwell = pytest.mark.skipif(
-    not _supported_device(), reason="Cake SSDCombined requires SM100 or SM103"
+    not _supported_device(), reason="Cake SSDCombined requires SM100, SM103 or SM107"
 )
 
 
@@ -273,7 +274,9 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
         family = "chunkpar"
     elif form == "triple_derived":
         family = (
-            "exactmeta" if torch.cuda.get_device_capability() == (10, 0) else "exactone"
+            "exactmeta"
+            if torch.cuda.get_device_capability() in ((10, 0), (10, 7))
+            else "exactone"
         )
     else:
         family = "exactfused"
@@ -620,7 +623,11 @@ def _cpu_runner(
     )
 
 
-_ROUTE_ARCHES = ("sm_100a", "sm_103a")
+_ROUTE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+# The architectures routing the seq_idx triple form deriving its table
+# through the light metadata stage (``exactmeta``): SM100 and SM107 (Rubin
+# runs the SM100 routing).
+_LIGHT_STAGE_ARCHES = ("sm_100a", "sm_107a")
 
 
 @pytest.mark.parametrize("arch", _ROUTE_ARCHES)
@@ -694,7 +701,7 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     )
     name, launch = calls[-1]
     assert name == runner.last_program_name
-    if arch == "sm_100a":
+    if arch in _LIGHT_STAGE_ARCHES:
         assert name == "exactmeta_bf16_varlen"
         assert launch["preprocess"]["sequence_offsets"] is table
         assert launch["preprocess_grid"] == (1, 1, 1)
@@ -791,7 +798,7 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
     family = module._PROGRAMS[prepared.program_name].family
     if form in ("cu_seqlens", "trusted"):
         assert family == "exactfused" and prepared.preprocess_grid == (0, 1, 1)
-    elif arch == "sm_100a":
+    elif arch in _LIGHT_STAGE_ARCHES:
         assert family == "exactmeta", (arch, form, prepared.program_name)
         assert prepared.preprocess_grid[0] >= 1
     else:
@@ -824,7 +831,7 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
 
 def test_prepare_and_run_refuse_other_capabilities_alike_without_gpu(monkeypatch):
     """Neither ``prepare`` nor ``run`` guesses a route for a device that is
-    not SM100 or SM103: both raise ``_target_arch``'s ``ValueError``."""
+    not SM100, SM103 or SM107: both raise ``_target_arch``'s ``ValueError``."""
 
     module = _module()
     target_arch = module._target_arch
@@ -840,9 +847,9 @@ def test_prepare_and_run_refuse_other_capabilities_alike_without_gpu(monkeypatch
         "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
         "num_seqs": 2,
     }
-    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
         runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **triple)
-    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
         runner.run(x, dt, A, B, C, **triple)
     assert calls == [] and loads == []
 
@@ -1089,7 +1096,7 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
     # Inside the window (2 sequences x 8 heads, 3 packed chunks): the program
     # of every form by capability, none on the pair program's grid.
     seqlen, num_seqs = 300, 2
-    derived = "exactmeta" if arch == "sm_100a" else "exactone"
+    derived = "exactmeta" if arch in _LIGHT_STAGE_ARCHES else "exactone"
     two_kernel = module.two_kernel_family(
         mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
     )
@@ -1098,7 +1105,7 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
         "trusted": "exactfused",
         "triple_i32": derived,
         "triple_i64": derived,
-        "publish": "exactmeta" if arch == "sm_100a" else two_kernel,
+        "publish": "exactmeta" if arch in _LIGHT_STAGE_ARCHES else two_kernel,
     }
     assert fused(
         nheads=8,

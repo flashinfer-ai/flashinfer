@@ -591,8 +591,8 @@ def test_cake_ssd_combined_route_matrix(
     d_has_hdim,
 ):
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(
         nheads=nheads,
@@ -618,8 +618,8 @@ def test_cake_ssd_combined_route_matrix(
 
 def test_cake_ssd_combined_accepts_framework_strided_input_views():
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(varlen=True)
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
@@ -654,8 +654,8 @@ def test_cake_ssd_combined_matches_cute_d_shape_coercion(
     d_has_hdim, runtime_d_has_hdim
 ):
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(d_has_hdim=d_has_hdim)
     d_shape = (8, 64) if runtime_d_has_hdim else (8,)
@@ -668,8 +668,8 @@ def test_cake_ssd_combined_matches_cute_d_shape_coercion(
 
 def test_cake_ssd_combined_updates_caller_buffers():
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(varlen=True)
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
@@ -718,7 +718,7 @@ def test_cake_ssd_combined_updates_caller_buffers():
     # program keeps its table private to each CTA, so that form keeps the
     # publishing route), its segment preprocess writes the buffer.
     program_publishing = cake.last_program_name
-    if capability == (10, 0):
+    if capability in ((10, 0), (10, 7)):
         assert program_publishing == program_derived
     else:
         _two_kernel_program(module, program_publishing, num_sequences=2, seqlen=256)
@@ -730,7 +730,7 @@ def test_cake_ssd_combined_updates_caller_buffers():
     # derived run of the same program; on SM103 bit-identical to a second
     # publishing run of the same two-kernel program into a fresh buffer and
     # allocated output storage.
-    if capability == (10, 0):
+    if capability in ((10, 0), (10, 7)):
         same_program = derived
     else:
         again_cumsum = torch.full_like(expected_cumsum, -1)
@@ -768,8 +768,8 @@ def test_cake_ssd_combined_updates_caller_buffers():
 @pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen"))
 def test_cake_ssd_combined_writes_selected_checkpoint_state(varlen, state_dtype):
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(
         varlen=varlen,
@@ -878,8 +878,8 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state(varlen, state_dtype)
 
 def test_cake_ssd_combined_allocation_output_lifetime():
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case()
     runner = SSDCombined(**constructor, backend="cake")
@@ -911,8 +911,8 @@ def test_cake_ssd_combined_f32_state_matches_cute_on_bf16_representable_states(
     recurrence and must be at least as accurate as CuTe's bf16 states."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(varlen=varlen, state_dtype=torch.float32)
     bf16_states = arguments["initial_states"].to(torch.bfloat16)
@@ -944,8 +944,8 @@ def test_cake_ssd_combined_accepts_unaligned_seqlen(varlen, lengths):
     in-kernel; the CuTe baseline runs on a zero-padded packed stream."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     if varlen:
         constructor, tensors, arguments = _case(varlen=True, lengths=lengths)
@@ -1034,8 +1034,8 @@ def test_cake_ssd_combined_accepts_short_total_tokens(varlen, lengths, state_dty
     rows; every other row stays under the 1 % default."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments, expected = _short_total_tokens_case(
         varlen, lengths, state_dtype
@@ -1065,8 +1065,8 @@ def test_cake_ssd_combined_short_call_after_nan_injection_is_clean():
     the TMA out-of-bounds zero fill, never from stale SMEM."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(varlen=True, lengths=(300,), seed=11)
     x, dt, A, B, C = tensors
@@ -1103,8 +1103,8 @@ def test_cake_ssd_combined_varlen_without_initial_states(lengths, count_source):
     sequence count comes from ``num_seqs`` or ``seq_chunk_cumsum``."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(
         varlen=True, lengths=lengths, initial_states=False
@@ -1124,8 +1124,8 @@ def test_cake_ssd_combined_varlen_without_initial_states(lengths, count_source):
 
 def test_cake_ssd_combined_varlen_without_initial_states_needs_a_count():
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(
         varlen=True, lengths=(128, 128), initial_states=False
@@ -1157,8 +1157,8 @@ def test_cake_ssd_combined_varlen_empty_sequences(
     and the fp64 recurrence; the status word stays clear."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(
         varlen=True,
@@ -1227,8 +1227,8 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(
     programs are judged."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(module, "two_kernel_family", lambda **_: family)
 
@@ -1246,7 +1246,7 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(
         # caller's buffer) to the ``exactmeta`` program: one program for both
         # calls, so the bitwise clause holds there without the family pin.
         # SM103 keeps the pinned two-kernel program.
-        fused = capability == (10, 0) and module.fused_selected(
+        fused = capability in ((10, 0), (10, 7)) and module.fused_selected(
             nheads=constructor.get("nheads", 8),
             num_sequences=num_seqs,
             nchunks=-(-max(lengths) // 128),
@@ -1549,8 +1549,8 @@ def _logical_chunk_metadata(lengths, extra_boundaries=()):
 
 def _skip_unless_cake_arch():
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
 
 def _assert_two_forms_p6(
@@ -2294,8 +2294,8 @@ def test_cake_ssd_combined_single_chunk_realistic_decay_has_no_nan(
     at least as accurate as CuTe's."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _realistic_decay_inputs(
         lengths, seed, varlen=varlen
@@ -2324,8 +2324,8 @@ def test_cake_ssd_combined_nemotron_accuracy_vs_recurrent_reference():
     (bf16 delta: 1.56 %, stock Triton: 0.62 %)."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _realistic_decay_inputs((1024,), 11)
     reference_out, reference_states = _fp64_reference(constructor, tensors, arguments)
@@ -2354,8 +2354,8 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
     the softplus-on rows stay under the 1 % default."""
 
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case(state_dtype=state_dtype)
     arguments["dt_softplus"] = dt_softplus
@@ -2377,10 +2377,10 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
 @pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen_metadata"))
 def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
     if any(
-        torch.cuda.get_device_capability(index) not in ((10, 0), (10, 3))
+        torch.cuda.get_device_capability(index) not in ((10, 0), (10, 3), (10, 7))
         for index in (0, 1)
     ):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     runners = []
     cases = []
@@ -2412,8 +2412,8 @@ def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
 
 def test_cake_ssd_combined_public_seq_chunk_cumsum_helpers():
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, _, arguments = _case(varlen=True)
     runner = SSDCombined(**constructor, backend="cake")
@@ -2486,8 +2486,8 @@ def test_cake_ssd_combined_public_seq_chunk_cumsum_helpers():
 @pytest.mark.parametrize("invalid", ["a_dtype", "out_shape"])
 def test_cake_ssd_combined_rejects_invalid_public_inputs_like_cute(invalid):
     capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake SSDCombined requires SM100, SM103 or SM107")
 
     constructor, tensors, arguments = _case()
     if invalid == "a_dtype":
@@ -2936,7 +2936,9 @@ def test_source_public_cake_constructor_rejects_non_exported_arch_without_gpu(
     cake_module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     cake_module._target_arch.cache_clear()
     try:
-        with pytest.raises(ValueError, match="requires SM100 or SM103, got SM110"):
+        with pytest.raises(
+            ValueError, match="requires SM100, SM103 or SM107, got SM110"
+        ):
             module.SSDCombined(128, 2, 64, 128, 1, backend="cake")
     finally:
         cake_module._target_arch.cache_clear()
@@ -3885,14 +3887,14 @@ def _cpu_forwarding_runner(module, monkeypatch, calls, **constructor):
 
 def _derived_family(module, lengths, *, nheads=8):
     """The family of the seq_idx triple form deriving a runner-owned table
-    inside the fused window on this device: ``exactmeta`` on SM100 (the light
-    metadata kernel then the fused main kernel, two launches), ``exactone`` on
+    inside the fused window on this device: ``exactmeta`` on SM100 and SM107
+    (the light metadata kernel then the fused main kernel, two launches), ``exactone`` on
     SM103 (the fused main kernel derives its table in a CTA prologue, one
     launch: the host interval between two launches hides a lighter stage
     there), the two-kernel program elsewhere."""
 
     capability = torch.cuda.get_device_capability()
-    if capability == (10, 0):
+    if capability in ((10, 0), (10, 7)):
         return "exactmeta"
     if capability == (10, 3):
         return "exactone"
@@ -3913,7 +3915,11 @@ def _two_kernel_program(module, name, *, num_sequences, seqlen):
     return family
 
 
-_ROUTE_ARCHES = ("sm_100a", "sm_103a")
+_ROUTE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+# The architectures routing the seq_idx triple form deriving its table
+# through the light metadata stage (``exactmeta``): SM100 and SM107 (Rubin
+# runs the SM100 routing).
+_LIGHT_STAGE_ARCHES = ("sm_100a", "sm_107a")
 
 
 @pytest.mark.parametrize("arch", _ROUTE_ARCHES)
@@ -3989,7 +3995,7 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case, arch):
         assert launch["preprocess_grid"] == (0, 1, 1)
         assert set(preprocess) == set(module._PREPROCESS_ARGS)
         assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
-    elif arch == "sm_100a":
+    elif arch in _LIGHT_STAGE_ARCHES:
         assert name == "exactmeta_bf16_varlen"
         assert launch["preprocess_grid"] == (1, 1, 1)  # 3 segments, 256 threads
         assert set(preprocess) == set(module._METADATA_ARGS)
@@ -4794,6 +4800,32 @@ def test_source_program_table_names_shipped_sources():
     assert set(module._CHUNKPAR3_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar3_")
     }
+    # The sm_107a (Rubin) module table: every exported program except the
+    # retained start ``exact_*`` programs and the SM103-only ``exactone_*``
+    # programs, each entry the fold module's stem under its own identity (the
+    # export's content hash, or the pending token before the export fills
+    # it); an ``exactmeta_*`` entry equals its ``exactfused_*`` varlen twin.
+    assert set(module._SM107_MODULES) == {
+        name
+        for name in module._PROGRAMS
+        if not name.startswith(("exact_", "exactone_"))
+    }
+    assert len(module._SM107_MODULES) == 48
+    for name, identity in module._SM107_MODULES.items():
+        stem, suffix = identity.rsplit("_", 1)
+        assert stem == module._PROGRAMS[name].main.module.rsplit("_", 1)[0], name
+        assert suffix == module._PENDING_EXPORT or re.fullmatch(r"[0-9a-f]+", suffix), (
+            name
+        )
+    assert {
+        name.replace("exactfused_", "exactmeta_", 1): shared
+        for name, shared in module._SM107_MODULES.items()
+        if name.startswith("exactfused_") and "_varlen" in name
+    } == {
+        name: shared
+        for name, shared in module._SM107_MODULES.items()
+        if name.startswith("exactmeta_")
+    }
     pending = sorted(
         name
         for name, program in module._PROGRAMS.items()
@@ -4921,6 +4953,29 @@ def test_source_program_table_names_shipped_sources():
                 rf"\b{kernel.kernel}\(", source.read_text(encoding="utf-8")
             )
             device_sources.add(source)
+        # The sm_107a render of the program (``_SM107_MODULES``): the same
+        # kernel symbol behind the shared preprocess, in its own device source
+        # once the Cake export has filled the identity; a pending identity
+        # ships no source and ``_require_exported`` refuses it by name.
+        rubin = module._arch_program(name, "sm_107a")
+        assert rubin.main.kernel == program.main.kernel
+        assert rubin.preprocess is program.preprocess
+        if name not in module._SM107_MODULES:
+            assert rubin is program
+        else:
+            assert rubin.main.module == module._SM107_MODULES[name]
+            if module._PENDING_EXPORT in rubin.main.module:
+                with pytest.raises(RuntimeError, match=f"{name} for sm_107a is not"):
+                    module._require_exported(name, rubin, "sm_107a")
+            else:
+                assert rubin.main.module != program.main.module
+                module._require_exported(name, rubin, "sm_107a")
+                source = source_dir / module._DEVICE_DIR / rubin.main.source
+                assert source.is_file(), source
+                assert re.search(
+                    rf"\b{rubin.main.kernel}\(", source.read_text(encoding="utf-8")
+                )
+                device_sources.add(source)
         template = templates[family]
         rendered = module._render_host_source(template, name, program)
         assert all(placeholder in template for placeholder in _HOST_PLACEHOLDERS)
@@ -4950,13 +5005,20 @@ def test_source_program_table_names_shipped_sources():
     # main sources (six ring + six ``_noring``), twelve fused ``exactfused``
     # main sources (the six varlen ones also serving ``exactmeta``), six
     # one-launch ``exactone`` main sources (the SM103 render of the fused
-    # varlen entries, the only architecture-specific files), eighteen
+    # varlen entries), eighteen
     # two-kernel ``exactpre`` main sources (six ring, six ``_noring``, six
     # ``_tail``), six look-back (``chunkpar``) and six three-phase
     # (``chunkpar3``) chunk-parallel main sources plus the segment preprocess
-    # and the packed-varlen metadata kernel, no other architecture copies and
-    # no orphans.
-    assert len(device_sources) == 62
+    # and the packed-varlen metadata kernel; plus one sm_107a (Rubin) render
+    # per filled ``_SM107_MODULES`` identity (42 once the export has filled
+    # the table: the six ``exactmeta`` entries share their ``exactfused``
+    # twins' files), no other architecture copies and no orphans.
+    rubin_sources = {
+        identity
+        for identity in module._SM107_MODULES.values()
+        if module._PENDING_EXPORT not in identity
+    }
+    assert len(device_sources) == 62 + len(rubin_sources)
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -4975,6 +5037,10 @@ def test_active_source_package_declares_cuda_half_types_explicitly():
         for program in module._PROGRAMS.values()
         for kernel in program.kernels
         if module._PENDING_EXPORT not in kernel.module
+    } | {
+        f"{identity}.cu"
+        for identity in module._SM107_MODULES.values()
+        if module._PENDING_EXPORT not in identity
     }
     assert sources
     for name in sorted(sources):
@@ -5312,6 +5378,13 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     other = quantities(8, 16, (12, 0))
     assert other["capability"] == (12, 0)
     assert other["predicted_us"] == small["predicted_us"]
+    # Rubin (10, 7) is a target without a calibrated row in either table: the
+    # B200 constants until a calibration run on Rubin fills its rows.
+    assert (10, 7) in module._TARGET_ARCHS
+    assert (10, 7) not in model and (10, 7) not in three_phase
+    rubin = quantities(8, 16, (10, 7), sm_count=212)
+    assert rubin["capability"] == (10, 7) and rubin["sm_count"] == 212
+    assert rubin["predicted_us"] == small["predicted_us"]
 
 
 @pytest.mark.parametrize("form", ("triple", "cu_seqlens"))
@@ -5605,6 +5678,178 @@ def test_source_unexported_program_refuses_to_build(monkeypatch, tmp_path, gap):
     message = str(excinfo.value)
     assert name in message and "export_cake_mamba_ssd_combined" in message
     assert not any(tmp_path.iterdir())
+
+
+def test_source_sm107_lookup_shadows_the_fold_main_module():
+    """``_main_module`` / ``_arch_program``: on sm_107a (Rubin) a program in
+    ``_SM107_MODULES`` builds the table module -- the same kernel symbol,
+    thread count and build flags behind the shared preprocess, host template
+    and SMEM literal -- and every other program (the retained start
+    ``exact_*`` and the SM103-only ``exactone_*`` programs) its fold module;
+    sm_100a and sm_103a always build the fold module.  ``_TARGET_ARCHS``
+    names the three capabilities, the seq_idx triple form deriving its table
+    routes SM107 like SM100 (the light metadata stage), the look-back program
+    balances against Rubin's 212 SMs and the cost model has no Rubin row yet
+    (the B200 constants until a calibration on Rubin fills it)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._TARGET_ARCHS == {
+        (10, 0): "sm_100a",
+        (10, 3): "sm_103a",
+        (10, 7): "sm_107a",
+    }
+    assert module._ARCH_CAPABILITIES["sm_107a"] == (10, 7)
+    assert module._SM107_ARCH == "sm_107a"
+    assert module._LIGHT_STAGE_CAPABILITIES == ((10, 0), (10, 7))
+    assert module._ONE_LAUNCH_CAPABILITIES == ((10, 3),)
+    assert module._CHUNK_PARALLEL_VCOUNT_BY_ARCH == {
+        (10, 0): 148,
+        (10, 3): 152,
+        (10, 7): 212,
+    }
+    assert module._chunk_parallel_vcount((10, 7)) == 212
+    assert (10, 7) not in module._CHUNK_PARALLEL_COST_MODEL_US
+    assert (10, 7) not in module._THREE_PHASE_COST_MODEL_US
+    for name, program in module._PROGRAMS.items():
+        for arch in ("sm_100a", "sm_103a"):
+            assert module._main_module(name, arch) == program.main.module
+            assert module._arch_program(name, arch) is program
+        rubin = module._arch_program(name, "sm_107a")
+        if name.startswith(("exact_", "exactone_")):
+            assert name not in module._SM107_MODULES
+            assert module._main_module(name, "sm_107a") == program.main.module
+            assert rubin is program
+            continue
+        expected = module._SM107_MODULES[name]
+        assert module._main_module(name, "sm_107a") == expected
+        assert rubin.main == module._scan(expected)
+        assert rubin.main.kernel == program.main.kernel
+        assert rubin.main.threads == 512 and rubin.main.fast_math
+        assert rubin.preprocess is program.preprocess
+        assert module.replace(rubin, main=program.main) == program
+
+
+@pytest.mark.parametrize("state", ("pending", "filled"))
+def test_source_sm107_program_builds_its_table_module_or_refuses_pending(
+    monkeypatch, tmp_path, state
+):
+    """On sm_107a the loader builds the program's ``_SM107_MODULES`` entry,
+    never its fold source: a pending identity is refused by name and
+    architecture before any source is read or nvcc is resolved (the fold
+    module of the same program still passes ``_require_exported`` for
+    sm_100a); a filled identity is compiled with ``-arch=sm_107a`` from its
+    own device file and embedded under its own module name next to the
+    shared preprocess cubin.  The table entry is overridden here, so both
+    states hold before and after the Cake export fills the table."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    name = "exactfused_bf16_batched"
+    fold = module._PROGRAMS[name]
+    stem = fold.main.module.rsplit("_", 1)[0]
+    suffix = module._PENDING_EXPORT if state == "pending" else "0123456789"
+    identity = f"{stem}_{suffix}"
+    monkeypatch.setitem(module._SM107_MODULES, name, identity)
+    monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
+    module._load_generated_program.cache_clear()
+    rubin = module._arch_program(name, "sm_107a")
+    assert rubin.main.module == identity and rubin.main.kernel == fold.main.kernel
+    if state == "pending":
+        monkeypatch.setattr(
+            module,
+            "_nvcc",
+            lambda: pytest.fail("nvcc resolved for a pending sm_107a program"),
+        )
+        module._require_exported(name, module._arch_program(name, "sm_100a"), "sm_100a")
+        with pytest.raises(RuntimeError, match="not exported yet") as excinfo:
+            module._load_generated_program(name, "sm_107a")
+        module._load_generated_program.cache_clear()
+        message = str(excinfo.value)
+        assert f"{name} for sm_107a" in message and identity in message
+        assert "export_cake_mamba_ssd_combined" in message
+        assert not any(tmp_path.iterdir())
+        return
+
+    # The fake source tree holds the shared preprocess and the sm_107a main
+    # source only: reading the fold source would fail.
+    device_dir = tmp_path / module._DEVICE_DIR
+    device_dir.mkdir(parents=True)
+    for kernel in rubin.kernels:
+        (device_dir / kernel.source).write_text(
+            f"{kernel.kernel} source\n", encoding="utf-8"
+        )
+    host = tmp_path / fold.host_template
+    host.parent.mkdir(parents=True)
+    host.write_text(
+        "namespace host_CAKE_SSD_PROGRAM {}\n"
+        "TVM_FFI_EMBED_CUBIN(CAKE_SSD_PREPROCESS_MODULE);\n"
+        "TVM_FFI_EMBED_CUBIN(CAKE_SSD_MAIN_MODULE);\n"
+        "CAKE_SSD_PREPROCESS_KERNEL CAKE_SSD_PREPROCESS_THREADS CAKE_SSD_MAIN_KERNEL "
+        "CAKE_SSD_STATE_DTYPE_CODE CAKE_SSD_STATE_DTYPE_BITS CAKE_SSD_MAIN_SMEM_BYTES\n",
+        encoding="utf-8",
+    )
+    nvcc = tmp_path / "cuda" / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.touch()
+    calls, load_calls = [], []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        module.Path(command[-1]).write_bytes(module.Path(command[-3]).read_bytes())
+        return SimpleNamespace(returncode=0, stderr="")
+
+    def load_inline(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
+    monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+
+    module._load_generated_program(name, "sm_107a")
+    module._load_generated_program.cache_clear()
+
+    assert [command[-3] for command in calls] == [
+        str(device_dir / kernel.source) for kernel in rubin.kernels
+    ]
+    assert all("-arch=sm_107a" in command for command in calls)
+    ((args, kwargs),) = load_calls
+    assert args[0].startswith(f"cake_mamba_ssd_{name}_sm_107a_")
+    rendered = kwargs["cpp_sources"]
+    assert f"TVM_FFI_EMBED_CUBIN({identity});" in rendered
+    assert f"TVM_FFI_EMBED_CUBIN({fold.main.module});" not in rendered
+    assert f"{fold.main.kernel} 4 16 {fold.main_smem_bytes}" in rendered
+    assert set(kwargs["embed_cubin"]) == {fold.preprocess.module, identity}
+    assert (tmp_path / "jit" / args[0] / f"{identity}.cubin").is_file()
+
+
+def test_source_sm107_forward_binds_the_rubin_vcount_without_gpu(monkeypatch):
+    """Forced chunk-parallel on an sm_107a device, the look-back program
+    balances its item-major tile range against Rubin's 212 SMs (V = 212
+    virtual CTA ranges, one aggregate per range) and caps the main grid at
+    the device's SM count."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module, monkeypatch, calls, nheads=8, ngroups=8, arch="sm_107a"
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
+    seqlen = 32768  # 256 chunks x 8 heads = 2048 tiles
+    x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+
+    runner.run(x, dt, A, B, torch.empty_like(B))
+
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "chunkpar_bf16_batched"
+    assert launch["main_grid"] == (212, 1, 1)
+    main = launch["main"]
+    assert main["vcount"] == 212 == module._CHUNK_PARALLEL_VCOUNT_BY_ARCH[(10, 7)]
+    assert tuple(main["agg_work"].shape) == (212 * (64 * 128 + 1),)
 
 
 def test_source_chunk_parallel_program_builds_from_its_own_template(
@@ -6993,7 +7238,7 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
     runner.run(x, dt, A, B, C, **triple)
     name, launch = calls[-1]
     assert name == runner.last_program_name
-    if arch == "sm_100a":
+    if arch in _LIGHT_STAGE_ARCHES:
         # ... the triple form deriving the table runs the exactmeta program:
         # the metadata stage (3 segments -> one 256-thread CTA) publishes the
         # runner's vector, which the fused main kernel reads
@@ -7053,7 +7298,7 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
     assert name == runner._workspaces.get(key(False, True)).workspace["program"]
     assert module._PROGRAMS[name].family == (
         "exactmeta"
-        if arch == "sm_100a"
+        if arch in _LIGHT_STAGE_ARCHES
         else module.two_kernel_family(
             mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
         )
@@ -7122,8 +7367,8 @@ def test_source_varlen_triple_form_routes_by_capability(monkeypatch, arch):
     two_kernel = module.two_kernel_family(
         mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
     )
-    derived = "exactmeta" if arch == "sm_100a" else "exactone"
-    published = "exactmeta" if arch == "sm_100a" else two_kernel
+    derived = "exactmeta" if arch in _LIGHT_STAGE_ARCHES else "exactone"
+    published = "exactmeta" if arch in _LIGHT_STAGE_ARCHES else two_kernel
     forms = (
         ("cu_seqlens", torch.int32),
         ("triple_i32", torch.int32),
@@ -7279,9 +7524,9 @@ def test_source_other_capabilities_are_refused_before_routing(monkeypatch):
         "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
         "num_seqs": 2,
     }
-    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
         runner.run(x, dt, A, B, C, **triple)
-    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
         runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **triple)
     assert calls == []
 
