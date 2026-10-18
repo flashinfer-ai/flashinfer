@@ -540,8 +540,8 @@ def _build_plan(
     t_kernel = f"t_precompute{dtype_suffix}"
     # The cu32 Stage-1 variant reads the caller's int32 prefix sums and
     # publishes the int64 copy the later stages read, removing the per-launch
-    # host cast.  It is selected before any alias rule and only where Stage 1
-    # runs and the architecture ships the program.
+    # host cast.  It is selected only where Stage 1 runs and the architecture
+    # ships the program.
     stage1_publishes_cu_seqlens = (
         cu_seqlens_dtype == torch.int32
         and total_tokens > 0
@@ -549,20 +549,6 @@ def _build_plan(
     )
     if stage1_publishes_cu_seqlens:
         t_kernel = f"{t_kernel}_cu32"
-    elif (
-        q.dtype == torch.float16
-        and arch == "sm_103a"
-        and hk == 16
-        and (
-            (num_seqs == 1 and total_tokens == 65536 and num_sab_heads == 48)
-            or (
-                num_seqs == 2
-                and total_tokens != num_seqs * max_seqlen
-                and num_sab_heads in (48, 64)
-            )
-        )
-    ):
-        t_kernel = "t_precompute_gb300_hv48_min6"
     # Without reading prefix-sum payloads, the full-block path is provably safe
     # only when the host bound and total force every sequence to have the same
     # aligned length. All other batches use the tail-safe generic kernel.
@@ -578,15 +564,6 @@ def _build_plan(
         prefill_kernel = f"cp_prefill_generic{dtype_suffix}"
     else:
         prefill_kernel = f"cp_prefill{dtype_suffix}"
-    # The terminal-semantics-off FP16 variants reproduce the current native
-    # dispatcher on B200.  They are named ``*_checkpoint`` in the frozen
-    # inventory because checkpointing first exposed this schedule distinction.
-    if arch == "sm_100a" and q.dtype == torch.float16:
-        prefill_kernel = {
-            "cp_prefill": "cp_prefill_checkpoint",
-            "cp_prefill_equal_head": "cp_prefill_equal_head_checkpoint",
-            "cp_prefill_generic": "cp_prefill_generic_checkpoint",
-        }[prefill_kernel]
     return GDNCPPrefillPlan(
         arch=arch,
         io_dtype=q.dtype,

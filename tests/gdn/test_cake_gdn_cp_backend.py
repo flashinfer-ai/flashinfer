@@ -109,7 +109,7 @@ def test_programs_shared_across_arches_serve_the_same_logical_kernels() -> None:
     ("arch", "hq", "hv", "expected_t", "expected_chunk", "expected_source"),
     [
         ("sm_100a", 16, 48, "t_precompute", None, None),
-        ("sm_103a", 16, 48, "t_precompute_gb300_hv48_min6", None, None),
+        ("sm_103a", 16, 48, "t_precompute", None, None),
         ("sm_103a", 16, 64, "t_precompute", 4096, 32768),
         ("sm_103a", 32, 32, "t_precompute", None, None),
     ],
@@ -145,31 +145,13 @@ def test_long_row_dispatch_is_exact(
 @pytest.mark.parametrize(
     ("arch", "seq_lens", "dtype", "heads", "expected_prefill"),
     [
-        (
-            "sm_100a",
-            (128,),
-            torch.float16,
-            (1, 1, 1),
-            "cp_prefill_equal_head_checkpoint",
-        ),
-        (
-            "sm_100a",
-            (128,),
-            torch.float16,
-            (32, 32, 32),
-            "cp_prefill_equal_head_checkpoint",
-        ),
+        ("sm_100a", (128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
+        ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
         ("sm_107a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
-        (
-            "sm_100a",
-            (128, 129),
-            torch.float16,
-            (4, 2, 2),
-            "cp_prefill_generic_checkpoint",
-        ),
+        ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
     ],
 )
 def test_generic_plan_selects_head_dtype_and_tail_routes(
@@ -626,7 +608,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
         "host_stages",
     ),
     [
-        # GB300 fp16 Hk16 alias class: the cu32 rule wins over the alias for int32 ...
+        # GB300 fp16 Hk16 class: int32 prefix sums select the cu32 program ...
         (
             "sm_103a",
             torch.float16,
@@ -637,7 +619,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
             "t_precompute_cu32",
             False,
         ),
-        # ... and int64 keeps today's alias.
+        # ... and int64 keeps the plain Stage-1 program.
         (
             "sm_103a",
             torch.float16,
@@ -645,7 +627,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
             (1536, 257),
             1536,
             torch.int64,
-            "t_precompute_gb300_hv48_min6",
+            "t_precompute",
             False,
         ),
         (
@@ -702,7 +684,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
         ),
     ],
 )
-def test_build_plan_selects_cu32_before_the_gb300_alias(
+def test_build_plan_selects_cu32_only_for_int32_where_shipped(
     monkeypatch: pytest.MonkeyPatch,
     arch: str,
     io_dtype: torch.dtype,
@@ -2281,10 +2263,7 @@ def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
             assert prepared.plan.t_kernel == f"{expected_t}_cu32"
             assert prepared.plan.host_stages_cu_seqlens is False
         else:
-            assert prepared.plan.t_kernel in (
-                expected_t,
-                "t_precompute_gb300_hv48_min6",
-            )
+            assert prepared.plan.t_kernel == expected_t
             assert prepared.cu_seqlens is cu_seqlens
         assert torch.equal(prepared.cu_seqlens, prefix)
         assert torch.equal(cu_seqlens, prefix.to(cu_dtype))
