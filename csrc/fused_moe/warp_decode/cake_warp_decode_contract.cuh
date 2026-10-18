@@ -1090,7 +1090,6 @@ struct KernelLaunch {
   dim3 cluster;
   size_t dynamic_smem_bytes;
   bool programmatic_dependent_launch;
-  bool allow_oversized_smem;
   bool cooperative;
   bool spread_cluster;
   KernelSubmit submit;

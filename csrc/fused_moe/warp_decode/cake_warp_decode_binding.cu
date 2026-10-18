@@ -513,12 +513,6 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
     attributes[attribute_count].val.cooperative = 1;
     ++attribute_count;
   }
-  // EnsureDeviceReady opts each supported kernel into its exact dynamic
-  // shared-memory size and rejects requests above the device opt-in ceiling.
-  // Preserve the default launch mode so CUDA uses that function attribute,
-  // matching the source launch; a second per-launch nonportable override is
-  // unnecessary for this export contract.
-  (void)launch.allow_oversized_smem;
 
   cudaLaunchConfig_t config{};
   config.gridDim = launch.grid;
