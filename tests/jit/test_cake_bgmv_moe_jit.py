@@ -302,6 +302,10 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     # bf16 rank-32 bundle binds its merge-in-expand record, every other combination the
     # shared body.
     metadata = cake_bgmv_moe._generic_metadata(rank, dtype, arch)
+    # The compute-capability-10.7 bf16 rank-32 record binds its own unfolded body,
+    # which still renders the kernels the shared bodies dropped (the binding never
+    # launches them); the shared bodies carry the trimmed kernel set.
+    shared_body = not metadata.body.endswith("_sm107a.cu")
 
     assert spec.name == uri
     assert (
@@ -329,12 +333,19 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER ",
-        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD ",
     ):
         assert macro in body
+    # The register-direct grouped shrink is rendered for fp16 only (the bf16
+    # bundles always select a ring form), so only the fp16 bodies carry its
+    # smem constant; the unfolded sm107a record keeps the constant with the
+    # kernel (its module never selects the direct form).
+    direct_smem = "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED 512\n"
+    assert (direct_smem in body) == (
+        cake_bgmv_moe._dtype_tag(dtype) == "f16" or not shared_body
+    )
     # Route-index publication in the eight shrink kernels plus the three grouping
     # counters (shared-memory histogram and fill counters, per-token route
     # counters) in group_hist / group_scatter and the two block-local bin
@@ -594,45 +605,70 @@ def test_grouped_workspace_sizing_and_selector():
     assert select(8192, 4096, 8, 128, 1024, 16)
     assert select(8192, 4096, 8, 128, 2048, 16)
     assert select(8192, 4096, 8, 128, 768, 32)
-    for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS:
-        metadata = cake_bgmv_moe._generic_metadata(rank, "bfloat16")
-        body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
-        for symbol in (
-            metadata.group_hist_symbol,
-            metadata.group_scan_symbol,
-            metadata.group_scatter_symbol,
-            metadata.shrink_grouped_symbol,
-            metadata.shrink_grouped_single_symbol,
-            metadata.shrink_grouped_ring_symbol,
-            metadata.shrink_grouped_ring_single_symbol,
-            metadata.shrink_grouped_ring_mixed_symbol,
-            metadata.shrink_grouped_ring_mixed_single_symbol,
-            metadata.expand_grouped_symbol,
-            metadata.combine_grouped_symbol,
-            metadata.order_build_symbol,
-        ):
-            assert body.count(f"{symbol}(") == 1, symbol
-        for macro in (
-            "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED",
-            "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD",
-        ):
-            assert f"#define {macro} " in body, macro
-        # Lever 3: the ring form stages two K tiles of x + weight rows (49664 B) behind the
-        # 512 B reduction scratch of the direct form.
-        assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED 512\n" in body
-        assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING 49664\n" in body
-        # Lever 34: the mixed-precision form stages the weight rows only (two 16 KiB K tiles).
-        assert (
-            "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED 33280\n"
-            in body
-        )
+    for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES:
+        tag = cake_bgmv_moe._dtype_tag(dtype)
+        for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS:
+            metadata = cake_bgmv_moe._generic_metadata(rank, dtype)
+            body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
+            # Every kernel the grouped pipeline can launch is defined exactly once
+            # (aliased macros name another kernel of this list).
+            for symbol in (
+                metadata.group_hist_symbol,
+                metadata.group_scan_symbol,
+                metadata.group_scatter_symbol,
+                metadata.shrink_grouped_symbol,
+                metadata.shrink_grouped_single_symbol,
+                metadata.shrink_grouped_ring_symbol,
+                metadata.shrink_grouped_ring_single_symbol,
+                metadata.shrink_grouped_ring_mixed_symbol,
+                metadata.shrink_grouped_ring_mixed_single_symbol,
+                metadata.expand_grouped_symbol,
+                metadata.combine_grouped_symbol,
+                metadata.order_build_symbol,
+            ):
+                assert body.count(f"{symbol}(") == 1, symbol
+            # The register-direct grouped shrink is rendered for fp16 only: the
+            # bf16 bundles always select a ring form (lever 3c on sm90a, lever 34
+            # elsewhere), so their alias resolves to the ring kernel. No bundle
+            # renders the one-rank-tile direct form (the host policy never selects
+            # one rank tile for the direct form); its alias resolves to the
+            # single-tile ring kernel (bf16) or the direct kernel (fp16).
+            prefix = "kernel_flashinfer_bgmv_moe_shrink_grouped"
+            direct = f"{prefix}_{tag}_r{rank}"
+            assert f"{prefix}_single_{tag}_r{rank}(" not in body
+            direct_smem = "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED "
+            ring = metadata.shrink_grouped_ring_symbol
+            ring_single = metadata.shrink_grouped_ring_single_symbol
+            if tag == "bf16":
+                assert f"{direct}(" not in body
+                assert metadata.shrink_grouped_symbol == ring
+                assert metadata.shrink_grouped_single_symbol == ring_single
+                assert direct_smem not in body
+            else:
+                assert body.count(f"{direct}(") == 1
+                assert metadata.shrink_grouped_symbol == direct
+                assert metadata.shrink_grouped_single_symbol == direct
+                # 512 B reduction scratch of the direct form.
+                assert f"{direct_smem}512\n" in body
+            for macro in (
+                "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST",
+                "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN",
+                "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER",
+                "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING",
+                "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED",
+                "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED",
+                "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD",
+            ):
+                assert f"#define {macro} " in body, macro
+            # Lever 3: the ring form stages two K tiles of x + weight rows (49664 B).
+            ring_smem = "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING 49664\n"
+            assert ring_smem in body
+            # Lever 34: the mixed-precision form (bf16 only) stages the weight rows
+            # only (two 16 KiB K tiles).
+            mixed_smem = (
+                "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED 33280\n"
+            )
+            assert (mixed_smem in body) == (tag == "bf16")
 
 
 def test_order_remap_selector_and_workspace():

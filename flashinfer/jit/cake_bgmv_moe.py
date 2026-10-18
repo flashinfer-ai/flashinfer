@@ -664,11 +664,23 @@ def _generic_metadata(
         group_hist_symbol=f"kernel_flashinfer_bgmv_moe_group_hist_{tag}_r{rank}",
         group_scan_symbol=f"kernel_flashinfer_bgmv_moe_group_scan_{tag}_r{rank}",
         group_scatter_symbol=f"kernel_flashinfer_bgmv_moe_group_scatter_{tag}_r{rank}",
-        shrink_grouped_symbol=f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}",
-        # Lever 20k: one-rank-tile-per-CTA form (rank 8 has one rank tile: same kernel).
+        # The register-direct grouped shrink is rendered for fp16 only: the bf16 bundles always
+        # select a ring form (lever 3c on sm90a, lever 34 elsewhere), so their alias resolves to
+        # the ring kernel.
+        shrink_grouped_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+            if tag == "bf16"
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}"
+        ),
+        # Lever 20k: the one-rank-tile-per-CTA direct form is not rendered (the host policy never
+        # selects one rank tile for the direct form); the alias resolves to the single-tile ring
+        # kernel (bf16; rank 8 has one rank tile: the ring kernel itself) or the direct kernel
+        # (fp16).
         shrink_grouped_single_symbol=(
-            f"kernel_flashinfer_bgmv_moe_shrink_grouped_single_{tag}_r{rank}"
-            if rank > 8
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_single_{tag}_r{rank}"
+            if tag == "bf16" and rank > 8
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+            if tag == "bf16"
             else f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}"
         ),
         # Lever 3: cp.async operand-ring forms (the binding launches them when hidden spans more

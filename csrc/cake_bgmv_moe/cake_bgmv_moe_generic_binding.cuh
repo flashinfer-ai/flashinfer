@@ -193,9 +193,16 @@ constexpr int32_t kGroupCombineThreads = 256;
 constexpr int32_t kGroupHistSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST;
 constexpr int32_t kGroupScanSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN;
 constexpr int32_t kGroupScatterSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER;
-constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
 // Lever 3: the cp.async operand-ring grouped shrink stages two K tiles of x and weight rows.
 constexpr int32_t kShrinkGroupedRingSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING;
+// The register-direct grouped shrink is rendered for fp16 only (the bf16 bundles always select a
+// ring form: lever 3c on sm_90a, lever 34 elsewhere); the bf16 aliases resolve to the ring kernels
+// and share their smem.
+#ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED
+constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
+#else
+constexpr int32_t kShrinkGroupedSmemBytes = kShrinkGroupedRingSmemBytes;
+#endif
 // Lever 34: the mixed-precision form's ring holds the weight rows only (fp16 bundles render no
 // mixed form; their aliases resolve to the ring kernels and share its smem).
 #ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED
@@ -343,6 +350,8 @@ void Configure() {
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkPrefillS3SmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE three-stage prefill shrink, PDL form)");
+#ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED
+  // The register-direct form (fp16 bundles only; CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE aliases it).
   TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkGroupedSmemBytes)
       << "Cake BGMV MoE grouped shrink requires " << kShrinkGroupedSmemBytes
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
@@ -351,11 +360,7 @@ void Configure() {
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkGroupedSmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink)");
-  // Lever 20k: the one-rank-tile-per-CTA form shares the launch constants (rank 8: same kernel).
-  CheckCuda(
-      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkGroupedSmemBytes),
-      "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, single rank tile)");
+#endif
   // Lever 3: the operand-ring forms exceed the default 48 KiB carveout.
   TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkGroupedRingSmemBytes)
       << "Cake BGMV MoE grouped shrink (operand ring) requires " << kShrinkGroupedRingSmemBytes
