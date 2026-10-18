@@ -10,7 +10,6 @@ def prepare_sparse_mqa_metadata(
     fmt="mxfp4",
     sparse_block_kv=8,
     page_kv=64,
-    use_unaligned_ks=False,
     starts=None,
     ends=None,
     num_kv_tokens=0,
@@ -24,6 +23,10 @@ def prepare_sparse_mqa_metadata(
 
     Returns a reusable plan. plan.run() generates metadata on the current stream.
     See SparseMetadataPlan for the contiguous/paged input and packed buffer ABI.
+    There is no use_unaligned_ks keyword. The former one accepted only False
+    (truthy values raised); passing it at all, including use_unaligned_ks=False,
+    now raises TypeError. Remove the keyword from existing calls (the exported
+    programs serve aligned windows).
     """
     from .experimental.deepgemm_sparse_mqa.sparse_mqa import SparseMetadataPlan
 
@@ -32,7 +35,6 @@ def prepare_sparse_mqa_metadata(
         fmt=fmt,
         sparse_block_kv=sparse_block_kv,
         page_kv=page_kv,
-        use_unaligned_ks=use_unaligned_ks,
         starts=starts,
         ends=ends,
         num_kv_tokens=num_kv_tokens,
