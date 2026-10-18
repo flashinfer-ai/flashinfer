@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -254,6 +255,80 @@ def test_variant_routing_by_token_count(hidden_size, num_tokens, expected):
     )
     # Support queries (no token count) keep the specialized answer.
     assert cake_bgmv_moe.cake_bgmv_moe_variant(3072, 32) == "specialized"
+
+
+def test_sm90a_never_selects_the_specialized_bodies():
+    # Hopper has no specialized token window, so every token count takes the
+    # generic bundle; the AOT list below therefore skips sm90a.
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW["sm90a"] is None
+    variant = cake_bgmv_moe.cake_bgmv_moe_variant
+    for hidden_size in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
+        for num_tokens in (*range(1, 4097), 1 << 16, 1 << 20):
+            assert variant(hidden_size, 32, num_tokens, "sm90a") == "generic"
+
+
+def test_aot_prebuilds_the_bundles_only_for_windowed_arches(monkeypatch):
+    from flashinfer import aot
+
+    # Stub every module generator so only the registration logic runs.
+    for attr in dir(aot):
+        if attr.startswith("gen_") and "_module" in attr and attr != "gen_all_modules":
+            result = [] if attr.endswith("_modules") else SimpleNamespace(name=attr)
+            monkeypatch.setattr(
+                aot, attr, lambda *args, _result=result, **kwargs: _result
+            )
+    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
+    specialized = []
+    generic = []
+
+    def fake_specialized(hidden_size, dtype, arch):
+        specialized.append((hidden_size, dtype, arch))
+        return SimpleNamespace(name=f"specialized_{hidden_size}_{dtype}_{arch}")
+
+    def fake_generic(rank, dtype, arch):
+        generic.append((rank, dtype, arch))
+        return SimpleNamespace(name=f"generic_{rank}_{dtype}_{arch}")
+
+    monkeypatch.setattr(aot, "gen_cake_bgmv_moe_module", fake_specialized)
+    monkeypatch.setattr(aot, "gen_cake_bgmv_moe_generic_module", fake_generic)
+
+    aot.gen_all_modules(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        {f"{arch}_exact": True for arch in cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES},
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+    )
+
+    windowed = [
+        arch
+        for arch in cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES
+        if cake_bgmv_moe.CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW[arch] is not None
+    ]
+    assert windowed == ["sm100a", "sm103a", "sm107a"]
+    assert specialized == [
+        (hidden_size, dtype, arch)
+        for arch in windowed
+        for hidden_size in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES
+        for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES
+    ]
+    # The generic fallback bundle is prebuilt for the same arches; sm90a has no
+    # AOT capability flag and is JIT-compiled on first use.
+    assert generic == [
+        (rank, dtype, arch)
+        for arch in windowed
+        for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS
+        for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES
+    ]
 
 
 def test_pdl_mode_policy():

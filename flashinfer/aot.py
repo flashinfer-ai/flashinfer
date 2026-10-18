@@ -847,8 +847,9 @@ def gen_all_modules(
         # Multi-LoRA MoE BGMV kernel
         if has_bgmv_moe:
             jit_specs.append(gen_bgmv_moe_module())
+        # No sm90a row: its specialized token window is None (the generic bundle
+        # always serves there) and detect_sm_capabilities() has no sm90a flag.
         for cake_bgmv_arch, cake_bgmv_flag in (
-            ("sm90a", "sm90a_exact"),
             ("sm100a", "sm100a_exact"),
             ("sm103a", "sm103a_exact"),
             ("sm107a", "sm107a_exact"),
