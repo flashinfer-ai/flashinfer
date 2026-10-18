@@ -445,6 +445,8 @@ void append_paged_kv_cache_with_slot_mapping(TensorView append_key, TensorView a
   TVM_FFI_ICHECK_GE(append_key.size(0), nnz);
   TVM_FFI_ICHECK_GE(append_value.size(0), nnz);
 
+  TVM_FFI_ICHECK_GT(page_size, 0) << "page_size must be positive";
+
   QKVLayout kv_layout = QKVLayout(layout);
   unsigned int num_heads, head_dim;
   head_dim = paged_k_cache.size(3);
@@ -457,6 +459,8 @@ void append_paged_kv_cache_with_slot_mapping(TensorView append_key, TensorView a
     TVM_FFI_ICHECK_EQ(paged_k_cache.size(1), page_size)
         << "paged_k_cache.size(1) must match page_size for NHD layout";
   }
+  TVM_FFI_ICHECK_GT(num_heads, 0) << "num_heads must be positive";
+  TVM_FFI_ICHECK_GT(head_dim, 0) << "head_dim must be positive";
 
   TVM_FFI_ICHECK_EQ(append_key.size(1), num_heads);
   TVM_FFI_ICHECK_EQ(append_key.size(2), head_dim);

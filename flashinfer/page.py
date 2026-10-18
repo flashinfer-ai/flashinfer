@@ -1171,6 +1171,8 @@ def append_paged_kv_cache_with_slot_mapping(
             page_size = paged_k_cache.shape[2]
         else:
             page_size = paged_k_cache.shape[1]
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
 
     # Validate shapes
     if kv_layout == "HND":
@@ -1179,6 +1181,10 @@ def append_paged_kv_cache_with_slot_mapping(
     else:
         head_dim = paged_k_cache.shape[3]
         num_heads = paged_k_cache.shape[2]
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive, got {head_dim}")
 
     if append_key.shape[1] != num_heads:
         raise ValueError(
