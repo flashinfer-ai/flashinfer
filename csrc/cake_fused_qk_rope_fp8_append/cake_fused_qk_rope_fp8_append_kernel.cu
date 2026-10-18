@@ -60,9 +60,17 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+// One device source serves every architecture of the family.  The JIT loader
+// binds the kernel symbol per module (-DCAKE_KERNEL_SYMBOL=<manifest
+// kernel_symbol>) so that co-loaded modules keep distinct symbols; the default
+// is the sm_100a module's symbol.
+#ifndef CAKE_KERNEL_SYMBOL
+#define CAKE_KERNEL_SYMBOL kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed
+#endif
+
 extern "C" {
 
-__global__ __launch_bounds__(96) void kernel_cake_fused_qk_rope_fp8_append_f2873a52b7d6a3954655(
+__global__ __launch_bounds__(96) void CAKE_KERNEL_SYMBOL(
     const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin,
     const int* __restrict__ seq_lens, const int* __restrict__ q_indptr,
     const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight,

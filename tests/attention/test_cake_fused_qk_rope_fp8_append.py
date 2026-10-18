@@ -7,12 +7,15 @@ fp32 payload with ``atol = rtol = 0.1``; ``q_scale`` with ``rtol = 1e-5``; flags
 tails and every untouched byte bitwise.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
 from flashinfer.cake_fused_qk_rope_fp8_append import (
     cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache as fused_fp8,
 )
+from flashinfer.jit import cake_fused_qk_rope_fp8_append as jit_fp8
 from flashinfer.utils import get_compute_capability
 
 HEAD_DIM = 128
@@ -30,6 +33,41 @@ def _skip_unless_supported():
         pytest.skip(
             f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {cc}"
         )
+
+
+def test_shared_sources_bind_one_kernel_symbol_per_module(monkeypatch):
+    """CPU-only: every architecture compiles the same kernel and binding sources,
+    and the loader binds each module to its own kernel symbol through a define."""
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    define = "-DCAKE_KERNEL_SYMBOL="
+    sources = set()
+    symbols = set()
+    for arch in jit_fp8.ARCHES:
+        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module(jit_fp8.STAGES[0], arch)
+        assert spec.name.endswith(f"_{arch}")
+        # _source_path() checked the manifest sha256 receipt of both sources.
+        sources.add(tuple(Path(source).resolve() for source in spec.sources))
+        flags = [flag for flag in spec.extra_cuda_cflags if flag.startswith(define)]
+        assert len(flags) == 1, spec.extra_cuda_cflags
+        symbol = flags[0][len(define) :]
+        assert symbol == "kernel_" + spec.name[: -len(f"_{arch}")]
+        symbols.add(symbol)
+    assert len(symbols) == len(jit_fp8.ARCHES)
+    [(kernel, binding)] = sources
+    assert kernel.name == "cake_fused_qk_rope_fp8_append_kernel.cu"
+    assert binding.name == "cake_fused_qk_rope_fp8_append_binding.cu"
+    assert kernel.parent == binding.parent
+    assert kernel.parent.name == "cake_fused_qk_rope_fp8_append"
+    kernel_text = kernel.read_text(encoding="utf-8")
+    binding_text = binding.read_text(encoding="utf-8")
+    assert "void CAKE_KERNEL_SYMBOL(" in kernel_text
+    assert "void CAKE_KERNEL_SYMBOL(" in binding_text
+    assert "namespace CAKE_HOST_SHIM_NAMESPACE {" in binding_text
+    default_symbol = "kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed"
+    for symbol in symbols - {default_symbol}:
+        assert symbol not in kernel_text and symbol not in binding_text
 
 
 def rotary_cos_sin_table(

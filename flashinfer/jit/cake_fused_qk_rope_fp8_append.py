@@ -16,10 +16,13 @@
 One source-only manifest lives under ``csrc/cake_fused_qk_rope_fp8_append``
 (``cake_fused_qk_rope_fp8_append_manifest.json``, schema ``cake.library_export.v5``):
 a single stage (``fp8_e4m3``; head configuration, quantization / norm policies,
-prefill vs decode and the caller-owned K/V route are launch parameters) rendered
-for ``sm_90a`` (H100/H200), ``sm_100a`` (B200) and ``sm_103a`` (B300), each with
-its tvm-ffi binding.  The host wrapper lives in
-:mod:`flashinfer.cake_fused_qk_rope_fp8_append`.
+prefill vs decode and the caller-owned K/V route are launch parameters) with one
+module each for ``sm_90a`` (H100/H200), ``sm_100a`` (B200) and ``sm_103a`` (B300).
+The three modules compile the same kernel and tvm-ffi binding sources; the only
+per-architecture inputs are the ``-gencode`` flags and the kernel symbol, which the
+loader passes as ``-DCAKE_KERNEL_SYMBOL=<kernel_symbol>`` so that every module
+keeps its own symbol when they are loaded into one process.  The host wrapper
+lives in :mod:`flashinfer.cake_fused_qk_rope_fp8_append`.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +55,10 @@ _NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
 }
+# The shared kernel and binding sources name the kernel through this macro; the
+# loader binds it per module so that every module keeps a distinct symbol.
+_KERNEL_SYMBOL_DEFINE = "CAKE_KERNEL_SYMBOL"
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def arch_for(compute_capability: tuple[int, int]) -> str:
@@ -148,6 +156,16 @@ def cake_fused_qk_rope_fp8_append_record(stage: str, arch: str) -> dict[str, Any
     return dict(_record(stage, arch))
 
 
+def _kernel_symbol_flag(record: dict[str, Any]) -> str:
+    """``-D`` flag binding the shared sources to this module's kernel symbol."""
+    symbol = record.get("kernel_symbol")
+    if not isinstance(symbol, str) or _IDENTIFIER.fullmatch(symbol) is None:
+        raise RuntimeError(
+            f"invalid kernel_symbol for module {record.get('name')!r}: {symbol!r}"
+        )
+    return f"-D{_KERNEL_SYMBOL_DEFINE}={symbol}"
+
+
 @functools.cache
 def gen_cake_fused_qk_rope_fp8_append_module(stage: str, arch: str) -> JitSpec:
     record = _record(stage, arch)
@@ -155,7 +173,11 @@ def gen_cake_fused_qk_rope_fp8_append_module(stage: str, arch: str) -> JitSpec:
     spec = gen_jit_spec(
         name=f"{record['name']}_{arch}",
         sources=[_source_path(units["device"]), _source_path(units["binding"])],
-        extra_cuda_cflags=[*_NVCC_FLAGS[arch], *record["compile_flags"]],
+        extra_cuda_cflags=[
+            *_NVCC_FLAGS[arch],
+            *record["compile_flags"],
+            _kernel_symbol_flag(record),
+        ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
     )
