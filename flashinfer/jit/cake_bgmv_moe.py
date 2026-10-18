@@ -74,6 +74,7 @@ CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN = 3 + CAKE_BGMV_MOE_ROUTE_INDEX_MAX_RO
 # split the hidden tiles over grid z when the pair x rank-block grid is small;
 # the last arrival reduces the partials in split order (deterministic) and
 # resets its counter, so the zeroed workspace is never memset again.
+# Only the per-route generic plans allocate it (``cake_bgmv_moe_route_index_numel``).
 CAKE_BGMV_MOE_SHRINK_RANK_TILE = 8
 CAKE_BGMV_MOE_SHRINK_TILE = 1024
 CAKE_BGMV_MOE_SHRINK_SPLIT_MAX = 8
@@ -301,11 +302,24 @@ def cake_bgmv_moe_route_index_words(num_tokens: int) -> int:
     )
 
 
-def cake_bgmv_moe_route_index_numel(num_tokens: int) -> int:
-    """int32 elements of the plan workspace (route index + hidden-split region)."""
+def cake_bgmv_moe_route_index_numel(
+    num_tokens: int,
+    variant: CakeBGMVMoEVariant = "generic",
+    grouped: bool = False,
+) -> int:
+    """int32 elements of the plan's route-index workspace.
 
+    Every plan holds the route index proper (header + per-token entries). Only
+    the per-route generic shrink forms append the hidden-split partials and
+    arrival counters; the specialized kernels and the grouped pipeline never
+    read that region, so their plans allocate the route index alone.
+    """
+
+    words = cake_bgmv_moe_route_index_words(num_tokens)
+    if variant == "specialized" or grouped:
+        return words
     return (
-        cake_bgmv_moe_route_index_words(num_tokens)
+        words
         + CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS
         + CAKE_BGMV_MOE_SHRINK_SPLIT_COUNTER_WORDS
     )

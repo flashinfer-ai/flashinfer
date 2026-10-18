@@ -404,13 +404,17 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
             )
 
         # Token->pair route index: published by the shrink kernels and read by
-        # the expand kernels (arbitrary pair order in O(1) per CTA), followed by
-        # the generic shrink's hidden-split partials and arrival counters.
-        # Pointer-stable and zero-initialized once; counts are monotonic with
-        # launch-parity bases and the split counters are reset by their last
-        # arrival, so graph replays never need a memset node.
+        # the expand kernels (arbitrary pair order in O(1) per CTA), followed,
+        # for the per-route generic pipeline only, by the shrink's hidden-split
+        # partials and arrival counters (the specialized kernels and the grouped
+        # pipeline never read them). Pointer-stable and zero-initialized once;
+        # counts are monotonic with launch-parity bases and the split counters
+        # are reset by their last arrival, so graph replays never need a memset
+        # node.
         self.route_index = torch.zeros(
-            cake_bgmv_moe_route_index_numel(int(x.shape[0])),
+            cake_bgmv_moe_route_index_numel(
+                int(x.shape[0]), variant=self.variant, grouped=self.grouped
+            ),
             dtype=torch.int32,
             device=x.device,
         )

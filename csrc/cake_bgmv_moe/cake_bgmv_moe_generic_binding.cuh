@@ -88,11 +88,13 @@ constexpr int32_t kRouteIndexHeaderWords = 4;
 constexpr int32_t kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes;
 // Hidden-split shrink workspace appended to the route index (see
 // flashinfer/jit/cake_bgmv_moe.py): FP32 partials [split][pair][64] as raw
-// 32-bit words, then one arrival counter per (pair block, rank block).
+// 32-bit words, then one arrival counter per (pair block, rank block). Only
+// the per-route shrink forms read it; grouped plans allocate the route index alone.
 constexpr int32_t kShrinkSplitMax = 8;
 constexpr int32_t kShrinkSplitMaxPairs = 128;
 constexpr int32_t kShrinkSplitPartialWords = kShrinkSplitMax * kShrinkSplitMaxPairs * 64;
 constexpr int32_t kShrinkSplitCounterWords = kShrinkSplitMaxPairs * (64 / kRankTile);
+constexpr int32_t kShrinkSplitWords = kShrinkSplitPartialWords + kShrinkSplitCounterWords;
 // Pair-grouped pipeline (round 5): routes grouped by their unique (LoRA,
 // expert) pair so each pair's weights are streamed once per tile of
 // kGroupTileTokens routes.  Plan-owned int32 workspace (see
@@ -115,27 +117,22 @@ constexpr int32_t kGroupShrinkRankTiles = kRank / kGroupShrinkRankTile;
 // tiles).  sm_90 pays 2-5 % for the rank-tile loop form itself, so it loops only where the H100
 // sweep showed net gains: one K tile -> the whole rank, two or three K tiles with >= 4 rank tiles
 // -> 4, otherwise one (straight-line path).
+// Both per-CTA policies branch on the compiled target (CAKE_BGMV_MOE_CC_MAJOR): Configure
+// checks that the device matches it, so no run-time capability query is needed.
 inline int32_t GroupShrinkRankTilesPerCta(int32_t num_tiles) {
-  static thread_local int cached_device = -1;
-  static thread_local int cached_major = 0;
-  int device = 0;
-  cudaGetDevice(&device);
-  if (device != cached_device) {
-    cudaDeviceGetAttribute(&cached_major, cudaDevAttrComputeCapabilityMajor, device);
-    cached_device = device;
-  }
-  if (cached_major == 9) {
+  if constexpr (CAKE_BGMV_MOE_CC_MAJOR == 9) {
     if (num_tiles >= 4 || (num_tiles > 1 && kGroupShrinkRankTiles < 4)) return 1;
     return num_tiles == 1 ? kGroupShrinkRankTiles
                           : (kGroupShrinkRankTiles < 4 ? kGroupShrinkRankTiles : 4);
+  } else {
+    const int32_t budget_raw = 16 / num_tiles;
+    const int32_t budget =
+        budget_raw < 1 ? 1
+                       : (budget_raw > kGroupShrinkRankTiles ? kGroupShrinkRankTiles : budget_raw);
+    int32_t per_cta = 1;  // largest power of two <= budget (a divisor of the rank tiles)
+    while (per_cta * 2 <= budget) per_cta *= 2;
+    return per_cta;
   }
-  const int32_t budget_raw = 16 / num_tiles;
-  const int32_t budget =
-      budget_raw < 1 ? 1
-                     : (budget_raw > kGroupShrinkRankTiles ? kGroupShrinkRankTiles : budget_raw);
-  int32_t per_cta = 1;  // largest power of two <= budget (a divisor of the rank tiles)
-  while (per_cta * 2 <= budget) per_cta *= 2;
-  return per_cta;
 }
 // Lever 3: the cp.async operand-ring grouped shrink (tile k+1's x and weight rows land in shared
 // memory while tile k computes) serves rows whose hidden spans more than one 1024-element K tile;
@@ -162,16 +159,8 @@ inline bool GroupShrinkMixed(bool ring) { return CAKE_BGMV_MOE_GROUP_SHRINK_MIXE
 // Blackwell: 8 at hidden >= 4096, 4 below (the expand is a per-CTA latency chain; 8 blocks at
 // hidden 2048 leaves too few CTAs); sm_90 rank 64 the same, rank 8-32 2 (neutral at 2-8 on H100).
 inline int32_t GroupExpandColBlocksPerCta(int32_t hidden, int32_t col_blocks) {
-  static thread_local int cached_device = -1;
-  static thread_local int cached_major = 0;
-  int device = 0;
-  cudaGetDevice(&device);
-  if (device != cached_device) {
-    cudaDeviceGetAttribute(&cached_major, cudaDevAttrComputeCapabilityMajor, device);
-    cached_device = device;
-  }
   int32_t per_cta = hidden >= 4096 ? 8 : 4;
-  if (cached_major == 9 && kRank < 32) per_cta = 2;
+  if constexpr (CAKE_BGMV_MOE_CC_MAJOR == 9 && kRank < 32) per_cta = 2;
   if (per_cta > col_blocks) per_cta = col_blocks;
   return per_cta < 1 ? 1 : per_cta;
 }
@@ -496,12 +485,9 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CheckCompact(route_index, "route_index");
   const int64_t route_words =
       kRouteIndexHeaderWords + static_cast<int64_t>(num_tokens) * kRouteIndexWordsPerToken;
-  TVM_FFI_ICHECK(route_index.ndim() == 1 && route_index.size(0) >= route_words +
-                                                                       kShrinkSplitPartialWords +
-                                                                       kShrinkSplitCounterWords)
+  TVM_FFI_ICHECK(route_index.ndim() == 1 && route_index.size(0) >= route_words)
       << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
-      << kRouteIndexWordsPerToken << " + " << (kShrinkSplitPartialWords + kShrinkSplitCounterWords)
-      << " int32 words";
+      << kRouteIndexWordsPerToken << " int32 words";
 
   TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwned))
@@ -642,6 +628,12 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
          "retired four-pair decode shrink, is rejected, got "
       << shrink_form;
   const int32_t splits = static_cast<int32_t>(shrink_splits);
+  // The per-route shrink forms append their hidden-split partials and arrival counters to
+  // the route index; the grouped pipeline above never reads them, so its plans omit them.
+  TVM_FFI_ICHECK(route_index.size(0) >= route_words + kShrinkSplitWords)
+      << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
+      << kRouteIndexWordsPerToken << " + " << kShrinkSplitWords
+      << " int32 words for the per-route shrink";
   auto* split_partials = reinterpret_cast<float*>(route_ptr + route_words);
   auto* split_counters = route_ptr + route_words + kShrinkSplitPartialWords;
   // Lever 27: bin-ordered dispatch.  The order_build prologue writes the route

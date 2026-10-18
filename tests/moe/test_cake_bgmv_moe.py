@@ -512,6 +512,13 @@ def test_expert_sorted_routes_match_reference_and_replay_bitwise(
     plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
     assert isinstance(plan, BGMVMoECakePlan)
     assert plan.variant == _expected_variant(hidden_size, num_tokens)
+    # The plan sizes the route index from the variant: only the per-route generic
+    # shrink appends the hidden-split region.
+    from flashinfer.jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
+
+    assert plan.route_index.numel() == cake_bgmv_moe_route_index_numel(
+        num_tokens, plan.variant, grouped=plan.grouped
+    )
     first = plan.run().clone()
     torch.cuda.synchronize()
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)

@@ -626,6 +626,17 @@ def test_route_index_workspace_sizing():
         cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096)
         == 4 + 4096 * 19 + split_words
     )
+    # Only the per-route generic shrink forms read the hidden-split region; the
+    # specialized kernels and the grouped pipeline take the route index alone.
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1, "specialized") == 4 + 19
+    assert (
+        cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096, "generic", grouped=True)
+        == 4 + 4096 * 19
+    )
+    assert (
+        cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096, "generic", grouped=False)
+        == 4 + 4096 * 19 + split_words
+    )
     for body_name in _specialized_bodies():
         body = (cake_bgmv_moe._get_csrc_dir() / body_name).read_text()
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " not in body
