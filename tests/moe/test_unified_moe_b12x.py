@@ -96,6 +96,26 @@ class TestB12xBackendOptions:
 
 
 class TestB12xUnifiedValidation:
+    @pytest.mark.parametrize(
+        "source_format", ["modelopt_e4m3_k32", "e4m3_k32", "fp4_e8m0_k32"]
+    )
+    def test_unified_w4a16_rejects_formats_without_a_matching_view(self, source_format):
+        from flashinfer.fused_moe.prepare import prepare_b12x_w4a16_weights
+
+        # Validation must precede packing or any CUDA allocation.
+        placeholder = torch.empty(0)
+        with pytest.raises(ValueError, match="use B12xMoEWrapper for K/32"):
+            prepare_b12x_w4a16_weights(
+                placeholder,
+                placeholder,
+                placeholder,
+                placeholder,
+                placeholder,
+                placeholder,
+                activation="silu",
+                source_format=source_format,
+            )
+
     @staticmethod
     def _runner(config, runner_type=B12xNvfp4Runner):
         runner = runner_type.__new__(runner_type)
@@ -1043,6 +1063,9 @@ class TestUnifiedB12xConformance:
             top_k=2,
             seed=321,
         )
+        if variant is QuantVariant.W4A16:
+            tensors["w1_alpha"].fill_(1.75)
+            tensors["w2_alpha"].fill_(0.75)
         layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
             tensors,
             quant=variant,
@@ -1095,8 +1118,9 @@ class TestUnifiedB12xConformance:
         tensors["w1_alpha"].fill_(1.75)
         tensors["w2_alpha"].fill_(0.75)
         prepared_views = []
+        outputs = []
         for source_format in ("modelopt", "compressed_tensors"):
-            _, _, weight_pack = _make_b12x_layer_and_packs(
+            layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
                 tensors,
                 quant=QuantConfig(
                     weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
@@ -1108,6 +1132,7 @@ class TestUnifiedB12xConformance:
                 source_format=source_format,
             )
             prepared_views.append(weight_pack.get_view("b12x_w4a16"))
+            outputs.append(_run_b12x_unified(layer, act_pack, weight_pack).clone())
         for field in (
             "w1_weight",
             "w1_weight_sf",
@@ -1123,6 +1148,8 @@ class TestUnifiedB12xConformance:
                 rtol=rtol,
                 atol=0,
             )
+
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=0.05, atol=0.05)
 
     def test_w4a16_ep_partials_sum_to_full(self):
         """Contiguous-shard EP through the unified API: two fake ranks'

@@ -23,6 +23,8 @@ _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
 _SOURCE_FORMATS = {
     "modelopt": "modelopt",
     "modelopt_nvfp4": "modelopt",
+    "modelopt_e4m3_k32": "modelopt_e4m3_k32",
+    "e4m3_k32": "modelopt_e4m3_k32",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
     "compressed-tensors": "compressed_tensors",
@@ -40,7 +42,7 @@ _W13_LAYOUTS = {
     "up_gate": "w13",
     "gate_up": "w31",
 }
-_MODEL_OPT_NVFP4_FORMATS = {"modelopt"}
+_MODEL_OPT_NVFP4_FORMATS = {"modelopt", "modelopt_e4m3_k32"}
 
 
 @dataclass(frozen=True)
@@ -209,7 +211,7 @@ def _normalize_source_format(source_format: str) -> str:
         return _SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "source_format must be one of 'modelopt', "
+            "source_format must be one of 'modelopt', 'modelopt_e4m3_k32', "
             "'fp4_e8m0_k32', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
@@ -267,6 +269,32 @@ def _validate_e8m0_k32_scales(
     if e8m0_dtype is not None and scales.dtype == e8m0_dtype:
         return scales
     raise TypeError(f"{name} must be torch.uint8 or torch.float8_e8m0fnu")
+
+
+def _validate_e4m3_k32_scales(
+    scales: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    name: str,
+) -> torch.Tensor:
+    """Validate logical ModelOpt-style E4M3 K/32 expert scales."""
+    if scales.ndim != 3:
+        raise ValueError(
+            f"{name} must be [E, {int(rows)}, {int(cols) // 32}], "
+            f"got {tuple(scales.shape)}"
+        )
+    if int(cols) % 32 != 0:
+        raise ValueError(f"{name} requires K divisible by 32, got {int(cols)}")
+    expected = (int(scales.shape[0]), int(rows), int(cols) // 32)
+    if tuple(scales.shape) != expected:
+        raise ValueError(
+            f"{name} must have shape [E, {int(rows)}, {int(cols) // 32}], "
+            f"got {tuple(scales.shape)}"
+        )
+    if scales.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"{name} must use torch.float8_e4m3fn")
+    return scales.contiguous()
 
 
 def _pack_e8m0_k32_scales(
@@ -538,8 +566,11 @@ def _permute_nvfp4_scales(
     size_k: int,
     size_n: int,
     a_dtype: torch.dtype,
+    group_size: int = 16,
     row_rotation: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if group_size not in (16, 32):
+        raise ValueError(f"E4M3 W4A16 group_size must be 16 or 32, got {group_size}")
     combined_scale_factor = _nvfp4_compute_scale_factor(scales, a_dtype)
     packed_scales: torch.Tensor | None = None
     for expert in range(scales.shape[0]):
@@ -553,7 +584,7 @@ def _permute_nvfp4_scales(
             expert_source.T,
             size_k=size_k,
             size_n=size_n,
-            group_size=16,
+            group_size=group_size,
         )
         expert_packed = _process_nvfp4_packed_scales(
             expert_scales,
@@ -568,7 +599,7 @@ def _permute_nvfp4_scales(
         packed_scales[expert].copy_(expert_packed)
     if packed_scales is None:
         packed_scales = torch.empty(
-            (0, size_k // _PACKED_TILE_SIZE, size_n // 2),
+            (0, size_k // group_size, size_n),
             dtype=torch.float8_e4m3fn,
             device=scales.device,
         )
@@ -729,6 +760,104 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     )
 
 
+def prepare_w4a16_modelopt_e4m3_k32_weights(
+    w13_fp4: torch.Tensor,
+    w13_blockscale: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    activation: str,
+    params_dtype: torch.dtype = torch.bfloat16,
+    w13_layout: str = "w13",
+    reuse_input_storage: bool = False,
+) -> W4A16PackedWeights:
+    """Prepare E2M1 weights with logical E4M3 scales at a K/32 cadence.
+
+    This is a weight-only ModelOpt contract: activations stay BF16 while each
+    32-value weight block uses an E4M3 scale and each expert projection retains
+    its FP32 global scale.  The larger block preserves NVFP4's fractional scale
+    semantics while halving scale storage relative to conventional K/16 NVFP4.
+    """
+    w13_layout = _normalize_w13_layout(w13_layout)
+    shape = validate_w4a16_packed_inputs(
+        w13_fp4,
+        w13_global_scale,
+        w2_fp4,
+        w2_global_scale,
+        activation=activation,
+    )
+    num_experts = shape.num_experts
+    hidden_size = shape.hidden_size
+    intermediate_size = shape.intermediate_size
+    w13_rows = shape.w13_rows
+    is_gated = shape.is_gated
+
+    w13_scale = _validate_e4m3_k32_scales(
+        w13_blockscale,
+        rows=w13_rows,
+        cols=hidden_size,
+        name="w13_blockscale",
+    )
+    w2_scale = _validate_e4m3_k32_scales(
+        w2_blockscale,
+        rows=hidden_size,
+        cols=intermediate_size,
+        name="w2_blockscale",
+    )
+    w13_row_rotation = intermediate_size if is_gated and w13_layout == "w13" else None
+
+    packed_w13 = _repack_weight(
+        w13_fp4 if reuse_input_storage else w13_fp4.contiguous(),
+        size_k=hidden_size,
+        size_n=w13_rows,
+        row_rotation=w13_row_rotation,
+        reuse_input_storage=reuse_input_storage,
+    )
+    packed_w2 = _repack_weight(
+        w2_fp4 if reuse_input_storage else w2_fp4.contiguous(),
+        size_k=intermediate_size,
+        size_n=hidden_size,
+        reuse_input_storage=reuse_input_storage,
+    )
+    packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
+        w13_scale,
+        w13_global_scale.contiguous(),
+        size_k=hidden_size,
+        size_n=w13_rows,
+        a_dtype=params_dtype,
+        group_size=32,
+        row_rotation=w13_row_rotation,
+    )
+    packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
+        w2_scale,
+        w2_global_scale.contiguous(),
+        size_k=intermediate_size,
+        size_n=hidden_size,
+        a_dtype=params_dtype,
+        group_size=32,
+    )
+
+    return W4A16PackedWeights(
+        w13=packed_w13,
+        w13_scale=packed_w13_scale,
+        w13_global_scale=packed_w13_global_scale,
+        w2=packed_w2,
+        w2_scale=packed_w2_scale,
+        w2_global_scale=packed_w2_global_scale,
+        workspace=_make_workspace(w13_fp4.device, max_blocks_per_sm=4),
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=is_gated,
+        params_dtype=params_dtype,
+        source_format="modelopt_e4m3_k32",
+        w13_layout=w13_layout,
+        scale_format="e4m3_k32",
+    )
+
+
 def prepare_w4a16_compressed_tensors_weights(
     w13_fp4: torch.Tensor,
     w13_blockscale: torch.Tensor,
@@ -870,6 +999,10 @@ def prepare_w4a16_packed_weights(
     w13_layout = _normalize_w13_layout(w13_layout)
     if source_format == "modelopt":
         return prepare_w4a16_modelopt_nvfp4_weights(
+            *args, w13_layout=w13_layout, **kwargs
+        )
+    if source_format == "modelopt_e4m3_k32":
+        return prepare_w4a16_modelopt_e4m3_k32_weights(
             *args, w13_layout=w13_layout, **kwargs
         )
     if source_format == "compressed_tensors":

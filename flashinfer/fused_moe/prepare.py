@@ -2779,8 +2779,8 @@ def prepare_b12x_w4a16_weights(
     activation : str
         Kernel activation name: ``"silu"`` or ``"relu2"``.
     source_format : str
-        Checkpoint scale convention: ``"modelopt"`` or
-        ``"compressed_tensors"``.
+        Checkpoint scale convention: ``"modelopt"`` or ``"compressed_tensors"``.
+        K/32 source formats require the native ``B12xMoEWrapper`` API.
 
     Returns
     -------
@@ -2798,6 +2798,13 @@ def prepare_b12x_w4a16_weights(
     )
 
     source_format = _normalize_source_format(source_format)
+    if source_format not in ("modelopt", "compressed_tensors"):
+        raise ValueError(
+            "The unified b12x_w4a16 weight view requires ModelOpt or "
+            "CompressedTensors K/16 scales; use B12xMoEWrapper for K/32 formats."
+        )
+    # The tensor-only unified view is consumed as ModelOpt by the runner.
+    # Canonicalize checkpoint scale conventions before warming that same cache.
     w1_global_scale = _source_global_scale(w1_global_scale, source_format=source_format)
     w2_global_scale = _source_global_scale(w2_global_scale, source_format=source_format)
     _get_w4a16_packed_weights(

@@ -117,6 +117,7 @@ _MODEL_OPT_W13_LAYOUTS = {"w13", "w31"}
 _NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
+    "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
 }
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
@@ -5015,7 +5016,8 @@ def _normalize_scale_format(scale_format: str) -> str:
         return _SCALE_FORMATS[scale_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
+            "scale_format must be one of 'e4m3_k16', 'e4m3_k32', or "
+            "'e8m0_k32', "
             f"got {scale_format!r}"
         ) from exc
 

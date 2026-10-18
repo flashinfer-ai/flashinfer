@@ -2680,6 +2680,9 @@ class B12xW4A16Config:
     ):
         """Build the ``b12x_w4a16`` weight view from checkpoint fp4 weights.
 
+        Supports ModelOpt and CompressedTensors K/16 scale conventions.
+        Use the native ``B12xMoEWrapper`` API for K/32 source formats.
+
         Register the result with ``MoEWeightPack.prepare_for("b12x_w4a16", ...)``.
         See :func:`flashinfer.fused_moe.prepare.prepare_b12x_w4a16_weights`.
         """
