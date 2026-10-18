@@ -41,7 +41,8 @@ _TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 _ARCH_CAPABILITIES = {arch: capability for capability, arch in _TARGET_ARCHS.items()}
 # The Rubin target (capability (10, 7)): its main kernels are separate device
 # modules (``_SM107_MODULES``, looked up by :func:`_main_module`) and its
-# routing is SM100's (``_LIGHT_STAGE_CAPABILITIES``).
+# routing is SM103's (``_ONE_LAUNCH_CAPABILITIES``: its fused varlen render
+# derives the sequence table in-kernel, one launch).
 _SM107_ARCH = "sm_107a"
 _DEVICE_DIR = Path("generated") / "device"
 # Prepared two-launch host launchers, one per kernel family: the same nine
@@ -109,11 +110,11 @@ class _Program:
     metadata), ``exactmeta`` (the same fused scan behind the light
     packed-varlen metadata kernel, which publishes ``seq_chunk_cumsum`` from
     the seq_idx triple in place of the full preprocess: the triple form
-    without a trusted caller table on SM100 and SM107, two launches),
-    ``exactone`` (the SM103 render of the fused scan whose CTA prologue
-    derives that table itself into its private row of the
-    ``seq_chunk_cumsum`` scratch: the same form on SM103, one launch, the
-    stage skipped with a grid of 0),
+    without a trusted caller table on SM100, two launches),
+    ``exactone`` (the SM103 / SM107 render of the fused scan whose CTA
+    prologue derives that table itself into its private row of the
+    ``seq_chunk_cumsum`` scratch: the same form on SM103 and SM107, one
+    launch, the stage skipped with a grid of 0),
     ``exactpre`` (the same persistent scan reading the delta /
     cumsum its preprocess wrote to the HBM workspace: the start two-launch
     form, same main arguments, with the round-6 state update), ``exact`` (the
@@ -156,8 +157,9 @@ class _Program:
 # metadata kernel: the fused exact scan (``exactfused_*``: delta / cumsum
 # computed in-CTA, one launch), the same fused scan behind the metadata kernel
 # (``exactmeta_*``: the seq_idx triple form deriving ``seq_chunk_cumsum`` on
-# SM100 and SM107, two launches), the SM103 fused scan deriving that table
-# in its CTA prologue (``exactone_*``: the same form on SM103, one launch), the
+# SM100, two launches), the SM103 / SM107 fused scan deriving that table in
+# its CTA prologue (``exactone_*``: the same form on SM103 and SM107, one
+# launch), the
 # two-kernel exact scan (``exactpre_*``: the start pre+scan
 # form with the round-6 single-rounding state update, which the fused route
 # keeps for saturated / long-item calls, see :func:`fused_selected`), the
@@ -264,7 +266,9 @@ _EXACTMETA_MODULES = {
 # derives the sequence table of the seq_idx triple form itself, so no stage
 # runs ahead of it -- with their own device sources (the ``exactfused_*``
 # varlen programs keep the SM100 render) behind the fused host template.
-# Refreshed by the Cake export; seed identities until it fills them.
+# SM107 renders the same one-launch form: its sources are the ``exactone_*``
+# entries of ``_SM107_MODULES``.  Refreshed by the Cake export; seed
+# identities until it fills them.
 _EXACTONE_MODULES = {
     "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_22b56edf7a",
     "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d294c9019e",
@@ -278,9 +282,13 @@ _EXACTONE_MODULES = {
 # (mask 0x7FFF), so every main program's device text differs from the
 # Blackwell fold; the loader builds these modules for capability (10, 7)
 # (:func:`_main_module`).  Programs absent here -- the retained start
-# ``exact_*`` programs and the SM103-only ``exactone_*`` programs -- build
-# their fold module; the preprocess and metadata kernels are shared.  An
-# ``exactmeta_*`` entry equals its ``exactfused_*`` varlen twin.
+# ``exact_*`` programs -- build their fold module; the preprocess and
+# metadata kernels are shared.  The sm_107a fused varlen render derives the
+# sequence table in-kernel like SM103's (one launch), so one sm_107a source
+# serves the three programs of a fused varlen suffix: the ``exactone_*``
+# entry names it, and the ``exactfused_*`` varlen entry and its
+# ``exactmeta_*`` twin equal it (an ``exactmeta_*`` entry always equals its
+# ``exactfused_*`` varlen twin).
 _SM107_MODULES = {
     "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f13183e6a1",
     "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
@@ -330,6 +338,12 @@ _SM107_MODULES = {
     "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
     "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
     "exactmeta_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_c61e499476",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_PENDINGEXPORT",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_PENDINGEXPORT",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_PENDINGEXPORT",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_PENDINGEXPORT",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_PENDINGEXPORT",
+    "exactone_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_PENDINGEXPORT",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -1445,11 +1459,12 @@ def chunk_parallel_selected(
 # 50 routed rows win beyond the band, no routed row loses).
 # The seq_idx triple form deriving its table inside the fused window, by
 # compute capability (``_materialize_workspace``): the light metadata stage
-# ahead of the fused main kernel (``exactmeta_*``) on SM100 and SM107 -- the
-# Rubin fused varlen render does not derive the table in-kernel, so Rubin
-# runs the SM100 routing -- and the one-launch ``exactone_*`` render on SM103.
-_LIGHT_STAGE_CAPABILITIES = ((10, 0), (10, 7))
-_ONE_LAUNCH_CAPABILITIES = ((10, 3),)
+# ahead of the fused main kernel (``exactmeta_*``) on SM100, and the
+# one-launch ``exactone_*`` render on SM103 and SM107 -- the Rubin fused
+# varlen render derives the table in-kernel like SM103's, and its host (a
+# Grace CPU like GB300's) hides a lighter stage in the launch interval too.
+_LIGHT_STAGE_CAPABILITIES = ((10, 0),)
+_ONE_LAUNCH_CAPABILITIES = ((10, 3), (10, 7))
 _FUSED_ROUTE_MAX_ITEMS_BATCHED = 1024
 _FUSED_ROUTE_MAX_CHUNKS_BATCHED = 16
 _FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED = 2048
@@ -1481,12 +1496,12 @@ def fused_selected(
     batched calls, the ``cu_seqlens`` form and the ``seq_idx`` triple form
     with a caller ``seq_chunk_cumsum`` the preprocess does not rewrite take
     ``exactfused_*`` (preprocess grid 0, one launch); the triple form
-    deriving the table takes ``exactmeta_*`` on SM100 and SM107 (the light
-    metadata kernel then the same fused main kernel, two launches) and
-    ``exactone_*`` on SM103 (the fused main kernel derives the table in its
-    CTA prologue, one launch) unless the table is published into the caller's buffer,
-    which keeps the two-kernel program on SM103 (``_materialize_workspace``
-    decides per compute capability)."""
+    deriving the table takes ``exactmeta_*`` on SM100 (the light metadata
+    kernel then the same fused main kernel, two launches) and ``exactone_*``
+    on SM103 and SM107 (the fused main kernel derives the table in its CTA
+    prologue, one launch) unless the table is published into the caller's
+    buffer, which keeps the two-kernel program on SM103 and SM107
+    (``_materialize_workspace`` decides per compute capability)."""
 
     items = int(num_sequences) * int(nheads)
     if not mode_varlen:
@@ -1963,19 +1978,18 @@ class CakeSSDCombined:
     0), one kernel; the triple form without one (the table is published,
     runner-owned or into the caller's buffer with
     ``update_seq_chunk_cumsum=True``) runs the program of the device's
-    compute capability: on SM100 and SM107 ``exactmeta_*`` -- the light
-    packed-varlen metadata kernel publishes the table, then the same fused
-    main kernel runs
-    (two launches, no dt preprocess); on SM103 ``exactone_*`` -- the fused
-    main kernel derives its private table in a CTA prologue (one launch) --
-    where the table is runner-owned, and the two-kernel program where the
-    caller's buffer must receive it.  A caller buffer for the
+    compute capability: on SM100 ``exactmeta_*`` -- the light packed-varlen
+    metadata kernel publishes the table, then the same fused main kernel runs
+    (two launches, no dt preprocess); on SM103 and SM107 ``exactone_*`` --
+    the fused main kernel derives its private table in a CTA prologue (one
+    launch) -- where the table is runner-owned, and the two-kernel program
+    where the caller's buffer must receive it.  A caller buffer for the
     ``cu_seqlens``-derived vector brings the fused program's full preprocess
     back to publish it (two launches).
 
     Seven kernel families serve every call and are selected per call.  The
     fused exact scan (``exactfused_*`` programs, ``exactmeta_*`` behind the
-    metadata kernel and the SM103 ``exactone_*`` render) runs one persistent CTA per
+    metadata kernel and the SM103 / SM107 ``exactone_*`` render) runs one persistent CTA per
     (sequence, head) item over its chunks in order and computes delta /
     cumsum in-CTA; the two-kernel exact scan (``exactpre_*``) is the same
     persistent scan reading the delta / cumsum its preprocess wrote to the
@@ -2329,19 +2343,19 @@ class CakeSSDCombined:
         # ``key.caller_cumsum``) run ``exactfused`` as one launch (preprocess
         # grid 0).  The triple form without one needs its sequence table
         # first, and which program provides it is decided per compute
-        # capability, each measured on its own architecture: on SM100 -- and
-        # SM107, which runs the SM100 routing: its fused varlen render does
-        # not derive the table in-kernel --
+        # capability, each measured on its own architecture: on SM100
         # ``exactmeta`` runs the light packed-varlen metadata kernel (one
         # thread per segment, no dt work) ahead of the same fused main kernel
         # (the stage drops from 4.1-4.7 us to 2.4-2.9 us; the fused main
         # kernel costs 0.7-0.9 us more than the two-kernel main kernel); on
-        # SM103 the host interval between two launches hides any lighter
-        # stage, so ``exactone`` runs the SM103 render of the fused main
-        # kernel, whose CTA prologue derives a private table from the triple
-        # (one launch, no stage) -- unless the caller's buffer must receive
-        # the table (``key.publish_table``), which only a publishing stage
-        # writes: that form keeps the two-kernel program on SM103.
+        # SM103 -- and SM107, whose fused varlen render derives the table
+        # in-kernel too and whose host is a Grace CPU like GB300's -- the host
+        # interval between two launches hides any lighter stage, so
+        # ``exactone`` runs that render of the fused main kernel, whose CTA
+        # prologue derives a private table from the triple (one launch, no
+        # stage) -- unless the caller's buffer must receive the table
+        # (``key.publish_table``), which only a publishing stage writes: that
+        # form keeps the two-kernel program on SM103 and SM107.
         derives_table = (
             self.has_varlen and not key.from_cu_seqlens and not key.caller_cumsum
         )
