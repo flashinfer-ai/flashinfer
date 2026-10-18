@@ -707,6 +707,7 @@ struct PreparedLaunch {
   void* p_seq_chunk_cumsum = nullptr;
   void* p_out_native = nullptr;
   void* p_s_work = nullptr;
+  void* p_agg_work = nullptr;
   void* p_h_words = nullptr;
   void* p_grid_barrier = nullptr;
   int32_t v_nheads{};
@@ -725,14 +726,15 @@ struct PreparedLaunch {
   float v_dt_max{};
   int32_t v_write_final_states{};
   int32_t v_checkpoint_state_count{};
+  int32_t v_vcount{};
   decltype(&Kernel()) kernel = nullptr;
   tvm::ffi::dim3 grid;
   tvm::ffi::dim3 block;
-  void* kargs[45] = {};
+  void* kargs[47] = {};
   std::vector<TensorView> retained;
 };
 
-inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView arg_b_map, TensorView arg_c_map, TensorView arg_out_map, TensorView arg_h_map, TensorView arg_x, TensorView arg_dt, TensorView arg_delta_precomputed, TensorView arg_cumsum_precomputed, TensorView arg_A, TensorView arg_B_tensor, TensorView arg_C, TensorView arg_D, TensorView arg_z, TensorView arg_dt_bias, TensorView arg_initial_states, TensorView arg_final_states, TensorView arg_checkpoint_states, TensorView arg_checkpoint_token_indices, TensorView arg_checkpoint_state_slots, TensorView arg_seq_idx_i32, TensorView arg_seq_idx_i64, TensorView arg_chunk_indices, TensorView arg_chunk_offsets, TensorView arg_seq_chunk_cumsum, TensorView arg_out_native, TensorView arg_s_work, TensorView arg_h_words, TensorView arg_grid_barrier, int64_t arg_nheads, int64_t arg_ngroups, int64_t arg_batch, int64_t arg_seqlen, int64_t arg_nchunks, int64_t arg_sequence_count, int64_t arg_num_logical_chunks, int64_t arg_mode_varlen, int64_t arg_D_mode, int64_t arg_has_z, int64_t arg_has_initial, int64_t arg_dt_softplus, double arg_dt_min, double arg_dt_max, int64_t arg_write_final_states, int64_t arg_checkpoint_state_count, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView arg_b_map, TensorView arg_c_map, TensorView arg_out_map, TensorView arg_h_map, TensorView arg_x, TensorView arg_dt, TensorView arg_delta_precomputed, TensorView arg_cumsum_precomputed, TensorView arg_A, TensorView arg_B_tensor, TensorView arg_C, TensorView arg_D, TensorView arg_z, TensorView arg_dt_bias, TensorView arg_initial_states, TensorView arg_final_states, TensorView arg_checkpoint_states, TensorView arg_checkpoint_token_indices, TensorView arg_checkpoint_state_slots, TensorView arg_seq_idx_i32, TensorView arg_seq_idx_i64, TensorView arg_chunk_indices, TensorView arg_chunk_offsets, TensorView arg_seq_chunk_cumsum, TensorView arg_out_native, TensorView arg_s_work, TensorView arg_agg_work, TensorView arg_h_words, TensorView arg_grid_barrier, int64_t arg_nheads, int64_t arg_ngroups, int64_t arg_batch, int64_t arg_seqlen, int64_t arg_nchunks, int64_t arg_sequence_count, int64_t arg_num_logical_chunks, int64_t arg_mode_varlen, int64_t arg_D_mode, int64_t arg_has_z, int64_t arg_has_initial, int64_t arg_dt_softplus, double arg_dt_min, double arg_dt_max, int64_t arg_write_final_states, int64_t arg_checkpoint_state_count, int64_t arg_vcount, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   check_cuda_tensor(arg_x_map, "x_map");
   check_dtype(arg_x_map, DLDataType{kDLBfloat, 16, 1}, "x_map");
   check_cuda_tensor(arg_b_map, "b_map");
@@ -809,6 +811,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   check_cuda_tensor(arg_s_work, "s_work");
   check_dtype(arg_s_work, DLDataType{kDLFloat, 32, 1}, "s_work");
   check_contiguous(arg_s_work, "s_work");
+  check_cuda_tensor(arg_agg_work, "agg_work");
+  check_dtype(arg_agg_work, DLDataType{kDLFloat, 32, 1}, "agg_work");
+  check_contiguous(arg_agg_work, "agg_work");
   check_cuda_tensor(arg_h_words, "h_words");
   check_dtype(arg_h_words, DLDataType{kDLUInt, 32, 1}, "h_words");
   check_contiguous(arg_h_words, "h_words");
@@ -857,6 +862,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   TVM_FFI_CHECK(arg_checkpoint_state_count >= -2147483648LL && arg_checkpoint_state_count <= 2147483647LL, ValueError)
       << "scalar 'checkpoint_state_count' value " << arg_checkpoint_state_count
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_vcount >= -2147483648LL && arg_vcount <= 2147483647LL, ValueError)
+      << "scalar 'vcount' value " << arg_vcount
+      << " is outside i32 range [-2147483648, 2147483647]";
   check_same_device(arg_b_map, arg_x_map, "b_map", "x_map");
   check_same_device(arg_c_map, arg_x_map, "c_map", "x_map");
   check_same_device(arg_out_map, arg_x_map, "out_map", "x_map");
@@ -883,6 +891,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   check_same_device(arg_seq_chunk_cumsum, arg_x_map, "seq_chunk_cumsum", "x_map");
   check_same_device(arg_out_native, arg_x_map, "out_native", "x_map");
   check_same_device(arg_s_work, arg_x_map, "s_work", "x_map");
+  check_same_device(arg_agg_work, arg_x_map, "agg_work", "x_map");
   check_same_device(arg_h_words, arg_x_map, "h_words", "x_map");
   check_same_device(arg_grid_barrier, arg_x_map, "grid_barrier", "x_map");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
@@ -890,7 +899,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
       << ", " << grid_z << ")";
 
   prepared.retained.clear();
-  prepared.retained.reserve(29);
+  prepared.retained.reserve(30);
   prepared.retained.push_back(arg_x_map);
   prepared.retained.push_back(arg_b_map);
   prepared.retained.push_back(arg_c_map);
@@ -918,6 +927,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.retained.push_back(arg_seq_chunk_cumsum);
   prepared.retained.push_back(arg_out_native);
   prepared.retained.push_back(arg_s_work);
+  prepared.retained.push_back(arg_agg_work);
   prepared.retained.push_back(arg_h_words);
   prepared.retained.push_back(arg_grid_barrier);
   prepared.kernel = &Kernel();
@@ -949,6 +959,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.p_seq_chunk_cumsum = arg_seq_chunk_cumsum.data_ptr();
   prepared.p_out_native = arg_out_native.data_ptr();
   prepared.p_s_work = arg_s_work.data_ptr();
+  prepared.p_agg_work = arg_agg_work.data_ptr();
   prepared.p_h_words = arg_h_words.data_ptr();
   prepared.p_grid_barrier = arg_grid_barrier.data_ptr();
   prepared.v_nheads = (int32_t)arg_nheads;
@@ -967,6 +978,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.v_dt_max = (float)arg_dt_max;
   prepared.v_write_final_states = (int32_t)arg_write_final_states;
   prepared.v_checkpoint_state_count = (int32_t)arg_checkpoint_state_count;
+  prepared.v_vcount = (int32_t)arg_vcount;
   prepared.grid = tvm::ffi::dim3((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   prepared.block = tvm::ffi::dim3(512u, 1u, 1u);
   prepared.kargs[0] = &prepared.p_x_map;
@@ -996,24 +1008,26 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.kargs[24] = &prepared.p_seq_chunk_cumsum;
   prepared.kargs[25] = &prepared.p_out_native;
   prepared.kargs[26] = &prepared.p_s_work;
-  prepared.kargs[27] = &prepared.p_h_words;
-  prepared.kargs[28] = &prepared.p_grid_barrier;
-  prepared.kargs[29] = &prepared.v_nheads;
-  prepared.kargs[30] = &prepared.v_ngroups;
-  prepared.kargs[31] = &prepared.v_batch;
-  prepared.kargs[32] = &prepared.v_seqlen;
-  prepared.kargs[33] = &prepared.v_nchunks;
-  prepared.kargs[34] = &prepared.v_sequence_count;
-  prepared.kargs[35] = &prepared.v_num_logical_chunks;
-  prepared.kargs[36] = &prepared.v_mode_varlen;
-  prepared.kargs[37] = &prepared.v_D_mode;
-  prepared.kargs[38] = &prepared.v_has_z;
-  prepared.kargs[39] = &prepared.v_has_initial;
-  prepared.kargs[40] = &prepared.v_dt_softplus;
-  prepared.kargs[41] = &prepared.v_dt_min;
-  prepared.kargs[42] = &prepared.v_dt_max;
-  prepared.kargs[43] = &prepared.v_write_final_states;
-  prepared.kargs[44] = &prepared.v_checkpoint_state_count;
+  prepared.kargs[27] = &prepared.p_agg_work;
+  prepared.kargs[28] = &prepared.p_h_words;
+  prepared.kargs[29] = &prepared.p_grid_barrier;
+  prepared.kargs[30] = &prepared.v_nheads;
+  prepared.kargs[31] = &prepared.v_ngroups;
+  prepared.kargs[32] = &prepared.v_batch;
+  prepared.kargs[33] = &prepared.v_seqlen;
+  prepared.kargs[34] = &prepared.v_nchunks;
+  prepared.kargs[35] = &prepared.v_sequence_count;
+  prepared.kargs[36] = &prepared.v_num_logical_chunks;
+  prepared.kargs[37] = &prepared.v_mode_varlen;
+  prepared.kargs[38] = &prepared.v_D_mode;
+  prepared.kargs[39] = &prepared.v_has_z;
+  prepared.kargs[40] = &prepared.v_has_initial;
+  prepared.kargs[41] = &prepared.v_dt_softplus;
+  prepared.kargs[42] = &prepared.v_dt_min;
+  prepared.kargs[43] = &prepared.v_dt_max;
+  prepared.kargs[44] = &prepared.v_write_final_states;
+  prepared.kargs[45] = &prepared.v_checkpoint_state_count;
+  prepared.kargs[46] = &prepared.v_vcount;
 
 }
 
@@ -1023,7 +1037,7 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
 }
 }  // namespace stage_main
 
-void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView preprocess_arg_dt_bias, TensorView preprocess_arg_segment_starts, TensorView preprocess_arg_segment_lengths, TensorView preprocess_arg_chunk_indices, TensorView preprocess_arg_chunk_offsets, TensorView preprocess_arg_delta, TensorView preprocess_arg_cumsum, int64_t preprocess_arg_num_segments, int64_t preprocess_arg_nheads, int64_t preprocess_arg_seqlen, int64_t preprocess_arg_direct_varlen_metadata, int64_t preprocess_arg_dt_softplus, double preprocess_arg_dt_min, double preprocess_arg_dt_max, TensorView preprocess_arg_seq_idx_i32, TensorView preprocess_arg_seq_idx_i64, int64_t preprocess_arg_seq_idx_int64, TensorView preprocess_arg_seq_chunk_cumsum, int64_t preprocess_arg_num_sequences, int64_t preprocess_arg_write_seq_chunk_cumsum, TensorView preprocess_arg_cu_seqlens, TensorView preprocess_arg_checkpoint_token_indices, int64_t preprocess_arg_metadata_from_cu_seqlens, int64_t preprocess_arg_checkpoint_state_count, TensorView preprocess_arg_preprocess_status, int64_t preprocess_grid_x, int64_t preprocess_grid_y, int64_t preprocess_grid_z, TensorView main_arg_x_map, TensorView main_arg_b_map, TensorView main_arg_c_map, TensorView main_arg_out_map, TensorView main_arg_h_map, TensorView main_arg_x, TensorView main_arg_dt, TensorView main_arg_delta_precomputed, TensorView main_arg_cumsum_precomputed, TensorView main_arg_A, TensorView main_arg_B_tensor, TensorView main_arg_C, TensorView main_arg_D, TensorView main_arg_z, TensorView main_arg_dt_bias, TensorView main_arg_initial_states, TensorView main_arg_final_states, TensorView main_arg_checkpoint_states, TensorView main_arg_checkpoint_token_indices, TensorView main_arg_checkpoint_state_slots, TensorView main_arg_seq_idx_i32, TensorView main_arg_seq_idx_i64, TensorView main_arg_chunk_indices, TensorView main_arg_chunk_offsets, TensorView main_arg_seq_chunk_cumsum, TensorView main_arg_out_native, TensorView main_arg_s_work, TensorView main_arg_h_words, TensorView main_arg_grid_barrier, int64_t main_arg_nheads, int64_t main_arg_ngroups, int64_t main_arg_batch, int64_t main_arg_seqlen, int64_t main_arg_nchunks, int64_t main_arg_sequence_count, int64_t main_arg_num_logical_chunks, int64_t main_arg_mode_varlen, int64_t main_arg_D_mode, int64_t main_arg_has_z, int64_t main_arg_has_initial, int64_t main_arg_dt_softplus, double main_arg_dt_min, double main_arg_dt_max, int64_t main_arg_write_final_states, int64_t main_arg_checkpoint_state_count, int64_t main_grid_x, int64_t main_grid_y, int64_t main_grid_z, int64_t cuda_stream_ptr) {
+void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView preprocess_arg_dt_bias, TensorView preprocess_arg_segment_starts, TensorView preprocess_arg_segment_lengths, TensorView preprocess_arg_chunk_indices, TensorView preprocess_arg_chunk_offsets, TensorView preprocess_arg_delta, TensorView preprocess_arg_cumsum, int64_t preprocess_arg_num_segments, int64_t preprocess_arg_nheads, int64_t preprocess_arg_seqlen, int64_t preprocess_arg_direct_varlen_metadata, int64_t preprocess_arg_dt_softplus, double preprocess_arg_dt_min, double preprocess_arg_dt_max, TensorView preprocess_arg_seq_idx_i32, TensorView preprocess_arg_seq_idx_i64, int64_t preprocess_arg_seq_idx_int64, TensorView preprocess_arg_seq_chunk_cumsum, int64_t preprocess_arg_num_sequences, int64_t preprocess_arg_write_seq_chunk_cumsum, TensorView preprocess_arg_cu_seqlens, TensorView preprocess_arg_checkpoint_token_indices, int64_t preprocess_arg_metadata_from_cu_seqlens, int64_t preprocess_arg_checkpoint_state_count, TensorView preprocess_arg_preprocess_status, int64_t preprocess_grid_x, int64_t preprocess_grid_y, int64_t preprocess_grid_z, TensorView main_arg_x_map, TensorView main_arg_b_map, TensorView main_arg_c_map, TensorView main_arg_out_map, TensorView main_arg_h_map, TensorView main_arg_x, TensorView main_arg_dt, TensorView main_arg_delta_precomputed, TensorView main_arg_cumsum_precomputed, TensorView main_arg_A, TensorView main_arg_B_tensor, TensorView main_arg_C, TensorView main_arg_D, TensorView main_arg_z, TensorView main_arg_dt_bias, TensorView main_arg_initial_states, TensorView main_arg_final_states, TensorView main_arg_checkpoint_states, TensorView main_arg_checkpoint_token_indices, TensorView main_arg_checkpoint_state_slots, TensorView main_arg_seq_idx_i32, TensorView main_arg_seq_idx_i64, TensorView main_arg_chunk_indices, TensorView main_arg_chunk_offsets, TensorView main_arg_seq_chunk_cumsum, TensorView main_arg_out_native, TensorView main_arg_s_work, TensorView main_arg_agg_work, TensorView main_arg_h_words, TensorView main_arg_grid_barrier, int64_t main_arg_nheads, int64_t main_arg_ngroups, int64_t main_arg_batch, int64_t main_arg_seqlen, int64_t main_arg_nchunks, int64_t main_arg_sequence_count, int64_t main_arg_num_logical_chunks, int64_t main_arg_mode_varlen, int64_t main_arg_D_mode, int64_t main_arg_has_z, int64_t main_arg_has_initial, int64_t main_arg_dt_softplus, double main_arg_dt_min, double main_arg_dt_max, int64_t main_arg_write_final_states, int64_t main_arg_checkpoint_state_count, int64_t main_arg_vcount, int64_t main_grid_x, int64_t main_grid_y, int64_t main_grid_z, int64_t cuda_stream_ptr) {
 
   DLDevice dev = preprocess_arg_dt.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -1040,7 +1054,7 @@ void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView p
   stage_preprocess::PreparedLaunch prepared_preprocess;
   stage_main::PreparedLaunch prepared_main;
   stage_preprocess::Prepare(prepared_preprocess, preprocess_arg_dt, preprocess_arg_A, preprocess_arg_dt_bias, preprocess_arg_segment_starts, preprocess_arg_segment_lengths, preprocess_arg_chunk_indices, preprocess_arg_chunk_offsets, preprocess_arg_delta, preprocess_arg_cumsum, preprocess_arg_num_segments, preprocess_arg_nheads, preprocess_arg_seqlen, preprocess_arg_direct_varlen_metadata, preprocess_arg_dt_softplus, preprocess_arg_dt_min, preprocess_arg_dt_max, preprocess_arg_seq_idx_i32, preprocess_arg_seq_idx_i64, preprocess_arg_seq_idx_int64, preprocess_arg_seq_chunk_cumsum, preprocess_arg_num_sequences, preprocess_arg_write_seq_chunk_cumsum, preprocess_arg_cu_seqlens, preprocess_arg_checkpoint_token_indices, preprocess_arg_metadata_from_cu_seqlens, preprocess_arg_checkpoint_state_count, preprocess_arg_preprocess_status, preprocess_grid_x, preprocess_grid_y, preprocess_grid_z, stream);
-  stage_main::Prepare(prepared_main, main_arg_x_map, main_arg_b_map, main_arg_c_map, main_arg_out_map, main_arg_h_map, main_arg_x, main_arg_dt, main_arg_delta_precomputed, main_arg_cumsum_precomputed, main_arg_A, main_arg_B_tensor, main_arg_C, main_arg_D, main_arg_z, main_arg_dt_bias, main_arg_initial_states, main_arg_final_states, main_arg_checkpoint_states, main_arg_checkpoint_token_indices, main_arg_checkpoint_state_slots, main_arg_seq_idx_i32, main_arg_seq_idx_i64, main_arg_chunk_indices, main_arg_chunk_offsets, main_arg_seq_chunk_cumsum, main_arg_out_native, main_arg_s_work, main_arg_h_words, main_arg_grid_barrier, main_arg_nheads, main_arg_ngroups, main_arg_batch, main_arg_seqlen, main_arg_nchunks, main_arg_sequence_count, main_arg_num_logical_chunks, main_arg_mode_varlen, main_arg_D_mode, main_arg_has_z, main_arg_has_initial, main_arg_dt_softplus, main_arg_dt_min, main_arg_dt_max, main_arg_write_final_states, main_arg_checkpoint_state_count, main_grid_x, main_grid_y, main_grid_z, stream);
+  stage_main::Prepare(prepared_main, main_arg_x_map, main_arg_b_map, main_arg_c_map, main_arg_out_map, main_arg_h_map, main_arg_x, main_arg_dt, main_arg_delta_precomputed, main_arg_cumsum_precomputed, main_arg_A, main_arg_B_tensor, main_arg_C, main_arg_D, main_arg_z, main_arg_dt_bias, main_arg_initial_states, main_arg_final_states, main_arg_checkpoint_states, main_arg_checkpoint_token_indices, main_arg_checkpoint_state_slots, main_arg_seq_idx_i32, main_arg_seq_idx_i64, main_arg_chunk_indices, main_arg_chunk_offsets, main_arg_seq_chunk_cumsum, main_arg_out_native, main_arg_s_work, main_arg_agg_work, main_arg_h_words, main_arg_grid_barrier, main_arg_nheads, main_arg_ngroups, main_arg_batch, main_arg_seqlen, main_arg_nchunks, main_arg_sequence_count, main_arg_num_logical_chunks, main_arg_mode_varlen, main_arg_D_mode, main_arg_has_z, main_arg_has_initial, main_arg_dt_softplus, main_arg_dt_min, main_arg_dt_max, main_arg_write_final_states, main_arg_checkpoint_state_count, main_arg_vcount, main_grid_x, main_grid_y, main_grid_z, stream);
   stage_preprocess::Submit(prepared_preprocess, stream);
   stage_main::Submit(prepared_main, stream);
 }

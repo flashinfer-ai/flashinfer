@@ -475,6 +475,7 @@ def test_dual_resolved_execution_and_optional_mismatch(model, variant, extra_fp4
         extra_topk=128,
         extra_page_size=64,
         extra_page_stride_bytes=64 * (288 if extra_fp4 else bpt),
+        extra_row_stride_bytes=288 if extra_fp4 else bpt,
         extra_indices_stride=128,
         extra_fp4=extra_fp4,
     )

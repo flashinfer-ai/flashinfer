@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -19,6 +20,11 @@ from pathlib import Path
 import pytest
 
 from flashinfer.jit import cake_gdn as cake_gdn
+
+# The -D knobs a record passes when it shares its body with a schedule twin
+# (its kernel symbol and the constant its deleted clone body baked in); the
+# resolver key (``specializations``) does not carry them.
+_BODY_SHARING_DEFINES = {"CAKE_GDN_KERNEL_SYMBOL", "LAUNCH_MIN_BLOCKS", "T_STEPS"}
 
 
 def _prefill(**overrides):
@@ -64,7 +70,8 @@ def _decode(**overrides):
 def test_manifest_lists_loadable_source_only_variants() -> None:
     # The manifest is the only registry: every variant names one kernel source
     # (shared with the other specializations of the same body), the -D defines
-    # that specialize it, and one host shim.  Nothing is pinned by checksum.
+    # that specialize it, and its host-shim template.  Nothing is pinned by
+    # checksum.
     manifest = cake_gdn._manifest()
     root = cake_gdn._source_dir()
     variants = manifest["variants"]
@@ -74,8 +81,12 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
     assert manifest["binary_artifacts"] is False
     assert "sha256" not in json.dumps(manifest)
     architectures = set(manifest["architectures"])
+    # Every shared header's sha256 enters every variant's compile-cache digest,
+    # so the manifest lists only headers that a listed kernel body includes.
+    header_names = {Path(header["path"]).name for header in manifest["cuda_headers"]}
     for header in manifest["cuda_headers"]:
         assert (root / header["path"]).is_file()
+    included_headers: set[str] = set()
     for record in variants:
         # One body per architecture: a kernel whose lowering differs on one
         # architecture (the sm_107a F64-free q scale) carries that architecture
@@ -85,13 +96,70 @@ def test_manifest_lists_loadable_source_only_variants() -> None:
             assert output["architectures"]
             assert set(output["architectures"]) <= architectures
             assert (root / output["path"]).is_file()
+            source = (root / output["path"]).read_text(encoding="utf-8")
+            included_headers.update(
+                name for name in header_names if f'#include "{name}"' in source
+            )
             served.extend(output["architectures"])
         assert sorted(served) == sorted(record["architectures"])
-        assert (root / record["host_binding"]["path"]).is_file()
-        for key, value in record["defines"].items():
+        assert (root / record["host_binding"]["template"]).is_file()
+        # A record spells out ``defines`` only where its -D flags are not its
+        # specializations (see test_manifest_defines_default_to_specializations).
+        for key, value in record.get("defines", {}).items():
             assert key.isidentifier()
             assert isinstance(value, str) and value
-        assert set(record["defines"]) <= set(record["specializations"])
+        # A record sharing its body with a schedule twin passes the knobs
+        # its own text used to bake in on the compile line; those are not
+        # specializations of the resolver key.
+        extra_defines = set(record.get("defines", {})) - set(record["specializations"])
+        assert extra_defines <= _BODY_SHARING_DEFINES
+    assert included_headers == header_names
+
+
+def test_host_shims_render_to_the_former_per_variant_text() -> None:
+    # Every variant's host shim is rendered from a class template under
+    # host/templates/; the sidecar pins the rendered text to the sha256 of the
+    # per-variant shim file it replaced.  A record that shares its body with a
+    # schedule twin passes its shim's kernel symbol as CAKE_GDN_KERNEL_SYMBOL.
+    pinned_path = Path(__file__).with_name("cake_gdn_host_shim_sha256.json")
+    pinned = json.loads(pinned_path.read_text(encoding="utf-8"))
+    variants = cake_gdn._manifest()["variants"]
+    assert sorted(pinned) == sorted(record["name"] for record in variants)
+    for record in variants:
+        host = record["host_binding"]
+        text = cake_gdn.render_cake_gdn_host_shim(record)
+        assert "@" not in text, record["name"]
+        assert f"TVM_FFI_EMBED_CUBIN({host['module_ident']});" in text
+        assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({host['entry']}, " in text
+        assert f'"{host["cuda_symbol"]}"' in text
+        defines = record.get("defines", {})
+        if "CAKE_GDN_KERNEL_SYMBOL" in defines:
+            assert defines["CAKE_GDN_KERNEL_SYMBOL"] == host["cuda_symbol"]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        assert digest == pinned[record["name"]], record["name"]
+
+
+def test_manifest_defines_default_to_specializations() -> None:
+    # The -D flags of a record are its specializations unless it spells out
+    # ``defines``: the decode bodies that bake their constants in-file take
+    # none, and some bodies take only a subset of the specialization keys.  A
+    # record never repeats its specializations as ``defines``.
+    variants = cake_gdn._manifest()["variants"]
+    explicit = 0
+    for record in variants:
+        flags = cake_gdn._define_flags(record)
+        from_specializations = tuple(
+            f"-D{key}={value}" for key, value in record["specializations"].items()
+        )
+        if "defines" in record:
+            explicit += 1
+            assert flags == tuple(
+                f"-D{key}={value}" for key, value in record["defines"].items()
+            )
+            assert flags != from_specializations
+        else:
+            assert flags == from_specializations
+    assert 0 < explicit < len(variants)
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
@@ -199,7 +267,6 @@ def test_prefill_resolver_selects_exact_sglang_tp4_checkpoint_row() -> None:
         store_final_state=True,
         checkpoint_every_n_tokens=64,
         use_state_indices=True,
-        seq_lens=(52, 93, 15, 107, 72, 61, 21),
     )
 
     assert route.route_id == "flashinfer.gdn_prefill.noncp.checkpoints.dvsplit"
@@ -228,6 +295,9 @@ def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
             checkpoint_every_n_tokens=64,
         )
 
+    # The SGLang TP4 BF16 indexed checkpoint route is structural: the same row
+    # with the TP2 head split (8, 8, 8) stays DV-split (2 * 7 * 8 = 112 tiles)
+    # but is not the frozen contract.
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
         match="SGLang TP4 BF16 indexed DV-split",
@@ -238,8 +308,8 @@ def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
             num_seqs=7,
             total_seq_len=421,
             max_seq_len=107,
-            num_q_heads=4,
-            num_k_heads=4,
+            num_q_heads=8,
+            num_k_heads=8,
             num_v_heads=8,
             use_initial_state=True,
             store_final_state=True,
@@ -252,6 +322,70 @@ def test_prefill_resolver_fails_closed_for_unpromoted_rows() -> None:
         match="low-precision state requires BF16 I/O",
     ):
         _prefill(state_dtype="float16")
+
+
+def test_prefill_resolver_takes_no_device_derived_lengths() -> None:
+    """The resolver reads nothing back from the device.
+
+    ``max_seq_len`` is an upper bound: the SGLang TP4 checkpoint row resolves
+    from the packed length alone, and the per-sequence ``seq_lens`` keyword
+    that used to feed a host-side consistency check is gone.
+    """
+
+    common = {
+        "arch": "sm_103a",
+        "io_dtype": "bfloat16",
+        "state_dtype": "bfloat16",
+        "num_seqs": 7,
+        "total_seq_len": 421,
+        "num_q_heads": 4,
+        "num_k_heads": 4,
+        "num_v_heads": 8,
+        "use_initial_state": True,
+        "store_final_state": True,
+        "checkpoint_every_n_tokens": 64,
+        "use_state_indices": True,
+    }
+    exact = _prefill(**common, max_seq_len=107)
+    bound = _prefill(**common, max_seq_len=421)
+    assert (
+        exact.route_id
+        == bound.route_id
+        == "flashinfer.gdn_prefill.noncp.checkpoints.dvsplit"
+    )
+    assert exact.variant_name == bound.variant_name
+
+    with pytest.raises(TypeError, match="seq_lens"):
+        _prefill(**common, max_seq_len=107, seq_lens=(52, 93, 15, 107, 72, 61, 21))
+
+
+def test_prefill_resolver_single_chunk_follows_the_host_bound() -> None:
+    """``single_chunk`` needs a bound of at most 64 tokens, not device lengths.
+
+    Four 64-token stateless sequences (the only shipped single-chunk head split,
+    H4/HV8) resolve to the single-chunk kernel with the exact bound and fall to
+    the general stateless specialization -- unshipped for this head split, so
+    fail closed -- when only the packed length is known.
+    """
+
+    common = {
+        "io_dtype": "bfloat16",
+        "num_seqs": 4,
+        "total_seq_len": 4 * 64,
+        "num_q_heads": 4,
+        "num_k_heads": 4,
+        "num_v_heads": 8,
+        "use_initial_state": False,
+        "store_final_state": False,
+    }
+    exact = _prefill(**common, max_seq_len=64)
+    assert exact.route_id == "flashinfer.gdn_prefill.noncp.single_chunk.dvsplit"
+    assert "single_chunk" in exact.variant_name
+
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"
+    ):
+        _prefill(**common, max_seq_len=4 * 64)
 
 
 def test_kernel_loader_fails_closed_for_unsupported_architecture() -> None:
@@ -1062,6 +1196,417 @@ def test_prefill_resolver_selects_exact_gated_physical_schedules() -> None:
     assert fullgrid_record["specializations"]["UNIT_GATES"] == 0
 
 
+@pytest.mark.parametrize("state_dtype", ("float32", "bfloat16"))
+def test_prefill_resolver_routes_the_bf16_dvsplit_bodies_to_the_sm100a_late_state_inp_twins(
+    state_dtype: str,
+) -> None:
+    """Lever L2 stays off on the sm_100a bf16-I/O DV-split bodies (Cake rule mirror); sm_103a takes the base."""
+    common = dict(
+        io_dtype="bfloat16",
+        state_dtype=state_dtype,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=8,
+        use_initial_state=True,
+        store_final_state=True,
+        gates_present=True,
+    )
+    late = _prefill(arch="sm_100a", **common)
+    early = _prefill(arch="sm_103a", **common)
+    assert late.route_id == early.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert "_sm100a_state_inp_late_" in late.variant_name
+    assert "state_inp_late" not in early.variant_name
+    late_record = cake_gdn._kernel_record(late.variant_name)
+    early_record = cake_gdn._kernel_record(early.variant_name)
+    assert late_record["architectures"] == ["sm_100a"]
+    assert late_record["specializations"] == early_record["specializations"]
+    assert late_record["tma_abi"] == early_record["tma_abi"] == "grid_constant"
+    base = early_record["source_schedule"]
+    assert late_record["source_schedule"] == f"{base}_sm100a_state_inp_late"
+
+
+def test_prefill_schedule_attr_pins_the_sm100a_late_state_inp_twin_names() -> None:
+    for use_initial_state in (False, True):
+        for state_dtype in ("float32", "bfloat16"):
+            kwargs = dict(
+                dvsplit=True,
+                use_initial_state=use_initial_state,
+                io_dtype="bfloat16",
+                state_dtype=state_dtype,
+                single_chunk=False,
+                gatepipe4=False,
+                fullgrid_vhold=False,
+            )
+            base = cake_gdn._prefill_schedule_attr(
+                sm100a_state_inp_late=False,
+                sm103a_role_rebalanced=False,
+                gate_stream_full=False,
+                **kwargs,
+            )
+            twin = cake_gdn._prefill_schedule_attr(
+                sm100a_state_inp_late=True,
+                sm103a_role_rebalanced=False,
+                gate_stream_full=False,
+                **kwargs,
+            )
+            assert base.startswith("flashinfer_blackwell_gdn_prefill_dvsplit")
+            assert twin == f"{base}_sm100a_state_inp_late"
+    # The rule never fires for sm_103a / sm_107a, f16 I/O, single-chunk or indexed-state routes.
+    # Hq16/Hv32 (Qwen3.5-35B TP1): the FP32-state DV-split base record lists sm_103a
+    # and sm_107a; the FP32-state TP2/TP4/TP8 base records list sm_103a only (sm_100a
+    # runs the late-state-input twins, which are the only records listing it).
+    for arch in ("sm_103a", "sm_107a"):
+        assert (
+            "state_inp_late"
+            not in _prefill(
+                arch=arch,
+                io_dtype="bfloat16",
+                num_q_heads=16,
+                num_k_heads=16,
+                num_v_heads=32,
+                gates_present=True,
+            ).variant_name
+        )
+    assert (
+        "state_inp_late" not in _prefill(gates_present=True).variant_name
+    )  # f16 I/O (gatepipe4)
+
+
+def _requested_prefill_source(monkeypatch, **overrides):
+    """The (schedule attr, specializations, route) the resolver asks the manifest for, whatever the manifest ships."""
+    captured: dict = {}
+
+    def fake_variant_for(*, arch, domain, schedule_attr, specializations):
+        captured.update(
+            arch=arch,
+            domain=domain,
+            schedule_attr=schedule_attr,
+            specializations=dict(specializations),
+        )
+        return {"name": f"stub:{schedule_attr}"}
+
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    monkeypatch.setattr(cake_gdn, "_variant_for", fake_variant_for)
+    try:
+        route = _prefill(**overrides)
+    finally:
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert captured["domain"] == "prefill"
+    return captured["schedule_attr"], captured["specializations"], route.route_id
+
+
+# Hq16/Hv16, fp16 I/O, fp32 state, initial + final state, 4 x 16 x 2 = 128 DV-split tiles: neither gatepipe4
+# (tiles != 128) nor, off sm_100a, fullgrid_vhold -- the exact SM103a role-rebalance compile key.
+_HQ16_HV16_F16_STATEFUL_128_TILES = dict(
+    io_dtype="float16",
+    state_dtype="float32",
+    num_seqs=4,
+    total_seq_len=4 * 1024,
+    max_seq_len=1024,
+    num_q_heads=16,
+    num_k_heads=16,
+    num_v_heads=16,
+    use_initial_state=True,
+    store_final_state=True,
+    gates_present=True,
+)
+
+
+def test_prefill_resolver_routes_the_sm103a_hq16_hv16_fp16_stateful_key_to_the_role_rebalanced_twin(
+    monkeypatch,
+) -> None:
+    """Cake rule mirror (``_should_use_sm103a_initial_state_role_rebalance``): sm_103a builds the 224/56 role-split
+    twin for exactly this key; sm_107a takes the plain body, sm_100a the full-grid V-hold body."""
+    base = "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io"
+    key = _HQ16_HV16_F16_STATEFUL_128_TILES
+    twin, twin_specs, route = _requested_prefill_source(
+        monkeypatch, arch="sm_103a", **key
+    )
+    assert twin == f"{base}_sm103a_role_rebalanced"
+    assert route == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert (
+        twin_specs["NUM_O_HEADS_LOG2"] == 4
+        and twin_specs["HEAD_GROUP_LOG2"] == 0
+        and twin_specs["IS_GQA"] == 1
+    )
+    assert twin_specs["USE_INITIAL_STATE"] == 1 and twin_specs["STORE_FINAL_STATE"] == 1
+    assert (
+        twin_specs["ENABLE_CHECKPOINTS"] == 0 and twin_specs["USE_STATE_INDICES"] == 0
+    )
+    assert twin_specs["SINGLE_CHUNK_NO_STATE"] == 0 and twin_specs["UNIT_GATES"] == 0
+    plain, plain_specs, _ = _requested_prefill_source(
+        monkeypatch, arch="sm_107a", **key
+    )
+    assert plain == base and plain_specs == twin_specs
+    vhold, vhold_specs, _ = _requested_prefill_source(
+        monkeypatch, arch="sm_100a", **key
+    )
+    assert vhold == f"{base}_fullgrid_vhold" and vhold_specs == twin_specs
+    # Without gates the gatepipe4 schedule is never selected, so the rule fires at any tile count on sm_103a.
+    no_gates, _, _ = _requested_prefill_source(
+        monkeypatch,
+        arch="sm_103a",
+        **{**key, "num_seqs": 2, "total_seq_len": 2048, "gates_present": False},
+    )
+    assert no_gates == twin
+    # Every neighbour of the key stays on its base on sm_103a: gatepipe4 (gated, tiles != 128), bf16 I/O,
+    # Hq8/Hv8, Hq16/Hv32 (full DV), no final state, indexed state.
+    for change in (
+        dict(num_seqs=2, total_seq_len=2048),
+        dict(io_dtype="bfloat16"),
+        dict(num_q_heads=8, num_k_heads=8, num_v_heads=8),
+        dict(num_v_heads=32),
+        dict(store_final_state=False),
+        dict(use_state_indices=True),
+    ):
+        attr, _, _ = _requested_prefill_source(
+            monkeypatch, arch="sm_103a", **{**key, **change}
+        )
+        assert "role_rebalanced" not in attr, (change, attr)
+
+
+def test_prefill_schedule_attr_pins_the_sm103a_role_rebalanced_twin_name() -> None:
+    kwargs = dict(
+        dvsplit=True,
+        use_initial_state=True,
+        io_dtype="float16",
+        state_dtype="float32",
+        single_chunk=False,
+        gatepipe4=False,
+        fullgrid_vhold=False,
+        sm100a_state_inp_late=False,
+    )
+    base = cake_gdn._prefill_schedule_attr(
+        sm103a_role_rebalanced=False, gate_stream_full=False, **kwargs
+    )
+    assert base == "flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io"
+    assert (
+        cake_gdn._prefill_schedule_attr(
+            sm103a_role_rebalanced=True, gate_stream_full=False, **kwargs
+        )
+        == f"{base}_sm103a_role_rebalanced"
+    )
+
+
+# Hq16/Hv32, bf16 I/O, fp32 state, initial + final state, 32 x 256-token sequences: 1024 full-DV work tiles on the
+# 148 / 160 / 212-CTA grid of the grid rule (seven, seven and five tiles per CTA), mean sequence length 256 -- a
+# gate-stream key on every architecture (Cake rule ``gate_stream_flat_default``: >= 2 tiles per CTA, mean <= 512).
+_HQ16_HV32_BF16_STATEFUL_32X256 = dict(
+    io_dtype="bfloat16",
+    state_dtype="float32",
+    num_seqs=32,
+    total_seq_len=32 * 256,
+    max_seq_len=256,
+    num_q_heads=16,
+    num_k_heads=16,
+    num_v_heads=32,
+    use_initial_state=True,
+    store_final_state=True,
+    gates_present=True,
+)
+
+
+def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin(
+    monkeypatch,
+) -> None:
+    """Cake rule mirror (``gate_stream_flat_default``, exporter ``_prefill_plan``): the full-DV stateful bodies take
+    their ``_gatestream_full`` twin on every architecture when a CTA owns at least two work tiles under the grid rule
+    and the mean sequence length is at most 512 tokens; every other key stays on its base."""
+    base = "flashinfer_blackwell_gdn_prefill_initial"
+    key = _HQ16_HV32_BF16_STATEFUL_32X256
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        twin, specs, route = _requested_prefill_source(monkeypatch, arch=arch, **key)
+        assert twin == f"{base}_gatestream_full", arch
+        assert route == "flashinfer.gdn_prefill.noncp.full_dv"
+        assert (
+            specs["NUM_O_HEADS_LOG2"] == 5
+            and specs["HEAD_GROUP_LOG2"] == 1
+            and specs["IS_GQA"] == 0
+        )
+        assert specs["USE_INITIAL_STATE"] == 1 and specs["STORE_FINAL_STATE"] == 1
+        assert specs["ENABLE_CHECKPOINTS"] == 0 and specs["USE_STATE_INDICES"] == 0
+        assert specs["SINGLE_CHUNK_NO_STATE"] == 0 and specs["UNIT_GATES"] == 0
+    # The bf16-state body has its own twin; 16 x 512 (512 tiles, four per CTA, mean 512) and the Hq8/Hv32 and
+    # Hq4/Hv16 16 x 512 head splits (512 / 256 tiles on 128 CTAs) qualify as well.
+    for change, expected in (
+        (dict(state_dtype="bfloat16"), f"{base}_bf16state_gatestream_full"),
+        (
+            dict(num_seqs=16, total_seq_len=16 * 512, max_seq_len=512),
+            f"{base}_gatestream_full",
+        ),
+        (
+            dict(
+                num_seqs=16,
+                total_seq_len=16 * 512,
+                max_seq_len=512,
+                num_q_heads=8,
+                num_k_heads=8,
+                state_dtype="bfloat16",
+            ),
+            f"{base}_bf16state_gatestream_full",
+        ),
+        (
+            dict(
+                num_seqs=16,
+                total_seq_len=16 * 512,
+                max_seq_len=512,
+                num_q_heads=4,
+                num_k_heads=4,
+                num_v_heads=16,
+            ),
+            f"{base}_gatestream_full",
+        ),
+    ):
+        attr, _, _ = _requested_prefill_source(
+            monkeypatch, arch="sm_103a", **{**key, **change}
+        )
+        assert attr == expected, (change, attr)
+    # Off: 8 x 1024 (256 tiles, two per CTA, but a 1024-token mean), 16 x 513 (mean above 512), 16 x 512 Hq4/Hv8
+    # (128 tiles, one CTA per tile), 4 x 256 Hq4/Hv8 (DV-split: one CTA per tile; sm_100a takes the L2 twin), f16
+    # I/O and the stateless body (no gate-stream twin), indexed state (the ``_indexed`` body, no twin).
+    for change, expected in (
+        (dict(num_seqs=8, total_seq_len=8 * 1024, max_seq_len=1024), base),
+        (dict(num_seqs=16, total_seq_len=16 * 513, max_seq_len=513), base),
+        (
+            dict(
+                num_seqs=16,
+                total_seq_len=16 * 512,
+                max_seq_len=512,
+                num_q_heads=4,
+                num_k_heads=4,
+                num_v_heads=8,
+            ),
+            base,
+        ),
+        (
+            dict(
+                num_seqs=4,
+                total_seq_len=4 * 256,
+                num_q_heads=4,
+                num_k_heads=4,
+                num_v_heads=8,
+            ),
+            "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late",
+        ),
+        (dict(io_dtype="float16"), f"{base}_f16io"),
+        (
+            dict(use_initial_state=False, store_final_state=False),
+            "flashinfer_blackwell_gdn_prefill",
+        ),
+        (dict(use_state_indices=True), base),
+    ):
+        attr, _, _ = _requested_prefill_source(
+            monkeypatch, arch="sm_100a", **{**key, **change}
+        )
+        assert attr == expected, (change, attr)
+
+
+def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() -> None:
+    """The ``_gatestream_full`` twin is exported for the head geometries the representative rows reach; a key
+    whose twin is not in the manifest (here the Qwen3.5-397B TP4 Hq4/Hv16 FP32-state record, 64 x 256 full-DV
+    tiles) resolves to its base ``_initial`` record on every architecture that ships it -- the route upstream
+    served before the twin existed -- while the Hq16/Hv32 key of the same shape takes the twin."""
+    shape = dict(
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        num_seqs=64,
+        total_seq_len=64 * 256,
+        max_seq_len=256,
+        use_initial_state=True,
+        store_final_state=True,
+        gates_present=True,
+    )
+    for arch in ("sm_100a", "sm_103a"):
+        base = _prefill(
+            arch=arch, num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape
+        )
+        assert base.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+        assert "gatestream" not in base.variant_name, base
+        record = cake_gdn._kernel_record(base.variant_name)
+        assert record["source_schedule"].endswith(
+            ":flashinfer_blackwell_gdn_prefill_initial"
+        )
+        assert (
+            record["specializations"]["HEAD_GROUP_LOG2"],
+            record["specializations"]["IS_GQA"],
+            record["specializations"]["NUM_O_HEADS_LOG2"],
+        ) == (2, 0, 4)
+        twin = _prefill(
+            arch=arch, num_q_heads=16, num_k_heads=16, num_v_heads=32, **shape
+        )
+        assert twin.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+        assert twin.variant_name.startswith(
+            "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full"
+        ), twin
+    # A missing base still fails closed: no architecture other than sm_100a / sm_103a ships the TP4 record.
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="sm_107a"):
+        _prefill(arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape)
+
+
+def test_prefill_schedule_attr_pins_the_gatestream_twin_names() -> None:
+    kwargs = dict(
+        dvsplit=False,
+        io_dtype="bfloat16",
+        single_chunk=False,
+        gatepipe4=False,
+        fullgrid_vhold=False,
+        sm100a_state_inp_late=False,
+        sm103a_role_rebalanced=False,
+    )
+    for state_dtype in ("float32", "bfloat16"):
+        base = cake_gdn._prefill_schedule_attr(
+            use_initial_state=True,
+            state_dtype=state_dtype,
+            gate_stream_full=False,
+            **kwargs,
+        )
+        assert base == "flashinfer_blackwell_gdn_prefill_initial" + (
+            "_bf16state" if state_dtype == "bfloat16" else ""
+        )
+        twin = cake_gdn._prefill_schedule_attr(
+            use_initial_state=True,
+            state_dtype=state_dtype,
+            gate_stream_full=True,
+            **kwargs,
+        )
+        assert twin == f"{base}_gatestream_full"
+        # No twin without initial state: the flag leaves the stateless name unchanged.
+        stateless = cake_gdn._prefill_schedule_attr(
+            use_initial_state=False,
+            state_dtype=state_dtype,
+            gate_stream_full=False,
+            **kwargs,
+        )
+        assert (
+            cake_gdn._prefill_schedule_attr(
+                use_initial_state=False,
+                state_dtype=state_dtype,
+                gate_stream_full=True,
+                **kwargs,
+            )
+            == stateless
+        )
+    # The rule itself: tiles per CTA from the grid rule, mean sequence length from the host scalars.
+    assert cake_gdn._cake_gdn_prefill_gate_stream_full(
+        num_seqs=32, total_seq_len=32 * 256, total_tiles=1024, grid_x=148
+    )
+    assert cake_gdn._cake_gdn_prefill_gate_stream_full(
+        num_seqs=16, total_seq_len=16 * 512, total_tiles=256, grid_x=128
+    )
+    assert not cake_gdn._cake_gdn_prefill_gate_stream_full(
+        num_seqs=16, total_seq_len=16 * 513, total_tiles=256, grid_x=128
+    )
+    assert not cake_gdn._cake_gdn_prefill_gate_stream_full(
+        num_seqs=8, total_seq_len=8 * 1024, total_tiles=256, grid_x=128
+    )
+    assert not cake_gdn._cake_gdn_prefill_gate_stream_full(
+        num_seqs=16, total_seq_len=16 * 512, total_tiles=128, grid_x=128
+    )
+    assert cake_gdn._cake_gdn_prefill_grid_x(1024, 148, False, 256) == 148
+    assert cake_gdn._cake_gdn_prefill_grid_x(512, 160, False, 512) == 128
+    assert cake_gdn._cake_gdn_prefill_grid_x(128, 148, True, 1024) == 128
+
+
 def test_prefill_resolver_accepts_dynamic_sglang_tp4_checkpoint_batches() -> None:
     common = {
         "arch": "sm_103a",
@@ -1081,14 +1626,12 @@ def test_prefill_resolver_accepts_dynamic_sglang_tp4_checkpoint_batches() -> Non
         num_seqs=7,
         total_seq_len=421,
         max_seq_len=107,
-        seq_lens=(52, 93, 15, 107, 72, 61, 21),
     )
     live = cake_gdn.select_cake_gdn_prefill_variant(
         **common,
         num_seqs=5,
         total_seq_len=4296,
         max_seq_len=897,
-        seq_lens=(849, 835, 862, 897, 853),
     )
     assert (
         frozen.route_id
@@ -1118,7 +1661,6 @@ def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> No
             checkpoint_every_n_tokens=128,
             use_state_indices=True,
             gates_present=True,
-            seq_lens=(849, 835, 862, 897, 853),
         )
 
     for arch, num_seqs in (("sm_100a", 10), ("sm_103a", 11), ("sm_107a", 14)):
@@ -1141,7 +1683,6 @@ def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> No
                 checkpoint_every_n_tokens=64,
                 use_state_indices=True,
                 gates_present=True,
-                seq_lens=(64,) * num_seqs,
             )
 
 

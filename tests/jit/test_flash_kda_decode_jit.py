@@ -108,7 +108,8 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
     assert not any("compute_120" in flag for flag in spec.extra_cuda_cflags)
 
-    frozen_source = flash_kda_decode._get_csrc_dir() / f"flashkda_decode_{variant}.cu"
+    body_file = flash_kda_decode.get_flash_kda_decode_body_file(variant)
+    frozen_source = flash_kda_decode._get_csrc_dir() / body_file
     frozen_text = frozen_source.read_text()
     assert "Frozen Cake recurrent-KDA export; do not edit by hand." in frozen_text
     assert "SHA256" not in frozen_text
@@ -150,10 +151,7 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
         assert "#define BLOCK_CHECKPOINT_MMA 0" in generated_body
 
     binding_text = spec.sources[0].read_text()
-    assert (
-        f'#define CAKE_KDA_DECODE_BODY_FILE "flashkda_decode_{variant}.cu"'
-        in binding_text
-    )
+    assert f'#define CAKE_KDA_DECODE_BODY_FILE "{body_file}"' in binding_text
     assert f"#define CAKE_KDA_DECODE_HEAD_DIM {metadata.head_dim}" in binding_text
     assert f"#define CAKE_KDA_DECODE_TOKENS {metadata.tokens}" in binding_text
     assert f"#define CAKE_KDA_DECODE_GATE_KIND {expected_gate_kind}" in binding_text
@@ -210,6 +208,72 @@ def test_flash_kda_decode_binding_contract():
     assert "kernel_flashinfer_recurrent_kda_t1_direct" in direct_impl
     assert "SMEM_TOTAL" not in direct_impl
     assert "int64_t beta_is_logit, int64_t cuda_stream" in direct_impl
+
+
+_TEMPLATED_BODY_FILES = {
+    1: "flashkda_decode_d128_t1_precomputed_direct.cu",
+    2: "flashkda_decode_d128_t2_precomputed.cu",
+    3: "flashkda_decode_d128_t3_lower_bound_split4.cu",
+    4: "flashkda_decode_d128_t4_precomputed.cu",
+    5: "flashkda_decode_d128_t5_precomputed_gram.cu",
+    6: "flashkda_decode_d128_t6_precomputed_gram.cu",
+}
+# variant -> (tokens, CAKE_KDA_DECODE_VALUE_SPLIT, CAKE_KDA_DECODE_LAUNCH_THREADS)
+_EXPECTED_BODIES = {
+    "d128_t1_precomputed_direct_split16": (1, 16, 32),
+    "d128_t1_precomputed_direct_split8": (1, 8, 32),
+    "d128_t2_precomputed_split4": (2, 4, 64),
+    "d128_t2_precomputed_split8": (2, 8, 64),
+    "d128_t3_lower_bound_split4": (3, 4, 96),
+    "d128_t4_precomputed_split1": (4, 1, 256),
+    "d128_t4_precomputed_split2": (4, 2, 128),
+    "d128_t4_precomputed_split4": (4, 4, 128),
+    "d128_t4_precomputed_split8": (4, 8, 128),
+    "d128_t5_precomputed_gram_split1": (5, 1, 256),
+    "d128_t5_precomputed_gram_split2": (5, 2, 160),
+    "d128_t5_precomputed_gram_split4": (5, 4, 160),
+    "d128_t5_precomputed_gram_split8": (5, 8, 160),
+    "d128_t6_precomputed_gram_split1": (6, 1, 256),
+    "d128_t6_precomputed_gram_split2": (6, 2, 192),
+    "d128_t6_precomputed_gram_split4": (6, 4, 192),
+    "d128_t6_precomputed_gram_split8": (6, 8, 192),
+}
+
+
+def test_flash_kda_decode_variants_share_templated_bodies():
+    csrc_dir = flash_kda_decode._get_csrc_dir()
+    assert flash_kda_decode.FLASH_KDA_DECODE_BODY_FILES == _TEMPLATED_BODY_FILES
+    assert set(_EXPECTED_BODIES) == set(flash_kda_decode.FLASH_KDA_DECODE_VARIANTS)
+    splits_by_body: dict[str, set[int]] = {}
+    for variant, (tokens, value_split, launch_threads) in _EXPECTED_BODIES.items():
+        body_file = _TEMPLATED_BODY_FILES[tokens]
+        assert flash_kda_decode.get_flash_kda_decode_body_file(variant) == body_file
+        metadata = flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA[variant]
+        assert (metadata.tokens, metadata.value_split) == (tokens, value_split)
+        assert metadata.launch_threads == launch_threads
+        binding_text = flash_kda_decode._get_binding_cu(metadata)
+        assert f'#define CAKE_KDA_DECODE_BODY_FILE "{body_file}"' in binding_text
+        assert f"#define CAKE_KDA_DECODE_VALUE_SPLIT {value_split}" in binding_text
+        assert (
+            f"#define CAKE_KDA_DECODE_LAUNCH_THREADS {launch_threads}" in binding_text
+        )
+        splits_by_body.setdefault(body_file, set()).add(value_split)
+    for body_file, splits in splits_by_body.items():
+        body_text = (csrc_dir / body_file).read_text()
+        guards = {
+            line for line in body_text.splitlines() if line.startswith("#if CAKE_KDA_")
+        }
+        # Multi-split templates select every split-specific line from the
+        # binding define; the single-split T=3 body carries no knob at all.
+        assert all(
+            line.startswith("#if CAKE_KDA_DECODE_VALUE_SPLIT ") for line in guards
+        )
+        assert {int(line.rsplit(" ", 1)[1]) for line in guards} <= splits
+        assert bool(guards) is (len(splits) > 1)
+    remaining = sorted(
+        path.name for path in csrc_dir.glob("flashkda_decode_d128_t*.cu")
+    )
+    assert remaining == sorted(set(_TEMPLATED_BODY_FILES.values()))
 
 
 def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):

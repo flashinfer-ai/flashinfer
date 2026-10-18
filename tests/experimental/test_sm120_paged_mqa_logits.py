@@ -1,10 +1,15 @@
 """SM120a paged FP8 MQA lightning-indexer logits (DeepGEMM signatures).
 
-Covers the exported ``(heads, page_kv, next_n)`` programs against a dequantized
-PyTorch reference and an independent Python mirror of the schedule, the
-``clean_logits=False`` write extent, CUDA Graph replay with changed contents,
-one-shot/plan equivalence, the padded block-stride cache view, and the
-host-only route/target helpers.
+Covers every exported ``(heads, page_kv, next_n, Q-atom variant)`` program --
+the batch selects the variant, so each geometry with two variants has a
+small-batch and a large-batch case -- against a dequantized PyTorch reference
+and an independent Python mirror of the schedule, the ``clean_logits=False``
+write extent, CUDA Graph replay with changed contents, one-shot/plan
+equivalence, the padded block-stride cache view, the head-count rule of the
+metadata entry, the optional long-context hint (``max_context_hint``, which
+applies the large-batch atom rule at batches 2-8 on every entry; 64-head
+next_n 5/6 keep the reference atoms), and the host-only
+route/target helpers.
 
 The GPU tests skip while the installed catalog carries no route for the shape
 or the device is not an exported architecture; the host-only helpers and the
@@ -25,31 +30,80 @@ from flashinfer.sm120_paged_mqa_logits import (
 HEAD_DIM = 128
 FUSED_ROW_BYTES = HEAD_DIM + 4
 ATOL, RTOL = 0.1, 0.1  # FP8 e4m3
-# (heads, page_kv, next_n, batch, average context)
+# (heads, page_kv, next_n, batch, average context).  The batch selects the
+# Q-atom variant (catalog ``atom_rule``): batches up to the small-batch bound
+# take the reference atomization (2-token atoms, ``a2``; ``a1`` for next_n 1),
+# larger batches the native atom (``a3``..``a6``), and the 64-head next_n 5/6
+# geometries take two 3-token atoms (``a3``) from the large-batch bound up.
 CASES = [
+    # Reference atomization: every geometry at a small batch.
     (32, 128, 1, 4, 1024),
-    (32, 128, 4, 3, 1024),
-    (32, 64, 2, 8, 2048),
-    (64, 64, 1, 8, 2048),
-    (64, 64, 4, 2, 512),
-    # next_n 3 (one 3-token atom), 5 (2 + 2 + 1 tokens: partial last atom) and
-    # 6 (2 + 2 + 2), on both head counts.
-    (32, 128, 3, 3, 1024),
-    (32, 64, 5, 2, 1024),
-    (32, 128, 6, 2, 512),
-    (64, 64, 3, 3, 1024),
-    (64, 64, 5, 2, 512),
-    (64, 64, 6, 2, 1024),
-    # The remaining exported routes, so every (heads, page, next_n) the catalog
-    # ships has a GPU correctness case (test_sm120_cases_cover_every_route).
     (32, 128, 2, 6, 2048),
+    (32, 128, 3, 3, 1024),
+    (32, 128, 4, 3, 1024),
     (32, 128, 5, 2, 1024),
+    (32, 128, 6, 2, 512),
     (32, 64, 1, 5, 1536),
+    (32, 64, 2, 8, 2048),
     (32, 64, 3, 3, 1024),
     (32, 64, 4, 3, 512),
+    (32, 64, 5, 2, 1024),
     (32, 64, 6, 2, 1024),
+    (64, 64, 1, 8, 2048),
     (64, 64, 2, 4, 1024),
+    (64, 64, 3, 3, 1024),
+    (64, 64, 4, 2, 512),
+    (64, 64, 5, 2, 512),
+    (64, 64, 6, 2, 1024),
+    # Native atoms (one Q atom per request) above the small-batch bound.
+    (32, 128, 3, 12, 512),
+    (32, 128, 4, 12, 512),
+    (32, 128, 5, 12, 512),
+    (32, 128, 6, 12, 512),
+    (32, 64, 3, 16, 512),
+    (32, 64, 4, 16, 512),
+    (32, 64, 5, 12, 512),
+    (32, 64, 6, 12, 512),
+    (64, 64, 3, 12, 512),
+    (64, 64, 4, 12, 512),
+    # 64 heads, next_n 5/6: two 3-token atoms from the large-batch bound up.
+    (64, 64, 5, 128, 256),
+    (64, 64, 6, 128, 256),
 ]
+# (heads, page_kv, next_n, batch, average context) for the optional long-context
+# hint (CAKE-1373 r2 R3).  With ``max_context_hint >= long_context_min_kv`` the
+# catalog's ``selection_long`` applies: batch class 1 (2 <= B <= 8) takes the
+# native atom where it fits the TMA Q box (next_n 3-6 at 32 heads, 3-4 at 64
+# heads) and keeps the reference ``a2`` for the 64-head next_n 5/6 geometries.
+# No new route: every hinted variant is a program the batch rule already ships.
+HINT_CASES = [
+    (32, 128, 3, 8, 16384),
+    (32, 64, 4, 8, 16384),
+    (32, 64, 5, 8, 16384),
+    (64, 64, 3, 8, 16384),
+    (64, 64, 6, 8, 16384),
+]
+# ``_inputs`` draws every request's last-token length from ``[0.7, 1.3) *
+# avg_ctx``, so ``data["max_context_len"]`` is not guaranteed to reach 16384 at
+# avg_ctx 16384.  The hint is an upper bound of the batch's context lengths, so
+# the hint cases pass an explicit bound above every drawn length instead.
+LONG_HINT = 65536
+# ``selection_long`` for batch class 1 (2 <= B <= 8): the native atom wherever
+# it fits the 256-row TMA Q box, else the reference pairing.
+LONG_CLASS1 = {
+    (32, 1): "a1",
+    (32, 2): "a2",
+    (32, 3): "a3",
+    (32, 4): "a4",
+    (32, 5): "a5",
+    (32, 6): "a6",
+    (64, 1): "a1",
+    (64, 2): "a2",
+    (64, 3): "a3",
+    (64, 4): "a4",
+    (64, 5): "a2",
+    (64, 6): "a2",
+}
 
 
 def _skip_unless_route(heads, page_kv, next_n):
@@ -218,7 +272,9 @@ def test_sm120_paged_mqa_logits(heads, page_kv, next_n, batch, avg_ctx):
         data["block_table"],
         data["max_context_len"],
     )
-    assert plan.route_name == _runtime.route_name(heads, page_kv, next_n)
+    assert plan.route_name == _runtime.route_name(heads, page_kv, next_n, batch)
+    assert plan.atom_variant == _runtime.atom_variant(heads, next_n, batch)
+    assert plan.route["atom_variant"] == plan.atom_variant
     assert plan.launch_count == 1 and plan.kernel_launches == 2
     assert plan.program_names == [plan.route["sequence"]]
     plan.output.fill_(float("nan"))
@@ -230,16 +286,32 @@ def test_sm120_paged_mqa_logits(heads, page_kv, next_n, batch, avg_ctx):
     stream.synchronize()
     _check(plan.logical_output, _reference(data), data, plan.output)
     # The sequence rebuilt the schedule; it matches the independent mirror.
-    atoms = _runtime.next_n_atoms(next_n)
+    atoms = _runtime.next_n_atoms(next_n, batch, heads)
+    assert atoms == plan.num_next_n_atoms
     expected = _schedule_reference(
         data["context_lens"], _runtime.split_kv(), atoms, plan.num_sms
     )
     assert plan.schedule_meta.cpu().tolist() == expected
     # The standalone metadata entry produces the same schedule.
-    meta = get_paged_mqa_logits_metadata(data["context_lens"], page_kv, plan.num_sms)
+    meta = get_paged_mqa_logits_metadata(
+        data["context_lens"], page_kv, plan.num_sms, num_heads=heads
+    )
     assert meta.dtype == torch.int32
     assert tuple(meta.shape) == _runtime.metadata_shape(plan.num_sms)
     assert torch.equal(meta, plan.schedule_meta)
+    # Without the head count the entry resolves exactly when every exported
+    # head count selects this schedule, and names ``num_heads`` otherwise.
+    variants = {
+        _runtime.atom_variant(h, next_n, batch) for h in _runtime.exported_heads()
+    }
+    if len(variants) == 1:
+        heads_free = get_paged_mqa_logits_metadata(
+            data["context_lens"], page_kv, plan.num_sms
+        )
+        assert torch.equal(heads_free, plan.schedule_meta)
+    else:
+        with pytest.raises(ValueError, match="num_heads"):
+            get_paged_mqa_logits_metadata(data["context_lens"], page_kv, plan.num_sms)
     # One-shot entry on the same operands: identical bits where both wrote.
     one_shot = fp8_paged_mqa_logits(
         data["q"],
@@ -249,6 +321,108 @@ def test_sm120_paged_mqa_logits(heads, page_kv, next_n, batch, avg_ctx):
         data["block_table"],
         meta,
         data["max_context_len"],
+    )
+    written = ~torch.isnan(plan.logical_output)
+    assert torch.equal(one_shot[written], plan.logical_output[written])
+
+
+@pytest.mark.parametrize("heads,page_kv,next_n,batch,avg_ctx", HINT_CASES)
+def test_sm120_paged_mqa_logits_long_context_hint(
+    heads, page_kv, next_n, batch, avg_ctx
+):
+    """``max_context_hint`` selects ``selection_long`` for batch 2-8 on every entry.
+
+    The hint is host-only: the schedule buffer carries no atom count, so the
+    metadata call and the logits call of one decode step must receive the same
+    hint (exactly as ``num_heads``).  The test also records the hazard: the
+    same operands without the hint build a different schedule wherever the
+    variant changes, and nothing at runtime can tell the two buffers apart.
+    """
+    _skip_unless_route(heads, page_kv, next_n)
+    data = _inputs(heads, page_kv, next_n, batch, avg_ctx)
+    hint = LONG_HINT
+    assert hint >= data["max_context_len"]
+    assert hint >= int(_runtime.atom_rule()["long_context_min_kv"])
+    plan = prepare_sm120_paged_mqa_logits(
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        data["max_context_len"],
+        max_context_hint=hint,
+    )
+    hinted = _runtime.atom_variant(heads, next_n, batch, max_context_hint=hint)
+    unhinted = _runtime.atom_variant(heads, next_n, batch)
+    assert plan.max_context_hint == hint
+    assert plan.atom_variant == hinted
+    assert plan.route_name == _runtime.route_name(
+        heads, page_kv, next_n, batch, max_context_hint=hint
+    )
+    assert plan.route["atom_variant"] == plan.atom_variant
+    assert plan.launch_count == 1 and plan.kernel_launches == 2
+    # The 64-head 5-/6-token native atom exceeds the TMA Q box, so that
+    # geometry keeps ``a2`` with or without the hint; every other case moves
+    # from the reference pairing to its native atom.
+    if (heads, next_n) in ((64, 5), (64, 6)):
+        assert hinted == unhinted == "a2"
+    else:
+        assert hinted != unhinted
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    _check(plan.logical_output, _reference(data), data, plan.output)
+    # The sequence rebuilt the schedule with the hinted atom count.
+    atoms = _runtime.next_n_atoms(next_n, batch, heads, max_context_hint=hint)
+    assert atoms == plan.num_next_n_atoms
+    expected = _schedule_reference(
+        data["context_lens"], _runtime.split_kv(), atoms, plan.num_sms
+    )
+    assert plan.schedule_meta.cpu().tolist() == expected
+    # The standalone metadata entry with the same hint produces the same schedule.
+    meta = get_paged_mqa_logits_metadata(
+        data["context_lens"],
+        page_kv,
+        plan.num_sms,
+        num_heads=heads,
+        max_context_hint=hint,
+    )
+    assert torch.equal(meta, plan.schedule_meta)
+    # With the hint at batch 2-8 the exported head counts select different
+    # schedules for next_n 5/6 (a5/a6 against a2), so the head-count-free call
+    # names ``num_heads`` there; next_n 3/4 resolve without it.
+    if next_n in (5, 6):
+        with pytest.raises(ValueError, match="num_heads"):
+            get_paged_mqa_logits_metadata(
+                data["context_lens"], page_kv, plan.num_sms, max_context_hint=hint
+            )
+    else:
+        heads_free = get_paged_mqa_logits_metadata(
+            data["context_lens"], page_kv, plan.num_sms, max_context_hint=hint
+        )
+        assert torch.equal(heads_free, plan.schedule_meta)
+    # The same operands WITHOUT the hint schedule the reference atoms, a
+    # different buffer wherever the variant changes.  The buffer is
+    # DeepGEMM-identical and carries no atom count, so a mismatch is not
+    # detectable from it; the logits entries rebuild the schedule under their
+    # own hint (checked above), which is why the sequence stays consistent.
+    unhinted_meta = get_paged_mqa_logits_metadata(
+        data["context_lens"], page_kv, plan.num_sms, num_heads=heads
+    )
+    if hinted == unhinted:
+        assert torch.equal(unhinted_meta, plan.schedule_meta)
+    else:
+        assert not torch.equal(unhinted_meta, plan.schedule_meta)
+    # One-shot entry with the same hint: identical bits where both wrote.
+    one_shot = fp8_paged_mqa_logits(
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        meta,
+        data["max_context_len"],
+        max_context_hint=hint,
     )
     written = ~torch.isnan(plan.logical_output)
     assert torch.equal(one_shot[written], plan.logical_output[written])
@@ -384,22 +558,42 @@ def test_sm120_paged_strided_per_layer_view():
 
 
 def test_sm120_cases_cover_every_route():
-    """Every exported (heads, page, next_n) route has a GPU correctness case."""
+    """Every exported (heads, page, next_n, atom) route has a GPU correctness case."""
     catalog = _runtime._catalog()
     exported = {
-        (record["num_heads"], record["page_kv"], record["next_n"])
-        for record in catalog["routes"].values()
-        if record["sequence"] is not None
+        name for name, record in catalog["routes"].items() if record["sequence"]
     }
-    covered = {(heads, page_kv, next_n) for heads, page_kv, next_n, _b, _c in CASES}
+    covered = {
+        _runtime.route_name(heads, page_kv, next_n, batch)
+        for heads, page_kv, next_n, batch, _c in CASES
+    }
     assert exported, "the installed catalog exports no logits route"
     assert exported <= covered, sorted(exported - covered)
+    for name in exported:
+        record = catalog["routes"][name]
+        assert name.endswith(f":{record['atom_variant']}")
+        assert record["atom_variant"] == f"a{record['next_n_atom']}"
+    # The long-context hint introduces no route: every variant it can select
+    # is an exported program with a batch-only case above, and the hint cases
+    # themselves resolve to exported routes.
+    hinted = {
+        _runtime.route_name(heads, page_kv, next_n, batch, max_context_hint=LONG_HINT)
+        for heads, page_kv, next_n, batch, _c in CASES + HINT_CASES
+    }
+    assert hinted <= exported, sorted(hinted - exported)
+
+
+def _batch_of_variant(heads, next_n, route):
+    """A batch of the first class whose variant the route name carries."""
+    rule = _runtime.atom_rule()
+    variants = rule["selection"][f"h{heads}:n{next_n}"]
+    index = variants.index(route.rsplit(":", 1)[1])
+    return int(rule["batch_class_min"][index])
 
 
 def test_sm120_paged_host_helpers_and_rejections():
     catalog = _runtime._catalog()
     assert catalog["schema"] == _runtime.CATALOG_SCHEMA
-    assert _runtime.route_name(64, 64, 2) == "sm120:fp8:h64:p64:n2"
     assert _runtime.metadata_shape(84) == (85, 2)
     assert _runtime.split_kv() == 128
     stride = _runtime.paged_logits_stride(1000)
@@ -407,9 +601,52 @@ def test_sm120_paged_host_helpers_and_rejections():
     assert not _runtime.route_available(16, 64, 1)
     assert not _runtime.route_available(64, 128, 1)
     assert _runtime.route_available(32, 64, 3)
+    assert _runtime.route_available(32, 64, 3, 8)
+    assert _runtime.route_available(32, 64, 3, 64)
     assert not _runtime.route_available(32, 64, 7)
+    assert not _runtime.route_available(32, 64, 3, 0)
+    assert _runtime.route_available(32, 64, 3, 8, max_context_hint=65536)
     with pytest.raises(ValueError):
-        _runtime.next_n_atoms(7)
+        _runtime.next_n_atoms(7, 8)
+    with pytest.raises(ValueError):
+        _runtime.atom_variant(16, 1, 8)
+    # A hint below one KV token is not an upper bound of anything.
+    with pytest.raises(ValueError):
+        _runtime.atom_variant(32, 3, 8, max_context_hint=0)
+    with pytest.raises(ValueError):
+        _runtime.next_n_atoms(3, 8, max_context_hint=-1)
+    # The route carries the realised Q atom: the reference pairing (a2) for
+    # next_n 2, the native atom above the small-batch bound, and the 64-head
+    # two-3-token-atom schedule from the large-batch bound up.
+    assert _runtime.route_name(64, 64, 2, 8) == "sm120:fp8:h64:p64:n2:a2"
+    assert _runtime.route_name(64, 64, 2, 256) == "sm120:fp8:h64:p64:n2:a2"
+    assert _runtime.route_name(32, 128, 1, 64) == "sm120:fp8:h32:p128:n1:a1"
+    assert _runtime.route_name(32, 128, 4, 8) == "sm120:fp8:h32:p128:n4:a2"
+    assert _runtime.route_name(32, 128, 4, 9) == "sm120:fp8:h32:p128:n4:a4"
+    assert _runtime.route_name(32, 128, 5, 64) == "sm120:fp8:h32:p128:n5:a5"
+    assert _runtime.route_name(64, 64, 5, 64) == "sm120:fp8:h64:p64:n5:a2"
+    assert _runtime.route_name(64, 64, 5, 127) == "sm120:fp8:h64:p64:n5:a2"
+    assert _runtime.route_name(64, 64, 5, 128) == "sm120:fp8:h64:p64:n5:a3"
+    # The long-context hint moves batch 2-8 to the native atom (R3); the same
+    # call without it keeps the reference pairing.
+    assert _runtime.route_name(32, 128, 3, 8) == "sm120:fp8:h32:p128:n3:a2"
+    assert (
+        _runtime.route_name(32, 128, 3, 8, max_context_hint=65536)
+        == "sm120:fp8:h32:p128:n3:a3"
+    )
+    assert (
+        _runtime.route_name(64, 64, 6, 8, max_context_hint=65536)
+        == "sm120:fp8:h64:p64:n6:a2"
+    )
+    for name in catalog["routes"]:
+        if name != _runtime.metadata_route_name():
+            record = catalog["routes"][name]
+            assert name == _runtime.route_name(
+                record["num_heads"],
+                record["page_kv"],
+                record["next_n"],
+                _batch_of_variant(record["num_heads"], record["next_n"], name),
+            )
     # Every logits route is the ordered (metadata, logits) pair behind one
     # prepared sequence; the metadata route is the standalone scheduler.
     metadata_route = _runtime.metadata_route_name()
@@ -420,15 +657,156 @@ def test_sm120_paged_host_helpers_and_rejections():
         else:
             assert stages == ["metadata", "logits"] and record["sequence"]
             assert record["kernel_launches"] == 2
-    # The Q-atom rule is a function of next_n only.  One atom per request up to
-    # next_n 4: 1 and 2 pair the tokens as DeepGEMM does, 3 and 4 score the whole
-    # request from one atom (DeepGEMM: two atoms).  5 and 6 run two atoms of at
-    # most three tokens (DeepGEMM: three), so their schedules carry two items per
-    # request.
-    expected_atoms = {1: 1, 2: 1, 3: 1, 4: 1, 5: 3, 6: 3}
-    assert set(_runtime.exported_next_n()) == set(expected_atoms)
-    for next_n, atoms in expected_atoms.items():
-        assert _runtime.next_n_atoms(next_n) == atoms
+    # The Q-atom rule is catalog data over (heads, next_n, batch class).  Table
+    # check: every (heads, next_n, class) resolves to the catalog's variant and
+    # atom count, and the head-count-free form resolves exactly where the
+    # exported head counts agree.
+    rule = _runtime.atom_rule()
+    starts = [int(v) for v in rule["batch_class_min"]]
+    assert starts[0] == 1 and starts == sorted(set(starts))
+    assert set(_runtime.exported_next_n()) == {
+        int(key.split(":")[1][1:]) for key in rule["selection"]
+    }
+    for key, variants in rule["selection"].items():
+        heads, next_n = (int(part[1:]) for part in key.split(":"))
+        assert len(variants) == len(starts)
+        for index, start in enumerate(starts):
+            batches = [start]
+            if index + 1 < len(starts):
+                batches.append(starts[index + 1] - 1)
+            for batch in batches:
+                assert _runtime.batch_class(batch) == index
+                assert _runtime.atom_variant(heads, next_n, batch) == variants[index]
+                atoms = rule["num_atoms"][f"n{next_n}:{variants[index]}"]
+                assert _runtime.next_n_atoms(next_n, batch, heads) == atoms
+                agreed = {
+                    rule["selection"][f"h{h}:n{next_n}"][index]
+                    for h in _runtime.exported_heads()
+                }
+                if len(agreed) == 1:
+                    assert _runtime.next_n_atoms(next_n, batch) == atoms
+                else:
+                    with pytest.raises(ValueError, match="num_heads"):
+                        _runtime.next_n_atoms(next_n, batch)
+    # The optional long-context hint (CAKE-1373 r2 R3) is a second selection
+    # table, ``selection_long``, that applies from ``long_context_min_kv`` KV
+    # tokens up.  It differs from ``selection`` in batch class 1 (2 <= B <= 8)
+    # only, where it takes the native atom that fits the TMA Q box; classes 0,
+    # 2 and 3 and the batch classes themselves are unaffected, and no hint
+    # (``None``) or a hint below the bound keeps the batch-only selection.
+    long_min = int(rule["long_context_min_kv"])
+    assert long_min == 16384
+    assert set(rule["selection_long"]) == set(rule["selection"])
+    geometries = {
+        (record["num_heads"], record["page_kv"], record["next_n"])
+        for name, record in catalog["routes"].items()
+        if name != metadata_route
+    }
+    for heads, page_kv, next_n in geometries:
+        assert _runtime.route_available(
+            heads, page_kv, next_n, 8, max_context_hint=65536
+        )
+    for key, variants in rule["selection"].items():
+        heads, next_n = (int(part[1:]) for part in key.split(":"))
+        long_variants = rule["selection_long"][key]
+        assert len(long_variants) == len(starts)
+        for index, start in enumerate(starts):
+            if index == 1:
+                assert long_variants[index] == LONG_CLASS1[(heads, next_n)]
+            else:
+                assert long_variants[index] == variants[index]
+            batches = [start]
+            if index + 1 < len(starts):
+                batches.append(starts[index + 1] - 1)
+            for batch in batches:
+                assert _runtime.batch_class(batch) == index
+                for hint, table_key in (
+                    (None, "selection"),
+                    (long_min - 1, "selection"),
+                    (long_min, "selection_long"),
+                    (65536, "selection_long"),
+                ):
+                    table = rule[table_key]
+                    variant = table[key][index]
+                    assert (
+                        _runtime.atom_variant(
+                            heads, next_n, batch, max_context_hint=hint
+                        )
+                        == variant
+                    )
+                    atoms = rule["num_atoms"][f"n{next_n}:{variant}"]
+                    assert (
+                        _runtime.next_n_atoms(
+                            next_n, batch, heads, max_context_hint=hint
+                        )
+                        == atoms
+                    )
+                    agreed = {
+                        table[f"h{h}:n{next_n}"][index]
+                        for h in _runtime.exported_heads()
+                    }
+                    if len(agreed) == 1:
+                        assert (
+                            _runtime.next_n_atoms(next_n, batch, max_context_hint=hint)
+                            == atoms
+                        )
+                    else:
+                        with pytest.raises(ValueError, match="num_heads"):
+                            _runtime.next_n_atoms(next_n, batch, max_context_hint=hint)
+    # Spot checks of the measured policy (CAKE-1373 r2): next_n 6 at batch 256
+    # is one native atom for 32 heads and two 3-token atoms for 64 heads, so the
+    # head count is required there; at batch 8 both head counts run the
+    # reference 2 + 2 + 2 atomization; next_n 1-4 never need the head count.
+    # Batch 1 is its own class: a single 3-token request takes one native atom,
+    # every other next_n keeps the reference atoms there.
+    assert _runtime.batch_class(1) == 0
+    assert _runtime.batch_class(2) == 1
+    assert _runtime.batch_class(8) == 1
+    assert _runtime.batch_class(9) == 2
+    assert _runtime.batch_class(128) == 3
+    assert _runtime.next_n_atoms(3, 1) == 1
+    assert _runtime.next_n_atoms(3, 2) == 2
+    assert _runtime.next_n_atoms(4, 1) == 2
+    assert _runtime.next_n_atoms(5, 1) == 3
+    assert _runtime.next_n_atoms(6, 1, 64) == 3
+    assert _runtime.next_n_atoms(6, 256, 32) == 1
+    assert _runtime.next_n_atoms(6, 256, 64) == 2
+    assert _runtime.next_n_atoms(6, 8, 32) == 3
+    assert _runtime.next_n_atoms(6, 8, 64) == 3
+    assert _runtime.next_n_atoms(6, 8) == 3
+    with pytest.raises(ValueError, match="num_heads"):
+        _runtime.next_n_atoms(6, 256)
+    with pytest.raises(ValueError, match="num_heads"):
+        _runtime.next_n_atoms(5, 64)
+    assert _runtime.next_n_atoms(4, 256) == 1
+    assert _runtime.next_n_atoms(4, 8) == 2
+    assert _runtime.next_n_atoms(3, 8) == 2
+    assert _runtime.next_n_atoms(3, 9) == 1
+    assert _runtime.next_n_atoms(5, 8) == 3
+    assert _runtime.next_n_atoms(1, 4096) == 1
+    assert _runtime.next_n_atoms(2, 4096) == 1
+    # Spot checks of the long-context hint (R3): from 16384 KV tokens up a
+    # batch of 2-8 takes one native atom for next_n 3/4 at both head counts
+    # and for next_n 5/6 at 32 heads, so the head count becomes required for
+    # next_n 5/6 there; batch 1 and the classes from batch 9 up are unchanged,
+    # and a hint below the bound is the batch-only selection.
+    assert _runtime.next_n_atoms(3, 8, max_context_hint=16384) == 1
+    assert _runtime.next_n_atoms(3, 8, max_context_hint=16383) == 2
+    assert _runtime.next_n_atoms(4, 8, max_context_hint=65536) == 1
+    assert _runtime.next_n_atoms(5, 8, 32, max_context_hint=65536) == 1
+    assert _runtime.next_n_atoms(6, 8, 64, max_context_hint=65536) == 3
+    with pytest.raises(ValueError, match="num_heads"):
+        _runtime.next_n_atoms(5, 8, max_context_hint=65536)
+    assert _runtime.next_n_atoms(3, 1, max_context_hint=65536) == 1
+    assert _runtime.next_n_atoms(4, 1, max_context_hint=65536) == 2
+    assert _runtime.next_n_atoms(3, 9, max_context_hint=4096) == 1
+    assert _runtime.next_n_atoms(3, 9, max_context_hint=65536) == 1
+    assert _runtime.next_n_atoms(6, 256, 64, max_context_hint=65536) == 2
+    assert _runtime.atom_variant(32, 3, 8, max_context_hint=16384) == "a3"
+    assert _runtime.atom_variant(64, 6, 8, max_context_hint=16384) == "a2"
+    assert _runtime.atom_variant(32, 5, 8, max_context_hint=16384) == "a5"
+    assert _runtime.atom_variant(32, 5, 8, max_context_hint=16383) == "a2"
+    assert _runtime.atom_variant(32, 5, 8) == "a2"
 
 
 def test_sm120_arch_targets_follow_the_compilation_context(monkeypatch):
@@ -478,7 +856,7 @@ def test_sm120_bindings_cover_every_program_argument():
         )
         bindings = {
             "metadata": _runtime.metadata_bindings(
-                context_lens, schedule_meta, num_sms=num_sms
+                context_lens, schedule_meta, num_sms=num_sms, num_heads=heads
             )
         }
         if name != _runtime.metadata_route_name():

@@ -26,27 +26,37 @@ boundaries, row-strided inputs, extreme scales, zero input, the residual-add
 fusion (against an add-then-norm autograd reference for every input
 gradient), bitwise reproducibility of ``dw``, changing token counts in one
 process and the autograd wrapper end to end.
+
+This suite exercises the backend package alone: it names the package once,
+through ``tests.test_helpers.cake_package``, and imports nothing else from
+flashinfer, so a build that vendors the package under another import path
+runs it unchanged after pointing that table entry at its package.  The
+``flashinfer.cake_rmsnorm_train`` facade and the ``flashinfer`` top-level
+exposure are covered by ``test_cake_rmsnorm_train_api.py``.
 """
 
 from __future__ import annotations
 
 import pytest
+import re
 import statistics
+from pathlib import Path
+
 import torch
 
-import flashinfer
-from flashinfer.cake_rmsnorm_train import (
-    CakeRMSNormFunction,
-    cake_rmsnorm,
-    cake_rmsnorm_train_backward,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_backward_workspace_bytes,
-    cake_rmsnorm_train_forward,
-    is_cake_rmsnorm_train_supported,
+from tests.test_helpers.cake_package import cake_package
+
+pkg = cake_package("cake_rmsnorm_train")
+cake_build = cake_package("cake_rmsnorm_train", "cake_build")
+loader = cake_package("cake_rmsnorm_train", "cake_jit")
+cake_rmsnorm = pkg.cake_rmsnorm
+cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
+cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
+cake_rmsnorm_train_backward_workspace_bytes = (
+    pkg.cake_rmsnorm_train_backward_workspace_bytes
 )
-from flashinfer.jit import cake_rmsnorm_train as loader
-from flashinfer.jit.env import has_flashinfer_jit_cache
-from flashinfer.utils import get_compute_capability
+cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
+is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTHS = ((6144, 1e-5), (2048, 1e-6), (512, 1e-6))
@@ -66,10 +76,14 @@ def _device() -> torch.device:
     return torch.device("cuda:0")
 
 
+def _capability() -> tuple[int, int]:
+    return torch.cuda.get_device_capability(_device())
+
+
 def _supported() -> bool:
     return (
         torch.cuda.is_available()
-        and get_compute_capability(_device()) in SUPPORTED_CAPABILITIES
+        and _capability() in SUPPORTED_CAPABILITIES
         and is_cake_rmsnorm_train_supported(_device())
     )
 
@@ -80,11 +94,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(autouse=not has_flashinfer_jit_cache(), scope="module")
+@pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
+    # Build the local architecture's libraries that have no prebuilt file before
+    # the first test, through the spec objects the package's loader itself builds
+    # on first use (``cake_build.load_library``); a prebuilt or already cached
+    # library loads without compiling.
     if _supported():
-        arch = loader.arch_for_capability(get_compute_capability(_device()))
-        flashinfer.jit.build_jit_specs(loader.specs_for_arch(arch), verbose=False)
+        arch = loader.arch_for_capability(_capability())
+        for spec in loader.specs_for_arch(arch):
+            spec.build_and_load()
     yield
 
 
@@ -96,7 +115,7 @@ def _skip_unless_hidden(hidden: int) -> None:
 def _skip_unless_route(hidden: int, residual: bool) -> None:
     _skip_unless_hidden(hidden)
     if residual and not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=_capability(),
         hidden=hidden,
         kind="fwd",
         residual=True,
@@ -309,7 +328,7 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
     matches the FP64 reference on both sides of its switch point."""
 
     _skip_unless_route(hidden, residual)
-    arch = loader.arch_for_capability(get_compute_capability(_device()))
+    arch = loader.arch_for_capability(_capability())
     names = loader.route_modules(arch, hidden, "fwd", residual)
     eps = EPS[hidden]
     launched = set()
@@ -370,7 +389,7 @@ def test_extreme_row(hidden: int) -> None:
 def test_residual_fusion(hidden: int, stride_pad, rows: int) -> None:
     _skip_unless_hidden(hidden)
     if not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=_capability(),
         hidden=hidden,
         kind="fwd",
         residual=True,
@@ -587,7 +606,7 @@ def _autograd_reference(x, w, eps, residual=None, grad_y=None, grad_h=None):
 def test_autograd_end_to_end(hidden: int, residual: bool, rows: int) -> None:
     _skip_unless_hidden(hidden)
     if residual and not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=_capability(),
         hidden=hidden,
         kind="fwd",
         residual=True,
@@ -672,15 +691,45 @@ def test_argument_validation(hidden: int) -> None:
         cake_rmsnorm_train_forward(cpu, w.cpu(), eps)
 
 
-def test_function_signature_is_exported() -> None:
-    assert flashinfer.cake_rmsnorm is cake_rmsnorm
-    assert flashinfer.cake_rmsnorm_train_forward is cake_rmsnorm_train_forward
-    assert flashinfer.cake_rmsnorm_train_backward is cake_rmsnorm_train_backward
-    assert (
-        flashinfer.cake_rmsnorm_train_backward_workspace_bytes
-        is cake_rmsnorm_train_backward_workspace_bytes
-    )
-    assert flashinfer.CakeRMSNormFunction is CakeRMSNormFunction
+def test_registry_records_reference_the_build_manifest() -> None:
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding
+    sources under ``csrc/`` of this package, their digests and a closure digest;
+    the registry itself records the host plan only.
+    """
+
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == pkg.__name__
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).parent
+    referenced = set()
+    for name, record in loader.MODULES.items():
+        assert record["library"] == record["kernel"], name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        for arch in record["arches"]:
+            library = loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{record['library']}_kernel.cu",
+                f"csrc/{record['library']}_binding.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (package / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert "--use_fast_math" not in entry["nvcc_flags"]
+            assert "--prec-div=true" in entry["nvcc_flags"]
+    assert referenced == set(libraries)
+    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
 
 def test_dw_not_worse_than_eager_fp32_over_the_matrix() -> None:
