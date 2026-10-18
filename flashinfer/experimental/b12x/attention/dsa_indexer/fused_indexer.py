@@ -33,6 +33,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import (
     KernelCompileSpec,
+    clear_compile_cache,
     launch as b12x_launch,
     tensor_compile_fact,
 )
@@ -61,6 +62,7 @@ from b12x.attention.dsa_indexer.tiled_topk import (
     _THREADS_PER_CTA as _RADIX_THREADS,
     _convert_to_uint8,
     _convert_to_uint32,
+    _deterministic_tie_fill,
     _exact_overflow_fallback,
     _smem_ld,
     _smem_red_add,
@@ -93,6 +95,8 @@ from b12x._lib.intrinsics import (
     fmax_f32,
     get_ptr_as_int64,
     ld_global_acquire_i32,
+    ld_global_cg_f32,
+    ld_global_cg_i32,
     ld_global_cg_v4_u32,
     ld_global_nc_f32,
     ld_global_nc_u32,
@@ -106,6 +110,7 @@ from b12x._lib.intrinsics import (
     st_shared_u8,
     st_shared_v4_u32,
     threadfence,
+    threadfence_sys,
 )
 
 # Triage kill-switch: B12X_INDEXER_DIRECT_K=0 forces every variant back to
@@ -469,9 +474,7 @@ def _coop_wide_round(
     """
     i = Int32(tx)
     while i < carry_count:
-        key = _convert_to_uint32(
-            _tie_break_key(Float32(s_c0_values[i]), Int32(s_c0_gindex[i]))
-        )
+        key = _convert_to_uint32(Float32(s_c0_values[i]))
         if (key & key_mask) == key_prefix:
             digit = Int32((key >> Uint32(digit_shift)) & Uint32(0xFFF))
             _smem_red_add(wide_hist_addr, digit, Int32(1))
@@ -531,9 +534,7 @@ def _coop_narrow_round(
     cute.arch.sync_threads()
     i = Int32(tx)
     while i < carry_count:
-        key = _convert_to_uint32(
-            _tie_break_key(Float32(s_c0_values[i]), Int32(s_c0_gindex[i]))
-        )
+        key = _convert_to_uint32(Float32(s_c0_values[i]))
         if (key & key_mask) == key_prefix:
             _smem_red_add(coarse_hist_addr, Int32(key & Uint32(0xFF)), Int32(1))
         i += Int32(_RADIX_THREADS)
@@ -1187,9 +1188,16 @@ def _fused_indexer_shared_storage_cls(
     topk: int,
     carry_cap: int,
     cands: int,
+    paged_output: bool,
 ):
-    class SharedStorage:
-        pass
+    # Unique class name per variant: cute.struct keys its layout by the class
+    # __name__, so two variants sharing the name "SharedStorage" would collide
+    # in the DSL compiler when both are traced in one process.
+    SharedStorage = type(
+        f"FusedIndexerSharedStorage_{topk}_{carry_cap}_{int(paged_output)}",
+        (),
+        {},
+    )
 
     def _u8_page():
         return cute.struct.Align[
@@ -1244,32 +1252,25 @@ def _fused_indexer_shared_storage_cls(
         "carry1_values": _f32(int(topk)),
         "carry1_gindex": _i32(int(topk)),
     }
+    # The tie-break needs the LOGICAL token index, which differs from the output
+    # gindex only for paged_output (physical slot). Carry it in a separate buffer
+    # only then; otherwise gindex IS the logical index and aliasing saves SMEM
+    # (the topk-2048 GLM specialization is at the SM120 carveout limit).
+    if paged_output:
+        annotations["carry0_lindex"] = _i32(int(carry_cap))
+        annotations["carry1_lindex"] = _i32(int(topk))
     SharedStorage.__annotations__ = annotations
     return cute.struct(SharedStorage)
-
-
-# Deterministic tie-break for the fused radix-select. Exact score ties (common
-# with FP8-quantized indexer logits) otherwise resolve through the _smem_xadd
-# atomics in a nondeterministic order, so the selected read plan jitters across
-# runs on an identical prompt (the 32K canary flake). Adding the candidate's
-# token index * 2^-24 to the score key makes tied scores map to distinct keys,
-# so the selector returns a stable plan (mirrors tiled_topk._tie_break_perturb).
-# Only the radix key is perturbed; the emitted score is read from the
-# unperturbed vin_v, so non-tied selections and output values are unchanged.
-_TIE_BREAK_EPS = 2.0**-24
-
-
-@cute.jit
-def _tie_break_key(value: Float32, gindex: Int32) -> Float32:
-    return value + Float32(gindex) * Float32(_TIE_BREAK_EPS)
 
 
 @cute.jit
 def _fused_radix_select(
     vin_v: cute.Tensor,
     vin_g: cute.Tensor,
+    vin_l: cute.Tensor,
     vout_v: cute.Tensor,
     vout_g: cute.Tensor,
+    vout_l: cute.Tensor,
     n_total: Int32,
     topk_static: Int32,
     cands: cutlass.Constexpr[int],
@@ -1303,15 +1304,11 @@ def _fused_radix_select(
     while idx_base < full_scan_limit:
         for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
             sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
-            bin8 = _convert_to_uint8(
-                _tie_break_key(Float32(vin_v[sidx]), Int32(vin_g[sidx]))
-            )
+            bin8 = _convert_to_uint8(Float32(vin_v[sidx]))
             _smem_red_add(h0, Int32(bin8), Int32(1))
         idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
     while idx_base < n_total:
-        bin8 = _convert_to_uint8(
-            _tie_break_key(Float32(vin_v[idx_base]), Int32(vin_g[idx_base]))
-        )
+        bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
         _smem_red_add(h0, Int32(bin8), Int32(1))
         idx_base += Int32(_RADIX_THREADS)
     cute.arch.sync_threads()
@@ -1347,14 +1344,15 @@ def _fused_radix_select(
     if topk == Int32(0):
         idx_base = Int32(tx)
         while idx_base < n_total:
-            bin8 = _convert_to_uint8(
-                _tie_break_key(Float32(vin_v[idx_base]), Int32(vin_g[idx_base]))
-            )
+            bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
                 s_out[pos] = idx_base
             idx_base += Int32(_RADIX_THREADS)
 
+    # Accumulate the exact pivot score key (MSD byte first) so the
+    # deterministic pivot-tie fill below can re-find key == pivot.
+    pivot_key = Uint32(0)
     if topk != Int32(0):
         cute.arch.sync_threads()
         if tx < Int32(257):
@@ -1365,7 +1363,7 @@ def _fused_radix_select(
         while idx_base < full_scan_limit:
             for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                 sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
-                raw_input = _tie_break_key(Float32(vin_v[sidx]), Int32(vin_g[sidx]))
+                raw_input = Float32(vin_v[sidx])
                 bin8 = _convert_to_uint8(raw_input)
                 if Int32(bin8) > threshold_bin:
                     pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -1380,7 +1378,7 @@ def _fused_radix_select(
                             _smem_red_add(h0, Int32(sub_bin), Int32(1))
             idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
         while idx_base < n_total:
-            raw_input = _tie_break_key(Float32(vin_v[idx_base]), Int32(vin_g[idx_base]))
+            raw_input = Float32(vin_v[idx_base])
             bin8 = _convert_to_uint8(raw_input)
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -1398,7 +1396,6 @@ def _fused_radix_select(
         # ni0 now holds the FULL threshold-bin candidate count: the xadd ran for every
         # bin-matching key, even past `cands`. Capture it to detect refine overflow.
         bin_count = Int32(_smem_ld(ni0, Int32(0)))
-
         for round_idx in cutlass.range_constexpr(4):
             if topk != Int32(-1):
                 r_idx_is_0 = (round_idx % 2) == 0
@@ -1438,6 +1435,7 @@ def _fused_radix_select(
                             _smem_st(lr, Int32(0), topk - val_tx1)
                 cute.arch.sync_threads()
                 sub_threshold = _smem_ld(thr, Int32(0))
+                pivot_key = (pivot_key << Uint32(8)) | Uint32(sub_threshold)
                 topk = topk - Int32(s_hist0[sub_threshold + Int32(1)])
 
                 if topk == Int32(0):
@@ -1449,9 +1447,7 @@ def _fused_radix_select(
                             else Int32(s_cand1[i])
                         )
                         offset = Int32(24 - round_idx * 8)
-                        raw_val = _tie_break_key(
-                            Float32(vin_v[c_idx]), Int32(vin_g[c_idx])
-                        )
+                        raw_val = Float32(vin_v[c_idx])
                         key32 = _convert_to_uint32(raw_val)
                         bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
                         if Int32(bin) > sub_threshold:
@@ -1472,9 +1468,7 @@ def _fused_radix_select(
                             if cutlass.const_expr(r_idx_is_0)
                             else Int32(s_cand1[i])
                         )
-                        raw_val = _tie_break_key(
-                            Float32(vin_v[c_idx]), Int32(vin_g[c_idx])
-                        )
+                        raw_val = Float32(vin_v[c_idx])
                         offset = Int32(24 - round_idx * 8)
                         key32 = _convert_to_uint32(raw_val)
                         bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
@@ -1484,9 +1478,9 @@ def _fused_radix_select(
                         else:
                             if Int32(bin) == sub_threshold:
                                 if cutlass.const_expr(round_idx == 3):
-                                    old_rem = _smem_xadd(lr, Int32(0), Int32(-1))
-                                    if old_rem > Int32(0):
-                                        s_out[topk_static - old_rem] = c_idx
+                                    # Pivot ties are filled deterministically by
+                                    # _deterministic_tie_fill after the refine loop.
+                                    pass
                                 else:
                                     cand_pos = (
                                         _smem_xadd(ni0, Int32(0), Int32(1))
@@ -1519,6 +1513,8 @@ def _fused_radix_select(
             s_hist0,
             s_hist1,
             s_out,
+            s_cand0,
+            s_cand1,
             h0,
             ctr,
             thr,
@@ -1527,8 +1523,10 @@ def _fused_radix_select(
             lr,
             flat=True,
             flat_values=vin_v,
+            flat_lindex=vin_l,
             input_tensor=vin_v,
             carry_values=vin_v,
+            carry_indices=vin_l,
             row_base=Int32(0),
             row_start=Int32(0),
             carry_base=Int32(0),
@@ -1537,8 +1535,46 @@ def _fused_radix_select(
             block_k=1,
             is_tiled=False,
             is_first=True,
-            tie_break=True,
-            gindex_values=vin_g,
+            output_index_offset=Int32(0),
+        )
+    elif topk > Int32(0):
+        # No overflow: the refine above emitted every winner with
+        # score > pivot and left `topk` pivot-tie slots. Fill them
+        # deterministically by logical column (ascending), not by
+        # _smem_xadd arrival order.
+        winner_count = Int32(_smem_ld(ctr, Int32(0)))
+        _deterministic_tie_fill(
+            tx,
+            n_total,
+            topk,
+            pivot_key,
+            s_hist0,
+            s_hist1,
+            s_out,
+            winner_count,
+            s_cand0,
+            s_cand1,
+            h0,
+            ctr,
+            thr,
+            ni0,
+            ni1,
+            lr,
+            True,
+            vin_v,
+            vin_l,
+            vin_v,
+            vin_v,
+            vin_l,
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            1,
+            1,
+            False,
+            True,
+            Int32(0),
         )
     cute.arch.sync_threads()
     i = Int32(tx)
@@ -1546,6 +1582,7 @@ def _fused_radix_select(
         sel = Int32(s_out[i])
         vout_v[i] = Float32(vin_v[sel])
         vout_g[i] = Int32(vin_g[sel])
+        vout_l[i] = Int32(vin_l[sel])
         i += Int32(_RADIX_THREADS)
 
 
@@ -1698,6 +1735,7 @@ class DSAFusedIndexerKernel:
             self.topk,
             self.carry_cap,
             self.cands,
+            self.paged_output,
         )
 
     @cute.jit
@@ -1715,6 +1753,7 @@ class DSAFusedIndexerKernel:
         out_values: cute.Tensor,
         pack_values: cute.Tensor,
         pack_indices: cute.Tensor,
+        pack_lindices: cute.Tensor,
         merge_state: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -1731,6 +1770,7 @@ class DSAFusedIndexerKernel:
             out_values,
             pack_values,
             pack_indices,
+            pack_lindices,
             merge_state,
         ).launch(
             grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
@@ -1757,6 +1797,7 @@ class DSAFusedIndexerKernel:
         out_values: cute.Tensor,
         pack_values: cute.Tensor,
         pack_indices: cute.Tensor,
+        pack_lindices: cute.Tensor,
         merge_state: cute.Tensor,
     ):
         tx, _, _ = cute.arch.thread_idx()
@@ -1814,12 +1855,25 @@ class DSAFusedIndexerKernel:
         s_c0_gindex = storage.carry0_gindex.get_tensor(
             cute.make_layout((self.carry_cap,), stride=(1,))
         )
+        if cutlass.const_expr(self.paged_output):
+            s_c0_lindex = storage.carry0_lindex.get_tensor(
+                cute.make_layout((self.carry_cap,), stride=(1,))
+            )
+        else:
+            # Non-paged output: the output gindex IS the logical token index.
+            s_c0_lindex = s_c0_gindex
         s_c1_values = storage.carry1_values.get_tensor(
             cute.make_layout((self.topk,), stride=(1,))
         )
         s_c1_gindex = storage.carry1_gindex.get_tensor(
             cute.make_layout((self.topk,), stride=(1,))
         )
+        if cutlass.const_expr(self.paged_output):
+            s_c1_lindex = storage.carry1_lindex.get_tensor(
+                cute.make_layout((self.topk,), stride=(1,))
+            )
+        else:
+            s_c1_lindex = s_c1_gindex
         s_hist0 = storage.hist0.get_tensor(cute.make_layout((384,), stride=(1,)))
         s_hist1 = storage.hist1.get_tensor(cute.make_layout((384,), stride=(1,)))
         s_out = storage.out_idx.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
@@ -1835,6 +1889,12 @@ class DSAFusedIndexerKernel:
         s_coop_counters = storage.coop_counters.get_tensor(
             cute.make_layout((2,), stride=(1,))
         )
+        # Tie-fill staging reuses the carry0 buffers: the local carry has
+        # already been packed into the global slab, so those SMEM words are
+        # free here. This avoids a dedicated tie-stage allocation that would
+        # push the topk>=2048 specializations past the SM120 carveout limit.
+        s_tie_v = s_c0_values
+        s_tie_l = s_c0_lindex
         # coop local histogram reuses hist0 (>=256); its u32 base address for atomics:
         coop_hist_addr = shared_ptr_to_u32(storage.hist0.data_ptr())
         coop_ctr_addr = shared_ptr_to_u32(storage.coop_counters.data_ptr())
@@ -2007,8 +2067,10 @@ class DSAFusedIndexerKernel:
                     _fused_radix_select(
                         s_c0_values,
                         s_c0_gindex,
+                        s_c0_lindex,
                         s_c1_values,
                         s_c1_gindex,
+                        s_c1_lindex,
                         carry_count,
                         topk_static,
                         self.cands,
@@ -2030,6 +2092,7 @@ class DSAFusedIndexerKernel:
                     while ti < topk_static:
                         s_c0_values[ti] = Float32(s_c1_values[ti])
                         s_c0_gindex[ti] = Int32(s_c1_gindex[ti])
+                        s_c0_lindex[ti] = Int32(s_c1_lindex[ti])
                         ti += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
                     carry_count = topk_static
@@ -2082,6 +2145,9 @@ class DSAFusedIndexerKernel:
                                     gidx = span_first + tok_rel
                             s_c0_values[carry_count + tok_rel - round_base] = val
                             s_c0_gindex[carry_count + tok_rel - round_base] = gidx
+                            s_c0_lindex[carry_count + tok_rel - round_base] = (
+                                span_first + tok_rel
+                            )
                 carry_count = carry_count + round_valid
                 round_base += Int32(256)
             cute.arch.sync_threads()
@@ -2089,8 +2155,10 @@ class DSAFusedIndexerKernel:
                 _fused_radix_select(
                     s_c0_values,
                     s_c0_gindex,
+                    s_c0_lindex,
                     s_c1_values,
                     s_c1_gindex,
+                    s_c1_lindex,
                     carry_count,
                     topk_static,
                     self.cands,
@@ -2112,6 +2180,7 @@ class DSAFusedIndexerKernel:
                 while ti < topk_static:
                     s_c0_values[ti] = Float32(s_c1_values[ti])
                     s_c0_gindex[ti] = Int32(s_c1_gindex[ti])
+                    s_c0_lindex[ti] = Int32(s_c1_lindex[ti])
                     ti += Int32(_RADIX_THREADS)
                 cute.arch.sync_threads()
                 carry_count = topk_static
@@ -2131,6 +2200,7 @@ class DSAFusedIndexerKernel:
             prev_do = Int32(0)
             prev_valid = Int32(0)
             prev_out_base = Int32(0)
+            prev_lindex_base = Int32(0)
             prev_scale_addr = scales_base_addr
             prev_pl2 = Int32(0)
             cur_pl2 = Int32(0)
@@ -2234,6 +2304,9 @@ class DSAFusedIndexerKernel:
                                         s_c0_gindex[carry_count + slot_idx] = (
                                             prev_out_base + slot_idx
                                         )
+                                        s_c0_lindex[carry_count + slot_idx] = (
+                                            prev_lindex_base + slot_idx
+                                        )
                             carry_count = carry_count + prev_valid
                             prev_do = Int32(0)
                 if do_page != Int32(0):
@@ -2309,6 +2382,7 @@ class DSAFusedIndexerKernel:
                         prev_pl2 = cur_pl2
                         cur_pl2 = cur_pl2 ^ Int32(1)
                         prev_out_base = abs_start + page_base
+                        prev_lindex_base = abs_start + page_base
                         if cutlass.const_expr(self.paged_output):
                             prev_out_base = page_id * Int32(_PAGE_SIZE)
                     else:
@@ -2373,6 +2447,9 @@ class DSAFusedIndexerKernel:
                                                 page_id * Int32(_PAGE_SIZE) + slot_idx
                                             )
                                         s_c0_gindex[carry_count + slot_idx] = output_idx
+                                        s_c0_lindex[carry_count + slot_idx] = (
+                                            abs_start + page_base + slot_idx
+                                        )
                             # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
                             # barrier — the next page's load barrier (or the trim's leading
                             # sync, or the pre-output sync) orders this reduce before any
@@ -2417,8 +2494,10 @@ class DSAFusedIndexerKernel:
                     _fused_radix_select(
                         s_c0_values,
                         s_c0_gindex,
+                        s_c0_lindex,
                         s_c1_values,
                         s_c1_gindex,
+                        s_c1_lindex,
                         carry_count,
                         topk_static,
                         self.cands,
@@ -2440,6 +2519,7 @@ class DSAFusedIndexerKernel:
                     while i < topk_static:
                         s_c0_values[i] = Float32(s_c1_values[i])
                         s_c0_gindex[i] = Int32(s_c1_gindex[i])
+                        s_c0_lindex[i] = Int32(s_c1_lindex[i])
                         i += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
                     carry_count = topk_static
@@ -2484,14 +2564,19 @@ class DSAFusedIndexerKernel:
                                 s_c0_gindex[carry_count + slot_idx] = (
                                     prev_out_base + slot_idx
                                 )
+                                s_c0_lindex[carry_count + slot_idx] = (
+                                    prev_lindex_base + slot_idx
+                                )
                     carry_count = carry_count + prev_valid
                 if carry_count > topk_static:
                     cute.arch.sync_threads()
                     _fused_radix_select(
                         s_c0_values,
                         s_c0_gindex,
+                        s_c0_lindex,
                         s_c1_values,
                         s_c1_gindex,
+                        s_c1_lindex,
                         carry_count,
                         topk_static,
                         self.cands,
@@ -2513,6 +2598,7 @@ class DSAFusedIndexerKernel:
                     while i < topk_static:
                         s_c0_values[i] = Float32(s_c1_values[i])
                         s_c0_gindex[i] = Int32(s_c1_gindex[i])
+                        s_c0_lindex[i] = Int32(s_c1_lindex[i])
                         i += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
                     carry_count = topk_static
@@ -2548,6 +2634,10 @@ class DSAFusedIndexerKernel:
             )
             pack_i_row = cute.make_tensor(
                 pack_indices.iterator + slab_base,
+                cute.make_layout((self.pack_cap,), stride=(1,)),
+            )
+            pack_l_row = cute.make_tensor(
+                pack_lindices.iterator + slab_base,
                 cute.make_layout((self.pack_cap,), stride=(1,)),
             )
             # Pre-declare every variable assigned inside the dynamic arms below;
@@ -2665,8 +2755,6 @@ class DSAFusedIndexerKernel:
                     winners = count_gt
                     remaining_k = topk_static - count_gt
                     done = Int32(0)
-                    if bin_count == remaining_k:
-                        done = Int32(1)
                     if done == Int32(0):
                         barrier_phase = _coop_wide_round(
                             merge_state,
@@ -2698,8 +2786,6 @@ class DSAFusedIndexerKernel:
                         mask = Uint32(0xFFFFFF00)
                         winners = winners + count_gt
                         remaining_k = remaining_k - count_gt
-                        if bin_count == remaining_k:
-                            done = Int32(1)
                     if done == Int32(0):
                         barrier_phase = _coop_narrow_round(
                             merge_state,
@@ -2727,23 +2813,17 @@ class DSAFusedIndexerKernel:
                         mask = Uint32(0xFFFFFFFF)
                         winners = winners + count_gt
                         remaining_k = remaining_k - count_gt
-                    # Count this CTA's winners and pivot ties, then reserve
-                    # their group slots: winners fill [0, winners), ties fill
-                    # [winners, topk) in arrival order.
+                    # Count this CTA's winners and pivot ties. Winners
+                    # (distinct scores) fill [0, winners) in arrival order;
+                    # pivot ties are packed to the global slab and filled
+                    # deterministically by logical column below.
                     if tx == Int32(0):
                         s_coop_counters[0] = Int32(0)
                         s_coop_counters[1] = Int32(0)
                     cute.arch.sync_threads()
                     i = Int32(tx)
                     while i < carry_count:
-                        key = (
-                            _convert_to_uint32(
-                                _tie_break_key(
-                                    Float32(s_c0_values[i]), Int32(s_c0_gindex[i])
-                                )
-                            )
-                            & mask
-                        )
+                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
                         if key > prefix:
                             _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
                         else:
@@ -2754,50 +2834,191 @@ class DSAFusedIndexerKernel:
                     if tx == Int32(0):
                         local_gt = Int32(s_coop_counters[0])
                         local_eq = Int32(s_coop_counters[1])
-                        # One 64-bit fetch-add reserves the winner slots (low
-                        # word) and the tie slots (high word).
-                        reserved = atomic_add_global_u64(
-                            _fused_state_ptr(
-                                merge_state, group_id, Int32(_FUSED_STATE_OUTPUT)
-                            ),
-                            Int64(local_gt) + (Int64(local_eq) << Int64(32)),
-                        )
+                        # Reserve the winner slots (distinct scores, arrival order OK).
                         s_coop_scalars[0] = Uint32(
-                            (reserved & Int64(0xFFFFFFFF)).to(Int32)
+                            atomic_add_global_i32(
+                                _fused_state_ptr(
+                                    merge_state, group_id, Int32(_FUSED_STATE_OUTPUT)
+                                ),
+                                local_gt,
+                            )
                         )
-                        s_coop_scalars[1] = Uint32(
-                            winners + (reserved >> Int64(32)).to(Int32)
-                        )
+                        s_coop_scalars[1] = Uint32(winners)
+                        s_coop_scalars[3] = Uint32(local_eq)
                         s_coop_counters[0] = Int32(0)
                         s_coop_counters[1] = Int32(0)
                     cute.arch.sync_threads()
                     gt_base = Int32(s_coop_scalars[0])
-                    eq_base = Int32(s_coop_scalars[1])
                     i = Int32(tx)
                     while i < carry_count:
-                        key = (
-                            _convert_to_uint32(
-                                _tie_break_key(
-                                    Float32(s_c0_values[i]), Int32(s_c0_gindex[i])
-                                )
-                            )
-                            & mask
-                        )
+                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
                         if key > prefix:
                             pos = gt_base + _smem_xadd(
                                 coop_ctr_addr, Int32(0), Int32(1)
                             )
                             out_values[group_id, pos] = Float32(s_c0_values[i])
                             out_indices[group_id, pos] = Int32(s_c0_gindex[i])
-                        else:
-                            if key == prefix:
-                                pos = eq_base + _smem_xadd(
-                                    coop_ctr_addr, Int32(1), Int32(1)
-                                )
-                                if pos < topk_static:
-                                    out_values[group_id, pos] = Float32(s_c0_values[i])
-                                    out_indices[group_id, pos] = Int32(s_c0_gindex[i])
                         i += Int32(_RADIX_THREADS)
+                    # Pack this CTA's pivot ties into the global slab; after a
+                    # grid barrier, CTA 0 fills [winners, topk) deterministically
+                    # by logical column over the packed ties.
+                    if tx == Int32(0):
+                        s_coop_scalars[2] = Uint32(
+                            atomic_add_global_i32(
+                                _fused_state_ptr(
+                                    merge_state, group_id, Int32(_FUSED_STATE_TIES)
+                                ),
+                                Int32(s_coop_scalars[3]),
+                            )
+                        )
+                    cute.arch.sync_threads()
+                    tie_off = Int32(s_coop_scalars[2])
+                    i = Int32(tx)
+                    while i < carry_count:
+                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
+                        if key == prefix:
+                            tpos = _smem_xadd(coop_ctr_addr, Int32(1), Int32(1))
+                            pack_values[slab_base + tie_off + tpos] = Float32(
+                                s_c0_values[i]
+                            )
+                            pack_indices[slab_base + tie_off + tpos] = Int32(
+                                s_c0_gindex[i]
+                            )
+                            pack_lindices[slab_base + tie_off + tpos] = Int32(
+                                s_c0_lindex[i]
+                            )
+                        i += Int32(_RADIX_THREADS)
+                    cute.arch.sync_threads()
+                    if tx == Int32(0):
+                        threadfence_sys()
+                        atomic_add_global_i32(
+                            _fused_state_ptr(
+                                merge_state, group_id, Int32(_FUSED_STATE_ARRIVAL)
+                            ),
+                            Int32(1),
+                        )
+                    cute.arch.sync_threads()
+                    if cta_in_group == Int32(0):
+                        arrival_target = (Int32(barrier_phase) + Int32(1)) * ctas_pg
+                        spin_wait_global_ge_i32(
+                            _fused_state_ptr(
+                                merge_state, group_id, Int32(_FUSED_STATE_ARRIVAL)
+                            ),
+                            arrival_target,
+                        )
+                        threadfence_sys()
+                        total_ties = ld_global_acquire_i32(
+                            _fused_state_ptr(
+                                merge_state, group_id, Int32(_FUSED_STATE_TIES)
+                            )
+                        )
+                        if remaining_k > Int32(0):
+                            if total_ties <= Int32(self.carry_cap):
+                                # Stage the packed tie slab into SMEM with
+                                # cache-bypassing (L2) loads: a plain load can
+                                # shadow the freshly packed slab with a stale L1
+                                # line, so the tie fill must read SMEM copies.
+                                i = Int32(tx)
+                                while i < total_ties:
+                                    s_tie_v[i] = ld_global_cg_f32(
+                                        get_ptr_as_int64(pack_values, slab_base + i)
+                                    )
+                                    s_tie_l[i] = ld_global_cg_i32(
+                                        get_ptr_as_int64(pack_lindices, slab_base + i)
+                                    )
+                                    i += Int32(_RADIX_THREADS)
+                                cute.arch.sync_threads()
+                                _deterministic_tie_fill(
+                                    tx,
+                                    total_ties,
+                                    remaining_k,
+                                    prefix,
+                                    s_hist0,
+                                    s_hist1,
+                                    s_out,
+                                    Int32(0),
+                                    s_cand0,
+                                    s_cand1,
+                                    h0,
+                                    ctr,
+                                    thr,
+                                    ni0,
+                                    ni1,
+                                    lr,
+                                    True,
+                                    s_tie_v,
+                                    s_tie_l,
+                                    pack_v_row,
+                                    pack_v_row,
+                                    pack_l_row,
+                                    Int32(0),
+                                    Int32(0),
+                                    Int32(0),
+                                    Int32(0),
+                                    1,
+                                    1,
+                                    False,
+                                    True,
+                                    Int32(0),
+                                )
+                                i = Int32(tx)
+                                while i < remaining_k:
+                                    sel = Int32(s_out[i])
+                                    out_values[group_id, winners + i] = Float32(
+                                        s_tie_v[sel]
+                                    )
+                                    out_indices[group_id, winners + i] = (
+                                        ld_global_cg_i32(
+                                            get_ptr_as_int64(
+                                                pack_indices, slab_base + sel
+                                            )
+                                        )
+                                    )
+                                    i += Int32(_RADIX_THREADS)
+                            else:
+                                _deterministic_tie_fill(
+                                    tx,
+                                    total_ties,
+                                    remaining_k,
+                                    prefix,
+                                    s_hist0,
+                                    s_hist1,
+                                    s_out,
+                                    Int32(0),
+                                    s_cand0,
+                                    s_cand1,
+                                    h0,
+                                    ctr,
+                                    thr,
+                                    ni0,
+                                    ni1,
+                                    lr,
+                                    True,
+                                    pack_v_row,
+                                    pack_l_row,
+                                    pack_v_row,
+                                    pack_v_row,
+                                    pack_l_row,
+                                    Int32(0),
+                                    Int32(0),
+                                    Int32(0),
+                                    Int32(0),
+                                    1,
+                                    1,
+                                    False,
+                                    True,
+                                    Int32(0),
+                                )
+                                i = Int32(tx)
+                                while i < remaining_k:
+                                    sel = Int32(s_out[i])
+                                    out_values[group_id, winners + i] = Float32(
+                                        pack_v_row[sel]
+                                    )
+                                    out_indices[group_id, winners + i] = Int32(
+                                        pack_i_row[sel]
+                                    )
+                                    i += Int32(_RADIX_THREADS)
                 # Departure: once its output is placed, every CTA publishes
                 # that it is done with the group state, and the last one
                 # zeroes the whole block (round histograms and counters) so
@@ -2841,6 +3062,7 @@ class DSAFusedIndexerKernel:
                 while i < carry_count:
                     pack_values[slab_base + off + i] = Float32(s_c0_values[i])
                     pack_indices[slab_base + off + i] = Int32(s_c0_gindex[i])
+                    pack_lindices[slab_base + off + i] = Int32(s_c0_lindex[i])
                     i += Int32(_RADIX_THREADS)
                 cute.arch.sync_threads()
                 # 3. release the writes, then bump arrival; old==ctas-1 => I am last
@@ -2862,8 +3084,10 @@ class DSAFusedIndexerKernel:
                         _fused_radix_select(
                             pack_v_row,
                             pack_i_row,
+                            pack_l_row,
                             s_c1_values,
                             s_c1_gindex,
+                            s_c1_lindex,
                             total,
                             topk_static,
                             self.cands,
@@ -2907,6 +3131,50 @@ class DSAFusedIndexerKernel:
                         ] = Int32(0)
 
 
+# cute.compile re-traces a @cute.jit function in place, mutating that one
+# function object's __code__ / _preprocessed state. Compiling two fused-indexer
+# variants that share the same __call__/kernel functions in a single process
+# corrupts the second variant's IR (wrong shared-memory layout / selection),
+# which surfaces as an illegal memory access or a wrong boundary index. Give
+# each variant its own copies of those two functions so each compile traces a
+# fresh function object.
+import types as _fused_types
+
+_FUSED_INDEXER_PRISTINE_CODE = {
+    "__call__": DSAFusedIndexerKernel.__call__.__wrapped__.__code__,
+    "kernel": DSAFusedIndexerKernel.kernel.__wrapped__.__code__,
+}
+_FUSED_INDEXER_VARIANT_COUNTER = 0
+
+
+def _fused_indexer_variant_class():
+    global _FUSED_INDEXER_VARIANT_COUNTER
+    tag = _FUSED_INDEXER_VARIANT_COUNTER
+    _FUSED_INDEXER_VARIANT_COUNTER += 1
+
+    def _copy(name, decorator):
+        orig = getattr(DSAFusedIndexerKernel, name).__wrapped__
+        # __name__ must match the code object's co_name (the preprocessor
+        # execs the transformed body under that name); uniqueness comes from
+        # the function object identity, not the name.
+        fn = _fused_types.FunctionType(
+            _FUSED_INDEXER_PRISTINE_CODE[name],
+            orig.__globals__,
+            name,
+            orig.__defaults__,
+            orig.__closure__,
+        )
+        fn.__module__ = orig.__module__
+        fn.__qualname__ = f"DSAFusedIndexerKernel.{name}_variant{tag}"
+        return decorator(fn)
+
+    ns = {
+        "__call__": _copy("__call__", cute.jit),
+        "kernel": _copy("kernel", cute.kernel),
+    }
+    return type(f"DSAFusedIndexerKernel_variant{tag}", (DSAFusedIndexerKernel,), ns)
+
+
 @lru_cache(maxsize=64)
 def _build_fused_indexer_kernel(
     kv_layout: int,
@@ -2922,7 +3190,7 @@ def _build_fused_indexer_kernel(
     vectorized_q_load: bool = False,
     q_row_stride_bytes: int = 0,
 ):
-    return DSAFusedIndexerKernel(
+    return _fused_indexer_variant_class()(
         num_heads_static=num_heads_static,
         topk=topk,
         kv_layout=kv_layout,
@@ -2960,6 +3228,16 @@ def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> tuple[object, 
     return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
 
 
+# cute.compile corrupts the IR of a fused-indexer variant that is traced
+# immediately after a *different* variant in the same process (the second
+# variant's shared-memory layout / selection comes out wrong, surfacing as an
+# illegal memory access or a wrong boundary index). The corruption lives in
+# the DSL compiler's incremental state, so the reliable workaround is to clear
+# the b12x compile cache whenever the traced variant changes and let the new
+# variant compile from a clean slate.
+_FUSED_INDEXER_LAST_VARIANT_SIG = None
+
+
 def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
     """Graph-safe launch via b12x_launch (compile-once + replayable run_compiled).
 
@@ -2988,6 +3266,11 @@ def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
         variant = "fused_indexer_v8_coop"
     else:
         variant = "fused_indexer_v8_oversub_serial"
+    global _FUSED_INDEXER_LAST_VARIANT_SIG
+    variant_sig = (variant,) + tuple(policy)
+    if variant_sig != _FUSED_INDEXER_LAST_VARIANT_SIG:
+        clear_compile_cache()
+        _FUSED_INDEXER_LAST_VARIANT_SIG = variant_sig
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )
@@ -3021,13 +3304,15 @@ def _alloc_merge_scratch(rows: int, topk: int, ctas_per_group: int, dev):
     if ctas_per_group <= 1:
         pack_v = torch.empty((1,), dtype=torch.float32, device=dev)
         pack_i = torch.empty((1,), dtype=torch.int32, device=dev)
+        pack_l = torch.empty((1,), dtype=torch.int32, device=dev)
         state = torch.zeros((2,), dtype=torch.int32, device=dev)
     else:
         cap = rows * ctas_per_group * int(topk)
         pack_v = torch.empty((cap,), dtype=torch.float32, device=dev)
         pack_i = torch.empty((cap,), dtype=torch.int32, device=dev)
+        pack_l = torch.empty((cap,), dtype=torch.int32, device=dev)
         state = torch.zeros((rows * _COOP_STATE_WORDS,), dtype=torch.int32, device=dev)
-    return pack_v, pack_i, state
+    return pack_v, pack_i, pack_l, state
 
 
 def fused_indexer_scratch_capacity(
@@ -3044,8 +3329,8 @@ def fused_indexer_scratch_capacity(
     not seq_len). This is the whole point: unlike a per-seq gather buffer, the fused merge
     scratch never scales with context/max_model_len, so the frugal constant cap is exact.
 
-    Returns (pack_elems, state_words): pack_values and pack_indices each need pack_elems
-    (f32 / i32); merge_state needs state_words int32.
+    Returns (pack_elems, state_words): pack_values, pack_indices, and pack_lindices
+    each need pack_elems (f32 / i32 / i32); merge_state needs state_words int32.
     """
     pack_elems = max(1, int(num_sms)) * int(topk)
     state_words = max(1, int(max_rows)) * _COOP_STATE_WORDS
@@ -3082,6 +3367,7 @@ def run_fused_paged_indexer(
     merge_threshold: int | None = None,
     pack_values: torch.Tensor | None = None,
     pack_indices: torch.Tensor | None = None,
+    pack_lindices: torch.Tensor | None = None,
     merge_state: torch.Tensor | None = None,
     merge_state_preinitialized: bool = False,
     output_physical_slots: bool = False,
@@ -3090,9 +3376,9 @@ def run_fused_paged_indexer(
     """Paged fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
 
-    pack_values/pack_indices/merge_state: optional caller-owned (workspace) scratch for
-    serving. Size them with fused_indexer_scratch_capacity(max_rows, topk, num_sms) ONCE
-    (fixed capacity, never grows -- the merge scratch is seq-independent). When omitted,
+    pack_values/pack_indices/pack_lindices/merge_state: optional caller-owned
+    (workspace) scratch for serving. Size them with
+    fused_indexer_scratch_capacity(max_rows, topk, num_sms) ONCE
     scratch is allocated per call (benchmarks/tests). A caller-owned merge_state must
     either be zero-initialized once and pass merge_state_preinitialized=True, or it is
     zeroed here for backwards compatibility. Both merge arms self-reset every scalar
@@ -3132,15 +3418,24 @@ def run_fused_paged_indexer(
         if out_values is None
         else out_values
     )
-    if pack_values is not None and pack_indices is not None and merge_state is not None:
+    if (
+        pack_values is not None
+        and pack_indices is not None
+        and pack_lindices is not None
+        and merge_state is not None
+    ):
         # Workspace-owned fixed-capacity scratch. Capacity is validated against
         # fused_indexer_scratch_capacity by the workspace at allocation time.
         pack_need = rows * ctas_per_group * int(topk)
         state_need = rows * _COOP_STATE_WORDS
-        if pack_values.numel() < pack_need or pack_indices.numel() < pack_need:
+        if (
+            pack_values.numel() < pack_need
+            or pack_indices.numel() < pack_need
+            or pack_lindices.numel() < pack_need
+        ):
             raise ValueError(
                 f"fused indexer pack scratch too small: need {pack_need}, have "
-                f"{min(pack_values.numel(), pack_indices.numel())} "
+                f"{min(pack_values.numel(), pack_indices.numel(), pack_lindices.numel())} "
                 f"(size via fused_indexer_scratch_capacity)"
             )
         if merge_state.numel() < state_need:
@@ -3150,11 +3445,14 @@ def run_fused_paged_indexer(
             )
         pack_v = pack_values.narrow(0, 0, pack_need)
         pack_i = pack_indices.narrow(0, 0, pack_need)
+        pack_l = pack_lindices.narrow(0, 0, pack_need)
         state = merge_state.narrow(0, 0, state_need)
         if not bool(merge_state_preinitialized):
             state.zero_()
     else:
-        pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, ctas_per_group, dev)
+        pack_v, pack_i, pack_l, state = _alloc_merge_scratch(
+            rows, topk, ctas_per_group, dev
+        )
     # Real dim-0 byte stride of the K-quant tensor: the packed paged cache interleaves
     # per-page scales (stride 8448), a plain [pages,64,128] view is contiguous (8192).
     # The wide g2s load must use this, not a hardcoded stride, to read the right page.
@@ -3193,6 +3491,7 @@ def run_fused_paged_indexer(
         _to_kernel_tensor(out_v, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(pack_v, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(pack_i, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(pack_l, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(state, cutlass.Int32, assumed_align=4),
         current_cuda_stream(),
     )
@@ -3209,6 +3508,7 @@ def run_fused_paged_indexer(
         ("ov", out_v),
         ("pv", pack_v),
         ("pi", pack_i),
+        ("pl", pack_l),
         ("st", state),
     ]
     _launch_fused(
@@ -3259,7 +3559,7 @@ def run_fused_indexer_mla(
         if out_values is None
         else out_values
     )
-    pack_v, pack_i, state = _alloc_merge_scratch(rows, topk, 1, dev)
+    pack_v, pack_i, pack_l, state = _alloc_merge_scratch(rows, topk, 1, dev)
     vectorized_q_load = _can_vectorize_q_load(q_bytes)
     q_row_stride_bytes = int(q_bytes.stride(0)) if vectorized_q_load else 0
     kernel = _build_fused_indexer_kernel(
@@ -3287,6 +3587,7 @@ def run_fused_indexer_mla(
         _to_kernel_tensor(out_v, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(pack_v, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(pack_i, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(pack_l, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(state, cutlass.Int32, assumed_align=4),
         current_cuda_stream(),
     )
@@ -3303,6 +3604,7 @@ def run_fused_indexer_mla(
         ("ov", out_v),
         ("pv", pack_v),
         ("pi", pack_i),
+        ("pl", pack_l),
         ("st", state),
     ]
     _launch_fused(

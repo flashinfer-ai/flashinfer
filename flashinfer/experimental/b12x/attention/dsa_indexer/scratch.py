@@ -361,6 +361,7 @@ class _B12XIndexerPagedScratchLayout:
     active_width_offset_bytes: int
     fused_pack_values_offset_bytes: int
     fused_pack_indices_offset_bytes: int
+    fused_pack_lindices_offset_bytes: int
     fused_merge_state_offset_bytes: int
     msa_page_scores_offset_bytes: int
     msa_block_scores_offset_bytes: int
@@ -444,6 +445,7 @@ class B12XIndexerPagedScratch:
     paged_indexer_active_width_cap: torch.Tensor | None = None
     fused_indexer_pack_values: torch.Tensor | None = None
     fused_indexer_pack_indices: torch.Tensor | None = None
+    fused_indexer_pack_lindices: torch.Tensor | None = None
     fused_indexer_merge_state: torch.Tensor | None = None
     fused_indexer_merge_state_preinitialized: bool = False
     msa_page_scores: torch.Tensor | None = None
@@ -577,12 +579,14 @@ class B12XIndexerPagedScratch:
         if (
             self.fused_indexer_pack_values is None
             or self.fused_indexer_pack_indices is None
+            or self.fused_indexer_pack_lindices is None
             or self.fused_indexer_merge_state is None
         ):
             raise RuntimeError("paged indexer scratch is missing fused buffers")
         return (
             self.fused_indexer_pack_values,
             self.fused_indexer_pack_indices,
+            self.fused_indexer_pack_lindices,
             self.fused_indexer_merge_state,
         )
 
@@ -1064,6 +1068,10 @@ def _indexer_paged_scratch_layout(
     cursor += fused_pack_elements * dtype_nbytes(torch.int32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
+    fused_pack_lindices_offset_bytes = cursor
+    cursor += fused_pack_elements * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
     fused_merge_state_offset_bytes = cursor
     cursor += fused_state_words * dtype_nbytes(torch.int32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
@@ -1157,6 +1165,7 @@ def _indexer_paged_scratch_layout(
         active_width_offset_bytes=active_width_offset_bytes,
         fused_pack_values_offset_bytes=fused_pack_values_offset_bytes,
         fused_pack_indices_offset_bytes=fused_pack_indices_offset_bytes,
+        fused_pack_lindices_offset_bytes=fused_pack_lindices_offset_bytes,
         fused_merge_state_offset_bytes=fused_merge_state_offset_bytes,
         msa_page_scores_offset_bytes=msa_page_scores_offset_bytes,
         msa_block_scores_offset_bytes=msa_block_scores_offset_bytes,
@@ -1426,6 +1435,12 @@ def _materialize_indexer_paged_scratch(
             shape=(int(layout.fused_pack_elements),),
             dtype=torch.int32,
         )
+        fused_pack_lindices, _ = materialize_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.fused_pack_lindices_offset_bytes,
+            shape=(int(layout.fused_pack_elements),),
+            dtype=torch.int32,
+        )
         fused_merge_state, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.fused_merge_state_offset_bytes,
@@ -1440,6 +1455,7 @@ def _materialize_indexer_paged_scratch(
     else:
         fused_pack_values = None
         fused_pack_indices = None
+        fused_pack_lindices = None
         fused_merge_state = None
 
     if str(caps.score_mode) == "msa":
@@ -1563,6 +1579,7 @@ def _materialize_indexer_paged_scratch(
         paged_indexer_active_width_cap=active_width_cap,
         fused_indexer_pack_values=fused_pack_values,
         fused_indexer_pack_indices=fused_pack_indices,
+        fused_indexer_pack_lindices=fused_pack_lindices,
         fused_indexer_merge_state=fused_merge_state,
         fused_indexer_merge_state_preinitialized=fused_merge_state is not None,
         msa_page_scores=msa_page_scores,

@@ -12,25 +12,6 @@ import pytest
 torch_device = "cuda"
 
 
-def _torch_topk_tied_nondeterministic() -> None:
-    """torch.topk(sorted=False) on tied input can return different index sets."""
-    # 64 candidates, all score 1.0 (total tie), topk=8.
-    x = torch.full((64,), 1.0, device=torch_device)
-    sets = set()
-    for _ in range(20):
-        idx = torch.topk(x, 8, sorted=False).indices
-        sets.add(tuple(idx.cpu().tolist()))
-    # With a deterministic selection there is exactly one set.
-    assert len(sets) == 1, (
-        f"torch.topk(sorted=False) is nondeterministic on ties: {len(sets)} distinct sets"
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_torch_topk_sorted_false_tie_determinism():
-    _torch_topk_tied_nondeterministic()
-
-
 def _run_tiled_topk_once(
     tile_logits, *, topk, block_q, block_k, lengths
 ) -> torch.Tensor:
@@ -103,4 +84,42 @@ def test_run_row_topk_tied_determinism():
     assert len(sets) == 1, (
         f"run_row_topk nondeterministic on ties: {len(sets)} distinct sets, "
         f"examples={list(sets)[:3]}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_run_row_topk_large_magnitude_tie_determinism():
+    """Tied scores at large magnitude must still select deterministically.
+
+    Regression for the fp32-ulp failure of the old index*2^-24 key perturbation:
+    at |score| >= 2^k the ulp (2^(k-23)) exceeds the 2^-24 perturbation step, so
+    tied candidates within ~2^(k+1) indices collapsed to one key and resolved via
+    nondeterministic _smem_xadd arrival order. The two-phase select (true-score
+    radix + index-ordered pivot-tie fill) must resolve ties by index at any
+    magnitude. 8192 (=2^13) candidates, all score 16.0, topk 512.
+    """
+    from b12x.attention.dsa_indexer.tiled_topk import run_row_topk
+
+    topk = 512
+    width = 8192
+    row_logits = torch.full((1, width), 16.0, dtype=torch.float32, device=torch_device)
+    lengths = torch.tensor([width], dtype=torch.int32, device=torch_device)
+
+    expected = tuple(sorted(range(topk)))  # index-asc tie-break -> earliest indices
+    sets = set()
+    for _ in range(20):
+        _, indices = run_row_topk(
+            row_logits=row_logits,
+            lengths=lengths,
+            topk=topk,
+        )
+        got = tuple(sorted(indices[0].cpu().tolist()))
+        sets.add(got)
+        assert got == expected, (
+            f"large-magnitude tie selected wrong set: got {got[:8]}... "
+            f"expected {expected[:8]}..."
+        )
+    assert len(sets) == 1, (
+        f"run_row_topk nondeterministic on large-magnitude ties: "
+        f"{len(sets)} distinct sets"
     )

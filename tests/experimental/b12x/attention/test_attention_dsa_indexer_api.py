@@ -1386,12 +1386,9 @@ def test_contiguous_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
         metadata=metadata,
         preinitialize_invalid_logits=False,
     )
-    # Mirror the kernel's key-only tie-break so boundary ties resolve to the
-    # same candidates (higher token index wins); logits themselves are unperturbed.
-    tie = torch.arange(k_rows, device=logits.device, dtype=torch.float32) * tiled_topk_module._TIE_BREAK_EPS
-    expected = torch.topk(logits + tie, k=topk, dim=1, largest=True, sorted=False).indices.to(
-        torch.int32
-    )
+    # Deterministic tie-break: (score desc, index asc), matching the kernel's
+    # two-phase select. Stable argsort on -logits gives that order per row.
+    expected = torch.argsort(-logits, dim=1, stable=True)[:, :topk].to(torch.int32)
 
     torch.cuda.synchronize(device)
     assert actual.shape == (q_rows, topk)
@@ -1461,12 +1458,9 @@ def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
         metadata=metadata,
         preinitialize_invalid_logits=False,
     )
-    # Mirror the kernel's key-only tie-break so boundary ties resolve to the same
-    # candidates (higher token index wins); values are gathered from unperturbed logits.
-    tie = torch.arange(k_rows, device=logits.device, dtype=torch.float32) * tiled_topk_module._TIE_BREAK_EPS
-    expected = torch.topk(logits + tie, k=topk, dim=1, largest=True, sorted=False).indices.to(
-        torch.int32
-    )
+    # Deterministic tie-break: (score desc, index asc), matching the kernel's
+    # two-phase select. Values are gathered from unperturbed logits.
+    expected = torch.argsort(-logits, dim=1, stable=True)[:, :topk].to(torch.int32)
 
     torch.cuda.synchronize(device)
     assert actual.shape == (q_rows, topk)
