@@ -158,7 +158,7 @@ def cake_fp4_allreduce_window_plan(
                 f"receive window {buffer['name']!r} has {nbytes} bytes, not a whole "
                 f"number of {period}-byte periods"
             )
-        runs = []
+        runs: list[tuple[int, int]] = []
         rest = None
         for word, run in buffer["fills"]:
             if run == "rest":
