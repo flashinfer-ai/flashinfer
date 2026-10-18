@@ -67,10 +67,12 @@ DEFAULT_CAPACITY = 16384
 LARGER_CAPACITY = 4096  # the odd-row cases run under this capacity
 # Fewer rows than teams / warps, one row per team plus some, the smallest
 # production tier and the largest tier; the four-rank cases are multiples of 4.
+# The fused norm adds the 4096-row tier, which runs its residual-prefetch
+# programs (18 to 28 rows per CTA on 148 to 160 SMs).
 ROWS = {
     ("allreduce", 2): (3, 6, 1024, 16384),
     ("allreduce", 4): (4, 8, 44, 1024, 16384),
-    ("rmsnorm", 2): (3, 11, 1024, 16384),
+    ("rmsnorm", 2): (3, 11, 1024, 4096, 16384),
 }
 ODD_ROWS = {("allreduce", 2): 1031, ("allreduce", 4): 1028, ("rmsnorm", 2): 1031}
 SMALL_ROWS = {("allreduce", 2): 3, ("allreduce", 4): 4, ("rmsnorm", 2): 3}
@@ -741,6 +743,14 @@ def _rmsnorm_cases(
 ):
     """Two launches per row count and output format on one workspace; the second into caller-provided buffers."""
     for rows in rows_list:
+        program = workspace.program(rows, output.value)
+        assert program.endswith("_pf") == loader.select_prefetch(
+            rows, workspace.grid
+        ), (
+            program,
+            rows,
+            workspace.grid,
+        )
         previous = None
         for launch in range(LAUNCHES_PER_CASE):
             case = _norm_case(

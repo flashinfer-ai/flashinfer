@@ -38,6 +38,7 @@ from flashinfer.jit.cake_fp4_allreduce_programs import (
     LIMITS,
     PROGRAMS,
     SELECT_BV,
+    SELECT_PREFETCH,
     WINDOWS,
 )
 from tests.comm import cake_fp4_allreduce_reference as ref
@@ -62,6 +63,7 @@ def _expected_program_ids() -> set[str]:
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}" for fmt in INPUT_FORMATS for bv in BVS}
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}_rst" for fmt, bv in REGISTER_STORE_FORMS}
     ids |= {f"tp2_rmsnorm_{i}_{o}" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+    ids |= {f"tp2_rmsnorm_{i}_{o}_pf" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
     return ids
 
 
@@ -104,7 +106,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 18
+    assert len(PROGRAMS) == 24
     keys = {
         "family",
         "world_size",
@@ -112,6 +114,7 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "output_format",
         "bv",
         "reset",
+        "prefetch",
         "targets",
         "kernel_symbol",
         "sources",
@@ -157,6 +160,11 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
             assert program.startswith(f"tp4_twoshot_{input_format}_bv{record['bv']}")
         else:
             assert record["bv"] is None and record["reset"] is None
+        if family == "rmsnorm":
+            assert record["prefetch"] in (False, True)
+            assert program.endswith("_pf") == record["prefetch"], program
+        else:
+            assert record["prefetch"] is None
     assert {
         target for record in PROGRAMS.values() for target in record["targets"]
     } == set(TARGETS)
@@ -203,12 +211,13 @@ def test_one_shot_and_fused_norm_programs_serve_both_targets() -> None:
     for program, record in PROGRAMS.items():
         if record["world_size"] == 2:
             assert set(record["targets"]) == set(TARGETS), program
-    # The family / input-format / output-format lattice of the fused norm is complete.
-    assert {
-        (record["input_format"], record["output_format"])
-        for record in PROGRAMS.values()
-        if record["family"] == "rmsnorm"
-    } == {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+    # The family / input-format / output-format lattice of the fused norm is complete, in both prefetch forms.
+    for prefetch in (False, True):
+        assert {
+            (record["input_format"], record["output_format"])
+            for record in PROGRAMS.values()
+            if record["family"] == "rmsnorm" and record["prefetch"] is prefetch
+        } == {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
 
 
 def _checkout_source_dir() -> Path:
@@ -259,6 +268,7 @@ def test_limits_and_selection_constants_match_the_contract() -> None:
     assert LIMITS["mxfp8_value_bytes"] == ref.HIDDEN
     assert LIMITS["mxfp8_scales_per_row"] == ref.HIDDEN // 32
     assert SELECT_BV == {"team_max": 40, "by_quad_min": 64}
+    assert SELECT_PREFETCH == {"rows_per_cta_min": 18, "rows_per_cta_max": 28}
     assert loader.HIDDEN == ref.HIDDEN == 6144
     assert loader.RECORD_BYTES == ref.RECORD_BYTES == 3456
     assert LIMITS["hidden"] == ref.HIDDEN
@@ -514,6 +524,43 @@ def test_select_bv_rejects_an_empty_grid() -> None:
         loader.select_bv(1024, 0)
 
 
+@pytest.mark.parametrize(
+    ("rows", "grid", "expected"),
+    [
+        (3, 148, False),
+        (1024, 148, False),
+        (2048, 148, False),
+        (148 * 18 - 1, 148, False),
+        (148 * 18, 148, True),
+        (3072, 148, True),
+        (4096, 148, True),
+        (148 * 29 - 1, 148, True),
+        (148 * 29, 148, False),
+        (8192, 148, False),
+        (16384, 148, False),
+        (152 * 18 - 1, 152, False),
+        (152 * 18, 152, True),
+        (4096, 152, True),
+        (152 * 29 - 1, 152, True),
+        (152 * 29, 152, False),
+        (4096, 160, True),
+    ],
+)
+def test_select_prefetch_rule(rows: int, grid: int, expected: bool) -> None:
+    assert loader.select_prefetch(rows, grid) is expected
+    per_cta = rows // grid
+    assert expected == (
+        SELECT_PREFETCH["rows_per_cta_min"]
+        <= per_cta
+        <= SELECT_PREFETCH["rows_per_cta_max"]
+    )
+
+
+def test_select_prefetch_rejects_an_empty_grid() -> None:
+    with pytest.raises(ValueError):
+        loader.select_prefetch(4096, 0)
+
+
 @pytest.mark.parametrize("target", TARGETS)
 @pytest.mark.parametrize("input_format", INPUT_FORMATS)
 def test_program_for_two_shot_picks_the_register_store_form_only_on_sm_100a(
@@ -543,7 +590,9 @@ def test_program_for_two_shot_picks_the_register_store_form_only_on_sm_100a(
 @pytest.mark.parametrize("target", TARGETS)
 def test_program_for_one_shot_and_fused_norm(target: str) -> None:
     for input_format in INPUT_FORMATS:
-        for rows in (3, 1031, 16384):
+        for rows in (3, 1031, 2048, 2664, 4096, 4291, 4292, 16384):
+            suffix = "_pf" if loader.select_prefetch(rows, 148) else ""
+            assert (rows in (2664, 4096, 4291)) == bool(suffix)
             assert (
                 loader.program_for(
                     family="allreduce",
@@ -567,7 +616,7 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                         grid=148,
                         target=target,
                     )
-                    == f"tp2_rmsnorm_{input_format}_{output_format}"
+                    == f"tp2_rmsnorm_{input_format}_{output_format}{suffix}"
                 )
     with pytest.raises(ValueError):
         loader.program_for(

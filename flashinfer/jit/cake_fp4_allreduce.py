@@ -17,9 +17,9 @@ JIT loader of the Cake NVFP4-transport tensor-parallel all-reduce (SM100 / SM103
 
 The programs are generated into ``csrc/cake_fp4_allreduce`` and listed in
 :mod:`flashinfer.jit.cake_fp4_allreduce_programs` (``PROGRAMS``: one physical
-program per family, world size, input format, output format, phase-B variant
-and re-arm form; ``WINDOWS``: the receive-window contract; ``SELECT_BV`` and
-``LIMITS``: the host rules).  Every program is an exact-architecture source:
+program per family, world size, input format, output format, phase-B variant,
+re-arm form and residual-prefetch form; ``WINDOWS``: the receive-window
+contract; ``SELECT_BV``, ``SELECT_PREFETCH`` and ``LIMITS``: the host rules).  Every program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
 B300) with that target's flag set, without fast math and with
 ``--fmad=false``, into a module named after the program, the target and a
@@ -40,7 +40,13 @@ import torch
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cake_fp4_allreduce_programs import LIMITS, PROGRAMS, SELECT_BV, WINDOWS
+from .cake_fp4_allreduce_programs import (
+    LIMITS,
+    PROGRAMS,
+    SELECT_BV,
+    SELECT_PREFETCH,
+    WINDOWS,
+)
 from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a"]
@@ -180,12 +186,13 @@ def programs(
     input_format: Optional[str] = None,
     output_format: Optional[str] = None,
     bv: Optional[int] = None,
+    prefetch: Optional[bool] = None,
     target: Optional[str] = None,
 ) -> tuple[str, ...]:
     """Program ids whose registry rows match every given key, in registry order.
 
-    ``output_format=None`` and ``bv=None`` do not filter; pass
-    ``output_format=""`` to select the rows without an output format (the
+    ``output_format=None``, ``bv=None`` and ``prefetch=None`` do not filter;
+    pass ``output_format=""`` to select the rows without an output format (the
     ``allreduce`` family).  ``target`` keeps the rows compiled for that target.
     """
 
@@ -202,6 +209,8 @@ def programs(
             if record["output_format"] != wanted:
                 continue
         if bv is not None and record["bv"] != int(bv):
+            continue
+        if prefetch is not None and record["prefetch"] != bool(prefetch):
             continue
         if target is not None and target not in record["targets"]:
             continue
@@ -265,6 +274,25 @@ def select_bv(rows: int, grid: int) -> int:
     return 1
 
 
+def select_prefetch(rows: int, grid: int) -> bool:
+    """Whether the fused-norm programs with the residual prefetch serve ``rows`` on ``grid`` CTAs.
+
+    The prefetch build is selected when ``rows // grid`` lies in
+    ``[SELECT_PREFETCH["rows_per_cta_min"], SELECT_PREFETCH["rows_per_cta_max"]]``
+    rows per CTA; outside that window the plain build is faster.  Every rank
+    evaluates this on the same grid, so every rank runs the same program.
+    """
+
+    if int(grid) <= 0:
+        raise ValueError(f"grid must be positive, got {grid}")
+    per_cta = int(rows) // int(grid)
+    return (
+        int(SELECT_PREFETCH["rows_per_cta_min"])
+        <= per_cta
+        <= int(SELECT_PREFETCH["rows_per_cta_max"])
+    )
+
+
 @functools.cache
 def program_for(
     family: str,
@@ -279,9 +307,11 @@ def program_for(
 
     The candidates are the rows of (family, world size, input format, output
     format) compiled for ``target``; when they carry phase-B variants the one
-    of :func:`select_bv` is kept.  The re-arm form follows from the registry's
-    per-target rows (a target has either the bulk or the register-store form
-    of a variant), so this function never restates that rule.
+    of :func:`select_bv` is kept, and when they carry a residual-prefetch form
+    the one of :func:`select_prefetch`.  The re-arm form follows from the
+    registry's per-target rows (a target has either the bulk or the
+    register-store form of a variant), so this function never restates that
+    rule.
     """
 
     candidates = programs(
@@ -301,6 +331,13 @@ def program_for(
         bv = select_bv(int(rows), int(grid))
         candidates = tuple(
             program for program in candidates if PROGRAMS[program]["bv"] == bv
+        )
+    if any(PROGRAMS[program]["prefetch"] is not None for program in candidates):
+        prefetch = select_prefetch(int(rows), int(grid))
+        candidates = tuple(
+            program
+            for program in candidates
+            if PROGRAMS[program]["prefetch"] == prefetch
         )
     if len(candidates) != 1:
         raise RuntimeError(
@@ -478,6 +515,7 @@ __all__ = [
     "RECORD_BYTES",
     "SCALAR_PARAMS",
     "SELECT_BV",
+    "SELECT_PREFETCH",
     "SOURCE_PACKAGE",
     "SUPPORTED_CAPABILITIES",
     "TARGET_CAPABILITIES",
@@ -497,6 +535,7 @@ __all__ = [
     "program_sources",
     "programs",
     "select_bv",
+    "select_prefetch",
     "supported_capability",
     "target_arch",
     "target_capabilities",
