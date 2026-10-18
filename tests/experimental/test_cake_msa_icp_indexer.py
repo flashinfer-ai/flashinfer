@@ -29,6 +29,8 @@ Graph replay.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import multiprocessing as mp
 import re
 import socket
@@ -120,6 +122,24 @@ def test_registry_records_are_consistent() -> None:
         "timeout_ns",
     ):
         assert required in merge_names, required
+
+
+def test_registry_tables_expand_to_the_pinned_records() -> None:
+    """The compact registry tables expand to exactly the exported record set.
+
+    ``cake_jit.PROGRAMS`` is built from one row per record plus the per-family
+    constants.  This digest of its canonical JSON pins the expanded dict (26
+    records: 12 scorers, 14 merges), so neither a row nor the expander can
+    drift silently.  After an intended registry change, recompute it as the
+    sha256 of ``json.dumps(PROGRAMS, sort_keys=True, separators=(",", ":"))``.
+    """
+    roles = [record["role"] for record in cake_jit.PROGRAMS.values()]
+    assert (roles.count("scorer"), roles.count("merge")) == (12, 14)
+    canonical = json.dumps(cake_jit.PROGRAMS, sort_keys=True, separators=(",", ":"))
+    assert (
+        hashlib.sha256(canonical.encode()).hexdigest()
+        == "fc9e6f6dda22b61dfea2aeeb60aaca59977398cf13fdfc9e61c894587c04ee8f"
+    )
 
 
 def test_scorer_records_share_one_kernel_text_per_rows_per_rank() -> None:

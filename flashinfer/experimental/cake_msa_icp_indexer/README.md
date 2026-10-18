@@ -126,8 +126,10 @@ with CUPTI under `torchrun`.
 
 ## Files
 
-- `cake_jit.py` -- program registry (`PROGRAMS`, `ARG_PLANS`, `POLICY`, written
-  by the generator) and the per-architecture JIT specs.
+- `cake_jit.py` -- program registry (`PROGRAMS`, expanded from one table row
+  per record plus the per-family constants, `ARG_PLANS`, `POLICY`; written by
+  the generator, the tabular form pending its regeneration) and the
+  per-architecture JIT specs.
 - `cake_backend.py` -- validation, planning, binding, the runner.
 - `cake_workspace.py` -- the symmetric-memory workspace.
 - `csrc/cake_msa_icp_indexer/` (repository root) -- the generated device and
