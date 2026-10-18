@@ -440,6 +440,7 @@ def _coop_wide_round(
     coarse_off: cutlass.Constexpr[int],
     fine_off: cutlass.Constexpr[int],
     s_c0_values: cute.Tensor,
+    s_c0_gindex: cute.Tensor,
     carry_count: Int32,
     key_mask: Uint32,
     key_prefix: Uint32,
@@ -468,7 +469,9 @@ def _coop_wide_round(
     """
     i = Int32(tx)
     while i < carry_count:
-        key = _convert_to_uint32(Float32(s_c0_values[i]))
+        key = _convert_to_uint32(
+            _tie_break_key(Float32(s_c0_values[i]), Int32(s_c0_gindex[i]))
+        )
         if (key & key_mask) == key_prefix:
             digit = Int32((key >> Uint32(digit_shift)) & Uint32(0xFFF))
             _smem_red_add(wide_hist_addr, digit, Int32(1))
@@ -505,6 +508,7 @@ def _coop_narrow_round(
     group_id: Int32,
     coarse_off: cutlass.Constexpr[int],
     s_c0_values: cute.Tensor,
+    s_c0_gindex: cute.Tensor,
     carry_count: Int32,
     key_mask: Uint32,
     key_prefix: Uint32,
@@ -527,7 +531,9 @@ def _coop_narrow_round(
     cute.arch.sync_threads()
     i = Int32(tx)
     while i < carry_count:
-        key = _convert_to_uint32(Float32(s_c0_values[i]))
+        key = _convert_to_uint32(
+            _tie_break_key(Float32(s_c0_values[i]), Int32(s_c0_gindex[i]))
+        )
         if (key & key_mask) == key_prefix:
             _smem_red_add(coarse_hist_addr, Int32(key & Uint32(0xFF)), Int32(1))
         i += Int32(_RADIX_THREADS)
@@ -1242,6 +1248,22 @@ def _fused_indexer_shared_storage_cls(
     return cute.struct(SharedStorage)
 
 
+# Deterministic tie-break for the fused radix-select. Exact score ties (common
+# with FP8-quantized indexer logits) otherwise resolve through the _smem_xadd
+# atomics in a nondeterministic order, so the selected read plan jitters across
+# runs on an identical prompt (the 32K canary flake). Adding the candidate's
+# token index * 2^-24 to the score key makes tied scores map to distinct keys,
+# so the selector returns a stable plan (mirrors tiled_topk._tie_break_perturb).
+# Only the radix key is perturbed; the emitted score is read from the
+# unperturbed vin_v, so non-tied selections and output values are unchanged.
+_TIE_BREAK_EPS = 2.0**-24
+
+
+@cute.jit
+def _tie_break_key(value: Float32, gindex: Int32) -> Float32:
+    return value + Float32(gindex) * Float32(_TIE_BREAK_EPS)
+
+
 @cute.jit
 def _fused_radix_select(
     vin_v: cute.Tensor,
@@ -1281,11 +1303,15 @@ def _fused_radix_select(
     while idx_base < full_scan_limit:
         for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
             sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
-            bin8 = _convert_to_uint8(Float32(vin_v[sidx]))
+            bin8 = _convert_to_uint8(
+                _tie_break_key(Float32(vin_v[sidx]), Int32(vin_g[sidx]))
+            )
             _smem_red_add(h0, Int32(bin8), Int32(1))
         idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
     while idx_base < n_total:
-        bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
+        bin8 = _convert_to_uint8(
+            _tie_break_key(Float32(vin_v[idx_base]), Int32(vin_g[idx_base]))
+        )
         _smem_red_add(h0, Int32(bin8), Int32(1))
         idx_base += Int32(_RADIX_THREADS)
     cute.arch.sync_threads()
@@ -1321,7 +1347,9 @@ def _fused_radix_select(
     if topk == Int32(0):
         idx_base = Int32(tx)
         while idx_base < n_total:
-            bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
+            bin8 = _convert_to_uint8(
+                _tie_break_key(Float32(vin_v[idx_base]), Int32(vin_g[idx_base]))
+            )
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
                 s_out[pos] = idx_base
@@ -1337,7 +1365,7 @@ def _fused_radix_select(
         while idx_base < full_scan_limit:
             for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
                 sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
-                raw_input = Float32(vin_v[sidx])
+                raw_input = _tie_break_key(Float32(vin_v[sidx]), Int32(vin_g[sidx]))
                 bin8 = _convert_to_uint8(raw_input)
                 if Int32(bin8) > threshold_bin:
                     pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -1352,7 +1380,7 @@ def _fused_radix_select(
                             _smem_red_add(h0, Int32(sub_bin), Int32(1))
             idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
         while idx_base < n_total:
-            raw_input = Float32(vin_v[idx_base])
+            raw_input = _tie_break_key(Float32(vin_v[idx_base]), Int32(vin_g[idx_base]))
             bin8 = _convert_to_uint8(raw_input)
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -1421,7 +1449,9 @@ def _fused_radix_select(
                             else Int32(s_cand1[i])
                         )
                         offset = Int32(24 - round_idx * 8)
-                        raw_val = Float32(vin_v[c_idx])
+                        raw_val = _tie_break_key(
+                            Float32(vin_v[c_idx]), Int32(vin_g[c_idx])
+                        )
                         key32 = _convert_to_uint32(raw_val)
                         bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
                         if Int32(bin) > sub_threshold:
@@ -1442,7 +1472,9 @@ def _fused_radix_select(
                             if cutlass.const_expr(r_idx_is_0)
                             else Int32(s_cand1[i])
                         )
-                        raw_val = Float32(vin_v[c_idx])
+                        raw_val = _tie_break_key(
+                            Float32(vin_v[c_idx]), Int32(vin_g[c_idx])
+                        )
                         offset = Int32(24 - round_idx * 8)
                         key32 = _convert_to_uint32(raw_val)
                         bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
@@ -1505,6 +1537,8 @@ def _fused_radix_select(
             block_k=1,
             is_tiled=False,
             is_first=True,
+            tie_break=True,
+            gindex_values=vin_g,
         )
     cute.arch.sync_threads()
     i = Int32(tx)
@@ -2582,6 +2616,7 @@ class DSAFusedIndexerKernel:
                     _FUSED_COARSE0,
                     _FUSED_FINE0,
                     s_c0_values,
+                    s_c0_gindex,
                     carry_count,
                     Uint32(0),
                     Uint32(0),
@@ -2639,6 +2674,7 @@ class DSAFusedIndexerKernel:
                             _FUSED_COARSE1,
                             _FUSED_FINE1,
                             s_c0_values,
+                            s_c0_gindex,
                             carry_count,
                             mask,
                             prefix,
@@ -2670,6 +2706,7 @@ class DSAFusedIndexerKernel:
                             group_id,
                             _FUSED_COARSE2,
                             s_c0_values,
+                            s_c0_gindex,
                             carry_count,
                             mask,
                             prefix,
@@ -2699,7 +2736,14 @@ class DSAFusedIndexerKernel:
                     cute.arch.sync_threads()
                     i = Int32(tx)
                     while i < carry_count:
-                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
+                        key = (
+                            _convert_to_uint32(
+                                _tie_break_key(
+                                    Float32(s_c0_values[i]), Int32(s_c0_gindex[i])
+                                )
+                            )
+                            & mask
+                        )
                         if key > prefix:
                             _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
                         else:
@@ -2731,7 +2775,14 @@ class DSAFusedIndexerKernel:
                     eq_base = Int32(s_coop_scalars[1])
                     i = Int32(tx)
                     while i < carry_count:
-                        key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
+                        key = (
+                            _convert_to_uint32(
+                                _tie_break_key(
+                                    Float32(s_c0_values[i]), Int32(s_c0_gindex[i])
+                                )
+                            )
+                            & mask
+                        )
                         if key > prefix:
                             pos = gt_base + _smem_xadd(
                                 coop_ctr_addr, Int32(0), Int32(1)

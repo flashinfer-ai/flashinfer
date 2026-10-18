@@ -68,6 +68,48 @@ def _resolve_smem_candidate_capacity(*, topk: int) -> int:
     return _DEFAULT_SMEM_CANDIDATES
 
 
+# Deterministic tie-break for the radix-select top-k. Exact score ties (common
+# with FP8-quantized indexer logits) otherwise resolve through shared-memory
+# atomics in a nondeterministic order, so the selected read plan jitters across
+# runs on an identical prompt (the 32K canary flake). Adding a position-based
+# epsilon to the radix KEY (not the emitted score) makes tied scores distinct,
+# so the selector returns a stable plan.
+_TIE_BREAK_EPS = 2.0**-24
+
+
+@cute.jit
+def _tie_break_key(value: Float32, index: Int32) -> Float32:
+    """Deterministic key-only tie-break: perturb the radix key by index * 2^-24
+    so exact score ties map to distinct keys. The emitted score is untouched
+    (only the selection key changes)."""
+    return value + Float32(index) * Float32(_TIE_BREAK_EPS)
+
+
+@cute.jit
+def _tie_break_column_index(
+    carry_indices,
+    row_start: Int32,
+    output_index_offset: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    vidx: Int32,
+    is_first: cutlass.Constexpr[bool],
+) -> Int32:
+    """Logical K-column index for a virtual candidate index (the tie-break key),
+    mirroring _emit_global_index_virtual without physical-slot translation. Carry
+    candidates resolve through carry_indices so the supertile fold perturbs by the
+    same column identity the reference sees."""
+    col = Int32(0)
+    if cutlass.const_expr(is_first):
+        col = row_start + vidx + output_index_offset
+    else:
+        if vidx < chunk_len:
+            col = row_start + vidx + output_index_offset
+        else:
+            col = Int32(carry_indices[carry_base + (vidx - chunk_len)])
+    return col
+
+
 @dsl_user_op
 def _cvt_rn_f16_f32(val: Float32, *, loc=None, ip=None) -> Uint32:
     result = llvm.inline_asm(
@@ -339,6 +381,9 @@ def _exact_overflow_fallback(
     block_k: cutlass.Constexpr[int],
     is_tiled: cutlass.Constexpr[bool],
     is_first: cutlass.Constexpr[bool],
+    tie_break: cutlass.Constexpr[bool] = False,
+    gindex_values=None,
+    tie_break_self: cutlass.Constexpr[bool] = False,
 ):
     """Exact overflow fallback shared by the tiled and fused radix kernels.
 
@@ -366,23 +411,28 @@ def _exact_overflow_fallback(
         cute.arch.sync_threads()
         idx_base = Int32(tx)
         while idx_base < n_total:
-            ex_key = _convert_to_uint32(
-                _fallback_load_value(
-                    flat,
-                    idx_base,
-                    flat_values,
-                    input_tensor,
-                    carry_values,
-                    row_base,
-                    row_start,
-                    carry_base,
-                    chunk_len,
-                    block_q,
-                    block_k,
-                    is_tiled,
-                    is_first,
-                )
+            ex_val = _fallback_load_value(
+                flat,
+                idx_base,
+                flat_values,
+                input_tensor,
+                carry_values,
+                row_base,
+                row_start,
+                carry_base,
+                chunk_len,
+                block_q,
+                block_k,
+                is_tiled,
+                is_first,
             )
+            if cutlass.const_expr(tie_break):
+                ex_val = ex_val + Float32(gindex_values[idx_base]) * Float32(
+                    _TIE_BREAK_EPS
+                )
+            elif cutlass.const_expr(tie_break_self):
+                ex_val = ex_val + Float32(idx_base) * Float32(_TIE_BREAK_EPS)
+            ex_key = _convert_to_uint32(ex_val)
             if cutlass.const_expr(ex_round == 0):
                 _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
             else:
@@ -431,23 +481,26 @@ def _exact_overflow_fallback(
     cute.arch.sync_threads()
     idx_base = Int32(tx)
     while idx_base < n_total:
-        ex_key = _convert_to_uint32(
-            _fallback_load_value(
-                flat,
-                idx_base,
-                flat_values,
-                input_tensor,
-                carry_values,
-                row_base,
-                row_start,
-                carry_base,
-                chunk_len,
-                block_q,
-                block_k,
-                is_tiled,
-                is_first,
-            )
+        ex_val = _fallback_load_value(
+            flat,
+            idx_base,
+            flat_values,
+            input_tensor,
+            carry_values,
+            row_base,
+            row_start,
+            carry_base,
+            chunk_len,
+            block_q,
+            block_k,
+            is_tiled,
+            is_first,
         )
+        if cutlass.const_expr(tie_break):
+            ex_val = ex_val + Float32(gindex_values[idx_base]) * Float32(_TIE_BREAK_EPS)
+        elif cutlass.const_expr(tie_break_self):
+            ex_val = ex_val + Float32(idx_base) * Float32(_TIE_BREAK_EPS)
+        ex_key = _convert_to_uint32(ex_val)
         if ex_key > ex_pivot:
             ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
             if ex_pos < topk_static:
@@ -456,23 +509,26 @@ def _exact_overflow_fallback(
     cute.arch.sync_threads()
     idx_base = Int32(tx)
     while idx_base < n_total:
-        ex_key = _convert_to_uint32(
-            _fallback_load_value(
-                flat,
-                idx_base,
-                flat_values,
-                input_tensor,
-                carry_values,
-                row_base,
-                row_start,
-                carry_base,
-                chunk_len,
-                block_q,
-                block_k,
-                is_tiled,
-                is_first,
-            )
+        ex_val = _fallback_load_value(
+            flat,
+            idx_base,
+            flat_values,
+            input_tensor,
+            carry_values,
+            row_base,
+            row_start,
+            carry_base,
+            chunk_len,
+            block_q,
+            block_k,
+            is_tiled,
+            is_first,
         )
+        if cutlass.const_expr(tie_break):
+            ex_val = ex_val + Float32(gindex_values[idx_base]) * Float32(_TIE_BREAK_EPS)
+        elif cutlass.const_expr(tie_break_self):
+            ex_val = ex_val + Float32(idx_base) * Float32(_TIE_BREAK_EPS)
+        ex_key = _convert_to_uint32(ex_val)
         if ex_key == ex_pivot:
             ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
             if ex_pos < topk_static:
@@ -856,6 +912,18 @@ class DSATiledTopkKernel:
                         self.is_tiled,
                         self.is_first,
                     )
+                    val = _tie_break_key(
+                        val,
+                        _tie_break_column_index(
+                            carry_indices,
+                            row_start,
+                            output_index_offset,
+                            out_base,
+                            length,
+                            idx,
+                            self.is_first,
+                        ),
+                    )
                     coarse_bin = _convert_to_coarse_bin(val)
                     _smem_red_add(h0, Int32(coarse_bin), Int32(1))
                 idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
@@ -872,6 +940,18 @@ class DSATiledTopkKernel:
                     self.block_k,
                     self.is_tiled,
                     self.is_first,
+                )
+                val = _tie_break_key(
+                    val,
+                    _tie_break_column_index(
+                        carry_indices,
+                        row_start,
+                        output_index_offset,
+                        out_base,
+                        length,
+                        idx_base,
+                        self.is_first,
+                    ),
                 )
                 coarse_bin = _convert_to_coarse_bin(val)
                 _smem_red_add(h0, Int32(coarse_bin), Int32(1))
@@ -930,6 +1010,18 @@ class DSATiledTopkKernel:
                             self.is_tiled,
                             self.is_first,
                         )
+                        val = _tie_break_key(
+                            val,
+                            _tie_break_column_index(
+                                carry_indices,
+                                row_start,
+                                output_index_offset,
+                                out_base,
+                                length,
+                                idx,
+                                self.is_first,
+                            ),
+                        )
                         coarse_bin = _convert_to_coarse_bin(val)
                         if Int32(coarse_bin) > threshold_bin:
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -948,6 +1040,18 @@ class DSATiledTopkKernel:
                         self.block_k,
                         self.is_tiled,
                         self.is_first,
+                    )
+                    val = _tie_break_key(
+                        val,
+                        _tie_break_column_index(
+                            carry_indices,
+                            row_start,
+                            output_index_offset,
+                            out_base,
+                            length,
+                            idx_base,
+                            self.is_first,
+                        ),
                     )
                     coarse_bin = _convert_to_coarse_bin(val)
                     if Int32(coarse_bin) > threshold_bin:
@@ -982,6 +1086,18 @@ class DSATiledTopkKernel:
                             self.is_tiled,
                             self.is_first,
                         )
+                        raw_input = _tie_break_key(
+                            raw_input,
+                            _tie_break_column_index(
+                                carry_indices,
+                                row_start,
+                                output_index_offset,
+                                out_base,
+                                length,
+                                idx,
+                                self.is_first,
+                            ),
+                        )
                         coarse_bin = _convert_to_coarse_bin(raw_input)
                         if Int32(coarse_bin) > threshold_bin:
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
@@ -1008,6 +1124,18 @@ class DSATiledTopkKernel:
                         self.block_k,
                         self.is_tiled,
                         self.is_first,
+                    )
+                    raw_input = _tie_break_key(
+                        raw_input,
+                        _tie_break_column_index(
+                            carry_indices,
+                            row_start,
+                            output_index_offset,
+                            out_base,
+                            length,
+                            idx_base,
+                            self.is_first,
+                        ),
                     )
                     coarse_bin = _convert_to_coarse_bin(raw_input)
                     if Int32(coarse_bin) > threshold_bin:
@@ -1111,6 +1239,18 @@ class DSATiledTopkKernel:
                                     self.is_tiled,
                                     self.is_first,
                                 )
+                                raw_val = _tie_break_key(
+                                    raw_val,
+                                    _tie_break_column_index(
+                                        carry_indices,
+                                        row_start,
+                                        output_index_offset,
+                                        out_base,
+                                        length,
+                                        c_idx,
+                                        self.is_first,
+                                    ),
+                                )
                                 key32 = _convert_to_uint32(raw_val)
                                 bin = (key32 >> Uint32(offset)) & Uint32(0xFF)
                                 if Int32(bin) > sub_threshold:
@@ -1146,6 +1286,18 @@ class DSATiledTopkKernel:
                                     self.block_k,
                                     self.is_tiled,
                                     self.is_first,
+                                )
+                                raw_val = _tie_break_key(
+                                    raw_val,
+                                    _tie_break_column_index(
+                                        carry_indices,
+                                        row_start,
+                                        output_index_offset,
+                                        out_base,
+                                        length,
+                                        c_idx,
+                                        self.is_first,
+                                    ),
                                 )
                                 offset = Int32(24 - round_idx * 8)
                                 key32 = _convert_to_uint32(raw_val)
@@ -1225,6 +1377,7 @@ class DSATiledTopkKernel:
                         block_k=self.block_k,
                         is_tiled=self.is_tiled,
                         is_first=self.is_first,
+                        tie_break_self=True,
                     )
 
             cute.arch.sync_threads()
