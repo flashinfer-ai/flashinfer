@@ -181,10 +181,35 @@ def _run_case(case: _VCCase):
         )
         out = wrapper.run(q, ops.k, ops.v, vc=ops.params)
     reference = vca.vc_reference(q, ops, sm_scale=sm_scale)
+    if case.repair_budget:
+        torch.testing.assert_close(
+            reference, _dense_repair_reference(q, ops, sm_scale), rtol=1e-4, atol=1e-4
+        )
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
     ).transpose(1, 2)
     return out.float(), reference, exact
+
+
+def _dense_repair_reference(q, ops, sm_scale):
+    """fp32 attention over the original tokens with the repair residuals added
+    back to the values of the selected tokens, which the repair rows identify
+    by their key copies. Independent of the row layout the kernel sees."""
+    s_k, repair = ops.seq_len_kv, ops.repair_tiles * vca.VC_K_BLOCK_SIZE
+    whole = s_k // vca.VC_K_BLOCK_SIZE * vca.VC_K_BLOCK_SIZE
+    rows = torch.cat(
+        [torch.arange(whole), torch.arange(whole + repair, s_k + repair)]
+    ).to(q.device)
+    k = ops.k[:, rows].float()
+    v = ops.v[:, rows].float() * ops.v_scale.unsqueeze(1)
+    rep_k = ops.k[:, whole : whole + repair].float()
+    rep_v = ops.v[:, whole : whole + repair].float() * ops.v_scale.unsqueeze(1)
+    for b in range(k.shape[0]):
+        for h in range(k.shape[2]):
+            match = (rep_k[b, :, h].unsqueeze(1) == k[b, :, h].unsqueeze(0)).all(-1)
+            v[b, :, h] += match.float().T @ rep_v[b, :, h]
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k) * sm_scale
+    return torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), v)
 
 
 def _relative_error(out: torch.Tensor, reference: torch.Tensor) -> float:

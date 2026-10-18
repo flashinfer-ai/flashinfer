@@ -481,11 +481,12 @@ the preparation writes; both are contiguous and 16-byte aligned on the run
 device, and a validating `run()` checks them against the plan. The plan's
 `VCAttentionConfig` sets `demean`. It is off after the V-Smooth window, when
 the means are zero, so a caller holds one plan of each kind and picks by
-`ops.demean`. `VCAttentionPreprocessor.prepare` and `vc_quantize` (two CuTe
-DSL kernels) return them with the permuted K and the E4M3 V as
-`VCAttentionOperands`, whose `.params` is the run-time object. `vc_quantize_repair`
-builds the V repair operands instead and their plan has demean off and a positive
-`repair_tiles`.
+`ops.demean`. `vc_quantize` runs the two CuTe DSL preparation kernels and
+returns them with the permuted K and the E4M3 V as `VCAttentionOperands`, whose
+`.params` is the run-time object. `VCAttentionPreprocessor.prepare` drives
+`vc_quantize` with the V-Smooth schedule, and `vc_reference` is the torch
+reference over those operands. `vc_quantize_repair` builds the V repair operands
+instead and their plan has demean off and a positive `repair_tiles`.
 
 ### Example
 

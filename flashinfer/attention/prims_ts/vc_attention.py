@@ -229,6 +229,7 @@ class VCAttentionOperands:
     perm: torch.Tensor | None  # [B, H, S_k] int64 token permutation
     demean: bool = True  # whether the means were subtracted (else zero)
     repair_tiles: int = 0
+    seq_len_kv: int | None = None  # K/V tokens before the repair tiles and padding
 
     @property
     def params(self) -> "VCAttentionParams":
@@ -367,6 +368,7 @@ def vc_quantize_repair(
         perm=None,
         demean=False,
         repair_tiles=repair_tiles,
+        seq_len_kv=s_k,
     )
 
 
@@ -519,12 +521,12 @@ def vc_reference(
         # Repair rows add to the numerator only, the zero padding of the partial
         # last tile is masked, and the denominator runs over the original tokens.
         repair = ops.repair_tiles * VC_K_BLOCK_SIZE
-        s_orig = s_k - repair
-        whole = s_orig // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
+        whole = ops.seq_len_kv // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
+        end = ops.seq_len_kv + repair
         row = torch.arange(s_k, device=k.device)
-        original = (row < whole) | ((row >= whole + repair) & (row < s_orig + repair))
+        original = (row < whole) | ((row >= whole + repair) & (row < end))
         scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * sm_scale
-        scores = scores.masked_fill(row >= s_orig + repair, -torch.inf)
+        scores = scores.masked_fill(row >= end, -torch.inf)
         weights = torch.exp(scores - scores.amax(dim=-1, keepdim=True))
         out = torch.einsum("bhqk,bkhd->bqhd", weights, v)
         denom = weights[..., original].sum(dim=-1).permute(0, 2, 1)  # [B, Sq, H]
