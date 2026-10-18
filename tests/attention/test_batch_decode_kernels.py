@@ -1601,11 +1601,15 @@ def test_tensor_core_decode_cuda_graph_padding_without_split_kv():
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda:1"])
-def test_fast_decode_plan_rejects_metadata_off_wrapper_device(metadata_device):
-    # fast_decode_plan adopts indptr/indices/last_page_len as the wrapper's
-    # buffers without copying, so metadata on any other device used to reach
-    # the kernel as-is and fault at the next synchronization (#6391).
+def test_fast_decode_plan_rejects_metadata_off_wrapper_device(
+    metadata_device, use_cuda_graph
+):
+    # fast_decode_plan never copies indptr/indices/last_page_len: outside CUDA
+    # graphs they become the wrapper's buffers and off-device metadata reached
+    # the kernel as-is (#6391); inside, run() reads the wrapper's own buffers,
+    # so off-device metadata planned from data run() never sees.
     if metadata_device == "cuda:1" and torch.cuda.device_count() < 2:
         pytest.skip("needs a second CUDA device")
     page_size = 16
@@ -1619,8 +1623,20 @@ def test_fast_decode_plan_rejects_metadata_off_wrapper_device(metadata_device):
         [(n - 1) % page_size + 1 for n in kv_lens], dtype=torch.int32
     )
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    graph_buffers = (
+        {
+            "use_cuda_graph": True,
+            "paged_kv_indptr_buffer": torch.empty_like(kv_indptr, device="cuda:0"),
+            "paged_kv_indices_buffer": torch.empty_like(kv_indices, device="cuda:0"),
+            "paged_kv_last_page_len_buffer": torch.empty_like(
+                kv_last_page_len, device="cuda:0"
+            ),
+        }
+        if use_cuda_graph
+        else {}
+    )
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD", backend="fa2"
+        workspace_buffer, "NHD", backend="fa2", **graph_buffers
     )
     with pytest.raises(ValueError, match="must be on the wrapper's device"):
         flashinfer.fast_decode_plan(

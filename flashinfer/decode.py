@@ -4888,6 +4888,11 @@ def fast_decode_plan(
     - Remove unnecessary device-to-device copy for the cuda graph buffers.
     - Remove unnecessary host-to-device copy for the metadata buffers.
 
+    Because nothing is copied on the FA2/FA3 path, ``indptr``, ``indices`` and
+    ``last_page_len`` must already be on the wrapper's device there (in
+    CUDA-graph mode, the wrapper's own buffers); a tensor elsewhere raises
+    ``ValueError``. Use ``plan()`` for host metadata.
+
     cuDNN uses the regular planner to refresh its KV lengths and block table;
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
@@ -4992,21 +4997,22 @@ def fast_decode_plan(
                 f"this wrapper was planned with {frozen_q_len}, got "
                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
             )
-    if not self.is_cuda_graph_enabled:
-        # Outside CUDA graphs the metadata tensors become the wrapper's
-        # buffers as-is and run() hands their pointers to the kernel, so they
-        # must already be on the wrapper's device; plan() is the path that
-        # copies host metadata over. Checked before any plan state changes.
-        for name, tensor in (
-            ("indptr", indptr),
-            ("indices", indices),
-            ("last_page_len", last_page_len),
-        ):
-            if tensor.device != self.device:
-                raise ValueError(
-                    f"{name} must be on the wrapper's device {self.device}, got "
-                    f"{tensor.device}; use plan() for host metadata"
-                )
+    # fast_decode_plan never copies the metadata: outside CUDA graphs the
+    # tensors become the wrapper's buffers as-is, and inside run() keeps
+    # reading the wrapper's own buffers, so the tensors passed here must be
+    # those buffers. Either way they live on the wrapper's device; plan() is
+    # the path that copies host metadata over. Checked before any plan state
+    # changes.
+    for name, tensor in (
+        ("indptr", indptr),
+        ("indices", indices),
+        ("last_page_len", last_page_len),
+    ):
+        if tensor.device != self.device:
+            raise ValueError(
+                f"{name} must be on the wrapper's device {self.device}, got "
+                f"{tensor.device}; use plan() for host metadata"
+            )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:
