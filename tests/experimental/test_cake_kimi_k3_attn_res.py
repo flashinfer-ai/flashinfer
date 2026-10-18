@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import inspect
+import json
 import pathlib
 import re
 
@@ -532,9 +534,10 @@ def _program_identity(name, record):
 
 def test_shared_sources_keep_distinct_program_symbols():
     """Every JIT library of the family loads into one process, so no two records may
-    export one kernel symbol or host-shim namespace.  Records sharing a translation
-    unit select their own through ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM``
-    in ``compile_flags``; a file's ``#ifndef`` defaults name the program that owns it."""
+    export one kernel symbol or host-shim namespace.  Every record selects its own
+    through ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM`` in ``compile_flags``
+    (the launch bindings take nothing else); a shared kernel file's ``#ifndef``
+    default names the program that owns it."""
     shims = set()
     for name, record in MODULES.items():
         defined, declared, shim = _program_identity(name, record)
@@ -542,6 +545,67 @@ def test_shared_sources_keep_distinct_program_symbols():
         assert shim and shim.startswith("cake_host_shim_"), (name, shim)
         shims.add(shim)
     assert len(shims) == len(MODULES)
+
+
+_BINDING_REQUIRED_MACRO = re.compile(r"^#ifndef (\w+)\n#error ", re.M)
+_KERNEL_LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\((\d+)")
+_KERNEL_CLUSTER_DIMS = re.compile(r"__cluster_dims__\((\d+),")
+_KERNEL_SMEM_TOTAL = re.compile(r"^#define SMEM_TOTAL (\d+)$", re.M)
+
+
+def test_launch_bindings_take_each_record_from_its_compile_flags():
+    """One launch binding per argument plan.  Every record selects its program through
+    the ``-D`` flags the registry derives from its rows: kernel symbol, host-shim
+    namespace, dynamic shared memory bytes, CTA threads and cluster size, which must
+    agree with the record's device source.  ``TVM_FFI_CHECK`` stringises its condition
+    unexpanded, so the bindings keep those macros out of its conditions."""
+    root = pathlib.Path(cake_jit.__file__).resolve().parent / "csrc"
+    required = {}
+    for plan in cake_jit.ARG_PLANS:
+        binding = f"cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_{plan}_binding.cu"
+        text = (root / binding).read_text(encoding="utf-8")
+        required[binding] = set(_BINDING_REQUIRED_MACRO.findall(text))
+        assert required[binding] == {
+            "CAKE_PROGRAM_KERNEL",
+            "CAKE_PROGRAM_SHIM",
+            "CAKE_BIND_SMEM",
+            "CAKE_BIND_THREADS",
+            "CAKE_BIND_CLUSTER",
+        }, binding
+        for line in text.splitlines():
+            if line.lstrip().startswith("TVM_FFI_CHECK("):
+                assert not set(re.findall(r"\w+", line)) & required[binding], line
+    for name, record in MODULES.items():
+        kernel, binding = record["sources"]
+        assert binding.endswith(f"_{record['arg_plan']}_binding.cu"), name
+        defines = dict(
+            flag[2:].split("=", 1)
+            for flag in record["compile_flags"]
+            if flag.startswith("-D")
+        )
+        missing = required[binding] - set(defines)
+        assert not missing, (name, missing)
+        assert defines["CAKE_PROGRAM_KERNEL"] == f"kernel_{name}", name
+        kernel_text = (root / kernel).read_text(encoding="utf-8")
+        bounds = {int(n) for n in _KERNEL_LAUNCH_BOUNDS.findall(kernel_text)}
+        cluster = {int(n) for n in _KERNEL_CLUSTER_DIMS.findall(kernel_text)} or {1}
+        totals = _KERNEL_SMEM_TOTAL.findall(kernel_text)
+        assert bounds == {int(defines["CAKE_BIND_THREADS"])}, (name, bounds)
+        assert cluster == {int(defines["CAKE_BIND_CLUSTER"])}, (name, cluster)
+        assert totals == [defines["CAKE_BIND_SMEM"]], (name, totals)
+
+
+def test_registry_rows_expand_to_the_pinned_records():
+    """``MODULES`` is built from the ``_PROGRAMS`` and ``_BINDINGS`` rows.  This digest
+    of its canonical JSON pins the expanded dict (91 records), so neither a row nor
+    the builder can drift silently.  After an intended registry change, recompute it
+    as the sha256 of ``json.dumps(MODULES, sort_keys=True, separators=(",", ":"))``."""
+    assert len(MODULES) == 91
+    canonical = json.dumps(MODULES, sort_keys=True, separators=(",", ":"))
+    assert (
+        hashlib.sha256(canonical.encode()).hexdigest()
+        == "5532eeed7f2c964b21841e177b1c29c98917e4a894ff003ac6477fbc3f96664c"
+    )
 
 
 # Every token count a decoder step can present in the small / mid range, plus the measured

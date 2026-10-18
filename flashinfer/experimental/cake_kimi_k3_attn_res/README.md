@@ -75,11 +75,15 @@ Output within `atol 8e-2 / rtol 3e-2` of the independent FP32 reference
 
 ## Generated sources
 
-`csrc/cake_kimi_k3_attn_res/*.cu` (device + TVM-FFI binding per module, one
-source compiled for every architecture its record lists)
-and the program rows, `ARG_PLANS` and `KERNELS` of `cake_jit.py` (`MODULES` is
-their expansion; a row that names another program's digest builds that
-program's two sources with its own `-DCAKE_PROGRAM_KERNEL` /
-`-DCAKE_PROGRAM_SHIM` pair) are receipt-bound exporter output: do not edit by
-hand. The shared sources and the tabular form are a hand fold of the exported
-literals pending their regeneration by the export.
+`csrc/cake_kimi_k3_attn_res/*.cu` (one device source per program, compiled for
+every architecture its record lists, plus one TVM-FFI launch binding per
+argument plan, `cake_kimi_k3_attn_res_{common,direct,k0_tma}_binding.cu`, which
+takes the program's kernel symbol, host-shim namespace, dynamic shared memory
+bytes, CTA threads and cluster size from `-DCAKE_PROGRAM_KERNEL` /
+`-DCAKE_PROGRAM_SHIM` / `-DCAKE_BIND_SMEM` / `-DCAKE_BIND_THREADS` /
+`-DCAKE_BIND_CLUSTER`) and the program rows, `ARG_PLANS` and `KERNELS` of
+`cake_jit.py` (`MODULES` is their expansion; a row that names another program's
+digest builds that program's device source, and every record's `-D` flags
+derive from its rows) are receipt-bound exporter output: do not edit by hand.
+The shared sources, the launch bindings and the tabular form are a hand fold of
+the exported literals pending their regeneration by the export.
