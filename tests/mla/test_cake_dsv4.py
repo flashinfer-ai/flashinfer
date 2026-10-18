@@ -1299,7 +1299,7 @@ _HOST_TMA_SOURCE_TENSORS = frozenset(
 
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_arg_plans_use_known_names(arch):
-    """Every generated argument is either bindable by name or a documented retired name."""
+    """Every generated argument is bindable by name."""
     unknown = []
     unaliased_tma = []
     for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
@@ -1309,10 +1309,7 @@ def test_registered_arg_plans_use_known_names(arch):
                 # A descriptor name the host binds only by vocabulary would still
                 # fail at launch: ``_bind_argument`` needs a tensor value for it.
                 unaliased_tma.append((variant, name, canonical))
-            if (
-                cake.is_bindable_arg(kind, name)
-                or canonical in cake._RETIRED_ARG_REASONS
-            ):
+            if cake.is_bindable_arg(kind, name):
                 continue
             unknown.append((variant, kind, name))
     assert unknown == []
@@ -1403,6 +1400,7 @@ def test_metadata_param_vocabulary_is_bindable():
     assert cake.canonical_arg_name("parameter", "num_split") == "num_splits"
     assert not cake.is_bindable_arg("buffer", "completion_base")
     assert not cake.is_bindable_arg("parameter", "completion_base")
+    assert not cake.is_bindable_arg("workspace", "tma_descriptor_workspace")
 
 
 _FAKE_PLAN = [
@@ -1417,7 +1415,6 @@ _FAKE_PLAN = [
     ("buffer", "sparse_topk_lens"),
     ("parameter", "num_query_tokens"),
     ("parameter", "sparse_topk"),
-    ("workspace", "tma_descriptor_workspace"),
     ("parameter", "num_q_heads"),
     ("grid", "grid_x"),
     ("grid", "grid_y"),
@@ -1434,7 +1431,7 @@ class _Recorder:
         self.calls.append(args)
 
 
-def _install_fake_variants(monkeypatch, plans, *, tma_bytes=384):
+def _install_fake_variants(monkeypatch, plans):
     """Route get_cake_dsv4_spec / module loading to fake plans and a recorder."""
     import flashinfer.jit.cake_dsv4 as jit
 
@@ -1447,9 +1444,6 @@ def _install_fake_variants(monkeypatch, plans, *, tma_bytes=384):
             "arch": arch,
             "entry": "run",
             "arg_plan": plans[variant],
-            "tma_workspace_bytes": tma_bytes
-            if any(kind == "workspace" for kind, _ in plans[variant])
-            else 0,
         }
 
     class _Sequence:
@@ -1474,7 +1468,6 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
     rows, compressed = 3, 132
     table, lens = _combined_metadata(rows, compressed)
     meta = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=rows)
-    raw = _aligned_u8(cake._PARTIAL_OFFSET)
     q = torch.empty((rows, 64, 512), dtype=torch.bfloat16)
     swa = torch.empty((16, 512), dtype=torch.bfloat16)
     comp = torch.empty((32, 512), dtype=torch.bfloat16)
@@ -1505,109 +1498,13 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
     assert bound["num_query_tokens"] == rows
     assert bound["num_q_heads"] == 64
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (7, 2, 1)
-    slab = bound["tma_descriptor_workspace"]
-    assert slab.numel() == cake._DESCRIPTOR_SLAB_BYTES
-    assert slab.data_ptr() % 128 == 0
     assert all(isinstance(bound[n], int) for n in ("sparse_topk", "grid_x"))
-    # Descriptor storage follows the TMA source geometry: the same tensors reuse
-    # it, another KV cache of the same shape gets its own, and the storage is
-    # private (not carved from the caller's workspace).
-    assert not (raw.data_ptr() <= slab.data_ptr() < raw.data_ptr() + raw.numel())
-    cake._launch_variant("fake", arch="sm_103a", grid=(7, 2, 1), values=values)
-    assert recorder.calls[-1][11] is slab
-    other = torch.empty((32, 512), dtype=torch.bfloat16)
-    cake._launch_variant(
-        "fake",
-        arch="sm_103a",
-        grid=(7, 2, 1),
-        values={**values, "compressed_KV_cache": other},
-    )
-    assert recorder.calls[-1][11] is not slab
 
 
-def test_descriptor_storage_pool_is_bounded_and_capture_safe(monkeypatch):
-    """Eager descriptor sets share a bounded pool; captured sets are retained."""
-    recorder = _install_fake_variants(monkeypatch, {"fake": _FAKE_PLAN})
-    rows, compressed = 3, 132
-    table, lens = _combined_metadata(rows, compressed)
-    meta = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=rows)
-    q = torch.empty((rows, 64, 512), dtype=torch.bfloat16)
-    swa = torch.empty((16, 512), dtype=torch.bfloat16)
-    base_values = {
-        "Q": q,
-        "SWA_cache": swa,
-        "O": torch.empty((rows, 64, 512), dtype=torch.bfloat16),
-        "num_heads": 64,
-        **meta.kernel_kwargs(),
-    }
-    caches = [torch.empty((32, 512), dtype=torch.bfloat16) for _ in range(5)]
-    pool_key = ("fake", "sm_103a", q.device)
-    cake._descriptor_pools.pop(pool_key, None)
-    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 2)
-    monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
-
-    def launch(cache):
-        cake._launch_variant(
-            "fake",
-            arch="sm_103a",
-            grid=(7, 2, 1),
-            values={**base_values, "compressed_KV_cache": cache},
-        )
-        return recorder.calls[-1][11]
-
-    s0, s1 = launch(caches[0]), launch(caches[1])
-    assert s0.data_ptr() != s1.data_ptr()
-    assert launch(caches[0]) is s0  # hit: no reassignment
-    s2 = launch(
-        caches[2]
-    )  # pool full: the least recently used storage (s1) is reassigned
-    assert s2 is s1
-    assert launch(caches[0]) is s0
-    assert launch(caches[1]) is s2  # cache 2 was least recently used
-    pool = cake._descriptor_pools[pool_key]
-    assert len(pool.live) == 2 and not pool.captured
-    distinct = {s.tensor.data_ptr() for s in pool.live.values()}
-    assert distinct == {s0.data_ptr(), s1.data_ptr()}
-
-    # Capture: a resident set is retained for the process lifetime, a new one is
-    # refused before any allocation or binding call.
-    monkeypatch.setattr(cake, "_is_capturing", lambda device: True)
-    calls = len(recorder.calls)
-    with pytest.raises(RuntimeError, match="before capture"):
-        launch(caches[3])
-    assert len(recorder.calls) == calls and len(pool.live) == 2
-    assert launch(caches[0]) is s0
-    assert set(pool.captured) and len(pool.live) == 1
-    monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
-    churned = {launch(c).data_ptr() for c in caches[1:] for _ in range(2)}
-    assert s0.data_ptr() not in churned  # the captured storage is never reassigned
-    assert len(pool.live) <= 2 and len(pool.captured) == 1
-    assert launch(caches[0]) is s0
-    # The pool allocated exactly capacity + captured storages.
-    all_storages = {s.tensor.data_ptr() for s in pool.live.values()}
-    all_storages |= {s.tensor.data_ptr() for s in pool.captured.values()}
-    all_storages |= {s.tensor.data_ptr() for s in pool.spare}
-    assert len(all_storages) == 3
-    cake._descriptor_pools.pop(pool_key, None)
-    assert recorder.calls[-1][11].numel() == cake._DESCRIPTOR_SLAB_BYTES
-
-
-def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatch):
+def test_launch_variant_reports_unknown_and_unavailable_names(monkeypatch):
     plans = {
-        "retired": [
-            ("parameter", "completion_base"),
-            ("grid", "grid_x"),
-            ("grid", "grid_y"),
-            ("grid", "grid_z"),
-        ],
         "unknown": [
             ("buffer", "mystery"),
-            ("grid", "grid_x"),
-            ("grid", "grid_y"),
-            ("grid", "grid_z"),
-        ],
-        "legacy": [
-            ("buffer", "sparse_indices"),
             ("grid", "grid_x"),
             ("grid", "grid_y"),
             ("grid", "grid_z"),
@@ -1618,53 +1515,33 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
             ("grid", "grid_y"),
             ("grid", "grid_z"),
         ],
-        "too_many_descriptors": [
+        "slab": [
             ("workspace", "tma_descriptor_workspace"),
             ("grid", "grid_x"),
             ("grid", "grid_y"),
             ("grid", "grid_z"),
         ],
     }
-    recorder = _install_fake_variants(monkeypatch, plans, tma_bytes=4096)
-    table, lens = _combined_metadata(2, 4)
-    combined = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=2)
-    separate = resolve_cake_dsv4_sparse_metadata(
-        table[:, :128],
-        extra_sparse_indices=table[:, 128:],
-        extra_sparse_topk_lens=lens - 128,
-        query_rows=2,
-    )
+    _install_fake_variants(monkeypatch, plans)
 
     def launch(variant, **values):
         cake._launch_variant(variant, arch="sm_103a", grid=(1, 1, 1), values=values)
 
-    with pytest.raises(ValueError, match="retired argument 'completion_base'"):
-        launch("retired", completion_base=0)
     with pytest.raises(ValueError, match="'mystery' \\(buffer\\) has no host value"):
         launch("unknown")
-    with pytest.raises(ValueError, match="predates the split-table metadata ABI"):
-        launch("legacy", sparse_indices=separate.legacy_combined_table)
-    launch("legacy", sparse_indices=combined.legacy_combined_table)
-    assert recorder.calls[-1][0] is table
+    # The descriptor-slab kind left the vocabulary with the by-value TMA ABI.
+    with pytest.raises(ValueError, match="unknown argument kind 'workspace'"):
+        launch("slab")
     # No host value is None for a real call (dense calls bind seq_lens in place
     # of cum_seq_lens_q); a None value is reported as unavailable.
     with pytest.raises(ValueError, match="not available for this call"):
         launch("ragged_only", cum_seq_lens_q=None)
-    with pytest.raises(ValueError, match="TMA descriptor bytes"):
-        launch("too_many_descriptors")
     with pytest.raises(TypeError, match="must be an int"):
-        launch("retired_int_check") if False else cake._bind_argument(
-            {"num_heads": 3.5},
-            "parameter",
-            "num_heads",
-            variant="x",
-            grid={},
-            descriptor_slab=None,
+        cake._bind_argument(
+            {"num_heads": 3.5}, "parameter", "num_heads", variant="x", grid={}
         )
     with pytest.raises(ValueError, match="three positive ints"):
-        cake._launch_variant(
-            "legacy", arch="sm_103a", grid=(0, 1, 1), values={"sparse_indices": table}
-        )
+        cake._launch_variant("unknown", arch="sm_103a", grid=(0, 1, 1), values={})
 
 
 def _plan(*names):
@@ -1691,7 +1568,6 @@ _MAIN_PLAN = _plan(
     ("parameter", "num_query_tokens"),
     ("parameter", "num_splits"),
     ("parameter", "has_sinks"),
-    ("workspace", "tma_descriptor_workspace"),
 )
 _REDUCE_PLAN = _plan(
     ("buffer", "partial_O"),
@@ -1773,14 +1649,7 @@ def test_run_cake_dsv4_binds_uniform_metadata_and_prefix_views(monkeypatch):
     # Grids derive from metadata rows, not query rows.
     assert (m["grid_x"], m["grid_y"], m["grid_z"]) == (rows * num_splits * 2, 1, 1)
     assert (r["grid_x"], r["grid_y"], r["grid_z"]) == (rows, 64, 1)
-    # Private descriptor storage; partial buffers carved at the documented offsets.
-    slab = m["tma_descriptor_workspace"]
-    assert slab.numel() == cake._DESCRIPTOR_SLAB_BYTES and slab.data_ptr() % 128 == 0
-    assert not (
-        workspace.data_ptr()
-        <= slab.data_ptr()
-        < workspace.data_ptr() + workspace.numel()
-    )
+    # Partial buffers carved at the documented offsets.
     assert m["partial_O"].data_ptr() == workspace.data_ptr() + layout.partial_o[0]
     assert m["partial_O"].dtype == torch.bfloat16
     assert m["partial_O"].numel() == rows * 64 * num_splits * 512
@@ -2003,15 +1872,12 @@ def test_metadata_resolution_combined_table():
     assert meta.compressed_indices.data_ptr() == table.data_ptr() + 128 * 4
     assert meta.swa_index_stride == meta.compressed_index_stride == 128 + compressed
     assert meta.sparse_topk_lens_offset == 0 and not meta.separate_tables
-    assert meta.legacy_combined_table is table
     assert set(meta.kernel_kwargs()) == set(KERNEL_METADATA_PARAMS)
-    # Explicit offset passes through and disables the legacy combined binding.
+    # Explicit offset passes through.
     shifted = resolve_cake_dsv4_sparse_metadata(
         table, lens - 40, sparse_topk_lens_offset=40, query_rows=rows
     )
-    assert (
-        shifted.sparse_topk_lens_offset == 40 and shifted.legacy_combined_table is None
-    )
+    assert shifted.sparse_topk_lens_offset == 40
     # SWA-only tables alias the compressed view onto the SWA table.
     swa_only, swa_lens = _combined_metadata(rows, 0)
     only = resolve_cake_dsv4_sparse_metadata(swa_only, swa_lens, query_rows=rows)
@@ -2036,7 +1902,7 @@ def test_metadata_resolution_separate_tables():
         extra_sparse_topk_lens=lens - 128,
         query_rows=rows,
     )
-    assert meta.separate_tables and meta.legacy_combined_table is None
+    assert meta.separate_tables
     assert meta.swa_indices is swa and meta.compressed_indices is extra
     assert (
         meta.swa_index_stride == 128 + compressed

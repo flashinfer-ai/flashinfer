@@ -364,30 +364,16 @@ def test_nvfp4_argument_vocabulary():
         assert cake.is_bindable_arg("parameter", name)
     values = {"lse_scale": 0.5, "total_tiles": 3}
     assert (
-        cake._bind_argument(
-            values, "parameter", "lse_scale", variant="v", grid={}, descriptor_slab=None
-        )
+        cake._bind_argument(values, "parameter", "lse_scale", variant="v", grid={})
         == 0.5
     )
     assert (
-        cake._bind_argument(
-            values,
-            "parameter",
-            "total_tiles",
-            variant="v",
-            grid={},
-            descriptor_slab=None,
-        )
+        cake._bind_argument(values, "parameter", "total_tiles", variant="v", grid={})
         == 3
     )
     with pytest.raises(TypeError, match="must be an int"):
         cake._bind_argument(
-            {"total_tiles": 2.0},
-            "parameter",
-            "total_tiles",
-            variant="v",
-            grid={},
-            descriptor_slab=None,
+            {"total_tiles": 2.0}, "parameter", "total_tiles", variant="v", grid={}
         )
 
 

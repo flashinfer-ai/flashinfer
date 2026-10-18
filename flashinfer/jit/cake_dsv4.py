@@ -27,10 +27,8 @@ from .cpp_ext import get_cuda_version, is_cuda_version_at_least
 _ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
 
 # Argument plans shared by the generated launchers: (kind, name) in binding order,
-# followed by the launch grid. ``_SLAB`` marks the SM103 bindings that read their
-# TMA descriptors from the caller-owned workspace slab.
+# followed by the launch grid.
 _GRID = (("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z"))
-_SLAB = (("workspace", "tma_descriptor_workspace"),)
 
 _PLAN_BF16_H128_PERSISTENT_QLAYOUT = (
     ("tma_buffer", "tmap_q"),
