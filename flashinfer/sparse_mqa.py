@@ -23,8 +23,10 @@ def prepare_sparse_mqa_metadata(
 
     Returns a reusable plan. plan.run() generates metadata on the current stream.
     See SparseMetadataPlan for the contiguous/paged input and packed buffer ABI.
-    There is no use_unaligned_ks keyword: the former one only ever raised, and
-    passing it now raises TypeError (the exported programs serve aligned windows).
+    There is no use_unaligned_ks keyword. The former one accepted only False
+    (truthy values raised); passing it at all, including use_unaligned_ks=False,
+    now raises TypeError. Remove the keyword from existing calls (the exported
+    programs serve aligned windows).
     """
     from .experimental.deepgemm_sparse_mqa.sparse_mqa import SparseMetadataPlan
 
