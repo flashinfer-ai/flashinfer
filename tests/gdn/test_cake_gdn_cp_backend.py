@@ -91,6 +91,27 @@ def test_generated_sources_carry_no_manifest_and_every_kernel_is_registered() ->
     assert referenced <= present, sorted(referenced - present)
 
 
+def test_programs_shared_across_arches_serve_the_same_logical_kernels() -> None:
+    """A program listed for several architectures answers the same names on each.
+
+    One logical kernel must resolve to one program wherever that program is
+    listed; a table naming it on one architecture only would re-split the
+    generations silently.
+    """
+
+    for program, record in gdn_cp_jit.MODULES.items():
+        if len(record["arches"]) < 2:
+            continue
+        per_arch = []
+        for arch in record["arches"]:
+            table = gdn_cp_jit.KERNELS[arch]
+            per_arch.append({name for name in table if table[name] == program})
+            for name in per_arch[-1]:
+                assert gdn_cp_jit.program_for(name, arch) == program
+        assert per_arch[0], program
+        assert all(names == per_arch[0] for names in per_arch), (program, per_arch)
+
+
 @pytest.mark.parametrize(
     ("arch", "hq", "hv", "expected_t", "expected_chunk", "expected_source"),
     [
