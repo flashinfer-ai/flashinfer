@@ -41,8 +41,10 @@ _TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 _ARCH_CAPABILITIES = {arch: capability for capability, arch in _TARGET_ARCHS.items()}
 # The Rubin target (capability (10, 7)): its main kernels are separate device
 # modules (``_SM107_MODULES``, looked up by :func:`_main_module`) and its
-# routing is SM103's (``_ONE_LAUNCH_CAPABILITIES``: its fused varlen render
-# derives the sequence table in-kernel, one launch).
+# routing is SM103's (``_ONE_LAUNCH_CAPABILITIES``: the seq_idx triple form
+# without a caller table runs the one-launch ``exactone_*`` render, which
+# derives the sequence table in-kernel; the fused varlen calls with one run
+# the ``exactfused_*`` render, as on SM103).
 _SM107_ARCH = "sm_107a"
 _DEVICE_DIR = Path("generated") / "device"
 # Prepared two-launch host launchers, one per kernel family: the same nine
@@ -266,9 +268,9 @@ _EXACTMETA_MODULES = {
 # derives the sequence table of the seq_idx triple form itself, so no stage
 # runs ahead of it -- with their own device sources (the ``exactfused_*``
 # varlen programs keep the SM100 render) behind the fused host template.
-# SM107 renders the same one-launch form: its sources are the ``exactone_*``
-# entries of ``_SM107_MODULES``.  Refreshed by the Cake export; seed
-# identities until it fills them.
+# SM107 ships the same one-launch form beside its ``exactfused_*`` varlen
+# render: its sources are the ``exactone_*`` entries of ``_SM107_MODULES``.
+# Refreshed by the Cake export; seed identities until it fills them.
 _EXACTONE_MODULES = {
     "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_22b56edf7a",
     "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d294c9019e",
@@ -283,25 +285,25 @@ _EXACTONE_MODULES = {
 # Blackwell fold; the loader builds these modules for capability (10, 7)
 # (:func:`_main_module`).  Programs absent here -- the retained start
 # ``exact_*`` programs -- build their fold module; the preprocess and
-# metadata kernels are shared.  The sm_107a fused varlen render derives the
-# sequence table in-kernel like SM103's (one launch), so one sm_107a source
-# serves the three programs of a fused varlen suffix: the ``exactone_*``
-# entry names it, and the ``exactfused_*`` varlen entry and its
-# ``exactmeta_*`` twin equal it (an ``exactmeta_*`` entry always equals its
-# ``exactfused_*`` varlen twin).
+# metadata kernels are shared.  A fused varlen suffix has two sm_107a
+# sources, as SM103 has two texts: the ``exactfused_*`` varlen entry names
+# the render of the SM100 form (the caller-table and cu_seqlens forms) and
+# the ``exactone_*`` entry the one-launch render, which derives the sequence
+# table in-kernel; an ``exactmeta_*`` entry always equals its ``exactfused_*``
+# varlen twin.
 _SM107_MODULES = {
     "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f13183e6a1",
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a536b8b6e8",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_PENDINGEXPORT",
     "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_4b3914f176",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6103de117",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_PENDINGEXPORT",
     "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_1bc323f61f",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_539c003e6b",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_PENDINGEXPORT",
     "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_3dc3d34077",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_b68ce1e618",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_PENDINGEXPORT",
     "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_beaa6c0634",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_f2717ae6c0",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_PENDINGEXPORT",
     "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_1f7505eacf",
-    "exactfused_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_ba9a2a6782",
+    "exactfused_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_PENDINGEXPORT",
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_0dbe1ddb35",
     "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_73e1fa1e8b",
     "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_bba26a1e7b",
@@ -332,12 +334,12 @@ _SM107_MODULES = {
     "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_c710487fff",
     "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_796c446558",
     "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_95d4c416ce",
-    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a536b8b6e8",
-    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6103de117",
-    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_539c003e6b",
-    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_b68ce1e618",
-    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_f2717ae6c0",
-    "exactmeta_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_ba9a2a6782",
+    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_PENDINGEXPORT",
+    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_PENDINGEXPORT",
+    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_PENDINGEXPORT",
+    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_PENDINGEXPORT",
+    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_PENDINGEXPORT",
+    "exactmeta_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_PENDINGEXPORT",
     "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a536b8b6e8",
     "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6103de117",
     "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_539c003e6b",
