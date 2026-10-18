@@ -302,6 +302,57 @@ def test_frost_capability_and_metadata_rejections():
         ep.check_support()
 
 
+@pytest.mark.parametrize("weight_format", [QuantFormat.MXFP4, QuantFormat.MXFP8])
+def test_frost_fma_large_expert_weight_offsets(weight_format):
+    """Both expert strides cross signed 32-bit word indexing at the last expert."""
+    _require_gpu()
+    if torch.cuda.mem_get_info()[0] < 100 * 1024**3:
+        pytest.skip("large expert-offset regression requires 100 GiB free memory")
+    mixed = weight_format == QuantFormat.MXFP4
+    e, h, i = (896, 7168, 3072) if mixed else (513, 4096, 4096)
+    packing = 2 if mixed else 1
+    dtype = torch.uint8 if mixed else torch.float8_e4m3fn
+    w1 = torch.zeros((e, 2 * i, h // packing), device="cuda", dtype=torch.uint8)
+    w2 = torch.zeros((e, h, i // packing), device="cuda", dtype=torch.uint8)
+    w1[-1].fill_(0x22 if mixed else 0x38)  # E2M1/E4M3 unit values.
+    w2[-1].fill_(0x22 if mixed else 0x38)
+    w1, w2 = w1.view(dtype), w2.view(dtype)
+    assert w2.numel() * w2.element_size() > 2**33
+    s1 = torch.full((e, 2 * i, h // 32), 114, device="cuda", dtype=torch.uint8)
+    s2 = torch.full((e, h, i // 32), 114, device="cuda", dtype=torch.uint8)
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        "frost_low_latency", FrostLowLatencyConfig.prepare_weights(w1, s1, w2, s2)
+    )
+    dq, q, sf = _quant(torch.ones((1, h), device="cuda", dtype=torch.bfloat16))
+    ids = torch.full((1, 1), e - 1, device="cuda", dtype=torch.int32)
+    rw = torch.ones((1, 1), device="cuda")
+    cfg = MoEConfig(
+        RoutingConfig(e, 1),
+        QuantConfig(weight=weight_format, activation=QuantFormat.MXFP8),
+        ExpertConfig(i),
+        backend=BackendOptions((FrostLowLatencyConfig(),)),
+    )
+    runner = FrostLowLatencyRunner(cfg, q.device)
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(MoEActivationPack(q, sf, ids, rw), weights)
+    runner.forward(inputs, tactic=("ffma", 1))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = runner.forward(inputs, tactic=("ffma", 1))
+    _, expected = _reference(dq, w1, s1, w2, s2, ids, rw, cfg.activation)
+    assert expected.float().norm() > 0
+    for expert in (e - 1, 0, e - 1):
+        ids.fill_(expert)
+        graph.replay()
+        torch.cuda.synchronize()
+        if expert == 0:
+            assert torch.count_nonzero(output) == 0
+        else:
+            _assert_near(output, expected)
+
+
 @pytest.mark.parametrize("installed", ["4.7.1", "4.8.0.dev0", None])
 def test_frost_declines_unsupported_compiler(monkeypatch, installed):
     from flashinfer.fused_moe.backends.frost_low_latency import runner as module

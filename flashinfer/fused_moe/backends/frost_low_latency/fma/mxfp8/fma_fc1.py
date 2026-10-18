@@ -57,6 +57,10 @@ def _kernel(
     row = (bid % (i // 32)) * 32 + warp * 4
     token = route // k
     expert = ids[token, route % k]
+    if cutlass.const_expr(unified):
+        # The general backend can hold more than 8 GiB of expert weights.
+        # Widen before multiplying the expert stride, not at the final load.
+        expert = expert.to(cutlass.Int64)
     xp = cute.recast_ptr(x.iterator, dtype=cutlass.Uint32)
     wp = cute.recast_ptr(weights.iterator, dtype=cutlass.Uint32)
     ws = cute.recast_ptr(weight_sf.iterator, dtype=cutlass.Uint8)

@@ -42,6 +42,8 @@ def _kernel(
     row = (bid % (h // 4)) * 4
     route = token * k + slot
     expert = ids[token, slot]
+    if cutlass.const_expr(unified):
+        expert = expert.to(cutlass.Int64)
     xp = cute.recast_ptr(mid.iterator, dtype=cutlass.Uint32)
     wp = cute.recast_ptr(weights.iterator, dtype=cutlass.Uint32)
     ws = cute.recast_ptr(weight_sf.iterator, dtype=cutlass.Uint8)
