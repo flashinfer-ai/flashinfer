@@ -2080,97 +2080,100 @@ kernel_cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de(const __grid_constant__ CU
             }
             int last_phase = my_n_tiles_2 - 1 & 1;
             int last_tile = my_n_tiles_2 - 1;
-            int drain_wait_phase = last_tile >> 1 & 1;
+            // An empty work item (no KV tile in this split) has no last tile. Its loads were skipped and no P was
+            // published, so its drain issues no PV (the MMA predicate below), and its two waits take the parity of
+            // the barrier's preceding phase, which a barrier that never advanced reports complete. The epilogue
+            // then stores the zeroed TMEM: O 0, stats (-inf, 0).
+            const int drain_has_tile = my_n_tiles_2 > 0;
+            int drain_wait_phase = (last_tile >> 1 & 1) | !drain_has_tile;
             if (cta_rank == 0) {
-                // An empty work item (no KV tile in this split) has no last tile: it issues no PV and
-                // releases both O slices at once (the epilogue stores the zeroed TMEM: O 0, stats (-inf, 0)).
-                if (my_n_tiles_2 > 0) {
-                    mbarrier_wait(p_full_addr + (last_phase) * 8, drain_wait_phase);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    mbarrier_wait(v_full_addr + (mma_v_stage) * 8, _phase_v_full);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_lo_12 = (((smem_p_addr) >> 4) & 0x3FFF) + (last_phase) * 512;
-                    int _mma_b_lo_12 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_v_stage) * 2048;
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .pred leader, p0, p1;\n\t"
-                        ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-                        ".reg .b64 da, db;\n\t"
-                        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                        "setp.ne.b32 p0, %3, 0;\n\t"
-                        "setp.ne.b32 p1, 1, 0;\n\t"
-                        "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-                        "mov.b32 adhi, 0x40004040;\n\t"
-                        "mov.b32 bdhi, 0x40004040;\n\t"
-                        "mov.b32 id, 138477584;\n\t"
-                        "mov.b32 alo, %0;\n\t"
-                        "mov.b32 blo, %1;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
-                        "add.u32 alo, alo, 2;\n\t"
-                        "add.u32 blo, blo, 256;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                        "add.u32 alo, alo, 2;\n\t"
-                        "add.u32 blo, blo, 256;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                        "add.u32 alo, alo, 2;\n\t"
-                        "add.u32 blo, blo, 256;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                        "}\n"
-                        :: "r"(_mma_a_lo_12), "r"(_mma_b_lo_12), "r"((tmem_tmem_scratch + (256))), "r"(((first_pv) ? 0 : 1)));
-                    elect_commit_cg2_multicast(o_done_addr, (uint16_t)(3));
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_lo_13 = (((smem_p_addr) >> 4) & 0x3FFF) + (last_phase) * 512;
-                    int _mma_b_lo_13 = ((((smem_v_addr + 16384) >> 4) & 0x3FFF) | 0x4000000) + (mma_v_stage) * 2048;
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .pred leader, p0, p1;\n\t"
-                        ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-                        ".reg .b64 da, db;\n\t"
-                        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                        "setp.ne.b32 p0, %3, 0;\n\t"
-                        "setp.ne.b32 p1, 1, 0;\n\t"
-                        "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-                        "mov.b32 adhi, 0x40004040;\n\t"
-                        "mov.b32 bdhi, 0x40004040;\n\t"
-                        "mov.b32 id, 138477584;\n\t"
-                        "mov.b32 alo, %0;\n\t"
-                        "mov.b32 blo, %1;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
-                        "add.u32 alo, alo, 2;\n\t"
-                        "add.u32 blo, blo, 256;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                        "add.u32 alo, alo, 2;\n\t"
-                        "add.u32 blo, blo, 256;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                        "add.u32 alo, alo, 2;\n\t"
-                        "add.u32 blo, blo, 256;\n\t"
-                        "mov.b64 da, {alo, adhi};\n\t"
-                        "mov.b64 db, {blo, bdhi};\n\t"
-                        "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                        "}\n"
-                        :: "r"(_mma_a_lo_13), "r"(_mma_b_lo_13), "r"((tmem_tmem_scratch + (384))), "r"(((first_pv) ? 0 : 1)));
-                    elect_commit_cg2_multicast(v_empty_addr + (mma_v_stage) * 8, (uint16_t)(3));
-                    mma_v_stage += 1;
-                    if (mma_v_stage == 2) { mma_v_stage = 0; _phase_v_full ^= 1; }
-                    elect_commit_cg2_multicast(p_empty_addr + (last_phase) * 8, (uint16_t)(3));
-                    elect_commit_cg2_multicast(o_full_addr + (last_phase) * 8, (uint16_t)(3));
-                } else {
-                    elect_commit_cg2_multicast(o_done_addr, (uint16_t)(3));
-                }
+                mbarrier_wait(p_full_addr + (last_phase) * 8, drain_wait_phase);
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                mbarrier_wait(v_full_addr + (mma_v_stage) * 8, _phase_v_full | !drain_has_tile);
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                int _mma_a_lo_12 = (((smem_p_addr) >> 4) & 0x3FFF) + (last_phase) * 512;
+                int _mma_b_lo_12 = ((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_v_stage) * 2048;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1, issue;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 issue, %4, 0;\n\t"
+                    "and.pred leader, leader, issue;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 138477584;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 256;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 256;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 256;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_a_lo_12), "r"(_mma_b_lo_12), "r"((tmem_tmem_scratch + (256))), "r"(((first_pv) ? 0 : 1)), "r"(drain_has_tile));
+                elect_commit_cg2_multicast(o_done_addr, (uint16_t)(3));
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                int _mma_a_lo_13 = (((smem_p_addr) >> 4) & 0x3FFF) + (last_phase) * 512;
+                int _mma_b_lo_13 = ((((smem_v_addr + 16384) >> 4) & 0x3FFF) | 0x4000000) + (mma_v_stage) * 2048;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1, issue;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 issue, %4, 0;\n\t"
+                    "and.pred leader, leader, issue;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 138477584;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 256;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 256;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 256;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_a_lo_13), "r"(_mma_b_lo_13), "r"((tmem_tmem_scratch + (384))), "r"(((first_pv) ? 0 : 1)), "r"(drain_has_tile));
+                elect_commit_cg2_multicast(v_empty_addr + (mma_v_stage) * 8, (uint16_t)(3));
+                mma_v_stage += 1;
+                if (mma_v_stage == 2) { mma_v_stage = 0; _phase_v_full ^= 1; }
+                elect_commit_cg2_multicast(p_empty_addr + (last_phase) * 8, (uint16_t)(3));
+                elect_commit_cg2_multicast(o_full_addr + (last_phase) * 8, (uint16_t)(3));
                 elect_commit_cg2_multicast(o_done_addr + 8, (uint16_t)(3));
                 elect_commit_cg2_multicast(q_empty_addr, (uint16_t)(3));
                 mbarrier_wait(o_empty_addr, 0);
