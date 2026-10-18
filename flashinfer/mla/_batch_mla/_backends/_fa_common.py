@@ -7,7 +7,7 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
+from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union
 
 import torch
 
@@ -1028,8 +1028,12 @@ class _BatchMLAPagedAttentionFaBackendBase(
             )
         if bmm1_scale is not None or bmm2_scale is not None:
             raise ValueError("BMM scales are not supported with an fa2/fa3 backend.")
-        q_nope, q_pe = cast(tuple[torch.Tensor, torch.Tensor], query)
-        ckv_cache, kpe_cache = cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
+        prepared = self._prepare_planned_inputs((query, kv_cache, out, lse))
+        if prepared is None:
+            raise ValueError(
+                f"Current query/KV cache/out/lse layout is unsupported by the selected {self._backend} MLA backend."
+            )
+        (q_nope, q_pe), (ckv_cache, kpe_cache) = prepared
         return self._run_generated_fa(
             q_nope=q_nope,
             q_pe=q_pe,
@@ -1059,6 +1063,9 @@ class _BatchMLAPagedAttentionFaBackendBase(
         self._planned_run_options = dict(run_options)
 
     def get_valid_tactics(self, inputs, profile):
+        # Limit automatic profiling to validated native FA3 widths.
+        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
+            return []
         return [-1] if self._prepare_planned_inputs(inputs) is not None else []
 
     def _prepare_planned_inputs(self, inputs):
@@ -1108,9 +1115,6 @@ class _BatchMLAPagedAttentionFaBackendBase(
             check_shape_dtype_device(
                 inputs[3], self._planned_query_shape, torch.float32, self.device, "lse"
             )
-        # Limit automatic profiling to validated native FA3 widths.
-        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
-            return None
         # Native FA forwards only outer strides. Q/KV loads and output stores
         # operate in 16-byte vectors, including for noncompact outer layouts.
         for tensor in (*query, *cache, inputs[2]):
@@ -1154,14 +1158,6 @@ class _BatchMLAPagedAttentionFaBackendBase(
         if tactic != -1:
             raise ValueError(f"Unsupported {self._backend} MLA tactic: {tactic!r}.")
         query, kv_cache, out, lse, sinks = inputs[:5]
-        # Selection lasts for the plan. Validate current tensors here as well
-        # as during profiling, before native code uses its fixed plan geometry.
-        prepared = self._prepare_planned_inputs(inputs)
-        if prepared is None:
-            raise ValueError(
-                f"Current tensor layout is unsupported by the selected {self._backend} MLA backend."
-            )
-        query, kv_cache = prepared
         return self.run_from_wrapper(
             query=query,
             kv_cache=kv_cache,

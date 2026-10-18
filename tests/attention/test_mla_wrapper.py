@@ -24,8 +24,8 @@ from flashinfer.utils import is_sm90a_supported
 
 COMMON_PLAN_KWARGS = dict(
     num_heads=16,
-    head_dim_ckv=4,
-    head_dim_kpe=2,
+    head_dim_ckv=8,
+    head_dim_kpe=8,
     page_size=1,
     causal=False,
     sm_scale=0.125,
@@ -157,7 +157,7 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
 
     import flashinfer.mla._batch_mla._backends._fa_common as fa_common
 
-    # These tests model the native planner with tiny 4/2-dimensional CPU tensors.
+    # These tests model the native planner with tiny 8/8-dimensional CPU tensors.
     # Keep metadata/transaction behavior real; mock the native support boundary
     # alongside the native implementation. Native support has separate tests.
     for module in (fa_common, fa2_backend, fa3_backend):
@@ -365,10 +365,10 @@ def test_legacy_flat_plan_temporarily_keeps_dynamic_lse(monkeypatch):
     with pytest.warns(DeprecationWarning):
         wrapper.plan(*csr, **COMMON_PLAN_KWARGS)
 
-    q_nope = torch.empty(2, 16, 4, dtype=torch.bfloat16)
-    q_pe = torch.empty(2, 16, 2, dtype=torch.bfloat16)
-    ckv_cache = torch.empty(2, 1, 4, dtype=torch.bfloat16)
-    kpe_cache = torch.empty(2, 1, 2, dtype=torch.bfloat16)
+    q_nope = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+    q_pe = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
         _, lse_base2 = wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, return_lse=True)
@@ -452,10 +452,9 @@ def test_positional_run_arguments_warn_once_per_wrapper(monkeypatch):
     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -484,10 +483,9 @@ def test_legacy_run_tensor_keywords_warn_once_at_caller(monkeypatch):
     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -529,10 +527,9 @@ def test_each_legacy_run_tensor_group_warns(monkeypatch, legacy_group):
         kv_cache_layout="split",
         **COMMON_PLAN_KWARGS,
     )
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
     run_kwargs = {"query": query, "kv_cache": kv_cache}
     if legacy_group == "query":
         run_kwargs.pop("query")
@@ -565,10 +562,9 @@ def test_legacy_run_tensor_groups_share_one_warning_per_wrapper(monkeypatch):
         kv_cache_layout="split",
         **COMMON_PLAN_KWARGS,
     )
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -595,14 +591,13 @@ def test_structural_split_run_does_not_warn_for_legacy_tensor_arguments(monkeypa
         kv_cache_layout="split",
         **COMMON_PLAN_KWARGS,
     )
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+    query, kv_cache = _packed_inputs()
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
         wrapper.run(
-            query=query.split((4, 2), dim=-1),
-            kv_cache=kv_cache.split((4, 2), dim=-1),
+            query=query.split((8, 8), dim=-1),
+            kv_cache=kv_cache.split((8, 8), dim=-1),
         )
 
     assert not any(
@@ -642,7 +637,7 @@ def test_plan_rejects_surplus_and_duplicate_legacy_arguments(monkeypatch):
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([1], dtype=torch.int32),
     )
-    tail = (16, 4, 2, 1, False, 0.125, torch.bfloat16, torch.bfloat16, False)
+    tail = (16, 8, 8, 1, False, 0.125, torch.bfloat16, torch.bfloat16, False)
 
     with pytest.raises(TypeError):
         wrapper.plan(*csr, *tail, "surplus")
@@ -756,12 +751,12 @@ def test_failed_backend_replan_keeps_previous_runnable_backend(
         )
         wrapper.plan(**plan_kwargs)
         query = (
-            torch.zeros(2, 16, 4, dtype=torch.bfloat16),
-            torch.zeros(2, 16, 2, dtype=torch.bfloat16),
+            torch.zeros(2, 16, 8, dtype=torch.bfloat16),
+            torch.zeros(2, 16, 8, dtype=torch.bfloat16),
         )
         cache = (
-            torch.zeros(9, 1, 4, dtype=torch.bfloat16),
-            torch.zeros(9, 1, 2, dtype=torch.bfloat16),
+            torch.zeros(9, 1, 8, dtype=torch.bfloat16),
+            torch.zeros(9, 1, 8, dtype=torch.bfloat16),
         )
         old_indices = wrapper._kv_indices_buf.clone()
         failing = _FakeBatchMLAModule()
@@ -887,8 +882,7 @@ def test_run_rejects_planned_value_contract_mismatch(
     _patch_fake_fa_module(monkeypatch, fake_module)
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS, **plan_kwargs)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+    query, kv_cache = _packed_inputs()
 
     with pytest.raises(ValueError, match=match):
         wrapper.run(query=query, kv_cache=kv_cache, **run_kwargs)
@@ -901,9 +895,8 @@ def test_run_returns_caller_owned_output_and_lse_by_identity(monkeypatch):
     _patch_fake_fa_module(monkeypatch, fake_module)
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), lse_mode="base2", **COMMON_PLAN_KWARGS)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    out = torch.empty(2, 16, 4, dtype=torch.bfloat16)
+    query, kv_cache = _packed_inputs()
+    out = torch.empty(2, 16, 8, dtype=torch.bfloat16)
     lse = torch.empty(2, 16, dtype=torch.float32)
 
     actual_out, actual_lse = wrapper.run(
@@ -1151,17 +1144,20 @@ def test_batch_mla_wrapper_public_imports_remain_compatible():
 
 
 def _packed_inputs():
-    query = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 6, dtype=torch.bfloat16)
+    width = COMMON_PLAN_KWARGS["head_dim_ckv"] + COMMON_PLAN_KWARGS["head_dim_kpe"]
+    query = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], width, dtype=torch.bfloat16)
+    kv_cache = torch.empty(
+        9, COMMON_PLAN_KWARGS["page_size"], width, dtype=torch.bfloat16
+    )
     return query, kv_cache
 
 
 def _independent_split_inputs():
-    q_nope = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 4, dtype=torch.bfloat16)
-    q_pe = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 2, dtype=torch.bfloat16)
-    ckv_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 4, dtype=torch.bfloat16)
-    kpe_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 2, dtype=torch.bfloat16)
-    return (q_nope, q_pe), (ckv_cache, kpe_cache)
+    widths = (COMMON_PLAN_KWARGS["head_dim_ckv"], COMMON_PLAN_KWARGS["head_dim_kpe"])
+    return tuple(
+        tuple(part.contiguous() for part in tensor.split(widths, dim=-1))
+        for tensor in _packed_inputs()
+    )
 
 
 def test_packed_plan_rejects_independent_split_without_copy(monkeypatch):
@@ -1202,13 +1198,13 @@ def test_packed_plan_accepts_adjacent_split_views(monkeypatch):
     query, kv_cache = _packed_inputs()
 
     out = wrapper.run(
-        query=(query[..., :4], query[..., 4:]),
-        kv_cache=(kv_cache[..., :4], kv_cache[..., 4:]),
+        query=(query[..., :8], query[..., 8:]),
+        kv_cache=(kv_cache[..., :8], kv_cache[..., 8:]),
     )
 
-    assert out.shape == query[..., :4].shape
-    assert fake_module.run_args[3].data_ptr() == query[..., :4].data_ptr()
-    assert fake_module.run_args[4].data_ptr() == query[..., 4:].data_ptr()
+    assert out.shape == query[..., :8].shape
+    assert fake_module.run_args[3].data_ptr() == query[..., :8].data_ptr()
+    assert fake_module.run_args[4].data_ptr() == query[..., 8:].data_ptr()
 
 
 def test_packed_plan_accepts_independent_zero_width_split_without_copy(monkeypatch):
@@ -1223,10 +1219,10 @@ def test_packed_plan_accepts_independent_zero_width_split_without_copy(monkeypat
         kv_cache_layout="packed",
         **{**COMMON_PLAN_KWARGS, "head_dim_kpe": 0},
     )
-    q_nope = torch.empty(2, 16, 4, dtype=torch.bfloat16)
+    q_nope = torch.empty(2, 16, 8, dtype=torch.bfloat16)
     q_pe = torch.empty(2, 16, 0, dtype=torch.bfloat16)
-    ckv_cache = torch.empty(2, 1, 4, dtype=torch.bfloat16)
-    kpe_cache = torch.empty(2, 1, 0, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.empty(9, 1, 0, dtype=torch.bfloat16)
 
     out = wrapper.run(
         query=(q_nope, q_pe),
@@ -3051,9 +3047,11 @@ def test_cutile_availability_uses_planned_device(monkeypatch, planned_supported)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_capability",
-        lambda device=None: (10, (0 if planned_supported else 7))
-        if device == target
-        else (10, current[0] - 100),
+        lambda device=None: (
+            (10, (0 if planned_supported else 7))
+            if device == target
+            else (10, current[0] - 100)
+        ),
     )
     monkeypatch.setattr(cutile_backend, "_get_compute_capability", lambda _: (10, 7))
     kernel = _FakeCutileKernel()
