@@ -665,6 +665,37 @@ def test_paged_bindings_cover_every_program_argument():
     assert checked > 0
 
 
+def test_paged_programs_share_parameterised_texts():
+    """Host-only: the paged programs of one head count and scheduler are built from one
+    parameterised text -- the p32/p64 and n1/n2 geometries differ only in the compile-line
+    definitions their catalog records fix (``fixed_definitions``: ``K_BLOCK_KV`` rows per
+    page, ``K_NEXT_N`` tokens per request). Every record's definitions match its route name
+    and reach the JIT compile line and the module name next to ``SM_COUNT``; no two records
+    instantiate one text with the same definitions."""
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    catalog = dense_mqa._catalog()
+    instances, shared = {}, 0
+    for route_name in catalog["paged_routes"]:
+        fields = {field[0]: int(field[1:]) for field in route_name.split(":")[2:5]}
+        for program in dense_mqa.program_names(route_name):
+            record = catalog["programs"][program]
+            fixed = record.get("fixed_definitions", {})
+            assert fixed.get("K_BLOCK_KV", fields["p"]) == fields["p"], route_name
+            assert fixed.get("K_NEXT_N", fields["n"]) == fields["n"], route_name
+            definitions = {**fixed, "SM_COUNT": 148}
+            if torch.cuda.is_available():  # the JIT spec needs a compilation context
+                for arch in record["arches"]:
+                    spec = dense_mqa.program_spec(arch, program, 148)
+                    for key, value in definitions.items():
+                        assert f"-D{key}={value}" in spec.extra_cuda_cflags, program
+                        assert f"_{key.lower()}{value}" in spec.name, spec.name
+            instance = (tuple(record["sources"]), tuple(sorted(fixed.items())))
+            assert instances.setdefault(instance, program) == program, instance
+            shared += bool(fixed)
+    assert shared > 0
+
+
 def test_paged_dynamic_scheduler_routes():
     """``policy.paged.dynamic_scheduler`` maps single-atom static routes to their ``:dyn`` routes, both in the
     catalog with one logits stage whose programs differ; ``paged_route_name(..., batch=)`` selects the dynamic
@@ -690,8 +721,8 @@ def test_paged_dynamic_scheduler_routes():
             dyn_program = _runtime.stage_program(
                 catalog["paged_routes"][dyn]["stages"][0], arch
             )
-            # Program ids are content hashes of the generated text: the two routes serve distinct programs on
-            # every architecture, and only the dynamic one binds the scheduler state.
+            # The static and the dynamic scheduler are distinct texts: the two routes serve distinct
+            # programs on every architecture, and only the dynamic one binds the scheduler state.
             assert dyn_program != static_program, (static, arch)
             assert (
                 catalog["programs"][dyn_program]["role"]

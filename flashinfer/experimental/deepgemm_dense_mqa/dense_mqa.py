@@ -11,7 +11,10 @@ architecture. Every program takes the launch grid of the logits consumers (the
 device's SM count, or a plan's CTA-budget override) as the compile-line
 definition ``SM_COUNT``: the per-SM cost partition and the metadata offsets are
 compile-time literals in every build, and one source text per program serves
-every SM count.
+every SM count. The paged p32/p64 and n1/n2 programs of one head count and
+scheduler share one parameterised text whose catalog record fixes the page size
+and the token count on the same compile line (``fixed_definitions``:
+``K_BLOCK_KV``, ``K_NEXT_N``).
 
 Head counts: the catalog policy lists the exported head counts (``heads``);
 ``BLOCK_Q = 128 // num_heads`` queries share one 128-row MMA tile (4 for 32
@@ -154,14 +157,19 @@ def program_names(route=None, arch=None):
 def program_spec(arch, name, num_sms):
     """FlashInfer JIT build specification of one generated program for ``arch`` and the launch grid ``num_sms``
     (the compile-line definition ``SM_COUNT`` of every program -- the SM count, or a plan's CTA-budget
-    override; the name carries every supplied value)."""
+    override -- and the ``fixed_definitions`` of a record built from a shared parameterised text, the
+    paged ``K_BLOCK_KV`` page size and ``K_NEXT_N`` token count; the name carries every supplied
+    value)."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
     record = _catalog()["programs"][name]
     if arch not in record["arches"]:
         raise RuntimeError(f"program {name} is not exported for {arch}")
-    definitions = {"SM_COUNT": int(num_sms)}
+    definitions = {
+        name: int(value) for name, value in record.get("fixed_definitions", {}).items()
+    }
+    definitions["SM_COUNT"] = int(num_sms)
     suffix = "".join(
         f"_{key.lower()}{value}" for key, value in sorted(definitions.items())
     )

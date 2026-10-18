@@ -874,6 +874,9 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -1034,6 +1037,10 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -1268,11 +1275,15 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_25af43b93d8c7a529af0_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_25af43b93d8c7a529af0_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
       ],
       "standalone": true
     },
@@ -1609,11 +1620,15 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
       ],
       "standalone": true
     },
@@ -1873,11 +1888,15 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_420b335e9786eb5a28c2_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_420b335e9786eb5a28c2_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
       ],
       "standalone": true
     },
@@ -2059,11 +2078,14 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_51c2cf11a140a553a710_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_51c2cf11a140a553a710_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_612058e94772738350cc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_612058e94772738350cc_binding.cu"
       ],
       "standalone": true
     },
@@ -2244,6 +2266,9 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -2560,6 +2585,10 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -2853,11 +2882,15 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
       ],
       "standalone": true
     },
@@ -3118,11 +3151,15 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
       ],
       "standalone": true
     },
@@ -3197,11 +3234,14 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097_binding.cu"
       ],
       "standalone": true
     },
@@ -3357,11 +3397,15 @@
         "--use_fast_math"
       ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_d651b932a515e61e0351_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_d651b932a515e61e0351_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
       ],
       "standalone": true
     },

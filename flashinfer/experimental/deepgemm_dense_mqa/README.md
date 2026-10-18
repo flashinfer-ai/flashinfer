@@ -57,7 +57,11 @@ or tensor identities change. Do not use one plan's output/metadata concurrently 
 different streams.
 
 Generated CUDA and bindings live in `csrc/experimental/deepgemm_dense_mqa/generated`
-(one device/binding pair per program, shared by both architectures). The runtime and the
+(one device/binding pair per program text, shared by both architectures; the paged `p32`/`p64`
+and `n1`/`n2` programs of one head count and scheduler are one text built with the compile-line
+definitions `K_BLOCK_KV` and `K_NEXT_N` that their catalog records fix in `fixed_definitions`; each definition
+set keeps the kernel symbol and host-shim namespace of the program it replaced through the text's
+`CAKE_PROGRAM_KERNEL` / `CAKE_PROGRAM_SHIM` ladder, so every JIT module exports its own symbols). The runtime and the
 program/route catalog are in this directory. The public API is `flashinfer/dense_mqa.py`;
 see `examples/experimental/dense_mqa.py`. Build/install FlashInfer with its supported CUDA
 toolchain before running:
