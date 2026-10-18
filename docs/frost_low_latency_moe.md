@@ -148,8 +148,13 @@ FROST and TRT-LLM narrow packed routing weights to BF16; the native CuTe DSL
 interface retains FP32 weights. Comparisons allow the numerical tolerances below
 rather than requiring bitwise equality across those rounding boundaries.
 It autotunes each original backend, checks six changing inputs after graph
-replay, and verifies outputs again after timing. The default warm mode uses
-CUDA Graphs with 128 public calls each and repeated original A/A controls.
+replay, and verifies outputs again after timing. The default
+`--timing-mode latency` brackets each complete call with external event nodes
+inside the CUDA Graph. `--timing-mode amortized --cache-mode warm` instead times
+128 calls together and divides the replay time by 128. Both retain repeated
+original A/A controls. Amortized replay throughput and individual-call latency
+are different measurements and can rank the pipelines differently; compare
+candidates under the same mode.
 Use `--route-pattern disjoint` for distinct experts across tokens or `shared`
 for the same top-k set per token. Both modes retain distinct experts within a
 token. Each timing graph repeats that routed input; it is not a serving trace.
@@ -179,12 +184,16 @@ quantization and routing selection are excluded. Check A/A and cross-process
 stability before interpreting a small difference. These are kernel GPU times
 at model-relevant shapes, not model throughput measurements.
 
-## B300 performance
+## Historical B300 performance: amortized warm replay
 
 Single B300/SM103, FlashInfer 0.7.2 at base `3184bbea`, PyTorch 2.13.0+cu130,
 CUDA 13.0 and CuTe DSL 4.8.0. These are **synthetic MX quantized model shapes**,
 not original-checkpoint or model-throughput measurements. TP labels describe
 local weight-slice geometry; these rows do not include communication.
+The table averages 128 complete calls in a warm CUDA Graph. It does not measure
+event-delimited single-call latency. Use the recorded source and commands in
+the linked result artifact to reproduce this historical measurement; new
+decode-selection results must state which timing mode they use.
 
 | Workload (T=1) | H / physical I / E / top-k | Best measured original | Original µs | FROST µs | Speedup |
 |---|---|---|---:|---:|---:|

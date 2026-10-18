@@ -48,6 +48,12 @@ def main():
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--cache-mode", choices=("warm", "cold"), default="warm")
     parser.add_argument(
+        "--timing-mode",
+        choices=("latency", "amortized"),
+        default="latency",
+        help="Event-delimited individual calls, or warm batched replay time / 128",
+    )
+    parser.add_argument(
         "--retune-cache",
         action="store_true",
         help="Rank all runner-advertised tactics using this routing/cache condition",
@@ -87,6 +93,8 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     a = parser.parse_args()
+    if a.cache_mode == "cold" and a.timing_mode == "amortized":
+        raise ValueError("Cold-cache measurement requires timing-mode latency")
     if (
         a.include_cutedsl
         and a.weight_format == "mxfp4"
@@ -221,17 +229,18 @@ def main():
                 )
                 for _ in range(16)
             ]
-            if flush is not None
+            if a.timing_mode == "latency"
             else []
         )
         with torch.cuda.graph(graph):
-            if flush is None:
+            if not intervals:
                 for _ in range(128):
                     output = layer(act, weights)
             else:
                 # External event nodes exclude both eviction and host enqueue.
                 for start, end in intervals:
-                    flush.add_(1)
+                    if flush is not None:
+                        flush.add_(1)
                     start.record()
                     output = layer(act, weights)
                     end.record()
@@ -435,7 +444,7 @@ def main():
         flashinfer=flashinfer.__version__,
         flashinfer_base_commit=flashinfer.__git_commit__,
         cuda=torch.version.cuda,
-        scope=f"{a.cache_mode} CUDA-Graph public routed-MoE call GPU time. Includes adapters and combine; excludes cache eviction, input quantization, routing selection, shared experts, communication, attention and serving.",
+        scope=f"{a.cache_mode} CUDA-Graph public routed-MoE {a.timing_mode} GPU time. Includes adapters and combine; excludes cache eviction, input quantization, routing selection, shared experts, communication, attention and serving.",
         cache_eviction_bytes=flush.numel() if flush is not None else 0,
         l2_bytes=l2_bytes,
         distinct_experts=unique_experts,
