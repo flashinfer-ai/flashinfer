@@ -835,7 +835,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -860,7 +859,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -883,7 +881,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -908,7 +905,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -931,7 +927,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -956,7 +951,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -979,7 +973,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1004,7 +997,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -1027,7 +1019,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1052,7 +1043,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -1075,7 +1065,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1100,7 +1089,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -1123,7 +1111,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1148,7 +1135,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -1171,7 +1157,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1196,7 +1181,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -1219,7 +1203,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1244,7 +1227,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_103a",
             "sm_107a"
           ],
@@ -1795,7 +1777,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1820,7 +1801,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
@@ -1848,7 +1828,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1873,7 +1852,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
@@ -1901,7 +1879,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1926,7 +1903,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
@@ -1954,7 +1930,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -1979,7 +1954,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
@@ -2007,7 +1981,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -2032,7 +2005,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -2060,7 +2032,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -2085,7 +2056,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -2113,7 +2083,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -2138,7 +2107,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -2310,7 +2278,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -2335,7 +2302,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -2748,7 +2714,6 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a",
         "sm_107a"
       ],
       "defines": {
@@ -2773,7 +2738,6 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_9ba675be100f.cu"
@@ -6618,7 +6582,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -6643,7 +6606,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -6671,7 +6633,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -6696,7 +6657,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -6724,7 +6684,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -6749,7 +6708,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -6777,7 +6735,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -6802,7 +6759,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -6830,7 +6786,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a",
         "sm_107a"
       ],
@@ -6855,7 +6810,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a",
             "sm_107a"
           ],
           "path": "cuda/cake_gdn_44429e0d7b456cf25225_61c11e1be923.cu"
@@ -8094,7 +8048,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a"
       ],
       "defines": {
@@ -8118,12 +8071,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a"
-          ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
-        },
-        {
-          "architectures": [
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_e1e2550ac8ccd62ae772_479359a72de3.cu"
@@ -8145,7 +8092,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a"
       ],
       "defines": {
@@ -8169,12 +8115,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a"
-          ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
-        },
-        {
-          "architectures": [
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_e1e2550ac8ccd62ae772_479359a72de3.cu"
@@ -8196,7 +8136,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a"
       ],
       "defines": {
@@ -8220,12 +8159,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a"
-          ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
-        },
-        {
-          "architectures": [
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_e1e2550ac8ccd62ae772_479359a72de3.cu"
@@ -8247,7 +8180,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a"
       ],
       "defines": {
@@ -8271,12 +8203,6 @@
       "outputs": [
         {
           "architectures": [
-            "sm_100a"
-          ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
-        },
-        {
-          "architectures": [
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_e1e2550ac8ccd62ae772_479359a72de3.cu"
@@ -8298,7 +8224,6 @@
     },
     {
       "architectures": [
-        "sm_100a",
         "sm_103a"
       ],
       "defines": {
@@ -8320,12 +8245,6 @@
       },
       "name": "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_d5abb5418532",
       "outputs": [
-        {
-          "architectures": [
-            "sm_100a"
-          ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_e8e9b65caa0e.cu"
-        },
         {
           "architectures": [
             "sm_103a"

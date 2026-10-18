@@ -1193,8 +1193,9 @@ def test_prefill_schedule_attr_pins_the_sm100a_late_state_inp_twin_names() -> No
             assert base.startswith("flashinfer_blackwell_gdn_prefill_dvsplit")
             assert twin == f"{base}_sm100a_state_inp_late"
     # The rule never fires for sm_103a / sm_107a, f16 I/O, single-chunk or indexed-state routes.
-    # Hq16/Hv32 (Qwen3.5-35B TP1): the FP32-state DV-split record that lists all three
-    # architectures; the FP32-state TP2/TP4/TP8 records ship for sm_100a / sm_103a only.
+    # Hq16/Hv32 (Qwen3.5-35B TP1): the FP32-state DV-split base record lists sm_103a
+    # and sm_107a; the FP32-state TP2/TP4/TP8 base records list sm_103a only (sm_100a
+    # runs the late-state-input twins, which are the only records listing it).
     for arch in ("sm_103a", "sm_107a"):
         assert (
             "state_inp_late"
