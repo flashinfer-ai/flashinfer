@@ -38,6 +38,7 @@ _Bf16Fp4Backend = Literal[
     "blackwell-native",
     "blackwell-tiled",
 ]
+_SourceBuiltBf16Fp4Backend = Literal["blackwell-native", "blackwell-tiled"]
 
 
 def _check_mm_bf16_fp4_problem_size(
@@ -136,7 +137,7 @@ def _blackwell_bf16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: _Bf16Fp4Backend,
+    backend: _SourceBuiltBf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
