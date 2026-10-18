@@ -1758,8 +1758,8 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 @requires_gvr2
 @pytest.mark.parametrize(
     "rows,msl_c",
-    [(9, 131136), (16, 131136), (128, 131136), (160, 65600)],
-    ids=["split9", "split16", "cta1024", "cta512"],
+    [(3, 131136), (9, 131136), (16, 131136), (128, 131136), (160, 65600)],
+    ids=["split3", "split9", "split16", "cta1024", "cta512"],
 )
 @pytest.mark.parametrize(
     "pattern", ["constant", "quantized4", "huge_flood_gt_k", "posinf", "neginf_tail"]
@@ -1767,9 +1767,10 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 @pytest.mark.parametrize("band", ["vpt4", "narrow"])
 def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern, band):
     """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
-    main launch (the register body's escape and degenerate-bracket arms),
-    hinted and hint-free, on the VPT 4 body and on rows of top_k < n <= 2048
-    columns (the VPT 2 body).
+    main launch (the register body's escape, narrowing fallback and
+    degenerate-bracket arms), hinted and hint-free, on the VPT 4 body and on rows
+    of top_k < n <= 2048 columns (the VPT 2 body), with SPLIT launches in
+    clusters of 8 and of 4 (B200: 3 rows; 9 and 16 rows) and one CTA per row.
     Rows of cap - 3 columns put the last column outside the float4 batch
     (n % 4 == 1)."""
     top_k = 1024 if band == "vpt4" else 512
@@ -2228,9 +2229,27 @@ def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
 
 @requires_gvr2
 @pytest.mark.parametrize(
-    "rows,msl_c,top_k",
-    [(16, 262208, 1024), (32, 1048640, 2048)],
-    ids=["cs4_k1024", "cs4_k2048"],
+    "rows,msl_c,top_k,page_size",
+    [
+        (16, 262208, 1024, None),
+        (32, 1048640, 2048, None),
+        (3, 1048832, 512, None),
+        (4, 524416, 512, None),
+        (3, 1048832, 1024, None),
+        (3, 1048640, 2048, None),
+        (3, 1048640, 2048, 64),
+        (8, 1048640, 2048, 64),
+    ],
+    ids=[
+        "cs4_k1024",
+        "cs4_k2048",
+        "cs8_k512",
+        "cs4_k512",
+        "cs8_k1024",
+        "cs8_k2048",
+        "cs8_k2048_paged64",
+        "cs4_k2048_paged64",
+    ],
 )
 @pytest.mark.parametrize(
     "pattern",
@@ -2246,12 +2265,15 @@ def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
         "neginf_tail",
     ],
 )
-def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, pattern):
+def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, page_size, pattern):
     """Tie floods, monotone ramps, +inf (in and out of the bracket window, more
     than K) and -inf tails (fewer than K finite values) in cluster-band rows of a
-    clustered SPLIT launch, hinted and hint-free: the clustered body's sentinel
-    bracket, crossing refinement and whole-row fallback. Lengths: just above the
-    register path, a slot step, and the cluster cap - 3 (n % 4 == 1)."""
+    clustered SPLIT launch (B200: clusters of 8 at 3 rows, of 4 at the others),
+    hinted and hint-free: the clustered body's sentinel bracket, crossing
+    refinement and whole-row fallback. Lengths: just above the register path (the
+    VPT 2 body), a slot step and the cluster cap - 3 (n % 4 == 1; the VPT 4 body).
+    Paged output is hint-free; at K = 2048 below 16 rows it is written by every
+    rank through the page table instead of staged in rank 0."""
     reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
     band = [reg_cap + 1, cs * 4096 * 2 + 5, cap - 3]
     lens = [band[r % len(band)] for r in range(rows)]
@@ -2273,6 +2295,9 @@ def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, pattern):
     logits = torch.full((rows, msl_c), 3e38, device=_DEV)
     for r in range(rows):
         logits[r, : lens[r]] = x[r, : lens[r]]
+    if page_size is not None:  # paged output is hint-free only
+        _run_hard(logits, lens, top_k, lens, "main", page_size=page_size)
+        return
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=_DEV)
     hint = torch.stack(
         [torch.randint(0, n_, (top_k,), generator=gen, device=_DEV) for n_ in lens]
