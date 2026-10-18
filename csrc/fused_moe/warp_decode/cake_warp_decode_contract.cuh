@@ -1040,21 +1040,6 @@ static_assert(CheckPublicBoundaries({1, 3072, 384, 256, 256, 8}, Geometry::kH307
 static_assert(!SelectSm100aSchedule({1, 2048, 768, 128, 64, 8}).supported);
 static_assert(!SelectSm103aSchedule({1, 2048, 768, 128, 128, 4}).supported);
 
-// Initial host-only input-storage candidate: preserve all other public routes.
-constexpr bool UsesOwnedInputScratch(const Shape& shape, const Schedule& schedule) {
-  return kTarget == Target::kSm100a && (shape.num_tokens == 1 || shape.num_tokens == 2 || shape.num_tokens == 5 || shape.num_tokens == 9 || shape.num_tokens == 10 || shape.num_tokens == 12 || shape.num_tokens == 14) &&
-         shape.hidden_size == 3072 && shape.intermediate_size == 1536 &&
-         shape.num_experts == 256 && shape.local_num_experts == 256 && shape.top_k == 8 &&
-         schedule.route_layout == RouteLayout::kDirect;
-}
-
-constexpr bool UsesOwnedPartialScratch(const Shape& shape, const Schedule& schedule) {
-  return kTarget == Target::kSm100a && (shape.num_tokens == 6 || shape.num_tokens == 10 || shape.num_tokens == 14) &&
-         shape.hidden_size == 3072 && shape.intermediate_size == 1536 &&
-         shape.num_experts == 256 && shape.local_num_experts == 256 && shape.top_k == 8 &&
-         schedule.route_layout == RouteLayout::kDirect;
-}
-
 struct Invocation {
   Shape shape;
   void* output;
@@ -1074,10 +1059,6 @@ struct Invocation {
   const void* gemm1_alpha = nullptr;
   const void* gemm1_beta = nullptr;
   const void* gemm1_clamp_limit = nullptr;
-  // Populated only from the validated preparation receipt's owning tensors.
-  void* prepared_intermediate = nullptr;
-  void* prepared_intermediate_scale = nullptr;
-  void* prepared_partials = nullptr;
 };
 
 enum class StatusDomain : uint8_t {

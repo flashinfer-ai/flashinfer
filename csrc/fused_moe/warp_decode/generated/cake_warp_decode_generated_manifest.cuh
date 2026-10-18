@@ -4903,18 +4903,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       inv.workspace == nullptr) return;
   detail::WorkspaceView ws{};
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws) || inv.workspace_bytes < ws.bytes) return;
-  if (inv.prepared_intermediate || inv.prepared_intermediate_scale) {
-    if (!warp_decode::UsesOwnedInputScratch(inv.shape, schedule) ||
-        !inv.prepared_intermediate || !inv.prepared_intermediate_scale) return;
-    ws.intermediate = static_cast<uint8_t*>(inv.prepared_intermediate);
-    ws.intermediate_scale = static_cast<uint8_t*>(inv.prepared_intermediate_scale);
-  }
-  if (inv.prepared_partials) {
-    if (!warp_decode::UsesOwnedPartialScratch(inv.shape, schedule) ||
-        (warp_decode::UsesOwnedInputScratch(inv.shape, schedule) &&
-         (!inv.prepared_intermediate || !inv.prepared_intermediate_scale))) return;
-    ws.partials = static_cast<uint16_t*>(inv.prepared_partials);
-  }
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return;
   { std::lock_guard<std::mutex> lock(detail::DeviceMutex());
@@ -10171,18 +10159,6 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       inv.workspace == nullptr) return;
   detail::WorkspaceView ws{};
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws) || inv.workspace_bytes < ws.bytes) return;
-  if (inv.prepared_intermediate || inv.prepared_intermediate_scale) {
-    if (!warp_decode::UsesOwnedInputScratch(inv.shape, schedule) ||
-        !inv.prepared_intermediate || !inv.prepared_intermediate_scale) return;
-    ws.intermediate = static_cast<uint8_t*>(inv.prepared_intermediate);
-    ws.intermediate_scale = static_cast<uint8_t*>(inv.prepared_intermediate_scale);
-  }
-  if (inv.prepared_partials) {
-    if (!warp_decode::UsesOwnedPartialScratch(inv.shape, schedule) ||
-        (warp_decode::UsesOwnedInputScratch(inv.shape, schedule) &&
-         (!inv.prepared_intermediate || !inv.prepared_intermediate_scale))) return;
-    ws.partials = static_cast<uint16_t*>(inv.prepared_partials);
-  }
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return;
   { std::lock_guard<std::mutex> lock(detail::DeviceMutex());
