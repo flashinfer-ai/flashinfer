@@ -391,6 +391,73 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
     const int tmem_intra_tmem = taddr + 256;
     const int tmem_state_delta_tmem = taddr + 384;
     const int tmem_inter_tmem = taddr + 448;
+    int table_base = 0;
+    if (metadata_from_cu_seqlens >= 2) {
+        table_base = bid * (sequence_count + 1);
+        #pragma unroll 1
+        for (int segment = tid; segment < num_logical_chunks; segment += 512) {
+            int start = chunk_indices[segment] * 128 + chunk_offsets[segment];
+            int sequence = 0;
+            if (metadata_from_cu_seqlens == 3) {
+                long long raw_sequence = seq_idx_i64[start];
+                sequence = (int)raw_sequence;
+                if (raw_sequence < 0) {
+                    sequence = -1;
+                }
+                if (raw_sequence >= (long long)sequence_count) {
+                    sequence = sequence_count;
+                }
+            } else {
+                sequence = seq_idx_i32[start];
+            }
+            int _max_0 = ((sequence) > (-1) ? (sequence) : (-1));
+            int _min_0 = ((_max_0) < (sequence_count) ? (_max_0) : (sequence_count));
+            sequence = _min_0;
+            int previous_sequence = -1;
+            if (segment != 0) {
+                int previous_start = chunk_indices[segment - 1] * 128 + chunk_offsets[segment - 1];
+                if (metadata_from_cu_seqlens == 3) {
+                    long long raw_previous = seq_idx_i64[previous_start];
+                    previous_sequence = (int)raw_previous;
+                    if (raw_previous < 0) {
+                        previous_sequence = -1;
+                    }
+                    if (raw_previous >= (long long)sequence_count) {
+                        previous_sequence = sequence_count;
+                    }
+                } else {
+                    previous_sequence = seq_idx_i32[previous_start];
+                }
+                int _max_1 = ((previous_sequence) > (-1) ? (previous_sequence) : (-1));
+                int _min_1 = ((_max_1) < (sequence_count) ? (_max_1) : (sequence_count));
+                previous_sequence = _min_1;
+            }
+            int flagged = 0;
+            if (sequence < 0) {
+                flagged = 1;
+            }
+            if (sequence >= sequence_count) {
+                flagged = 1;
+            }
+            if (sequence < previous_sequence) {
+                flagged = 1;
+            }
+            if (flagged != 0) {
+                preprocess_status[0] = 1;
+            }
+            #pragma unroll 1
+            for (int opened_id = previous_sequence + 1; opened_id < sequence + 1; opened_id++) {
+                seq_chunk_cumsum[table_base + opened_id] = segment;
+            }
+            if (segment == num_logical_chunks - 1) {
+                #pragma unroll 1
+                for (int closed_id = sequence + 1; closed_id < sequence_count + 1; closed_id++) {
+                    seq_chunk_cumsum[table_base + closed_id] = num_logical_chunks;
+                }
+            }
+        }
+    }
+    asm volatile("barrier.sync 1, 512;" ::: "memory");
 
     // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
@@ -410,25 +477,25 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_scaled_b_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work = bid; work < sequence_count * nheads; work += num_bids) {
-                int sequence = work / (unsigned int)nheads;
-                int first_logical = sequence * nchunks;
+                int sequence_1 = work / (unsigned int)nheads;
+                int first_logical = sequence_1 * nchunks;
                 int logical_end = first_logical + nchunks;
                 int item_lo = 0;
                 int item_hi = 0;
                 int item_checkpoint = -1;
                 int checkpoint_rank = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_10 = ((cu_seqlens[sequence]) > (0) ? (cu_seqlens[sequence]) : (0));
-                    int _min_12 = ((_max_10) < (seqlen) ? (_max_10) : (seqlen));
-                    item_lo = _min_12;
-                    int _max_11 = ((cu_seqlens[sequence + 1]) > (0) ? (cu_seqlens[sequence + 1]) : (0));
-                    int _min_13 = ((_max_11) < (seqlen) ? (_max_11) : (seqlen));
-                    item_hi = _min_13;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_12 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
+                    int _min_14 = ((_max_12) < (seqlen) ? (_max_12) : (seqlen));
+                    item_lo = _min_14;
+                    int _max_13 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
+                    int _min_15 = ((_max_13) < (seqlen) ? (_max_13) : (seqlen));
+                    item_hi = _min_15;
                     int item_count = 0;
                     if (item_hi > item_lo) {
                         item_count = (item_hi + 127) / 128 - item_lo / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint = checkpoint_token_indices[sequence];
+                            int candidate_checkpoint = checkpoint_token_indices[sequence_1];
                             if (candidate_checkpoint > item_lo && candidate_checkpoint < item_hi && candidate_checkpoint % 128 != 0) {
                                 item_checkpoint = candidate_checkpoint;
                                 checkpoint_rank = candidate_checkpoint / 128 - item_lo / 128 + 1;
@@ -439,8 +506,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical = 0;
                     logical_end = item_count;
                 } else {
-                    first_logical = seq_chunk_cumsum[sequence];
-                    logical_end = seq_chunk_cumsum[sequence + 1];
+                    first_logical = seq_chunk_cumsum[table_base + sequence_1];
+                    logical_end = seq_chunk_cumsum[table_base + sequence_1 + 1];
                 }
                 int _uniform_7 = make_warp_uniform(first_logical);
                 first_logical = _uniform_7;
@@ -568,25 +635,25 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_x_full_1 = 0;
             #pragma unroll 1
             for (unsigned int work_1 = bid; work_1 < sequence_count * nheads; work_1 += num_bids) {
-                int sequence_1 = work_1 / (unsigned int)nheads;
-                int first_logical_1 = sequence_1 * nchunks;
+                int sequence_2 = work_1 / (unsigned int)nheads;
+                int first_logical_1 = sequence_2 * nchunks;
                 int logical_end_1 = first_logical_1 + nchunks;
                 int item_lo_1 = 0;
                 int item_hi_1 = 0;
                 int item_checkpoint_1 = -1;
                 int checkpoint_rank_1 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_8 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
-                    int _min_10 = ((_max_8) < (seqlen) ? (_max_8) : (seqlen));
-                    item_lo_1 = _min_10;
-                    int _max_9 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
-                    int _min_11 = ((_max_9) < (seqlen) ? (_max_9) : (seqlen));
-                    item_hi_1 = _min_11;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_10 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
+                    int _min_12 = ((_max_10) < (seqlen) ? (_max_10) : (seqlen));
+                    item_lo_1 = _min_12;
+                    int _max_11 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
+                    int _min_13 = ((_max_11) < (seqlen) ? (_max_11) : (seqlen));
+                    item_hi_1 = _min_13;
                     int item_count_1 = 0;
                     if (item_hi_1 > item_lo_1) {
                         item_count_1 = (item_hi_1 + 127) / 128 - item_lo_1 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_1];
+                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_2];
                             if (candidate_checkpoint_1 > item_lo_1 && candidate_checkpoint_1 < item_hi_1 && candidate_checkpoint_1 % 128 != 0) {
                                 item_checkpoint_1 = candidate_checkpoint_1;
                                 checkpoint_rank_1 = candidate_checkpoint_1 / 128 - item_lo_1 / 128 + 1;
@@ -597,8 +664,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_1 = 0;
                     logical_end_1 = item_count_1;
                 } else {
-                    first_logical_1 = seq_chunk_cumsum[sequence_1];
-                    logical_end_1 = seq_chunk_cumsum[sequence_1 + 1];
+                    first_logical_1 = seq_chunk_cumsum[table_base + sequence_2];
+                    logical_end_1 = seq_chunk_cumsum[table_base + sequence_2 + 1];
                 }
                 int _uniform_5 = make_warp_uniform(first_logical_1);
                 first_logical_1 = _uniform_5;
@@ -678,27 +745,27 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_cb_empty = 1;
             #pragma unroll 1
             for (unsigned int work_2 = bid; work_2 < sequence_count * nheads; work_2 += num_bids) {
-                int sequence_2 = work_2 / (unsigned int)nheads;
+                int sequence_3 = work_2 / (unsigned int)nheads;
                 int head = work_2 % (unsigned int)nheads;
                 int group = head * ngroups / nheads;
-                int first_logical_2 = sequence_2 * nchunks;
+                int first_logical_2 = sequence_3 * nchunks;
                 int logical_end_2 = first_logical_2 + nchunks;
                 int item_lo_2 = 0;
                 int item_hi_2 = 0;
                 int item_checkpoint_2 = -1;
                 int checkpoint_rank_2 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_0 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
-                    int _min_0 = ((_max_0) < (seqlen) ? (_max_0) : (seqlen));
-                    item_lo_2 = _min_0;
-                    int _max_1 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
-                    int _min_1 = ((_max_1) < (seqlen) ? (_max_1) : (seqlen));
-                    item_hi_2 = _min_1;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_2 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
+                    int _min_2 = ((_max_2) < (seqlen) ? (_max_2) : (seqlen));
+                    item_lo_2 = _min_2;
+                    int _max_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
+                    int _min_3 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
+                    item_hi_2 = _min_3;
                     int item_count_2 = 0;
                     if (item_hi_2 > item_lo_2) {
                         item_count_2 = (item_hi_2 + 127) / 128 - item_lo_2 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_2];
+                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_3];
                             if (candidate_checkpoint_2 > item_lo_2 && candidate_checkpoint_2 < item_hi_2 && candidate_checkpoint_2 % 128 != 0) {
                                 item_checkpoint_2 = candidate_checkpoint_2;
                                 checkpoint_rank_2 = candidate_checkpoint_2 / 128 - item_lo_2 / 128 + 1;
@@ -709,8 +776,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_2 = 0;
                     logical_end_2 = item_count_2;
                 } else {
-                    first_logical_2 = seq_chunk_cumsum[sequence_2];
-                    logical_end_2 = seq_chunk_cumsum[sequence_2 + 1];
+                    first_logical_2 = seq_chunk_cumsum[table_base + sequence_3];
+                    logical_end_2 = seq_chunk_cumsum[table_base + sequence_3 + 1];
                 }
                 int _uniform_0 = make_warp_uniform(first_logical_2);
                 first_logical_2 = _uniform_0;
@@ -731,8 +798,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 int next_physical = 0;
                 int next_token = 0;
                 if (first_logical_2 < logical_end_2) {
-                    int chunk = first_logical_2 - sequence_2 * nchunks;
-                    if (metadata_from_cu_seqlens != 0) {
+                    int chunk = first_logical_2 - sequence_3 * nchunks;
+                    if (metadata_from_cu_seqlens == 1) {
                         chunk = ((first_logical_2 > checkpoint_rank_2) ? (item_lo_2 / 128 + first_logical_2 - 1) * 128 : ((first_logical_2 == checkpoint_rank_2) ? item_checkpoint_2 : ((first_logical_2 == 0) ? item_lo_2 : (item_lo_2 / 128 + first_logical_2) * 128))) / 128;
                     } else {
                         chunk = chunk_indices[first_logical_2];
@@ -754,8 +821,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     int refill_before_cb = refill_first;
                     if (refill_before_cb != 0) {
                         if (logical_end_2 > logical_2 + 1) {
-                            int chunk_1 = logical_2 + 1 - sequence_2 * nchunks;
-                            if (metadata_from_cu_seqlens != 0) {
+                            int chunk_1 = logical_2 + 1 - sequence_3 * nchunks;
+                            if (metadata_from_cu_seqlens == 1) {
                                 chunk_1 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
                             } else {
                                 chunk_1 = chunk_indices[logical_2 + 1];
@@ -829,8 +896,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     if (cb_acc_stage == 2) { cb_acc_stage = 0; _phase_cb_empty ^= 1; }
                     if (refill_before_cb == 0) {
                         if (logical_end_2 > logical_2 + 1) {
-                            int chunk_2 = logical_2 + 1 - sequence_2 * nchunks;
-                            if (metadata_from_cu_seqlens != 0) {
+                            int chunk_2 = logical_2 + 1 - sequence_3 * nchunks;
+                            if (metadata_from_cu_seqlens == 1) {
                                 chunk_2 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
                             } else {
                                 chunk_2 = chunk_indices[logical_2 + 1];
@@ -861,26 +928,26 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_x_empty = 1;
             #pragma unroll 1
             for (unsigned int work_3 = bid; work_3 < sequence_count * nheads; work_3 += num_bids) {
-                int sequence_3 = work_3 / (unsigned int)nheads;
+                int sequence_4 = work_3 / (unsigned int)nheads;
                 int head_1 = work_3 % (unsigned int)nheads;
-                int first_logical_3 = sequence_3 * nchunks;
+                int first_logical_3 = sequence_4 * nchunks;
                 int logical_end_3 = first_logical_3 + nchunks;
                 int item_lo_3 = 0;
                 int item_hi_3 = 0;
                 int item_checkpoint_3 = -1;
                 int checkpoint_rank_3 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_2 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
-                    int _min_2 = ((_max_2) < (seqlen) ? (_max_2) : (seqlen));
-                    item_lo_3 = _min_2;
-                    int _max_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
-                    int _min_3 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
-                    item_hi_3 = _min_3;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_4 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
+                    int _min_4 = ((_max_4) < (seqlen) ? (_max_4) : (seqlen));
+                    item_lo_3 = _min_4;
+                    int _max_5 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
+                    int _min_5 = ((_max_5) < (seqlen) ? (_max_5) : (seqlen));
+                    item_hi_3 = _min_5;
                     int item_count_3 = 0;
                     if (item_hi_3 > item_lo_3) {
                         item_count_3 = (item_hi_3 + 127) / 128 - item_lo_3 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_3];
+                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_4];
                             if (candidate_checkpoint_3 > item_lo_3 && candidate_checkpoint_3 < item_hi_3 && candidate_checkpoint_3 % 128 != 0) {
                                 item_checkpoint_3 = candidate_checkpoint_3;
                                 checkpoint_rank_3 = candidate_checkpoint_3 / 128 - item_lo_3 / 128 + 1;
@@ -891,8 +958,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_3 = 0;
                     logical_end_3 = item_count_3;
                 } else {
-                    first_logical_3 = seq_chunk_cumsum[sequence_3];
-                    logical_end_3 = seq_chunk_cumsum[sequence_3 + 1];
+                    first_logical_3 = seq_chunk_cumsum[table_base + sequence_4];
+                    logical_end_3 = seq_chunk_cumsum[table_base + sequence_4 + 1];
                 }
                 int _uniform_3 = make_warp_uniform(first_logical_3);
                 first_logical_3 = _uniform_3;
@@ -903,14 +970,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 float next_delta[4];
                 #pragma unroll 1
                 for (int logical_3 = first_logical_3; logical_3 < logical_end_3; logical_3++) {
-                    int physical_chunk = logical_3 - sequence_3 * nchunks;
+                    int physical_chunk = logical_3 - sequence_4 * nchunks;
                     int segment_offset = 0;
                     int segment_limit = 128;
-                    if (metadata_from_cu_seqlens != 0) {
+                    if (metadata_from_cu_seqlens == 1) {
                         int first_chunk = item_lo_3 / 128;
                         int segment_start = ((checkpoint_rank_3 < logical_3) ? (first_chunk + logical_3 - 1) * 128 : ((logical_3 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 == 0) ? item_lo_3 : (first_chunk + logical_3) * 128)));
-                        int _min_4 = ((((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) : (item_hi_3));
-                        int segment_end = _min_4;
+                        int _min_6 = ((((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) : (item_hi_3));
+                        int segment_end = _min_6;
                         physical_chunk = segment_start / 128;
                         segment_offset = segment_start - physical_chunk * 128;
                         segment_limit = segment_end - physical_chunk * 128;
@@ -942,8 +1009,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         int prefetch_last = publish_end - 1;
                         #pragma unroll
                         for (int local = 0; local < 4; local++) {
-                            int _min_5 = ((prefetch_last) < (prefetch_base + local) ? (prefetch_last) : (prefetch_base + local));
-                            lane_raw[local] = dt[(physical_start + _min_5) * nheads + head_1];
+                            int _min_7 = ((prefetch_last) < (prefetch_base + local) ? (prefetch_last) : (prefetch_base + local));
+                            lane_raw[local] = dt[(physical_start + _min_7) * nheads + head_1];
                         }
                     }
                     int has_next_chunk = 0;
@@ -955,14 +1022,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     int next_chunk_tokens = 128;
                     float raw_next[4];
                     if (has_next_chunk != 0) {
-                        int physical_chunk_0 = logical_3 + 1 - sequence_3 * nchunks;
+                        int physical_chunk_0 = logical_3 + 1 - sequence_4 * nchunks;
                         int segment_offset_1 = 0;
                         int segment_limit_2 = 128;
-                        if (metadata_from_cu_seqlens != 0) {
+                        if (metadata_from_cu_seqlens == 1) {
                             int first_chunk_1 = item_lo_3 / 128;
                             int segment_start_1 = ((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk_1 + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1)) * 128)));
-                            int _min_6 = ((((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) : (item_hi_3));
-                            int segment_end_1 = _min_6;
+                            int _min_8 = ((((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) : (item_hi_3));
+                            int segment_end_1 = _min_8;
                             physical_chunk_0 = segment_start_1 / 128;
                             segment_offset_1 = segment_start_1 - physical_chunk_0 * 128;
                             segment_limit_2 = segment_end_1 - physical_chunk_0 * 128;
@@ -991,8 +1058,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         int next_last = next_publish_end - 1;
                         #pragma unroll
                         for (int local_1 = 0; local_1 < 4; local_1++) {
-                            int _min_7 = ((next_last) < (prefetch_base + local_1) ? (next_last) : (prefetch_base + local_1));
-                            raw_next[local_1] = dt[(next_start + _min_7) * nheads + head_1];
+                            int _min_9 = ((next_last) < (prefetch_base + local_1) ? (next_last) : (prefetch_base + local_1));
+                            raw_next[local_1] = dt[(next_start + _min_9) * nheads + head_1];
                         }
                     }
                     mbarrier_wait(aux_empty_addr + (input_stage_3) * 8, _phase_aux_empty);
@@ -1169,8 +1236,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                             }
                             physical_cumsum[local_6] = value;
                         }
-                        int _max_4 = ((segment_offset - 1) > (0) ? (segment_offset - 1) : (0));
-                        int base_token = _max_4;
+                        int _max_6 = ((segment_offset - 1) > (0) ? (segment_offset - 1) : (0));
+                        int base_token = _max_6;
                         int base_lane = base_token / 4;
                         int base_slot = base_token % 4;
                         float _shfl_2 = __shfl_sync(0xFFFFFFFF, physical_cumsum[0], base_lane);
@@ -1199,9 +1266,9 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                                 float _sub_0;
                                 asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(physical_cumsum[local_8]), "f"(segment_base));
                                 cumsum_value = _sub_0;
-                                float _max_5 = max_noftz(lane_dt[local_8], -65504.0f);
-                                float _min_8 = fminf(_max_5, 65504.0f);
-                                float bounded = _min_8;
+                                float _max_7 = max_noftz(lane_dt[local_8], -65504.0f);
+                                float _min_10 = fminf(_max_7, 65504.0f);
+                                float bounded = _min_10;
                                 __half delta_half = (__half)bounded;
                                 float _cvt_f32_0 = (float)delta_half;
                                 delta_value = _cvt_f32_0;
@@ -1397,8 +1464,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                             }
                             physical_cumsum_1[local_15] = value_1;
                         }
-                        int _max_6 = ((next_segment_offset - 1) > (0) ? (next_segment_offset - 1) : (0));
-                        int base_token_1 = _max_6;
+                        int _max_8 = ((next_segment_offset - 1) > (0) ? (next_segment_offset - 1) : (0));
+                        int base_token_1 = _max_8;
                         int base_lane_1 = base_token_1 / 4;
                         int base_slot_1 = base_token_1 % 4;
                         float _shfl_6 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[0], base_lane_1);
@@ -1427,9 +1494,9 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                                 float _sub_1;
                                 asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(physical_cumsum_1[local_17]), "f"(segment_base_1));
                                 cumsum_value_1 = _sub_1;
-                                float _max_7 = max_noftz(lane_dt_1[local_17], -65504.0f);
-                                float _min_9 = fminf(_max_7, 65504.0f);
-                                float bounded_1 = _min_9;
+                                float _max_9 = max_noftz(lane_dt_1[local_17], -65504.0f);
+                                float _min_11 = fminf(_max_9, 65504.0f);
+                                float bounded_1 = _min_11;
                                 __half delta_half_1 = (__half)bounded_1;
                                 float _cvt_f32_1 = (float)delta_half_1;
                                 delta_value_1 = _cvt_f32_1;
@@ -1466,21 +1533,21 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_state_delta_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work_4 = bid; work_4 < sequence_count * nheads; work_4 += num_bids) {
-                int sequence_4 = work_4 / (unsigned int)nheads;
+                int sequence_5 = work_4 / (unsigned int)nheads;
                 int head_2 = work_4 % (unsigned int)nheads;
-                int state_head_base = (sequence_4 * nheads + head_2) * 64 * 128;
-                if (metadata_from_cu_seqlens != 0) {
+                int state_head_base = (sequence_5 * nheads + head_2) * 64 * 128;
+                if (metadata_from_cu_seqlens == 1) {
                     if (warp == 4) {
                         if (elect_sync()) {
-                            int raw_lo = cu_seqlens[sequence_4];
-                            int raw_hi = cu_seqlens[sequence_4 + 1];
+                            int raw_lo = cu_seqlens[sequence_5];
+                            int raw_hi = cu_seqlens[sequence_5 + 1];
                             int flagged_cu = 0;
-                            if (sequence_4 == 0) {
+                            if (sequence_5 == 0) {
                                 if (raw_lo != 0) {
                                     flagged_cu = 1;
                                 }
                             }
-                            if (sequence_4 == sequence_count - 1) {
+                            if (sequence_5 == sequence_count - 1) {
                                 if (raw_hi != seqlen) {
                                     flagged_cu = 1;
                                 }
@@ -1520,24 +1587,24 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         }
                     }
                 }
-                int first_logical_4 = sequence_4 * nchunks;
+                int first_logical_4 = sequence_5 * nchunks;
                 int logical_end_4 = first_logical_4 + nchunks;
                 int item_lo_4 = 0;
                 int item_hi_4 = 0;
                 int item_checkpoint_4 = -1;
                 int checkpoint_rank_4 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_14 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
-                    int _min_17 = ((_max_14) < (seqlen) ? (_max_14) : (seqlen));
-                    item_lo_4 = _min_17;
-                    int _max_15 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
-                    int _min_18 = ((_max_15) < (seqlen) ? (_max_15) : (seqlen));
-                    item_hi_4 = _min_18;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_16 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
+                    int _min_19 = ((_max_16) < (seqlen) ? (_max_16) : (seqlen));
+                    item_lo_4 = _min_19;
+                    int _max_17 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
+                    int _min_20 = ((_max_17) < (seqlen) ? (_max_17) : (seqlen));
+                    item_hi_4 = _min_20;
                     int item_count_4 = 0;
                     if (item_hi_4 > item_lo_4) {
                         item_count_4 = (item_hi_4 + 127) / 128 - item_lo_4 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_4];
+                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_5];
                             if (candidate_checkpoint_4 > item_lo_4 && candidate_checkpoint_4 < item_hi_4 && candidate_checkpoint_4 % 128 != 0) {
                                 item_checkpoint_4 = candidate_checkpoint_4;
                                 checkpoint_rank_4 = candidate_checkpoint_4 / 128 - item_lo_4 / 128 + 1;
@@ -1548,8 +1615,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_4 = 0;
                     logical_end_4 = item_count_4;
                 } else {
-                    first_logical_4 = seq_chunk_cumsum[sequence_4];
-                    logical_end_4 = seq_chunk_cumsum[sequence_4 + 1];
+                    first_logical_4 = seq_chunk_cumsum[table_base + sequence_5];
+                    logical_end_4 = seq_chunk_cumsum[table_base + sequence_5 + 1];
                 }
                 int _uniform_11 = make_warp_uniform(first_logical_4);
                 first_logical_4 = _uniform_11;
@@ -1557,14 +1624,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 logical_end_4 = _uniform_12;
                 #pragma unroll 1
                 for (int logical_4 = first_logical_4; logical_4 < logical_end_4; logical_4++) {
-                    int physical_chunk_1 = logical_4 - sequence_4 * nchunks;
+                    int physical_chunk_1 = logical_4 - sequence_5 * nchunks;
                     int segment_offset_2 = 0;
                     int segment_limit_1 = 128;
-                    if (metadata_from_cu_seqlens != 0) {
+                    if (metadata_from_cu_seqlens == 1) {
                         int first_chunk_2 = item_lo_4 / 128;
                         int segment_start_2 = ((checkpoint_rank_4 < logical_4) ? (first_chunk_2 + logical_4 - 1) * 128 : ((logical_4 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 == 0) ? item_lo_4 : (first_chunk_2 + logical_4) * 128)));
-                        int _min_19 = ((((checkpoint_rank_4 < logical_4 + 1) ? (first_chunk_2 + (logical_4 + 1) - 1) * 128 : ((logical_4 + 1 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 + 1 == 0) ? item_lo_4 : (first_chunk_2 + (logical_4 + 1)) * 128)))) < (item_hi_4) ? (((checkpoint_rank_4 < logical_4 + 1) ? (first_chunk_2 + (logical_4 + 1) - 1) * 128 : ((logical_4 + 1 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 + 1 == 0) ? item_lo_4 : (first_chunk_2 + (logical_4 + 1)) * 128)))) : (item_hi_4));
-                        int segment_end_2 = _min_19;
+                        int _min_21 = ((((checkpoint_rank_4 < logical_4 + 1) ? (first_chunk_2 + (logical_4 + 1) - 1) * 128 : ((logical_4 + 1 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 + 1 == 0) ? item_lo_4 : (first_chunk_2 + (logical_4 + 1)) * 128)))) < (item_hi_4) ? (((checkpoint_rank_4 < logical_4 + 1) ? (first_chunk_2 + (logical_4 + 1) - 1) * 128 : ((logical_4 + 1 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 + 1 == 0) ? item_lo_4 : (first_chunk_2 + (logical_4 + 1)) * 128)))) : (item_hi_4));
+                        int segment_end_2 = _min_21;
                         physical_chunk_1 = segment_start_2 / 128;
                         segment_offset_2 = segment_start_2 - physical_chunk_1 * 128;
                         segment_limit_1 = segment_end_2 - physical_chunk_1 * 128;
@@ -1727,13 +1794,13 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         if (state_stage_1 == 2) { state_stage_1 = 0; _phase_state_read_released ^= 1; }
                     }
                     if (checkpoint_state_count > 0) {
-                        int checkpoint_token = checkpoint_token_indices[sequence_4];
+                        int checkpoint_token = checkpoint_token_indices[sequence_5];
                         int segment_end_3 = physical_chunk_1 * 128 + segment_limit_1;
                         if (segment_end_3 > seqlen) {
                             segment_end_3 = seqlen;
                         }
                         if (checkpoint_token == segment_end_3) {
-                            int checkpoint_slot = checkpoint_state_slots[sequence_4];
+                            int checkpoint_slot = checkpoint_state_slots[sequence_5];
                             if (checkpoint_slot >= 0 && checkpoint_slot < checkpoint_state_count) {
                                 int checkpoint_head_base = (checkpoint_slot * nheads + head_2) * 64 * 128;
                                 #pragma unroll
@@ -1790,25 +1857,25 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_aux_full_1 = 0;
             #pragma unroll 1
             for (unsigned int work_5 = bid; work_5 < sequence_count * nheads; work_5 += num_bids) {
-                int sequence_5 = work_5 / (unsigned int)nheads;
-                int first_logical_5 = sequence_5 * nchunks;
+                int sequence_6 = work_5 / (unsigned int)nheads;
+                int first_logical_5 = sequence_6 * nchunks;
                 int logical_end_5 = first_logical_5 + nchunks;
                 int item_lo_5 = 0;
                 int item_hi_5 = 0;
                 int item_checkpoint_5 = -1;
                 int checkpoint_rank_5 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_12 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
-                    int _min_14 = ((_max_12) < (seqlen) ? (_max_12) : (seqlen));
-                    item_lo_5 = _min_14;
-                    int _max_13 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
-                    int _min_15 = ((_max_13) < (seqlen) ? (_max_13) : (seqlen));
-                    item_hi_5 = _min_15;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_14 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
+                    int _min_16 = ((_max_14) < (seqlen) ? (_max_14) : (seqlen));
+                    item_lo_5 = _min_16;
+                    int _max_15 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
+                    int _min_17 = ((_max_15) < (seqlen) ? (_max_15) : (seqlen));
+                    item_hi_5 = _min_17;
                     int item_count_5 = 0;
                     if (item_hi_5 > item_lo_5) {
                         item_count_5 = (item_hi_5 + 127) / 128 - item_lo_5 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_5];
+                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_6];
                             if (candidate_checkpoint_5 > item_lo_5 && candidate_checkpoint_5 < item_hi_5 && candidate_checkpoint_5 % 128 != 0) {
                                 item_checkpoint_5 = candidate_checkpoint_5;
                                 checkpoint_rank_5 = candidate_checkpoint_5 / 128 - item_lo_5 / 128 + 1;
@@ -1819,8 +1886,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_5 = 0;
                     logical_end_5 = item_count_5;
                 } else {
-                    first_logical_5 = seq_chunk_cumsum[sequence_5];
-                    logical_end_5 = seq_chunk_cumsum[sequence_5 + 1];
+                    first_logical_5 = seq_chunk_cumsum[table_base + sequence_6];
+                    logical_end_5 = seq_chunk_cumsum[table_base + sequence_6 + 1];
                 }
                 int _uniform_9 = make_warp_uniform(first_logical_5);
                 first_logical_5 = _uniform_9;
@@ -1828,14 +1895,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 logical_end_5 = _uniform_10;
                 #pragma unroll 1
                 for (int logical_5 = first_logical_5; logical_5 < logical_end_5; logical_5++) {
-                    int physical_chunk_2 = logical_5 - sequence_5 * nchunks;
+                    int physical_chunk_2 = logical_5 - sequence_6 * nchunks;
                     int segment_offset_3 = 0;
                     int segment_limit_3 = 128;
-                    if (metadata_from_cu_seqlens != 0) {
+                    if (metadata_from_cu_seqlens == 1) {
                         int first_chunk_3 = item_lo_5 / 128;
                         int segment_start_3 = ((checkpoint_rank_5 < logical_5) ? (first_chunk_3 + logical_5 - 1) * 128 : ((logical_5 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 == 0) ? item_lo_5 : (first_chunk_3 + logical_5) * 128)));
-                        int _min_16 = ((((checkpoint_rank_5 < logical_5 + 1) ? (first_chunk_3 + (logical_5 + 1) - 1) * 128 : ((logical_5 + 1 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 + 1 == 0) ? item_lo_5 : (first_chunk_3 + (logical_5 + 1)) * 128)))) < (item_hi_5) ? (((checkpoint_rank_5 < logical_5 + 1) ? (first_chunk_3 + (logical_5 + 1) - 1) * 128 : ((logical_5 + 1 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 + 1 == 0) ? item_lo_5 : (first_chunk_3 + (logical_5 + 1)) * 128)))) : (item_hi_5));
-                        int segment_end_4 = _min_16;
+                        int _min_18 = ((((checkpoint_rank_5 < logical_5 + 1) ? (first_chunk_3 + (logical_5 + 1) - 1) * 128 : ((logical_5 + 1 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 + 1 == 0) ? item_lo_5 : (first_chunk_3 + (logical_5 + 1)) * 128)))) < (item_hi_5) ? (((checkpoint_rank_5 < logical_5 + 1) ? (first_chunk_3 + (logical_5 + 1) - 1) * 128 : ((logical_5 + 1 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 + 1 == 0) ? item_lo_5 : (first_chunk_3 + (logical_5 + 1)) * 128)))) : (item_hi_5));
+                        int segment_end_4 = _min_18;
                         physical_chunk_2 = segment_start_3 / 128;
                         segment_offset_3 = segment_start_3 - physical_chunk_2 * 128;
                         segment_limit_3 = segment_end_4 - physical_chunk_2 * 128;
@@ -1943,30 +2010,30 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_x_full_2 = 0;
             #pragma unroll 1
             for (unsigned int work_6 = bid; work_6 < sequence_count * nheads; work_6 += num_bids) {
-                int sequence_6 = work_6 / (unsigned int)nheads;
+                int sequence_7 = work_6 / (unsigned int)nheads;
                 int head_3 = work_6 % (unsigned int)nheads;
                 float d_head_value = 0.0f;
                 if (D_mode == 1) {
                     d_head_value = (float)D[head_3];
                 }
-                int first_logical_6 = sequence_6 * nchunks;
+                int first_logical_6 = sequence_7 * nchunks;
                 int logical_end_6 = first_logical_6 + nchunks;
                 int item_lo_6 = 0;
                 int item_hi_6 = 0;
                 int item_checkpoint_6 = -1;
                 int checkpoint_rank_6 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_16 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
-                    int _min_20 = ((_max_16) < (seqlen) ? (_max_16) : (seqlen));
-                    item_lo_6 = _min_20;
-                    int _max_17 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
-                    int _min_21 = ((_max_17) < (seqlen) ? (_max_17) : (seqlen));
-                    item_hi_6 = _min_21;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_18 = ((cu_seqlens[sequence_7]) > (0) ? (cu_seqlens[sequence_7]) : (0));
+                    int _min_22 = ((_max_18) < (seqlen) ? (_max_18) : (seqlen));
+                    item_lo_6 = _min_22;
+                    int _max_19 = ((cu_seqlens[sequence_7 + 1]) > (0) ? (cu_seqlens[sequence_7 + 1]) : (0));
+                    int _min_23 = ((_max_19) < (seqlen) ? (_max_19) : (seqlen));
+                    item_hi_6 = _min_23;
                     int item_count_6 = 0;
                     if (item_hi_6 > item_lo_6) {
                         item_count_6 = (item_hi_6 + 127) / 128 - item_lo_6 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_6];
+                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_7];
                             if (candidate_checkpoint_6 > item_lo_6 && candidate_checkpoint_6 < item_hi_6 && candidate_checkpoint_6 % 128 != 0) {
                                 item_checkpoint_6 = candidate_checkpoint_6;
                                 checkpoint_rank_6 = candidate_checkpoint_6 / 128 - item_lo_6 / 128 + 1;
@@ -1977,8 +2044,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_6 = 0;
                     logical_end_6 = item_count_6;
                 } else {
-                    first_logical_6 = seq_chunk_cumsum[sequence_6];
-                    logical_end_6 = seq_chunk_cumsum[sequence_6 + 1];
+                    first_logical_6 = seq_chunk_cumsum[table_base + sequence_7];
+                    logical_end_6 = seq_chunk_cumsum[table_base + sequence_7 + 1];
                 }
                 int _uniform_13 = make_warp_uniform(first_logical_6);
                 first_logical_6 = _uniform_13;
@@ -1986,14 +2053,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 logical_end_6 = _uniform_14;
                 #pragma unroll 1
                 for (int logical_6 = first_logical_6; logical_6 < logical_end_6; logical_6++) {
-                    int physical_chunk_3 = logical_6 - sequence_6 * nchunks;
+                    int physical_chunk_3 = logical_6 - sequence_7 * nchunks;
                     int segment_offset_4 = 0;
                     int segment_limit_4 = 128;
-                    if (metadata_from_cu_seqlens != 0) {
+                    if (metadata_from_cu_seqlens == 1) {
                         int first_chunk_4 = item_lo_6 / 128;
                         int segment_start_4 = ((checkpoint_rank_6 < logical_6) ? (first_chunk_4 + logical_6 - 1) * 128 : ((logical_6 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 == 0) ? item_lo_6 : (first_chunk_4 + logical_6) * 128)));
-                        int _min_22 = ((((checkpoint_rank_6 < logical_6 + 1) ? (first_chunk_4 + (logical_6 + 1) - 1) * 128 : ((logical_6 + 1 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 + 1 == 0) ? item_lo_6 : (first_chunk_4 + (logical_6 + 1)) * 128)))) < (item_hi_6) ? (((checkpoint_rank_6 < logical_6 + 1) ? (first_chunk_4 + (logical_6 + 1) - 1) * 128 : ((logical_6 + 1 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 + 1 == 0) ? item_lo_6 : (first_chunk_4 + (logical_6 + 1)) * 128)))) : (item_hi_6));
-                        int segment_end_5 = _min_22;
+                        int _min_24 = ((((checkpoint_rank_6 < logical_6 + 1) ? (first_chunk_4 + (logical_6 + 1) - 1) * 128 : ((logical_6 + 1 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 + 1 == 0) ? item_lo_6 : (first_chunk_4 + (logical_6 + 1)) * 128)))) < (item_hi_6) ? (((checkpoint_rank_6 < logical_6 + 1) ? (first_chunk_4 + (logical_6 + 1) - 1) * 128 : ((logical_6 + 1 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 + 1 == 0) ? item_lo_6 : (first_chunk_4 + (logical_6 + 1)) * 128)))) : (item_hi_6));
+                        int segment_end_5 = _min_24;
                         physical_chunk_3 = segment_start_4 / 128;
                         segment_offset_4 = segment_start_4 - physical_chunk_3 * 128;
                         segment_limit_4 = segment_end_5 - physical_chunk_3 * 128;
