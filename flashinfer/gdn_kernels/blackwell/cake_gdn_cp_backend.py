@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Four-stage context-parallel GDN prefill backend for SM100/SM103.
+"""Four-stage context-parallel GDN prefill backend for SM100/SM103/SM107.
 
 The prepared launcher stages prefix sums, directly binds index mappings, and
 owns all cross-stage workspaces.  Its captured replay path preserves the pinned PR4078
@@ -1549,7 +1549,7 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
     max_seqlen: int | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> None:
-    """Public dispatcher target; every accepted SM100/SM103 route uses GDN CP."""
+    """Public dispatcher target; every accepted SM100/SM103/SM107 route uses GDN CP."""
 
     global _public_key, _public_prepared
     stream = torch.cuda.current_stream(q.device)
