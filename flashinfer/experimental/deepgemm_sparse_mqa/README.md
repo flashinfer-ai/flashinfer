@@ -50,6 +50,8 @@ uint8 with the extent given by `metadata_size_bytes()`; the int32 workspace has
 `metadata_workspace_words()` entries and must initially be zero. Its three counters are
 restored by the kernel after every submission. Split allocation order is not a canonical
 serialization; consume metadata through this ABI rather than comparing raw buffers.
+There is no `use_unaligned_ks` keyword: the former one only ever raised, and passing
+it now raises `TypeError` (the exported programs serve aligned windows).
 
 `prepare_sparse_mqa_logits(q, sf_q, kv, sf_kv, weights, metadata_plan, output=None)`
 binds packed E2M1 `[Q, 32, 64]` or E4M3 `[Q, 32, 128]` queries, int32 `[Q, 32]` packed

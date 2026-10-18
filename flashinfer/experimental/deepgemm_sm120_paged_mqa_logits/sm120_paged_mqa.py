@@ -39,7 +39,6 @@ CATALOG_SCHEMA = "sm120_paged_mqa.v1"
 CATALOG_FILE = "sm120_paged_mqa_catalog.json"
 HEAD_DIM = 128
 FUSED_ROW_BYTES = HEAD_DIM + 4  # one FP8 row plus its FP32 scale
-LOGITS_DTYPES = ("float32",)
 
 # Exported compute capabilities.  sm_121a (GB10) has the same instruction
 # surface but a separate cubin; it joins when a device is measured.
@@ -189,12 +188,8 @@ def next_n_atoms(next_n, batch, num_heads=None, max_context_hint=None):
     return int(atom_rule()["num_atoms"][f"n{int(next_n)}:{variant}"])
 
 
-def route_name(
-    num_heads, page_kv, next_n, batch, logits_dtype="float32", max_context_hint=None
-):
+def route_name(num_heads, page_kv, next_n, batch, max_context_hint=None):
     """Logical route of a problem (host-known scalars only, incl. the batch)."""
-    if logits_dtype not in LOGITS_DTYPES:
-        raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
     variant = atom_variant(num_heads, next_n, batch, max_context_hint)
     return f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}:{variant}"
 
@@ -209,7 +204,6 @@ def route_available(
     page_kv,
     next_n,
     batch=None,
-    logits_dtype="float32",
     max_context_hint=None,
 ):
     """True when the shipped catalog carries this paged route (host-only).
@@ -220,8 +214,6 @@ def route_available(
     """
     try:
         if num_heads not in exported_heads() or page_kv not in exported_page_sizes():
-            return False
-        if logits_dtype not in LOGITS_DTYPES:
             return False
         selection = atom_rule()["selection"]
         key = f"h{int(num_heads)}:n{int(next_n)}"
@@ -722,7 +714,6 @@ class Sm120PagedIndexerPlan:
         schedule_meta=None,
         output=None,
         sm_count=None,
-        logits_dtype="float32",
         max_context_hint=None,
     ):
         import torch
@@ -766,10 +757,10 @@ class Sm120PagedIndexerPlan:
         max_context_len = int(max_context_len)
         if max_context_len < 1 or max_context_len > int(block_table.shape[1]) * page_kv:
             raise ValueError("max_context_len must be in 1..S * page_kv")
-        if not route_available(num_heads, page_kv, next_n, batch, logits_dtype):
+        if not route_available(num_heads, page_kv, next_n, batch):
             raise ValueError(
                 f"no exported SM120 paged MQA route for {num_heads} heads, page "
-                f"{page_kv}, next_n {next_n}, batch {batch}, {logits_dtype}"
+                f"{page_kv}, next_n {next_n}, batch {batch}"
             )
         tensors = [q, kv_cache, weights, context_lens, block_table]
         if any(tensor.device != q.device for tensor in tensors):
@@ -803,7 +794,7 @@ class Sm120PagedIndexerPlan:
         self.atom_variant = atom_variant(num_heads, next_n, batch, max_context_hint)
         self.num_next_n_atoms = next_n_atoms(next_n, batch, num_heads, max_context_hint)
         self.route_name = route_name(
-            num_heads, page_kv, next_n, batch, logits_dtype, max_context_hint
+            num_heads, page_kv, next_n, batch, max_context_hint
         )
         self.route = _catalog()["routes"][self.route_name]
         bindings = {
