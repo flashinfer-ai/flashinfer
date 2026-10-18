@@ -27,7 +27,7 @@ MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test_trtllm_allreduce_fusion_pdl.py"
 
 # Tests that require torchrun instead of mpirun
-TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py"
+TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py tests/comm/test_mnnvl_cutedsl_h7168.py tests/comm/test_mnnvl_cutedsl_static_fp8.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
 _run_pytest_group() {
@@ -82,11 +82,14 @@ main() {
     echo ""
 
     for test_file in $TORCHRUN_TEST_FILES; do
+        local junit_file
+        junit_file=$(junit_file_for_test "$test_file")
         echo "=========================================="
-        echo "Running: ${TORCHRUN_PREFIX} -m pytest ${test_file} -v"
+        echo "Running: ${TORCHRUN_PREFIX} -m pytest ${test_file} -v --junitxml=${junit_file}"
         echo "=========================================="
         if [ "$DRY_RUN" != "true" ]; then
-            if ${TORCHRUN_PREFIX} -m pytest "${test_file}" -v; then
+            rm -f "$junit_file"
+            if ${TORCHRUN_PREFIX} -m pytest "${test_file}" -v --junitxml="${junit_file}"; then
                 echo "PASSED: $test_file"
             else
                 echo "FAILED: $test_file"

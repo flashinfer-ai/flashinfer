@@ -6,7 +6,8 @@ schedule is derived in-kernel); ``get_paged_mqa_logits_metadata`` is a
 no-launch DeepGEMM-signature placeholder.
 
 The tests skip while the installed catalog carries no paged route for the
-shape (``paged_route_available``); the host-only helpers are tested always.
+shape (``paged_route_available``); the host-only helpers are tested always and
+their device-dependent checks run only on a catalogued architecture.
 Correctness is validated on EVERY shipped shape through
 ``PagedMqaPlan(enforce_admission=False)`` (the export protocol's view: the
 catalog's admission rules are routing policy, not a validity bound); where the
@@ -40,11 +41,27 @@ CASES = [
     ),  # batch > dynamic_scheduler.max_batch: the static program of a single-atom geometry
     (32, 64, 1, 16, 4096),
     (64, 32, 1, 16, 4096),
-    # next_n-2 coverage geometries: exported, admission withheld until their
-    # table clears
+    # next_n-2 coverage geometries: static-preferred and admitted at batch <= 16 through
+    # 5376 context on both architectures; ``_inputs`` draws max_context_len <= 5323 for
+    # an average context of 4096, so every draw of these cases lands inside that window.
     (32, 64, 2, 16, 4096),
     (64, 32, 2, 16, 4096),
+    # (64, 64, 2) at batch 256 and an average context of 98304: ``_inputs`` draws max_context_len in
+    # 68812..127795, inside the sm_100a static-preferred window [256, 256, 43008, 169728], whose text
+    # route ``paged:fp8:h64:p64:n2:hyb8c4`` serves it there (the hybrid tail pool of the static
+    # program, one scheduler-state word per SM); the dynamic route on sm_103a.
+    (64, 64, 2, 256, 98304),
 ]
+
+
+def _text_routes(scheduler):
+    """Every window-selected text route of ``paged_dynamic_scheduler()``."""
+    return {
+        route
+        for table in scheduler["static_window_routes"].values()
+        for pairs in table.values()
+        for _window, route in pairs
+    }
 
 
 def _catalog_paged_routes():
@@ -66,6 +83,19 @@ def _skip_unless_route(heads, page, next_n):
         pytest.skip(
             f"catalog has no paged route for H={heads}, page {page}, next_n {next_n}"
         )
+
+
+def _catalogued_device_arch():
+    """The catalog architecture of the current CUDA device, or ``None`` without a CUDA device or on a
+    device whose architecture ships no programs: the device-dependent half of a host test then ends."""
+    if not torch.cuda.is_available():
+        return None
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    try:
+        return dense_mqa.device_arch(torch.device("cuda"))
+    except RuntimeError:
+        return None
 
 
 def _admitted(q, ctx_2d, max_len, heads, page, next_n):
@@ -327,6 +357,17 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     if plan.route_name == static and static in scheduler["routes"]:
         preferred = _runtime.paged_static_preferred(plan.arch, static, batch, max_len)
         assert batch > scheduler["max_batch"] or preferred
+    if plan.route_name in _text_routes(scheduler):
+        # a window-selected text of the static program: inside a static-preferred window that names it, the
+        # plan's scheduler state is the route's (one word per SM for the hybrid texts)
+        assert _runtime.paged_static_preferred(plan.arch, static, batch, max_len)
+        assert (
+            _runtime.paged_static_window_route(plan.arch, static, batch, max_len)
+            == plan.route_name
+        )
+    assert plan.sched_counters.numel() == _runtime.paged_sched_state_words(
+        plan.route_name, plan.num_sms
+    )
     num_sms = plan.num_sms
     plan.output.fill_(float("nan"))
     stream = torch.cuda.Stream()
@@ -457,7 +498,7 @@ def test_paged_host_helpers_and_rejections():
     with pytest.raises(ValueError):
         _runtime.paged_next_n_atoms(3)
     assert not _runtime.paged_route_available(64, 64, 3)
-    if not torch.cuda.is_available():
+    if _catalogued_device_arch() is None:
         return
     device = torch.device("cuda")
     ctx_1d = torch.full((4,), 100, device=device, dtype=torch.int32)
@@ -661,29 +702,102 @@ def test_paged_dynamic_scheduler_routes():
             )
             == static
         )
+    text_routes = _text_routes(dynamic)
     for route_name in catalog["paged_routes"]:
-        if route_name.endswith(":dyn") or route_name in dynamic["routes"]:
+        if (
+            route_name.endswith(":dyn")
+            or route_name in dynamic["routes"]
+            or route_name in text_routes
+        ):
             continue
         fields = {field[0]: int(field[1:]) for field in route_name.split(":")[2:5]}
         assert (
             _runtime.paged_route_name(fields["h"], fields["p"], fields["n"], batch=1)
             == route_name
         )
+    # window-selected text routes (catalog v10): each is catalogued, delivered exactly on the architectures whose table
+    # names it, serves a program distinct from the static and dynamic ones there, binds the scheduler state its
+    # ``sched_state`` record sizes, and inherits the static route's admission rules
+    for arch, table in dynamic["static_window_routes"].items():
+        for static, pairs in table.items():
+            assert static in dynamic["routes"], (arch, static)
+            for window, route in pairs:
+                assert route in catalog["paged_routes"] and route.startswith(
+                    static + ":"
+                ), route
+                assert window in dynamic["static_windows"][arch][static], (
+                    route,
+                    window,
+                )
+                programs = catalog["paged_routes"][route]["stages"][0][1]
+                assert arch in programs, (route, arch)
+                for other in catalog["arches"]:
+                    named = any(
+                        route == r
+                        for _s, ps in dynamic["static_window_routes"]
+                        .get(other, {})
+                        .items()
+                        for _w, r in ps
+                    )
+                    assert (other in programs) == named, (route, other)
+                program = programs[arch]
+                static_program = catalog["paged_routes"][static]["stages"][0][1][arch]
+                dyn_program = catalog["paged_routes"][dynamic["routes"][static]][
+                    "stages"
+                ][0][1][arch]
+                assert program not in (static_program, dyn_program), route
+                assert "sched_counters" in {
+                    name for _kind, name in catalog["programs"][program]["arg_plan"]
+                }
+                base, per_sm, max_sms = dynamic["sched_state"][route]
+                assert base >= 2 and per_sm >= 1 and max_sms >= SM_COUNT[arch], route
+                assert (
+                    _runtime.paged_sched_state_words(route, SM_COUNT[arch])
+                    == base + per_sm * SM_COUNT[arch]
+                )
+                admission = catalog["policy"]["paged"]["admission"][arch]
+                assert admission.get(route) == admission.get(static), (route, static)
+                min_batch, max_batch, min_ctx, max_ctx = window
+                batch = min_batch if max_batch is None else max_batch
+                ctx = max(min_ctx, 256) if max_ctx is None else max_ctx
+                assert (
+                    _runtime.paged_route_name(
+                        int(static.split(":h")[1].split(":")[0]),
+                        int(static.split(":p")[1].split(":")[0]),
+                        int(static.split(":n")[1].split(":")[0]),
+                        batch=batch,
+                        max_context_len=ctx,
+                        arch=arch,
+                    )
+                    == route
+                )
+    assert _runtime.paged_sched_state_words("paged:fp8:h64:p64:n1", 148) == 2
     # static-preferred windows: inside one, a batch the dynamic route would take stays on the static program when the
     # call's architecture and max_context_len are given; without them (and outside the windows) the rule above holds.
+    # Each parsed window is (min_batch, max_batch, min_context_len, max_context_len): the catalog's two-field
+    # entries start at batch 1 and context 1, its three-field entries carry a lower batch bound, its four-field
+    # entries a context lower bound as well (test_paged_static_window_lower_bound).
     for arch, table in dynamic["static_windows"].items():
         for static, windows in table.items():
             assert static in dynamic["routes"] and windows, (arch, static)
             fields = {field[0]: int(field[1:]) for field in static.split(":")[2:5]}
-            for max_batch, max_ctx in windows:
-                assert max_batch is None or 1 <= max_batch <= dynamic["max_batch"]
-                assert max_ctx is None or max_ctx >= 1
-                batch = 1 if max_batch is None else max_batch
-                ctx = 256 if max_ctx is None else max_ctx
+            for min_batch, max_batch, min_ctx, max_ctx in windows:
+                assert 1 <= min_batch <= dynamic["max_batch"]
+                assert (
+                    max_batch is None or min_batch <= max_batch <= dynamic["max_batch"]
+                )
+                assert min_ctx >= 1 and (max_ctx is None or max_ctx >= min_ctx)
+                batch = min_batch if max_batch is None else max_batch
+                ctx = max(min_ctx, 256) if max_ctx is None else max_ctx
                 assert _runtime.paged_static_preferred(arch, static, batch, ctx)
                 h, p, n = fields["h"], fields["p"], fields["n"]
                 at_ctx = {"batch": batch, "max_context_len": ctx, "arch": arch}
-                assert _runtime.paged_route_name(h, p, n, **at_ctx) == static
+                # the static route, or the text route the window names (catalog v10)
+                expected = (
+                    _runtime.paged_static_window_route(arch, static, batch, ctx)
+                    or static
+                )
+                assert _runtime.paged_route_name(h, p, n, **at_ctx) == expected
                 dyn_route = dynamic["routes"][static]
                 assert _runtime.paged_route_name(h, p, n, batch=batch) == dyn_route
                 if max_ctx is not None:
@@ -692,6 +806,129 @@ def test_paged_dynamic_scheduler_routes():
                     beyond = _runtime.paged_route_name(h, p, n, **past) == dyn_route
                     pref = _runtime.paged_static_preferred(arch, static, batch, ctx1)
                     assert beyond or pref
+
+
+# The SM count of each catalogued architecture (B200 148, GB300 152): the batch of the (64, 64, 2)
+# batch-lower-bounded static window, pinned so the probe below is deterministic per architecture.
+SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
+
+
+def test_paged_static_window_lower_bound(monkeypatch):
+    """A ``static_windows`` entry may carry a lower batch bound (``[min_batch, max_batch, max_context_len]``):
+    the (64, 64, 2) route keeps the static program at batch == the SM count through 5376 context on both
+    architectures, while batch 64 / 128, the neighbouring batches and longer contexts take the dynamic route;
+    the static route admits the window; an entry of another length is refused when the policy is read."""
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    dynamic = _runtime.paged_dynamic_scheduler()
+    static, dyn = "paged:fp8:h64:p64:n2", "paged:fp8:h64:p64:n2:dyn"
+    if dynamic["routes"].get(static) != dyn:
+        pytest.skip("catalog ships no dynamic-scheduler program for h64 p64 n2")
+
+    def route(arch, batch, ctx):
+        return _runtime.paged_route_name(
+            64, 64, 2, batch=batch, max_context_len=ctx, arch=arch
+        )
+
+    real = dense_mqa._catalog()
+    for arch in sorted(real["arches"]):
+        sms = SM_COUNT[arch]
+        windows = dynamic["static_windows"][arch][static]
+        assert (sms, sms, 1, 5376) in windows and (1, 64, 1, 3840) in windows, (
+            arch,
+            windows,
+        )
+        # the engine extents of an average-4096 call (``_inputs`` draws max_context_len <= 5323)
+        for ctx in (2880, 4096, 5323, 5376):
+            assert route(arch, sms, ctx) == static, (arch, ctx)
+        assert _runtime.paged_static_preferred(arch, static, sms, 5376)
+        assert route(arch, sms, 5377) == dyn and route(arch, sms, 8192) == dyn
+        for batch in (64, 128, sms - 1, sms + 1):
+            assert route(arch, batch, 4096) == dyn, (arch, batch)
+        # the batch-64 edge from batch 1 is unchanged; the other architecture's SM count is not this one's window
+        assert route(arch, 64, 3840) == static
+        other = next(count for a, count in SM_COUNT.items() if a != arch)
+        assert route(arch, other, 4096) == dyn
+        assert (
+            _runtime.paged_route_name(
+                64, 64, 1, batch=sms, max_context_len=4096, arch=arch
+            )
+            == "paged:fp8:h64:p64:n1:dyn"
+        )
+        # the static route admits every call its window selects (the catalog invariant)
+        assert _runtime.paged_route_admitted(arch, static, sms, 5376)
+        # the context-lower-bounded four-field form (catalog v10): sm_100a keeps the static program at batch 256 from
+        # 43008 through 169728 context (the measured 128k rows) and the dynamic one below (the measured 32k rows)
+        if arch == "sm_100a":
+            assert (256, 256, 43008, 169728) in windows, windows
+            # the window names the hybrid-tail-pool text of the static program (catalog v10): its own route, the
+            # static route's admission, one scheduler-state word per SM on top of the two
+            hyb = "paged:fp8:h64:p64:n2:hyb8c4"
+            assert ((256, 256, 43008, 169728), hyb) in dynamic["static_window_routes"][
+                arch
+            ][static]
+            for ctx in (43008, 131072, 169664, 169728):
+                assert route(arch, 256, ctx) == hyb, ctx
+                assert _runtime.paged_static_window_route(arch, static, 256, ctx) == hyb
+                assert _runtime.paged_static_preferred(arch, static, 256, ctx)
+                assert _runtime.paged_route_admitted(arch, hyb, 256, ctx)
+                assert _runtime.paged_route_admitted(arch, static, 256, ctx)
+            for ctx in (32768, 42624, 42752, 43007, 169729, 169984):
+                assert route(arch, 256, ctx) == dyn, ctx
+                assert (
+                    _runtime.paged_static_window_route(arch, static, 256, ctx) is None
+                )
+            for batch in (255, 257):
+                assert route(arch, batch, 131072) == dyn, batch
+            assert _runtime.paged_sched_state_words(hyb, sms) == 2 + sms
+            assert _runtime.paged_sched_state_words(static, sms) == 2
+            with pytest.raises(ValueError, match="at most"):
+                _runtime.paged_sched_state_words(hyb, 257)
+        else:
+            assert not any(len(w) == 4 and w[2] > 1 for w in windows), windows
+            assert route(arch, 256, 131072) == dyn
+            assert not dynamic["static_window_routes"].get(arch), arch
+    # an entry of another length is a catalog error, refused when the policy is read
+    patched = dict(real)
+    patched["policy"] = dict(real["policy"])
+    paged = real["policy"]["paged"]
+    patched["policy"]["paged"] = dict(
+        paged,
+        dynamic_scheduler=dict(
+            paged["dynamic_scheduler"],
+            static_windows={"sm_100a": {static: [[1, 2, 3, 4, 5]]}},
+        ),
+    )
+    monkeypatch.setattr(dense_mqa, "_catalog", lambda: patched)
+    monkeypatch.setattr(_runtime, "_catalog", lambda: patched)
+    with pytest.raises(ValueError, match="static window"):
+        _runtime.paged_dynamic_scheduler()
+    # a window route that is not a text route of its static route, and a malformed sched_state record, are refused too
+    for bad in (
+        dict(
+            static_window_routes={
+                "sm_100a": {
+                    static: [[[256, 256, 43008, 169728], "paged:fp8:h64:p64:n1"]]
+                }
+            }
+        ),
+        dict(static_window_routes={"sm_100a": {static: [[[256, 256, 43008, 169728]]]}}),
+        dict(sched_state={"paged:fp8:h64:p64:n2:hyb8c4": {"base_words": 2}}),
+        dict(
+            sched_state={
+                "paged:fp8:h64:p64:n2:hyb8c4": {
+                    "base_words": 0,
+                    "words_per_sm": 1,
+                    "max_sms": 256,
+                }
+            }
+        ),
+    ):
+        patched["policy"]["paged"] = dict(
+            paged, dynamic_scheduler=dict(paged["dynamic_scheduler"], **bad)
+        )
+        with pytest.raises(ValueError, match="static window route|sched_state"):
+            _runtime.paged_dynamic_scheduler()
 
 
 def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
@@ -765,12 +1002,12 @@ def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
     with pytest.raises(ValueError, match="requires batch and max_context_len"):
         _runtime.paged_route_available(heads, page, 2, arch="sm_100a")
     monkeypatch.undo()
-    if not torch.cuda.is_available():
+    arch = _catalogued_device_arch()
+    if arch is None:
         return
     # Live refusal under the shipped rules of this device's architecture (and the export bypass). The plan
     # resolves the route from the call's batch (the dynamic-scheduler route up to its max_batch, the static
     # route above it), so every probe is judged on the route the plan would select.
-    arch = dense_mqa.device_arch(torch.device("cuda"))
     probes = ((17, 1024), (17, 32769), (65, 8448), (129, 8448), (4096, 131072))
     route_for = lambda b, c: _runtime.paged_route_name(
         heads, page, 2, batch=b, max_context_len=c, arch=arch

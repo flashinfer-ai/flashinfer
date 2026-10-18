@@ -1318,6 +1318,14 @@ def _route(
         ):
             return "fp8_h64_source_exact"
         if max_q_len >= 257:
+            if num_heads in (16, 32, 64):
+                # The single-CTA M64 persistent body (num_heads runtime, heads
+                # past num_heads predicated) beats the low-head prefill
+                # producer on every 16/32/64-head prefill row of the DSv4
+                # contract on GB300: 2.1-5.2x on the 512-8192-token rows
+                # (widths 128-1024, single and dual caches), with the same
+                # oracle.  Two programs, selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
             return "fp8_lowhead_prefill"
         if (
             num_heads in (8, 16)

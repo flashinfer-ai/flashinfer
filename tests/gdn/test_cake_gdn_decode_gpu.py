@@ -324,6 +324,8 @@ def _launch_prefill(
         0,
         _SCALE,
         4,
+        # Launch ABI v2: total_tokens (4 sequences of 64) after num_seqs.
+        4 * 64,
         4,
         num_v_heads,
         total_tiles,

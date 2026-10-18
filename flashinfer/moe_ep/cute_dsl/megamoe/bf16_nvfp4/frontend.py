@@ -55,8 +55,16 @@ class MegaMoEBf16Nvfp4Config:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    defer_topk_reduce: bool = False
 
     def __post_init__(self) -> None:
+        if self.defer_topk_reduce and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "defer_topk_reduce requires enable_in_kernel_fc2_reduce=False "
+                "and in_kernel_fc2_reduce=False."
+            )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.activation not in ("swiglu", "situ"):
@@ -110,13 +118,15 @@ class MegaMoEBf16Nvfp4Config:
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
         if self.mma_tiler_mnk not in (
+            (128, 32, 256),
             (128, 64, 256),
             (128, 128, 256),
+            (256, 32, 256),
             (256, 64, 256),
             (256, 128, 256),
         ):
             raise ValueError(
-                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
+                "W4A16 MegaMoE requires M128/N32,N64,N128 or M256/N32,N64,N128, K256."
             )
         if self.cluster_shape_mnk != (2, 1, 1) and not (
             self.cluster_shape_mnk == (1, 1, 1) and self.mma_tiler_mnk == (128, 64, 256)
@@ -209,6 +219,7 @@ class MegaMoEBf16Nvfp4Frontend:
                 "activation": self.config.activation,
                 "situ_beta": self.config.situ_beta,
                 "situ_linear_beta": self.config.situ_linear_beta,
+                "defer_topk_reduce": self.config.defer_topk_reduce,
             },
         )
         if new_config != self._config:
@@ -624,7 +635,10 @@ class MegaMoEBf16Nvfp4Frontend:
                 "combine_output must be CUDA BF16 with the expected shape."
             )
         output = inputs.reduced_output
-        if c.in_kernel_fc2_reduce:
+        if c.defer_topk_reduce:
+            if output is not None:
+                raise ValueError("defer_topk_reduce does not use reduced_output.")
+        elif c.in_kernel_fc2_reduce:
             if output is not None:
                 raise ValueError("in_kernel_fc2_reduce does not use reduced_output.")
         elif (
@@ -700,6 +714,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     )
     fc1_norm_const: Optional[torch.Tensor] = None
     _use_fc1_norm_const: bool = False
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     @property
     def kernel_combine_output(self) -> torch.Tensor:
@@ -712,6 +728,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     def destroy(self) -> None:
         if not self._destroyed:
             self._staging_inputs = None
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._frontend.release()
             for root in self._sym_roots:
                 free_sym_tensor(root)
@@ -747,6 +765,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    defer_topk_reduce: bool = False,
 ) -> MegaMoEBf16Nvfp4SymmBuffer:
     """Allocate stable per-expert scales and BF16 transport buffers.
 
@@ -757,6 +776,8 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     Later omission retains the last staged normalization. A captured graph
     retains its normalization mode; enabling it requires warmup and recapture.
     A normalized graph observes in-place updates to its captured source tensor.
+    ``defer_topk_reduce=True`` exposes BF16 per-route rows for caller finalization
+    and requires in-kernel FC2 reduction to be disabled.
     """
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
@@ -783,6 +804,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        defer_topk_reduce=defer_topk_reduce,
     )
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
@@ -799,6 +821,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             combine_dtype="bf16",
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             apply_topk_in_fc1=apply_topk_in_fc1,
+            defer_topk_reduce=defer_topk_reduce,
         )
     else:
         resolved_knobs = {}
@@ -814,6 +837,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         "activation": activation,
         "situ_beta": situ_beta,
         "situ_linear_beta": situ_linear_beta,
+        "defer_topk_reduce": defer_topk_reduce,
     }
     if not tuner.is_valid_bf16_nvfp4_for_config(cfg, optional_config):
         raise ValueError(
@@ -861,7 +885,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
 
 
 def bf16_nvfp4_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
@@ -872,14 +896,25 @@ def bf16_nvfp4_mega_moe(
     sync: bool = False,
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
-) -> None:
+) -> Optional[torch.Tensor]:
+    """Run W4A16 MegaMoE, returning per-route rows in deferred mode.
+
+    Deferred workspaces require ``y=None``; otherwise ``y`` receives the
+    finalized output. Returned partials borrow the symmetric workspace.
+    """
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    if y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden}).")
-    if not y.is_cuda or not y.is_contiguous():
-        raise ValueError("y must be a contiguous CUDA tensor.")
+    if symm_buffer._frontend.config.defer_topk_reduce:
+        if y is not None:
+            raise ValueError("defer_topk_reduce=True requires y=None.")
+    else:
+        if y is None or y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
+            raise ValueError(
+                f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden})."
+            )
+        if not y.is_cuda or not y.is_contiguous():
+            raise ValueError("y must be a contiguous CUDA tensor.")
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
@@ -906,9 +941,11 @@ def bf16_nvfp4_mega_moe(
         num_tokens=n,
     )
     if symm_buffer._frontend.config.in_kernel_fc2_reduce:
+        assert y is not None
         y.copy_(result[:, 0])
     if sync:
         torch.cuda.synchronize()
+    return result if symm_buffer._frontend.config.defer_topk_reduce else None
 
 
 def bf16_nvfp4_mega_launch_thunk(
@@ -917,7 +954,10 @@ def bf16_nvfp4_mega_launch_thunk(
     symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
 ) -> Callable[[], None]:
     reduced_output = None
-    if not symm_buffer._frontend.config.in_kernel_fc2_reduce:
+    if not (
+        symm_buffer._frontend.config.in_kernel_fc2_reduce
+        or symm_buffer._frontend.config.defer_topk_reduce
+    ):
         ensure_not_capturing("launch thunk output allocation")
         # Keep this raw-core thunk compute-only while sharing the Tensor signature.
         reduced_output = torch.empty(

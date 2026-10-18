@@ -10,17 +10,25 @@ with per-variant SASS equivalence checks against the generated originals.
 
 - `manifest.json` is the only registry. Each entry under `variants` names
   its kernel sources (`outputs[].path`, each shared by every specialization of
-  the same kernel body), the compile-time `defines` that specialize them
-  (passed as `-D` flags), the `specializations` the resolver matches, and
-  one host shim (`host_binding`).
+  the same kernel body), the `specializations` the resolver matches (also
+  passed as the `-D` flags that specialize the body, unless the entry spells
+  out its own `defines`: the decode bodies that bake their constants in-file
+  take none, and some bodies take only a subset of the keys), and the
+  template, kernel symbol and parameters of its host shim (`host_binding`).
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
   outputs of a record partition its `architectures`, and the loader
   compiles the one output that lists the device's architecture. Genuine
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
-  target other than exact SM100a; the seven `fullgrid_vhold` prefill variants
-  stay SM100a-only) or, when one architecture's lowering of a shared body
+  target other than exact SM100a; the eight `fullgrid_vhold` prefill variants
+  stay SM100a-only; a prefill body that SM107a shares with SM100a and/or
+  SM103a masks its shared-memory descriptor addresses per architecture
+  inside the one file -- the per-file `CAKE_GDN_SMEM_DESC_MASK`, `0x7FFF`
+  under `#if __CUDA_ARCH__ == 1070` and `0x3FFF` otherwise, or an exact
+  `#if __CUDA_ARCH__ == 1030` guard -- so no prefill record carries a
+  mask-only SM107a copy of another body) or, when one architecture's
+  lowering of a shared body
   differs from the shipped text, in that architecture's own output: the
   SM107a decode bodies scale q through `cake_f32_mul_f64const_rn` (an exact,
   FP64-free emulation of `(float)((double)x * SCALE)` defined in
@@ -29,7 +37,7 @@ with per-variant SASS equivalence checks against the generated originals.
   `cake_`) and are delivered as `sm_107a`-only outputs of the same records,
   while the SM100a/SM103a outputs keep the shipped text byte for byte. In the
   manifest this reads as follows: a decode record exported for SM107a together
-  with SM100a/SM103a (36 three-architecture decode records in the current
+  with SM100a/SM103a (23 three-architecture decode records in the current
   manifest) keeps its shipped body as `outputs[0]` with `architectures`
   reduced to `["sm_100a", "sm_103a"]` and gains an `sm_107a` output; a decode
   record exported for SM107a alone (the `_vpre` / `_pro` bodies; the fp32 T=1
@@ -41,37 +49,112 @@ with per-variant SASS equivalence checks against the generated originals.
   `csrc/`, shared with other Cake families, so the cubin compile adds `csrc`
   to its include path). No SM100a/SM103a kernel body and no kernel's
   behaviour changes.
-  `cuda/gdn_prefill_generated.cuh` and `../cake_gdn_common.cuh` are the
-  shared device headers.
-  Three prefill variants keep their own source with in-file defines
-  (`dvsplit_initial_bf16state_135bfa59984f`, `..._d8b5b50285af`,
-  `dvsplit_initial_f16io_f481beb70ea9`): compiled from the shared body with
-  the same values passed as `-D`, nvcc 13.4 (sm_103a) schedules them
-  differently (same instruction count; register assignment, instruction
-  order and one uniform address computation change), deterministically.
-  They stay as separate files so every variant compiles to the SASS of its
-  original under identical compile conditions.
-- `host/` holds one TVM-FFI launcher per variant. The helpers they share
-  (device guard, tensor checks, dynamic shared-memory opt-in) live in
-  `host/cake_gdn_host_common.h`.
+  `../cake_gdn_common.cuh` is the shared device header of the decode bodies
+  that do not include `cake_gdn_device_common.cuh`.
+  In-file defines and the same values passed as `-D` are not interchangeable:
+  for three prefill variants (`dvsplit_initial_bf16state_135bfa59984f`,
+  `..._d8b5b50285af`, `dvsplit_initial_f16io_f481beb70ea9`) compiled from the
+  shared body with their values passed as `-D`, nvcc 13.4 (sm_103a) schedules
+  the kernel differently from the in-file form (same instruction count;
+  register assignment, instruction order and one uniform address computation
+  change), deterministically.
+- `host/templates/` holds one TVM-FFI launcher template per shim class. The
+  former per-variant shims differed only in identifiers and literals, which
+  the templates take as `@NAME@` placeholders: `@ENTRY@`, `@MODULE_IDENT@`,
+  `@CUDA_SYMBOL@` and `@SHIM_NAMESPACE@` come from `host_binding` (`entry`,
+  `module_ident`, `cuda_symbol`, `shim_namespace`), every other placeholder
+  from `host_binding.params`. `flashinfer/jit/cake_gdn.py` renders the shim
+  text at load time; it is byte-identical to the former file
+  (`tests/gdn/cake_gdn_host_shim_sha256.json` pins it per variant). The
+  helpers the launchers share (device guard, tensor checks, dynamic
+  shared-memory opt-in) live in `host/cake_gdn_host_common.h`.
 
 `flashinfer/jit/cake_gdn.py` compiles the kernel to a cubin with `nvcc`,
-embeds it into the host shim, and resolves requests to exactly one listed
-variant; requests outside the listed routes fail closed.
+embeds it into the rendered host shim, and resolves requests to exactly one
+listed variant; requests outside the listed routes fail closed.
 
 ## Contracts
 
 Indexed prefill requires every state slot to be in `[0, pool_size)`.
 Indexed decode requires every initial/output state slot to be `-1` or in
-`[0, state.size(0))`. The prefill adapter validates CUDA-resident slots
-asynchronously on the caller stream before dispatch, including during CUDA
-Graph capture and replay. The decode adapters trust caller-provided slots
-by default (parity with the CuTe decode kernels) and perform the same
-asynchronous fail-closed check only when `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`.
+`[0, state.size(0))`. Both adapters trust caller-provided slots by default
+(parity with the CuTe kernels) and perform an asynchronous fail-closed check
+on the caller stream (device-side assert, also under CUDA Graph capture and
+replay) only when `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`.
+
+### Non-CP prefill: host-free launch
+
+The non-CP prefill route (`flashinfer/gdn_prefill.py::_run_cake_gdn_prefill`,
+`backend="cake_gdn"` with `use_cp=False`/`"auto"`) reads nothing back from
+the device. There is no host-int cache, no cached int32 copy and no
+capture-time "warm up eagerly first" error; the one-time `nvcc` compile and
+TVM-FFI load of a kernel variant is the only eager step before a CUDA Graph
+capture.
+
+- Host-known inputs. `num_seqs = cu_seqlens.numel() - 1` and
+  `total_tokens = q.shape[0]` are shapes. The kernel variant
+  (`flashinfer/jit/cake_gdn.py::select_cake_gdn_prefill_variant`, no
+  `seq_lens` argument) and the persistent grid follow an upper bound on the
+  longest sequence: the exact maximum from `cu_seqlens_cpu` when given, else
+  the public `max_seqlen` hint, else `total_tokens`. A loose bound is always
+  correct; it only changes the grid size and whether the stateless
+  single-chunk kernel (bound <= 64 tokens, no initial/final state, no
+  checkpoints) is eligible.
+- `cu_seqlens_cpu` (keyword-only on `chunk_gated_delta_rule`): an optional
+  host copy of `cu_seqlens` -- a one-dimensional int32/int64 CPU tensor or
+  a sequence of Python ints of length `num_seqs + 1` with the same values
+  (vLLM `query_start_loc_cpu`, the prefix sums of SGLang
+  `extend_seq_lens_cpu`). With it the host validates the offsets
+  (non-decreasing, first `0`, last `total_tokens`), rejects a `max_seqlen`
+  smaller than the exact maximum and checks the checkpoint count exactly,
+  all before any launch and without a synchronization. A CUDA tensor is
+  refused, not copied. Other backends ignore the parameter.
+- Device-side guard (kernel launch ABI v2). The kernel receives
+  `total_tokens` as a scalar after `num_seqs` and resolves `cu_seqlens` per
+  work tile: `begin = min(cu_seqlens[b], total_tokens)`,
+  `end = min(max(cu_seqlens[b + 1], begin), total_tokens)`. Offsets past the
+  token count are clamped and a non-monotonic pair becomes an empty sequence
+  -- a documented no-op (its output rows are untouched, its state slot keeps
+  the initial state), never an out-of-bounds access and never a trap. The
+  consistency of `checkpoint_cu_starts` with `cu_seqlens` and the interval
+  stays a caller precondition, as the public docstring states; the host does
+  not read it.
+- Grid rule (`_cake_gdn_prefill_grid_x(total_tiles, sm_count, dvsplit,
+  bound_tokens)`, one formula shared with the Cake program's
+  `_select_persistent_grid_ctas`): DV-split or `total_tiles <= 128` ->
+  `min(sm_count, total_tiles)`; else `G = min(sm_count, total_tiles)` when
+  `ceil(total_tiles / G) < ceil(total_tiles / 128)`, otherwise `128` (ties
+  keep 128). `bound_tokens` is validated but does not change the grid.
+  The host shim checks `0 < grid_x <= total_tiles` and the tensor-map
+  workspace size (`512` bytes per CTA, cached per device, stream and grid).
+- Metadata dtypes. The kernels take int32 offsets and slots. Int32
+  `cu_seqlens`, `state_indices` and `checkpoint_cu_starts` reach the kernel
+  as is (zero-copy path); int64 metadata is cast on the caller's stream at
+  every call (one small device kernel, recorded into the graph under
+  capture). Nothing is cached by tensor identity, so a buffer rewritten in
+  place -- an inference-mode tensor without a version counter, a persistent
+  engine buffer, or the inputs of a captured graph between replays -- is
+  always what the kernel reads.
+- CUDA Graph. Capture needs no prior eager call for the same metadata; replay
+  reads the live `cu_seqlens`, `state_indices`, `checkpoint_cu_starts` and
+  data buffers. Tests: `tests/gdn/test_cake_gdn_prefill_gpu.py` (zero-sync
+  proof under `torch.cuda.set_sync_debug_mode("error")` plus a profiler
+  check, cold capture, in-place rewrite replay, chunked state carry, int64 /
+  int32 equivalence, malformed-metadata no-op) and the CPU contract tests in
+  `tests/gdn/test_cake_gdn_prefill.py`.
 
 Use the GDN prefill API with `backend="cake_gdn"` to select this backend
-explicitly; automatic prefill dispatch continues to select CuTe. Decode
-requests with `backend="auto"` try the listed decode variants first.
+explicitly; automatic prefill dispatch continues to select CuTe.  Under
+`backend="cake_gdn"` with `use_cp="auto"` (the default), a BF16/FP16-I/O row
+with FP32 initial + final state, gates, no checkpoints and no state indices
+whose work leaves most SMs idle (`4 * num_seqs * max(Hq, Hv) < SMs`) and whose
+longest sequence (`max_seqlen`) has at least 4096 tokens runs the Cake CP
+backend (`csrc/gdn/gdn_cp`, `flashinfer/gdn_kernels/blackwell/cake_gdn_cp_backend.py`)
+on SM100a/SM103a instead of a record of this manifest; every other row keeps
+the non-CP record.  Pass `max_seqlen` when the batch has more than one
+sequence: without it the band estimates the longest sequence as `ceil(total_seq_len / num_seqs)` (the Cake CP
+program's convention for an omitted hint), which matches the Cake dispatcher only for balanced batches.
+Decode requests with `backend="auto"` try the listed decode variants first.
 
 The decode variants include the Qwen3.5-35B-A3B TP=2 speculative-verify
 rows (H=8 / HV=16, BF16 state pool, seven-step BF16 checkpoint cache,
