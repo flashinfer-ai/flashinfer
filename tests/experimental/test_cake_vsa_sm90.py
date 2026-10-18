@@ -338,6 +338,56 @@ def test_split_variants_are_the_shipped_ones():
     assert small_route(mask, sms=132, cluster_capacity=CAP) is None
 
 
+def test_stage_table_builds_every_stage_from_the_shared_launcher():
+    from flashinfer.jit import cake_vsa_sm90 as sm90_jit
+
+    sm90_jit.gen_cake_vsa_sm90_module.cache_clear()
+    try:
+        assert len(sm90_jit.STAGES) == 14
+        for stage in sm90_jit.STAGES:
+            row = sm90_jit._STAGES[stage]
+            # Building the spec re-hashes both sources against the table pins.
+            spec = sm90_jit.gen_cake_vsa_sm90_module(stage)
+            assert [source.name for source in spec.sources] == [
+                f"{row.module}_kernel.cu",
+                "cake_vsa_sm90_binding.cu",
+            ]
+            defines = dict(
+                flag[2:].split("=", 1)
+                for flag in spec.extra_cuda_cflags
+                if flag.startswith("-DCAKE_VSA_SM90_")
+            )
+            assert defines == {
+                "CAKE_VSA_SM90_KERNEL": f"kernel_{row.module}",
+                "CAKE_VSA_SM90_SHIM_NAMESPACE": f"cake_host_shim_{row.shim}",
+                "CAKE_VSA_SM90_THREADS": f"{row.threads}u",
+                "CAKE_VSA_SM90_SMEM_BYTES": f"{row.smem_bytes}u",
+                "CAKE_VSA_SM90_CLUSTER_X": str(row.cluster_x),
+                "CAKE_VSA_SM90_ABI": str(row.abi),
+            }
+        with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
+            sm90_jit.gen_cake_vsa_sm90_module("small_k1s")
+    finally:
+        sm90_jit.gen_cake_vsa_sm90_module.cache_clear()
+
+
+def test_stage_table_geometry_matches_the_stage_names():
+    from flashinfer.jit.cake_vsa_sm90 import _STAGES
+
+    for stage, row in _STAGES.items():
+        if stage.startswith("attention"):
+            assert (row.abi, row.cluster_x, row.threads) == (3, 1, 384)
+        elif stage.endswith("s"):
+            assert (row.abi, row.cluster_x, row.threads) == (2, 1, 256)
+        elif "c" in stage[len("small_k") :]:
+            assert (row.abi, row.cluster_x) == (1, int(stage.rsplit("c", 1)[1]))
+            assert row.threads == 256
+        else:
+            assert (row.abi, row.cluster_x) == (1, 1)
+            assert row.threads == (128 if stage == "small_k1" else 256)
+        assert row.smem_bytes <= 232448
+
+
 def _tile_rows(plan):
     """Per-CTA plan rows: the static rows ``c * stride + i`` (the first row's
     META_NTILES word = static count), plus, in the queue layout, a round-robin

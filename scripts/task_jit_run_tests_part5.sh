@@ -28,4 +28,4 @@ pytest -s tests/test_artifacts.py
 # Cover the API gate without enrolling experimental backend tests; the only
 # exception is the CPU-only host planner of the Cake SM90 VSA backend below.
 pytest -s tests/experimental/test_experimental_api.py
-pytest -s tests/experimental/test_cake_vsa_sm90.py -k '(test_plan or test_small_route_rule or test_sliced_routes or test_cluster_one_wave or test_split_variants) and not lifetime'
+pytest -s tests/experimental/test_cake_vsa_sm90.py -k '(test_plan or test_small_route_rule or test_sliced_routes or test_cluster_one_wave or test_split_variants or test_stage_table) and not lifetime'
