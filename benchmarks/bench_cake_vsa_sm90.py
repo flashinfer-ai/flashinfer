@@ -167,7 +167,7 @@ def make_inputs(axes, seed):
 
 def prepare(mask, backend, scale):
     h, mb, nb = mask.shape
-    workspace_size = 0 if backend in ("cake", "cake_cute") else 128 * 1024 * 1024
+    workspace_size = 0 if backend == "cake" else 128 * 1024 * 1024
     wrapper = VariableBlockSparseAttentionWrapper(
         torch.empty(workspace_size, dtype=torch.uint8, device="cuda"), backend=backend
     )

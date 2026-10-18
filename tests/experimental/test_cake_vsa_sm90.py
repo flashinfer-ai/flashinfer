@@ -1112,8 +1112,7 @@ def test_plan_stream_and_graph_lifetime():
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
     reason="cake (SM90) VSA requires Hopper compute capability 9.0",
 )
-@pytest.mark.parametrize("engine", ["cuda", "cute"])
-def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
+def test_queue_kernel_matches_the_static_kernel_bit_exact(monkeypatch):
     """The queue kernel only moves tiles between CTAs: its output is bit-identical
     to the static kernel's on the same plan, its queue words return to zero after
     every launch, and a captured graph replays it."""
@@ -1129,9 +1128,7 @@ def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
     rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
     cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
     q, k, v = _inputs(h, mb, nb)
-    queued = CakeVsaSm90Plan(
-        "cuda", mask, rows, cols, h, h, 128, route="persistent", engine=engine
-    )
+    queued = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="persistent")
     if not queued.queue:
         pytest.skip(f"{sms} SMs: fewer than {POOL_MIN_TILES} tiles per CTA")
     out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
@@ -1139,9 +1136,7 @@ def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
     torch.cuda.synchronize()
     assert int(queued.dbg[62:64].abs().sum()) == 0
     monkeypatch.setattr(module, "POOL_MIN_TILES", 10**9)
-    static = CakeVsaSm90Plan(
-        "cuda", mask, rows, cols, h, h, 128, route="persistent", engine=engine
-    )
+    static = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="persistent")
     assert not static.queue and static.num_ctas == queued.num_ctas
     torch.testing.assert_close(static.run(q, k, v), first, atol=0, rtol=0)
     graph = torch.cuda.CUDAGraph()
@@ -1261,15 +1256,14 @@ def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
 
 
 @requires_hopper
-@pytest.mark.parametrize("backend", ["cake", "cake_cute"])
-def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
+def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup():
     # On a mode-2 tile both warpgroups address the same 64 output rows; the
     # idle warpgroup's accumulator is 0 x rcp(0) = NaN and its store must not
     # happen (it raced the owner's store).  NaN-filled output, many runs.
     mask = _odd_single_block_mask().cuda()
     torch.manual_seed(11)
     q, k, v = _inputs(2, 129, 1024)
-    wrapper = _wrapper(mask, backend=backend)
+    wrapper = _wrapper(mask)
     expected = _reference(q, k, v, mask, 128**-0.5)
     for _ in range(20):
         out = torch.full(
@@ -1280,3 +1274,34 @@ def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
             "an output row was never written or holds NaN"
         )
         torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
+
+
+@requires_hopper
+def test_backend_cake_cute_is_an_alias_of_cake():
+    """``backend="cake_cute"`` (the name of the removed CuTe DSL build) plans and
+    runs the ``cake`` kernels: same stage, bit-identical output, same DPS ABI."""
+    from flashinfer.sparse import VariableBlockSparseAttentionWrapper
+
+    h, mb, nb = 2, 16, 16
+    mask = _topk_mask(h, mb, nb, 12).cuda()
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    wrappers = {}
+    for backend in ("cake", "cake_cute"):
+        wrapper = VariableBlockSparseAttentionWrapper(
+            torch.empty(0, device="cuda", dtype=torch.uint8), backend=backend
+        )
+        wrapper.plan(
+            mask, rows, cols, h, h, 128, q_data_type=torch.bfloat16, non_blocking=False
+        )
+        wrappers[backend] = wrapper
+    plan_a = wrappers["cake"]._cake_vsa_sm90_plan
+    plan_b = wrappers["cake_cute"]._cake_vsa_sm90_plan
+    for name in ("small_kmax", "small_split", "small_cluster", "num_ctas"):
+        assert getattr(plan_a, name) == getattr(plan_b, name), name
+    q, k, v = _inputs(h, mb, nb)
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    expected = wrappers["cake"].run(q, k, v, enable_pdl=False)
+    actual = wrappers["cake_cute"].run(q, k, v, out=out, enable_pdl=False)
+    assert actual.data_ptr() == out.data_ptr() and actual.shape == q.shape
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
