@@ -657,6 +657,7 @@ def gen_all_modules(
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
+    has_sm107a_exact = sm_capabilities.get("sm107a_exact", False)
     has_sm107 = sm_capabilities.get("sm107", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
@@ -1047,6 +1048,8 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_100a"))
         if has_sm103a_exact:
             jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_103a"))
+        if has_sm107a_exact:
+            jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_107a"))
         # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
         # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
         if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:

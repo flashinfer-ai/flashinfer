@@ -13,15 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-JIT loader of the Cake NVFP4-transport tensor-parallel all-reduce (SM100 / SM103).
+JIT loader of the Cake NVFP4-transport tensor-parallel all-reduce (SM100 / SM103 / SM107).
 
 The programs are generated into ``csrc/cake_fp4_allreduce`` and listed in
 :mod:`flashinfer.jit.cake_fp4_allreduce_programs` (``PROGRAMS``: one physical
 program per family, world size, input format, output format, phase-B variant,
-re-arm form and residual-prefetch form; ``WINDOWS``: the receive-window
+re-arm form, poll form and residual-prefetch form; ``WINDOWS``: the receive-window
 contract; ``SELECT_BV``, ``SELECT_PREFETCH`` and ``LIMITS``: the host rules).  Every program is an exact-architecture source:
 it is compiled once per exact target (``sm_100a`` for B200, ``sm_103a`` for
-B300) with that target's flag set, without fast math and with
+B300, ``sm_107a`` for SM107 devices) with that target's flag set, without fast math and with
 ``--fmad=false``, into a module named after the program, the target and a
 digest of its sources.  Build targets follow ``FLASHINFER_CUDA_ARCH_LIST``
 when set, else the visible devices (:class:`CompilationContext`); a device
@@ -47,9 +47,15 @@ from .cake_fp4_allreduce_programs import (
     SELECT_PREFETCH,
     WINDOWS,
 )
-from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
 
-CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a"]
+CakeFp4AllReduceTarget = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 SOURCE_PACKAGE = "cake_fp4_allreduce"
 MODULE_PREFIX = "cake_fp4_allreduce"
@@ -57,10 +63,12 @@ MODULE_PREFIX = "cake_fp4_allreduce"
 TARGET_FLAGS: dict[str, list[str]] = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
+    "sm_107a": sm107a_nvcc_flags,
 }
 TARGET_CAPABILITIES: dict[str, tuple[int, int]] = {
     "sm_100a": (10, 0),
     "sm_103a": (10, 3),
+    "sm_107a": (10, 7),
 }
 SUPPORTED_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     TARGET_CAPABILITIES.values()
@@ -123,7 +131,7 @@ def supported_capability(capability: tuple[int, int]) -> Optional[tuple[int, int
 
 
 def target_of_capability(capability: tuple[int, int]) -> Optional[str]:
-    """Exact target (``"sm_100a"`` / ``"sm_103a"``) built for ``capability``, else ``None``."""
+    """Exact target (``"sm_100a"`` / ``"sm_103a"`` / ``"sm_107a"``) built for ``capability``, else ``None``."""
 
     key = supported_capability(capability)
     if key is None:
@@ -186,14 +194,16 @@ def programs(
     input_format: Optional[str] = None,
     output_format: Optional[str] = None,
     bv: Optional[int] = None,
+    poll: Optional[str] = None,
     prefetch: Optional[bool] = None,
     target: Optional[str] = None,
 ) -> tuple[str, ...]:
     """Program ids whose registry rows match every given key, in registry order.
 
-    ``output_format=None``, ``bv=None`` and ``prefetch=None`` do not filter;
-    pass ``output_format=""`` to select the rows without an output format (the
-    ``allreduce`` family).  ``target`` keeps the rows compiled for that target.
+    ``output_format=None``, ``bv=None``, ``poll=None`` and ``prefetch=None`` do
+    not filter; pass ``output_format=""`` to select the rows without an output
+    format (the ``allreduce`` family).  ``target`` keeps the rows compiled for
+    that target.
     """
 
     selected = []
@@ -209,6 +219,8 @@ def programs(
             if record["output_format"] != wanted:
                 continue
         if bv is not None and record["bv"] != int(bv):
+            continue
+        if poll is not None and record["poll"] != poll:
             continue
         if prefetch is not None and record["prefetch"] != bool(prefetch):
             continue
@@ -308,10 +320,11 @@ def program_for(
     The candidates are the rows of (family, world size, input format, output
     format) compiled for ``target``; when they carry phase-B variants the one
     of :func:`select_bv` is kept, and when they carry a residual-prefetch form
-    the one of :func:`select_prefetch`.  The re-arm form follows from the
-    registry's per-target rows (a target has either the bulk or the
-    register-store form of a variant), so this function never restates that
-    rule.
+    the one of :func:`select_prefetch`.  The re-arm form and the fused norm's
+    poll form follow from the registry's per-target rows (a target has either
+    the bulk or the register-store form of a variant, and either the grouped
+    or the probe-all poll of a fused-norm input format), so this function
+    never restates those rules.
     """
 
     candidates = programs(
@@ -453,7 +466,7 @@ def module_name(program: str, target: str) -> str:
 
     FlashInfer resolves installed AOT artifacts by module name before ninja
     sees the build inputs, so the content-derived name keeps a changed program
-    from reusing a stale library, and the target keeps the two exact-architecture
+    from reusing a stale library, and the target keeps the exact-architecture
     libraries of one program apart under one target set.
     """
 

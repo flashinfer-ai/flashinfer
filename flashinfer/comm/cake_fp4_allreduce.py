@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake NVFP4-transport tensor-parallel all-reduce (SM100 / SM103).
+Cake NVFP4-transport tensor-parallel all-reduce (SM100 / SM103 / SM107).
 
 Every rank quantises its ``[rows, 6144]`` bfloat16 partial to NVFP4 records
 (E2M1 values, one E4M3 scale per 16 values, one float32 row scale), pushes
@@ -43,7 +43,7 @@ Usage protocol::
     workspace.destroy()
 
 Requirements: two or four ranks (two for ``rmsnorm``) on one node with CUDA
-IPC peer access, SM100 (B200) or SM103 (B300) devices with the same SM count
+IPC peer access, SM100 (B200), SM103 (B300) or SM107 devices with the same SM count
 that are build targets of this process (``FLASHINFER_CUDA_ARCH_LIST`` when
 set, else the visible devices), hidden size 6144, contiguous tensors on the
 workspace device and ``rows <= capacity`` (a multiple of 4 for world size 4).

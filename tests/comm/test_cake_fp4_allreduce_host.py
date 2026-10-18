@@ -43,15 +43,24 @@ from flashinfer.jit.cake_fp4_allreduce_programs import (
 )
 from tests.comm import cake_fp4_allreduce_reference as ref
 
-TARGETS = ("sm_100a", "sm_103a")
+TARGETS = ("sm_100a", "sm_103a", "sm_107a")
 INPUT_FORMATS = ("bf16", "nvfp4")
 OUTPUT_FORMATS = ("bf16", "nvfp4", "mxfp8")
 BVS = (0, 1, 2)
-# The sm_100a builds measured with the register-store re-arm: BF16 bv 0 / 1, NVFP4 bv 1 / 2.
-REGISTER_STORE_FORMS = {("bf16", 0), ("bf16", 1), ("nvfp4", 1), ("nvfp4", 2)}
+# The two-shot (input format, bv) variants each target builds with the register-store re-arm
+# ("_rst"), from its own measurement; the others use the bulk re-arm (sm_103a throughout).
+REGISTER_STORE_FORMS = {
+    "sm_100a": {("bf16", 0), ("bf16", 1), ("nvfp4", 1), ("nvfp4", 2)},
+    "sm_103a": set(),
+    "sm_107a": {("bf16", 0), ("bf16", 1), ("nvfp4", 0), ("nvfp4", 2)},
+}
+REGISTER_STORE_VARIANTS = set().union(*REGISTER_STORE_FORMS.values())
+# The targets whose NVFP4-input fused-norm programs probe the peer row's six pairs at once ("_pa"), from
+# their own measurement; the others (sm_107a, and every BF16-input program) poll in two-pair groups.
+PROBE_ALL_TARGETS = ("sm_100a", "sm_103a")
 CAPACITIES = (4, 1024, 4096, 16384, 100000)
 SOURCE_DIR = "csrc/cake_fp4_allreduce"
-MAX_DYNAMIC_SMEM_BYTES = 232448  # the opt-in limit of SM100 / SM103
+MAX_DYNAMIC_SMEM_BYTES = 232448  # the opt-in limit of SM100 / SM103 / SM107
 # The kernel contract: sentinel words, record geometry and the window formulas.
 VAL, SF, RS = 0x88888888, 0xFFFFFFFF, 0x80000000
 VALUE_BYTES, SCALE_BYTES, RECORD_BYTES, ROW_SCALE_BYTES = 3072, 384, 3456, 16
@@ -61,9 +70,11 @@ ROTATION = 3
 def _expected_program_ids() -> set[str]:
     ids = {f"tp2_oneshot_{fmt}" for fmt in INPUT_FORMATS}
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}" for fmt in INPUT_FORMATS for bv in BVS}
-    ids |= {f"tp4_twoshot_{fmt}_bv{bv}_rst" for fmt, bv in REGISTER_STORE_FORMS}
+    ids |= {f"tp4_twoshot_{fmt}_bv{bv}_rst" for fmt, bv in REGISTER_STORE_VARIANTS}
     ids |= {f"tp2_rmsnorm_{i}_{o}" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
     ids |= {f"tp2_rmsnorm_{i}_{o}_pf" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+    ids |= {f"tp2_rmsnorm_nvfp4_{o}_pa" for o in OUTPUT_FORMATS}
+    ids |= {f"tp2_rmsnorm_nvfp4_{o}_pa_pf" for o in OUTPUT_FORMATS}
     return ids
 
 
@@ -106,7 +117,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 24
+    assert len(PROGRAMS) == 31
     keys = {
         "family",
         "world_size",
@@ -114,6 +125,7 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "output_format",
         "bv",
         "reset",
+        "poll",
         "prefetch",
         "targets",
         "kernel_symbol",
@@ -163,15 +175,18 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         if family == "rmsnorm":
             assert record["prefetch"] in (False, True)
             assert program.endswith("_pf") == record["prefetch"], program
+            assert record["poll"] in ("grouped", "all")
+            stem = program[: -len("_pf")] if record["prefetch"] else program
+            assert stem.endswith("_pa") == (record["poll"] == "all"), program
         else:
-            assert record["prefetch"] is None
+            assert record["prefetch"] is None and record["poll"] is None
     assert {
         target for record in PROGRAMS.values() for target in record["targets"]
     } == set(TARGETS)
 
 
 def test_two_shot_programs_cover_every_variant_once_per_target() -> None:
-    """On each target one program serves each (input format, bv); only sm_100a runs the four register-store forms."""
+    """On each target one program serves each (input format, bv), in the re-arm form that target measured."""
     for target in TARGETS:
         for input_format in INPUT_FORMATS:
             for bv in BVS:
@@ -186,38 +201,82 @@ def test_two_shot_programs_cover_every_variant_once_per_target() -> None:
                 ]
                 assert len(matching) == 1, (target, input_format, bv, matching)
                 (program,) = matching
-                register_store = target == "sm_100a" and (
-                    (input_format, bv) in REGISTER_STORE_FORMS
-                )
+                register_store = (input_format, bv) in REGISTER_STORE_FORMS[target]
                 assert PROGRAMS[program]["reset"] == (
                     "st" if register_store else "bulk"
                 )
                 assert program.endswith("_rst") == register_store
-    # The register-store forms are sm_100a only; the bulk twins of those four forms are sm_103a only.
-    for input_format, bv in REGISTER_STORE_FORMS:
-        assert PROGRAMS[f"tp4_twoshot_{input_format}_bv{bv}_rst"]["targets"] == (
-            "sm_100a",
-        )
-        assert PROGRAMS[f"tp4_twoshot_{input_format}_bv{bv}"]["targets"] == ("sm_103a",)
+    # A variant's register-store form ships for the targets that measured it, its bulk form for the others.
     for input_format in INPUT_FORMATS:
         for bv in BVS:
-            if (input_format, bv) not in REGISTER_STORE_FORMS:
-                assert set(
-                    PROGRAMS[f"tp4_twoshot_{input_format}_bv{bv}"]["targets"]
-                ) == set(TARGETS)
+            bulk = f"tp4_twoshot_{input_format}_bv{bv}"
+            st_targets = tuple(
+                t for t in TARGETS if (input_format, bv) in REGISTER_STORE_FORMS[t]
+            )
+            bulk_targets = tuple(
+                t for t in TARGETS if (input_format, bv) not in REGISTER_STORE_FORMS[t]
+            )
+            assert PROGRAMS[bulk]["targets"] == bulk_targets, bulk
+            if st_targets:
+                assert PROGRAMS[f"{bulk}_rst"]["targets"] == st_targets, bulk
+            else:
+                assert f"{bulk}_rst" not in PROGRAMS
 
 
-def test_one_shot_and_fused_norm_programs_serve_both_targets() -> None:
+def test_one_shot_programs_serve_every_target() -> None:
     for program, record in PROGRAMS.items():
-        if record["world_size"] == 2:
+        if record["family"] == "allreduce" and record["world_size"] == 2:
             assert set(record["targets"]) == set(TARGETS), program
-    # The family / input-format / output-format lattice of the fused norm is complete, in both prefetch forms.
-    for prefetch in (False, True):
-        assert {
-            (record["input_format"], record["output_format"])
-            for record in PROGRAMS.values()
-            if record["family"] == "rmsnorm" and record["prefetch"] is prefetch
-        } == {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+
+
+def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
+    """On each target one program serves each (input format, output format, prefetch form), in the poll form
+    that target measured: the probe-all poll ("_pa") for NVFP4 input on sm_100a / sm_103a, the two-pair groups
+    otherwise."""
+    for target in TARGETS:
+        for input_format in INPUT_FORMATS:
+            for output_format in OUTPUT_FORMATS:
+                for prefetch in (False, True):
+                    matching = [
+                        program
+                        for program, record in PROGRAMS.items()
+                        if record["family"] == "rmsnorm"
+                        and record["input_format"] == input_format
+                        and record["output_format"] == output_format
+                        and record["prefetch"] is prefetch
+                        and target in record["targets"]
+                    ]
+                    assert len(matching) == 1, (
+                        target,
+                        input_format,
+                        output_format,
+                        prefetch,
+                        matching,
+                    )
+                    (program,) = matching
+                    probe_all = input_format == "nvfp4" and target in PROBE_ALL_TARGETS
+                    assert PROGRAMS[program]["poll"] == (
+                        "all" if probe_all else "grouped"
+                    )
+                    suffix = ("_pa" if probe_all else "") + ("_pf" if prefetch else "")
+                    assert (
+                        program == f"tp2_rmsnorm_{input_format}_{output_format}{suffix}"
+                    )
+    # The probe-all form ships for the targets that measured it, the grouped form for the others; the BF16-input
+    # programs have one form for all three targets.
+    for output_format in OUTPUT_FORMATS:
+        for pf in ("", "_pf"):
+            assert (
+                PROGRAMS[f"tp2_rmsnorm_nvfp4_{output_format}_pa{pf}"]["targets"]
+                == PROBE_ALL_TARGETS
+            )
+            assert PROGRAMS[f"tp2_rmsnorm_nvfp4_{output_format}{pf}"][
+                "targets"
+            ] == tuple(t for t in TARGETS if t not in PROBE_ALL_TARGETS)
+            assert (
+                PROGRAMS[f"tp2_rmsnorm_bf16_{output_format}{pf}"]["targets"] == TARGETS
+            )
+            assert f"tp2_rmsnorm_bf16_{output_format}_pa{pf}" not in PROGRAMS
 
 
 def _checkout_source_dir() -> Path:
@@ -563,7 +622,7 @@ def test_select_prefetch_rejects_an_empty_grid() -> None:
 
 @pytest.mark.parametrize("target", TARGETS)
 @pytest.mark.parametrize("input_format", INPUT_FORMATS)
-def test_program_for_two_shot_picks_the_register_store_form_only_on_sm_100a(
+def test_program_for_two_shot_picks_the_targets_re_arm_form(
     target: str, input_format: str
 ) -> None:
     grid = 148
@@ -578,9 +637,7 @@ def test_program_for_two_shot_picks_the_register_store_form_only_on_sm_100a(
             grid=grid,
             target=target,
         )
-        register_store = (
-            target == "sm_100a" and (input_format, bv) in REGISTER_STORE_FORMS
-        )
+        register_store = (input_format, bv) in REGISTER_STORE_FORMS[target]
         suffix = "_rst" if register_store else ""
         assert program == f"tp4_twoshot_{input_format}_bv{bv}{suffix}"
         assert target in PROGRAMS[program]["targets"]
@@ -605,6 +662,9 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                 )
                 == f"tp2_oneshot_{input_format}"
             )
+            poll = (
+                "_pa" if input_format == "nvfp4" and target in PROBE_ALL_TARGETS else ""
+            )
             for output_format in OUTPUT_FORMATS:
                 assert (
                     loader.program_for(
@@ -616,7 +676,7 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                         grid=148,
                         target=target,
                     )
-                    == f"tp2_rmsnorm_{input_format}_{output_format}{suffix}"
+                    == f"tp2_rmsnorm_{input_format}_{output_format}{poll}{suffix}"
                 )
     with pytest.raises(ValueError):
         loader.program_for(
@@ -673,6 +733,10 @@ def test_build_targets_follow_flashinfer_cuda_arch_list(monkeypatch) -> None:
         pin("10.3")
         assert loader.target_capabilities() == ((10, 3),)
         assert loader.supported_capability((10, 0)) is None
+        pin("10.7")
+        assert loader.target_capabilities() == ((10, 7),)
+        assert loader.supported_capability((10, 7)) == (10, 7)
+        assert loader.supported_capability((10, 3)) is None
         pin("9.0 12.0f")
         assert loader.target_capabilities() == ()
     finally:
@@ -686,6 +750,9 @@ def test_exact_target_table() -> None:
     )
     assert (
         loader.TARGET_FLAGS["sm_103a"][0] == "-gencode=arch=compute_103a,code=sm_103a"
+    )
+    assert (
+        loader.TARGET_FLAGS["sm_107a"][0] == "-gencode=arch=compute_107a,code=sm_107a"
     )
     assert "--fmad=false" in loader.COMPILE_FLAGS
 

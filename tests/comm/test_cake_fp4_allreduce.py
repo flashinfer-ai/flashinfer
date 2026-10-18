@@ -66,9 +66,11 @@ RECORD_BYTES = ref.RECORD_BYTES
 DEFAULT_CAPACITY = 16384
 LARGER_CAPACITY = 4096  # the odd-row cases run under this capacity
 # Fewer rows than teams / warps, one row per team plus some, the smallest
-# production tier and the largest tier; the four-rank cases are multiples of 4.
-# The fused norm adds the 4096-row tier, which runs its residual-prefetch
-# programs (18 to 28 rows per CTA on 148 to 160 SMs).
+# production tier and the largest tier; the four-rank cases are multiples of 4,
+# and bv0_rows() adds the grid-derived tier that selects the bv-0 two-shot
+# schedule (no fixed row count does so on every shipped grid). The fused norm
+# adds the 4096-row tier, which runs its residual-prefetch programs (18 to 28
+# rows per CTA on 148 to 212 SMs).
 ROWS = {
     ("allreduce", 2): (3, 6, 1024, 16384),
     ("allreduce", 4): (4, 8, 44, 1024, 16384),
@@ -77,6 +79,20 @@ ROWS = {
 ODD_ROWS = {("allreduce", 2): 1031, ("allreduce", 4): 1028, ("rmsnorm", 2): 1031}
 SMALL_ROWS = {("allreduce", 2): 3, ("allreduce", 4): 4, ("rmsnorm", 2): 3}
 MID_ROWS = 1024
+
+
+def bv0_rows(grid: int) -> int:
+    """The four-rank tier that selects the bv-0 two-shot schedule on ``grid`` CTAs.
+
+    The bv-0 window is 40 < rows // grid <= 64, so the tier follows the grid: 52
+    rows per CTA, rounded down to a multiple of 4 (7696 rows on 148 SMs, 7904 on
+    152, 11024 on 212), under DEFAULT_CAPACITY.
+    """
+    rows = 4 * ((52 * grid) // 4)
+    assert loader.select_bv(rows, grid) == 0 and rows <= DEFAULT_CAPACITY, (rows, grid)
+    return rows
+
+
 LAUNCHES_PER_CASE = 2
 BACK_TO_BACK_CALLS = 4
 GRAPH_CALLS = 3
@@ -211,14 +227,14 @@ def _check_workspace(
     assert workspace.ctrl.numel() == window["ctrl_words"]
     assert int(torch.count_nonzero(workspace.ctrl).item()) == 0
     assert workspace.target == loader.target_arch(device.index)
-    assert workspace.target in ("sm_100a", "sm_103a")
+    assert workspace.target in ("sm_100a", "sm_103a", "sm_107a")
     capability = torch.cuda.get_device_capability(device)
     assert loader.supported_capability(capability) == tuple(capability)
     if family == "allreduce" and world_size == 2:
         assert workspace.grid <= LIMITS["tp2_oneshot_grid_max"]
     if world_size == 4:
         assert capacity <= LIMITS["tp4_cap_max"]
-        for rows in ROWS[("allreduce", 4)]:
+        for rows in (*ROWS[("allreduce", 4)], bv0_rows(workspace.grid)):
             bv = loader.select_bv(rows, workspace.grid)
             assert bv in (0, 1, 2)
             program = loader.program_for(
@@ -525,8 +541,9 @@ def _allreduce_suite(input_format, world_size, rank, device, group):
             device,
             DEFAULT_CAPACITY,
         )
+        tiers = ROWS[key] if world_size == 2 else (*ROWS[key], bv0_rows(workspace.grid))
         _allreduce_cases(
-            workspace, ROWS[key], input_format, world_size, rank, device, group, seed
+            workspace, tiers, input_format, world_size, rank, device, group, seed
         )
         _back_to_back(workspace, input_format, world_size, rank, device, group, seed)
         _alternating_rows(

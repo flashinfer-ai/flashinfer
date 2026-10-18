@@ -176,7 +176,8 @@ Calls accept any row count up to the capacity (a multiple of 4 for world size
 4), perform no allocation when the output buffers are given and no host
 synchronisation, so they can be captured into CUDA graphs; the
 ``launch_with_pdl`` flag issues the kernel as a programmatic dependent launch.
-The programs are exact-architecture builds for SM100 (B200) and SM103 (B300);
+The programs are exact-architecture builds for SM100 (B200), SM103 (B300) and
+SM107;
 the build targets follow ``FLASHINFER_CUDA_ARCH_LIST`` when set, else the
 visible devices.
 
