@@ -132,3 +132,10 @@ with CUPTI under `torchrun`.
 - `cake_workspace.py` -- the symmetric-memory workspace.
 - `csrc/cake_msa_icp_indexer/` (repository root) -- the generated device and
   host-binding sources plus their shared headers; receipt-bound, do not edit.
+- The 12 scorer records build three kernel texts, one per `rows_per_rank`:
+  `cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu` (32),
+  `cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu` (64) and
+  `cake_msa_icp_indexer_a1d2b2946134a90f832e_kernel.cu` (128). A record's
+  `compile_flags` fix `BLOCK_Q` (`4 * query_len`) and its kernel symbol
+  (`-DCAKE_PROGRAM_KERNEL`). This fold is a hand edit of the exported clones
+  pending its regeneration by the exporter.

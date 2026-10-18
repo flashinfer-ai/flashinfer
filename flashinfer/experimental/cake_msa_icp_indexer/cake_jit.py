@@ -36,16 +36,23 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # lists the host binding's argument order once per role.  ``POLICY`` carries
 # the host-side planning constants the backend mirrors (merge warp policy,
 # pad encodings, production switches).  All three literals are written by the
-# generated-program export; do not edit by hand.
+# generated-program export; do not edit by hand.  Exception, pending its
+# regeneration by the export: the scorer records of one ``rows_per_rank``
+# family share one kernel text (the family's ``query_len`` 1 export) and each
+# record's ``compile_flags`` fix ``BLOCK_Q`` (``4 * query_len``) and the kernel
+# symbol of that record.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_msa_icp_indexer_0526764aadf29021f835": {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_0526764aadf29021f835_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_0526764aadf29021f835_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=32",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_0526764aadf29021f835",
+        ],
         "use_pdl": True,
         "query_len": 8,
         "rows_per_rank": 32,
@@ -124,10 +131,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_1efb99d6a16097468ed4_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_1efb99d6a16097468ed4_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_1efb99d6a16097468ed4",
+        ],
         "use_pdl": True,
         "query_len": 2,
         "rows_per_rank": 32,
@@ -206,10 +216,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_56918d06c4ae67812752_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_56918d06c4ae67812752_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=12",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_56918d06c4ae67812752",
+        ],
         "use_pdl": True,
         "query_len": 3,
         "rows_per_rank": 32,
@@ -256,10 +269,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_71ba5a628ebea112847c_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_71ba5a628ebea112847c_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_71ba5a628ebea112847c",
+        ],
         "use_pdl": True,
         "query_len": 2,
         "rows_per_rank": 64,
@@ -290,10 +306,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_7e593093c70057f71290_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_7e593093c70057f71290_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_7e593093c70057f71290",
+        ],
         "use_pdl": True,
         "query_len": 4,
         "rows_per_rank": 32,
@@ -327,7 +346,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "cake_msa_icp_indexer/cake_msa_icp_indexer_a1d2b2946134a90f832e_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_a1d2b2946134a90f832e_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=4",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_a1d2b2946134a90f832e",
+        ],
         "use_pdl": True,
         "query_len": 1,
         "rows_per_rank": 128,
@@ -342,10 +364,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_a25ac9f6d1806c937555_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_a25ac9f6d1806c937555_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_a25ac9f6d1806c937555",
+        ],
         "use_pdl": True,
         "query_len": 4,
         "rows_per_rank": 64,
@@ -363,7 +388,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=4",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_a8101e4dbbf1639b3bbd",
+        ],
         "use_pdl": True,
         "query_len": 1,
         "rows_per_rank": 32,
@@ -378,10 +406,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_ac84ae929e6b0b76f4a4_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_a1d2b2946134a90f832e_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_ac84ae929e6b0b76f4a4_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_ac84ae929e6b0b76f4a4",
+        ],
         "use_pdl": True,
         "query_len": 4,
         "rows_per_rank": 128,
@@ -415,7 +446,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=4",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_cd26681ee2375382ee29",
+        ],
         "use_pdl": True,
         "query_len": 1,
         "rows_per_rank": 64,
@@ -430,10 +464,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_d1e79de3128a4be7527e_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_d1e79de3128a4be7527e_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=12",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_d1e79de3128a4be7527e",
+        ],
         "use_pdl": True,
         "query_len": 3,
         "rows_per_rank": 64,
@@ -448,10 +485,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "role": "scorer",
         "sources": [
-            "cake_msa_icp_indexer/cake_msa_icp_indexer_dc24f0e9db942be02542_kernel.cu",
+            "cake_msa_icp_indexer/cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu",
             "cake_msa_icp_indexer/cake_msa_icp_indexer_dc24f0e9db942be02542_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DBLOCK_Q=32",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_icp_indexer_dc24f0e9db942be02542",
+        ],
         "use_pdl": True,
         "query_len": 8,
         "rows_per_rank": 64,

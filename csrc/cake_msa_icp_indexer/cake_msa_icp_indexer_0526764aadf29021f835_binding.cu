@@ -27,7 +27,15 @@
 
 #include "cake_msa_icp_indexer_host_common.cuh"
 
-extern "C" __global__ void kernel_cake_msa_icp_indexer_0526764aadf29021f835(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, int* __restrict__ block_table, float* __restrict__ score, uint8_t* __restrict__ valid, int* __restrict__ seq_lens, int* __restrict__ query_start_loc, long long* __restrict__ positions, uint8_t* __restrict__ active_rows, int total_tokens, int token_begin, int token_count, int request_begin, int score_stride, int block_table_stride, int split_count, int rank, int* __restrict__ forced_column, int* __restrict__ pool, int pool_stride, int* __restrict__ row_meta, int* __restrict__ status, int* __restrict__ gen_ctr, int x_region_stride, int x_par_stride);
+// The kernel symbol comes from the program record's compile_flags
+// (-DCAKE_PROGRAM_KERNEL=<symbol>); CAKE_STR spells it in the launch error.
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL must be defined (-DCAKE_PROGRAM_KERNEL=<kernel symbol>) by the program record's compile_flags"
+#endif
+#define CAKE_STR_(x) #x
+#define CAKE_STR(x) CAKE_STR_(x)
+
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, int* __restrict__ block_table, float* __restrict__ score, uint8_t* __restrict__ valid, int* __restrict__ seq_lens, int* __restrict__ query_start_loc, long long* __restrict__ positions, uint8_t* __restrict__ active_rows, int total_tokens, int token_begin, int token_count, int request_begin, int score_stride, int block_table_stride, int split_count, int rank, int* __restrict__ forced_column, int* __restrict__ pool, int pool_stride, int* __restrict__ row_meta, int* __restrict__ status, int* __restrict__ gen_ctr, int x_region_stride, int x_par_stride);
 
 
 namespace cake_host_shim_46b468ca2078abe4 {
@@ -262,7 +270,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_block_table, TensorV
   void* kargs[] = {&p_Q, &p_K, &p_block_table, &p_score, &p_valid, &p_seq_lens, &p_query_start_loc, &p_positions, &p_active_rows, &v_total_tokens, &v_token_begin, &v_token_count, &v_request_begin, &v_score_stride, &v_block_table_stride, &v_split_count, &v_rank, &p_forced_column, &p_pool, &v_pool_stride, &p_row_meta, &p_status, &p_gen_ctr, &v_x_region_stride, &v_x_par_stride};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_msa_icp_indexer_0526764aadf29021f835), 66560);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 66560);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(192u, 1u, 1u);
@@ -281,9 +289,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_block_table, TensorV
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_msa_icp_indexer_0526764aadf29021f835), kargs);
+      &config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_msa_icp_indexer_0526764aadf29021f835 failed: "
+      << "cudaLaunchKernelExC for " CAKE_STR(CAKE_PROGRAM_KERNEL) " failed: "
       << cudaGetErrorString(launch_status);
 }
 
