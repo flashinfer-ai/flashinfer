@@ -672,7 +672,6 @@ def test_cake_ssd_combined_updates_caller_buffers():
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
     constructor, tensors, arguments = _case(varlen=True)
-    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     expected_cumsum = arguments["seq_chunk_cumsum"]
     actual_cumsum = torch.full_like(expected_cumsum, -1)
@@ -689,17 +688,19 @@ def test_cake_ssd_combined_updates_caller_buffers():
     program_trusted = cake.last_program_name
     assert program_trusted == "exactfused_bf16_varlen"
     _assert_cake_accuracy(allocated, expected, constructor, tensors, arguments)
-    # Without a caller table the preprocess derives it into the runner's own
-    # vector: the two-kernel program (one chunk per item here -> the retained
-    # start ``exact`` program, ``two_kernel_family``).
+    # Without a caller table the table is derived by the program of the
+    # capability: on SM100 the light metadata kernel publishes the runner's
+    # vector, then the same fused main kernel runs (``exactmeta``, inside the
+    # fused window; two launches); on SM103 the fused main kernel derives its
+    # private table in a CTA prologue (``exactone``, one launch).
     derived = runner.run(
         *tensors, **{**arguments, "seq_chunk_cumsum": None, "num_seqs": 2}
     )
     program_derived = cake.last_program_name
-    assert program_derived == (
-        module.two_kernel_family(mode_varlen=True, num_sequences=2, seqlen=256)
-        + "_bf16_varlen"
-    )
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    derived_family = _derived_family(module, (128, 128))
+    assert module._PROGRAMS[program_derived].family == derived_family
+    assert program_derived.startswith(f"{derived_family}_bf16_varlen")
     actual = runner.run(
         *tensors,
         **{
@@ -710,16 +711,41 @@ def test_cake_ssd_combined_updates_caller_buffers():
         },
     )
 
-    # Publishing into the caller's buffer is the derived form: the same
-    # two-kernel program, and the kernel-written table is the host's.
-    assert cake.last_program_name == program_derived
+    # Publishing into the caller's buffer needs a publishing stage, and the
+    # kernel-written table is the host's: on SM100 the derived form's
+    # exactmeta program again (its metadata kernel writes the caller's
+    # buffer); on SM103 the two-kernel program (the one-launch exactone
+    # program keeps its table private to each CTA, so that form keeps the
+    # publishing route), its segment preprocess writes the buffer.
+    program_publishing = cake.last_program_name
+    if capability == (10, 0):
+        assert program_publishing == program_derived
+    else:
+        _two_kernel_program(module, program_publishing, num_sequences=2, seqlen=256)
     torch.testing.assert_close(actual_cumsum, expected_cumsum, rtol=0, atol=0)
     assert actual[0] is out
-    # Caller-owned output storage and a kernel-written cumsum must not change
-    # the arithmetic: bit-identical to the derived run of the same program.
-    torch.testing.assert_close(actual[0], derived[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], derived[1], rtol=0, atol=0)
     _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+    # Caller-owned output storage and a kernel-written cumsum must not change
+    # the arithmetic (a same-program statement): on SM100 bit-identical to the
+    # derived run of the same program; on SM103 bit-identical to a second
+    # publishing run of the same two-kernel program into a fresh buffer and
+    # allocated output storage.
+    if capability == (10, 0):
+        same_program = derived
+    else:
+        again_cumsum = torch.full_like(expected_cumsum, -1)
+        same_program = runner.run(
+            *tensors,
+            **{
+                **arguments,
+                "seq_chunk_cumsum": again_cumsum,
+                "update_seq_chunk_cumsum": True,
+            },
+        )
+        assert cake.last_program_name == program_publishing
+        torch.testing.assert_close(again_cumsum, expected_cumsum, rtol=0, atol=0)
+    torch.testing.assert_close(actual[0], same_program[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], same_program[1], rtol=0, atol=0)
 
     preserved_cumsum = actual_cumsum.clone()
     trusted_again = runner.run(
@@ -1213,6 +1239,22 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(
     )
     x, dt, A, B, C = tensors
     table = torch.full((num_seqs + 1,), -7, dtype=torch.int32, device="cuda")
+
+    def expected_prefix(tokens):
+        # Inside the fused window SM100 routes the triple form deriving its
+        # table (the clean call, and the flagged call publishing into the
+        # caller's buffer) to the ``exactmeta`` program: one program for both
+        # calls, so the bitwise clause holds there without the family pin.
+        # SM103 keeps the pinned two-kernel program.
+        fused = capability == (10, 0) and module.fused_selected(
+            nheads=constructor.get("nheads", 8),
+            num_sequences=num_seqs,
+            nchunks=-(-max(lengths) // 128),
+            mode_varlen=True,
+            total_tokens=tokens,
+        )
+        return "exactmeta_" if fused else f"{family}_"
+
     flagged_arguments = {
         **arguments,
         "initial_states": arguments["initial_states"][:num_seqs].contiguous(),
@@ -1238,22 +1280,114 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(
     expected = _cute_padded_reference(
         constructor, clean_tensors, clean_arguments, lengths
     )
+    # The clean call publishes into its own caller buffer too: on SM103 a
+    # runner-owned table would run the one-launch ``exactone`` program (the
+    # fused rounding, not the pinned two-kernel family's) and the bitwise
+    # clause below is a same-program statement; the one-launch program has
+    # its own test (``test_cake_ssd_combined_exactone_flags_out_of_range_seq_idx``).
+    clean_table = torch.full((num_seqs + 1,), -7, dtype=torch.int32, device="cuda")
+    clean_arguments = {
+        **clean_arguments,
+        "seq_chunk_cumsum": clean_table,
+        "update_seq_chunk_cumsum": True,
+    }
     runner = SSDCombined(**constructor, backend="cake")
     cake = runner._cake_runner
     cake.seq_idx_status(reset=True)
     clean_out, clean_final = runner.run(*clean_tensors, **clean_arguments)
     assert cake.seq_idx_status() == 0
-    assert cake.last_program_name.startswith(f"{family}_")
+    assert cake.last_program_name.startswith(expected_prefix(total))
+    assert clean_table.tolist() == _seq_chunk_cumsum(lengths).tolist()
 
     out, final = runner.run(*tensors, **flagged_arguments)
 
-    assert cake.last_program_name.startswith(f"{family}_")
+    assert cake.last_program_name.startswith(expected_prefix(total + tail))
     assert cake.seq_idx_status(reset=True) == 1
     # The out-of-range id closes the in-range ranges and opens none of its
     # own: table[num_seqs] is the first segment of the out-of-range tail.
     expected_table = _seq_chunk_cumsum(lengths).tolist()
     expected_table[-1] = int(_seq_chunk_cumsum((*lengths, tail))[num_seqs])
     assert table.tolist() == expected_table
+    assert tuple(final.shape) == (num_seqs, 8, 64, 128)
+    assert torch.equal(out[:, :total], clean_out)
+    assert torch.equal(final, clean_final)
+    _assert_cake_accuracy(
+        (out[:, :total], final), expected, constructor, clean_tensors, clean_arguments
+    )
+    runner.run(*clean_tensors, **clean_arguments)
+    assert cake.seq_idx_status(reset=True) == 0
+
+
+@pytest.mark.parametrize(
+    "lengths,tail,seq_idx_dtype",
+    [
+        ((100, 150), 70, torch.int32),
+        ((128, 128), 64, torch.int32),
+        ((100, 150), 70, torch.int64),
+    ],
+    ids=("tail-shares-chunk", "tail-opens-chunk", "tail-shares-chunk-i64"),
+)
+def test_cake_ssd_combined_exactone_flags_out_of_range_seq_idx(
+    lengths, tail, seq_idx_dtype
+):
+    """SM103, the one-launch ``exactone`` program (the seq_idx triple with a
+    runner-owned table inside the fused window): its CTA prologue applies the
+    publishing stages' sequence-boundary rule, so the out-of-range trailing
+    id sets the status word, the in-range sequences are bitwise those of the
+    clean one-launch call and correct against CuTe / fp64, and a clean call
+    afterwards leaves the reset word at 0.  No caller table is involved: the
+    derived rows stay private to each CTA."""
+
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("the one-launch exactone program routes on SM103 only")
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    num_seqs = len(lengths)
+    total = sum(lengths)
+    constructor, tensors, arguments = _case(
+        varlen=True, lengths=(*lengths, tail), seq_idx_dtype=seq_idx_dtype
+    )
+    flagged_arguments = {
+        **arguments,
+        "initial_states": arguments["initial_states"][:num_seqs].contiguous(),
+        "seq_chunk_cumsum": None,
+        "update_seq_chunk_cumsum": False,
+        "num_seqs": num_seqs,
+    }
+    clean_tensors = tuple(
+        value[:, :total].contiguous()
+        if value.ndim >= 2 and value.shape[1] == total + tail
+        else value
+        for value in tensors
+    )
+    seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(lengths, seq_idx_dtype)
+    clean_arguments = {
+        **flagged_arguments,
+        "z": arguments["z"][:, :total].contiguous(),
+        "seq_idx": seq_idx,
+        "chunk_indices": chunk_indices,
+        "chunk_offsets": chunk_offsets,
+    }
+    assert module.fused_selected(
+        nheads=constructor.get("nheads", 8),
+        num_sequences=num_seqs,
+        nchunks=-(-max(lengths) // 128),
+        mode_varlen=True,
+        total_tokens=total + tail,
+    )
+    expected = _cute_padded_reference(
+        constructor, clean_tensors, clean_arguments, lengths
+    )
+    runner = SSDCombined(**constructor, backend="cake")
+    cake = runner._cake_runner
+    cake.seq_idx_status(reset=True)
+    clean_out, clean_final = runner.run(*clean_tensors, **clean_arguments)
+    assert cake.seq_idx_status() == 0
+    assert cake.last_program_name.startswith("exactone_"), cake.last_program_name
+
+    out, final = runner.run(*tensors, **flagged_arguments)
+
+    assert cake.last_program_name.startswith("exactone_"), cake.last_program_name
+    assert cake.seq_idx_status(reset=True) == 1
     assert tuple(final.shape) == (num_seqs, 8, 64, 128)
     assert torch.equal(out[:, :total], clean_out)
     assert torch.equal(final, clean_final)
@@ -1567,11 +1701,14 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # The chunk-parallel rule reads the same host quantities in both forms
     # (round 6 made the families' rounding differ, so a form-dependent family
     # would break this contract before any element compares).  Within the
-    # exact-scan family the fused program is taken only where its preprocess
-    # grid is 0, i.e. in the cu_seqlens form: the triple runs the two-kernel
-    # program of the same variant -- ``exactpre`` (round-6 arithmetic, the
-    # fused program's) from two chunks per item, the retained start ``exact``
-    # program for one-chunk items (the host two-kernel route).
+    # exact-scan family both forms run the fused main kernel inside the fused
+    # window -- ``exactfused`` in the cu_seqlens form (one launch), the
+    # capability's program for the triple deriving its table (``exactmeta``
+    # on SM100, ``exactone`` on SM103: ``_derived_family``) --
+    # and the two-kernel program of the same variant outside it (``exactpre``
+    # from two chunks per item, the retained start ``exact`` program for
+    # one-chunk items, the host two-kernel route); the arithmetic is the same
+    # in both forms, so they compare bitwise.
     same_arithmetic = True
     fused = False
     if program_triple.startswith("chunkpar_"):
@@ -1583,11 +1720,6 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
         two_kernel = module.two_kernel_family(
             mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
         )
-        assert program_triple.split("_", 1)[0] == two_kernel, program_triple
-        assert program_cu.split("_", 1)[1] == program_triple.split("_", 1)[1], (
-            program_cu,
-            program_triple,
-        )
         fused = module.fused_selected(
             nheads=8,
             num_sequences=len(lengths),
@@ -1595,11 +1727,20 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             mode_varlen=True,
             total_tokens=sum(lengths),
         )
+        assert program_triple.split("_", 1)[0] == (
+            _derived_family(module, lengths) if fused else two_kernel
+        ), (
+            program_triple,
+            fused,
+        )
+        assert program_cu.split("_", 1)[1] == program_triple.split("_", 1)[1], (
+            program_cu,
+            program_triple,
+        )
         assert program_cu.split("_", 1)[0] == ("exactfused" if fused else two_kernel), (
             program_cu,
             fused,
         )
-        same_arithmetic = not (fused and two_kernel == "exact")
     assert final.dtype == state_dtype
     assert tuple(final.shape) == (len(lengths), 8, 64, 128)
     assert torch.isfinite(out.to(torch.float32)).all()
@@ -1642,7 +1783,7 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # The triple with the caller's trusted table: the fused program of the
     # cu_seqlens form inside the fused window (one launch, the caller's
     # tables read in-kernel) and bitwise that form; the derived triple's
-    # two-kernel program outside it, bitwise the derived call.
+    # program outside it, bitwise the derived call.
     out_trusted, final_trusted = runner.run(*tensors, **arguments)
     assert cake.seq_idx_status(reset=True) == 0
     program_trusted = cake.last_program_name
@@ -3705,10 +3846,13 @@ def test_source_program_name_covers_every_state_dtype(
 
 
 def _cpu_forwarding_runner(module, monkeypatch, calls, **constructor):
-    """A real runner on CPU tensors whose launcher call is captured."""
+    """A real runner on CPU tensors whose launcher call is captured; the device
+    answers as ``arch`` (default ``sm_103a``), which decides the route of the
+    seq_idx triple form deriving its table."""
 
+    arch = constructor.pop("arch", "sm_103a")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
+    monkeypatch.setattr(module, "_target_arch", lambda *_: arch)
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
     monkeypatch.setattr(module, "_sm_count", lambda _: 1)
     monkeypatch.setattr(
@@ -3739,6 +3883,40 @@ def _cpu_forwarding_runner(module, monkeypatch, calls, **constructor):
     )
 
 
+def _derived_family(module, lengths, *, nheads=8):
+    """The family of the seq_idx triple form deriving a runner-owned table
+    inside the fused window on this device: ``exactmeta`` on SM100 (the light
+    metadata kernel then the fused main kernel, two launches), ``exactone`` on
+    SM103 (the fused main kernel derives its table in a CTA prologue, one
+    launch: the host interval between two launches hides a lighter stage
+    there), the two-kernel program elsewhere."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability == (10, 0):
+        return "exactmeta"
+    if capability == (10, 3):
+        return "exactone"
+    return module.two_kernel_family(
+        mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
+    )
+
+
+def _two_kernel_program(module, name, *, num_sequences, seqlen):
+    """Assert ``name`` is the two-kernel program of a packed-varlen call
+    (``two_kernel_family``) and return its family."""
+
+    family = module.two_kernel_family(
+        mode_varlen=True, num_sequences=num_sequences, seqlen=seqlen
+    )
+    assert module._PROGRAMS[name].family == family, name
+    assert name.startswith(f"{family}_bf16_varlen"), name
+    return family
+
+
+_ROUTE_ARCHES = ("sm_100a", "sm_103a")
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
 @pytest.mark.parametrize(
     "case",
     (
@@ -3748,15 +3926,18 @@ def _cpu_forwarding_runner(module, monkeypatch, calls, **constructor):
         "runner_buffer_from_num_seqs",
     ),
 )
-def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
+def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case, arch):
     """The preprocess owns ``seq_chunk_cumsum``: one launcher call binds the
     same vector to both stages and ``write_seq_chunk_cumsum`` says whether
     the preprocess fills it; ``num_seqs`` supplies the count when there are
-    no initial states.  The seq_idx triple form runs the two-kernel program
-    where the preprocess publishes the table (runner-owned, or the caller's
-    buffer with ``update_seq_chunk_cumsum=True``) and the fused single-launch
-    program where the caller's table is trusted (round 6: the fused program
-    is selected only where its preprocess grid is 0; F1b)."""
+    no initial states.  The seq_idx triple form runs, where the table is
+    published (runner-owned, or the caller's buffer with
+    ``update_seq_chunk_cumsum=True``), the ``exactmeta`` program on SM100
+    (the light metadata kernel publishes it ahead of the fused main kernel);
+    on SM103 the one-launch ``exactone`` program for a runner-owned table
+    (the main kernel derives it, nothing is published) and the two-kernel
+    program for a caller buffer; and the fused single-launch program where
+    the caller's table is trusted (round 6 F1b: its preprocess grid is 0)."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -3767,6 +3948,7 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
         calls,
         has_varlen=True,
         has_initial_states=has_initial_states,
+        arch=arch,
     )
     seqlen, num_seqs = 300, 2
     x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
@@ -3797,18 +3979,52 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
     assert tuple(out.shape) == (1, seqlen, 1, 64)
     assert tuple(final.shape) == (num_seqs, 1, 64, 128)
     ((name, launch),) = calls
-    # seq_idx triple form: the fused program only where its preprocess grid
-    # is 0 (a trusted caller table), the two-kernel program where the
-    # preprocess publishes the table.
+    # seq_idx triple form: the fused single launch only where its preprocess
+    # grid is 0 (a trusted caller table); the ``exactmeta`` program -- the
+    # 12-argument metadata stage publishing the table into the vector the
+    # main kernel reads, one thread per segment -- where it is published.
+    preprocess, main = launch["preprocess"], launch["main"]
     if case == "precomputed":
         assert name == "exactfused_bf16_varlen"
         assert launch["preprocess_grid"] == (0, 1, 1)
-    else:
-        assert name == "exactpre_bf16_varlen"
+        assert set(preprocess) == set(module._PREPROCESS_ARGS)
+        assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
+    elif arch == "sm_100a":
+        assert name == "exactmeta_bf16_varlen"
+        assert launch["preprocess_grid"] == (1, 1, 1)  # 3 segments, 256 threads
+        assert set(preprocess) == set(module._METADATA_ARGS)
+        assert preprocess["sequence_offsets"] is main["seq_chunk_cumsum"]
+        assert preprocess["num_segments"] == 3 and preprocess["seqlen"] == seqlen
+        assert preprocess["chunk_indices"] is main["chunk_indices"]
+        assert preprocess["chunk_offsets"] is main["chunk_offsets"]
+    elif case == "update_caller_buffer":
+        # SM103 keeps the two-kernel program where the caller's buffer must
+        # receive the table: the full preprocess publishes the vector it reads.
+        _two_kernel_program(module, name, num_sequences=num_seqs, seqlen=seqlen)
         assert launch["preprocess_grid"][0] >= 1
-    preprocess, main = launch["preprocess"], launch["main"]
-    assert main["metadata_from_cu_seqlens"] == 0
-    assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
+        assert set(preprocess) == set(module._PREPROCESS_ARGS)
+        assert preprocess["write_seq_chunk_cumsum"] == 1
+        assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
+    else:
+        # SM103 derives a runner-owned table in the fused main kernel's CTA
+        # prologue: the one-launch exactone program (the stage's grid is 0,
+        # nothing is published), its scratch one row per CTA (one CTA here:
+        # 2 items on this 1-SM device).
+        assert name == "exactone_bf16_varlen"
+        assert launch["preprocess_grid"] == (0, 1, 1)
+        assert launch["main_grid"] == (1, 1, 1)
+        assert set(preprocess) == set(module._PREPROCESS_ARGS)
+        assert preprocess["write_seq_chunk_cumsum"] == 0
+        assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
+    # The published table: the metadata stage's ``sequence_offsets``, the
+    # segment preprocess's ``seq_chunk_cumsum`` (the one-launch program's
+    # private scratch rides in the same slot, unpublished).
+    table_arg = (
+        "sequence_offsets" if name.startswith("exactmeta_") else "seq_chunk_cumsum"
+    )
+    assert main["metadata_from_cu_seqlens"] == (
+        module._TABLE_IN_KERNEL_I32 if name.startswith("exactone_") else 0
+    )
     assert preprocess["num_sequences"] == main["sequence_count"] == num_seqs
     assert preprocess["seq_idx_i32"] is main["seq_idx_i32"] is kwargs["seq_idx"]
     assert preprocess["seq_idx_int64"] == 0
@@ -3818,15 +4034,14 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
         assert preprocess["seq_chunk_cumsum"] is caller_vector
         assert preprocess["write_seq_chunk_cumsum"] == 0
     elif case == "update_caller_buffer":
-        assert preprocess["seq_chunk_cumsum"] is caller_vector
-        assert preprocess["write_seq_chunk_cumsum"] == 1
+        # The publishing stage writes into the caller's buffer.
+        assert preprocess[table_arg] is caller_vector
     else:
-        assert preprocess["write_seq_chunk_cumsum"] == 1
-        bound = preprocess["seq_chunk_cumsum"]
+        bound = preprocess[table_arg]
         assert bound.dtype == torch.int32 and bound.numel() == num_seqs + 1
         # The runner-owned vector is reused across calls of the same count.
         runner.run(x, dt, A, B, C, **kwargs)
-        assert calls[-1][1]["preprocess"]["seq_chunk_cumsum"] is bound
+        assert calls[-1][1]["preprocess"][table_arg] is bound
 
 
 @pytest.mark.parametrize(
@@ -4282,6 +4497,49 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
     assert "if (preprocess_grid_x != 0)" not in exactpre_template
     assert module._PREPROCESS_ARGS[-1] == "preprocess_status"
     assert len(module._PREPROCESS_ARGS) == 27
+    # The exactmeta template is the fused template with the 12-argument
+    # packed-varlen metadata stage (one thread per segment, no dynamic shared
+    # memory), always launched, ahead of the same 44-argument main kernel.
+    metadata_template = (
+        module._source_dir() / module._EXACTMETA_HOST_TEMPLATE
+    ).read_text(encoding="utf-8")
+    assert (
+        _host_prepare_arguments(metadata_template, "preprocess")
+        == module._METADATA_ARGS
+    )
+    assert _host_prepare_arguments(metadata_template, "main") == module._MAIN_ARGS
+    assert _host_run_arguments(metadata_template, "preprocess") == module._METADATA_ARGS
+    assert _host_run_arguments(metadata_template, "main") == module._MAIN_ARGS
+    assert "if (preprocess_grid_x != 0)" not in metadata_template
+    assert len(module._METADATA_ARGS) == 12
+    assert module._METADATA_ARGS[-1] == "preprocess_status"
+    metadata_stage = metadata_template[
+        metadata_template.index(
+            "namespace stage_preprocess {"
+        ) : metadata_template.index("namespace stage_main {")
+    ]
+    assert "void* kargs[12] = {};" in metadata_stage
+    assert "prepared.kargs[11] = &prepared.p_preprocess_status;" in metadata_stage
+    assert "prepared.kargs[12]" not in metadata_stage
+    assert "prepared.block, stream, 0u)" in metadata_stage
+    assert (
+        'check_dtype(arg_seq_idx_i64, DLDataType{kDLInt, 64, 1}, "seq_idx_i64");'
+        in metadata_stage
+    )
+    assert (
+        'check_dtype(arg_sequence_offsets, DLDataType{kDLInt, 32, 1}, "sequence_offsets");'
+        in metadata_stage
+    )
+    # Beyond its preprocess stage and Run signature the template is the fused
+    # template byte for byte.
+    assert (
+        metadata_template[metadata_template.index("namespace stage_main {") :].split(
+            "\nvoid Run("
+        )[0]
+        == fused_template[fused_template.index("namespace stage_main {") :].split(
+            "\nvoid Run("
+        )[0]
+    )
     assert (
         'check_dtype(arg_cu_seqlens, DLDataType{kDLInt, 32, 1}, "cu_seqlens");'
         in template
@@ -4388,6 +4646,74 @@ def test_source_program_launch_orders_stage_arguments(monkeypatch):
             0x1234,
         )
     ]
+    # An exactmeta program orders its 12-argument metadata stage first.
+    calls.clear()
+    metadata = {name: f"meta:{name}" for name in module._METADATA_ARGS}
+    module._launch_program(
+        "exactmeta_bf16_varlen",
+        "sm_103a",
+        preprocess=metadata,
+        preprocess_grid=(1, 1, 1),
+        main=main,
+        main_grid=(16, 1, 1),
+        cuda_stream=0x1234,
+    )
+    assert calls == [
+        (
+            *(f"meta:{name}" for name in module._METADATA_ARGS),
+            1,
+            1,
+            1,
+            *(f"main:{name}" for name in module._MAIN_ARGS),
+            16,
+            1,
+            1,
+            0x1234,
+        )
+    ]
+
+
+def test_source_sequence_arguments_take_the_metadata_stage_order():
+    """``preprocess_args`` selects the preprocess stage's tuple: the metadata
+    stage values are ordered by ``_METADATA_ARGS`` and a segment-preprocess
+    dict fails closed on the first metadata name it lacks."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    metadata = {name: f"meta:{name}" for name in module._METADATA_ARGS}
+    main = {name: f"main:{name}" for name in module._MAIN_ARGS}
+    ordered = module._sequence_arguments(
+        module._MAIN_ARGS,
+        metadata,
+        (1, 1, 1),
+        main,
+        (2, 1, 1),
+        7,
+        preprocess_args=module._METADATA_ARGS,
+    )
+    assert ordered == (
+        *(f"meta:{name}" for name in module._METADATA_ARGS),
+        1,
+        1,
+        1,
+        *(f"main:{name}" for name in module._MAIN_ARGS),
+        2,
+        1,
+        1,
+        7,
+    )
+    assert set(module._METADATA_ARGS) - set(module._PREPROCESS_ARGS) == {
+        "sequence_offsets"
+    }
+    with pytest.raises(KeyError, match="sequence_offsets"):
+        module._sequence_arguments(
+            module._MAIN_ARGS,
+            {name: object() for name in module._PREPROCESS_ARGS},
+            (1, 1, 1),
+            main,
+            (1, 1, 1),
+            0,
+            preprocess_args=module._METADATA_ARGS,
+        )
 
 
 _HOST_PLACEHOLDERS = (
@@ -4404,11 +4730,12 @@ _HOST_PLACEHOLDERS = (
 
 
 def test_source_program_table_names_shipped_sources():
-    """Every program of the four families binds shipped generated sources:
-    the one preprocess (one warp per tile of its block), its family's host
-    template and main dynamic SMEM, and a main kernel whose symbol is the
-    module identity without its hash.  Table entries the Cake export has
-    not filled fail here by name."""
+    """Every program of the seven families binds shipped generated sources:
+    its preprocess stage (the segment preprocess, one warp per tile of its
+    block, or the packed-varlen metadata kernel of the ``exactmeta``
+    programs), its family's host template and main dynamic SMEM, and a main
+    kernel whose symbol is the module identity without its hash.  Table
+    entries the Cake export has not filled fail here by name."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_dir = module._source_dir()
@@ -4418,17 +4745,43 @@ def test_source_program_table_names_shipped_sources():
         for family, variants in (
             ("exact", ("", "_noring")),
             ("exactfused", ("", "_noring")),
-            ("exactpre", ("", "_noring")),
+            ("exactpre", ("", "_noring", "_tail")),
             ("chunkpar", ("",)),
             ("chunkpar3", ("",)),
         )
         for variant in variants
         for state in ("bf16", "f16", "f32")
         for mode in ("batched", "varlen")
+    } | {
+        f"{family}_{state}_varlen{variant}"
+        for family in ("exactmeta", "exactone")
+        for variant in ("", "_noring")
+        for state in ("bf16", "f16", "f32")
     }
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
     }
+    # The exactmeta programs are the exactfused varlen main kernels (the same
+    # device modules) behind the metadata stage.
+    assert set(module._EXACTMETA_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith("exactmeta_")
+    }
+    assert {
+        name.replace("exactfused_", "exactmeta_", 1): shared
+        for name, shared in module._EXACTFUSED_MODULES.items()
+        if "_varlen" in name
+    } == module._EXACTMETA_MODULES
+    # The exactone programs are the SM103 render of the same six fused varlen
+    # entries: their own device modules, never the exactfused files.
+    assert set(module._EXACTONE_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith("exactone_")
+    }
+    assert {
+        name.replace("exactone_", "exactfused_", 1) for name in module._EXACTONE_MODULES
+    } == {name for name in module._EXACTFUSED_MODULES if "_varlen" in name}
+    assert not set(module._EXACTONE_MODULES.values()) & set(
+        module._EXACTFUSED_MODULES.values()
+    )
     assert set(module._EXACTFUSED_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exactfused_")
     }
@@ -4448,9 +4801,14 @@ def test_source_program_table_names_shipped_sources():
     )
     assert not pending, f"programs awaiting the Cake export: {pending}"
     assert module._PENDING_EXPORT not in module._SEGMENT_PREPROCESS_MODULE
+    assert module._PENDING_EXPORT not in module._PACKED_METADATA_MODULE
     assert (
         module._SEGMENT_PREPROCESS.threads
         == 32 * module._SEGMENT_PREPROCESS_TILES_PER_BLOCK
+    )
+    assert module._PACKED_METADATA.threads == 256
+    assert module._PACKED_METADATA.kernel == (
+        "kernel_factorized_persistent_packed_varlen_metadata"
     )
     family_host = {
         "exact": (
@@ -4462,6 +4820,16 @@ def test_source_program_table_names_shipped_sources():
             module._EXACTFUSED_HOST_TEMPLATE,
             module._MAIN_ARGS,
             module._EXACTFUSED_SMEM_BYTES,
+        ),
+        "exactmeta": (
+            module._EXACTMETA_HOST_TEMPLATE,
+            module._MAIN_ARGS,
+            module._EXACTFUSED_SMEM_BYTES,
+        ),
+        "exactone": (
+            module._EXACTFUSED_HOST_TEMPLATE,
+            module._MAIN_ARGS,
+            module._EXACTONE_SMEM_BYTES,
         ),
         "chunkpar": (
             module._CHUNKPAR_HOST_TEMPLATE,
@@ -4489,20 +4857,33 @@ def test_source_program_table_names_shipped_sources():
         family, state_key, mode, *variant = name.split("_")
         template_path, main_args, smem_bytes = family_host[family]
         if variant:
-            assert variant == ["noring"] and family in (
+            (variant_name,) = variant
+            assert variant_name in ("noring", "tail")
+            assert family in (
                 "exact",
                 "exactfused",
+                "exactmeta",
+                "exactone",
                 "exactpre",
             )
-            smem_bytes = module._VARIANT_SMEM_BYTES[(family, "noring")]
+            if variant_name == "tail":
+                assert family == "exactpre"
+            smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
             assert (
                 smem_bytes
                 == {
-                    "exact": module._EXACT_NORING_SMEM_BYTES,
-                    "exactfused": module._EXACTFUSED_NORING_SMEM_BYTES,
-                    "exactpre": module._EXACTPRE_NORING_SMEM_BYTES,
-                }[family]
+                    ("exact", "noring"): module._EXACT_NORING_SMEM_BYTES,
+                    ("exactfused", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
+                    ("exactmeta", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
+                    ("exactone", "noring"): module._EXACTONE_NORING_SMEM_BYTES,
+                    ("exactpre", "noring"): module._EXACTPRE_NORING_SMEM_BYTES,
+                    ("exactpre", "tail"): module._EXACTPRE_TAIL_SMEM_BYTES,
+                }[(family, variant_name)]
             )
+        assert program.variant == (variant[0] if variant else "")
+        assert program.cluster_dims == module._VARIANT_CLUSTER_DIMS.get(
+            (family, program.variant), (1, 1, 1)
+        )
         assert program.family == family
         assert program.host_template == template_path
         assert program.main_args == main_args
@@ -4510,7 +4891,12 @@ def test_source_program_table_names_shipped_sources():
         assert (program.state_dtype_code, program.state_dtype_bits) == (
             module._STATE_DTYPE_CODES[state_key]
         )
-        assert program.preprocess is module._SEGMENT_PREPROCESS
+        if family == "exactmeta":
+            assert program.preprocess is module._PACKED_METADATA
+            assert program.preprocess_args == module._METADATA_ARGS
+        else:
+            assert program.preprocess is module._SEGMENT_PREPROCESS
+            assert program.preprocess_args == module._PREPROCESS_ARGS
         assert program.main.module.startswith(
             program.main.kernel.removeprefix("kernel_") + "_"
         )
@@ -4523,7 +4909,11 @@ def test_source_program_table_names_shipped_sources():
             + "".join(f"_{part}" for part in variant)
         )
         assert program.preprocess.threads > 0 and program.main.threads == 512
-        assert not program.preprocess.fast_math and program.main.fast_math
+        # The integer-only metadata kernel is built with the loader's
+        # ``--use_fast_math`` (its launcher's build option); the segment
+        # preprocess without it.
+        assert program.preprocess.fast_math == (family == "exactmeta")
+        assert program.main.fast_math
         for kernel in program.kernels:
             source = source_dir / module._DEVICE_DIR / kernel.source
             assert source.is_file(), source
@@ -4558,11 +4948,15 @@ def test_source_program_table_names_shipped_sources():
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
     # One shared source per physical kernel: twelve retained start ``exact``
     # main sources (six ring + six ``_noring``), twelve fused ``exactfused``
-    # main sources, twelve two-kernel ``exactpre`` main sources, six
-    # look-back (``chunkpar``) and six three-phase (``chunkpar3``)
-    # chunk-parallel main sources plus the one preprocess kernel, no
-    # architecture copies and no orphans.
-    assert len(device_sources) == 49
+    # main sources (the six varlen ones also serving ``exactmeta``), six
+    # one-launch ``exactone`` main sources (the SM103 render of the fused
+    # varlen entries, the only architecture-specific files), eighteen
+    # two-kernel ``exactpre`` main sources (six ring, six ``_noring``, six
+    # ``_tail``), six look-back (``chunkpar``) and six three-phase
+    # (``chunkpar3``) chunk-parallel main sources plus the segment preprocess
+    # and the packed-varlen metadata kernel, no other architecture copies and
+    # no orphans.
+    assert len(device_sources) == 62
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -5108,6 +5502,8 @@ def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
                 == {
                     "exact": module._HOST_TEMPLATE,
                     "exactfused": module._EXACTFUSED_HOST_TEMPLATE,
+                    "exactmeta": module._EXACTMETA_HOST_TEMPLATE,
+                    "exactone": module._EXACTFUSED_HOST_TEMPLATE,
                     "exactpre": module._EXACTPRE_HOST_TEMPLATE,
                 }[family]
             )
@@ -5192,6 +5588,7 @@ def test_source_unexported_program_refuses_to_build(monkeypatch, tmp_path, gap):
         smem_bytes,
         module._CHUNKPAR_HOST_TEMPLATE,
         module._MAIN_ARGS_CHUNKPAR,
+        module._PREPROCESS_ARGS,
     )
     name = "chunkpar_bf16_batched_probe"
     monkeypatch.setitem(module._PROGRAMS, name, program)
@@ -5229,6 +5626,7 @@ def test_source_chunk_parallel_program_builds_from_its_own_template(
         200704,
         module._CHUNKPAR_HOST_TEMPLATE,
         module._MAIN_ARGS_CHUNKPAR,
+        module._PREPROCESS_ARGS,
     )
     name = "chunkpar_bf16_batched_probe"
     monkeypatch.setitem(module._PROGRAMS, name, program)
@@ -5759,18 +6157,24 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
     # forced exact scan: the fused program where its preprocess grid is 0
     # (batched, cu_seqlens form, and the triple form whose caller cumsum is
     # trusted -- ``_case`` precomputes it -- inside the fused window); the
-    # two-kernel program otherwise (exactpre, or the retained start program
-    # for one-chunk items).
+    # triple form deriving its table runs ``exactmeta`` inside the window
+    # and the two-kernel program outside it (exactpre, or the retained start
+    # program for one-chunk items).
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    if form == "triple" and not module.fused_selected(
-        nheads=8,
-        num_sequences=len(lengths),
-        nchunks=-(-max(lengths) // 128),
-        mode_varlen=True,
-        total_tokens=sum(lengths),
-    ):
-        family = module.two_kernel_family(
-            mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
+    if form == "triple":
+        fused = module.fused_selected(
+            nheads=8,
+            num_sequences=len(lengths),
+            nchunks=-(-max(lengths) // 128),
+            mode_varlen=True,
+            total_tokens=sum(lengths),
+        )
+        family = (
+            "exactfused"
+            if fused
+            else module.two_kernel_family(
+                mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
+            )
         )
     else:
         family = "exactfused"
@@ -5879,13 +6283,27 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     exact, chunk_parallel = results["never"], results["always"]
     three_phase = results["three_phase"]
     mode = "batched" if form == "batched" else "varlen"
-    family = (
-        importlib.import_module("flashinfer.mamba.cake_ssd_combined").two_kernel_family(
-            mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
+    # The triple deriving its table (``make_case`` passes no caller table):
+    # the program of the device's capability inside the fused window
+    # (``_derived_family``), the two-kernel program outside it; every other
+    # form runs the fused single launch.
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    if form == "triple":
+        family = (
+            _derived_family(module, lengths)
+            if module.fused_selected(
+                nheads=8,
+                num_sequences=len(lengths),
+                nchunks=-(-max(lengths) // 128),
+                mode_varlen=True,
+                total_tokens=sum(lengths),
+            )
+            else module.two_kernel_family(
+                mode_varlen=True, num_sequences=len(lengths), seqlen=sum(lengths)
+            )
         )
-        if form == "triple"
-        else "exactfused"
-    )
+    else:
+        family = "exactfused"
     assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
@@ -6178,17 +6596,26 @@ def test_source_exact_scan_variant_programs():
                 assert b.main_smem_bytes == noring_smem
                 assert a.main.module != b.main.module
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 12
+    # the two-kernel family: six ring, six ``_noring`` and six ``_tail`` programs
     assert (
         len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 12
     )
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 12
+        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 18
     )
     assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
     assert (
         len([name for name in module._PROGRAMS if name.startswith("chunkpar3_")]) == 6
     )
-    assert len(module._PROGRAMS) == 48
+    # The exactmeta programs: the six exactfused varlen main kernels (ring and
+    # ``_noring``) behind the packed-varlen metadata stage.
+    assert (
+        len([name for name in module._PROGRAMS if name.startswith("exactmeta_")]) == 6
+    )
+    # The exactone programs: the SM103 render of the same six fused varlen
+    # entries (one launch), their own device modules.
+    assert len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 6
+    assert len(module._PROGRAMS) == 66
 
 
 @pytest.mark.parametrize(
@@ -6357,6 +6784,53 @@ def test_source_two_kernel_route_mirrors_the_seed_rule():
     assert route(mode_varlen=True, num_sequences=0, seqlen=100) == "exact"
 
 
+def test_source_persistent_grid_mirrors_the_seed_rule():
+    """``_persistent_grid_size`` mirrors the generator's host-side grid rule:
+    one CTA per (sequence, head) item up to one
+    wave; beyond it the smallest count of two to four items per CTA that
+    divides the items and keeps at least four fifths of the SMs busy; else
+    one CTA per SM.  Pinned on the shipped SM counts (B200 148, GB300 152)
+    at the gate rows' item counts, and checked as a property over four
+    waves."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    grid = module._persistent_grid_size
+    for sm_count in (148, 152):
+        # one wave: one CTA per item
+        for items in (1, 8, 16, 32, 64, 128, sm_count):
+            assert grid(total_work=items, sm_count=sm_count) == items
+        # 256 / 384 / 512 items: two / three / four per CTA on 128 CTAs
+        # (128 x 5 >= 4 x 152)
+        assert grid(total_work=256, sm_count=sm_count) == 128
+        assert grid(total_work=384, sm_count=sm_count) == 128
+        assert grid(total_work=512, sm_count=sm_count) == 128
+        # 296 items: two per CTA on 148 CTAs on either part
+        assert grid(total_work=296, sm_count=sm_count) == 148
+        # 1024 .. 20480 items (the saturated gate rows): one CTA per SM
+        for items in (1024, 2048, 4096, 8192, 20480):
+            assert grid(total_work=items, sm_count=sm_count) == sm_count
+        # odd counts just past one wave: one CTA per SM
+        for items in (sm_count + 1, 255, 257):
+            assert grid(total_work=items, sm_count=sm_count) == sm_count
+        for total_work in range(1, 4 * sm_count + 2):
+            value = grid(total_work=total_work, sm_count=sm_count)
+            assert 1 <= value <= sm_count
+            if total_work <= sm_count:
+                assert value == total_work
+            elif value != sm_count:
+                assert total_work % value == 0 and 2 <= total_work // value <= 4
+                assert value * 5 >= sm_count * 4
+            else:
+                # one CTA per SM only when no smaller balanced grid exists
+                # (296 items on 148 SMs: two per CTA on 148 CTAs is both)
+                assert not any(
+                    total_work % k == 0
+                    and total_work // k < sm_count
+                    and (total_work // k) * 5 >= sm_count * 4
+                    for k in range(2, 5)
+                )
+
+
 def test_source_retained_start_programs_are_the_round5_files():
     """The ``exact_*`` programs are the round-5 start files retained byte for
     byte: the 12 device sources the start loader bound,
@@ -6455,22 +6929,29 @@ def test_source_saturated_batched_call_keeps_the_two_kernel_program(monkeypatch)
     assert launch["main"]["metadata_from_cu_seqlens"] == 0
 
 
-def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
+def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch):
     """A short packed-varlen call in the seq_idx triple form inside the fused
-    shape window runs the two-kernel program while its preprocess publishes
-    ``seq_chunk_cumsum`` (runner-owned, or the caller's buffer with
-    ``update_seq_chunk_cumsum=True``): the preprocess would run anyway and
-    the fused main kernel costs more than the two-kernel main kernel
-    (round-6 pre-acceptance gate, 15 rows).  With a caller table the
-    preprocess does not rewrite (``update_seq_chunk_cumsum=False``) nothing
-    is published, so the fused program is one launch reading the caller's
-    tables (``_WorkspaceKey.caller_cumsum``).  Outside
-    the window the trusted table still runs the two-kernel program.  The
-    same call in the cu_seqlens form takes the fused program (next test)."""
+    shape window runs, while ``seq_chunk_cumsum`` is published (runner-owned,
+    or the caller's buffer with ``update_seq_chunk_cumsum=True``), the
+    program of the device's capability: on SM100 ``exactmeta`` (the light
+    metadata kernel publishes the table, one thread per segment, no dt work,
+    then the fused main kernel runs); on SM103 the one-launch ``exactone``
+    program for a runner-owned table (the fused main kernel derives it in a
+    CTA prologue, nothing is published) and the two-kernel program where the
+    caller's buffer must receive it (the full preprocess publishes it).  With
+    a caller table the preprocess does not rewrite
+    (``update_seq_chunk_cumsum=False``) nothing is published, so the fused
+    program is one launch reading the caller's tables
+    (``_WorkspaceKey.caller_cumsum``).  Outside the window the trusted table
+    still runs the two-kernel program.  The same call in the cu_seqlens form
+    takes the fused program (next test)."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
-    runner = _cpu_forwarding_runner(module, monkeypatch, calls, has_varlen=True)
+    runner = _cpu_forwarding_runner(
+        module, monkeypatch, calls, has_varlen=True, arch=arch
+    )
     seqlen, num_seqs = 300, 2
     x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
     dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
@@ -6484,9 +6965,9 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
         "num_seqs": num_seqs,
     }
 
-    def key(caller_cumsum):
+    def key(caller_cumsum, publish_table=False):
         # (device, batch, seqlen, nchunks, num_segments, num_sequences, state
-        # dtype, from_cu_seqlens, caller_cumsum, family override)
+        # dtype, from_cu_seqlens, caller_cumsum, publish_table, family override)
         return module._WorkspaceKey(
             None,
             1,
@@ -6497,6 +6978,7 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
             torch.bfloat16,
             False,
             caller_cumsum,
+            publish_table,
             "auto",
         )
 
@@ -6510,14 +6992,37 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
     )
     runner.run(x, dt, A, B, C, **triple)
     name, launch = calls[-1]
-    # ... the triple form deriving the table runs the two-kernel program,
-    # preprocess included
-    assert name == runner.last_program_name == "exactpre_bf16_varlen"
-    assert module._PROGRAMS[name].family == "exactpre"
-    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
-    assert launch["preprocess_grid"][0] >= 1
-    assert launch["main"]["metadata_from_cu_seqlens"] == 0
+    assert name == runner.last_program_name
+    if arch == "sm_100a":
+        # ... the triple form deriving the table runs the exactmeta program:
+        # the metadata stage (3 segments -> one 256-thread CTA) publishes the
+        # runner's vector, which the fused main kernel reads
+        assert name == "exactmeta_bf16_varlen"
+        assert module._PROGRAMS[name].family == "exactmeta"
+        assert set(launch["preprocess"]) == set(module._METADATA_ARGS)
+        assert launch["preprocess_grid"] == (1, 1, 1)
+        assert launch["preprocess"]["num_segments"] == 3
+        table_arg = "sequence_offsets"
+    else:
+        # ... on SM103 the one-launch exactone program: no stage (grid 0);
+        # the fused main kernel's CTA prologue derives the table into its row
+        # of the runner's scratch (one CTA: 2 items on this 1-SM device)
+        assert name == "exactone_bf16_varlen"
+        assert module._PROGRAMS[name].family == "exactone"
+        assert set(launch["preprocess"]) == set(module._PREPROCESS_ARGS)
+        assert launch["preprocess_grid"] == (0, 1, 1)
+        assert launch["main_grid"] == (1, 1, 1)
+        assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
+        assert launch["main"]["seq_chunk_cumsum"].numel() == num_seqs + 1
+        table_arg = "seq_chunk_cumsum"
+    assert launch["preprocess"][table_arg] is launch["main"]["seq_chunk_cumsum"]
+    assert launch["preprocess"]["seq_idx_i32"] is triple["seq_idx"]
+    assert launch["preprocess"]["chunk_indices"] is triple["chunk_indices"]
+    assert launch["main"]["metadata_from_cu_seqlens"] == (
+        module._TABLE_IN_KERNEL_I32 if arch == "sm_103a" else 0
+    )
     assert key(False) in runner._workspaces
+    derived_vector = launch["main"]["seq_chunk_cumsum"]
 
     # ... a trusted caller table makes the fused program one launch: the
     # preprocess grid is 0 and the main kernel reads the caller's tables
@@ -6535,19 +7040,30 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
     assert key(True) in runner._workspaces
     assert runner._workspaces.get(key(True)).workspace["program"] == name
 
-    # ... while a caller buffer the preprocess must fill is the derived form
-    # again (its own workspace key, the two-kernel program)
+    # ... while a caller buffer the publishing stage must fill is its own
+    # call shape (``publish_table``): on SM100 the same exactmeta program,
+    # publishing into the caller's buffer; on SM103 the two-kernel program
+    # (the one-launch program keeps its rows private, so it is not an option)
     buffer = torch.empty_like(vector)
     runner.run(
         x, dt, A, B, C, **triple, seq_chunk_cumsum=buffer, update_seq_chunk_cumsum=True
     )
     name, launch = calls[-1]
-    assert name == runner.last_program_name == "exactpre_bf16_varlen"
-    assert launch["preprocess"]["write_seq_chunk_cumsum"] == 1
-    assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
+    assert name == runner.last_program_name
+    assert name == runner._workspaces.get(key(False, True)).workspace["program"]
+    assert module._PROGRAMS[name].family == (
+        "exactmeta"
+        if arch == "sm_100a"
+        else module.two_kernel_family(
+            mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
+        )
+    )
+    assert launch["preprocess"][table_arg] is buffer
+    assert launch["main"]["seq_chunk_cumsum"] is buffer
+    assert launch["main"]["metadata_from_cu_seqlens"] == 0
+    assert buffer is not derived_vector
     assert launch["preprocess_grid"][0] >= 1
-    assert runner._workspaces.get(key(False)).workspace["program"] == name
-    assert len(runner._workspaces) == 2
+    assert len(runner._workspaces) == 3
 
     # Outside the fused window (257 one-token sequences > 256 items) the
     # trusted table keeps the two-kernel program: one chunk per item, so the
@@ -6580,6 +7096,194 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch):
     assert module._PROGRAMS[name].family == "exact"
     assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
     assert launch["preprocess_grid"][0] >= 1
+
+
+@pytest.mark.parametrize("arch", _ROUTE_ARCHES)
+def test_source_varlen_triple_form_routes_by_capability(monkeypatch, arch):
+    """Route matrix of the four packed-varlen call forms inside the fused
+    window, per compute capability.  The ``cu_seqlens`` form and the triple
+    form with a trusted caller table run the fused program as one launch on
+    both architectures (preprocess grid 0; the cu_seqlens form derives its
+    tables in-CTA, ``metadata_from_cu_seqlens``).  The triple form deriving
+    its table (int32 or int64 ``seq_idx``) runs the program of the
+    capability: ``exactmeta`` on SM100 (the 12-argument light metadata stage
+    publishes it ahead of the main kernel), ``exactone`` on SM103 (one
+    launch, the main kernel's prologue derives it; ``metadata_from_cu_seqlens``
+    names the seq_idx dtype).  The triple form publishing the table into the
+    caller's buffer needs a publishing stage on both: ``exactmeta`` on SM100,
+    the two-kernel program on SM103."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    seqlen, num_seqs = 300, 2
+    chunk_indices = torch.tensor([0, 1, 2], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 0, 0], dtype=torch.int32)
+    table = torch.tensor([0, 1, 3], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 150, seqlen], dtype=torch.int32)
+    two_kernel = module.two_kernel_family(
+        mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
+    )
+    derived = "exactmeta" if arch == "sm_100a" else "exactone"
+    published = "exactmeta" if arch == "sm_100a" else two_kernel
+    forms = (
+        ("cu_seqlens", torch.int32),
+        ("triple_i32", torch.int32),
+        ("triple_i64", torch.int64),
+        ("trusted", torch.int32),
+        ("publish", torch.int32),
+    )
+    for form, seq_idx_dtype in forms:
+        calls = []
+        runner = _cpu_forwarding_runner(
+            module,
+            monkeypatch,
+            calls,
+            has_varlen=True,
+            seq_idx_dtype=seq_idx_dtype,
+            arch=arch,
+        )
+        x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
+        dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
+        A = torch.empty((1,), dtype=torch.float32)
+        B = torch.empty((1, seqlen, 1, 128), dtype=torch.bfloat16)
+        C = torch.empty_like(B)
+        if form == "cu_seqlens":
+            kwargs = {"cu_seqlens": cu_seqlens}
+        else:
+            kwargs = {
+                "seq_idx": torch.zeros((1, seqlen), dtype=seq_idx_dtype),
+                "chunk_indices": chunk_indices,
+                "chunk_offsets": chunk_offsets,
+                "num_seqs": num_seqs,
+            }
+            if form == "trusted":
+                kwargs["seq_chunk_cumsum"] = table
+            elif form == "publish":
+                kwargs["seq_chunk_cumsum"] = torch.empty_like(table)
+                kwargs["update_seq_chunk_cumsum"] = True
+        runner.run(x, dt, A, B, C, **kwargs)
+        name, launch = calls[-1]
+        assert name == runner.last_program_name
+        family = module._PROGRAMS[name].family
+        if form in ("cu_seqlens", "trusted"):
+            assert family == "exactfused", (arch, form, name)
+            assert launch["preprocess_grid"] == (0, 1, 1)
+            assert launch["main"]["metadata_from_cu_seqlens"] == int(
+                form == "cu_seqlens"
+            )
+        elif form == "publish":
+            assert family == published, (arch, form, name)
+            assert launch["preprocess_grid"][0] >= 1
+            assert launch["main"]["metadata_from_cu_seqlens"] == 0
+            assert launch["main"]["seq_chunk_cumsum"] is kwargs["seq_chunk_cumsum"]
+        elif family == "exactone":
+            assert arch == "sm_103a" and family == derived, (arch, form, name)
+            assert launch["preprocess_grid"] == (0, 1, 1)
+            assert launch["main"]["metadata_from_cu_seqlens"] == (
+                module._TABLE_IN_KERNEL_I64
+                if form == "triple_i64"
+                else module._TABLE_IN_KERNEL_I32
+            )
+            assert set(launch["preprocess"]) == set(module._PREPROCESS_ARGS)
+            assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
+            assert launch["preprocess"]["seq_idx_int64"] == int(form == "triple_i64")
+        else:
+            assert family == derived, (arch, form, name)
+            assert launch["preprocess_grid"][0] >= 1
+            assert launch["main"]["metadata_from_cu_seqlens"] == 0
+            stage_args = (
+                module._METADATA_ARGS
+                if family == "exactmeta"
+                else module._PREPROCESS_ARGS
+            )
+            assert set(launch["preprocess"]) == set(stage_args)
+            assert launch["preprocess"]["seq_idx_int64"] == int(form == "triple_i64")
+
+
+def test_source_exactone_scratch_has_one_table_row_per_cta(monkeypatch):
+    """The one-launch program's ``seq_chunk_cumsum`` scratch is sized with
+    the shape's workspace as one ``num_sequences + 1`` int32 row per CTA of
+    the main kernel's persistent grid (``_persistent_grid_size``): the CTA
+    prologue derives its private table into row ``blockIdx.x``.  It grows
+    with the sequence count and the grid, the stage is skipped and the same
+    scratch is bound to both stages."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    for num_seqs, sm_count in ((2, 148), (4, 148), (32, 148), (2, 1)):
+        calls = []
+        runner = _cpu_forwarding_runner(
+            module,
+            monkeypatch,
+            calls,
+            has_varlen=True,
+            nheads=8,
+            ngroups=8,
+            arch="sm_103a",
+        )
+        monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
+        monkeypatch.setenv(module._CHUNK_PARALLEL_ENV, "never")
+        seqlen = 64 * num_seqs  # 64-token sequences, two per 128-token chunk
+        ids = torch.arange(num_seqs, dtype=torch.int32)
+        triple = {
+            "seq_idx": torch.repeat_interleave(ids, 64).reshape(1, seqlen),
+            "chunk_indices": ids // 2,
+            "chunk_offsets": (ids % 2) * 64,
+            "num_seqs": num_seqs,
+        }
+        assert module.fused_selected(
+            nheads=8,
+            num_sequences=num_seqs,
+            nchunks=1,
+            mode_varlen=True,
+            total_tokens=seqlen,
+        )
+        runner.run(
+            torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16),
+            torch.empty((1, seqlen, 8), dtype=torch.float32),
+            torch.empty((8,), dtype=torch.float32),
+            torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16),
+            torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16),
+            **triple,
+        )
+        name, launch = calls[-1]
+        assert module._PROGRAMS[name].family == "exactone", (num_seqs, sm_count, name)
+        grid = module._persistent_grid_size(total_work=8 * num_seqs, sm_count=sm_count)
+        assert launch["main_grid"] == (grid, 1, 1)
+        assert launch["preprocess_grid"] == (0, 1, 1)
+        scratch = launch["main"]["seq_chunk_cumsum"]
+        assert scratch.dtype == torch.int32
+        assert scratch.numel() == grid * (num_seqs + 1), (num_seqs, sm_count, grid)
+        assert launch["preprocess"]["seq_chunk_cumsum"] is scratch
+        assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
+
+
+def test_source_other_capabilities_are_refused_before_routing(monkeypatch):
+    """A device that is neither SM100 nor SM103 is refused by ``_target_arch``
+    (the same ``ValueError`` from ``run`` and ``prepare``): no route is
+    guessed for an unmeasured capability."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    target_arch = module._target_arch
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, has_varlen=True)
+    monkeypatch.setattr(module, "_target_arch", target_arch.__wrapped__)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    seqlen = 300
+    x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
+    A = torch.empty((1,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    triple = {
+        "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+        "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+        "num_seqs": 2,
+    }
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        runner.run(x, dt, A, B, C, **triple)
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **triple)
+    assert calls == []
 
 
 def test_source_fused_cu_seqlens_form_derives_the_metadata_in_kernel(monkeypatch):
@@ -6625,3 +7329,117 @@ def test_source_fused_cu_seqlens_form_derives_the_metadata_in_kernel(monkeypatch
     assert launch["preprocess_grid"][0] >= 1
     assert launch["preprocess"]["seq_chunk_cumsum"] is buffer
     assert launch["main"]["seq_chunk_cumsum"] is buffer
+
+
+def test_source_tail_route_mirrors_the_kernel_tests_rule():
+    """``tail_selected`` mirrors the Cake kernel-tests ``tail_route`` for the
+    two-kernel family: a two-kernel exact-scan call runs the ``_tail`` pair
+    program where its balanced persistent grid leaves a tail wave, the
+    host-known chunks per item reach 16 and the pair makespan in items
+    ``ceil(items / pairs) / 2`` is below the persistent program's ``ceil(items
+    / grid)``.  The expectation is recomputed here from the rule's definition
+    over a grid of item and chunk counts on both devices (148 / 152 SMs)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    route = module.tail_selected
+
+    assert module._TAIL_MIN_CHUNKS == 16
+    assert module._tail_grid_size(sm_count=148) == 148
+    assert module._tail_grid_size(sm_count=152) == 152
+    assert module._tail_grid_size(sm_count=147) == 146
+
+    def expected(items, chunks, sm_count):
+        pairs = sm_count // 2
+        grid = module._persistent_grid_size(total_work=items, sm_count=sm_count)
+        tail_wave = items > sm_count and grid < sm_count
+        return (
+            tail_wave
+            and chunks >= 16
+            and math.ceil(items / pairs) / 2 < math.ceil(items / grid)
+        )
+
+    for sm_count in (148, 152):
+        for items in (64, 128, 148, 152, 256, 296, 304, 384, 512, 640, 768, 1024, 2048):
+            for chunks in (1, 4, 8, 15, 16, 17, 31, 32, 64):
+                assert route(
+                    total_work=items, chunks_per_item=chunks, sm_count=sm_count
+                ) == expected(items, chunks, sm_count), (sm_count, items, chunks)
+        # the measured rows: 512 items (4 sequences x 128 heads)
+        assert route(total_work=512, chunks_per_item=16, sm_count=sm_count)
+        assert route(total_work=512, chunks_per_item=32, sm_count=sm_count)
+        assert not route(total_work=512, chunks_per_item=8, sm_count=sm_count)
+        # 256 items: pair makespan 2.0 equals the persistent program's 2
+        assert not route(total_work=256, chunks_per_item=32, sm_count=sm_count)
+        # 1024 items: a full wave (grid 148 / 152), no tail wave
+        assert not route(total_work=1024, chunks_per_item=32, sm_count=sm_count)
+    # the chunks per item are the two-kernel route's quantity
+    chunks = module.host_chunks_per_item
+    assert chunks(mode_varlen=False, num_sequences=4, seqlen=2048) == 16
+    assert chunks(mode_varlen=True, num_sequences=64, seqlen=64 * 4096) == 32
+    assert chunks(mode_varlen=True, num_sequences=3, seqlen=3 * 2048 - 1) == 16
+    assert chunks(mode_varlen=True, num_sequences=0, seqlen=128) == 1
+    assert module.two_kernel_family(
+        mode_varlen=False, num_sequences=4, seqlen=2048
+    ) == ("exactpre")
+    assert module.two_kernel_family(
+        mode_varlen=False, num_sequences=16, seqlen=128
+    ) == ("exact")
+    # no call inside the fused window reaches the pair program's floor with a
+    # tail wave: batched fused calls span at most 16 chunks only up to 2048
+    # chunk-items, varlen fused calls at most 256 items
+    assert not (
+        module.fused_selected(
+            nheads=128,
+            num_sequences=4,
+            nchunks=16,
+            mode_varlen=False,
+            total_tokens=8192,
+        )
+        and route(total_work=512, chunks_per_item=16, sm_count=148)
+    )
+    assert (
+        module.fused_selected(
+            nheads=128,
+            num_sequences=4,
+            nchunks=16,
+            mode_varlen=False,
+            total_tokens=8192,
+        )
+        is False
+    )
+
+
+def test_source_tail_programs_are_bound():
+    """The six ``_tail`` programs (two-kernel family, three state dtypes,
+    batched and varlen) bind the family's host template and main arguments,
+    the tail SMEM literal, the ``tail`` variant and the 2-CTA cluster shape;
+    the ring and ``_noring`` programs keep their variants, and the fused and
+    retained ``exact`` families have no pair program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    names = [
+        f"exactpre_{state}_{mode}_tail"
+        for state in ("bf16", "f16", "f32")
+        for mode in ("batched", "varlen")
+    ]
+    assert len(names) == 6
+    for name in names:
+        program = module._PROGRAMS[name]
+        ring = module._PROGRAMS[name.rsplit("_", 1)[0]]
+        assert program.variant == "tail"
+        assert program.family == ring.family == "exactpre"
+        assert (
+            program.main_smem_bytes == module._VARIANT_SMEM_BYTES[("exactpre", "tail")]
+        )
+        assert program.host_template == ring.host_template
+        assert program.main_args == ring.main_args
+        assert program.cluster_dims == (2, 1, 1) and ring.cluster_dims == (1, 1, 1)
+        assert ring.variant == ""
+        assert module._PROGRAMS[f"{name.rsplit('_', 1)[0]}_noring"].variant == "noring"
+    assert not any(name.endswith("_tail") for name in module._SCAN_MODULES)
+    assert not any(name.endswith("_tail") for name in module._EXACTFUSED_MODULES)
+    assert set(module._VARIANT_CLUSTER_DIMS) == {("exactpre", "tail")}
+    assert (
+        module._program_name("exactpre", torch.bfloat16, False, "tail")
+        == "exactpre_bf16_batched_tail"
+    )
