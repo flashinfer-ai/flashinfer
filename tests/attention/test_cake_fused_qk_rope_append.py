@@ -608,8 +608,9 @@ def test_stage_for_without_shape_is_the_base_build():
 
 
 # ----------------------------------------------------------------------------------------------
-# Shared sources (CPU): every (stage, arch) module compiles the stage's one kernel source
-# and the one binding, instantiated through -D defines, and keeps its own kernel symbol.
+# Shared sources (CPU): every (stage, arch) module compiles the one parametric kernel
+# source and the one binding, instantiated through -D defines, and keeps its own
+# kernel symbol.
 
 _GENCODE = {
     "sm_90a": "compute_90a",
@@ -639,7 +640,7 @@ def test_jit_spec_shares_sources_and_keeps_distinct_symbols(monkeypatch):
         for stage in jit.stages_for(arch):
             spec = jit.gen_cake_fused_qk_rope_append_module(stage, arch)
             kernel, binding = spec.sources
-            assert kernel.name == f"cake_fused_qk_rope_append_{stage}_kernel.cu"
+            assert kernel.name == "cake_fused_qk_rope_append_kernel.cu"
             assert binding.name == "cake_fused_qk_rope_append_binding.cu"
             assert kernel.parent == binding.parent
             assert spec.name.endswith(f"_{arch}")
@@ -663,7 +664,8 @@ def test_jit_spec_shares_sources_and_keeps_distinct_symbols(monkeypatch):
 # table.  The 20-hex digest identifies the (stage, arch) build in the Cake export:
 # module name ``cake_fused_qk_rope_append_<digest>``, spec name ``<module>_<arch>``,
 # kernel symbol ``kernel_<module>``, host-shim namespace
-# ``cake_host_shim_<module>_<arch>``.
+# ``cake_host_shim_<module>_<arch>``.  ``_STAGE_KNOBS`` pins the stage knobs the
+# loader passes as -D flags (the former per-stage in-file #define values).
 
 _MODULE_DIGESTS = {
     ("hq8_hkv1", "sm_100a"): "63134a7b435c3dac735e",
@@ -719,6 +721,33 @@ _ARG_NAMES = [
     "grid_z",
 ]
 
+_KNOB_NAMES = (
+    "NUM_Q_HEADS",
+    "NUM_KV_HEADS",
+    "WARPS_PER_ROW",
+    "V_SUB_BASE",
+    "CLEAR_UNIT_CHUNKS",
+    "L_DIRECT_LOOKUP",
+    "CLEAR_UNITS_PER_WARP",
+)
+
+# stage -> knob values in _KNOB_NAMES order
+_STAGE_KNOBS = {
+    "hq8_hkv1": (8, 1, 4, 0, 256, 0, 1),
+    "hq8_hkv1_vsub3_d": (8, 1, 4, 3, 256, 1, 1),
+    "hq64_hkv8": (64, 8, 8, 0, 256, 0, 1),
+    "hq64_hkv8_u2": (64, 8, 8, 0, 256, 0, 2),
+    "hq64_hkv8_d_u2": (64, 8, 8, 0, 256, 1, 2),
+    "hq64_hkv8_d": (64, 8, 8, 0, 256, 1, 1),
+    "hq64_hkv8_w20_vsub18_d": (64, 8, 20, 18, 256, 1, 1),
+    "hq64_hkv8_w20_vsub18": (64, 8, 20, 18, 256, 0, 1),
+}
+
+
+def _knob_flags(stage):
+    pairs = zip(_KNOB_NAMES, _STAGE_KNOBS[stage], strict=True)
+    return [f"-D{name}={value}" for name, value in pairs]
+
 
 def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
     from flashinfer.jit import cake_fused_qk_rope_append as jit
@@ -732,21 +761,43 @@ def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
     }
     shipped = {(stage, arch) for arch in jit.ARCHES for stage in jit.stages_for(arch)}
     assert shipped == set(_MODULE_DIGESTS)
+    assert {stage for stage, _arch in shipped} == set(_STAGE_KNOBS)
+    assert jit._KNOBS == _KNOB_NAMES
     csrc = jit._get_csrc_dir()
     for (stage, arch), digest in sorted(_MODULE_DIGESTS.items()):
         module = f"cake_fused_qk_rope_append_{digest}"
         spec = jit.gen_cake_fused_qk_rope_append_module(stage, arch)
         assert spec.name == f"{module}_{arch}"
         assert spec.sources == [
-            csrc / f"cake_fused_qk_rope_append_{stage}_kernel.cu",
+            csrc / "cake_fused_qk_rope_append_kernel.cu",
             csrc / "cake_fused_qk_rope_append_binding.cu",
         ]
         added = [
             *arch_flags[arch],
             f"-DCAKE_KERNEL_SYMBOL=kernel_{module}",
             f"-DCAKE_HOST_SHIM_NAMESPACE=cake_host_shim_{module}_{arch}",
+            *_knob_flags(stage),
         ]
         assert spec.extra_cuda_cflags[-len(added) :] == added
         generic = spec.extra_cuda_cflags[: -len(added)]
-        assert not any(flag.startswith(("-gencode", "-DCAKE_")) for flag in generic)
+        knob_prefixes = tuple(f"-D{name}=" for name in _KNOB_NAMES)
+        assert not any(
+            flag.startswith(("-gencode", "-DCAKE_", *knob_prefixes)) for flag in generic
+        )
     assert [name for _kind, name in jit.arg_plan()] == _ARG_NAMES
+
+
+def test_parametric_kernel_guards_every_stage_knob():
+    from flashinfer.jit import cake_fused_qk_rope_append as jit
+
+    text = jit._source_path(
+        "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
+    ).read_text(encoding="utf-8")
+    for knob in _KNOB_NAMES:
+        assert text.count(f"#ifndef {knob}\n#error ") == 1, knob
+        assert f"#define {knob} " not in text, knob
+    assert text.count("#if CLEAR_UNITS_PER_WARP == 2\n") == 1
+    assert text.count("#elif CLEAR_UNITS_PER_WARP == 1\n") == 1
+    assert text.count("#if V_SUB_BASE != 0\n") == 2
+    assert text.count("#if L_DIRECT_LOOKUP != 0\n") == 2
+    assert text.count("CAKE_KERNEL_SYMBOL(") == 1

@@ -181,36 +181,8 @@
       "sha256": "9449993d16dbb56d042d3a6d44c6779b47843c6262f0df31113512eb2a1ddf6a"
     },
     {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_d_kernel.cu",
-      "sha256": "2510ea008554a1b3e8d15c3e66ae996ab5021e56721ab9c8a382bb5c3328299a"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_d_u2_kernel.cu",
-      "sha256": "af4b5f32cd18894e5d71da8228aad021f00e746825165a50d5292d73a72ee1fd"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_kernel.cu",
-      "sha256": "97a48aa9e088ea2062effd998e9e0767e2bba77bbe185d275c3d4bf443a431bc"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_u2_kernel.cu",
-      "sha256": "5ed103fa2893474352b30202a27aaa9b287583d10274536cea37de9c93996764"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_w20_vsub18_d_kernel.cu",
-      "sha256": "d3f61999c97a1962b7f503a2fcafb29502cb47a50236c69f5cbd2fb76b16327c"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_w20_vsub18_kernel.cu",
-      "sha256": "60b76525f4e23c2f8dc748c6c5f7a3aed5a322176b4a42a39cf3ad2622abe947"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq8_hkv1_kernel.cu",
-      "sha256": "19939c15dc9b8750dccad34ddca90f589a392fb267bc26bf4088252c4a6b0d49"
-    },
-    {
-      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq8_hkv1_vsub3_d_kernel.cu",
-      "sha256": "b12bc146630d010efe87c429ecf88bade03f868cfb00e0e36f73f3f2a9154879"
+      "path": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu",
+      "sha256": "b558a2109916ef1d9c72aa2e013f61b9f988d3fe597c02b5ff6b9f3f82edc19a"
     }
   ],
   "library": "flashinfer",
@@ -233,7 +205,9 @@
       "compile_flags": [],
       "ffi_entry": "run",
       "specializations": {
+        "CLEAR_UNITS_PER_WARP": 1,
         "CLEAR_UNIT_CHUNKS": 256,
+        "L_DIRECT_LOOKUP": 0,
         "NUM_KV_HEADS": 8,
         "NUM_Q_HEADS": 64,
         "V_SUB_BASE": 0,
@@ -242,7 +216,7 @@
       "stage": "hq64_hkv8",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -263,6 +237,7 @@
       "compile_flags": [],
       "ffi_entry": "run",
       "specializations": {
+        "CLEAR_UNITS_PER_WARP": 1,
         "CLEAR_UNIT_CHUNKS": 256,
         "L_DIRECT_LOOKUP": 1,
         "NUM_KV_HEADS": 8,
@@ -273,7 +248,7 @@
       "stage": "hq64_hkv8_d",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_d_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -301,7 +276,7 @@
       "stage": "hq64_hkv8_d_u2",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_d_u2_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -320,6 +295,7 @@
       "specializations": {
         "CLEAR_UNITS_PER_WARP": 2,
         "CLEAR_UNIT_CHUNKS": 256,
+        "L_DIRECT_LOOKUP": 0,
         "NUM_KV_HEADS": 8,
         "NUM_Q_HEADS": 64,
         "V_SUB_BASE": 0,
@@ -328,7 +304,7 @@
       "stage": "hq64_hkv8_u2",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_u2_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -345,7 +321,9 @@
       "compile_flags": [],
       "ffi_entry": "run",
       "specializations": {
+        "CLEAR_UNITS_PER_WARP": 1,
         "CLEAR_UNIT_CHUNKS": 256,
+        "L_DIRECT_LOOKUP": 0,
         "NUM_KV_HEADS": 8,
         "NUM_Q_HEADS": 64,
         "V_SUB_BASE": 18,
@@ -354,7 +332,7 @@
       "stage": "hq64_hkv8_w20_vsub18",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_w20_vsub18_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -375,6 +353,7 @@
       "compile_flags": [],
       "ffi_entry": "run",
       "specializations": {
+        "CLEAR_UNITS_PER_WARP": 1,
         "CLEAR_UNIT_CHUNKS": 256,
         "L_DIRECT_LOOKUP": 1,
         "NUM_KV_HEADS": 8,
@@ -385,7 +364,7 @@
       "stage": "hq64_hkv8_w20_vsub18_d",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq64_hkv8_w20_vsub18_d_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -402,7 +381,9 @@
       "compile_flags": [],
       "ffi_entry": "run",
       "specializations": {
+        "CLEAR_UNITS_PER_WARP": 1,
         "CLEAR_UNIT_CHUNKS": 256,
+        "L_DIRECT_LOOKUP": 0,
         "NUM_KV_HEADS": 1,
         "NUM_Q_HEADS": 8,
         "V_SUB_BASE": 0,
@@ -411,7 +392,7 @@
       "stage": "hq8_hkv1",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq8_hkv1_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     },
     {
@@ -432,6 +413,7 @@
       "compile_flags": [],
       "ffi_entry": "run",
       "specializations": {
+        "CLEAR_UNITS_PER_WARP": 1,
         "CLEAR_UNIT_CHUNKS": 256,
         "L_DIRECT_LOOKUP": 1,
         "NUM_KV_HEADS": 1,
@@ -442,7 +424,7 @@
       "stage": "hq8_hkv1_vsub3_d",
       "translation_units": {
         "binding": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_binding.cu",
-        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_hq8_hkv1_vsub3_d_kernel.cu"
+        "device": "csrc/cake_fused_qk_rope_append/cake_fused_qk_rope_append_kernel.cu"
       }
     }
   ],

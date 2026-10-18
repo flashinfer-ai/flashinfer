@@ -22,11 +22,14 @@ two head configurations ``(Hq, Hkv) = (8, 1)`` / ``(64, 8)`` (the base build
 shipped for ``sm_90a`` (H100/H200), ``sm_100a`` (B200) and ``sm_103a`` (B300);
 a record's ``builds[arch]`` holds the module name and kernel symbol of that
 (stage, arch) library, and ``contract.arg_plan`` the binding's argument order
-shared by every build.  The kernel source of a
-stage and the tvm-ffi binding are shared by all architectures: every module
-compiles them with ``-DCAKE_KERNEL_SYMBOL=<its kernel_symbol>`` and its own
-host-shim namespace (:func:`_module_defines`), so the per-(stage, arch)
-libraries keep distinct symbols and can be loaded into one process.
+shared by every build.  One parametric kernel source
+(``cake_fused_qk_rope_append_kernel.cu``) and one tvm-ffi binding are shared
+by every stage and architecture: a module compiles them with the stage's knob
+defines (``-DNUM_Q_HEADS=...`` ... ``-DCLEAR_UNITS_PER_WARP=...`` from the
+record's ``specializations``, :func:`_knob_defines`), with
+``-DCAKE_KERNEL_SYMBOL=<its kernel_symbol>`` and its own host-shim namespace
+(:func:`_module_defines`), so the per-(stage, arch) libraries keep distinct
+symbols and can be loaded into one process.
 :func:`stage_for` mirrors the Cake policy (``contract.stage_policy``)
 and picks the stage from the architecture and the problem shape; the host
 wrapper lives in :mod:`flashinfer.cake_fused_qk_rope_append`.
@@ -58,6 +61,18 @@ ARCHES = ("sm_90a", "sm_100a", "sm_103a")
 HEAD_DIM = 128
 _VEC = 8
 _CLEAR_UNIT_CHUNKS = 256
+# Knobs of the parametric kernel source, in the order of its ``#ifndef`` guards;
+# every stage record's ``specializations`` carries exactly these (the former
+# per-stage in-file ``#define`` values).
+_KNOBS = (
+    "NUM_Q_HEADS",
+    "NUM_KV_HEADS",
+    "WARPS_PER_ROW",
+    "V_SUB_BASE",
+    "CLEAR_UNIT_CHUNKS",
+    "L_DIRECT_LOOKUP",
+    "CLEAR_UNITS_PER_WARP",
+)
 _NVCC_FLAGS = {
     "sm_90a": sm90a_nvcc_flags,
     "sm_100a": sm100a_nvcc_flags,
@@ -305,10 +320,25 @@ def _source_path(relative_path: str) -> Path:
     return path
 
 
+def _knob_defines(record: dict[str, Any]) -> list[str]:
+    """``-D`` flags that instantiate the parametric kernel source for one stage.
+
+    The knobs are the record's ``specializations``; the kernel source has an
+    ``#ifndef``/``#error`` guard per knob, so a missing one fails the build.
+    """
+    knobs = record["specializations"]
+    if set(knobs) != set(_KNOBS):
+        raise RuntimeError(
+            f"stage {record['stage']!r} specializations {sorted(knobs)} "
+            f"!= {sorted(_KNOBS)}"
+        )
+    return [f"-D{name}={int(knobs[name])}" for name in _KNOBS]
+
+
 def _module_defines(record: dict[str, Any], arch: str) -> list[str]:
     """``-D`` flags that instantiate the shared sources for one (stage, arch) module.
 
-    The kernel source of a stage and the binding are shared by all architectures.
+    The kernel source and the binding are shared by all stages and architectures.
     Each module is its own JIT library and all of them may be loaded into one
     process, so every build keeps its own kernel symbol (the manifest record's
     ``kernel_symbol``) and its own host-shim namespace.
@@ -330,6 +360,7 @@ def gen_cake_fused_qk_rope_append_module(stage: str, arch: str) -> JitSpec:
             *_NVCC_FLAGS[arch],
             *record["compile_flags"],
             *_module_defines(record, arch),
+            *_knob_defines(record),
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
