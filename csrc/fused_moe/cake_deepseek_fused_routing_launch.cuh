@@ -38,7 +38,8 @@ struct MultiTokenBand {
 };
 // Per-band table, checked before the shipped rule; kMultiTokenBandCount entries are live (the
 // trailing sentinel keeps the array non-empty).  Mirrors MULTI_TOKEN_BANDS of the Cake seed.
-// Measured per-shape overrides (both seeds, both interleaved rounds, >= 1 % each); other T use the rule.
+// Measured per-shape overrides (both seeds, both interleaved rounds, >= 1 % each); other T use the
+// rule.
 constexpr int kMultiTokenBandCount = 3;
 constexpr MultiTokenBand kMultiTokenBands[kMultiTokenBandCount + 1] = {
     {3393, 3393, 4}, {4096, 4096, 5}, {4241, 4241, 5}, {0, 0, 1}};
@@ -67,8 +68,9 @@ inline bool device_has_multi_token_members() {
   return state == 2;
 }
 
-// The sm_107a single-group members (cake_deepseek_fused_routing_kernels_sm107a_single.cu) are compiled
-// for the same device passes as the multi-token members and dispatched on the same compute capability.
+// The sm_107a single-group members (cake_deepseek_fused_routing_kernels_sm107a_single.cu) are
+// compiled for the same device passes as the multi-token members and dispatched on the same compute
+// capability.
 inline bool device_has_sm107a_single_members() { return device_has_multi_token_members(); }
 
 // Tokens one CTA routes for this launch: 1 (the one-token kernels) unless the device has the
@@ -189,13 +191,15 @@ cudaError_t launch(ScoreT* scores, BiasT* bias, ScoreT* topk_values, int32_t* to
     if (num_experts <= 128) {
       return cudaLaunchKernelEx(
           &config,
-          cake_deepseek_routing_sm107a_single::kernel_cake_deepseek_routing_single<ScoreT, BiasT, 128>,
+          cake_deepseek_routing_sm107a_single::kernel_cake_deepseek_routing_single<ScoreT, BiasT,
+                                                                                   128>,
           scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
           groups32, top_groups32, scaling32, has_replay);
     }
     return cudaLaunchKernelEx(
         &config,
-        cake_deepseek_routing_sm107a_single::kernel_cake_deepseek_routing_single<ScoreT, BiasT, 384>,
+        cake_deepseek_routing_sm107a_single::kernel_cake_deepseek_routing_single<ScoreT, BiasT,
+                                                                                 384>,
         scores, bias, topk_values, topk_indices, replay_bytes, tokens32, experts32, topk32,
         groups32, top_groups32, scaling32, has_replay);
   }
