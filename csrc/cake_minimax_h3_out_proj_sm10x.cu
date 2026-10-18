@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 // clang-format off
-// MiniMax-H3 attention output projection + indexed gate + residual for sm_103a (Blackwell,
-// compute capability 10.3).  Generated device code; three operator variants share one
-// translation unit.  The activation arrives in the Ulysses (sequence-parallel) receive layout
+// MiniMax-H3 attention output projection + indexed gate + residual for sm_100a and sm_103a
+// (Blackwell, compute capability 10.0 and 10.3; one translation unit compiled once per target,
+// MINIMAX_H3_SM_MINOR naming the minor).  Generated device code; three operator variants share
+// one translation unit.  The activation arrives in the Ulysses (sequence-parallel) receive layout
 // attn_out[P, M, 56 / P, 128] (block p holds heads [p * 56 / P, (p + 1) * 56 / P)) and is consumed
 // in place: the logical activation is A[m, h * 128 + d] = attn_out[h / (56 / P), m, h % (56 / P), d].
 //
@@ -2620,6 +2621,16 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
 
 #include "tvm_ffi_utils.h"
 
+// The one 10.x minor this build serves: 0 for sm_100a, 3 for sm_103a.  The JIT builder passes
+// it next to the matching -gencode (the device code above already branches on __CUDA_ARCH__
+// wherever 10.0 and 10.3 differ), so one translation unit compiled once per target replaces
+// the former per-target copies while each module keeps its exact-capability check.
+#ifndef MINIMAX_H3_SM_MINOR
+#error "define MINIMAX_H3_SM_MINOR (0 for sm_100a, 3 for sm_103a) to match the -gencode target"
+#endif
+static_assert(MINIMAX_H3_SM_MINOR == 0 || MINIMAX_H3_SM_MINOR == 3,
+              "MINIMAX_H3_SM_MINOR must be 0 (sm_100a) or 3 (sm_103a)");
+
 namespace {
 
 constexpr int64_t kHidden = 5376;        // N: o_weight rows, out columns
@@ -2875,8 +2886,9 @@ void ConfigureKernels() {
   status = cudaGetDeviceProperties(&properties, device);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to query CUDA device properties: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(properties.major == 10 && properties.minor == 3, RuntimeError)
-      << "this MiniMax-H3 out-proj build targets compute capability 10.3 exactly (tcgen05 + TMEM + 2-CTA MMA)";
+  TVM_FFI_CHECK(properties.major == 10 && properties.minor == MINIMAX_H3_SM_MINOR, RuntimeError)
+      << "this MiniMax-H3 out-proj build targets compute capability 10." << MINIMAX_H3_SM_MINOR
+      << " exactly (tcgen05 + TMEM + 2-CTA MMA)";
   TVM_FFI_CHECK(properties.multiProcessorCount >= kCtaGroup, RuntimeError)
       << "MiniMax-H3 out-proj requires at least " << kCtaGroup << " SMs";
   OptInSmem(kernel_minimax_h3_quant_mxfp8, kQuantMxfp8Smem, "quantize mxfp8");
