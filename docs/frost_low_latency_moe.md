@@ -221,6 +221,17 @@ their absolute kernel times with that qualification; they are not interchangeabl
 Frost autotuning tactics. Changing-input graph and post-timing checks use each
 backend's declared reference, including its default-tactic control.
 
+Prims-TS uses another MXFP8 intermediate scale: `2**(floor(log2(amax)) - 8)`
+with saturating E4M3 conversion, rather than `2**ceil(log2(amax / 448))`.
+For example, a block maximum of 500 gives scales 1 and 2 respectively; the
+former clips its largest value to 448. `--backend-references` models this
+source-defined scale with FP32 activation for Prims, again outside timing and
+with unchanged tolerances. This is a separate numerical contract, not an
+interchangeable Frost tactic or evidence of a kernel correctness failure.
+With `--retune-cache`, the benchmark ranks the full advertised Prims tactic
+list once; it skips the redundant preliminary autotune. Factorized backends
+retain their native per-GEMM search before the cache-specific comparison.
+
 It includes scale conversion and combine. By default the precomputed routing
 weights are FP32; use `--routing-weights-dtype bf16` to measure a producer that
 already emits BF16 weights. Removing a conversion helps only when that

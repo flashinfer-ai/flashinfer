@@ -60,10 +60,13 @@ def _decode_mx(payload, scales):
     ).reshape(values.shape)
 
 
-def _bf16_intermediate_reference(q, sf, w1, s1, w2, s2, ids, scores, activation):
-    """Model CUTLASS/cuDNN grouped MX SwiGLU rounding outside timed regions.
+def _mx_intermediate_reference(
+    q, sf, w1, s1, w2, s2, ids, scores, activation, *, prims_scale=False
+):
+    """Model native MX SwiGLU numerical boundaries outside timed regions.
 
-    Both write BF16 GEMM1 and activation values before MXFP8 quantization.
+    CUTLASS/cuDNN write BF16 GEMM1 and activation before MXFP8 quantization.
+    Prims keeps FP32 activation and uses an exponent-only MX scale instead.
     FP64 dots and ordered FP32 combine provide a tolerance-based reference;
     they do not model the native reduction order bit for bit.
     """
@@ -71,32 +74,32 @@ def _bf16_intermediate_reference(q, sf, w1, s1, w2, s2, ids, scores, activation)
     result = torch.zeros_like(x, dtype=torch.float32)
     for token in range(ids.shape[0]):
         for slot, expert in enumerate(ids[token].tolist()):
-            gu = (
-                (x[token] @ _decode_mx(w1[expert], s1[expert]).T)
-                .float()
-                .bfloat16()
-                .float()
-            )
+            gu = (x[token] @ _decode_mx(w1[expert], s1[expert]).T).float()
+            if not prims_scale:
+                gu = gu.bfloat16().float()
             up, gate = gu.chunk(2)
             gate = gate.clamp_max(activation.limit)
             up = up.clamp(-activation.limit, activation.limit)
             mid = (
-                (
-                    gate
-                    / (1 + torch.exp(-gate * activation.alpha))
-                    * (up + activation.beta)
-                )
-                .bfloat16()
-                .float()
-                .reshape(-1, 32)
+                gate
+                / (1 + torch.exp(-gate * activation.alpha))
+                * (up + activation.beta)
             )
-            exponent = torch.ceil(
-                torch.log2(
-                    mid.abs().amax(-1).clamp_min(torch.finfo(torch.float32).tiny) / 448
-                )
+            if not prims_scale:
+                mid = mid.bfloat16().float()
+            mid = mid.reshape(-1, 32)
+            amax = mid.abs().amax(-1).clamp_min(torch.finfo(torch.float32).tiny)
+            # Prims gmem_c_resources truncates amax to a power of two, then
+            # divides by 256; it can saturate values that the /448 rule retains.
+            exponent = (
+                torch.floor(torch.log2(amax)) - 8
+                if prims_scale
+                else torch.ceil(torch.log2(amax / 448))
             ).clamp(-127, 127)
             scale = torch.exp2(exponent)[..., None]
-            dq = ((mid / scale).to(torch.float8_e4m3fn).float() * scale).flatten()
+            dq = (
+                (mid / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale
+            ).flatten()
             down = (
                 (dq.double() @ _decode_mx(w2[expert], s2[expert]).T).bfloat16().float()
             )
@@ -153,7 +156,7 @@ def main():
     parser.add_argument(
         "--backend-references",
         action="store_true",
-        help="Validate CUTLASS/cuDNN grouped against their BF16 intermediate contract; record disagreement with TRT separately",
+        help="Use CUTLASS/cuDNN BF16-intermediate and Prims MX-scale references; record disagreement with TRT separately",
     )
     parser.add_argument(
         "--include-frost-tactics",
@@ -397,21 +400,35 @@ def main():
         # A frozen-tactic validation must not recompile/tune the entire space.
         # The initial default call still establishes the normal runner binding;
         # the requested tactic is applied before capture below.
-        with autotune(a.retune_cache or requested_tactics.get(name) is None):
+        initial_autotune = a.retune_cache or requested_tactics.get(name) is None
+        # Prims advertises its full tactic list without a preliminary search.
+        # The cache-specific sweep below already ranks every candidate once.
+        if a.retune_cache and name == "prims_ts":
+            initial_autotune = False
+        with autotune(initial_autotune):
             layer(act, weights)
         layers[name] = layer
 
     def backend_references():
         references = {}
         if a.backend_references:
-            for name in ("cutlass", "cudnn_grouped"):
+            for name in ("cutlass", "cudnn_grouped", "prims_ts"):
                 if name not in layers:
                     continue
                 # This benchmark constructs a PackedPrecomputed activation
-                # pack. Both adapters narrow these routing scores to BF16.
+                # pack. These adapters narrow routing scores to BF16.
                 scores = rw.bfloat16()
-                references[name] = _bf16_intermediate_reference(
-                    q, sf, q1, s1, q2, s2, ids, scores, activation
+                references[name] = _mx_intermediate_reference(
+                    q,
+                    sf,
+                    q1,
+                    s1,
+                    q2,
+                    s2,
+                    ids,
+                    scores,
+                    activation,
+                    prims_scale=name == "prims_ts",
                 )
         return references
 
@@ -436,6 +453,7 @@ def main():
                     candidates.append(tactic)
             check_ref = references.get(name, ref)
             ranked = []
+            print(f"{name}: ranking {len(candidates)} tactics", flush=True)
             for tactic in candidates:
                 layer._winners[key] = (runner, tactic)
                 layer(act, weights)
@@ -452,6 +470,8 @@ def main():
                     mx,
                 )
                 ranked.append((median(values), tactic))
+                if len(ranked) % 64 == 0:
+                    print(f"{name}: ranked {len(ranked)}/{len(candidates)}", flush=True)
             winner = min(ranked, key=lambda item: item[0])[1]
             layer._winners[key] = (runner, winner)
             cache_tuning[name] = [
@@ -615,7 +635,10 @@ def main():
         cache_tuning=cache_tuning,
         numerical_references={
             name: (
-                "BF16 GEMM1 and activation before MXFP8; BF16 expert output; ordered FP32 combine reference"
+                "FP32 activation; exponent-only MX scale with saturating E4M3; BF16 expert output; ordered FP32 combine reference"
+                if name.removesuffix("_default") == "prims_ts"
+                and name.removesuffix("_default") in references
+                else "BF16 GEMM1 and activation before MXFP8; BF16 expert output; ordered FP32 combine reference"
                 if name.removesuffix("_default") in references
                 else "TRT-LLM output"
             )
