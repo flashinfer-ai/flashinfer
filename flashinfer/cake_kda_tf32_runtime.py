@@ -13,15 +13,11 @@ from flashinfer.jit.cake_kda_tf32 import device_arch as detect_gpu_arch
 from flashinfer.kda_prefill import (
     _direct_m128_route,
     _make_lpt_task_bins,
+    _pair_packed_beta_tma_source,
     _persistent_m128_roofline,
+    _select_bf16_route,
     _should_use_bt16_dense_wavefront,
-    _should_use_bt16_prepare_chain,
     _should_use_h12_direct_n32,
-    _should_use_independent_dvsplit,
-    _should_use_lpt_persistent,
-    _should_use_scalar_chunk_lpt,
-    _should_use_source_vtile_direct,
-    _should_use_source_vtile_persistent,
     _uses_measured_sm100_persistent_policy,
     _wave_quantized_bt16_prepare_ctas,
 )
@@ -699,28 +695,6 @@ def _pad_beta_tma_source(beta_flat, *, total_tokens: int, num_heads: int):
     return beta_flat.new_zeros((padded_tokens, padded_heads))
 
 
-def _pair_packed_beta_tma_source(beta_flat, *, total_tokens: int, num_heads: int):
-    """Return an aliasing H12 beta view with a TensorMap-legal row pitch.
-
-    Pairing two consecutive token rows turns dense ``[T, 12]`` storage into
-    ``[T/2, 24]`` without moving data.  Its 48-byte row pitch is TensorMap
-    encodable, and the direct kernel rounds each sequence start down to the pair
-    boundary before selecting the original token/head element in shared
-    memory.  Unsupported layouts return ``None`` and retain the padded-copy
-    fallback.
-    """
-    if tuple(beta_flat.shape) != (total_tokens, num_heads):
-        raise ValueError("beta_flat must have shape [total_tokens, num_heads]")
-    if (
-        num_heads != 12
-        or total_tokens % 2 != 0
-        or (not beta_flat.is_contiguous())
-        or (beta_flat.data_ptr() % 16 != 0)
-    ):
-        return None
-    return beta_flat.view(total_tokens // 2, 24)
-
-
 def _beta_tma_copy_required(
     offsets: tuple[int, ...] | list[int], *, chunk_tokens: int
 ) -> bool:
@@ -1228,7 +1202,12 @@ def _should_use_uniform_piece_persistent(
     use_initial_state: bool = True,
     store_final_state: bool = True,
 ) -> bool:
-    """Select recurrence pieces when their occupancy-aware roofline wins."""
+    """Select recurrence pieces when their occupancy-aware roofline wins.
+
+    ``flashinfer.kda_prefill._should_use_uniform_piece_persistent`` adds the
+    148 / 152-SM gate of the measured policy; the TF32 auto route keeps this
+    SM-count-free rule (its persistent family is not exported).
+    """
     if not uniform_sequences or max_seq_len <= 0:
         return False
     estimate = _persistent_m128_roofline(
@@ -1438,238 +1417,6 @@ def _constrained_direct_m128_route(
     ):
         return BF16_ROUTE_DIRECT_M128
     return _direct_m128_route(num_heads=num_heads, max_sequence_length=max_seq_len)
-
-
-def _requires_exact_n16_recurrence(
-    *,
-    sm_count: int,
-    fixed_layout: bool,
-    num_seqs: int,
-    num_heads: int,
-    uniform_sequences: bool,
-) -> bool:
-    """Select the measured N16 graph for the 148-SM H96/N128 holdout."""
-    return (
-        sm_count == 148
-        and (not fixed_layout)
-        and (num_seqs == 128)
-        and (num_heads == 96)
-        and uniform_sequences
-    )
-
-
-def _select_bf16_route(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    fixed_layout: bool,
-    num_seqs: int,
-    num_heads: int,
-    uniform_sequences: bool,
-    lpt_loads: tuple[int, ...],
-    max_seq_len: int = 0,
-    use_initial_state: bool = True,
-    store_final_state: bool = True,
-) -> str:
-    """Select one material BF16 schedule family from resolved host metadata."""
-    direct_route = _direct_m128_route(
-        num_heads=num_heads, max_sequence_length=max_seq_len
-    )
-    if num_heads == 64 and _should_use_independent_dvsplit(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_M64
-    if _should_use_source_vtile_direct(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_SOURCE_VTILE_M128
-    if _should_use_source_vtile_persistent(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        fixed_layout=fixed_layout,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_SOURCE_VTILE_M128
-    if _should_use_bt16_dense_wavefront(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_BT16_M64
-    if direct_route == BF16_ROUTE_DIRECT_M128_N16:
-        if _should_use_h12_direct_n32(
-            compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-            num_heads=num_heads,
-            max_sequence_length=max_seq_len,
-        ):
-            return BF16_ROUTE_DIRECT_M128
-        total_tasks = num_seqs * num_heads
-        direct_waves = (total_tasks + sm_count - 1) // sm_count
-        chain_waves = (BT16_VALUE_SPLITS * total_tasks + sm_count - 1) // sm_count
-        if (
-            gpu_arch in ("sm_100a", "sm_103a")
-            and uniform_sequences
-            and (max_seq_len > H12_DIRECT_N32_MAX_SEQ_LEN)
-            and (chain_waves > direct_waves)
-        ):
-            return BF16_ROUTE_DIRECT_M128
-        if total_tasks > 2 * sm_count and max_seq_len >= 512:
-            return BF16_ROUTE_DIRECT_M128
-        if _should_use_bt16_prepare_chain(
-            compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-            sm_count=sm_count,
-            num_sequences=num_seqs,
-            num_heads=num_heads,
-            max_sequence_length=max_seq_len,
-            n16_alternative=True,
-        ):
-            return BF16_ROUTE_BT16_M64
-        return direct_route
-    if _should_use_bt16_prepare_chain(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        sm_count=sm_count,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_BT16_M64
-    if _should_use_small_bh_owner_helper(
-        gpu_arch=gpu_arch,
-        sm_count=sm_count,
-        num_seqs=num_seqs,
-        num_heads=num_heads,
-        max_seq_len=max_seq_len,
-    ):
-        return BF16_ROUTE_SMALL_BH_M128
-    if _requires_exact_n16_recurrence(
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-    ):
-        return BF16_ROUTE_DIRECT_M128_N16
-    if _should_use_independent_dvsplit(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_M64
-    if _should_use_scalar_chunk_lpt(
-        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-        sm_count=sm_count,
-        num_sequences=num_seqs,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-        max_sequence_length=max_seq_len,
-    ):
-        return BF16_ROUTE_SCALAR_CHUNK_LPT_M128
-    total_tasks = num_seqs * num_heads
-    if _should_use_uniform_piece_persistent(
-        gpu_arch=gpu_arch,
-        sm_count=sm_count,
-        num_seqs=num_seqs,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-        max_seq_len=max_seq_len,
-        use_initial_state=use_initial_state,
-        store_final_state=store_final_state,
-    ):
-        return BF16_ROUTE_PIECE_M128
-    if (
-        _uses_measured_sm100_persistent_policy(
-            compute_capability=_COMPUTE_CAPABILITY[gpu_arch], sm_count=sm_count
-        )
-        and num_heads in (64, 96)
-        and uniform_sequences
-        and (total_tasks > sm_count)
-    ):
-        return BF16_ROUTE_HEAD_GROUPED_M128
-    if (
-        not uniform_sequences
-        and total_tasks > sm_count
-        and _should_use_lpt_persistent(
-            compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
-            sm_count=sm_count,
-            num_heads=num_heads,
-            loads=lpt_loads,
-        )
-    ):
-        return BF16_ROUTE_LPT_M128
-    return direct_route
-
-
-def select_bf16_schedule_route(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    fixed_layout: bool,
-    sequence_lengths: tuple[int, ...],
-    num_heads: int,
-    use_initial_state: bool = True,
-    store_final_state: bool = True,
-) -> str:
-    """Select one physical BF16 schedule from runtime-resolved shape metadata.
-
-    This is the canonical metadata adapter for callers that need to share the
-    production dispatch policy without reproducing its shape guards. Shape
-    values select among materially different schedule families; they do not
-    create per-shape kernel identities.
-    """
-    if sm_count <= 0 or num_heads <= 0:
-        raise ValueError("sm_count and num_heads must be positive")
-    if not sequence_lengths or any((length <= 0 for length in sequence_lengths)):
-        raise ValueError("sequence_lengths must contain positive lengths")
-    if gpu_arch not in _COMPUTE_CAPABILITY:
-        raise ValueError(
-            f"gpu_arch must be one of {sorted(_COMPUTE_CAPABILITY)}, got {gpu_arch!r}"
-        )
-    num_seqs = len(sequence_lengths)
-    uniform_sequences = len(set(sequence_lengths)) == 1
-    total_tasks = num_seqs * num_heads
-    lpt_loads: tuple[int, ...] = ()
-    if (
-        _uses_measured_sm100_persistent_policy(
-            compute_capability=_COMPUTE_CAPABILITY[gpu_arch], sm_count=sm_count
-        )
-        and (not uniform_sequences)
-        and (total_tasks > sm_count)
-    ):
-        ordered_seq_lens = tuple(sorted(sequence_lengths, reverse=True))
-        _task_ids, _task_offsets, lpt_loads = _make_lpt_task_bins(
-            ordered_seq_lens, num_heads=num_heads, sm_count=sm_count
-        )
-    return _select_bf16_route(
-        gpu_arch=gpu_arch,
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-        lpt_loads=lpt_loads,
-        max_seq_len=max(sequence_lengths),
-        use_initial_state=use_initial_state,
-        store_final_state=store_final_state,
-    )
 
 
 def _require_tensor(
@@ -2143,14 +1890,14 @@ class FlashKDABlackwellBF16FusedLaunch:
                 indexed_state_pool=state_indices is not None,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                 preferred_route=_select_bf16_route(
-                    gpu_arch=gpu_arch,
+                    compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
                     sm_count=sm_count,
                     fixed_layout=fixed_layout,
-                    num_seqs=num_seqs,
+                    num_sequences=num_seqs,
                     num_heads=num_heads,
                     uniform_sequences=uniform_sequences,
                     lpt_loads=lpt_loads,
-                    max_seq_len=max_seq_len,
+                    max_sequence_length=max_seq_len,
                     use_initial_state=initial_state is not None,
                     store_final_state=final_state is not None,
                 )
@@ -2159,17 +1906,39 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         else:
             route = _select_bf16_route(
-                gpu_arch=gpu_arch,
+                compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
                 sm_count=sm_count,
                 fixed_layout=fixed_layout,
-                num_seqs=num_seqs,
+                num_sequences=num_seqs,
                 num_heads=num_heads,
                 uniform_sequences=uniform_sequences,
                 lpt_loads=lpt_loads,
-                max_seq_len=max_seq_len,
+                max_sequence_length=max_seq_len,
                 use_initial_state=initial_state is not None,
                 store_final_state=final_state is not None,
             )
+            if (
+                compute_dtype == "tf32"
+                and route == BF16_ROUTE_DIRECT_M128
+                and _direct_m128_route(
+                    num_heads=num_heads, max_sequence_length=max_seq_len
+                )
+                == BF16_ROUTE_DIRECT_M128
+                and _should_use_uniform_piece_persistent(
+                    gpu_arch=gpu_arch,
+                    sm_count=sm_count,
+                    num_seqs=num_seqs,
+                    num_heads=num_heads,
+                    uniform_sequences=uniform_sequences,
+                    max_seq_len=max_seq_len,
+                    use_initial_state=initial_state is not None,
+                    store_final_state=final_state is not None,
+                )
+            ):
+                # The shared planner requests recurrence pieces on 148- and
+                # 152-SM parts only; the TF32 launch keeps requesting them
+                # wherever their roofline wins (the family is not exported).
+                route = BF16_ROUTE_PIECE_M128
             if compute_dtype == "bf16" and route not in {
                 BF16_ROUTE_DIRECT_M128,
                 BF16_ROUTE_DIRECT_M128_N16,
@@ -2599,9 +2368,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         )
         pair_packed_beta_tma = (
-            _pair_packed_beta_tma_source(
-                beta_flat, total_tokens=total_tokens, num_heads=num_heads
-            )
+            _pair_packed_beta_tma_source(beta_flat.unsqueeze(0))
             if not self._active_beta_f32
             and route == BF16_ROUTE_DIRECT_M128
             and (num_heads == 12)
@@ -4984,14 +4751,14 @@ def _supports_fp32_bt16_launch(args, kwargs) -> bool:
     if checkpoint_request:
         return False
     route = _select_bf16_route(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
         fixed_layout=fixed_layout,
-        num_seqs=len(sequence_lengths),
+        num_sequences=len(sequence_lengths),
         num_heads=int(num_heads),
         uniform_sequences=len(set(sequence_lengths)) == 1,
         lpt_loads=(),
-        max_seq_len=max(sequence_lengths),
+        max_sequence_length=max(sequence_lengths),
         use_initial_state=initial_state is not None,
         store_final_state=final_state is not None,
     )
