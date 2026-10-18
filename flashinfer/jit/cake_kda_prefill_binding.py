@@ -8,18 +8,21 @@ launcher text is a fixed function of the module's argument plan
 ``cake_kda_tf32.spec`` renders it into the generated-source directory at
 JIT-spec creation instead of reading a checked-in copy. Every module keeps its
 own kernel symbol and host-shim namespace, which lets all modules load into one
-process.
+process. The preparing entries encode and upload the TMA descriptors and opt
+the kernel into its dynamic shared memory; the launch-only entry reuses both.
 """
 
 from string import Template
+from textwrap import indent
 
-# Tensor dtype code -> (CheckDtype code triple, device pointer element type).
+# Tensor dtype code -> (tvm_ffi_utils.h DLDataType constant, device pointer
+# element type).
 _TENSOR_TYPES = {
-    "bf16": ((4, 16, 1), "__nv_bfloat16"),
-    "f32": ((2, 32, 1), "float"),
-    "i32": ((0, 32, 1), "int"),
-    "i64": ((0, 64, 1), "long long"),
-    "u32": ((1, 32, 1), "unsigned int"),
+    "bf16": ("dl_bfloat16", "__nv_bfloat16"),
+    "f32": ("dl_float32", "float"),
+    "i32": ("dl_int32", "int"),
+    "i64": ("dl_int64", "long long"),
+    "u32": ("dl_uint32", "unsigned int"),
 }
 
 # Scalar code -> (host value type, kernel parameter type, FFI parameter type,
@@ -79,12 +82,12 @@ using tvm::ffi::TensorView;
 
 void $entry($entry_params) {
   DLDevice dev = arg_$first.device();
-  ScopedCudaDevice device_guard(dev.device_id);
+  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
 """,
-    "tensor": """  CheckCudaTensor(arg_$name, "$name");
-  CheckDtype(arg_$name, "$name", $code, $bits, $lanes);
+    "tensor": """  check_cuda_tensor(arg_$name, "$name");
+  check_dtype(arg_$name, $dtype, "$name");
 """,
-    "contiguous": """  CheckContiguous(arg_$name, "$name");
+    "contiguous": """  check_contiguous(arg_$name, "$name");
 """,
     "strided": """  TVM_FFI_CHECK(arg_$name.ndim() >= 3, ValueError)
       << "$name must have at least 3 dimensions";
@@ -99,10 +102,10 @@ void $entry($entry_params) {
 """,
     "current_device": """  CheckCurrentCudaDevice(arg_$first, "$first");
 """,
-    "workspace": """  CheckCudaTensor(arg_tma_descriptor_workspace, "tma_descriptor_workspace");
+    "workspace": """  check_cuda_tensor(arg_tma_descriptor_workspace, "tma_descriptor_workspace");
   CheckSameCudaDevice(arg_tma_descriptor_workspace, arg_$first, "tma_descriptor_workspace", "$first");
-  CheckContiguous(arg_tma_descriptor_workspace, "tma_descriptor_workspace");
-  CheckDtype(arg_tma_descriptor_workspace, "tma_descriptor_workspace", 1, 8, 1);
+  check_contiguous(arg_tma_descriptor_workspace, "tma_descriptor_workspace");
+  check_dtype(arg_tma_descriptor_workspace, dl_uint8, "tma_descriptor_workspace");
   TVM_FFI_CHECK(arg_tma_descriptor_workspace.numel() >= $bytes, ValueError)
       << "tma_descriptor_workspace requires at least $bytes bytes";
   TVM_FFI_CHECK(
@@ -118,8 +121,9 @@ void $entry($entry_params) {
 """,
     "pointer": """  $ctype* p_$name = static_cast<$ctype*>(arg_$name.data_ptr());
 """,
-    "descriptor": """  CUtensorMap h_$name = EncodeTma_${name}_$encoder(arg_$name);
-  CakeTensorMap const* p_$name = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(arg_tma_descriptor_workspace, ${slot}u));
+    "descriptor": """  CakeTensorMap const* p_$name = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(arg_tma_descriptor_workspace, ${slot}u));
+""",
+    "encode": """        EncodeTma_${name}_$encoder(arg_$name),
 """,
     "scalar": """  $ctype v_$name = ($ctype)arg_$name;
 """,
@@ -141,9 +145,13 @@ void $entry($entry_params) {
     "dims": """  dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(${block}u, 1u, 1u);
 """,
-    "upload": """  if (descriptor_action != 0) {
-  const CUtensorMap workspace_maps[] = {$maps};
-  UploadCallerTmaWorkspace(arg_tma_descriptor_workspace.data_ptr(), workspace_maps, stream);
+    "upload": """  // Only the preparing actions encode and upload the descriptors and opt
+  // the kernel into its dynamic shared memory; the launch-only action reuses
+  // both from the preparation that filled this workspace.
+  if (descriptor_action != 0) {
+    const CUtensorMap workspace_maps[] = {
+$maps    };
+$shared_memory    UploadCallerTmaWorkspace(arg_tma_descriptor_workspace.data_ptr(), workspace_maps, stream);
   }
   if (descriptor_action == 1) return;
 """,
@@ -225,7 +233,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_prepared, $namespace::RunPrepared);
 }
 
 # Prepared wrappers: FFI name -> (function, descriptor_action). Action 2 encodes
-# and uploads the TMA descriptors and launches, 1 only uploads, 0 only launches.
+# and uploads the TMA descriptors and launches, 1 only encodes and uploads, 0
+# only launches. Actions 2 and 1 also opt the kernel into its dynamic shared
+# memory on the tensors' device.
 _WRAPPERS = (("Run", 2), ("PrepareTma", 1), ("RunPrepared", 0))
 
 # Argument signatures. ``tensors`` gives the dtype code of every tensor argument
@@ -839,13 +849,12 @@ def render_kda_prefill_binding(
     call_args = []
     checks = []
     conversions = []
+    encodes = []
     kargs = []
     for kind, name in arg_plan:
         if kind in ("buffer", "tma_buffer"):
-            (code, bits, lanes), ctype = _TENSOR_TYPES[signature["tensors"][name]]
-            checks.append(
-                _render("tensor", name=name, code=code, bits=bits, lanes=lanes)
-            )
+            dtype, ctype = _TENSOR_TYPES[signature["tensors"][name]]
+            checks.append(_render("tensor", name=name, dtype=dtype))
             layout = signature["layouts"].get(name, "contiguous")
             if layout != "unchecked":
                 checks.append(_render(layout, name=name))
@@ -858,9 +867,8 @@ def render_kda_prefill_binding(
             else:
                 slot = descriptors.index(name)
                 kernel_params.append(f"CakeTensorMap const* {name}")
-                conversions.append(
-                    _render("descriptor", name=name, encoder=encoders[slot], slot=slot)
-                )
+                conversions.append(_render("descriptor", name=name, slot=slot))
+                encodes.append(_render("encode", name=name, encoder=encoders[slot]))
         elif kind == "parameter":
             ctype, kernel_type, ffi_type, bounds = _SCALAR_TYPES[
                 signature["scalars"][name]
@@ -914,12 +922,19 @@ def render_kda_prefill_binding(
         *conversions,
         _render("kargs", kargs=", ".join(kargs)),
     ]
+    shared_memory = ""
     if smem_bytes > _DEFAULT_SMEM_LIMIT:
-        parts.append(_render("shared_memory", symbol=symbol, smem=smem_bytes))
+        shared_memory = _render("shared_memory", symbol=symbol, smem=smem_bytes)
+    if not descriptors:
+        parts.append(shared_memory)
     parts.append(_render("dims", block=block))
     if descriptors:
         parts.append(
-            _render("upload", maps=", ".join(f"h_{name}" for name in descriptors))
+            _render(
+                "upload",
+                maps="".join(encodes),
+                shared_memory=indent(shared_memory, "  "),
+            )
         )
     parts.append(_render(_LAUNCH_TEMPLATES[launch], symbol=symbol, smem=smem_bytes))
     if descriptors:

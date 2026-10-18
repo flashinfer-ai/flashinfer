@@ -24,7 +24,7 @@ import pytest
 from flashinfer.jit import cake_kda_tf32
 from flashinfer.jit import core as jit_core
 from flashinfer.jit import env as jit_env
-from flashinfer.jit.cake_kda_prefill_binding import BINDINGS
+from flashinfer.jit.cake_kda_prefill_binding import BINDINGS, _DEFAULT_SMEM_LIMIT
 
 PREPARED_EXPORTS = ("run", "run_prepare_tma", "run_prepared")
 
@@ -37,9 +37,8 @@ def test_every_module_has_one_binding_row_and_one_kernel_source():
         ]
 
 
-def test_bindings_render_to_the_former_per_module_text():
-    # The sidecar pins each rendered binding to the sha256 of the checked-in
-    # binding file it replaced (keyed by module).
+def test_bindings_render_to_the_pinned_text():
+    # The sidecar pins the sha256 of each rendered binding (keyed by module).
     sidecar = Path(__file__).with_name("cake_kda_prefill_binding_sha256.json")
     pinned = json.loads(sidecar.read_text(encoding="utf-8"))
     assert sorted(pinned) == sorted(cake_kda_tf32.MODULES)
@@ -64,6 +63,29 @@ def test_bindings_render_to_the_former_per_module_text():
     # modules can load into one process.
     assert len(symbols) == len(cake_kda_tf32.MODULES)
     assert len(namespaces) == len(cake_kda_tf32.MODULES)
+
+
+def test_prepared_launch_skips_descriptor_encoding():
+    # Only the preparing actions encode and upload the TMA descriptors and opt
+    # the kernel into its dynamic shared memory; the launch-only action reuses
+    # both. Modules without descriptors export run only and keep the opt-in.
+    for name, record in cake_kda_tf32.MODULES.items():
+        _signature, smem_bytes, _block, _launch, encoders, _strides = BINDINGS[name]
+        text = cake_kda_tf32.render_binding(name)
+        assert "ScopedCudaDevice" not in text
+        assert "CUtensorMap h_" not in text
+        opt_ins = text.count("EnsureMaxDynamicSharedMemory(")
+        assert opt_ins == int(smem_bytes > _DEFAULT_SMEM_LIMIT)
+        if not record["tma_workspace_bytes"]:
+            assert "EncodeTma_" not in text
+            assert "descriptor_action" not in text
+            continue
+        start = text.index("  if (descriptor_action != 0) {\n")
+        end = text.index("  if (descriptor_action == 1) return;\n", start)
+        preparing = text[start:end]
+        assert text.count("EncodeTma_") == len(encoders)
+        assert preparing.count("EncodeTma_") == len(encoders)
+        assert preparing.count("EnsureMaxDynamicSharedMemory(") == opt_ins
 
 
 @pytest.mark.parametrize("arch", cake_kda_tf32.ARCHES)
