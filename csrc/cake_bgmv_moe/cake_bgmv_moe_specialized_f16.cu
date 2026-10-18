@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 // Generated source for FlashInfer.
-// Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio, bf16 hidden 3072 rank 32.
+// Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio, f16 hidden HDIM rank 32.
 // Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, atomics, FMA only); compile flags: none.
 // Generated file; do not edit manually.
 #include <cuda_bf16.h>
@@ -29,6 +29,22 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+// One body serves both specialized hidden sizes. The generated binding defines
+// CAKE_BGMV_MOE_HIDDEN before it includes this file: HDIM stands in for the
+// size inside the kernels, and every kernel symbol pastes the size in so that
+// each hidden-size module keeps its own symbols.
+#ifndef CAKE_BGMV_MOE_HIDDEN
+#error "CAKE_BGMV_MOE_HIDDEN must be defined before including this body"
+#endif
+#ifdef HDIM
+#error "HDIM is already defined; this body uses it as its hidden-size alias"
+#endif
+#define HDIM CAKE_BGMV_MOE_HIDDEN
+#define CAKE_BGMV_MOE_PASTE_(a, b) a##b
+#define CAKE_BGMV_MOE_PASTE(a, b) CAKE_BGMV_MOE_PASTE_(a, b)
+#define CAKE_BGMV_MOE_HIDDEN_SYMBOL(prefix, suffix) \
+  CAKE_BGMV_MOE_PASTE(CAKE_BGMV_MOE_PASTE(prefix, CAKE_BGMV_MOE_HIDDEN), suffix)
+
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_X_SMEM_OFF 0
@@ -42,10 +58,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WARP_PARTIALS_STRIDE 512
 #define SMEM_TOTAL 221696
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_SHRINK_DECODE \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_shrink_f16_h, _r32_p4_s3)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h3072_r32_p4_s3(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_SHRINK_DECODE(
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
@@ -64,9 +82,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
   const int cta_rank = 0;
 
   // Kernel setup ops
-  __nv_bfloat16* x_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
+  __half* x_smem = reinterpret_cast<__half*>(smem_raw + 0);
   const int x_smem_addr = smem + 0;
-  __nv_bfloat16* w_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 24576);
+  __half* w_smem = reinterpret_cast<__half*>(smem_raw + 24576);
   const int w_smem_addr = smem + 24576;
   float* warp_partials = reinterpret_cast<float*>(smem_raw + 221184);
   const int warp_partials_addr = smem + 221184;
@@ -105,24 +123,24 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
     for (int pp_1 = 0; pp_1 < 4; pp_1++) {
       if (valid[pp_1] != 0) {
-        if (k_base < 3072) {
+        if (k_base < HDIM) {
           asm volatile(
               "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                   x_smem_addr + (unsigned int)((tile % 3 * 4 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
-              "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                  (tokens[pp_1] * 3072 + (long long)k_base)));
+              "l"(reinterpret_cast<const __half*>(x_raw) +
+                  (tokens[pp_1] * HDIM + (long long)k_base)));
 #pragma unroll
           for (int rr = 0; rr < 8; rr++) {
             int rank_row = rank_base + rr;
             long long weight_index = ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 32 +
                                       (long long)rank_row) *
-                                         3072 +
+                                         HDIM +
                                      (long long)k_base;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              w_smem_addr + (unsigned int)((tile % 3 * 4 * 8 * 1024 +
                                                            pp_1 * 8 * 1024 + rr * 1024 + tid * 8) *
                                                           2)),
-                         "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index));
+                         "l"(reinterpret_cast<const __half*>(lora_a_raw) + weight_index));
           }
         }
       }
@@ -188,7 +206,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     for (int pp_4 = 0; pp_4 < 4; pp_4++) {
       int x_thread_base = tile_1 % 3 * 4 * 1024 + pp_4 * 1024 + tid * 8;
       if (valid[pp_4] != 0) {
-        if (k_base_1 < 3072) {
+        if (k_base_1 < HDIM) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
                          "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[(0) + 1])),
@@ -200,10 +218,14 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
             for (int _pair = 0; _pair < 4; _pair++) {
               asm volatile(
                   "{\n\t"
-                  "shl.b32 %0, %2, 16;\n\t"
-                  "and.b32 %1, %2, 0xffff0000;\n\t"
+                  ".reg .b16 h_lo, h_hi;\n\t"
+                  ".reg .b32 f_lo, f_hi;\n\t"
+                  "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                  "cvt.f32.f16 f_lo, h_lo;\n\t"
+                  "cvt.f32.f16 f_hi, h_hi;\n\t"
+                  "mov.b64 %0, {f_lo, f_hi};\n\t"
                   "}\n"
-                  : "=f"((&x_values[_pair * 2])[0]), "=f"((&x_values[_pair * 2])[1])
+                  : "=l"(*reinterpret_cast<unsigned long long*>(&x_values[_pair * 2]))
                   : "r"(x_carriers[_pair]));
             }
           }
@@ -213,7 +235,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
         if (valid[pp_4] != 0) {
-          if (k_base_1 < 3072) {
+          if (k_base_1 < HDIM) {
             int w_thread_base = tile_1 % 3 * 4 * 8 * 1024 + pp_4 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
@@ -226,10 +248,14 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
               for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
                     "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    ".reg .b16 h_lo, h_hi;\n\t"
+                    ".reg .b32 f_lo, f_hi;\n\t"
+                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                    "mov.b64 %0, {f_lo, f_hi};\n\t"
                     "}\n"
-                    : "=f"((&w_values[_pair * 2])[0]), "=f"((&w_values[_pair * 2])[1])
+                    : "=l"(*reinterpret_cast<unsigned long long*>(&w_values[_pair * 2]))
                     : "r"(w_carriers[_pair]));
               }
             }
@@ -268,27 +294,27 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
       for (int pp_5 = 0; pp_5 < 4; pp_5++) {
         if (valid[pp_5] != 0) {
-          if (refill_k < 3072) {
+          if (refill_k < HDIM) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 3 : 3)) % 3 * 4 * 1024 +
                                                            pp_5 * 1024 + tid * 8) *
                                                           2)),
-                         "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                             (tokens[pp_5] * 3072 + (long long)refill_k)));
+                         "l"(reinterpret_cast<const __half*>(x_raw) +
+                             (tokens[pp_5] * HDIM + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
                   ((loras[pp_5] * (long long)num_experts + experts[pp_5]) * 32 +
                    (long long)rank_row_1) *
-                      3072 +
+                      HDIM +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                       w_smem_addr + (unsigned int)(((tile_1 + ((1) ? 3 : 3)) % 3 * 4 * 8 * 1024 +
                                                     pp_5 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
                                                    2)),
-                  "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index_1));
+                  "l"(reinterpret_cast<const __half*>(lora_a_raw) + weight_index_1));
             }
           }
         }
@@ -302,9 +328,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       int owner_rr = lane % 8;
       int pair_1 = pair_block * 4 + owner_pp;
       if (pair_1 < num_pairs) {
-        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(shrink_out_raw) +
-                                           (pair_1 * 32 + rank_base + owner_rr)) +
-          (0)) = __float2bfloat16_rn(owned_accum);
+        *(reinterpret_cast<__half*>(reinterpret_cast<__half*>(shrink_out_raw) +
+                                    (pair_1 * 32 + rank_base + owner_rr)) +
+          (0)) = __float2half_rn(owned_accum);
       }
     }
   }
@@ -341,6 +367,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_SHRINK_DECODE
 #undef NUM_MAIN_STAGES
 #undef SMEM_TOTAL
 #undef SMEM_WARP_PARTIALS_OFF
@@ -367,10 +394,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #define SMEM_WARP_PARTIALS_STRIDE 128
 #define SMEM_TOTAL 36992
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_SHRINK_PREFILL \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_shrink_f16_h, _r32_p1_s2)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h3072_r32_p1_s2(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_SHRINK_PREFILL(
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
@@ -389,9 +418,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
   const int cta_rank = 0;
 
   // Kernel setup ops
-  __nv_bfloat16* x_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
+  __half* x_smem = reinterpret_cast<__half*>(smem_raw + 0);
   const int x_smem_addr = smem + 0;
-  __nv_bfloat16* w_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
+  __half* w_smem = reinterpret_cast<__half*>(smem_raw + 4096);
   const int w_smem_addr = smem + 4096;
   float* warp_partials = reinterpret_cast<float*>(smem_raw + 36864);
   const int warp_partials_addr = smem + 36864;
@@ -430,24 +459,24 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
     for (int pp_1 = 0; pp_1 < 1; pp_1++) {
       if (valid[pp_1] != 0) {
-        if (k_base < 3072) {
+        if (k_base < HDIM) {
           asm volatile(
               "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                   x_smem_addr + (unsigned int)((tile % 2 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
-              "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                  (tokens[pp_1] * 3072 + (long long)k_base)));
+              "l"(reinterpret_cast<const __half*>(x_raw) +
+                  (tokens[pp_1] * HDIM + (long long)k_base)));
 #pragma unroll
           for (int rr = 0; rr < 8; rr++) {
             int rank_row = rank_base + rr;
             long long weight_index = ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 32 +
                                       (long long)rank_row) *
-                                         3072 +
+                                         HDIM +
                                      (long long)k_base;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              w_smem_addr + (unsigned int)((tile % 2 * 8 * 1024 + pp_1 * 8 * 1024 +
                                                            rr * 1024 + tid * 8) *
                                                           2)),
-                         "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index));
+                         "l"(reinterpret_cast<const __half*>(lora_a_raw) + weight_index));
           }
         }
       }
@@ -513,7 +542,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     for (int pp_4 = 0; pp_4 < 1; pp_4++) {
       int x_thread_base = tile_1 % 2 * 1024 + pp_4 * 1024 + tid * 8;
       if (valid[pp_4] != 0) {
-        if (k_base_1 < 3072) {
+        if (k_base_1 < HDIM) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
                          "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[(0) + 1])),
@@ -525,10 +554,14 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
             for (int _pair = 0; _pair < 4; _pair++) {
               asm volatile(
                   "{\n\t"
-                  "shl.b32 %0, %2, 16;\n\t"
-                  "and.b32 %1, %2, 0xffff0000;\n\t"
+                  ".reg .b16 h_lo, h_hi;\n\t"
+                  ".reg .b32 f_lo, f_hi;\n\t"
+                  "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                  "cvt.f32.f16 f_lo, h_lo;\n\t"
+                  "cvt.f32.f16 f_hi, h_hi;\n\t"
+                  "mov.b64 %0, {f_lo, f_hi};\n\t"
                   "}\n"
-                  : "=f"((&x_values[_pair * 2])[0]), "=f"((&x_values[_pair * 2])[1])
+                  : "=l"(*reinterpret_cast<unsigned long long*>(&x_values[_pair * 2]))
                   : "r"(x_carriers[_pair]));
             }
           }
@@ -538,7 +571,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
         if (valid[pp_4] != 0) {
-          if (k_base_1 < 3072) {
+          if (k_base_1 < HDIM) {
             int w_thread_base = tile_1 % 2 * 8 * 1024 + pp_4 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
@@ -551,10 +584,14 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
               for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
                     "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    ".reg .b16 h_lo, h_hi;\n\t"
+                    ".reg .b32 f_lo, f_hi;\n\t"
+                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                    "mov.b64 %0, {f_lo, f_hi};\n\t"
                     "}\n"
-                    : "=f"((&w_values[_pair * 2])[0]), "=f"((&w_values[_pair * 2])[1])
+                    : "=l"(*reinterpret_cast<unsigned long long*>(&w_values[_pair * 2]))
                     : "r"(w_carriers[_pair]));
               }
             }
@@ -593,27 +630,27 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
       for (int pp_5 = 0; pp_5 < 1; pp_5++) {
         if (valid[pp_5] != 0) {
-          if (refill_k < 3072) {
+          if (refill_k < HDIM) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 2 : 3)) % 2 * 1024 +
                                                            pp_5 * 1024 + tid * 8) *
                                                           2)),
-                         "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                             (tokens[pp_5] * 3072 + (long long)refill_k)));
+                         "l"(reinterpret_cast<const __half*>(x_raw) +
+                             (tokens[pp_5] * HDIM + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
                   ((loras[pp_5] * (long long)num_experts + experts[pp_5]) * 32 +
                    (long long)rank_row_1) *
-                      3072 +
+                      HDIM +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                       w_smem_addr + (unsigned int)(((tile_1 + ((1) ? 2 : 3)) % 2 * 8 * 1024 +
                                                     pp_5 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
                                                    2)),
-                  "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index_1));
+                  "l"(reinterpret_cast<const __half*>(lora_a_raw) + weight_index_1));
             }
           }
         }
@@ -627,9 +664,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       int owner_rr = lane % 8;
       int pair_1 = pair_block + owner_pp;
       if (pair_1 < num_pairs) {
-        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(shrink_out_raw) +
-                                           (pair_1 * 32 + rank_base + owner_rr)) +
-          (0)) = __float2bfloat16_rn(owned_accum);
+        *(reinterpret_cast<__half*>(reinterpret_cast<__half*>(shrink_out_raw) +
+                                    (pair_1 * 32 + rank_base + owner_rr)) +
+          (0)) = __float2half_rn(owned_accum);
       }
     }
   }
@@ -666,6 +703,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_SHRINK_PREFILL
 #undef NUM_MAIN_STAGES
 #undef SMEM_TOTAL
 #undef SMEM_WARP_PARTIALS_OFF
@@ -689,10 +727,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #define SMEM_ROUTE_LIST_STRIDE 72
 #define SMEM_TOTAL 256
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_EXPAND_TOKEN \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_expand_token_f16_h, _r32)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_bf16_h3072_r32(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_EXPAND_TOKEN(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -713,7 +753,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
   const int cta_rank = 0;
 
   // Kernel setup ops
-  __nv_bfloat16* shrink_stage = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
+  __half* shrink_stage = reinterpret_cast<__half*>(smem_raw + 0);
   const int shrink_stage_addr = smem + 0;
   int* route_list = reinterpret_cast<int*>(smem_raw + 128);
   const int route_list_addr = smem + 128;
@@ -736,7 +776,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
         }
       }
     }
-    if (output_col < 3072) {
+    if (output_col < HDIM) {
       long long lora_id = lora_indices[token];
       if (lora_id >= 0) {
         int pair_base = token * 2;
@@ -758,7 +798,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              shrink_stage_addr +
                              (unsigned int)((stage_route * 32 + stage_rank_block * 8) * 2)),
-                         "l"(reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
+                         "l"(reinterpret_cast<const __half*>(shrink_raw) +
                              ((pair_base + stage_route) * 32 + stage_rank_block * 8)));
           }
           asm volatile("cp.async.commit_group;");
@@ -783,22 +823,25 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                 for (int _pair = 0; _pair < 4; _pair++) {
                   asm volatile(
                       "{\n\t"
-                      "shl.b32 %0, %2, 16;\n\t"
-                      "and.b32 %1, %2, 0xffff0000;\n\t"
+                      ".reg .b16 h_lo, h_hi;\n\t"
+                      ".reg .b32 f_lo, f_hi;\n\t"
+                      "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                      "cvt.f32.f16 f_lo, h_lo;\n\t"
+                      "cvt.f32.f16 f_hi, h_hi;\n\t"
+                      "mov.b64 %0, {f_lo, f_hi};\n\t"
                       "}\n"
-                      : "=f"((&activation_values[_pair * 2])[0]),
-                        "=f"((&activation_values[_pair * 2])[1])
+                      : "=l"(*reinterpret_cast<unsigned long long*>(&activation_values[_pair * 2]))
                       : "r"(activation_carriers[_pair]));
                 }
               }
               long long weight_index =
-                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col) *
+                  ((lora_id * (long long)num_experts + expert) * HDIM + (long long)output_col) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
               {
                 const uint4* _vptr_0 = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index + 0);
+                    reinterpret_cast<const __half*>(lora_b_raw) + weight_index + 0);
                 uint4 _vld_0[1];
 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -808,11 +851,15 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                   for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
                         "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        ".reg .b16 h_lo, h_hi;\n\t"
+                        ".reg .b32 f_lo, f_hi;\n\t"
+                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                        "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]),
-                          "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                        : "=l"(*reinterpret_cast<unsigned long long*>(
+                            &_vec_load_0[0 + _blk * 8 + _pair * 2]))
                         : "r"(_vpairs_0[_pair]));
                   }
                 }
@@ -903,8 +950,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                 float _vec_load_1[8];
                 {
                   const uint4* _vptr_1 = reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
-                      (pair_1 * 32 + rank_col_1) + 0);
+                      reinterpret_cast<const __half*>(shrink_raw) + (pair_1 * 32 + rank_col_1) + 0);
                   uint4 _vld_1[1];
 #pragma unroll
                   for (int _blk = 0; _blk < 1; _blk++) {
@@ -914,23 +960,27 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                     for (int _pair = 0; _pair < 4; _pair++) {
                       asm volatile(
                           "{\n\t"
-                          "shl.b32 %0, %2, 16;\n\t"
-                          "and.b32 %1, %2, 0xffff0000;\n\t"
+                          ".reg .b16 h_lo, h_hi;\n\t"
+                          ".reg .b32 f_lo, f_hi;\n\t"
+                          "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                          "cvt.f32.f16 f_lo, h_lo;\n\t"
+                          "cvt.f32.f16 f_hi, h_hi;\n\t"
+                          "mov.b64 %0, {f_lo, f_hi};\n\t"
                           "}\n"
-                          : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]),
-                            "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
+                          : "=l"(*reinterpret_cast<unsigned long long*>(
+                              &_vec_load_1[0 + _blk * 8 + _pair * 2]))
                           : "r"(_vpairs_1[_pair]));
                     }
                   }
                 }
                 long long weight_index_1 =
-                    ((lora_id * (long long)num_experts + expert_1) * 3072 + (long long)output_col) *
+                    ((lora_id * (long long)num_experts + expert_1) * HDIM + (long long)output_col) *
                         32 +
                     (long long)rank_col_1;
                 float _vec_load_2[8];
                 {
                   const uint4* _vptr_2 = reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index_1 + 0);
+                      reinterpret_cast<const __half*>(lora_b_raw) + weight_index_1 + 0);
                   uint4 _vld_2[1];
 #pragma unroll
                   for (int _blk = 0; _blk < 1; _blk++) {
@@ -940,11 +990,15 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                     for (int _pair = 0; _pair < 4; _pair++) {
                       asm volatile(
                           "{\n\t"
-                          "shl.b32 %0, %2, 16;\n\t"
-                          "and.b32 %1, %2, 0xffff0000;\n\t"
+                          ".reg .b16 h_lo, h_hi;\n\t"
+                          ".reg .b32 f_lo, f_hi;\n\t"
+                          "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                          "cvt.f32.f16 f_lo, h_lo;\n\t"
+                          "cvt.f32.f16 f_hi, h_hi;\n\t"
+                          "mov.b64 %0, {f_lo, f_hi};\n\t"
                           "}\n"
-                          : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]),
-                            "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
+                          : "=l"(*reinterpret_cast<unsigned long long*>(
+                              &_vec_load_2[0 + _blk * 8 + _pair * 2]))
                           : "r"(_vpairs_2[_pair]));
                     }
                   }
@@ -988,6 +1042,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_EXPAND_TOKEN
 #undef NUM_MAIN_STAGES
 #undef SMEM_ROUTE_LIST_OFF
 #undef SMEM_ROUTE_LIST_STAGE_BYTES
@@ -1008,11 +1063,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
 #define SMEM_ROUTE_LIST_STRIDE 72
 #define SMEM_TOTAL 256
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_EXPAND_TOKEN_DUAL \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_expand_token_dual_col_f16_h, _r32)
 
 extern "C" {
 
-__global__
-__launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_bf16_h3072_r32(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_EXPAND_TOKEN_DUAL(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -1033,7 +1089,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
   const int cta_rank = 0;
 
   // Kernel setup ops
-  __nv_bfloat16* shrink_stage = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
+  __half* shrink_stage = reinterpret_cast<__half*>(smem_raw + 0);
   const int shrink_stage_addr = smem + 0;
   int* route_list = reinterpret_cast<int*>(smem_raw + 128);
   const int route_list_addr = smem + 128;
@@ -1072,10 +1128,10 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
       }
       int valid0 = 0;
       int valid1 = 0;
-      if (output_col0 < 3072) {
+      if (output_col0 < HDIM) {
         valid0 = 1;
       }
-      if (output_col1 < 3072) {
+      if (output_col1 < HDIM) {
         valid1 = 1;
       }
       float total0 = 0.0f;
@@ -1087,7 +1143,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
           asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                            shrink_stage_addr +
                            (unsigned int)((stage_route * 32 + stage_rank_block * 8) * 2)),
-                       "l"(reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
+                       "l"(reinterpret_cast<const __half*>(shrink_raw) +
                            ((pair_base + stage_route) * 32 + stage_rank_block * 8)));
         }
         asm volatile("cp.async.commit_group;");
@@ -1113,23 +1169,26 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
               for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
                     "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    ".reg .b16 h_lo, h_hi;\n\t"
+                    ".reg .b32 f_lo, f_hi;\n\t"
+                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                    "mov.b64 %0, {f_lo, f_hi};\n\t"
                     "}\n"
-                    : "=f"((&activation_values[_pair * 2])[0]),
-                      "=f"((&activation_values[_pair * 2])[1])
+                    : "=l"(*reinterpret_cast<unsigned long long*>(&activation_values[_pair * 2]))
                     : "r"(activation_carriers[_pair]));
               }
             }
             if (valid0 != 0) {
               long long weight_index0 =
-                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col0) *
+                  ((lora_id * (long long)num_experts + expert) * HDIM + (long long)output_col0) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
               {
                 const uint4* _vptr_0 = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index0 + 0);
+                    reinterpret_cast<const __half*>(lora_b_raw) + weight_index0 + 0);
                 uint4 _vld_0[1];
 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1139,11 +1198,15 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                   for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
                         "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        ".reg .b16 h_lo, h_hi;\n\t"
+                        ".reg .b32 f_lo, f_hi;\n\t"
+                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                        "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]),
-                          "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                        : "=l"(*reinterpret_cast<unsigned long long*>(
+                            &_vec_load_0[0 + _blk * 8 + _pair * 2]))
                         : "r"(_vpairs_0[_pair]));
                   }
                 }
@@ -1157,13 +1220,13 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
             }
             if (valid1 != 0) {
               long long weight_index1 =
-                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col1) *
+                  ((lora_id * (long long)num_experts + expert) * HDIM + (long long)output_col1) *
                       32 +
                   (long long)rank_col;
               float _vec_load_1[8];
               {
                 const uint4* _vptr_1 = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index1 + 0);
+                    reinterpret_cast<const __half*>(lora_b_raw) + weight_index1 + 0);
                 uint4 _vld_1[1];
 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1173,11 +1236,15 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                   for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
                         "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        ".reg .b16 h_lo, h_hi;\n\t"
+                        ".reg .b32 f_lo, f_hi;\n\t"
+                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                        "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]),
-                          "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
+                        : "=l"(*reinterpret_cast<unsigned long long*>(
+                            &_vec_load_1[0 + _blk * 8 + _pair * 2]))
                         : "r"(_vpairs_1[_pair]));
                   }
                 }
@@ -1276,8 +1343,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
               float _vec_load_2[8];
               {
                 const uint4* _vptr_2 = reinterpret_cast<const uint4*>(
-                    reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
-                    (pair_1 * 32 + rank_col_1) + 0);
+                    reinterpret_cast<const __half*>(shrink_raw) + (pair_1 * 32 + rank_col_1) + 0);
                 uint4 _vld_2[1];
 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1287,24 +1353,28 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                   for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
                         "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        ".reg .b16 h_lo, h_hi;\n\t"
+                        ".reg .b32 f_lo, f_hi;\n\t"
+                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                        "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]),
-                          "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
+                        : "=l"(*reinterpret_cast<unsigned long long*>(
+                            &_vec_load_2[0 + _blk * 8 + _pair * 2]))
                         : "r"(_vpairs_2[_pair]));
                   }
                 }
               }
               if (valid0 != 0) {
-                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
+                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * HDIM +
                                              (long long)output_col0) *
                                                 32 +
                                             (long long)rank_col_1;
                 float _vec_load_3[8];
                 {
                   const uint4* _vptr_3 = reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index0_1 + 0);
+                      reinterpret_cast<const __half*>(lora_b_raw) + weight_index0_1 + 0);
                   uint4 _vld_3[1];
 #pragma unroll
                   for (int _blk = 0; _blk < 1; _blk++) {
@@ -1314,11 +1384,15 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                     for (int _pair = 0; _pair < 4; _pair++) {
                       asm volatile(
                           "{\n\t"
-                          "shl.b32 %0, %2, 16;\n\t"
-                          "and.b32 %1, %2, 0xffff0000;\n\t"
+                          ".reg .b16 h_lo, h_hi;\n\t"
+                          ".reg .b32 f_lo, f_hi;\n\t"
+                          "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                          "cvt.f32.f16 f_lo, h_lo;\n\t"
+                          "cvt.f32.f16 f_hi, h_hi;\n\t"
+                          "mov.b64 %0, {f_lo, f_hi};\n\t"
                           "}\n"
-                          : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]),
-                            "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
+                          : "=l"(*reinterpret_cast<unsigned long long*>(
+                              &_vec_load_3[0 + _blk * 8 + _pair * 2]))
                           : "r"(_vpairs_3[_pair]));
                     }
                   }
@@ -1331,14 +1405,14 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                 }
               }
               if (valid1 != 0) {
-                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
+                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * HDIM +
                                              (long long)output_col1) *
                                                 32 +
                                             (long long)rank_col_1;
                 float _vec_load_4[8];
                 {
                   const uint4* _vptr_4 = reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index1_1 + 0);
+                      reinterpret_cast<const __half*>(lora_b_raw) + weight_index1_1 + 0);
                   uint4 _vld_4[1];
 #pragma unroll
                   for (int _blk = 0; _blk < 1; _blk++) {
@@ -1348,11 +1422,15 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                     for (int _pair = 0; _pair < 4; _pair++) {
                       asm volatile(
                           "{\n\t"
-                          "shl.b32 %0, %2, 16;\n\t"
-                          "and.b32 %1, %2, 0xffff0000;\n\t"
+                          ".reg .b16 h_lo, h_hi;\n\t"
+                          ".reg .b32 f_lo, f_hi;\n\t"
+                          "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                          "cvt.f32.f16 f_lo, h_lo;\n\t"
+                          "cvt.f32.f16 f_hi, h_hi;\n\t"
+                          "mov.b64 %0, {f_lo, f_hi};\n\t"
                           "}\n"
-                          : "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[0]),
-                            "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[1])
+                          : "=l"(*reinterpret_cast<unsigned long long*>(
+                              &_vec_load_4[0 + _blk * 8 + _pair * 2]))
                           : "r"(_vpairs_4[_pair]));
                     }
                   }
@@ -1387,12 +1465,12 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
           (0)) = total1;
       }
     } else {
-      if (output_col0 < 3072) {
+      if (output_col0 < HDIM) {
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col0)) +
           (0)) = 0.0f;
       }
-      if (output_col1 < 3072) {
+      if (output_col1 < HDIM) {
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col1)) +
           (0)) = 0.0f;
@@ -1418,6 +1496,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_EXPAND_TOKEN_DUAL
 #undef NUM_MAIN_STAGES
 #undef SMEM_ROUTE_LIST_OFF
 #undef SMEM_ROUTE_LIST_STAGE_BYTES
@@ -1427,6 +1506,11 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
+
+#undef CAKE_BGMV_MOE_HIDDEN_SYMBOL
+#undef CAKE_BGMV_MOE_PASTE
+#undef CAKE_BGMV_MOE_PASTE_
+#undef HDIM
 
 // Dynamic shared memory per launch, in bytes.
 #define CAKE_BGMV_MOE_SMEM_SHRINK_DECODE 221696

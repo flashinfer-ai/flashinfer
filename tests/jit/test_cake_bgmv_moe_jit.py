@@ -22,6 +22,29 @@ import pytest
 from flashinfer.jit import cake_bgmv_moe
 from flashinfer.jit import core as jit_core
 
+# The folded specialized bodies paste CAKE_BGMV_MOE_HIDDEN into every kernel
+# symbol, so the symbol text never appears in the source: derive the names the
+# way the preprocessor does and compare them with the loader's table.
+_HIDDEN_SYMBOL_RE = re.compile(r"CAKE_BGMV_MOE_HIDDEN_SYMBOL\((kernel_\w+), (_\w+)\)")
+
+
+def _hidden_symbols(body, hidden_size):
+    return {
+        f"{prefix}{hidden_size}{suffix}"
+        for prefix, suffix in _HIDDEN_SYMBOL_RE.findall(body)
+    }
+
+
+def _specialized_bodies():
+    """One folded body per dtype, shared by every hidden size."""
+    return sorted(
+        {
+            cake_bgmv_moe._metadata(hidden_size, dtype).body
+            for hidden_size in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES
+            for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES
+        }
+    )
+
 
 @pytest.mark.parametrize("arch", cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
 @pytest.mark.parametrize(
@@ -127,15 +150,19 @@ def test_jit_spec_binds_generated_source_per_arch(
     assert cake_bgmv_moe._get_csrc_dir().parent in spec.extra_include_dirs
     assert cake_bgmv_moe._get_include_dir() in spec.extra_include_dirs
     body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
-    for symbol in metadata[1:]:
-        assert symbol in body
-    if not metadata.body.endswith("_sm107a.cu"):
-        # The unfolded sm107a record still renders the retired t64 expand kernel
-        # (the binding never launches it); the shared bodies dropped it.
+    if metadata.body.endswith("_sm107a.cu"):
+        # The unfolded sm107a record declares its symbols literally and still
+        # renders the retired t64 expand kernel (the binding never launches it).
+        for symbol in metadata[1:]:
+            assert symbol in body
+    else:
+        assert _hidden_symbols(body, hidden_size) == set(metadata[1:])
         assert "_expand_token_t64_" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
     assert f"#define CAKE_BGMV_MOE_HIDDEN {hidden_size}" in binding
+    input_dtype = {"bfloat16": "dl_bfloat16", "float16": "dl_float16"}[dtype]
+    assert f"#define CAKE_BGMV_MOE_INPUT_DTYPE {input_dtype}" in binding
     assert "CAKE_BGMV_MOE_EXPAND_TOKEN_T64" not in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
@@ -181,19 +208,32 @@ def test_binding_preserves_graph_and_tensor_contracts():
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
 
-    for hidden_size in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
-        for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES:
-            body = (
-                cake_bgmv_moe._get_csrc_dir()
-                / cake_bgmv_moe._metadata(hidden_size, dtype).body
-            ).read_text()
-            smem_totals = re.findall(r"#define SMEM_TOTAL (\d+)", body)
-            assert smem_totals[:2] == ["221696", "36992"]
-            # The shrink kernels publish the token->pair route index; the expand
-            # kernels keep one owner per output (no output atomics).
-            assert body.count("atomicAdd(") == 2
-            assert "atomicAdd(&reinterpret_cast<float" not in body
-            assert "expand_pair_owned" not in body
+    for body_name in _specialized_bodies():
+        body = (cake_bgmv_moe._get_csrc_dir() / body_name).read_text()
+        smem_totals = re.findall(r"#define SMEM_TOTAL (\d+)", body)
+        assert smem_totals[:2] == ["221696", "36992"]
+        # The shrink kernels publish the token->pair route index; the expand
+        # kernels keep one owner per output (no output atomics).
+        assert body.count("atomicAdd(") == 2
+        assert "atomicAdd(&reinterpret_cast<float" not in body
+        assert "expand_pair_owned" not in body
+
+
+def test_specialized_bodies_fold_the_hidden_sizes():
+    # One body per dtype serves both hidden sizes: the size enters only through
+    # CAKE_BGMV_MOE_HIDDEN, and the kernel symbols are pasted from it.
+    assert len(_specialized_bodies()) == len(cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES)
+    for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES:
+        metadata = {
+            hidden_size: cake_bgmv_moe._metadata(hidden_size, dtype)
+            for hidden_size in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES
+        }
+        bodies = {m.body for m in metadata.values()}
+        assert len(bodies) == 1
+        body = (cake_bgmv_moe._get_csrc_dir() / bodies.pop()).read_text()
+        assert not re.search(r"\b(2688|3072)\b", body)
+        for hidden_size, m in metadata.items():
+            assert _hidden_symbols(body, hidden_size) == set(m[1:])
 
 
 # ---- generic-shape bundles -------------------------------------------------
@@ -586,10 +626,8 @@ def test_route_index_workspace_sizing():
         cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096)
         == 4 + 4096 * 19 + split_words
     )
-    for hidden in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
-        body = (
-            cake_bgmv_moe._get_csrc_dir() / f"cake_bgmv_moe_bf16_h{hidden}.cu"
-        ).read_text()
+    for body_name in _specialized_bodies():
+        body = (cake_bgmv_moe._get_csrc_dir() / body_name).read_text()
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " not in body
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN " in body
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL " in body
@@ -815,12 +853,12 @@ def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
     )
     assert (
         cake_bgmv_moe._metadata(3072, "float16", "sm107a").body
-        == "cake_bgmv_moe_f16_h3072.cu"
+        == "cake_bgmv_moe_specialized_f16.cu"
     )
     for arch in ("sm90a", "sm100a", "sm103a", None):
         assert (
             cake_bgmv_moe._metadata(3072, "bfloat16", arch).body
-            == "cake_bgmv_moe_bf16_h3072.cu"
+            == "cake_bgmv_moe_specialized_bf16.cu"
         )
     assert (
         cake_bgmv_moe._generic_metadata(32, "bfloat16").body

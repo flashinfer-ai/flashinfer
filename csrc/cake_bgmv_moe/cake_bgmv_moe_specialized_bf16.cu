@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 // Generated source for FlashInfer.
-// Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio, bf16 hidden 2688 rank 32.
+// Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio, bf16 hidden HDIM rank 32.
 // Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, atomics, FMA only); compile flags: none.
 // Generated file; do not edit manually.
 #include <cuda_bf16.h>
@@ -29,6 +29,22 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+// One body serves both specialized hidden sizes. The generated binding defines
+// CAKE_BGMV_MOE_HIDDEN before it includes this file: HDIM stands in for the
+// size inside the kernels, and every kernel symbol pastes the size in so that
+// each hidden-size module keeps its own symbols.
+#ifndef CAKE_BGMV_MOE_HIDDEN
+#error "CAKE_BGMV_MOE_HIDDEN must be defined before including this body"
+#endif
+#ifdef HDIM
+#error "HDIM is already defined; this body uses it as its hidden-size alias"
+#endif
+#define HDIM CAKE_BGMV_MOE_HIDDEN
+#define CAKE_BGMV_MOE_PASTE_(a, b) a##b
+#define CAKE_BGMV_MOE_PASTE(a, b) CAKE_BGMV_MOE_PASTE_(a, b)
+#define CAKE_BGMV_MOE_HIDDEN_SYMBOL(prefix, suffix) \
+  CAKE_BGMV_MOE_PASTE(CAKE_BGMV_MOE_PASTE(prefix, CAKE_BGMV_MOE_HIDDEN), suffix)
+
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_X_SMEM_OFF 0
@@ -42,10 +58,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WARP_PARTIALS_STRIDE 512
 #define SMEM_TOTAL 221696
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_SHRINK_DECODE \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_shrink_bf16_h, _r32_p4_s3)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h2688_r32_p4_s3(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_SHRINK_DECODE(
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
@@ -105,18 +123,18 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
     for (int pp_1 = 0; pp_1 < 4; pp_1++) {
       if (valid[pp_1] != 0) {
-        if (k_base < 2688) {
+        if (k_base < HDIM) {
           asm volatile(
               "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                   x_smem_addr + (unsigned int)((tile % 3 * 4 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
               "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                  (tokens[pp_1] * 2688 + (long long)k_base)));
+                  (tokens[pp_1] * HDIM + (long long)k_base)));
 #pragma unroll
           for (int rr = 0; rr < 8; rr++) {
             int rank_row = rank_base + rr;
             long long weight_index = ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 32 +
                                       (long long)rank_row) *
-                                         2688 +
+                                         HDIM +
                                      (long long)k_base;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              w_smem_addr + (unsigned int)((tile % 3 * 4 * 8 * 1024 +
@@ -188,7 +206,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     for (int pp_4 = 0; pp_4 < 4; pp_4++) {
       int x_thread_base = tile_1 % 3 * 4 * 1024 + pp_4 * 1024 + tid * 8;
       if (valid[pp_4] != 0) {
-        if (k_base_1 < 2688) {
+        if (k_base_1 < HDIM) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
                          "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[(0) + 1])),
@@ -213,7 +231,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
         if (valid[pp_4] != 0) {
-          if (k_base_1 < 2688) {
+          if (k_base_1 < HDIM) {
             int w_thread_base = tile_1 % 3 * 4 * 8 * 1024 + pp_4 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
@@ -268,20 +286,20 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
       for (int pp_5 = 0; pp_5 < 4; pp_5++) {
         if (valid[pp_5] != 0) {
-          if (refill_k < 2688) {
+          if (refill_k < HDIM) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 3 : 3)) % 3 * 4 * 1024 +
                                                            pp_5 * 1024 + tid * 8) *
                                                           2)),
                          "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                             (tokens[pp_5] * 2688 + (long long)refill_k)));
+                             (tokens[pp_5] * HDIM + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
                   ((loras[pp_5] * (long long)num_experts + experts[pp_5]) * 32 +
                    (long long)rank_row_1) *
-                      2688 +
+                      HDIM +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
@@ -341,6 +359,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_SHRINK_DECODE
 #undef NUM_MAIN_STAGES
 #undef SMEM_TOTAL
 #undef SMEM_WARP_PARTIALS_OFF
@@ -367,10 +386,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #define SMEM_WARP_PARTIALS_STRIDE 128
 #define SMEM_TOTAL 36992
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_SHRINK_PREFILL \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_shrink_bf16_h, _r32_p1_s2)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h2688_r32_p1_s2(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_SHRINK_PREFILL(
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
@@ -430,18 +451,18 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
     for (int pp_1 = 0; pp_1 < 1; pp_1++) {
       if (valid[pp_1] != 0) {
-        if (k_base < 2688) {
+        if (k_base < HDIM) {
           asm volatile(
               "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                   x_smem_addr + (unsigned int)((tile % 2 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
               "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                  (tokens[pp_1] * 2688 + (long long)k_base)));
+                  (tokens[pp_1] * HDIM + (long long)k_base)));
 #pragma unroll
           for (int rr = 0; rr < 8; rr++) {
             int rank_row = rank_base + rr;
             long long weight_index = ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 32 +
                                       (long long)rank_row) *
-                                         2688 +
+                                         HDIM +
                                      (long long)k_base;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              w_smem_addr + (unsigned int)((tile % 2 * 8 * 1024 + pp_1 * 8 * 1024 +
@@ -513,7 +534,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     for (int pp_4 = 0; pp_4 < 1; pp_4++) {
       int x_thread_base = tile_1 % 2 * 1024 + pp_4 * 1024 + tid * 8;
       if (valid[pp_4] != 0) {
-        if (k_base_1 < 2688) {
+        if (k_base_1 < HDIM) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
                          "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[(0) + 1])),
@@ -538,7 +559,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
         if (valid[pp_4] != 0) {
-          if (k_base_1 < 2688) {
+          if (k_base_1 < HDIM) {
             int w_thread_base = tile_1 % 2 * 8 * 1024 + pp_4 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
@@ -593,20 +614,20 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
       for (int pp_5 = 0; pp_5 < 1; pp_5++) {
         if (valid[pp_5] != 0) {
-          if (refill_k < 2688) {
+          if (refill_k < HDIM) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 2 : 3)) % 2 * 1024 +
                                                            pp_5 * 1024 + tid * 8) *
                                                           2)),
                          "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                             (tokens[pp_5] * 2688 + (long long)refill_k)));
+                             (tokens[pp_5] * HDIM + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
                   ((loras[pp_5] * (long long)num_experts + experts[pp_5]) * 32 +
                    (long long)rank_row_1) *
-                      2688 +
+                      HDIM +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
@@ -666,6 +687,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_SHRINK_PREFILL
 #undef NUM_MAIN_STAGES
 #undef SMEM_TOTAL
 #undef SMEM_WARP_PARTIALS_OFF
@@ -689,10 +711,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #define SMEM_ROUTE_LIST_STRIDE 72
 #define SMEM_TOTAL 256
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_EXPAND_TOKEN \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_expand_token_bf16_h, _r32)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_bf16_h2688_r32(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_EXPAND_TOKEN(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -736,7 +760,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
         }
       }
     }
-    if (output_col < 2688) {
+    if (output_col < HDIM) {
       long long lora_id = lora_indices[token];
       if (lora_id >= 0) {
         int pair_base = token * 2;
@@ -792,7 +816,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                 }
               }
               long long weight_index =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col) *
+                  ((lora_id * (long long)num_experts + expert) * HDIM + (long long)output_col) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
@@ -924,7 +948,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                   }
                 }
                 long long weight_index_1 =
-                    ((lora_id * (long long)num_experts + expert_1) * 2688 + (long long)output_col) *
+                    ((lora_id * (long long)num_experts + expert_1) * HDIM + (long long)output_col) *
                         32 +
                     (long long)rank_col_1;
                 float _vec_load_2[8];
@@ -988,6 +1012,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_EXPAND_TOKEN
 #undef NUM_MAIN_STAGES
 #undef SMEM_ROUTE_LIST_OFF
 #undef SMEM_ROUTE_LIST_STAGE_BYTES
@@ -1008,11 +1033,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
 #define SMEM_ROUTE_LIST_STRIDE 72
 #define SMEM_TOTAL 256
 #define THREADS 128
+#define CAKE_BGMV_MOE_BODY_EXPAND_TOKEN_DUAL \
+  CAKE_BGMV_MOE_HIDDEN_SYMBOL(kernel_flashinfer_bgmv_moe_expand_token_dual_col_bf16_h, _r32)
 
 extern "C" {
 
-__global__
-__launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_bf16_h2688_r32(
+__global__ __launch_bounds__(128, 1) void CAKE_BGMV_MOE_BODY_EXPAND_TOKEN_DUAL(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -1072,10 +1098,10 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
       }
       int valid0 = 0;
       int valid1 = 0;
-      if (output_col0 < 2688) {
+      if (output_col0 < HDIM) {
         valid0 = 1;
       }
-      if (output_col1 < 2688) {
+      if (output_col1 < HDIM) {
         valid1 = 1;
       }
       float total0 = 0.0f;
@@ -1123,7 +1149,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
             }
             if (valid0 != 0) {
               long long weight_index0 =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col0) *
+                  ((lora_id * (long long)num_experts + expert) * HDIM + (long long)output_col0) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
@@ -1157,7 +1183,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
             }
             if (valid1 != 0) {
               long long weight_index1 =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col1) *
+                  ((lora_id * (long long)num_experts + expert) * HDIM + (long long)output_col1) *
                       32 +
                   (long long)rank_col;
               float _vec_load_1[8];
@@ -1297,7 +1323,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                 }
               }
               if (valid0 != 0) {
-                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * 2688 +
+                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * HDIM +
                                              (long long)output_col0) *
                                                 32 +
                                             (long long)rank_col_1;
@@ -1331,7 +1357,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                 }
               }
               if (valid1 != 0) {
-                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * 2688 +
+                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * HDIM +
                                              (long long)output_col1) *
                                                 32 +
                                             (long long)rank_col_1;
@@ -1387,12 +1413,12 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
           (0)) = total1;
       }
     } else {
-      if (output_col0 < 2688) {
+      if (output_col0 < HDIM) {
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col0)) +
           (0)) = 0.0f;
       }
-      if (output_col1 < 2688) {
+      if (output_col1 < HDIM) {
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col1)) +
           (0)) = 0.0f;
@@ -1418,6 +1444,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
 }  // extern "C"
 
 #undef BLACKWELL_INF
+#undef CAKE_BGMV_MOE_BODY_EXPAND_TOKEN_DUAL
 #undef NUM_MAIN_STAGES
 #undef SMEM_ROUTE_LIST_OFF
 #undef SMEM_ROUTE_LIST_STAGE_BYTES
@@ -1427,6 +1454,11 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
+
+#undef CAKE_BGMV_MOE_HIDDEN_SYMBOL
+#undef CAKE_BGMV_MOE_PASTE
+#undef CAKE_BGMV_MOE_PASTE_
+#undef HDIM
 
 // Dynamic shared memory per launch, in bytes.
 #define CAKE_BGMV_MOE_SMEM_SHRINK_DECODE 221696

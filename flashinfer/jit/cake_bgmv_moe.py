@@ -476,9 +476,17 @@ def _metadata(
 ) -> CakeBGMVMoEMetadata:
     _check_hidden_size(hidden_size)
     tag = _dtype_tag(dtype)
+    # One body per dtype serves both hidden sizes: the generated binding defines
+    # CAKE_BGMV_MOE_HIDDEN and the body pastes it into every kernel symbol. The
+    # compute-capability-10.7 records keep their own unfolded bodies.
     suffix = _body_suffix(arch, (dtype, hidden_size) in _SM107A_SPECIALIZED_BODIES)
+    body = (
+        f"cake_bgmv_moe_{tag}_h{hidden_size}{suffix}.cu"
+        if suffix
+        else f"cake_bgmv_moe_specialized_{tag}.cu"
+    )
     return CakeBGMVMoEMetadata(
-        body=f"cake_bgmv_moe_{tag}_h{hidden_size}{suffix}.cu",
+        body=body,
         shrink_decode_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_{tag}_h{hidden_size}_r32_p4_s3"
         ),
@@ -799,9 +807,12 @@ def get_cake_bgmv_moe_uri(
 
 
 def _binding_source(
-    metadata: CakeBGMVMoEMetadata, hidden_size: int, target: CakeBGMVMoEArchTarget
+    metadata: CakeBGMVMoEMetadata,
+    hidden_size: int,
+    dtype: CakeBGMVMoEDType,
+    target: CakeBGMVMoEArchTarget,
 ) -> str:
-    input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
+    input_dtype = "dl_bfloat16" if dtype == "bfloat16" else "dl_float16"
     major, minor = target.capability
     return f"""\
 /*
@@ -989,7 +1000,7 @@ def gen_cake_bgmv_moe_module(
 
     uri = get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_bgmv_moe_binding.cu"
-    write_if_different(binding, _binding_source(metadata, hidden_size, target))
+    write_if_different(binding, _binding_source(metadata, hidden_size, dtype, target))
     spec = gen_jit_spec(
         name=uri,
         sources=[binding],
