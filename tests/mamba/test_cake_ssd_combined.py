@@ -5129,7 +5129,9 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
 
 _CHUNK_PARALLEL_ENV = "FLASHINFER_CAKE_SSD_CHUNK_PARALLEL"
 _SELECTION_SM_COUNT = 148
-_SELECTION_CAPABILITIES = ((10, 0), (10, 3))
+_SELECTION_CAPABILITIES = ((10, 0), (10, 3))  # the 148-SM rule cases below
+_COST_MODEL_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+_RUBIN_SM_COUNT = 212
 _CHUNK_PARALLEL_WORKSPACE_ARGS = (
     "h_map",
     "s_work",
@@ -5233,6 +5235,30 @@ def test_source_chunk_parallel_selection_rule(
     assert selected is expected
 
 
+@pytest.mark.parametrize(
+    "batch,nheads,nchunks,expected",
+    (
+        (1, 8, 16, True),  # 128 tiles inside the first wave: 20.0 vs 33.5 us
+        (1, 8, 8, False),  # 8 chunks: the exact scan (18.8 us) beats cp_fixed (20.0)
+        (1, 128, 32, False),  # 128 items x 32 chunks: 4096 tiles, exact 66.9 us
+        (1, 8, 256, True),  # the 32768-token calibration row: 75.4 vs 475.4 us
+        (4, 8, 64, True),  # 32 items x 64 chunks: 75.4 vs 121.9 us
+        (1, 32, 16, True),  # 512 tiles: three-phase 29.0 x 1.05 vs 33.5 us
+    ),
+    ids=("1x8x16", "1x8x8", "1x128x32", "1x8x256", "4x8x64", "1x32x16"),
+)
+def test_source_chunk_parallel_selection_rule_rubin(batch, nheads, nchunks, expected):
+    """The same rule with the Rubin (10, 7) constants at 212 SMs: the
+    cheaper exact scan (serial_fixed 4.07 us, 1.84 us per chunk) keeps the
+    8-chunk 1 x 1024 x 8 call that the Blackwell constants hand to
+    chunk-parallel; the other cases follow the Blackwell verdicts."""
+
+    selected = _batched_selection(
+        batch, nheads, nchunks, capability=(10, 7), sm_count=_RUBIN_SM_COUNT
+    )
+    assert selected is expected
+
+
 @pytest.mark.parametrize("capability", _SELECTION_CAPABILITIES, ids=("sm100", "sm103"))
 @pytest.mark.parametrize(
     "batch,nheads,nchunks,varlen,expected",
@@ -5309,12 +5335,12 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     predicted main-kernel times from the calibrated constants: the exact
     scan's per-chunk cost interpolates linearly between 32 and 128 work
     items, the chunk-parallel program pays its fixed cost plus one per-tile
-    cost for every tile beyond the first wave of SMs; unmeasured
-    capabilities use the B200 constants."""
+    cost for every tile beyond the first wave of SMs; capabilities
+    without a calibrated row use the B200 constants."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     model = module._CHUNK_PARALLEL_COST_MODEL_US
-    assert set(model) == set(_SELECTION_CAPABILITIES)
+    assert set(model) == set(_COST_MODEL_CAPABILITIES)
     assert module._CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE == 64 * 128 * (4 + 2)
 
     def quantities(nheads, nchunks, capability, sm_count=_SELECTION_SM_COUNT):
@@ -5340,7 +5366,7 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
     assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
     three_phase = module._THREE_PHASE_COST_MODEL_US
-    assert set(three_phase) == set(_SELECTION_CAPABILITIES)
+    assert set(three_phase) == set(_COST_MODEL_CAPABILITIES)
     assert predicted["three_phase"] == pytest.approx(three_phase[(10, 0)]["cp_fixed"])
     assert small["mode_varlen"] is False
 
@@ -5378,13 +5404,23 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     other = quantities(8, 16, (12, 0))
     assert other["capability"] == (12, 0)
     assert other["predicted_us"] == small["predicted_us"]
-    # Rubin (10, 7) is a target without a calibrated row in either table: the
-    # B200 constants until a calibration run on Rubin fills its rows.
+    # Rubin (10, 7): its own calibrated rows (the same 24-cell protocol on
+    # 212 SMs), so 1 x 2048 x 8 heads fits the first wave of 212 SMs and the
+    # 32768-token calibration row pays 2048 - 212 per-tile costs.
     assert (10, 7) in module._TARGET_ARCHS
-    assert (10, 7) not in model and (10, 7) not in three_phase
-    rubin = quantities(8, 16, (10, 7), sm_count=212)
+    rubin_model = model[(10, 7)]
+    rubin = quantities(8, 16, (10, 7), sm_count=_RUBIN_SM_COUNT)
     assert rubin["capability"] == (10, 7) and rubin["sm_count"] == 212
-    assert rubin["predicted_us"] == small["predicted_us"]
+    assert rubin["predicted_us"]["exact_scan"] == pytest.approx(
+        rubin_model["serial_fixed"] + rubin_model["serial_per_chunk_small"] * 16
+    )
+    assert rubin["predicted_us"]["exact_scan"] == pytest.approx(33.526)
+    assert rubin["predicted_us"]["chunk_parallel"] == pytest.approx(20.0)
+    assert rubin["predicted_us"]["three_phase"] == pytest.approx(21.0)
+    long_prefill = quantities(8, 256, (10, 7), sm_count=_RUBIN_SM_COUNT)["predicted_us"]
+    assert long_prefill["exact_scan"] == pytest.approx(475.366)
+    assert long_prefill["chunk_parallel"] == pytest.approx(75.4472)
+    assert long_prefill["three_phase"] == pytest.approx(69.8376)
 
 
 @pytest.mark.parametrize("form", ("triple", "cu_seqlens"))
@@ -5708,8 +5744,8 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
         (10, 7): 212,
     }
     assert module._chunk_parallel_vcount((10, 7)) == 212
-    assert (10, 7) not in module._CHUNK_PARALLEL_COST_MODEL_US
-    assert (10, 7) not in module._THREE_PHASE_COST_MODEL_US
+    assert (10, 7) in module._CHUNK_PARALLEL_COST_MODEL_US
+    assert (10, 7) in module._THREE_PHASE_COST_MODEL_US
     for name, program in module._PROGRAMS.items():
         for arch in ("sm_100a", "sm_103a"):
             assert module._main_module(name, arch) == program.main.module

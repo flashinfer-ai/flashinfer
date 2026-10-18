@@ -959,12 +959,16 @@ _CHUNK_PARALLEL_COST_MODEL_US = {
         "cp_fixed": 21.6,
         "cp_per_tile": 0.0459,
     },
+    (10, 7): {  # Rubin, sm_107a (212 SMs); calibrated on the same 24-cell
+        # protocol as the Blackwell rows (main-kernel medians, cold L2).
+        "serial_fixed": 4.07,
+        "serial_per_chunk_small": 1.841,
+        "serial_per_chunk_large": 1.962,
+        "cp_fixed": 20.0,
+        "cp_per_tile": 0.0302,
+    },
 }
-# Unmeasured capabilities use the B200 constants.  (10, 7) (Rubin, sm_107a)
-# has no calibrated row yet, here or in ``_THREE_PHASE_COST_MODEL_US``: a
-# calibration run on Rubin fills both rows; until then its selection uses the
-# B200 constants (never another capability's constants copied into a (10, 7)
-# row).
+# Capabilities without a calibrated row use the B200 constants.
 _CHUNK_PARALLEL_COST_MODEL_DEFAULT = (10, 0)
 _CHUNK_PARALLEL_SMALL_ITEMS = 32
 _CHUNK_PARALLEL_LARGE_ITEMS = 128
@@ -973,12 +977,14 @@ _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
 # Third cost arm: the three-phase program's own
 # calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
 # module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
-# 4), copied verbatim; they take part in the exact-vs-chunk-parallel gate only
-# (the faster of the two chunk-parallel predictions is compared with the
+# 4, copied verbatim for the Blackwell rows; the (10, 7) row was fit on Rubin
+# with the same protocol); they take part in the exact-vs-chunk-parallel gate
+# only (the faster of the two chunk-parallel predictions is compared with the
 # exact scan's).
 _THREE_PHASE_COST_MODEL_US = {
     (10, 0): {"cp_fixed": 25.0, "cp_per_tile": 0.0491},
     (10, 3): {"cp_fixed": 24.1, "cp_per_tile": 0.0429},
+    (10, 7): {"cp_fixed": 21.0, "cp_per_tile": 0.0266},
 }
 # Chunk-parallel FAMILY rule inside the chunk-parallel regime, mirrored from
 # the look-back seed module (``three_phase_preferred``): the three-phase
