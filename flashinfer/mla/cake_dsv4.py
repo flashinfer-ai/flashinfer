@@ -131,7 +131,7 @@ registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
 ``nvfp4_decode_tile_oc{1,2,4}``, ``nvfp4_decode_tile_h64_oc{2,4}``) plus
 ``nvfp4_merge``, bound through the same
 registration machinery as the BF16/FP8 routes from the generated sources under
-``csrc/cake_dsv4/sm_100a`` and ``csrc/cake_dsv4/sm_103a``; a plan that selects
+``csrc/cake_dsv4/{sm_100a,sm_103a,common}``; a plan that selects
 an unexported variant raises ``NotImplementedError``. Splits write
 ``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
 workspace; the final base-2 LSE lives in an extra ``lse`` region appended

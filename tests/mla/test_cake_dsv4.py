@@ -1254,6 +1254,26 @@ def test_unexported_variant_fails(arch):
         get_cake_dsv4_spec("unexported_variant", arch=arch)
 
 
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_registered_sources_exist_and_shared_sources_live_in_common(arch):
+    """Every registered source is on disk; a source both architectures compile
+    lives under ``common/`` and every ``common/`` source is compiled by both.
+    """
+    from flashinfer.jit.cake_dsv4 import _get_csrc_dir
+
+    csrc_dir = _get_csrc_dir()
+    other = "sm_103a" if arch == "sm_100a" else "sm_100a"
+    for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
+        twin = _ARCH_REGISTRATIONS[other]["variants"][variant]["sources"]
+        for source in spec["sources"]:
+            assert (csrc_dir / source).is_file(), (arch, variant, source)
+            assert (source in twin) == source.startswith("common/"), (
+                arch,
+                variant,
+                source,
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Hardening (flashinfer#4671): name-based binding, workspace, metadata         #
 # --------------------------------------------------------------------------- #

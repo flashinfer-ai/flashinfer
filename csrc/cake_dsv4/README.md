@@ -31,8 +31,8 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 
 | path | contents |
 | --- | --- |
-| `sm_100a/`, `sm_103a/` | one `cake_dsv4_<hash>_kernel.cu` (device code) and one `cake_dsv4_<hash>_binding.cu` (TVM-FFI launcher) per BF16 / FP8 variant and architecture, plus the headers every unit of that architecture includes: `cake_dsv4_device_common.cuh` (device preamble) and `cake_dsv4_host_common.cuh` (dynamic shared-memory opt-in) |
-| `common/` | the NVFP4 decode family, compiled for both architectures from the same sources: the `cake_dsv4_nvfp4_*_kernel.cu` units, their `*_binding.cu` launchers and the `cake_dsv4_nvfp4_{device,host}_common.cuh` headers (launch helpers, tensor-map encoders, tensor checks) |
+| `sm_100a/`, `sm_103a/` | one `cake_dsv4_<hash>_kernel.cu` (device code) and one `cake_dsv4_<hash>_binding.cu` (TVM-FFI launcher) per BF16 / FP8 variant whose kernel differs between the two architectures (14 per directory), plus the headers every unit of that directory includes: `cake_dsv4_device_common.cuh` (device preamble) and `cake_dsv4_host_common.cuh` (dynamic shared-memory opt-in) |
+| `common/` | sources both architectures compile: the 13 BF16 / FP8 variants whose kernel is identical on sm_100a and sm_103a (`cake_dsv4_<hash>_{kernel,binding}.cu`, named by the sm_100a hash, with their own copies of the two `cake_dsv4_*_common.cuh` headers), and the NVFP4 decode family (the `cake_dsv4_nvfp4_*_kernel.cu` units, their `*_binding.cu` launchers and the `cake_dsv4_nvfp4_{device,host}_common.cuh` headers: launch helpers, tensor-map encoders, tensor checks) |
 | `cake_dsv4_launch_sequence.cc` | host-only `run_sequence`: issues the producer and reducer launches of a two-stage route from one FFI call |
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
