@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical and route tests of the source-built GEMM backends on SM100/SM103."""
 
+import re
+
 import pytest
 import torch
 
@@ -508,6 +510,114 @@ def test_blackwell_bf16_fp4_cuda_graph_capture(blackwell_device, backend, shape)
     torch.testing.assert_close(
         out, (reference.float() * 0.5).to(torch.bfloat16), atol=1e-2, rtol=1e-2
     )
+
+
+def _operands(device, backend, shape=(16, 64, 1024)):
+    """Valid operands; for this shape the tiled route reads A through a raw pointer."""
+
+    a, (b, b_descale, _alpha), _reference = _case(
+        device, backend, shape, torch.bfloat16, None, 3
+    )
+    return a, b, b_descale
+
+
+def _rejects(exc, message, a, b, b_descale, alpha=None, **kwargs):
+    with pytest.raises(exc, match=re.escape(message)):
+        mm_bf16_fp4(a, b, b_descale, alpha, **kwargs)
+
+
+@pytest.mark.parametrize("backend", ["blackwell-native", "blackwell-tiled"])
+def test_blackwell_bf16_fp4_rejects_invalid_operands(blackwell_device, backend):
+    """Every invalid operand raises before any program is built or launched."""
+
+    a, b, s = _operands(blackwell_device, backend)
+    f32 = dict(dtype=torch.float32, device=blackwell_device)
+    contiguous_b = f"{backend} requires contiguous b and b_descale"
+    alpha_message = "alpha must be a contiguous float32 tensor with shape (1,)"
+    cases = [
+        ("a, b, and b_descale must be contiguous", a.t().contiguous().t(), b, s),
+        (contiguous_b, a, b.t().contiguous().t(), s),
+        (contiguous_b, a, b, s.t().contiguous().t()),
+        ("a, b, and b_descale must be on the same device", a, b.cpu(), s),
+        ("K=1016 must be a multiple of block_size=16", a[:, :1016], b, s),
+        ("a.shape[1]=512 but prepared b encodes K=1024", a[:, :512], b, s),
+        ("M and N must be positive; got M=0, N=64", a[:0], b, s),
+        (alpha_message, a, b, s, torch.ones((1,), **f32).to(torch.float16)),
+        (alpha_message, a, b, s, torch.ones((2,), **f32)),
+        (alpha_message, a, b, s, torch.ones((), **f32)),
+        ("alpha must be on the same device as a", a, b, s, torch.ones((1,))),
+    ]
+    for message, *operands in cases:
+        _rejects(ValueError, message, *operands, backend=backend)
+    _rejects(
+        TypeError, "a must be bfloat16", a.to(torch.float16), b, s, backend=backend
+    )
+    out = torch.empty((16, 64), dtype=torch.bfloat16, device=blackwell_device)
+    out_message = (
+        "out must be contiguous, on the same device, and have shape/dtype "
+        "(16, 64)/torch.bfloat16"
+    )
+    for bad_out in (out[:, :32], out.to(torch.float16), out.t().contiguous().t()):
+        _rejects(ValueError, out_message, a, b, s, backend=backend, out=bad_out)
+
+
+def test_blackwell_bf16_fp4_rejects_wrong_layout(blackwell_device):
+    """Operands in the other backend's layout, N % 64 != 0, N = 0, bad out dtypes."""
+
+    native, tiled = "blackwell-native", "blackwell-tiled"
+    a, b_n, s_n = _operands(blackwell_device, native)
+    _, b_t, s_t = _operands(blackwell_device, tiled)
+    a_n0, b_n0, s_n0 = _operands(blackwell_device, native, (16, 0, 1024))
+    s_n_u8, s_t_i8 = s_n.view(torch.uint8), s_t.view(torch.int8)
+    cases = [
+        (native, "blackwell-native expects the uint8 [N, K/2] weight", a, b_t, s_t),
+        (tiled, "blackwell-tiled expects the int32 [K/16, N*2] weight", a, b_n, s_n),
+        (native, "linear float8_e4m3fn scales with shape (64, 64)", a, b_n, s_n_u8),
+        (tiled, "S0E5M3 uint8 scales with shape (64, 64)", a, b_t, s_t_i8),
+        (tiled, "N to be a multiple of 64; got N=32", a, b_t[:, :64], s_t[:, :32]),
+        (native, "M and N must be positive; got M=16, N=0", a_n0, b_n0, s_n0),
+    ]
+    for backend, message, *operands in cases:
+        _rejects(ValueError, message, *operands, backend=backend)
+    _rejects(
+        ValueError,
+        "blackwell-tiled requires bfloat16 output; got torch.float16",
+        a,
+        b_t,
+        s_t,
+        backend=tiled,
+        out_dtype=torch.float16,
+    )
+    _rejects(
+        ValueError,
+        "out_dtype must be bfloat16 or float16; got torch.float32",
+        a,
+        b_n,
+        s_n,
+        backend=native,
+        out_dtype=torch.float32,
+    )
+
+
+@pytest.mark.parametrize("backend", ["blackwell-native", "blackwell-tiled"])
+def test_blackwell_bf16_fp4_skip_check_still_validates(blackwell_device, backend):
+    """``skip_check=True`` skips the API checker; the compute path rejects the same."""
+
+    a, b, s = _operands(blackwell_device, backend)
+    bad_alpha = torch.ones((2,), dtype=torch.float32, device=blackwell_device)
+    bad_out = torch.empty((1, 64), dtype=torch.bfloat16, device=blackwell_device)
+    for operands, kwargs in (
+        ((a.t().contiguous().t(), b, s), {}),
+        ((a[:0], b, s), {}),
+        ((a[:, :512].contiguous(), b, s), {}),
+        ((a, b.t().contiguous().t(), s), {}),
+        ((a, b.cpu(), s), {}),
+        ((a, b, s, bad_alpha), {}),
+        ((a, b, s), dict(out_dtype=torch.float32)),
+        ((a, b, s), dict(out=bad_out)),
+    ):
+        with pytest.raises(ValueError):
+            mm_bf16_fp4(*operands, backend=backend, skip_check=True, **kwargs)
 
 
 # Route of every test row, replayed without a GPU or a JIT build: the inputs
