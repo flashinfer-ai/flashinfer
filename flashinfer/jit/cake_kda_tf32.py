@@ -3,7 +3,9 @@
 One kernel source serves both architectures where the generated bodies agree
 (architecture-specific lowering sits under exact ``__CUDA_ARCH__`` guards); each
 architecture still compiles its own module. Argument plans and factory kwargs are
-stored once and expanded into ``MODULES`` / ``FACTORIES`` at import.
+stored once and expanded into ``MODULES`` / ``FACTORIES`` at import. The host
+binding of every module is rendered from ``cake_kda_prefill_binding`` into the
+generated-source directory when its JIT spec is created.
 """
 
 from functools import cache
@@ -12,7 +14,9 @@ from pathlib import Path
 import torch
 
 from . import env as jit_env
+from .cake_kda_prefill_binding import render_kda_prefill_binding
 from .core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .utils import write_if_different
 
 ARCHES = ("sm_100a", "sm_103a")
 _NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
@@ -334,7 +338,9 @@ ARG_PLANS = {
 }
 
 # module name -> (family directory, source digest, architectures, argument plan,
-# TMA descriptor workspace bytes). Sources are csrc/kda/<dir>/cake_kda_<dir>_<digest>_{kernel,binding}.cu.
+# TMA descriptor workspace bytes). The kernel body is
+# csrc/kda/<dir>/cake_kda_<dir>_<digest>_kernel.cu; render_binding() renders its
+# host binding.
 _MODULE_ROWS = {
     "cake_kda_bf16_02c6dae5d13691ae05c3": (
         "bf16",
@@ -938,10 +944,7 @@ def _module_record(directory, digest, arches, plan, tma_workspace_bytes):
     stem = f"cake_kda_{directory}_{digest}"
     return {
         "arches": arches,
-        "sources": [
-            f"csrc/kda/{directory}/{stem}_kernel.cu",
-            f"csrc/kda/{directory}/{stem}_binding.cu",
-        ],
+        "sources": [f"csrc/kda/{directory}/{stem}_kernel.cu"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [list(slot) for slot in ARG_PLANS[plan]],
@@ -1918,6 +1921,19 @@ def _source_path(relative):
     return Path(__file__).resolve().parents[2] / relative
 
 
+def render_binding(name):
+    """Render the tvm-ffi host binding of one module."""
+    directory, digest, _arches, plan, tma_workspace_bytes = _MODULE_ROWS[name]
+    return render_kda_prefill_binding(
+        name,
+        directory=directory,
+        digest=digest,
+        plan=plan,
+        arg_plan=ARG_PLANS[plan],
+        tma_workspace_bytes=tma_workspace_bytes,
+    )
+
+
 @cache
 def spec(name, arch):
     record = MODULES[name]
@@ -1927,12 +1943,19 @@ def spec(name, arch):
     if not include.is_dir():
         include = Path(__file__).resolve().parents[2] / "include"
     sources = [_source_path(path) for path in record["sources"]]
+    spec_name = f"{record['cache_name']}_{arch}"
+    binding = (
+        jit_env.FLASHINFER_GEN_SRC_DIR
+        / spec_name
+        / f"{record['cache_name']}_binding.cu"
+    )
+    write_if_different(binding, render_binding(name))
     return gen_jit_spec(
-        name=f"{record['cache_name']}_{arch}",
-        sources=sources,
+        name=spec_name,
+        sources=[*sources, binding],
         extra_cuda_cflags=[*_NVCC_FLAGS[arch], *record["compile_flags"]],
         extra_include_paths=[
-            sources[-1].parent,
+            sources[0].parent,
             _source_path(_SHIM_HEADER).parent,
             _source_path("csrc/tvm_ffi_utils.h").parent,
             include,
