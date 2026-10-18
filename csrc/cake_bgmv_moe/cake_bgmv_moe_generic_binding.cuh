@@ -23,6 +23,9 @@
  *   CAKE_BGMV_MOE_EXPAND_T64_PF       64-lane expand, B rows register-prefetched before PDL wait
  *   CAKE_BGMV_MOE_EXPAND_T128_PF      128-lane expand, B rows register-prefetched before PDL wait
  *   CAKE_BGMV_MOE_ORDER_BUILD         single-CTA route-order prologue of the SM90 per-route shrink
+ *   CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND  1 for the merge-in-expand records (sm107a generic bf16
+ *                                        rank 32): the expand kernels take the shrink's per-split
+ *                                        partials and the split count and merge them themselves
  *   (the grouped-pipeline kernels CAKE_BGMV_MOE_GROUP_* / *_GROUPED are listed below)
  */
 #pragma once
@@ -36,6 +39,10 @@
 #include "tvm_ffi_utils.h"
 
 #include CAKE_BGMV_MOE_BODY_FILE
+
+#ifndef CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND
+#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND 0
+#endif
 
 namespace flashinfer {
 namespace cake_bgmv_moe_generic {
@@ -771,6 +778,21 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   auto expand_kernel_t64 = prefetch_form ? CAKE_BGMV_MOE_EXPAND_T64_PF : CAKE_BGMV_MOE_EXPAND_T64;
   auto expand_kernel_t128 =
       prefetch_form ? CAKE_BGMV_MOE_EXPAND_T128_PF : CAKE_BGMV_MOE_EXPAND_T128;
+#if CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND
+  // Merge-in-expand record: the shrink kernels left the per-split partials in the workspace
+  // (splits > 1) and the expand kernels sum them in split order and write shrink_out; with
+  // splits == 1 they read the shrink output as the shared kernels do.
+  const cudaError_t expand_status =
+      schedule == Schedule::kTokenOwnedT64
+          ? cudaLaunchKernelEx(&config, expand_kernel_t64, y_ptr, shrink_ptr, b_ptr, token_ptr,
+                               expert_ptr, lora_ptr, weight_ptr, num_pairs, num_experts, num_tokens,
+                               output_stride, output_offset, route_ptr, kRouteLookup, kRouteAdvance,
+                               hidden, split_partials, splits)
+          : cudaLaunchKernelEx(&config, expand_kernel_t128, y_ptr, shrink_ptr, b_ptr, token_ptr,
+                               expert_ptr, lora_ptr, weight_ptr, num_pairs, num_experts, num_tokens,
+                               output_stride, output_offset, route_ptr, kRouteLookup, kRouteAdvance,
+                               hidden, split_partials, splits);
+#else
   const cudaError_t expand_status =
       schedule == Schedule::kTokenOwnedT64
           ? cudaLaunchKernelEx(&config, expand_kernel_t64, y_ptr, shrink_ptr, b_ptr, token_ptr,
@@ -781,6 +803,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
                                expert_ptr, lora_ptr, weight_ptr, num_pairs, num_experts, num_tokens,
                                output_stride, output_offset, route_ptr, kRouteLookup, kRouteAdvance,
                                hidden);
+#endif
   CheckCuda(expand_status, "Cake BGMV MoE generic expand launch");
 }
 
