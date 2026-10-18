@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ast
+import dataclasses
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -61,6 +62,7 @@ instance_key = cake_backend.instance_key
 instance_symbol = cake_backend.instance_symbol
 sk_exact_plan = cake_backend.sk_exact_plan
 sk_sync_plan = cake_backend.sk_sync_plan
+check_stream_k_plan = cake_backend.check_stream_k_plan
 operand_view = cake_backend.operand_view
 plan_dense_projection_gemm = cake_backend.plan_dense_projection_gemm
 plan_router_fp32_gemm = cake_backend.plan_router_fp32_gemm
@@ -3805,9 +3807,9 @@ def test_instance_key_rejects_bad_configurations():
 
 @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
 def test_stream_k_plan_rules(pairs):
-    # --- sk="auto" (the launcher default): a K-aligned two-way split of a single partial wave ---
-    # every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an A / B
-    # panel stay K-synchronised and the fixup reads one slab
+    # --- sk="auto" (the launcher default): a two-way split of a single partial wave ---
+    # on an even K every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an
+    # A / B panel stay K-synchronised and the fixup reads one slab
     assert stream_k_plan(24, 96, pairs, sk="auto") == (0, 24, 48, 48)
     assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (
         0,
@@ -3815,12 +3817,12 @@ def test_stream_k_plan_rules(pairs):
         2 * (pairs // 2),
         48,
     )
-    assert stream_k_plan(10, 17, pairs, sk="auto") == (
-        0,
-        10,
-        20,
-        9,
-    )  # odd K steps: ceil(k / 2)
+    # odd K steps: units of ceil(k / 2) over the linearised 10 x 17 steps; 2 x 10 units would leave the last one
+    # starting at step 19 x 9 = 171 of 170, so the plan has the 19 that hold a K step
+    assert stream_k_plan(10, 17, pairs, sk="auto") == (0, 10, 19, 9)
+    assert stream_k_plan(16, 17, pairs, sk="auto") == (0, 16, 31, 9)
+    # 15 x 9 < 8 x 17: still two units per tile
+    assert stream_k_plan(8, 17, pairs, sk="auto") == (0, 8, 16, 9)
     assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (
         0,
         10,
@@ -3885,6 +3887,50 @@ def test_stream_k_plan_rules(pairs):
     # --- sk="tiles": the diagnostic whole-tile unit path ---
     assert stream_k_plan(pairs + 10, 256, pairs, sk="tiles") == (pairs, 10, 10, 256)
     assert stream_k_plan(0, 96, pairs, sk=True) == (0, 0, 0, 96)
+
+
+@pytest.mark.parametrize("pairs", [74, 76, 106])  # 148 / 152 / 212 SMs
+def test_stream_k_plans_give_every_unit_a_k_step(pairs):
+    # a unit without a K step never finishes in the pd 2 / sk_slab 2 / stt programs (the work handoff runs in an
+    # item's last segment): every linearised policy plans the units that hold one, and nothing more
+    for tiles in range(1, 2 * pairs + 3):
+        for k_blocks in range(1, 80):
+            for sk in ("auto", True):
+                num_full, tail, units, ipu = stream_k_plan(tiles, k_blocks, pairs, sk)
+                if units:
+                    assert (
+                        ipu >= 1 and (units - 1) * ipu < tail * k_blocks <= units * ipu
+                    )
+
+
+def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
+    # the dgrad of T = 1024, N = 1032, K = 1000 on 76 CTA pairs: 16 tail tiles of 17 K steps, one partial wave
+    E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
+    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
+    plan, *_ = plan_dense_projection_gemm(
+        E(1024, 1032), E(1032, 1000), E(1024, 1000), pd=2, slots=2, epi="tma", **kw
+    )
+    assert plan.pd == 2 and (plan.tail_tiles, plan.k_blocks) == (16, 17)
+    assert (plan.sk_units, plan.iters_per_unit, plan.sk_iters) == (31, 9, 272)
+    check_stream_k_plan(plan)
+    # the 2 x tail units of the earlier plan: unit 31 starts at K step 279 of 272
+    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
+        check_stream_k_plan(dataclasses.replace(plan, sk_units=32))
+    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
+        check_stream_k_plan(dataclasses.replace(plan, iters_per_unit=0))
+    # the same empty unit is legal on a program that hands off at the bottom of the item loop
+    check_stream_k_plan(dataclasses.replace(plan, pd=0, sk_units=32))
+    # synchronised plans: a collector for every program, at most one per tail tile for the sk_slab 2 / stt ones
+    sync = dataclasses.replace(
+        plan, pd=0, sk_sync=True, sk_slab=2, sk_units=32, iters_per_unit=9
+    )
+    check_stream_k_plan(sync)
+    with pytest.raises(ValueError, match="collectors <= tail_tiles"):
+        check_stream_k_plan(dataclasses.replace(sync, sk_units=33))
+    check_stream_k_plan(dataclasses.replace(sync, sk_slab=0, sk_units=33))
+    for slab in (0, 2):
+        with pytest.raises(ValueError, match="1 <= collectors"):
+            check_stream_k_plan(dataclasses.replace(sync, sk_slab=slab, sk_units=16))
 
 
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
@@ -4317,12 +4363,13 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         and 2 * plan.tail_tiles <= plan.sm_pairs
                     )
                     assert plan.k_blocks >= 2 * SK_MIN_ITERS
+                    # the units of ceil(k_blocks / 2) K steps that hold one: 2 x tail on an even k_blocks
+                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
                     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
                         0,
                         plan.pair_tiles,
-                        2 * plan.pair_tiles,
+                        -(-(plan.pair_tiles * plan.k_blocks) // plan.iters_per_unit),
                     )
-                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
                 if plan.sk_units and not htail and sync_plan is None:
                     assert (
                         plan.ws_f32_elems
@@ -5515,6 +5562,46 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     ) != cake_backend.convenience_key(
         0, 0, (True, ("cta_rows", 128), ("sk", "auto")), G, X, out1
     )
+
+
+# longer than a cold-cache JIT build; the hang this test guards against never returns
+@pytest.mark.timeout(300)
+def test_pd2_stream_k_on_an_odd_k_completes():
+    """The dgrad of T = 1024, N = 1032, K = 1000 is one partial wave of 16 tiles of 17 K steps.  Two units per tile
+    would leave the last one without a K step, and the pd 2 program waits for that unit's accumulator forever; the
+    planner plans the 31 units that hold one."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 11)
+    T, N, K = 1024, 1032, 1000
+    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
+    W = (torch.randn(N, K, device=device, generator=g) * N**-0.5).to(torch.bfloat16)
+    v = dict(
+        A=G,
+        B=W,
+        out=torch.full((T, K), float("nan"), device=device, dtype=torch.bfloat16),
+    )
+    knobs = _registered_knobs(
+        v,
+        dict(pd=2, slots=2, epi="tma"),
+        dict(pd=2, slots=2, epi="tma", pro=15),
+        dict(pd=2, slots=1, epi="tma", pro=15),
+    )
+    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"], **knobs)
+    plan = prepared.plan
+    assert plan.pd == 2 and plan.k_blocks == 17 and plan.tail_tiles * 2 <= plan.sm_pairs
+    assert (
+        (plan.sk_units - 1) * plan.iters_per_unit
+        < plan.sk_iters
+        < 2 * plan.tail_tiles * plan.iters_per_unit
+    )
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(v["out"], G.double() @ W.double())
 
 
 def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
