@@ -759,8 +759,6 @@ def test_cu32_stage1_registry_arg_plan_matches_the_host_call(
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ]
-    assert record["launch"]["block"] == [128, 1, 1]
-    assert record["launch"]["cluster"] == [1, 1, 1]
 
 
 class _CopyRecorder:

@@ -50,8 +50,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_0988da242f8528c9fdec_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_0988da242f8528c9fdec_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_0988da242f8528c9fdec",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "q"],
@@ -76,13 +74,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 640,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_1284aa3c9e3f34eb5df5": {
@@ -90,8 +81,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_1284aa3c9e3f34eb5df5_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_1284aa3c9e3f34eb5df5_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_1284aa3c9e3f34eb5df5",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "source"],
@@ -108,13 +97,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_28b5fee38bf967a68cd8": {
@@ -122,8 +104,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_28b5fee38bf967a68cd8_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_28b5fee38bf967a68cd8_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_28b5fee38bf967a68cd8",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -139,13 +119,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 24960,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_29c857ce26576248b1c8": {
@@ -153,8 +126,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_29c857ce26576248b1c8_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_29c857ce26576248b1c8_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_29c857ce26576248b1c8",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "q"],
@@ -179,13 +150,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 82560,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_107a"],
     },
     "cake_gdn_cp_2eb4e3c69f8d5339cba3": {
@@ -193,8 +157,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_2eb4e3c69f8d5339cba3_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_2eb4e3c69f8d5339cba3_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_2eb4e3c69f8d5339cba3",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "packed"],
@@ -211,13 +173,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_306612b8c71d26cd1d83": {
@@ -225,8 +180,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_306612b8c71d26cd1d83_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_306612b8c71d26cd1d83_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_306612b8c71d26cd1d83",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -241,13 +194,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 24960,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_31a251fd8cbae7fb9d60": {
@@ -255,8 +201,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_31a251fd8cbae7fb9d60_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_31a251fd8cbae7fb9d60_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_31a251fd8cbae7fb9d60",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -280,13 +224,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_438c7804657ab305e23f": {
@@ -294,8 +231,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_438c7804657ab305e23f_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_438c7804657ab305e23f_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_438c7804657ab305e23f",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -319,13 +254,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_496899c05a73707f3f72": {
@@ -333,8 +261,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_496899c05a73707f3f72_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_496899c05a73707f3f72_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_496899c05a73707f3f72",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "source"],
@@ -351,13 +277,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_4cce14a6b72822cb9ff5": {
@@ -365,8 +284,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_4cce14a6b72822cb9ff5_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_4cce14a6b72822cb9ff5_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_4cce14a6b72822cb9ff5",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "packed"],
@@ -383,13 +300,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_510a0627fc99f6b9429c": {
@@ -397,8 +307,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_510a0627fc99f6b9429c_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_510a0627fc99f6b9429c_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_510a0627fc99f6b9429c",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "q"],
@@ -423,13 +331,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 640,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_58df50f20a8e6a75e788": {
@@ -437,8 +338,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_58df50f20a8e6a75e788_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_58df50f20a8e6a75e788_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_58df50f20a8e6a75e788",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "q"],
@@ -451,13 +350,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [32, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_5e8583a983c7aa197239": {
@@ -465,8 +357,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_5e8583a983c7aa197239_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_5e8583a983c7aa197239_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_5e8583a983c7aa197239",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "packed"],
@@ -483,13 +373,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_65642b3b1c2872ac7959": {
@@ -497,8 +380,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_65642b3b1c2872ac7959_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_65642b3b1c2872ac7959_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_65642b3b1c2872ac7959",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -522,13 +403,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_6856273b89c0049e09b9": {
@@ -536,8 +410,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_6856273b89c0049e09b9_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_6856273b89c0049e09b9_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_6856273b89c0049e09b9",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -561,13 +433,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_107a"],
     },
     "cake_gdn_cp_6cb33987eab2fdd2a40a": {
@@ -575,8 +440,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_6cb33987eab2fdd2a40a_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_6cb33987eab2fdd2a40a_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_6cb33987eab2fdd2a40a",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "packed"],
@@ -593,13 +456,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_72564a892ad77a80bc74": {
@@ -607,8 +463,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_72564a892ad77a80bc74_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_72564a892ad77a80bc74_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_72564a892ad77a80bc74",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "local_transfer"],
@@ -626,13 +480,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 164864,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_7c18fb3d6e06a4d25a64": {
@@ -640,8 +487,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_7c18fb3d6e06a4d25a64_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_7c18fb3d6e06a4d25a64_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_7c18fb3d6e06a4d25a64",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -661,13 +506,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 225280,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_107a"],
     },
     "cake_gdn_cp_862720015e8760a08ccc": {
@@ -675,8 +513,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_862720015e8760a08ccc_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_862720015e8760a08ccc_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_862720015e8760a08ccc",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "source"],
@@ -693,13 +529,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_86f4471fb290c9489313": {
@@ -707,8 +536,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_86f4471fb290c9489313_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_86f4471fb290c9489313_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_86f4471fb290c9489313",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -732,13 +559,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_8d18c9a7d634c6df6e7e": {
@@ -746,8 +566,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_8d18c9a7d634c6df6e7e_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_8d18c9a7d634c6df6e7e_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_8d18c9a7d634c6df6e7e",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "source"],
@@ -764,13 +582,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_902c2149cbdfd8f74a79": {
@@ -778,8 +589,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_902c2149cbdfd8f74a79_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_902c2149cbdfd8f74a79_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_902c2149cbdfd8f74a79",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -803,13 +612,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_107a"],
     },
     "cake_gdn_cp_91580fabfb9eae4b9cb6": {
@@ -817,8 +619,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_91580fabfb9eae4b9cb6_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_91580fabfb9eae4b9cb6_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_91580fabfb9eae4b9cb6",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "packed"],
@@ -835,13 +635,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_a0c0fe113dc3d4a2c02d": {
@@ -849,8 +642,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_a0c0fe113dc3d4a2c02d_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_a0c0fe113dc3d4a2c02d_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_a0c0fe113dc3d4a2c02d",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "local_transfer"],
@@ -868,13 +659,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 132096,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_a3c89471a34205cf5fa6": {
@@ -882,8 +666,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_a3c89471a34205cf5fa6_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_a3c89471a34205cf5fa6_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_a3c89471a34205cf5fa6",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "source"],
@@ -900,13 +682,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_b89a7ff12a25db400df8": {
@@ -914,8 +689,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_b89a7ff12a25db400df8_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_b89a7ff12a25db400df8_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_b89a7ff12a25db400df8",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -935,13 +708,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 159744,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_bbdd97c3096cd360b467": {
@@ -949,8 +715,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_bbdd97c3096cd360b467_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_bbdd97c3096cd360b467_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_bbdd97c3096cd360b467",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "packed"],
@@ -967,13 +731,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_c1c2bbbd5cd640e1becb": {
@@ -981,8 +738,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_c1c2bbbd5cd640e1becb_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_c1c2bbbd5cd640e1becb_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_c1c2bbbd5cd640e1becb",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -1006,13 +761,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_c2f66f9e7a1e3b12cabd": {
@@ -1020,8 +768,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_c2f66f9e7a1e3b12cabd_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_c2f66f9e7a1e3b12cabd_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_c2f66f9e7a1e3b12cabd",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "q"],
@@ -1034,13 +780,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [32, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_d5827d0f1ecedc535e35": {
@@ -1048,8 +787,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_d5827d0f1ecedc535e35_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_d5827d0f1ecedc535e35_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_d5827d0f1ecedc535e35",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -1064,13 +801,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 24960,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_dc9fd29403170907f3a6": {
@@ -1078,8 +808,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_dc9fd29403170907f3a6_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_dc9fd29403170907f3a6_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_dc9fd29403170907f3a6",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "local_transfer"],
@@ -1097,13 +825,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 2048,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_e19f8702607bd4d78e49": {
@@ -1111,8 +832,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_e19f8702607bd4d78e49_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_e19f8702607bd4d78e49_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_e19f8702607bd4d78e49",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -1132,13 +851,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 159744,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_e22ac3051c70e802f177": {
@@ -1146,8 +858,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_e22ac3051c70e802f177_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_e22ac3051c70e802f177_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_e22ac3051c70e802f177",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "source"],
@@ -1164,13 +874,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_gdn_cp_f297019c7bec02dd6183": {
@@ -1178,8 +881,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_f297019c7bec02dd6183_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_f297019c7bec02dd6183_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_f297019c7bec02dd6183",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "K"],
@@ -1195,13 +896,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [128, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 24960,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_ffe233cc2d497efa304a": {
@@ -1209,8 +903,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "gdn/gdn_cp/cake_gdn_cp_ffe233cc2d497efa304a_kernel.cu",
             "gdn/gdn_cp/cake_gdn_cp_ffe233cc2d497efa304a_binding.cu",
         ],
-        "kernel": "kernel_cake_gdn_cp_ffe233cc2d497efa304a",
-        "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
@@ -1234,13 +926,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [384, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 224768,
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "arches": ["sm_103a"],
     },
 }
@@ -1412,7 +1097,6 @@ def gen_gdn_cp_spec(program: str, arch: GDNCPArch) -> JitSpec:
             "-DNDEBUG",
             "-O3",
             *_ARCH_FLAGS[arch],
-            *record["compile_flags"],
         ],
         extra_include_paths=[sources[0].parent, *_include_dirs()],
         needs_device_linking=True,
