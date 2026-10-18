@@ -202,7 +202,10 @@ def test_cluster_one_wave_uses_the_device_capacity():
         cluster_variant_for([8] * 16, sms=132, cluster_capacity={2: 66})
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="thread block clusters need a Hopper or newer GPU",
+)
 def test_cluster_capacity_resolves_from_the_driver():
     cap = cluster_capacity(torch.cuda.current_device())
     sms = torch.cuda.get_device_properties(0).multi_processor_count
