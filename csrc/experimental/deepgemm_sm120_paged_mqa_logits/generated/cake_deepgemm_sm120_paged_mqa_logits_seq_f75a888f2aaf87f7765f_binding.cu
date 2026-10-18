@@ -29,36 +29,16 @@
 #include <cstdint>
 #include <vector>
 
+#include "experimental/cake_host_common.cuh"
+
 extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7(int* __restrict__ context_lens, int* __restrict__ schedule_meta, int batch_size, int next_n, int num_next_n_atoms, int split_kv, int num_sms);
 extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_52522722d895ca31177d(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride);
 
 
 namespace cake_host_shim_39e0bf5ce78ffe70 {
 
+using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
-
-// Opt the linked kernel into its dynamic shared memory once for every device
-// that accepts it. Function-local static initialization already serializes
-// the first call; no lock or per-device cache is needed.
-inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
-  cudaKernel_t kernel = nullptr;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
-  int device_count = 0;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
-  int configured = 0;
-  for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
-        cudaSuccess) {
-      ++configured;
-    } else {
-      (void)cudaGetLastError();
-    }
-  }
-  TVM_FFI_CHECK(configured > 0, RuntimeError)
-      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
-  return true;
-}
 
 namespace stage_metadata {
 
