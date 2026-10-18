@@ -1728,6 +1728,34 @@ def _validate_qkv_layout(q, k, v) -> bool:
     return False
 
 
+@cache
+def _exported_fused_m128_bodies(gpu_arch: str) -> tuple[dict[str, Any], ...]:
+    """Chunk and factory kwargs of every exported fused M128 body of ``gpu_arch``."""
+    from flashinfer.jit.cake_kda_tf32 import FACTORIES
+
+    return tuple(
+        {"chunk": args[0], **dict(kwargs)}
+        for args, kwargs in FACTORIES.get(gpu_arch, {}).get(
+            "compiled_bf16_fused_m128", {}
+        )
+    )
+
+
+def _fused_m128_body_exported(gpu_arch: str, chunk: int, **flags: Any) -> bool:
+    """Whether an exported fused M128 body of ``chunk`` tokens carries ``flags``.
+
+    A flag value of ``None`` requires the flag to be absent from the body's
+    factory signature (the chunk-carrier flags exist only where they apply).
+    The planner requests a measured specialization only where the registry
+    exports it and otherwise keeps the exported sibling body.
+    """
+    return any(
+        body["chunk"] == chunk
+        and all(body.get(name) == value for name, value in flags.items())
+        for body in _exported_fused_m128_bodies(gpu_arch)
+    )
+
+
 class FlashKDABlackwellBF16FusedLaunch:
     """Preallocated single-kernel launch for the production BF16 path."""
 
@@ -2142,6 +2170,17 @@ class FlashKDABlackwellBF16FusedLaunch:
                 use_initial_state=initial_state is not None,
                 store_final_state=final_state is not None,
             )
+            if compute_dtype == "bf16" and route not in {
+                BF16_ROUTE_DIRECT_M128,
+                BF16_ROUTE_DIRECT_M128_N16,
+                BF16_ROUTE_M64,
+            }:
+                # The BT16, small-BH, vtile, scalar-chunk and persistent
+                # families have no exported BF16 body: their grids take the
+                # direct family (the one-wave value split below still applies).
+                route = _direct_m128_route(
+                    num_heads=num_heads, max_sequence_length=max_seq_len
+                )
         if (
             route == BF16_ROUTE_BT16_M64
             and (not self._state_dtype_is_fp32)
@@ -2516,9 +2555,17 @@ class FlashKDABlackwellBF16FusedLaunch:
             num_heads=num_heads,
             max_seq_len=max_seq_len,
             register_inverse=use_n32_register_inverse,
+        ) and _fused_m128_body_exported(
+            gpu_arch,
+            BF16_M128_CHUNK,
+            n32_prediction_first=True,
+            n32_ft_slab=self._n32_ft_slab,
         )
         use_n32_tensor_state_decay = (
             checkpoint_every_n_tokens == 0
+            and _fused_m128_body_exported(
+                gpu_arch, BF16_M128_CHUNK, tensor_state_decay=True
+            )
             and _should_use_n32_tensor_state_decay(
                 gpu_arch=gpu_arch,
                 route=route,
@@ -2529,6 +2576,28 @@ class FlashKDABlackwellBF16FusedLaunch:
                 prediction_first=use_n32_prediction_first,
             )
         )
+        # Standalone bodies take the FP32 chunk carrier for FP32 rows and for
+        # unbounded prefill without rows (``fp32_carrier`` below); the registry
+        # ships the pair-packed H12 beta layout only for some of those flavours.
+        pair_packed_beta_exported = (
+            compute_dtype != "bf16"
+            or self._n32_ft_slab
+            or _fused_m128_body_exported(
+                gpu_arch,
+                BF16_M128_CHUNK,
+                gate_kind=gate_kind.value,
+                n32_ft_slab=False,
+                pair_packed_beta=True,
+                checkpoint_dtype_is_fp32=True
+                if fp32_checkpoints
+                or (
+                    unbounded_softplus
+                    and self._state_dtype_is_fp32
+                    and state_checkpoints is None
+                )
+                else None,
+            )
+        )
         pair_packed_beta_tma = (
             _pair_packed_beta_tma_source(
                 beta_flat, total_tokens=total_tokens, num_heads=num_heads
@@ -2537,6 +2606,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             and route == BF16_ROUTE_DIRECT_M128
             and (num_heads == 12)
             and (max_seq_len > H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQ_LEN)
+            and pair_packed_beta_exported
             else None
         )
         use_pair_packed_beta = pair_packed_beta_tma is not None
@@ -2724,6 +2794,21 @@ class FlashKDABlackwellBF16FusedLaunch:
             or use_scalar_chunk_lpt_m128
             or use_persistent_m128
         )
+        if (
+            compute_dtype == "bf16"
+            and uses_default_fused_m128
+            and not self._n32_ft_slab
+            and not _fused_m128_body_exported(
+                gpu_arch,
+                BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
+                serving_native_abi=False,
+                n32_ft_slab=False,
+            )
+        ):
+            # Every exported standalone body takes the serving ABI; its runtime
+            # parameters (use_state_indices, checkpoint cadence, beta and state
+            # slot strides) express the plain call as well.
+            serving_native_abi = True
         if fp32_checkpoints and not uses_default_fused_m128:
             raise NotImplementedError(
                 "FP32 intermediate states are only carried by the fused direct M128 body; "
@@ -4976,6 +5061,33 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     if gpu_arch not in ("sm_100a", "sm_103a"):
         return False
     heads = int(q.shape[2])
+    if compute_dtype == "bf16" and argument(9, "lower_bound") is None:
+        # The unbounded composite's window bodies are exported for a beta whose
+        # token pitch differs from the head count (the parts then take the
+        # serving ABI, as serving allocators hand beta over), for FP32
+        # checkpoint rows (merged in place) with either pitch and, with the
+        # plain pitch, for the pair-packed H12 beta of an even token count
+        # without rows.  Other unbounded calls keep the sequential body, which
+        # carries the same FP32 chunk state.
+        if beta.ndim != 3:
+            return False
+        tokens_per_batch = int(q.shape[1])
+        if int(beta.shape[0]) == 1 or (
+            int(beta.shape[1]) == tokens_per_batch
+            and beta.stride(0) == tokens_per_batch * beta.stride(1)
+        ):
+            plain_pitch = beta.stride(1) == heads
+            paired_beta = plain_pitch and beta.data_ptr() % 16 == 0
+        else:
+            # Padded or batch-strided storage with B > 1: the parts read one
+            # dense refresh copy (plain pitch, aligned base).
+            plain_pitch = paired_beta = True
+        if plain_pitch:
+            if state_checkpoints is None:
+                if heads != 12 or sum(lengths) % 2 or not paired_beta:
+                    return False
+            elif state_checkpoints.dtype != torch.float32:
+                return False
     crossover = dict(
         sm_count=_device_sm_count(q.device),
         fp32_indexed_state=initial_state.dtype == torch.float32,
@@ -5630,7 +5742,9 @@ class FlashKDABlackwellLaunch:
                 (FlashKDABlackwellFP32SmallBHLaunch, _supports_fp32_small_bh_launch),
             )
             if compute_dtype != "tf32":
-                candidates = tuple(reversed(candidates))
+                # The BF16 BT16 and small-BH bodies are not exported; the fused
+                # M128 launch routes those grids to its direct / M64 families.
+                candidates = ()
             impl = (
                 FlashKDABlackwellFP32FusedM128Launch
                 if state_indices is not None
