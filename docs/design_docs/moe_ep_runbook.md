@@ -240,7 +240,44 @@ device-side aborts):
 Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
 process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
-`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).  The BF16 pull-style
+twin (`sm90_bf16_bf16_bf16_pull_cutedsl`) shares both targets, and its token
+sweep has its own bench script,
+`benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py`
+(same CLI minus the FP8-only axes; see that tree's `TUNING.md`).
+
+The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
+Cake-generated parametric persistent kernel per deployment, JIT-compiled from
+`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
+for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
+multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. Sixteen ranks over two hosts run
+the same modules under a two-node torchrun (`--nnodes 2 --nproc_per_node 8`,
+`NCCL_GIN_ENABLE=1`); cross-host pairs use GIN, the transport table may keep LSA
+inside each host. Each EP-rank pair moves dispatch payloads and expert results over
+GIN (default `transport_table="all_gin"`) or LSA (load/store over NVLink / PCIe peer
+mappings; the copier instances reserve one copier CTA per LSA destination of a rank).
+To pick the table per deployment offline, run
+`torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8
+--hidden H --intermediate I --num-experts E --topk K --max-tokens <capacities>
+[--shared-expert]` once and configure `transport_table="tuned"`: the workspace looks
+the winner up in `FLASHINFER_MOE_EP_KNOB_CACHE` (keyed by GPU, geometry, variant,
+capacity and the gathered peer topology; all-GIN on a miss). Latency:
+`benchmarks/moe_ep/backends/mega/kernel/sm120/bench_moe_ep_sm120_w4a8_cake_mega.py`.
+Serving frameworks that know the largest per-rank token count of a call should pass it
+as the invocation's token bucket (`layer.stage_inputs(t, compile_tokens_per_rank=bucket)`
+then `layer.compute_staged(output=...)`, the same value on every rank): the call then skips
+the backend's per-call `[rows, expert histogram]` all-gather and its host read-back, and it
+can be captured into a CUDA graph -- one graph per bucket, after one eager call of the layer on
+that workspace; every rank replays the same bucket sequence in the same order (see "CUDA
+graphs" in the kernel package README).
+A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
+makes the call fail on every rank with `CUDA error: unspecified launch failure`
+(device `trap`) instead of hanging; restart the processes (see the wait-deadline
+paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
+this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
+the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
 
 The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
 payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
@@ -575,6 +612,123 @@ prefill chunks), per-role offline knob caches.
 
 ---
 
+## Blackwell GenPhase decoding (explicit opt-in)
+
+The existing SM100 MXFP8 config can select the independently owned GenPhase
+pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
+the legacy weight layout, workspace pool keys, knob cache and autotuner.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+backend = MegaConfig(
+    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=6,
+        gate_up_clamp=10.0,
+        kernel_variant="genphase",
+        knobs=None,  # cached winner, otherwise geometry-based heuristics
+    ),
+    quantize_input=True,
+    preprocess_weights=True,
+)
+layer = MoEEpLayer(bootstrap, fleet_params, weights, backend=backend)
+layer.warmup(tensors)  # collective on every EP rank, before CUDA graph capture
+output = layer.forward(tensors)
+```
+
+GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
+capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
+intermediate size must be a multiple of 64. N128 supports CGA4; N64 supports
+CGA2 or CGA4. In-kernel FC2 reduction remains unsupported.
+
+With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
+host-side estimate based on EP size, expert count, top-k, intermediate width,
+SM count and the planned live-token bucket (capacity when no bucket is known).
+The estimate favors N64 for sparse expert batches and CGA2 when estimated FC1
+work underfills a CGA4 wave; the grouped hint starts at four resident-cluster
+waves. This is a starting estimate that assumes spread routing. Skew and masked
+routes can favor other candidates. No device routing readback occurs during
+selection, and a prepared workspace keeps its configuration for replay.
+
+Set `knobs="auto"` to collectively tune on the first `layer.warmup(tensors)`.
+All EP ranks must enter warmup together before CUDA graph capture. The sweep
+checks a sampled Torch oracle before and after timing warm CUDA graphs, selects
+by median of per-sample maximum-rank duration, and caches the winner. It covers
+the three admitted geometries and original/two/four/eight-wave grouped hints.
+The timed scope is dispatch + FC1/FC2 + reduction; input staging and weight
+preparation are outside it. Tuning creates temporary workspaces and compiles
+candidates; subsequent forward calls reuse the chosen configuration. Tuning
+preserves input/output pointers, and auto workspaces are excluded from pooling.
+
+An auto layer supports only its default capacity: `create_workspace()` rejects
+`knobs="auto"` even after warmup. For additional capacity or live-token profiles,
+construct a layer with fixed or offline-tuned knobs before creating handles.
+
+For serving, tune offline and use `knobs=None` when constructing layers:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
+  --arch sm100 --dtype mxfp8_e4m3 --kernel-variant genphase \
+  --hidden 4096 --intermediate 1024 --num-experts 256 --topk 8 \
+  --max-tokens 1024 --live-tokens 65
+```
+
+Prepare the matching profile before capture on every EP rank. For the bucket
+above, construct a layer with `knobs=None` and use its handle explicitly:
+
+```python
+workspace = layer.create_workspace(1024, live_tokens=65)
+layer.warmup(tensors, workspace=workspace)
+output = layer.forward(tensors, workspace=workspace)
+```
+
+Repeat for representative live-token buckets; use `--skew` for skewed routing.
+`layer.live_token_buckets(1024)` lists the cached buckets. Calls without a
+workspace handle use the layer's default capacity profile; they do not select
+a live-token profile from the incoming batch automatically.
+`FLASHINFER_MOE_EP_KNOB_CACHE` controls the cache path (`off` disables it).
+Entries require matching GPU/SM count, CUDA/Torch/DSL compiler stack, compiler
+options, implementation
+revision, operation attributes, EP geometry, capacity and live-token bucket.
+The native compiler target has the same cache identity before and after the
+first workspace configures CuTe DSL, including its bare architecture alias.
+Collective tuning waits for rank 0 to finish the cache write before returning.
+Distribute the same cache to every EP rank. Construction checks that ranks
+agree on the selected configuration before allocating collective storage.
+A warmup result is also available through `layer.get_tuned_knobs()`.
+
+Explicit `mma_tiler_mnk`, `cluster_shape_mn`, and `schedule_policy` fields or
+a GenPhase `knobs` dictionary constrain both heuristics and the tuning sweep.
+Conflicting explicit fields are rejected. `schedule_policy=("grouped", None)`
+retains the original grouped hint; a positive integer supplies a fixed hint.
+Legacy inference knob names are not accepted by GenPhase. The low-level
+`Sm100GenphaseMoeConfig` keeps its explicit N128/CGA4 defaults.
+
+`quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
+`False` accepts E4M3 activations and per-32 typed E8M0 scales in
+`MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with
+`-1` for masked slots, unique valid IDs per token and finite valid scores.
+As on the legacy SM100 path, callers provide valid routing; the backend checks
+metadata without scanning routing values on every forward.
+
+With `preprocess_weights=True`, canonical BF16 weights or canonical
+prequantized E4M3 weights plus E8M0 scales are converted to GenPhase's
+16-row gate/up stripes and physical K-major layout. Weight scales may use
+typed `torch.float8_e8m0fnu` or raw `torch.uint8` storage. The exported
+`preprocess_mxfp8_cutedsl_mega_weights(..., kernel_variant="genphase")` helper produces
+the same payload for `preprocess_weights=False` callers. Legacy transformed
+weights cannot be reused. GenPhase workspace pooling is isolated by pipeline
+and resolved configuration. Rubin source and frontend are independent.
+
+Native layer coverage is in the existing
+`test_moe_ep_mxfp8_cutedsl_mega_multirank.py::test_blackwell_genphase_layer_graph_and_weight_formats`
+test, runnable with `torchrun --nproc_per_node=<1|2|4> -m pytest`.
+
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
@@ -583,7 +737,7 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
 - `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo)
+  and BF16 (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer

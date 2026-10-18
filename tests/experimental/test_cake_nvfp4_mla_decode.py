@@ -24,6 +24,7 @@ import torch
 from flashinfer.experimental.nvfp4_mla_decode import cake_backend
 from flashinfer.experimental.nvfp4_mla_decode.cake_backend import (
     BALANCED_MIN_KV,
+    BOUNDARY_COST_TILES,
     CLUSTER_PAIR,
     DSV4_Q_LEN,
     FLAG_DIRECT_OUT,
@@ -318,6 +319,51 @@ def test_rejects_fewer_than_128_query_rows(kv_lens, num_heads, q_len):
         )
 
 
+def unit_model_costs(plan):
+    """Per-unit model cost ``tiles + BOUNDARY_COST_TILES * (pieces - 1)`` of a balanced plan.
+
+    Counted over the ``pair_row == 0`` items of each unit (both rows of a
+    piece share the tile range); this is the quantity the host plan equalises.
+    """
+    costs = []
+    for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False):
+        pieces = [it for it in plan.items[a:b] if it[2] == 0]
+        tiles = sum(it[4] - it[3] for it in pieces)
+        costs.append(tiles + BOUNDARY_COST_TILES * (len(pieces) - 1))
+    return costs
+
+
+def assert_cost_balanced(plan, kv_lens, *, q_len, num_heads, num_sms):
+    """The balanced partition is cost-balanced, not tile-balanced.
+
+    The greedy fill behind ``cost_balanced_unit_bounds`` closes a unit once the
+    next tile (plus its boundary cost when it opens a new piece) would exceed
+    the per-unit bound, so every unit but the last is within one tile plus one
+    boundary cost of the most expensive unit, and the most expensive unit
+    costs no more than the equal-tiles partition's worst unit.
+    """
+    costs = unit_model_costs(plan)
+    worst = max(costs)
+    assert all(c > worst - (BOUNDARY_COST_TILES + 1) for c in costs[:-1]), costs
+    m_tiles = math.ceil(q_len * num_heads / ROWS_PER_TILE)
+    seq_lens = [kv_tiles(kv) for kv in kv_lens for _ in range(m_tiles)]
+    total = sum(seq_lens)
+    units = plan.num_units
+    equal_worst = 0.0
+    for u in range(units):
+        lo, hi = (u * total) // units, ((u + 1) * total) // units
+        pos, pieces = 0, 0
+        for tiles in seq_lens:
+            if pos < hi and pos + tiles > lo:
+                pieces += 1
+            pos += tiles
+        equal_worst = max(
+            equal_worst, (hi - lo) + BOUNDARY_COST_TILES * max(pieces - 1, 0)
+        )
+    assert worst <= equal_worst + 1e-9, (worst, equal_worst)
+    assert plan.num_units <= num_sms // CLUSTER_PAIR
+
+
 # Plan geometry of the shapes the GPU tests run (128-token pipeline tiles;
 # cluster of two CTAs per unit; balanced schedule over num_sms // 2 units;
 # uniform schedule pairs consecutive rows). Columns: schedule, kv_lens, q_len,
@@ -326,12 +372,13 @@ def test_rejects_fewer_than_128_query_rows(kv_lens, num_heads, q_len):
 # ``assert_plan_well_formed``.
 PLAN_EXPECTATIONS = [
     ("balanced", [256, 300], 6, 64, 148, None, True, (12, 1, 2, 1, None)),
-    ("balanced", [8192] * 4, 6, 64, 148, None, False, (168, 74, 148, 7, None)),
+    # cost-balanced partition: the optimum needs 72 of the 74 units
+    ("balanced", [8192] * 4, 6, 64, 148, None, False, (144, 72, 144, 6, None)),
     # contract row partial_pages_h8
     ("balanced", [1000, 8192, 5000], 6, 8, 148, None, True, (28, 14, 28, 8, None)),
     ("balanced", [131072, 64], 1, 64, 148, None, False, (76, 37, 74, 37, None)),
     # contract row bs32_q6_kv8k (auto -> balanced at the 8K threshold)
-    ("auto", [8192] * 32, 6, 64, 148, None, True, (336, 74, 148, 2, None)),
+    ("auto", [8192] * 32, 6, 64, 148, None, True, (324, 74, 148, 2, None)),
     ("uniform", [64, 4096], 6, 64, 148, 16, False, (18, 9, 18, 2, 16)),
     # contract row smoke, forced to two splits (tiles_per_split = ceil(3 / 2))
     ("auto", [256, 300], 6, 64, 148, 2, True, (18, 9, 18, 2, 2)),
@@ -378,12 +425,9 @@ def test_plan_geometry_and_invariants(
         assert plan.unit_first == tuple(range(0, plan.num_items + 1, CLUSTER_PAIR))
         assert all(it[4] - it[3] <= plan.tiles_per_split for it in plan.items)
     else:
-        assert plan.num_units <= num_sms // CLUSTER_PAIR
-        tiles = [
-            sum(it[4] - it[3] for it in plan.items[a:b])
-            for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
-        ]
-        assert max(tiles) - min(tiles) <= 2 * V_HALVES
+        assert_cost_balanced(
+            plan, kv_lens, q_len=q_len, num_heads=num_heads, num_sms=num_sms
+        )
 
 
 def test_balanced_units_are_contiguous_in_request_major_order():
@@ -487,11 +531,7 @@ def test_balanced_plan_covers_every_page_once(kv_lens, num_heads, num_sms):
     assert_plan_well_formed(
         plan, kv_lens, q_len=6, num_heads=num_heads, enable_sink=True
     )
-    pages = [
-        sum(it[4] - it[3] for it in plan.items[a:b])
-        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
-    ]
-    assert max(pages) - min(pages) <= 2
+    assert_cost_balanced(plan, kv_lens, q_len=6, num_heads=num_heads, num_sms=num_sms)
 
 
 def test_auto_schedule_threshold():

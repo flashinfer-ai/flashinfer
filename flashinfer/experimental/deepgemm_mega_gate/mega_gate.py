@@ -6,7 +6,8 @@
 
 One compiled program per physical schedule template (block tokens, MMA CTA
 pair, split-K, expert groups, pipeline stages, gate warpgroups, K-block
-merge, the single-token cluster-reduction route, the small-M idle L2 touch).
+merge, the single-token cluster-reduction route, the 2..4-token cluster-reduction
+route of SM100a, the small-M idle L2 touch).
 The token count, the SM-count-derived worker stride and the physical-map /
 logical-output flags are kernel arguments, so any token count is served: the
 DeepGEMM configuration for ``M`` is snapped onto the exported template set.
@@ -25,10 +26,10 @@ ROUTE_FLAG_UNMAPPED_OUTPUT = 2
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 PROGRAMS = {
-    "cake_deepgemm_mega_gate_03ec269c991bda293e41": {
+    "cake_deepgemm_mega_gate_094f5a3c7afdfc448778": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_03ec269c991bda293e41_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_03ec269c991bda293e41_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_094f5a3c7afdfc448778_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_094f5a3c7afdfc448778_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -62,10 +63,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_0efed871dc36b6202b4b": {
+    "cake_deepgemm_mega_gate_3561d17eaa3f4b261151": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_0efed871dc36b6202b4b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_0efed871dc36b6202b4b_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3561d17eaa3f4b261151_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3561d17eaa3f4b261151_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -99,10 +100,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_1ba724ffb65f5c8a34ac": {
+    "cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_1ba724ffb65f5c8a34ac_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_1ba724ffb65f5c8a34ac_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -136,10 +137,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_344eaed5f3cbdb26700d": {
+    "cake_deepgemm_mega_gate_443ee7219ad7504a35a0": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_344eaed5f3cbdb26700d_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_344eaed5f3cbdb26700d_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_443ee7219ad7504a35a0_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_443ee7219ad7504a35a0_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -173,10 +174,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_405f6008eb19d6cf4dca": {
+    "cake_deepgemm_mega_gate_882c44206a6ea3c085b4": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_405f6008eb19d6cf4dca_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_405f6008eb19d6cf4dca_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_882c44206a6ea3c085b4_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_882c44206a6ea3c085b4_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -210,10 +211,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_6443777451076c4eaabb": {
+    "cake_deepgemm_mega_gate_8b22b176f3db4b110d56": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_6443777451076c4eaabb_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_6443777451076c4eaabb_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8b22b176f3db4b110d56_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8b22b176f3db4b110d56_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -247,10 +248,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_72863ee40f5199dd111d": {
+    "cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_72863ee40f5199dd111d_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_72863ee40f5199dd111d_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -284,10 +285,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_9b3753d5dbc609dc49da": {
+    "cake_deepgemm_mega_gate_99c1c61a19e3d15ee143": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_9b3753d5dbc609dc49da_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_9b3753d5dbc609dc49da_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_99c1c61a19e3d15ee143_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_99c1c61a19e3d15ee143_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -321,10 +322,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_9eb0496be67a6aae1388": {
+    "cake_deepgemm_mega_gate_a8833c334d5a93ad889b": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_9eb0496be67a6aae1388_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_9eb0496be67a6aae1388_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_a8833c334d5a93ad889b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_a8833c334d5a93ad889b_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -358,10 +359,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_af3cc36d7d3167cc2d8b": {
+    "cake_deepgemm_mega_gate_ab8ab2e282f523349bbc": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_af3cc36d7d3167cc2d8b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_af3cc36d7d3167cc2d8b_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_ab8ab2e282f523349bbc_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_ab8ab2e282f523349bbc_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -395,10 +396,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_b5a62fb00848690ade55": {
+    "cake_deepgemm_mega_gate_aeda81f093c3fa7be274": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_b5a62fb00848690ade55_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_b5a62fb00848690ade55_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_aeda81f093c3fa7be274_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_aeda81f093c3fa7be274_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -432,10 +433,10 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a": {
+    "cake_deepgemm_mega_gate_c01e013d8fdd8e74134c": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c01e013d8fdd8e74134c_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c01e013d8fdd8e74134c_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -469,10 +470,84 @@ PROGRAMS = {
             ["grid", "grid_z"],
         ],
     },
-    "cake_deepgemm_mega_gate_cd6cb9119b40e8edd2fc": {
+    "cake_deepgemm_mega_gate_c58a40265fa9d7d03481": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_cd6cb9119b40e8edd2fc_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_cd6cb9119b40e8edd2fc_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c58a40265fa9d7d03481_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_c58a40265fa9d7d03481_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "X"],
+            ["tma_buffer", "W"],
+            ["buffer", "bias"],
+            ["buffer", "image_bias"],
+            ["buffer", "image_mask"],
+            ["buffer", "mask"],
+            ["buffer", "physical_map"],
+            ["buffer", "logical_count"],
+            ["buffer", "topk_idx"],
+            ["buffer", "unmapped_idx"],
+            ["buffer", "topk_weights"],
+            ["buffer", "scratch"],
+            ["buffer", "score_barriers"],
+            ["buffer", "fixed_mask"],
+            ["buffer", "random_mask"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_shared"],
+            ["parameter", "map_width"],
+            ["parameter", "ep_rank"],
+            ["parameter", "routed_scale"],
+            ["parameter", "unmapped_stride"],
+            ["parameter", "num_workers"],
+            ["parameter", "route_flags"],
+            ["parameter", "num_split_k"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+    },
+    "cake_deepgemm_mega_gate_f3a19a16a7987e71c969": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f3a19a16a7987e71c969_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f3a19a16a7987e71c969_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "X"],
+            ["tma_buffer", "W"],
+            ["buffer", "bias"],
+            ["buffer", "image_bias"],
+            ["buffer", "image_mask"],
+            ["buffer", "mask"],
+            ["buffer", "physical_map"],
+            ["buffer", "logical_count"],
+            ["buffer", "topk_idx"],
+            ["buffer", "unmapped_idx"],
+            ["buffer", "topk_weights"],
+            ["buffer", "scratch"],
+            ["buffer", "score_barriers"],
+            ["buffer", "fixed_mask"],
+            ["buffer", "random_mask"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_shared"],
+            ["parameter", "map_width"],
+            ["parameter", "ep_rank"],
+            ["parameter", "routed_scale"],
+            ["parameter", "unmapped_stride"],
+            ["parameter", "num_workers"],
+            ["parameter", "route_flags"],
+            ["parameter", "num_split_k"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+    },
+    "cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -513,7 +588,7 @@ TEMPLATES = (
     {
         "block_tokens": 16,
         "num_mma_ctas": 1,
-        "num_split_k": 8,
+        "num_split_k": 16,
         "num_expert_groups": 3,
         "num_stages": 12,
         "num_gate_warpgroups": 2,
@@ -523,7 +598,24 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76",
+    },
+    {
+        "block_tokens": 16,
+        "num_mma_ctas": 1,
+        "num_split_k": 16,
+        "num_expert_groups": 3,
+        "num_stages": 12,
+        "num_gate_warpgroups": 2,
+        "k_block_merge": 1,
+        "single_token": False,
+        "idle_touch": True,
+        "static_tokens": 0,
+        "static_route": -1,
+        "static_workers": 0,
+        "cluster_tokens": 4,
+        "program": "cake_deepgemm_mega_gate_99c1c61a19e3d15ee143",
     },
     {
         "block_tokens": 16,
@@ -538,7 +630,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_b5a62fb00848690ade55",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_aeda81f093c3fa7be274",
     },
     {
         "block_tokens": 16,
@@ -553,7 +646,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_03ec269c991bda293e41",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_f3a19a16a7987e71c969",
     },
     {
         "block_tokens": 32,
@@ -568,7 +662,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_9b3753d5dbc609dc49da",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_3561d17eaa3f4b261151",
     },
     {
         "block_tokens": 96,
@@ -583,7 +678,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_405f6008eb19d6cf4dca",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_882c44206a6ea3c085b4",
     },
     {
         "block_tokens": 176,
@@ -598,7 +694,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_af3cc36d7d3167cc2d8b",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_443ee7219ad7504a35a0",
     },
     {
         "block_tokens": 176,
@@ -613,7 +710,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_af3cc36d7d3167cc2d8b",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_443ee7219ad7504a35a0",
     },
     {
         "block_tokens": 176,
@@ -628,7 +726,8 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_1ba724ffb65f5c8a34ac",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_c58a40265fa9d7d03481",
     },
     {
         "block_tokens": 176,
@@ -643,12 +742,13 @@ TEMPLATES = (
         "static_tokens": 0,
         "static_route": -1,
         "static_workers": 0,
-        "program": "cake_deepgemm_mega_gate_cd6cb9119b40e8edd2fc",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_094f5a3c7afdfc448778",
     },
     {
         "block_tokens": 16,
         "num_mma_ctas": 1,
-        "num_split_k": 8,
+        "num_split_k": 16,
         "num_expert_groups": 3,
         "num_stages": 12,
         "num_gate_warpgroups": 2,
@@ -657,8 +757,25 @@ TEMPLATES = (
         "idle_touch": True,
         "static_tokens": 1,
         "static_route": 1,
-        "static_workers": 6,
-        "program": "cake_deepgemm_mega_gate_6443777451076c4eaabb",
+        "static_workers": 3,
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_f78ed5c2f5ea2b8989aa",
+    },
+    {
+        "block_tokens": 16,
+        "num_mma_ctas": 1,
+        "num_split_k": 16,
+        "num_expert_groups": 3,
+        "num_stages": 12,
+        "num_gate_warpgroups": 2,
+        "k_block_merge": 1,
+        "single_token": False,
+        "idle_touch": True,
+        "static_tokens": 4,
+        "static_route": 1,
+        "static_workers": 3,
+        "cluster_tokens": 4,
+        "program": "cake_deepgemm_mega_gate_8b22b176f3db4b110d56",
     },
     {
         "block_tokens": 16,
@@ -673,7 +790,8 @@ TEMPLATES = (
         "static_tokens": 16,
         "static_route": 1,
         "static_workers": 6,
-        "program": "cake_deepgemm_mega_gate_9eb0496be67a6aae1388",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_c01e013d8fdd8e74134c",
     },
     {
         "block_tokens": 16,
@@ -688,7 +806,8 @@ TEMPLATES = (
         "static_tokens": 16,
         "static_route": 2,
         "static_workers": 6,
-        "program": "cake_deepgemm_mega_gate_344eaed5f3cbdb26700d",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_a8833c334d5a93ad889b",
     },
     {
         "block_tokens": 32,
@@ -703,7 +822,8 @@ TEMPLATES = (
         "static_tokens": 128,
         "static_route": 1,
         "static_workers": 6,
-        "program": "cake_deepgemm_mega_gate_0efed871dc36b6202b4b",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_ab8ab2e282f523349bbc",
     },
     {
         "block_tokens": 96,
@@ -718,11 +838,12 @@ TEMPLATES = (
         "static_tokens": 512,
         "static_route": 1,
         "static_workers": 6,
-        "program": "cake_deepgemm_mega_gate_72863ee40f5199dd111d",
+        "cluster_tokens": 0,
+        "program": "cake_deepgemm_mega_gate_3ca2bfdfda45f81dad49",
     },
 )
 """Exported schedule templates (``block_tokens``, ``num_mma_ctas``, ``num_split_k``, ``num_expert_groups``,
-``num_stages``, ``num_gate_warpgroups``, ``k_block_merge``, ``single_token``, ``idle_touch``) and their program."""
+``num_stages``, ``num_gate_warpgroups``, ``k_block_merge``, ``single_token``, ``idle_touch``, ``cluster_tokens``) and their program."""
 
 
 def _ceildiv(a, b):
@@ -731,6 +852,18 @@ def _ceildiv(a, b):
 
 def _align(a, b):
     return _ceildiv(a, b) * b
+
+
+SMALL_M_CLUSTER_SPLIT16_ARCHES = ("sm_100a",)
+SMALL_M_CLUSTER_SPLIT16_MAX_TOKENS = 4
+
+
+def _small_m_cluster_split16(M, arch):
+    """The 2..4-token 16-split cluster route of the listed architectures."""
+    return (
+        1 < M <= SMALL_M_CLUSTER_SPLIT16_MAX_TOKENS
+        and arch in SMALL_M_CLUSTER_SPLIT16_ARCHES
+    )
 
 
 def deepgemm_config(
@@ -743,8 +876,10 @@ def deepgemm_config(
     has_image_bias=False,
     has_physical_map=True,
     deterministic=False,
+    arch=None,
 ):
-    """DeepGEMM's wave/tile/split-K selection and SMEM budget.
+    """DeepGEMM's wave/tile/split-K selection and SMEM budget, plus the single-tile 16-split routes (``arch`` = the
+    device architecture; only the 2..4-token route depends on it).
 
     Returns ``(block, ctas, split, groups, stages, warpgroups, launch_ctas, workers)``.
     """
@@ -816,6 +951,19 @@ def deepgemm_config(
     if not candidates:
         raise ValueError("Mega Gate has no configuration for the supplied SM count")
     _, groups, ctas, split, block, launch_ctas, workers, waves = min(candidates)
+    if (
+        (M == 1 or _small_m_cluster_split16(M, arch))
+        and not deterministic
+        and ctas == 1
+        and split == 8
+        and K % (16 * 64) == 0
+        and groups * 16 < 64
+        and groups * 16 <= num_sms
+    ):
+        # 16 K-splits on the single-tile small-M routes (the exported M == 1 and SM100a 2..4-token cluster programs).
+        split = 16
+        workers = num_sms // (groups * 16)
+        launch_ctas = min(workers, _ceildiv(M, block)) * groups * 16
     if deterministic:
         split = 1
         workers = launch_ctas // (groups * ctas)
@@ -838,8 +986,9 @@ def deepgemm_config(
     return block, ctas, split, groups, stages, warpgroups, launch_ctas, workers
 
 
-def _exact_template(cfg, M, K, E):
-    """The schedule levers of DeepGEMM configuration ``cfg`` resolved for ``M``: ``(merge, single_token, idle_touch)``."""
+def _exact_template(cfg, M, K, E, arch=None):
+    """The schedule levers of DeepGEMM configuration ``cfg`` resolved for ``M``: ``(merge, single_token, idle_touch,
+    cluster_tokens)``."""
     block, ctas, split, groups, stages, _warpgroups, _launch, workers = cfg
     em = _align(E, 128) // groups
     merge = (
@@ -858,8 +1007,18 @@ def _exact_template(cfg, M, K, E):
         and (K // 64 // split) % 2 == 0
     ):
         merge = 2
-    single_token = ctas == 1 and 1 < split <= 8 and M == 1 and split * em * 4 <= 8192
-    return merge, single_token, M <= 64
+    single_token = (
+        ctas == 1
+        and 1 < split <= 16
+        and M == 1
+        and (split * em * 4 <= 8192 or split > 8)
+    )
+    cluster_tokens = (
+        SMALL_M_CLUSTER_SPLIT16_MAX_TOKENS
+        if ctas == 1 and split == 16 and _small_m_cluster_split16(M, arch)
+        else 0
+    )
+    return merge, single_token, M <= 64, cluster_tokens
 
 
 def route_flags_for(has_physical_map, unmapped_output):
@@ -887,14 +1046,21 @@ def _schedule_axes(t):
             "k_block_merge",
             "single_token",
             "idle_touch",
+            "cluster_tokens",
         )
     )
 
 
 def select_template(
-    M, num_sms, *, has_physical_map=True, unmapped_output=False, deterministic=False
+    M,
+    num_sms,
+    *,
+    has_physical_map=True,
+    unmapped_output=False,
+    deterministic=False,
+    arch=None,
 ):
-    """``(template index, launch_ctas, num_workers)`` for ``M`` tokens on ``num_sms`` SMs.
+    """``(template index, launch_ctas, num_workers)`` for ``M`` tokens on ``num_sms`` SMs of ``arch``.
 
     The DeepGEMM block snaps to the smallest exported block >= it within the same (ctas, split, groups)
     family (the largest exported block when none is larger); the closest exported instance of that
@@ -904,10 +1070,18 @@ def select_template(
     """
     K, E = EXPORTED["K"], EXPORTED["E"]
     cfg = deepgemm_config(
-        M, K, E, num_sms, has_physical_map=has_physical_map, deterministic=deterministic
+        M,
+        K,
+        E,
+        num_sms,
+        has_physical_map=has_physical_map,
+        deterministic=deterministic,
+        arch=arch,
     )
     block, ctas, split, groups, exact_stages, exact_warpgroups, _launch, _workers = cfg
-    exact_merge, single_token, exact_touch = _exact_template(cfg, M, K, E)
+    exact_merge, single_token, exact_touch, cluster_tokens = _exact_template(
+        cfg, M, K, E, arch
+    )
     family = [
         i
         for i, t in enumerate(TEMPLATES)
@@ -915,11 +1089,12 @@ def select_template(
         and (t["num_mma_ctas"], t["num_split_k"], t["num_expert_groups"])
         == (ctas, split, groups)
         and t["single_token"] == single_token
+        and t["cluster_tokens"] == cluster_tokens
     ]
     if not family:
         raise NotImplementedError(
             f"no exported Mega Gate template for M={M} (DeepGEMM family ctas={ctas}, split={split}, "
-            f"groups={groups}, single_token={single_token})"
+            f"groups={groups}, single_token={single_token}, cluster_tokens={cluster_tokens})"
         )
     larger = [
         TEMPLATES[i]["block_tokens"]
@@ -930,7 +1105,9 @@ def select_template(
     pre = (
         cfg
         if not deterministic
-        else deepgemm_config(M, K, E, num_sms, has_physical_map=has_physical_map)
+        else deepgemm_config(
+            M, K, E, num_sms, has_physical_map=has_physical_map, arch=arch
+        )
     )
     task_ctas = pre[1] * groups * pre[2]
     workers = num_sms // task_ctas
@@ -1122,6 +1299,7 @@ class MegaGatePlan:
             has_physical_map=to_physical_map is not None,
             unmapped_output=unmapped_topk_idx is not None,
             deterministic=bool(deterministic),
+            arch=arch,
         )
         template = TEMPLATES[index]
         block_tokens, num_split_k = template["block_tokens"], template["num_split_k"]

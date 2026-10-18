@@ -525,9 +525,14 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
     // Preserve the public physical payload boundary through the inverse
     // combine: each owner stores one BF16/FP16 partial before the final
     // quantizer reads the byte-carried intermediate.
-    accumulationStorage =
-        alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
-    params.accumulation_data = accumulationStorage.data_ptr();
+    // The cake backend fuses the combine with block quantization for rows
+    // whose hidden size is a whole number of 32-column blocks and never
+    // writes the intermediate; see moe_a2a_combine_fuses_quantization.
+    if (!tl_throughput::moe_a2a_combine_fuses_quantization(params)) {
+      accumulationStorage =
+          alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
+      params.accumulation_data = accumulationStorage.data_ptr();
+    }
   } else if (useLowPrecision) {
     // Low-precision combine upcasts the FP8 recv buffers to a BF16 output; no output scales.
     TVM_FFI_ICHECK(output.dtype() == dl_bfloat16)

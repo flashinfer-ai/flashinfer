@@ -1,13 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""MXFP4-weight specialization of the shared MXFP8-activation FMA kernels."""
+"""Compatibility import for flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4.fma (one release)."""
 
-from functools import partial
+from importlib import import_module
+import sys
 
-from ..mxfp8 import fma as common
-
-_TAG = "cudnn_frost-mxfp8_mxfp4-fma-v1"
-supported = common.supported
-check_support = common.check_support
-source_digest = partial(common.source_digest, mixed=True)
-tactic = partial(common.tactic, mixed=True)
-build = partial(common.build, mixed=True)
+sys.modules[__name__] = import_module(
+    "flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4.fma"
+)

@@ -1261,8 +1261,6 @@ def _row_plan(
             state["table"] = _aligned_page_table(
                 block_tables, row_batches, row_seq_lens, page_size
             )
-        elif domain == DOMAIN_FP8_PAGE64:
-            state["last_kv"] = row_seq_lens - 1
         elif topk > 0:
             state["row_seq_lens"] = torch.full_like(row_seq_lens, topk)
         return state
@@ -1648,7 +1646,7 @@ def trtllm_mla_blackwell_decode(
             kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
             out.reshape(-1, _ALIGNED_VALUE_DIM),
             state["lse"],
-            plan["last_kv"],
+            plan["row_seq_lens"],
             row_batches,
             block_tables.reshape(-1),
             state["partial_output"],

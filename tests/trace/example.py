@@ -27,12 +27,17 @@ dsv41_fp8_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp8_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
 dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
+gated_residual_rmsnorm_h8192.json
+gated_residual_next_rmsnorm_h8192.json
+gated_residual_next_rmsnorm_scalar_alpha_h8192.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
+gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
+gdn_prefill_gates_q4_k4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -117,12 +122,15 @@ prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
+rmsnorm_sigmoid_gate_nh32_h64.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
+top_k_varlen_n4096_k512.json
+top_k_varlen_n8192_k1024.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
@@ -132,6 +140,10 @@ trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
+moe_layer_cudnn_frost_bf16.json
+moe_layer_cudnn_frost_mxfp8.json
+moe_layer_cudnn_frost_nvfp4.json
+moe_layer_cudnn_frost_mxfp8_mxfp4.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -142,6 +154,7 @@ dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 
 import contextlib
@@ -194,6 +207,10 @@ from flashinfer.prefill import (
     fmha_v2_prefill_sm120,
 )
 from flashinfer.utils import is_sm100a_supported
+from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
+
+# Public MoELayer pack schemas, including all four Frost quantization formats.
+generate_moe_layer_traces(SAVE_DIR)
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
@@ -295,6 +312,40 @@ x = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 res = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 w = torch.ones(5120, dtype=torch.bfloat16, device=device)
 flashinfer.fused_add_rmsnorm(x, res, w)
+
+# ── fused gated normalization (SM103) ──────────────────────────────
+if torch.cuda.get_device_capability() == (10, 3):
+    gated_h = 8192
+    gated_branch = torch.randn(8, gated_h, dtype=torch.bfloat16, device=device)
+    gated_residual = torch.randn(8, gated_h, dtype=torch.float32, device=device)
+    gated_weight = torch.randn(gated_h, dtype=torch.bfloat16, device=device)
+    gated_alpha = torch.randn(gated_h, dtype=torch.float32, device=device)
+    gated_beta = torch.randn(gated_h, dtype=torch.float32, device=device)
+    flashinfer.norm.gated_residual_rmsnorm(
+        gated_branch,
+        gated_residual,
+        gated_weight,
+        gated_alpha,
+        gated_beta,
+        1e-6,
+    )
+    for alpha in (gated_alpha, 1.0):
+        flashinfer.norm.gated_residual_next_rmsnorm(
+            gated_branch,
+            gated_residual,
+            gated_weight,
+            alpha,
+            gated_beta,
+            post_eps=1e-8,
+            next_eps=1e-5,
+            next_gain_center=1.0,
+            post_weight=gated_weight,
+            post_gain_center=1.0,
+        )
+
+    gate_input = torch.randn(8, 32, 64, dtype=torch.bfloat16, device=device)
+    gate = torch.randn_like(gate_input)
+    flashinfer.norm.rmsnorm_sigmoid_gate(gate_input, gate)
 
 # ── rmsnorm_quant + fused_add_rmsnorm_quant (DeepSeek-V3 down-proj, h=7168) ──
 # Quantize to FP8 E4M3 after normalization; scale is per-tensor.
@@ -1053,6 +1104,15 @@ with contextlib.suppress(Exception):
         gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
     )
 
+# ── GDN raw gate fusion (trace-only; no optional cuDNN dependency) ───────────
+from flashinfer.trace.templates.gdn import gdn_prefill_trace
+
+flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
+    **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
+    backend="cudnn",
+    save_dir=SAVE_DIR,
+)
+
 # ── GDN-2 prefill (channel-wise gates, chunk prefill) ────────────────────────
 with contextlib.suppress(Exception):
     import flashinfer.gdn2_prefill  # noqa: PLC0415
@@ -1124,6 +1184,14 @@ b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
+
+# ── ReplaySSM accepted-prefix commit (SM100/SM103) ────────────────────────
+if torch.cuda.get_device_capability()[0] == 10:
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    flashinfer.gdn_decode.gated_delta_rule_replayssm_commit(
+        **gdn_replayssm_commit_trace.init(device=device)
+    )
 
 # ── GDN fused decode step (the registry's SM120 geometry, TP=1) ──────────────
 # Suppressed like the other optional-dependency examples: on a non-SM120 card
@@ -1270,45 +1338,57 @@ flashinfer.kda_decode.fused_kda_decode(
 )
 
 # ── packed fused Kimi K3 speculative decode (conv + KDA + gated RMSNorm) ────
-fkp_N, fkp_T = 2, 3
-fkp_rows = fkp_N * fkp_T
-fkp_slots = fkp_rows + 1
-fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
-fkp_conv_storage = torch.zeros(
-    fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
-)
-fkp_conv_state = fkp_conv_storage.transpose(1, 2)
-fkp_raw_gate = torch.randn(1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
-fkp_indices = torch.arange(fkp_rows, 0, -1, dtype=torch.int32, device=device).reshape(
-    fkp_N, fkp_T
-)
-fkp_query_start = torch.arange(0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device)
-fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
-fkp_state = torch.zeros(fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
-fkp_output_gate = torch.randn(fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-flashinfer.kda_decode.packed_fused_kda_decode(
-    fkp_x,
-    fk_weight,
-    fkp_conv_state,
-    fkp_raw_gate,
-    fkp_raw_beta,
-    fk_A_log,
-    fk_dt_bias,
-    fkp_indices,
-    fkp_state,
-    fkp_output_gate,
-    fk_norm_weight,
-    query_start_loc=fkp_query_start,
-    num_accepted_tokens=fkp_accepted,
-)
+# T>1 packed decode is SM10x-only.
+if torch.cuda.get_device_capability(device)[0] == 10:
+    fkp_N, fkp_T = 2, 3
+    fkp_rows = fkp_N * fkp_T
+    fkp_slots = fkp_rows + 1
+    fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+    fkp_conv_storage = torch.zeros(
+        fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
+    )
+    fkp_conv_state = fkp_conv_storage.transpose(1, 2)
+    fkp_raw_gate = torch.randn(
+        1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
+    )
+    fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
+    fkp_indices = torch.arange(
+        fkp_rows, 0, -1, dtype=torch.int32, device=device
+    ).reshape(fkp_N, fkp_T)
+    fkp_query_start = torch.arange(
+        0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device
+    )
+    fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
+    fkp_state = torch.zeros(
+        fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device
+    )
+    fkp_output_gate = torch.randn(
+        fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device
+    )
+    flashinfer.kda_decode.packed_fused_kda_decode(
+        fkp_x,
+        fk_weight,
+        fkp_conv_state,
+        fkp_raw_gate,
+        fkp_raw_beta,
+        fk_A_log,
+        fk_dt_bias,
+        fkp_indices,
+        fkp_state,
+        fkp_output_gate,
+        fk_norm_weight,
+        query_start_loc=fkp_query_start,
+        num_accepted_tokens=fkp_accepted,
+    )
+else:
+    print("Skipping packed fused KDA example: requires SM10x")
 
 # ── AlphaMoE fused router (SM100/SM103) ──────────────────────────────────────
 _alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
 _alpha_router_cc = torch.cuda.get_device_capability(device)
 if (
     _alpha_router_cc in {(10, 0), (10, 3)}
-    and is_sm100a_supported(device)
+    and is_sm100a_supported(torch.device(device))
     and is_cuda_version_at_least("12.9" if _alpha_router_cc == (10, 3) else "12.8")
 ):
     flashinfer.fused_moe.alphamoe_fused_router(
@@ -2598,6 +2678,15 @@ with contextlib.suppress(Exception):
     _cmk_k_rope = torch.randn(_cmk_T, 1, _cmk_rope, dtype=torch.bfloat16, device=device)
     _concat_mla_k(_cmk_k, _cmk_k_nope, _cmk_k_rope)
 
+# concat_mla_kv_quant_fp8 (MLA context K/V pack + fp8 cast, 12 local heads).
+with contextlib.suppress(Exception):
+    from flashinfer import concat_mla_kv_quant_fp8 as _concat_mla_kv_quant_fp8
+
+    _ckv_T, _ckv_H = 2048, 12
+    _ckv_kv_nope = torch.randn(_ckv_T, _ckv_H, 256, dtype=torch.bfloat16, device=device)
+    _ckv_k_pe = torch.randn(_ckv_T, 64, dtype=torch.bfloat16, device=device)
+    _concat_mla_kv_quant_fp8(_ckv_kv_nope, _ckv_k_pe)
+
 # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
 with contextlib.suppress(Exception):
     import math as _math2
@@ -2935,3 +3024,41 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# ── top_k_varlen (DeepSeek sparse-attention indexer top-k) ─────────────────
+# decode shape: one row per request, per-request lengths; the radix_cutlass
+# backend runs on any GPU -> top_k_varlen_n8192_k1024.json
+from flashinfer.trace.templates.topk import top_k_varlen_trace as _tkv_trace
+
+_tkv_in = _tkv_trace.init(batch_size=32, max_seq_len=8192, top_k=1024, device=device)
+flashinfer.top_k_varlen(**_tkv_in)
+
+# windowed (prefill) shape: one row per prompt token, every request's keys
+# packed along the column axis, row r ranks [row_starts[r], row_starts[r] +
+# seq_lens[r]) and returns absolute columns; served by the gvr_2 engines
+# (SM100/SM103/SM107) -> top_k_varlen_n4096_k512.json
+_tkv_cc = torch.cuda.get_device_capability()
+if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _tkv_cc[0] * 10 + _tkv_cc[1]):
+    _tkv_R, _tkv_L = 2, 2048  # two 2048-token prompts
+    _tkv_logits = torch.randn(
+        _tkv_R * _tkv_L, _tkv_R * _tkv_L, dtype=torch.float32, device=device
+    )
+    _tkv_starts = torch.tensor(
+        [(r * _tkv_L) for r in range(_tkv_R) for _ in range(_tkv_L)],
+        dtype=torch.int32,
+        device=device,
+    )
+    _tkv_lens = torch.tensor(
+        [i + 1 for _ in range(_tkv_R) for i in range(_tkv_L)],
+        dtype=torch.int32,
+        device=device,
+    )
+    flashinfer.top_k_varlen(
+        _tkv_logits,
+        _tkv_lens,
+        512,
+        row_starts=_tkv_starts,
+        max_window_len=_tkv_L,
+        absolute_indices=True,
+        backend="gvr_2",
+    )

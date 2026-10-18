@@ -38,7 +38,9 @@ norm PDL trigger) are re-implemented here byte-for-byte from the Cake modules
 through a logical key resolved in ``cake_jit.KERNELS``.  Weights are read in
 the model layout (``nn.Linear`` ``[out, in]`` BF16); nothing is copied or
 packed and nothing is allocated at launch, so a prepared runner is CUDA Graph
-safe.  See ``README.md`` in this package.
+safe.  Every plan is derived from the device's own SM count (``QUALIFIED_SM_COUNTS``
+names the physical counts the programs are qualified on; other counts are refused).
+See ``README.md`` in this package.
 """
 
 from __future__ import annotations
@@ -64,9 +66,16 @@ SHARED_INTERMEDIATE = 6144
 RMS_EPS = 1.0e-5
 SUPPORTED_TP = (1, 8)
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-#: SM count the plan rules were frozen with (B200 and B300 both expose 148 SMs);
-#: ``prepare_*`` refuses a device with another count.
+#: Reference SM count of the frozen plan rules (B200 and B300 expose 148 SMs): the default
+#: argument of the host planners when no device is given (CPU callers, ``required_kernel_keys``).
 SM_COUNT = 148
+#: Physical SM counts the programs are qualified on: 148 (B200, B300) and 152 (GB200, GB300).
+#: ``prepare_*`` plans every route from the device's ``multi_processor_count`` -- the decode
+#: grids are tile-bound (94 / 112 / 131 co-resident CTAs on either count) and the prefill plans
+#: pass their resident-pair windows (``num_items`` / ``sk_*``) as runtime arguments -- and admits
+#: only these counts: the decode programs need every CTA of their grid resident and the stream-K
+#: windows were validated on these parts only (README, "Tested physical configurations").
+QUALIFIED_SM_COUNTS = (148, 152)
 #: Largest token count served by the decode (weight-streaming) kernels.
 DECODE_MAX_T = 128
 #: Token counts of the validated route set (both stages, TP 1 and 8).
@@ -473,6 +482,9 @@ MAX_SEG = 4
 SK_MIN_NUM_K = 64
 SK_MIN_ITERS = 32
 SK_FIXUP_ITERS = 12
+SK_MIN_SAVING_ITERS = (
+    32  # a stream-K cut must undercut the whole-tile plan by this many K iterations
+)
 SK_MIN_REUSE_ROWS = 8
 SK_PARTIAL_REUSE_MAX_REM_PCT = 55
 
@@ -713,12 +725,14 @@ def _sk_max_seg(sk_tiles: int, num_k: int, ipc: int) -> int:
 def split_plan(
     cluster_tiles: int, num_k: int, sm_count: int, reuse_rows: int = 1
 ) -> dict[str, int]:
-    """Persistent plan: whole pair tiles for the full waves, a stream-K trailing wave when it wins."""
+    """Persistent plan: whole pair tiles for the full waves, a stream-K trailing wave when it wins by at least
+    ``SK_MIN_SAVING_ITERS`` (mirror of the Cake tail module's ``split_plan``; a near-whole remainder wave is not cut)."""
     resident = max(1, sm_count // CTA_GROUP)
     full = (cluster_tiles // resident) * resident
     rem = cluster_tiles - full
     waves = (cluster_tiles + resident - 1) // resident
-    best_cost = float(waves * num_k)
+    whole_cost = float(waves * num_k)
+    best_cost = whole_cost
     plan = {
         "num_items": cluster_tiles,
         "full_items": cluster_tiles,
@@ -750,7 +764,7 @@ def split_plan(
             if max_seg > MAX_SEG:
                 continue
             cost = (full_i // resident) * num_k + ipc + SK_FIXUP_ITERS * (max_seg - 1)
-            if cost < best_cost:
+            if cost < best_cost and cost <= whole_cost - SK_MIN_SAVING_ITERS:
                 best_cost = cost
                 plan = {
                     "num_items": full_i + g2,
@@ -830,13 +844,21 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
 
 
 def route_kernel_keys(
-    stage: str, tp: int, num_tokens: int, sm_count: int = SM_COUNT
+    stage: str,
+    tp: int,
+    num_tokens: int,
+    sm_count: int = SM_COUNT,
+    num_partials: int = 1,
 ) -> tuple[str, ...]:
-    """Logical kernel keys launched by the production route of ``(stage, tp, num_tokens)``."""
+    """Logical kernel keys launched by the production route of ``(stage, tp, num_tokens)`` on a
+    ``sm_count``-SM device; ``num_partials`` is the tail's routed-partial count ``P`` (the decode
+    tail instance depends on it; the front and the prefill tail do not)."""
     if tp not in SUPPORTED_TP:
         raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
     if num_tokens < 1:
         raise ValueError("num_tokens must be positive")
+    if int(num_partials) < 1:
+        raise ValueError("num_partials must be positive")
     i_local = i_local_for_tp(tp)
     if stage == "front":
         if num_tokens <= DECODE_MAX_T:
@@ -848,7 +870,9 @@ def route_kernel_keys(
         if num_tokens <= DECODE_MAX_T:
             return (
                 decode_kernel_key(
-                    decode_tail_plan(num_tokens, i_local, tp, 1, sm_count)
+                    decode_tail_plan(
+                        num_tokens, i_local, tp, int(num_partials), sm_count
+                    )
                 ),
             )
         plan = prefill_tail_plan(num_tokens, tp, sm_count)
@@ -902,16 +926,22 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def _check_sm_count(device: torch.device) -> int:
-    """The decode grids and the stream-K plans are compiled for ``SM_COUNT`` SMs (the plan is part of
-    the kernel symbol); a device with another count has no registered instance."""
+def _device_sm_count(device: torch.device) -> tuple[int, int]:
+    """``(device index, SM count)`` of a qualified device.
+
+    The plans are derived from the device's own SM count; a count outside
+    ``QUALIFIED_SM_COUNTS`` is refused rather than planned (the decode programs rely on
+    every CTA of their grid being resident and the plan rules were validated on the
+    qualified parts only).
+    """
     index = _device_index(device)
     _, count = _device_facts(index)
-    if count != SM_COUNT:
+    if count not in QUALIFIED_SM_COUNTS:
         raise NotImplementedError(
-            f"the generated programs are planned for {SM_COUNT} SMs; device {index} has {count}"
+            f"the generated Kimi-K3 LatentMoE programs are qualified for devices with "
+            f"{' / '.join(map(str, QUALIFIED_SM_COUNTS))} SMs; device {index} has {count}"
         )
-    return index
+    return index, count
 
 
 def generated_program_available(
@@ -919,18 +949,26 @@ def generated_program_available(
     stage: Optional[str] = None,
     tp: Optional[int] = None,
     num_tokens: Optional[int] = None,
+    num_partials: int = 1,
 ) -> bool:
-    """True when this checkout registers the programs for ``device`` (optionally: one exact route)."""
+    """True when this checkout registers the programs for ``device`` (optionally: one exact route).
+
+    The route is resolved with the device's SM count and, for the tail, the caller's
+    routed-partial count ``num_partials`` (the decode tail instance depends on it), so the
+    answer is exactly what ``prepare_kimi_k3_latent_moe_*`` would require.
+    """
     capability, count = _device_facts(_device_index(device))
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
-    if arch is None or not MODULES or count != SM_COUNT:
+    if arch is None or not MODULES or count not in QUALIFIED_SM_COUNTS:
         return False
     if stage is None and tp is None and num_tokens is None:
-        return cake_jit.route_available(arch, required_kernel_keys())
+        return cake_jit.route_available(arch, required_kernel_keys(count))
     if stage is None or tp is None or num_tokens is None:
         raise ValueError("pass stage, tp and num_tokens together or none of them")
     try:
-        keys = route_kernel_keys(stage, int(tp), int(num_tokens))
+        keys = route_kernel_keys(
+            stage, int(tp), int(num_tokens), count, int(num_partials)
+        )
     except ValueError:
         return False
     return cake_jit.route_available(arch, keys)
@@ -1064,6 +1102,7 @@ class KimiK3LatentMoeRunner:
     rank: int
     num_tokens: int
     arch: str
+    sm_count: int  # SM count of the device the plan was derived for
     route: str  # "decode" or "prefill"
     plan: dict[str, Any] = field(repr=False)
     launches: tuple[_Launch, ...] = field(repr=False)
@@ -1164,12 +1203,12 @@ def prepare_kimi_k3_latent_moe_front(
         )
     )
     arch = _device_arch(device)
-    index = _check_sm_count(device)
+    index, sm_count = _device_sm_count(device)
     launches: tuple[_Launch, ...]
     plan: dict[str, Any]
     with torch.cuda.device(index):
         if T <= DECODE_MAX_T:
-            plan = decode_front_plan(T, i_local)
+            plan = decode_front_plan(T, i_local, sm_count)
             key = decode_kernel_key(plan)
             f32_dummy, counters, tl = _scratch(device)
             kwargs = dict(
@@ -1199,7 +1238,7 @@ def prepare_kimi_k3_latent_moe_front(
             launches = (_Launch("front_decode", key, module, kwargs, entry, arguments),)
             route = "decode"
         else:
-            plan = prefill_front_plan(T, i_local)
+            plan = prefill_front_plan(T, i_local, sm_count)
             key = front_kernel_key(i_local, plan["evict_first"])
             ws, counters = _front_workspace(
                 device, plan["sk_tiles"], plan["sk_max_seg"]
@@ -1229,7 +1268,16 @@ def prepare_kimi_k3_latent_moe_front(
             launches = (_Launch("front_gemm", key, module, kwargs, entry, arguments),)
             route = "prefill"
     return KimiK3LatentMoeRunner(
-        "front", tp, 0, T, arch, route, plan, launches, (logits, latent, shared_act)
+        "front",
+        tp,
+        0,
+        T,
+        arch,
+        sm_count,
+        route,
+        plan,
+        launches,
+        (logits, latent, shared_act),
     )
 
 
@@ -1301,12 +1349,12 @@ def prepare_kimi_k3_latent_moe_tail(
         )
     )
     arch = _device_arch(device)
-    index = _check_sm_count(device)
+    index, sm_count = _device_sm_count(device)
     launches: tuple[_Launch, ...]
     plan: dict[str, Any]
     with torch.cuda.device(index):
         if T <= DECODE_MAX_T:
-            plan = decode_tail_plan(T, i_local, tp, P)
+            plan = decode_tail_plan(T, i_local, tp, P, sm_count)
             key = decode_kernel_key(plan)
             f32_dummy, counters, tl = _scratch(device)
             kwargs = dict(
@@ -1338,7 +1386,7 @@ def prepare_kimi_k3_latent_moe_tail(
             )
             route = "decode"
         else:
-            plan = prefill_tail_plan(T, tp)
+            plan = prefill_tail_plan(T, tp, sm_count)
             ws, counters, norm_counter = _tail_workspace(
                 device, plan["sk_tiles"], plan["sk_max_seg"], plan["block_n"]
             )
@@ -1420,7 +1468,7 @@ def prepare_kimi_k3_latent_moe_tail(
                 )
             route = "prefill"
     return KimiK3LatentMoeRunner(
-        "tail", tp, rank, T, arch, route, plan, launches, (y_workspace, out)
+        "tail", tp, rank, T, arch, sm_count, route, plan, launches, (y_workspace, out)
     )
 
 
@@ -1460,6 +1508,7 @@ __all__ = [
     "ROW_TOKENS",
     "SHARED_INTERMEDIATE",
     "SM_COUNT",
+    "QUALIFIED_SM_COUNTS",
     "TAIL_ROWS_STAGGER",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "SUPPORTED_TP",

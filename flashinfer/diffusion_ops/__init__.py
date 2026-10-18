@@ -28,6 +28,13 @@ from .minimax_h3_out_proj import (
     prepare_minimax_h3_o_weight_mxfp8,
     prepare_minimax_h3_o_weight_nvfp4,
 )
+from .minimax_h3_mlp import (
+    minimax_h3_mlp,
+    minimax_h3_mlp_mxfp8,
+    minimax_h3_mlp_nvfp4,
+    prepare_minimax_h3_fc2_weight_mxfp8,
+    prepare_minimax_h3_fc2_weight_nvfp4,
+)
 from .cake_minimax_h3_sm120_quant_pre_attention import (
     MiniMaxH3PreAttentionOutput,
     minimax_h3_fp8_pre_attention,
@@ -38,6 +45,12 @@ from .cake_minimax_h3_sm120_quant_pre_attention import (
 from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
     minimax_h3_fc1_swiglu_fp8,
     prepare_minimax_h3_fc1_weight_fp8,
+)
+from .cake_minimax_h3_sm120_quant_mlp import (
+    minimax_h3_mlp_fp8_sm120,
+    minimax_h3_mlp_nvfp4_sm120,
+    prepare_minimax_h3_fc2_weight_fp8,
+    prepare_minimax_h3_fc2_weight_nvfp4_sm120,
 )
 
 from .cake_minimax_h3_sm120_quant_out_proj import (
@@ -70,6 +83,10 @@ __all__ = [
     "minimax_h3_fc1_swiglu",
     "minimax_h3_fc1_swiglu_fp8",
     "minimax_h3_fc1_swiglu_mxfp8",
+    "minimax_h3_mlp_fp8_sm120",
+    "minimax_h3_mlp_nvfp4_sm120",
+    "prepare_minimax_h3_fc2_weight_fp8",
+    "prepare_minimax_h3_fc2_weight_nvfp4_sm120",
     "minimax_h3_fc1_swiglu_nvfp4",
     "prepare_minimax_h3_fc1_weight_fp8",
     "prepare_minimax_h3_fc1_weight_mxfp8",
@@ -80,6 +97,11 @@ __all__ = [
     "minimax_h3_out_proj_reference",
     "prepare_minimax_h3_o_weight_mxfp8",
     "prepare_minimax_h3_o_weight_nvfp4",
+    "minimax_h3_mlp",
+    "minimax_h3_mlp_mxfp8",
+    "minimax_h3_mlp_nvfp4",
+    "prepare_minimax_h3_fc2_weight_mxfp8",
+    "prepare_minimax_h3_fc2_weight_nvfp4",
     "MiniMaxH3PreAttentionOutput",
     "minimax_h3_fp8_pre_attention",
     "minimax_h3_nvfp4_pre_attention",
