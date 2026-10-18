@@ -23,7 +23,7 @@ import shutil
 import subprocess
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Tuple
 
@@ -37,8 +37,15 @@ _CHUNK_SIZE = 128
 _HEADDIM = 64
 _DSTATE = 128
 
-_TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+_TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 _ARCH_CAPABILITIES = {arch: capability for capability, arch in _TARGET_ARCHS.items()}
+# The Rubin target (capability (10, 7)): its main kernels are separate device
+# modules (``_SM107_MODULES``, looked up by :func:`_main_module`) and its
+# routing is SM103's (``_ONE_LAUNCH_CAPABILITIES``: the seq_idx triple form
+# without a caller table runs the one-launch ``exactone_*`` render, which
+# derives the sequence table in-kernel; the fused varlen calls with one run
+# the ``exactfused_*`` render, as on SM103).
+_SM107_ARCH = "sm_107a"
 _DEVICE_DIR = Path("generated") / "device"
 # Prepared two-launch host launchers, one per kernel family: the same nine
 # ``CAKE_SSD_*`` placeholders and namespace scheme; the look-back chunk-parallel
@@ -105,10 +112,11 @@ class _Program:
     metadata), ``exactmeta`` (the same fused scan behind the light
     packed-varlen metadata kernel, which publishes ``seq_chunk_cumsum`` from
     the seq_idx triple in place of the full preprocess: the triple form
-    without a trusted caller table on SM100, two launches), ``exactone`` (the
-    SM103 render of the fused scan whose CTA prologue derives that table
-    itself into its private row of the ``seq_chunk_cumsum`` scratch: the
-    same form on SM103, one launch, the stage skipped with a grid of 0),
+    without a trusted caller table on SM100, two launches),
+    ``exactone`` (the SM103 / SM107 render of the fused scan whose CTA
+    prologue derives that table itself into its private row of the
+    ``seq_chunk_cumsum`` scratch: the same form on SM103 and SM107, one
+    launch, the stage skipped with a grid of 0),
     ``exactpre`` (the same persistent scan reading the delta /
     cumsum its preprocess wrote to the HBM workspace: the start two-launch
     form, same main arguments, with the round-6 state update), ``exact`` (the
@@ -151,8 +159,9 @@ class _Program:
 # metadata kernel: the fused exact scan (``exactfused_*``: delta / cumsum
 # computed in-CTA, one launch), the same fused scan behind the metadata kernel
 # (``exactmeta_*``: the seq_idx triple form deriving ``seq_chunk_cumsum`` on
-# SM100, two launches), the SM103 fused scan deriving that table in its CTA
-# prologue (``exactone_*``: the same form on SM103, one launch), the
+# SM100, two launches), the SM103 / SM107 fused scan deriving that table in
+# its CTA prologue (``exactone_*``: the same form on SM103 and SM107, one
+# launch), the
 # two-kernel exact scan (``exactpre_*``: the start pre+scan
 # form with the round-6 single-rounding state update, which the fused route
 # keeps for saturated / long-item calls, see :func:`fused_selected`), the
@@ -259,6 +268,8 @@ _EXACTMETA_MODULES = {
 # derives the sequence table of the seq_idx triple form itself, so no stage
 # runs ahead of it -- with their own device sources (the ``exactfused_*``
 # varlen programs keep the SM100 render) behind the fused host template.
+# SM107 ships the same one-launch form beside its ``exactfused_*`` varlen
+# render: its sources are the ``exactone_*`` entries of ``_SM107_MODULES``.
 # Refreshed by the Cake export; seed identities until it fills them.
 _EXACTONE_MODULES = {
     "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_22b56edf7a",
@@ -267,6 +278,74 @@ _EXACTONE_MODULES = {
     "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0ea2f04df1",
     "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_c99424e391",
     "exactone_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_0bf916128c",
+}
+# sm_107a (Rubin) device modules of the exported programs, filled by the Cake
+# export: the tcgen05 SMEM descriptor address field is 15 bits on sm_107a
+# (mask 0x7FFF), so every main program's device text differs from the
+# Blackwell fold; the loader builds these modules for capability (10, 7)
+# (:func:`_main_module`).  Programs absent here -- the retained start
+# ``exact_*`` programs -- build their fold module; the preprocess and
+# metadata kernels are shared.  A fused varlen suffix has two sm_107a
+# sources, as SM103 has two texts: the ``exactfused_*`` varlen entry names
+# the render of the SM100 form (the caller-table and cu_seqlens forms) and
+# the ``exactone_*`` entry the one-launch render, which derives the sequence
+# table in-kernel; an ``exactmeta_*`` entry always equals its ``exactfused_*``
+# varlen twin.
+_SM107_MODULES = {
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f13183e6a1",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_4b3914f176",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7fb91bb6f2",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_1bc323f61f",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8ed847c643",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_3dc3d34077",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_beaa6c0634",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_1f7505eacf",
+    "exactfused_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_c61e499476",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_0dbe1ddb35",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_73e1fa1e8b",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_bba26a1e7b",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_4a41373610",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_5394d76cd0",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_4248999288",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_cb5e8e04f4",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_7477f7179b",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_c2308748ef",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_8d7007b9c3",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_88a1af468a",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_bd9b159b8f",
+    "exactpre_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_noring_ef4419d019",
+    "exactpre_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_noring_f182206344",
+    "exactpre_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_noring_76185a69db",
+    "exactpre_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring_fa67078da3",
+    "exactpre_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_noring_0f9eff4d4d",
+    "exactpre_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_noring_efdbde0ea8",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_79a1e86066",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_f2b8226a51",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_80dd0f122a",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_fcce4c4920",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_911ae0f1c3",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_17781c9d04",
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_2905988f95",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_01a42c5976",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_617667906e",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_c710487fff",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_796c446558",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_95d4c416ce",
+    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
+    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7fb91bb6f2",
+    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8ed847c643",
+    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
+    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
+    "exactmeta_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_c61e499476",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a536b8b6e8",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6103de117",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_539c003e6b",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_b68ce1e618",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_f2717ae6c0",
+    "exactone_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_ba9a2a6782",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -672,12 +751,37 @@ def _program_name(
     return f"{family}_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}{suffix}"
 
 
-def _require_exported(name: str, program: _Program) -> None:
-    """Refuse a program whose table entries the Cake export has not filled."""
+def _main_module(name: str, arch: str) -> str:
+    """The main-kernel module program ``name`` builds for ``arch``: its
+    ``_SM107_MODULES`` entry on sm_107a where the table has one, else the
+    program's fold module."""
+
+    module = _PROGRAMS[name].main.module
+    if arch == _SM107_ARCH:
+        return _SM107_MODULES.get(name, module)
+    return module
+
+
+def _arch_program(name: str, arch: str) -> _Program:
+    """Program ``name`` as built for ``arch``: the table binding with its main
+    kernel rebound to :func:`_main_module` (the same symbol, thread count and
+    build flags; only the module identity, hence the device source, differs)."""
+
+    program = _PROGRAMS[name]
+    module = _main_module(name, arch)
+    if module == program.main.module:
+        return program
+    return replace(program, main=_scan(module))
+
+
+def _require_exported(name: str, program: _Program, arch: str = "") -> None:
+    """Refuse a program whose table entries the Cake export has not filled;
+    ``arch`` names the architecture whose main module was looked up."""
 
     if _PENDING_EXPORT in program.main.module or program.main_smem_bytes <= 0:
+        target = f" for {arch}" if arch else ""
         raise RuntimeError(
-            f"Cake SSDCombined program {name} is not exported yet (main module "
+            f"Cake SSDCombined program {name}{target} is not exported yet (main module "
             f"{program.main.module!r}, main dynamic shared memory "
             f"{program.main_smem_bytes} bytes): run the Cake export "
             "(tools/export_cake_mamba_ssd_combined.py with the chunk-parallel "
@@ -871,8 +975,16 @@ _CHUNK_PARALLEL_COST_MODEL_US = {
         "cp_fixed": 21.6,
         "cp_per_tile": 0.0459,
     },
+    (10, 7): {  # Rubin, sm_107a (212 SMs); calibrated on the same 24-cell
+        # protocol as the Blackwell rows (main-kernel medians, cold L2).
+        "serial_fixed": 4.07,
+        "serial_per_chunk_small": 1.841,
+        "serial_per_chunk_large": 1.962,
+        "cp_fixed": 20.0,
+        "cp_per_tile": 0.0302,
+    },
 }
-# Unmeasured capabilities use the B200 constants.
+# Capabilities without a calibrated row use the B200 constants.
 _CHUNK_PARALLEL_COST_MODEL_DEFAULT = (10, 0)
 _CHUNK_PARALLEL_SMALL_ITEMS = 32
 _CHUNK_PARALLEL_LARGE_ITEMS = 128
@@ -881,12 +993,14 @@ _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
 # Third cost arm: the three-phase program's own
 # calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
 # module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
-# 4), copied verbatim; they take part in the exact-vs-chunk-parallel gate only
-# (the faster of the two chunk-parallel predictions is compared with the
+# 4, copied verbatim for the Blackwell rows; the (10, 7) row was fit on Rubin
+# with the same protocol); they take part in the exact-vs-chunk-parallel gate
+# only (the faster of the two chunk-parallel predictions is compared with the
 # exact scan's).
 _THREE_PHASE_COST_MODEL_US = {
     (10, 0): {"cp_fixed": 25.0, "cp_per_tile": 0.0491},
     (10, 3): {"cp_fixed": 24.1, "cp_per_tile": 0.0429},
+    (10, 7): {"cp_fixed": 21.0, "cp_per_tile": 0.0266},
 }
 # Chunk-parallel FAMILY rule inside the chunk-parallel regime, mirrored from
 # the look-back seed module (``three_phase_preferred``): the three-phase
@@ -902,6 +1016,19 @@ _THREE_PHASE_COST_MODEL_US = {
 _THREE_PHASE_MAX_TILES = 256
 _THREE_PHASE_MIN_ITEMS = 32
 _THREE_PHASE_MIN_CHUNKS = 64
+# Rubin (sm_107a, 212 SMs) measured the opposite ordering over most of the
+# chunk-parallel regime (three-phase / look-back 0.90-0.97 at 8 items x
+# 64-128 chunks, 16 items x 32-128 chunks and 32 items x 32 chunks, main
+# kernel, cold L2); the look-back stays ahead only at 32 items x 16 chunks
+# (1.01-1.02) and 8 items x 256 chunks (1.01).  Its rule: three-phase for
+# batched calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or at least
+# ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks per item, except calls of at most
+# ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at least
+# ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks; varlen calls stay on the look-back.
+_RUBIN_THREE_PHASE_CAPABILITIES = ((10, 7),)
+_RUBIN_THREE_PHASE_MIN_CHUNKS = 32
+_RUBIN_LOOKBACK_MAX_ITEMS = 8
+_RUBIN_LOOKBACK_MIN_CHUNKS = 256
 # Chunk-parallel workspace per (chunk, head) tile: the f32 [64, 128] state
 # increments (32 KB) plus the bf16 [64, 128] state operand (16 KB).
 _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
@@ -917,7 +1044,7 @@ _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
 # followed by V f32 log-decay scalars.
 _CHUNK_PARALLEL_SEGMENT_CAP = 1024
 _CHUNK_PARALLEL_GRID_BARRIER_WORDS = 4 + _CHUNK_PARALLEL_SEGMENT_CAP
-_CHUNK_PARALLEL_VCOUNT_BY_ARCH = {(10, 0): 148, (10, 3): 152}
+_CHUNK_PARALLEL_VCOUNT_BY_ARCH = {(10, 0): 148, (10, 3): 152, (10, 7): 212}
 _CHUNK_PARALLEL_VCOUNT_DEFAULT = (10, 0)
 _CHUNK_PARALLEL_AGG_ELEMS_PER_RANGE = _HEADDIM * _DSTATE + 1
 # Three-phase device state: u32 ``[arrive, generation]`` of its software grid
@@ -1199,16 +1326,34 @@ def selection_quantities(
 
 
 def three_phase_preferred(
-    *, work_items: int, chunks: int, tiles: int, mode_varlen: bool
+    *,
+    work_items: int,
+    chunks: int,
+    tiles: int,
+    mode_varlen: bool,
+    capability: tuple[int, int],
 ) -> bool:
     """Inside the chunk-parallel regime: the three-phase family for batched
     calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or with at least
     ``_THREE_PHASE_MIN_ITEMS`` work items and ``_THREE_PHASE_MIN_CHUNKS``
-    chunks per item; the look-back family otherwise."""
+    chunks per item; the look-back family otherwise.  On the
+    ``_RUBIN_THREE_PHASE_CAPABILITIES`` the three-phase family also serves
+    every batched call of at least ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks
+    per item, except at most ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at
+    least ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks."""
 
     if mode_varlen:
         return False
-    return int(tiles) <= _THREE_PHASE_MAX_TILES or (
+    if int(tiles) <= _THREE_PHASE_MAX_TILES:
+        return True
+    if tuple(capability) in _RUBIN_THREE_PHASE_CAPABILITIES:
+        if (
+            int(work_items) <= _RUBIN_LOOKBACK_MAX_ITEMS
+            and int(chunks) >= _RUBIN_LOOKBACK_MIN_CHUNKS
+        ):
+            return False
+        return int(chunks) >= _RUBIN_THREE_PHASE_MIN_CHUNKS
+    return (
         int(work_items) >= _THREE_PHASE_MIN_ITEMS
         and int(chunks) >= _THREE_PHASE_MIN_CHUNKS
     )
@@ -1268,6 +1413,7 @@ def chunk_parallel_family(
         chunks=quantities["chunks"],
         tiles=quantities["tiles"],
         mode_varlen=quantities["mode_varlen"],
+        capability=capability,
     ):
         return "chunkpar3"
     return "chunkpar"
@@ -1313,6 +1459,14 @@ def chunk_parallel_selected(
 # program (``exactpre_*``): the fused kernel's in-CTA preprocess serialises
 # with the scan and loses on saturated grids (93-row calibration, both archs:
 # 50 routed rows win beyond the band, no routed row loses).
+# The seq_idx triple form deriving its table inside the fused window, by
+# compute capability (``_materialize_workspace``): the light metadata stage
+# ahead of the fused main kernel (``exactmeta_*``) on SM100, and the
+# one-launch ``exactone_*`` render on SM103 and SM107 -- the Rubin fused
+# varlen render derives the table in-kernel like SM103's, and its host (a
+# Grace CPU like GB300's) hides a lighter stage in the launch interval too.
+_LIGHT_STAGE_CAPABILITIES = ((10, 0),)
+_ONE_LAUNCH_CAPABILITIES = ((10, 3), (10, 7))
 _FUSED_ROUTE_MAX_ITEMS_BATCHED = 1024
 _FUSED_ROUTE_MAX_CHUNKS_BATCHED = 16
 _FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED = 2048
@@ -1346,10 +1500,10 @@ def fused_selected(
     ``exactfused_*`` (preprocess grid 0, one launch); the triple form
     deriving the table takes ``exactmeta_*`` on SM100 (the light metadata
     kernel then the same fused main kernel, two launches) and ``exactone_*``
-    on SM103 (the fused main kernel derives the table in its CTA prologue,
-    one launch) unless the table is published into the caller's buffer,
-    which keeps the two-kernel program on SM103 (``_materialize_workspace``
-    decides per compute capability)."""
+    on SM103 and SM107 (the fused main kernel derives the table in its CTA
+    prologue, one launch) unless the table is published into the caller's
+    buffer, which keeps the two-kernel program on SM103 and SM107
+    (``_materialize_workspace`` decides per compute capability)."""
 
     items = int(num_sequences) * int(nheads)
     if not mode_varlen:
@@ -1512,7 +1666,7 @@ def _target_arch(device_index: int) -> str:
     arch = _TARGET_ARCHS.get(tuple(capability))
     if arch is None:
         raise ValueError(
-            "Cake SSDCombined requires SM100 or SM103, got "
+            "Cake SSDCombined requires SM100, SM103 or SM107, got "
             f"SM{capability[0]}{capability[1]}"
         )
     return arch
@@ -1727,8 +1881,8 @@ def _exact_scan_variant(
 def _load_generated_program(name: str, arch: str):
     """Build one program for ``arch``; the loaded module serves every device."""
 
-    program = _PROGRAMS[name]
-    _require_exported(name, program)
+    program = _arch_program(name, arch)
+    _require_exported(name, program, arch)
     source_dir = _source_dir()
     host_source = _render_host_source(
         (source_dir / program.host_template).read_text(encoding="utf-8"),
@@ -1797,8 +1951,9 @@ class CakeSSDCombined:
     """Source-built Cake implementation of the admitted SSDCombined domain.
 
     The kernels require head dimension 64, state dimension 128, BF16
-    inputs/outputs, BF16, FP16, or FP32 states, and SM100/SM103.  Any positive
-    ``chunk_size`` is accepted as the caller's convention: the programs tile
+    inputs/outputs, BF16, FP16, or FP32 states, and SM100, SM103 or SM107
+    (Rubin).  Any positive ``chunk_size`` is accepted as the caller's
+    convention: the programs tile
     the token axis in 128-token chunks internally and the SSD output and
     final states do not depend on the chunk size (chunking factorises the
     same recurrence; only rounding differs), so ``chunk_size=256`` (the
@@ -1827,16 +1982,16 @@ class CakeSSDCombined:
     ``update_seq_chunk_cumsum=True``) runs the program of the device's
     compute capability: on SM100 ``exactmeta_*`` -- the light packed-varlen
     metadata kernel publishes the table, then the same fused main kernel runs
-    (two launches, no dt preprocess); on SM103 ``exactone_*`` -- the fused
-    main kernel derives its private table in a CTA prologue (one launch) --
-    where the table is runner-owned, and the two-kernel program where the
-    caller's buffer must receive it.  A caller buffer for the
+    (two launches, no dt preprocess); on SM103 and SM107 ``exactone_*`` --
+    the fused main kernel derives its private table in a CTA prologue (one
+    launch) -- where the table is runner-owned, and the two-kernel program
+    where the caller's buffer must receive it.  A caller buffer for the
     ``cu_seqlens``-derived vector brings the fused program's full preprocess
     back to publish it (two launches).
 
     Seven kernel families serve every call and are selected per call.  The
     fused exact scan (``exactfused_*`` programs, ``exactmeta_*`` behind the
-    metadata kernel and the SM103 ``exactone_*`` render) runs one persistent CTA per
+    metadata kernel and the SM103 / SM107 ``exactone_*`` render) runs one persistent CTA per
     (sequence, head) item over its chunks in order and computes delta /
     cumsum in-CTA; the two-kernel exact scan (``exactpre_*``) is the same
     persistent scan reading the delta / cumsum its preprocess wrote to the
@@ -2195,18 +2350,22 @@ class CakeSSDCombined:
         # thread per segment, no dt work) ahead of the same fused main kernel
         # (the stage drops from 4.1-4.7 us to 2.4-2.9 us; the fused main
         # kernel costs 0.7-0.9 us more than the two-kernel main kernel); on
-        # SM103 the host interval between two launches hides any lighter
-        # stage, so ``exactone`` runs the SM103 render of the fused main
-        # kernel, whose CTA prologue derives a private table from the triple
-        # (one launch, no stage) -- unless the caller's buffer must receive
-        # the table (``key.publish_table``), which only a publishing stage
-        # writes: that form keeps the two-kernel program on SM103.
+        # SM103 -- and SM107, whose fused varlen render derives the table
+        # in-kernel too and whose host is a Grace CPU like GB300's -- the host
+        # interval between two launches hides any lighter stage, so
+        # ``exactone`` runs that render of the fused main kernel, whose CTA
+        # prologue derives a private table from the triple (one launch, no
+        # stage) -- unless the caller's buffer must receive the table
+        # (``key.publish_table``), which only a publishing stage writes: that
+        # form keeps the two-kernel program on SM103 and SM107.
         derives_table = (
             self.has_varlen and not key.from_cu_seqlens and not key.caller_cumsum
         )
-        light_stage = derives_table and tuple(capability) == (10, 0)
+        light_stage = derives_table and tuple(capability) in _LIGHT_STAGE_CAPABILITIES
         one_launch = (
-            derives_table and not key.publish_table and tuple(capability) == (10, 3)
+            derives_table
+            and not key.publish_table
+            and tuple(capability) in _ONE_LAUNCH_CAPABILITIES
         )
         fused = (
             not chunk_parallel

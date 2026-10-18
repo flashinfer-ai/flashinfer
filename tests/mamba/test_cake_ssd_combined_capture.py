@@ -21,7 +21,7 @@ limitations under the License.
 # outputs from the graph's private pool; a captured call refuses with
 # ``CakeSSDCombinedCaptureError`` only for a shape this runner never ran or
 # prepared and for a program never launched in this process; the workspace a
-# graph recorded is pinned.  GPU tests need SM100/SM103; the registry and the
+# graph recorded is pinned.  GPU tests need SM100, SM103 or SM107; the registry and the
 # capture logic are also exercised on CPU through a runner whose launcher is
 # captured and whose capture status is faked.
 
@@ -46,11 +46,12 @@ def _supported_device() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
         (10, 0),
         (10, 3),
+        (10, 7),
     )
 
 
 requires_blackwell = pytest.mark.skipif(
-    not _supported_device(), reason="Cake SSDCombined requires SM100 or SM103"
+    not _supported_device(), reason="Cake SSDCombined requires SM100, SM103 or SM107"
 )
 
 
@@ -242,8 +243,8 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     fused single-launch program of the trusted-table route: ``prepare`` and the
     captured ``run`` resolve the same program from the same arguments), for
     the seq_idx triple deriving a runner-owned table (the capability's
-    program: ``exactmeta`` on SM100, two launches; ``exactone`` on SM103, one
-    launch whose CTA prologue derives the table into the workspace scratch
+    program: ``exactmeta`` on SM100, two launches; ``exactone`` on SM103 and
+    SM107, one launch whose CTA prologue derives the table into the workspace scratch
     the graph replays against) and for the chunk-parallel program forced
     through the override.
 
@@ -620,7 +621,11 @@ def _cpu_runner(
     )
 
 
-_ROUTE_ARCHES = ("sm_100a", "sm_103a")
+_ROUTE_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+# The architectures routing the seq_idx triple form deriving its table
+# through the light metadata stage (``exactmeta``): SM100 alone (SM103 and
+# SM107 run the one-launch ``exactone`` render).
+_LIGHT_STAGE_ARCHES = ("sm_100a",)
 
 
 @pytest.mark.parametrize("arch", _ROUTE_ARCHES)
@@ -686,15 +691,15 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     # Asking the publishing stage to rewrite the table is another call shape
     # under its own key (unprepared, so it reads the environment): on SM100
     # the exactmeta program (the light metadata kernel publishing into the
-    # caller's buffer, then the same fused main kernel), on SM103 the
-    # two-kernel program (the segment preprocess publishes).
+    # caller's buffer, then the same fused main kernel), on SM103 and SM107
+    # the two-kernel program (the segment preprocess publishes).
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     runner.run(
         x, dt, A, B, C, **triple, seq_chunk_cumsum=table, update_seq_chunk_cumsum=True
     )
     name, launch = calls[-1]
     assert name == runner.last_program_name
-    if arch == "sm_100a":
+    if arch in _LIGHT_STAGE_ARCHES:
         assert name == "exactmeta_bf16_varlen"
         assert launch["preprocess"]["sequence_offsets"] is table
         assert launch["preprocess_grid"] == (1, 1, 1)
@@ -755,8 +760,8 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
     the ``cu_seqlens`` form and the trusted-table triple form (the fused
     program, one launch), and the triple form deriving its table with int32
     or int64 ``seq_idx`` (``exactmeta`` on SM100, the table published ahead
-    of the main kernel; ``exactone`` on SM103, one launch with the table
-    derived in the main kernel's prologue)."""
+    of the main kernel; ``exactone`` on SM103 and SM107, one launch with the
+    table derived in the main kernel's prologue)."""
 
     module = _module()
     seq_idx_dtype = torch.int64 if form == "triple_i64" else torch.int32
@@ -791,7 +796,7 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
     family = module._PROGRAMS[prepared.program_name].family
     if form in ("cu_seqlens", "trusted"):
         assert family == "exactfused" and prepared.preprocess_grid == (0, 1, 1)
-    elif arch == "sm_100a":
+    elif arch in _LIGHT_STAGE_ARCHES:
         assert family == "exactmeta", (arch, form, prepared.program_name)
         assert prepared.preprocess_grid[0] >= 1
     else:
@@ -824,7 +829,7 @@ def test_prepare_and_run_resolve_the_same_program_by_capability_without_gpu(
 
 def test_prepare_and_run_refuse_other_capabilities_alike_without_gpu(monkeypatch):
     """Neither ``prepare`` nor ``run`` guesses a route for a device that is
-    not SM100 or SM103: both raise ``_target_arch``'s ``ValueError``."""
+    not SM100, SM103 or SM107: both raise ``_target_arch``'s ``ValueError``."""
 
     module = _module()
     target_arch = module._target_arch
@@ -840,9 +845,9 @@ def test_prepare_and_run_refuse_other_capabilities_alike_without_gpu(monkeypatch
         "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
         "num_seqs": 2,
     }
-    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
         runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **triple)
-    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+    with pytest.raises(ValueError, match="requires SM100, SM103 or SM107"):
         runner.run(x, dt, A, B, C, **triple)
     assert calls == [] and loads == []
 
@@ -1057,7 +1062,7 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
     chunk-items and varlen calls at 256 items and 512 chunk-items; the pair
     rule needs more items than SMs and 16 chunks per item), so the fused
     programs -- ``exactfused``, and the derived triple form's ``exactmeta``
-    on SM100 / ``exactone`` on SM103 -- ship no pair program and never launch
+    on SM100 / ``exactone`` on SM103 and SM107 -- ship no pair program and never launch
     on the even grid.  Asserted over a grid of shapes on the route functions,
     on the program table, and through ``prepare`` / ``run`` for every
     packed-varlen form inside the window, including the publishing form that
@@ -1089,7 +1094,7 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
     # Inside the window (2 sequences x 8 heads, 3 packed chunks): the program
     # of every form by capability, none on the pair program's grid.
     seqlen, num_seqs = 300, 2
-    derived = "exactmeta" if arch == "sm_100a" else "exactone"
+    derived = "exactmeta" if arch in _LIGHT_STAGE_ARCHES else "exactone"
     two_kernel = module.two_kernel_family(
         mode_varlen=True, num_sequences=num_seqs, seqlen=seqlen
     )
@@ -1098,7 +1103,7 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
         "trusted": "exactfused",
         "triple_i32": derived,
         "triple_i64": derived,
-        "publish": "exactmeta" if arch == "sm_100a" else two_kernel,
+        "publish": "exactmeta" if arch in _LIGHT_STAGE_ARCHES else two_kernel,
     }
     assert fused(
         nheads=8,
