@@ -564,3 +564,53 @@ def test_stage_for_without_shape_is_the_base_build():
     assert stage_for(64, 8) == "hq64_hkv8"
     with pytest.raises(ValueError):
         stage_for(16, 2)
+
+
+# ----------------------------------------------------------------------------------------------
+# Shared sources (CPU): every (stage, arch) module compiles the stage's one kernel source
+# and the one binding, instantiated through -D defines, and keeps its own kernel symbol.
+
+_GENCODE = {
+    "sm_90a": "compute_90a",
+    "sm_100a": "compute_100a",
+    "sm_103a": "compute_103a",
+}
+
+
+def _define(flags, macro):
+    values = [flag.split("=", 1)[1] for flag in flags if flag.startswith(f"-D{macro}=")]
+    assert len(values) == 1, (macro, flags)
+    return values[0]
+
+
+def test_jit_spec_shares_sources_and_keeps_distinct_symbols(monkeypatch):
+    from flashinfer.jit import cake_fused_qk_rope_append as jit
+    from flashinfer.jit import core as jit_core
+
+    monkeypatch.setattr(
+        jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "0a")}
+    )
+    jit.gen_cake_fused_qk_rope_append_module.cache_clear()
+
+    symbols = {}
+    shims = {}
+    for arch in ("sm_90a", "sm_100a", "sm_103a"):
+        for stage in jit.stages_for(arch):
+            spec = jit.gen_cake_fused_qk_rope_append_module(stage, arch)
+            kernel, binding = spec.sources
+            assert kernel.name == f"cake_fused_qk_rope_append_{stage}_kernel.cu"
+            assert binding.name == "cake_fused_qk_rope_append_binding.cu"
+            assert kernel.parent == binding.parent
+            assert spec.name.endswith(f"_{arch}")
+            assert any(_GENCODE[arch] in flag for flag in spec.extra_cuda_cflags)
+            symbol = _define(spec.extra_cuda_cflags, "CAKE_KERNEL_SYMBOL")
+            shim = _define(spec.extra_cuda_cflags, "CAKE_HOST_SHIM_NAMESPACE")
+            for source in (kernel, binding):
+                text = source.read_text(encoding="utf-8")
+                assert "#ifndef CAKE_KERNEL_SYMBOL" in text
+                assert symbol not in text
+            symbols[(stage, arch)] = symbol
+            shims[(stage, arch)] = shim
+    assert len(symbols) == 20
+    assert len(set(symbols.values())) == len(symbols)
+    assert len(set(shims.values())) == len(shims)

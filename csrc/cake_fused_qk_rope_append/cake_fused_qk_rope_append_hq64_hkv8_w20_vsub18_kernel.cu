@@ -52,17 +52,17 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 128
 #define NUM_Q_HEADS 64
 #define NUM_KV_HEADS 8
-#define WARPS_PER_ROW 8
-#define V_SUB_BASE 0
+#define WARPS_PER_ROW 20
+#define V_SUB_BASE 18
 #define CLEAR_UNIT_CHUNKS 256
 #define L_SKIP_INVALID 0
 #define L_WEIGHT_SELECT 0
-#define L_DIRECT_LOOKUP 1
+#define L_DIRECT_LOOKUP 0
 #define L_HITLANE_PAGE 0
 #define L_ZERO_HINT 0
 #define L_DEP_GATE 0
 #define L_ROW_CLEAR 0
-#define CLEAR_UNITS_PER_WARP 2
+#define CLEAR_UNITS_PER_WARP 1
 #define P_NO_CLEAR 0
 #define P_CLEAR_ONLY 0
 #define P_NO_LOOKUP 0
@@ -73,10 +73,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+#ifndef CAKE_KERNEL_SYMBOL
+#error "CAKE_KERNEL_SYMBOL must name this build's kernel (the loader passes -DCAKE_KERNEL_SYMBOL=<manifest kernel_symbol>)"
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_fused_qk_rope_append_d3c33d4c6b33e645e252(__nv_bfloat16* __restrict__ qkv, float* __restrict__ cos_sin, int* __restrict__ q_indptr, int* __restrict__ seq_lens, int* __restrict__ page_table, __nv_bfloat16* __restrict__ k_cache, __nv_bfloat16* __restrict__ v_cache, __nv_bfloat16* __restrict__ out_q, __nv_bfloat16* __restrict__ out_k, __nv_bfloat16* __restrict__ out_v, float* __restrict__ q_norm_weight, float* __restrict__ k_norm_weight, int num_rows, int num_requests, int max_pages, int page_size, long long k_page_stride, long long v_page_stride, int num_row_ctas, int clear_units_per_request, int qk_norm_policy, float eps, int use_out_k, int use_out_v, int clear_last_page)
+CAKE_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ qkv, float* __restrict__ cos_sin, int* __restrict__ q_indptr, int* __restrict__ seq_lens, int* __restrict__ page_table, __nv_bfloat16* __restrict__ k_cache, __nv_bfloat16* __restrict__ v_cache, __nv_bfloat16* __restrict__ out_q, __nv_bfloat16* __restrict__ out_k, __nv_bfloat16* __restrict__ out_v, float* __restrict__ q_norm_weight, float* __restrict__ k_norm_weight, int num_rows, int num_requests, int max_pages, int page_size, long long k_page_stride, long long v_page_stride, int num_row_ctas, int clear_units_per_request, int qk_norm_policy, float eps, int use_out_k, int use_out_v, int clear_last_page)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -95,71 +99,62 @@ kernel_cake_fused_qk_rope_append_d3c33d4c6b33e645e252(__nv_bfloat16* __restrict_
     int d0 = lane_0 % 8 * 8;
     if (bid >= num_row_ctas) {
         {
-            int cid_u = (bid - num_row_ctas) * 4 + warp_1;
-            int warps_per_req = (clear_units_per_request + CLEAR_UNITS_PER_WARP - 1) / CLEAR_UNITS_PER_WARP;
-            if (cid_u < num_requests * warps_per_req && clear_last_page != 0) {
-                int req_u = cid_u / warps_per_req;
-                int u0 = cid_u % warps_per_req * CLEAR_UNITS_PER_WARP;
-                int seq_len_u = seq_lens[req_u];
-                if (seq_len_u > 0) {
-                    int last_u = seq_len_u - 1;
-                    int start_u = (last_u % page_size + 1) * (NUM_KV_HEADS * 128 / 8);
-                    int end_u = page_size * (NUM_KV_HEADS * 128 / 8);
-                    if (start_u < (u0 / 2 + (CLEAR_UNITS_PER_WARP + 1) / 2) * CLEAR_UNIT_CHUNKS && end_u > u0 / 2 * CLEAR_UNIT_CHUNKS) {
-                        int page_u32 = page_table[req_u * max_pages + last_u / page_size];
-                        long long page_u = (long long)page_u32;
-                        long long kbase_u = page_u * k_page_stride;
-                        long long vbase_u = page_u * v_page_stride;
-                        float zeros_u[8];
+            int cid = (bid - num_row_ctas) * 4 + warp_1;
+            if (cid < num_requests * clear_units_per_request && clear_last_page != 0) {
+                int req_c = cid / clear_units_per_request;
+                int u = cid % clear_units_per_request;
+                int cache_sel = u % 2;
+                int unit_begin = u / 2 * CLEAR_UNIT_CHUNKS;
+                int seq_len_c = seq_lens[req_c];
+                if (seq_len_c > 0) {
+                    int last_c = seq_len_c - 1;
+                    int start_chunk = (last_c % page_size + 1) * (NUM_KV_HEADS * 128 / 8);
+                    int end_chunk = page_size * (NUM_KV_HEADS * 128 / 8);
+                    if (start_chunk < unit_begin + CLEAR_UNIT_CHUNKS && unit_begin < end_chunk) {
+                        int page_c32 = page_table[req_c * max_pages + last_c / page_size];
+                        long long page_c = (long long)page_c32;
+                        float zeros[8];
                         #pragma unroll
                         for (int j = 0; j < 8; j++) {
-                            zeros_u[j] = 0.0f;
+                            zeros[j] = 0.0f;
                         }
-                        int u = 0;
-                        int cu = 0;
-                        long long off_u = 0;
-                        int ub = 0;
-                        #pragma unroll
-                        for (int jj = 0; jj < CLEAR_UNITS_PER_WARP; jj++) {
-                            u = u0 + jj;
-                            if (u < clear_units_per_request) {
-                                ub = u / 2 * CLEAR_UNIT_CHUNKS;
-                                if (start_u < ub + CLEAR_UNIT_CHUNKS && ub < end_u) {
-                                    if (u % 2 == 0) {
-                                        #pragma unroll
-                                        for (int k = 0; k < CLEAR_UNIT_CHUNKS / 32; k++) {
-                                            cu = ub + lane_0 + 32 * k;
-                                            if (cu >= start_u && cu < end_u) {
-                                                off_u = (long long)cu * 8;
-                                                {
-                                                    {
-                                                        __nv_bfloat162 _pk[4];
-                                                        _pk[0] = __floats2bfloat162_rn(zeros_u[0 + 0], zeros_u[0 + 1]);
-                                                        _pk[1] = __floats2bfloat162_rn(zeros_u[0 + 2], zeros_u[0 + 3]);
-                                                        _pk[2] = __floats2bfloat162_rn(zeros_u[0 + 4], zeros_u[0 + 5]);
-                                                        _pk[3] = __floats2bfloat162_rn(zeros_u[0 + 6], zeros_u[0 + 7]);
-                                                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(k_cache + (kbase_u + off_u)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                                                    }
-                                                }
-                                            }
+                        int c = 0;
+                        long long off_c = 0;
+                        long long base_c = 0;
+                        if (cache_sel == 0) {
+                            base_c = page_c * k_page_stride;
+                            #pragma unroll
+                            for (int k = 0; k < CLEAR_UNIT_CHUNKS / 32; k++) {
+                                c = unit_begin + lane_0 + 32 * k;
+                                if (c >= start_chunk && c < end_chunk) {
+                                    off_c = (long long)c * 8;
+                                    {
+                                        {
+                                            __nv_bfloat162 _pk[4];
+                                            _pk[0] = __floats2bfloat162_rn(zeros[0 + 0], zeros[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(zeros[0 + 2], zeros[0 + 3]);
+                                            _pk[2] = __floats2bfloat162_rn(zeros[0 + 4], zeros[0 + 5]);
+                                            _pk[3] = __floats2bfloat162_rn(zeros[0 + 6], zeros[0 + 7]);
+                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(k_cache + (base_c + off_c)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                         }
-                                    } else {
-                                        #pragma unroll
-                                        for (int k_1 = 0; k_1 < CLEAR_UNIT_CHUNKS / 32; k_1++) {
-                                            cu = ub + lane_0 + 32 * k_1;
-                                            if (cu >= start_u && cu < end_u) {
-                                                off_u = (long long)cu * 8;
-                                                {
-                                                    {
-                                                        __nv_bfloat162 _pk[4];
-                                                        _pk[0] = __floats2bfloat162_rn(zeros_u[0 + 0], zeros_u[0 + 1]);
-                                                        _pk[1] = __floats2bfloat162_rn(zeros_u[0 + 2], zeros_u[0 + 3]);
-                                                        _pk[2] = __floats2bfloat162_rn(zeros_u[0 + 4], zeros_u[0 + 5]);
-                                                        _pk[3] = __floats2bfloat162_rn(zeros_u[0 + 6], zeros_u[0 + 7]);
-                                                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(v_cache + (vbase_u + off_u)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                                                    }
-                                                }
-                                            }
+                                    }
+                                }
+                            }
+                        } else {
+                            base_c = page_c * v_page_stride;
+                            #pragma unroll
+                            for (int k_1 = 0; k_1 < CLEAR_UNIT_CHUNKS / 32; k_1++) {
+                                c = unit_begin + lane_0 + 32 * k_1;
+                                if (c >= start_chunk && c < end_chunk) {
+                                    off_c = (long long)c * 8;
+                                    {
+                                        {
+                                            __nv_bfloat162 _pk[4];
+                                            _pk[0] = __floats2bfloat162_rn(zeros[0 + 0], zeros[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(zeros[0 + 2], zeros[0 + 3]);
+                                            _pk[2] = __floats2bfloat162_rn(zeros[0 + 4], zeros[0 + 5]);
+                                            _pk[3] = __floats2bfloat162_rn(zeros[0 + 6], zeros[0 + 7]);
+                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(v_cache + (base_c + off_c)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                         }
                                     }
                                 }
@@ -233,9 +228,16 @@ kernel_cake_fused_qk_rope_append_d3c33d4c6b33e645e252(__nv_bfloat16* __restrict_
             #pragma unroll
             for (int g_1 = 0; g_1 < ((NUM_KV_HEADS + 4 - 1) / 4 + WARPS_PER_ROW - 1) / WARPS_PER_ROW; g_1++) {
                 {
-                    vhead_of[g_1] = 4 * (sub + WARPS_PER_ROW * g_1) + hsel;
-                    vok[g_1] = ((4 * (sub + WARPS_PER_ROW * g_1) < NUM_KV_HEADS) ? 1 : 0);
-                    src_v = ((vhead_of[g_1] < NUM_KV_HEADS) ? vhead_of[g_1] : NUM_KV_HEADS - 1);
+                    vfirst = 4 * (sub - V_SUB_BASE + WARPS_PER_ROW * g_1);
+                    vhead_of[g_1] = vfirst + hsel;
+                    vok[g_1] = 0;
+                    if (vfirst >= 0) {
+                        if (vfirst < NUM_KV_HEADS) {
+                            vok[g_1] = 1;
+                        }
+                    }
+                    src_v = ((vok[g_1] != 0) ? vhead_of[g_1] : NUM_KV_HEADS - 1);
+                    src_v = ((src_v < NUM_KV_HEADS) ? src_v : NUM_KV_HEADS - 1);
                 }
                 {
                     {
@@ -376,12 +378,6 @@ kernel_cake_fused_qk_rope_append_d3c33d4c6b33e645e252(__nv_bfloat16* __restrict_
             int g_e = 0;
             int g_l = 0;
             {
-                g_req = ((row < num_requests) ? row : num_requests - 1);
-                g_b = q_indptr[g_req];
-                g_e = q_indptr[g_req + 1];
-                g_l = seq_lens[g_req];
-            }
-            {
                 #pragma unroll
                 for (int k_2 = 0; k_2 < 8; k_2++) {
                     lb[k_2] = 0;
@@ -399,11 +395,6 @@ kernel_cake_fused_qk_rope_append_d3c33d4c6b33e645e252(__nv_bfloat16* __restrict_
             unsigned int dep_self = 0;
             unsigned int dep_zero = 0;
             int row_g = row;
-            if (g_b <= row_g && row_g < g_e) {
-                req = g_req;
-                pos = row + g_l - g_e;
-                le_req = g_e;
-            }
             int page32 = 0;
             int have_page = 0;
             int hit = 0;
@@ -665,7 +656,12 @@ kernel_cake_fused_qk_rope_append_d3c33d4c6b33e645e252(__nv_bfloat16* __restrict_
                     if (do_v != 0) {
                         vh = vhead_of[g_3];
                         {
-                            v_ok = ((vh < NUM_KV_HEADS) ? 1 : 0);
+                            v_ok = 0;
+                            if (vh >= 0) {
+                                if (vh < NUM_KV_HEADS) {
+                                    v_ok = 1;
+                                }
+                            }
                         }
                         if (P_NO_KV == 0 && v_ok != 0) {
                             if (use_out_v != 0) {

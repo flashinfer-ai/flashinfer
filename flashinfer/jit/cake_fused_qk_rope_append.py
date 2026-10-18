@@ -19,8 +19,12 @@ for every architecture (``sm_90a`` H100/H200, ``sm_100a`` B200, ``sm_103a`` B300
 one stage per build the Cake host policy can select for the two head
 configurations ``(Hq, Hkv) = (8, 1)`` / ``(64, 8)`` (``contract.stages_by_arch``;
 the base build ``hq8_hkv1`` / ``hq64_hkv8`` plus lever builds such as
-``hq8_hkv1_vsub3_d`` or ``hq64_hkv8_w20_vsub18_d``), each with its tvm-ffi
-binding.  :func:`stage_for` mirrors the Cake policy (``contract.stage_policy``)
+``hq8_hkv1_vsub3_d`` or ``hq64_hkv8_w20_vsub18_d``).  The kernel source of a
+stage and the tvm-ffi binding are shared by all architectures: every module
+compiles them with ``-DCAKE_KERNEL_SYMBOL=<its kernel_symbol>`` and its own
+host-shim namespace (:func:`_module_defines`), so the per-(stage, arch)
+libraries keep distinct symbols and can be loaded into one process.
+:func:`stage_for` mirrors the Cake policy (``contract.stage_policy``)
 and picks the stage from the architecture and the problem shape; the host
 wrapper lives in :mod:`flashinfer.cake_fused_qk_rope_append`.
 """
@@ -308,6 +312,20 @@ def cake_fused_qk_rope_append_record(stage: str, arch: str) -> dict[str, Any]:
     return dict(_record(stage, arch))
 
 
+def _module_defines(record: dict[str, Any], arch: str) -> list[str]:
+    """``-D`` flags that instantiate the shared sources for one (stage, arch) module.
+
+    The kernel source of a stage and the binding are shared by all architectures.
+    Each module is its own JIT library and all of them may be loaded into one
+    process, so every build keeps its own kernel symbol (the manifest record's
+    ``kernel_symbol``) and its own host-shim namespace.
+    """
+    return [
+        f"-DCAKE_KERNEL_SYMBOL={record['kernel_symbol']}",
+        f"-DCAKE_HOST_SHIM_NAMESPACE=cake_host_shim_{record['name']}_{arch}",
+    ]
+
+
 @functools.cache
 def gen_cake_fused_qk_rope_append_module(stage: str, arch: str) -> JitSpec:
     record = _record(stage, arch)
@@ -315,7 +333,11 @@ def gen_cake_fused_qk_rope_append_module(stage: str, arch: str) -> JitSpec:
     spec = gen_jit_spec(
         name=f"{record['name']}_{arch}",
         sources=[_source_path(units["device"]), _source_path(units["binding"])],
-        extra_cuda_cflags=[*_NVCC_FLAGS[arch], *record["compile_flags"]],
+        extra_cuda_cflags=[
+            *_NVCC_FLAGS[arch],
+            *record["compile_flags"],
+            *_module_defines(record, arch),
+        ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
     )

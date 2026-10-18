@@ -73,10 +73,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+#ifndef CAKE_KERNEL_SYMBOL
+#error "CAKE_KERNEL_SYMBOL must name this build's kernel (the loader passes -DCAKE_KERNEL_SYMBOL=<manifest kernel_symbol>)"
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_fused_qk_rope_append_97bef5f0cc2815a74f0f(__nv_bfloat16* __restrict__ qkv, float* __restrict__ cos_sin, int* __restrict__ q_indptr, int* __restrict__ seq_lens, int* __restrict__ page_table, __nv_bfloat16* __restrict__ k_cache, __nv_bfloat16* __restrict__ v_cache, __nv_bfloat16* __restrict__ out_q, __nv_bfloat16* __restrict__ out_k, __nv_bfloat16* __restrict__ out_v, float* __restrict__ q_norm_weight, float* __restrict__ k_norm_weight, int num_rows, int num_requests, int max_pages, int page_size, long long k_page_stride, long long v_page_stride, int num_row_ctas, int clear_units_per_request, int qk_norm_policy, float eps, int use_out_k, int use_out_v, int clear_last_page)
+CAKE_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ qkv, float* __restrict__ cos_sin, int* __restrict__ q_indptr, int* __restrict__ seq_lens, int* __restrict__ page_table, __nv_bfloat16* __restrict__ k_cache, __nv_bfloat16* __restrict__ v_cache, __nv_bfloat16* __restrict__ out_q, __nv_bfloat16* __restrict__ out_k, __nv_bfloat16* __restrict__ out_v, float* __restrict__ q_norm_weight, float* __restrict__ k_norm_weight, int num_rows, int num_requests, int max_pages, int page_size, long long k_page_stride, long long v_page_stride, int num_row_ctas, int clear_units_per_request, int qk_norm_policy, float eps, int use_out_k, int use_out_v, int clear_last_page)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
