@@ -53,6 +53,7 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    ARG_PLANS,
     KERNELS,
     MODULES,
     kernel_module_name,
@@ -1084,7 +1085,7 @@ def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any],
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, name in ARG_PLANS[record["arg_plan"]]:
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
@@ -1095,7 +1096,7 @@ def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any],
                 f"host binding provides {sorted(kwargs)}"
             )
     module = load_cake_kimi_k3_attn_res_module(module_name)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    return module.run, tuple(arguments)
 
 
 @dataclass(frozen=True)
@@ -1244,9 +1245,6 @@ def prepare_kimi_k3_attn_res(
         eps=float(eps),
         output_norm_eps=float(output_norm_eps),
         block_write_idx=int(block_write_idx),
-        num_blocks=int(num_blocks),
-        has_delta=int(delta is not None),
-        apply_output_norm=int(output_norm_weight is not None),
         enable_pdl=int(enable_pdl),
         M=M,
     )

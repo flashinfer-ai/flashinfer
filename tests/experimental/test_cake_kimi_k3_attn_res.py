@@ -484,7 +484,7 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_co
                     plan.kernel_key,
                 )
     for record in MODULES.values():
-        assert record["tma_workspace_bytes"] == 0
+        assert record["arg_plan"] in cake_jit.ARG_PLANS
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
 
 
