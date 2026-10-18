@@ -34,19 +34,17 @@ from .utils import write_if_different
 
 CakeBGMVMoEDType = Literal["bfloat16", "float16"]
 CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a", "sm107a"]
-CakeBGMVMoESchedule = Literal[
-    "token_owned_t64",
-    "token_owned",
-    "token_owned_dual_col",
-]
+CakeBGMVMoESchedule = Literal["token_owned", "token_owned_dual_col"]
 
 CAKE_BGMV_MOE_HIDDEN_SIZES = (2688, 3072)
 CAKE_BGMV_MOE_DTYPES: tuple[CakeBGMVMoEDType, ...] = (
     "bfloat16",
     "float16",
 )
+# Schedule id 0 was the 64-lane token-owned expand: the selector never picked it
+# inside the specialized token window, so the kernel was removed and the
+# binding rejects the id.
 CAKE_BGMV_MOE_SCHEDULE_IDS: dict[CakeBGMVMoESchedule, int] = {
-    "token_owned_t64": 0,
     "token_owned": 1,
     "token_owned_dual_col": 2,
 }
@@ -85,15 +83,15 @@ CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS = 128
 # the pair x rank-tile grid is at most this many CTAs (one-wave launches are
 # latency-bound; the extra stage hides the cold-L2 HBM latency) and the
 # two-stage ring beyond it (at 1024 CTAs the depth is a coin flip per row and
-# the stage costs occupancy once the grid fills the machine).  Shrink forms: 0 two-stage prefill, 1 decode (4 pairs per CTA),
-# 2 three-stage prefill.
+# the stage costs occupancy once the grid fills the machine).  Shrink forms: 0 two-stage prefill,
+# 2 three-stage prefill (form 1, the retired four-pair decode kernel, is rejected by
+# the binding).
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS = 512
 # Lever 11d: on Blackwell the three-stage ring also wins at exactly one wave of
 # 1024 CTAs when the K loop is long (hidden >= 4096); SM90 keeps the CTA rule.
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS = 1024
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN = 4096
 CAKE_BGMV_MOE_SHRINK_FORM_PREFILL = 0
-CAKE_BGMV_MOE_SHRINK_FORM_DECODE = 1
 CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3 = 2
 CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS = (
     CAKE_BGMV_MOE_SHRINK_SPLIT_MAX * CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS * 64
@@ -324,8 +322,9 @@ def select_cake_bgmv_moe_generic_shrink(
     Mirrors the Cake generator's ``select_generic_shrink_launch`` and
     ``select_generic_shrink_stages``: the 1-pair kernel beat the 4-pair decode
     kernel on every measured small-pair row once the partials moved to
-    registers, so the decode form (1) is never selected.  The prefill kernel
-    runs its three-stage ring (form 2) while the pair x rank-tile grid is at
+    registers, so the decode form (1) was retired and the binding rejects it.
+    The prefill kernel runs its three-stage ring (form 2) while the pair x
+    rank-tile grid is at
     most ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS`` CTAs (on SM100/SM103 also
     up to ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS`` CTAs when
     ``hidden_size >= CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN``) and
@@ -391,16 +390,13 @@ class CakeBGMVMoEMetadata(NamedTuple):
     body: str
     shrink_decode_symbol: str
     shrink_prefill_symbol: str
-    token_t64_symbol: str
     token_symbol: str
     token_dual_col_symbol: str
 
 
 class CakeBGMVMoEGenericMetadata(NamedTuple):
     body: str
-    shrink_decode_symbol: str
     shrink_prefill_symbol: str
-    shrink_decode_pdl_symbol: str
     shrink_prefill_pdl_symbol: str
     shrink_prefill_s3_symbol: str
     shrink_prefill_s3_pdl_symbol: str
@@ -488,9 +484,6 @@ def _metadata(
         ),
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_{tag}_h{hidden_size}_r32_p1_s2"
-        ),
-        token_t64_symbol=(
-            f"kernel_flashinfer_bgmv_moe_expand_token_t64_{tag}_h{hidden_size}_r32"
         ),
         token_symbol=(
             f"kernel_flashinfer_bgmv_moe_expand_token_{tag}_h{hidden_size}_r32"
@@ -618,17 +611,11 @@ def _generic_metadata(
     suffix = _body_suffix(arch, (dtype, rank) in _SM107A_GENERIC_BODIES)
     return CakeBGMVMoEGenericMetadata(
         body=f"cake_bgmv_moe_generic_{tag}_r{rank}{suffix}.cu",
-        shrink_decode_symbol=(
-            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3"
-        ),
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2"
         ),
         # PDL forms: griddepcontrol.launch_dependents (early/late by pdl_early);
         # selected by the binding together with the prefetch expand forms.
-        shrink_decode_pdl_symbol=(
-            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3_pdl"
-        ),
         shrink_prefill_pdl_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2_pdl"
         ),
@@ -751,7 +738,7 @@ def select_cake_bgmv_moe_schedule(
 
     The table was measured on B200 (SM100, 148 SMs); all targets share it;
     Rubin (SM107, 212 SMs) inherits it pending measurement.
-    Sweeping the three expand schedules over the serving shapes (hidden
+    Sweeping the expand schedules over the serving shapes (hidden
     2688/3072, 1..1024 tokens, BF16, CUPTI cold-L2) puts them within 1.2 % of
     each other on B200 and within 3.5 % on H100 (SM90), where
     ``token_owned_dual_col`` trails ``token_owned`` by about 3 % at 1024
@@ -763,8 +750,6 @@ def select_cake_bgmv_moe_schedule(
     if num_tokens <= 0:
         raise ValueError(f"num_tokens must be positive, got {num_tokens}")
 
-    if num_tokens in (1, 4, 8):
-        return "token_owned_t64"
     if hidden_size == 3072 and num_tokens in (512, 1024):
         return "token_owned_dual_col"
     if hidden_size == 2688 and num_tokens == 1024:
@@ -831,7 +816,6 @@ def _binding_source(
 #define CAKE_BGMV_MOE_CC_MINOR {minor}
 #define CAKE_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
-#define CAKE_BGMV_MOE_EXPAND_TOKEN_T64 {metadata.token_t64_symbol}
 #define CAKE_BGMV_MOE_EXPAND_TOKEN {metadata.token_symbol}
 #define CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL {metadata.token_dual_col_symbol}
 
@@ -895,9 +879,7 @@ def _generic_binding_source(
 #define CAKE_BGMV_MOE_INPUT_DTYPE {input_dtype}
 #define CAKE_BGMV_MOE_CC_MAJOR {major}
 #define CAKE_BGMV_MOE_CC_MINOR {minor}
-#define CAKE_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
-#define CAKE_BGMV_MOE_SHRINK_DECODE_PDL {metadata.shrink_decode_pdl_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL_PDL {metadata.shrink_prefill_pdl_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL_S3 {metadata.shrink_prefill_s3_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL {metadata.shrink_prefill_s3_pdl_symbol}

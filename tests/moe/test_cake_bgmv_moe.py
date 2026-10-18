@@ -418,6 +418,36 @@ def test_unknown_backend_rejected():
         )
 
 
+def test_cake_plan_rejects_the_retired_schedule_and_shrink_form():
+    # The specialized 64-lane expand (schedule 0) and the generic four-pair
+    # decode shrink (form 1) were removed: the plan constructor rejects them
+    # before it allocates any workspace (the bindings reject them again).
+    # CPU tensors: nothing here touches a device.
+    kwargs = dict(
+        y_accum=torch.empty((4, 2688), dtype=torch.float32),
+        shrink_out=torch.empty((1, 8, 32), dtype=torch.bfloat16),
+        x=torch.empty((4, 2688), dtype=torch.bfloat16),
+        lora_a=torch.empty((1, 2, 32, 2688), dtype=torch.bfloat16),
+        lora_b=torch.empty((1, 2, 2688, 32), dtype=torch.bfloat16),
+        sorted_token_ids=torch.empty((8,), dtype=torch.int64),
+        expert_ids=torch.empty((8,), dtype=torch.int64),
+        lora_indices=torch.empty((4,), dtype=torch.int64),
+        topk_weights=torch.empty((8,), dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="schedule_id 0"):
+        BGMVMoECakePlan(None, schedule_id=0, variant="specialized", **kwargs)
+    with pytest.raises(ValueError, match="schedule_id 2"):
+        BGMVMoECakePlan(
+            None, schedule_id=2, variant="generic", shrink_launch=(0, 1), **kwargs
+        )
+    with pytest.raises(ValueError, match="shrink_launch"):
+        BGMVMoECakePlan(
+            None, schedule_id=1, variant="generic", shrink_launch=(1, 1), **kwargs
+        )
+    with pytest.raises(ValueError, match="shrink_launch"):
+        BGMVMoECakePlan(None, schedule_id=1, variant="generic", **kwargs)
+
+
 def test_cake_plan_reports_backend_used():
     _require_cake_arch()
     plan = prepare_bgmv_moe(*_make_inputs(2688, 4, torch.bfloat16), backend="cake")
@@ -428,7 +458,8 @@ def test_cake_plan_reports_backend_used():
 
 # (hidden, rank, tokens, dtype, arbitrary routes, top_k): runtime-hidden
 # generic bundles. Tokens <= 8 take the 64-lane expand, more the 128-lane one;
-# <= 32 pairs take the decode shrink (PPB=4), more the prefill shrink (PPB=1).
+# small pair x rank-tile grids take the three-stage prefill shrink, wide grids
+# the two-stage one (one pair per CTA either way).
 _GENERIC_CASES = [
     (3072, 16, 8, torch.bfloat16, False, 2),
     (3072, 8, 40, torch.float16, False, 2),

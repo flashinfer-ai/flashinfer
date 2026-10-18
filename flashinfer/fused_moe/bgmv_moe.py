@@ -347,7 +347,8 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.variant: CakeBGMVMoEVariant = variant
         # Generic variant only: (shrink form, hidden splits) chosen at prepare
         # time by ``select_cake_bgmv_moe_generic_shrink`` (form 0 two-stage
-        # prefill ring, 1 decode, 2 three-stage prefill ring for small grids).
+        # prefill ring, 2 three-stage prefill ring for small grids; form 1, the
+        # retired four-pair decode kernel, is rejected).
         self.shrink_launch: Optional[Tuple[int, int]] = shrink_launch
         # Generic variant only: pair-grouped pipeline (each unique (LoRA, expert)
         # pair's weights streamed once per tile of routes, deterministic per-token
@@ -368,7 +369,39 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.lora_indices = lora_indices
         self.topk_weights = topk_weights
         self.schedule_id: Optional[int] = schedule_id
-        from ..jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
+        from ..jit.cake_bgmv_moe import (
+            CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS,
+            CAKE_BGMV_MOE_SCHEDULE_IDS,
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL,
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3,
+            cake_bgmv_moe_route_index_numel,
+        )
+
+        # Reject the removed kernels before any workspace is allocated (the
+        # bindings reject them again): specialized schedule 0 was the 64-lane
+        # expand, generic shrink form 1 the four-pair decode shrink.
+        valid_schedule_ids = (
+            CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS.values()
+            if variant == "generic"
+            else CAKE_BGMV_MOE_SCHEDULE_IDS.values()
+        )
+        if int(schedule_id) not in valid_schedule_ids:
+            raise ValueError(
+                f"schedule_id {schedule_id} is not a {variant} Cake BGMV MoE expand "
+                f"schedule; valid ids are {sorted(valid_schedule_ids)}"
+            )
+        shrink_forms = (
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL,
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3,
+        )
+        if variant == "generic" and (
+            shrink_launch is None or int(shrink_launch[0]) not in shrink_forms
+        ):
+            raise ValueError(
+                "generic Cake BGMV MoE plans take shrink_launch=(form, splits) with "
+                "form 0 (two-stage prefill) or 2 (three-stage prefill), got "
+                f"{shrink_launch}"
+            )
 
         # Token->pair route index: published by the shrink kernels and read by
         # the expand kernels (arbitrary pair order in O(1) per CTA), followed by

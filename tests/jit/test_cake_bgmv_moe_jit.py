@@ -26,16 +26,16 @@ from flashinfer.jit import core as jit_core
 @pytest.mark.parametrize(
     ("hidden_size", "num_tokens", "expected"),
     [
-        (3072, 1, "token_owned_t64"),
-        (3072, 4, "token_owned_t64"),
-        (3072, 8, "token_owned_t64"),
+        (3072, 1, "token_owned"),
+        (3072, 4, "token_owned"),
+        (3072, 8, "token_owned"),
         (3072, 32, "token_owned"),
         (3072, 256, "token_owned"),
         (3072, 512, "token_owned_dual_col"),
         (3072, 1024, "token_owned_dual_col"),
-        (2688, 1, "token_owned_t64"),
-        (2688, 4, "token_owned_t64"),
-        (2688, 8, "token_owned_t64"),
+        (2688, 1, "token_owned"),
+        (2688, 4, "token_owned"),
+        (2688, 8, "token_owned"),
         (2688, 32, "token_owned"),
         (2688, 256, "token_owned"),
         (2688, 512, "token_owned"),
@@ -49,6 +49,21 @@ def test_selector_matches_measured_shape_portfolio(
         cake_bgmv_moe.select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
         == expected
     )
+
+
+def test_specialized_schedule_ids_exclude_the_retired_t64_expand():
+    # The 64-lane specialized expand (schedule 0) and the generic four-pair
+    # decode shrink (form 1) were removed with the code that served them.
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SCHEDULE_IDS == {
+        "token_owned": 1,
+        "token_owned_dual_col": 2,
+    }
+    assert "token_t64_symbol" not in cake_bgmv_moe.CakeBGMVMoEMetadata._fields
+    for field in cake_bgmv_moe.CakeBGMVMoEGenericMetadata._fields:
+        assert "decode" not in field
+    assert not hasattr(cake_bgmv_moe, "CAKE_BGMV_MOE_SHRINK_FORM_DECODE")
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_FORM_PREFILL == 0
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3 == 2
 
 
 def test_selector_rejects_unsupported_shapes():
@@ -113,9 +128,14 @@ def test_jit_spec_binds_generated_source_per_arch(
     body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
     for symbol in metadata[1:]:
         assert symbol in body
+    if not metadata.body.endswith("_sm107a.cu"):
+        # The unfolded sm107a record still renders the retired t64 expand kernel
+        # (the binding never launches it); the shared bodies dropped it.
+        assert "_expand_token_t64_" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
     assert f"#define CAKE_BGMV_MOE_HIDDEN {hidden_size}" in binding
+    assert "CAKE_BGMV_MOE_EXPAND_TOKEN_T64" not in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
     assert '#include "cake_bgmv_moe_binding.cuh"' in binding
@@ -139,8 +159,8 @@ def test_arch_modules_do_not_share_a_uri():
 def test_binding_preserves_graph_and_tensor_contracts():
     binding = (cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_binding.cuh").read_text()
     assert "TensorView route_index" in binding
-    assert "kExpandT64SmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_T64" in binding
     assert "kExpandDualSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_DUAL" in binding
+    assert "T64" not in binding
     assert "CheckCompiledArch" in binding
     assert "CheckExactSM100" not in binding
     assert (
@@ -156,6 +176,7 @@ def test_binding_preserves_graph_and_tensor_contracts():
     assert "EXPAND_PAIR" not in binding
     assert "CAKE_BGMV_MOE_SHRINK_DECODE<<<" in binding
     assert "cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL," in binding
+    assert "schedule_value >= static_cast<int64_t>(Schedule::kTokenOwned)" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
 
@@ -317,10 +338,11 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
     for symbol in metadata[1:]:
         assert symbol in body
+    if shared_body:
+        assert "_p4_s3" not in body
+        assert "SMEM_SHRINK_DECODE" not in body
     for macro in (
-        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221824",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120",
-        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE_PDL 221824",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_PDL 37120",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3 ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3_PDL ",
@@ -346,12 +368,13 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     assert (direct_smem in body) == (
         cake_bgmv_moe._dtype_tag(dtype) == "f16" or not shared_body
     )
-    # Route-index publication in the eight shrink kernels plus the three grouping
+    # Route-index publication in the six shrink kernels plus the three grouping
     # counters (shared-memory histogram and fill counters, per-token route
     # counters) in group_hist / group_scatter and the two block-local bin
     # counters (histogram, cursor) of the order_build prologue; the expands
-    # keep one owner per output (no output atomics).
-    assert body.count("atomicAdd(") == 13
+    # keep one owner per output (no output atomics). The unfolded sm107a record
+    # still renders the two retired decode shrink kernels (eight shrink kernels).
+    assert body.count("atomicAdd(") == (11 if shared_body else 13)
     assert "atomicAdd(&reinterpret_cast<float" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
@@ -363,6 +386,7 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
+    assert "SHRINK_DECODE" not in binding
     # Lever 3c: sm90a runs the operand-ring grouped shrink on single-K-tile rows too;
     # Blackwell keeps the register-direct form there.
     single_tile_ring = 1 if arch == "sm90a" else 0
@@ -429,16 +453,24 @@ def test_generic_binding_preserves_graph_and_tensor_contracts():
         "major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR" in binding
     )
     assert (
-        "kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE" in binding
+        "kShrinkPrefillS3SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3"
+        in binding
     )
     assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding
     assert "cudaFuncAttributeMaxDynamicSharedMemorySize" in binding
     assert "cudaMemsetAsync" not in binding
     assert "x.size(1) % kVec == 0" in binding
-    assert "CAKE_BGMV_MOE_SHRINK_DECODE<<<" in binding
     assert "CAKE_BGMV_MOE_SHRINK_PREFILL<<<" in binding
-    assert "CAKE_BGMV_MOE_SHRINK_DECODE_PDL<<<" in binding
     assert "CAKE_BGMV_MOE_SHRINK_PREFILL_PDL<<<" in binding
+    assert "CAKE_BGMV_MOE_SHRINK_PREFILL_S3<<<" in binding
+    assert "CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL<<<" in binding
+    # The four-pair decode shrink (form 1) is gone; the binding rejects the form.
+    assert "SHRINK_DECODE" not in binding
+    assert "kShrinkFormDecode" not in binding
+    assert (
+        "shrink_form == kShrinkFormPrefill || shrink_form == kShrinkFormPrefillS3"
+        in binding
+    )
     # The expand is a programmatic dependent launch of the shrink (PDL): the
     # expand grid may start while the shrink drains and waits in-kernel.
     assert "cudaLaunchKernelEx(&config, expand_kernel_t64," in binding
@@ -483,7 +515,7 @@ def test_route_index_workspace_sizing():
         body = (
             cake_bgmv_moe._get_csrc_dir() / f"cake_bgmv_moe_bf16_h{hidden}.cu"
         ).read_text()
-        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " in body
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " not in body
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN " in body
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL " in body
 
@@ -771,4 +803,7 @@ def test_sm107a_bodies_are_selected_for_the_measured_bf16_shapes_only():
         assert "Target: sm_90a, sm_100a, sm_103a" in shared_body
         assert "ld.global.v8.b32" in wide_body
         assert "ld.global.v8.b32" not in shared_body
-        assert smem_lines(shared_body) == smem_lines(wide_body)
+        # The shared bodies dropped the retired t64 expand kernel and its constant.
+        assert smem_lines(shared_body) == [
+            line for line in smem_lines(wide_body) if "SMEM_EXPAND_T64" not in line
+        ]
