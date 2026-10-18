@@ -4,14 +4,17 @@ Generated programs serve every architecture: per KV layout a runtime metadata
 kernel (SM count, sparse capacity, split width, block size and page size are
 runtime arguments) and an exact-geometry metadata kernel for the production
 geometry (``LIMITS["exact_capacity"]`` sparse blocks of ``LIMITS["sparse_block_kv"]``
-tokens, ``LIMITS["page_kv"]``-token pages) compiled for one exported device SM
-count each (``LIMITS["exact_num_sms"]``; route key ``metadata:<layout>:exact:<sms>``),
-plus the block-scaled logits
-kernel (one per format and layout).  ``MODULES`` registers each program once
+tokens, ``LIMITS["page_kv"]``-token pages) that compiles the exported device SM
+count of each architecture in (``LIMITS["exact_num_sms_by_arch"]``; their union
+``LIMITS["exact_num_sms"]``; route key ``metadata:<layout>:exact:<sms>``), plus the
+block-scaled logits kernel (one per format and layout).  ``MODULES`` registers each program once
 with the architectures it compiles for; ``ROUTES`` maps a logical kernel key
 (``metadata_route_key``, ``logits:<fmt>:<layout>``) to its program; ``LIMITS``
-carries the exported geometry.  Plans bind user tensors once; ``run()`` submits
-on the current PyTorch stream without allocations.
+carries the exported geometry, ``kv_ef_k_max`` (the per-format threshold of
+the paged logits programs' ``kv_ef`` L2-hint gate) and ``pdl_default`` (the
+per-architecture ``"<fmt>:<layout>"`` table of the logits launch's programmatic
+dependent launch default, live when ``pdl_chain`` is true).  Plans bind user
+tensors once; ``run()`` submits on the current PyTorch stream without allocations.
 """
 
 from __future__ import annotations
@@ -23,10 +26,80 @@ import tvm_ffi
 
 # Populated verbatim by the generated-program export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322": {
+    "cake_deepgemm_sparse_mqa_04dfc611d72bc4f90ca1": {
         "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322_binding.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_04dfc611d72bc4f90ca1_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_04dfc611d72bc4f90ca1_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "Starts"],
+            ["buffer", "Ends"],
+            ["buffer", "Context"],
+            ["buffer", "BlockTable"],
+            ["buffer", "Requests"],
+            ["buffer", "Sparse"],
+            ["buffer", "Metadata"],
+            ["buffer", "Workspace"],
+            ["parameter", "num_q_tokens"],
+            ["parameter", "num_kv_tokens"],
+            ["parameter", "block_table_stride"],
+            ["parameter", "num_ctas"],
+            ["parameter", "num_sms"],
+            ["parameter", "sms_divmod"],
+            ["parameter", "num_max_sparse_blocks"],
+            ["parameter", "blocks_per_split"],
+            ["parameter", "split_divmod"],
+            ["parameter", "sparse_block_kv"],
+            ["parameter", "block_shift"],
+            ["parameter", "blocks_per_page"],
+            ["parameter", "page_shift"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_sparse_mqa_145f50b757d66b665119": {
+        "sources": [
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_145f50b757d66b665119_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_145f50b757d66b665119_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "Starts"],
+            ["buffer", "Ends"],
+            ["buffer", "Context"],
+            ["buffer", "BlockTable"],
+            ["buffer", "Requests"],
+            ["buffer", "Sparse"],
+            ["buffer", "Metadata"],
+            ["buffer", "Workspace"],
+            ["parameter", "num_q_tokens"],
+            ["parameter", "num_kv_tokens"],
+            ["parameter", "block_table_stride"],
+            ["parameter", "num_ctas"],
+            ["parameter", "num_sms"],
+            ["parameter", "sms_divmod"],
+            ["parameter", "num_max_sparse_blocks"],
+            ["parameter", "blocks_per_split"],
+            ["parameter", "split_divmod"],
+            ["parameter", "sparse_block_kv"],
+            ["parameter", "block_shift"],
+            ["parameter", "blocks_per_page"],
+            ["parameter", "page_shift"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_sparse_mqa_231ab2b2db576cf301be": {
+        "sources": [
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_231ab2b2db576cf301be_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_231ab2b2db576cf301be_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -43,16 +116,17 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "logits_stride"],
             ["parameter", "kv_page_stride_bytes"],
             ["parameter", "num_sms"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_sparse_mqa_3bfcb411f01cc76113be": {
+    "cake_deepgemm_sparse_mqa_4474bf9d9c1daebfe281": {
         "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_3bfcb411f01cc76113be_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_3bfcb411f01cc76113be_binding.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_4474bf9d9c1daebfe281_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_4474bf9d9c1daebfe281_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -84,10 +158,10 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_sparse_mqa_45284ac27434cdff81f2": {
+    "cake_deepgemm_sparse_mqa_79ed80d8d13d34722b63": {
         "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_45284ac27434cdff81f2_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_45284ac27434cdff81f2_binding.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_79ed80d8d13d34722b63_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_79ed80d8d13d34722b63_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -104,51 +178,17 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "logits_stride"],
             ["parameter", "kv_page_stride_bytes"],
             ["parameter", "num_sms"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_sparse_mqa_63de295a148bfd61dbca": {
+    "cake_deepgemm_sparse_mqa_916b54ba03cd20e2eccd": {
         "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_63de295a148bfd61dbca_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_63de295a148bfd61dbca_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a"],
-    },
-    "cake_deepgemm_sparse_mqa_7824bf2a4a902225d6f8": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_7824bf2a4a902225d6f8_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_7824bf2a4a902225d6f8_binding.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_916b54ba03cd20e2eccd_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_916b54ba03cd20e2eccd_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -165,156 +205,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "logits_stride"],
             ["parameter", "kv_page_stride_bytes"],
             ["parameter", "num_sms"],
+            ["parameter", "kv_ef"],
+            ["launch", "enable_pdl"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_sparse_mqa_902ec6b7ae479462d214": {
+    "cake_deepgemm_sparse_mqa_b44642d30195c7f98868": {
         "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_902ec6b7ae479462d214_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_902ec6b7ae479462d214_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_eddc11afc3a31783d4ab": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_eddc11afc3a31783d4ab_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_eddc11afc3a31783d4ab_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a"],
-    },
-    "cake_deepgemm_sparse_mqa_f9c966dba9fa31868dbb": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_f9c966dba9fa31868dbb_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_f9c966dba9fa31868dbb_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_ff8c1a20aeba51091b1e": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_ff8c1a20aeba51091b1e_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_ff8c1a20aeba51091b1e_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_ff9376991950f1fcab1d": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_ff9376991950f1fcab1d_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_ff9376991950f1fcab1d_binding.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_b44642d30195c7f98868_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_b44642d30195c7f98868_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -331,6 +233,43 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "logits_stride"],
             ["parameter", "kv_page_stride_bytes"],
             ["parameter", "num_sms"],
+            ["parameter", "kv_ef"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_deepgemm_sparse_mqa_f42a1f804d4b5a1998c3": {
+        "sources": [
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_f42a1f804d4b5a1998c3_kernel.cu",
+            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_f42a1f804d4b5a1998c3_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "Starts"],
+            ["buffer", "Ends"],
+            ["buffer", "Context"],
+            ["buffer", "BlockTable"],
+            ["buffer", "Requests"],
+            ["buffer", "Sparse"],
+            ["buffer", "Metadata"],
+            ["buffer", "Workspace"],
+            ["parameter", "num_q_tokens"],
+            ["parameter", "num_kv_tokens"],
+            ["parameter", "block_table_stride"],
+            ["parameter", "num_ctas"],
+            ["parameter", "num_sms"],
+            ["parameter", "sms_divmod"],
+            ["parameter", "num_max_sparse_blocks"],
+            ["parameter", "blocks_per_split"],
+            ["parameter", "split_divmod"],
+            ["parameter", "sparse_block_kv"],
+            ["parameter", "block_shift"],
+            ["parameter", "blocks_per_page"],
+            ["parameter", "page_shift"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -339,16 +278,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
 }
 ROUTES: dict[str, str] = {
-    "logits:mxfp4:contiguous": "cake_deepgemm_sparse_mqa_45284ac27434cdff81f2",
-    "logits:mxfp4:paged": "cake_deepgemm_sparse_mqa_ff9376991950f1fcab1d",
-    "logits:mxfp8:contiguous": "cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322",
-    "logits:mxfp8:paged": "cake_deepgemm_sparse_mqa_7824bf2a4a902225d6f8",
-    "metadata:contiguous": "cake_deepgemm_sparse_mqa_902ec6b7ae479462d214",
-    "metadata:contiguous:exact:148": "cake_deepgemm_sparse_mqa_63de295a148bfd61dbca",
-    "metadata:contiguous:exact:152": "cake_deepgemm_sparse_mqa_f9c966dba9fa31868dbb",
-    "metadata:paged": "cake_deepgemm_sparse_mqa_3bfcb411f01cc76113be",
-    "metadata:paged:exact:148": "cake_deepgemm_sparse_mqa_eddc11afc3a31783d4ab",
-    "metadata:paged:exact:152": "cake_deepgemm_sparse_mqa_ff8c1a20aeba51091b1e",
+    "logits:mxfp4:contiguous": "cake_deepgemm_sparse_mqa_79ed80d8d13d34722b63",
+    "logits:mxfp4:paged": "cake_deepgemm_sparse_mqa_916b54ba03cd20e2eccd",
+    "logits:mxfp8:contiguous": "cake_deepgemm_sparse_mqa_231ab2b2db576cf301be",
+    "logits:mxfp8:paged": "cake_deepgemm_sparse_mqa_b44642d30195c7f98868",
+    "metadata:contiguous": "cake_deepgemm_sparse_mqa_145f50b757d66b665119",
+    "metadata:contiguous:exact:148": "cake_deepgemm_sparse_mqa_4474bf9d9c1daebfe281",
+    "metadata:contiguous:exact:152": "cake_deepgemm_sparse_mqa_4474bf9d9c1daebfe281",
+    "metadata:paged": "cake_deepgemm_sparse_mqa_f42a1f804d4b5a1998c3",
+    "metadata:paged:exact:148": "cake_deepgemm_sparse_mqa_04dfc611d72bc4f90ca1",
+    "metadata:paged:exact:152": "cake_deepgemm_sparse_mqa_04dfc611d72bc4f90ca1",
 }
 LIMITS: dict[str, Any] = {
     "max_sparse_blocks": 2048,
@@ -358,6 +297,23 @@ LIMITS: dict[str, Any] = {
     "heads": 32,
     "exact_capacity": 2048,
     "exact_num_sms": [148, 152],
+    "exact_num_sms_by_arch": {"sm_100a": [148], "sm_103a": [152]},
+    "kv_ef_k_max": {"mxfp4": 32768, "mxfp8": 8192},
+    "pdl_chain": True,
+    "pdl_default": {
+        "sm_100a": {
+            "mxfp4:contiguous": False,
+            "mxfp4:paged": True,
+            "mxfp8:contiguous": False,
+            "mxfp8:paged": True,
+        },
+        "sm_103a": {
+            "mxfp4:contiguous": False,
+            "mxfp4:paged": True,
+            "mxfp8:contiguous": False,
+            "mxfp8:paged": True,
+        },
+    },
 }
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -498,14 +454,20 @@ def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
 
 def exported_exact_sms(arch: str, *, paged: bool) -> tuple[int, ...]:
     """SM counts whose exact-geometry metadata program of the layout is exported for ``arch`` (the device's
-    architecture); ``LIMITS["exact_num_sms"]`` is the union over all architectures."""
+    architecture). One program text per layout serves every architecture, and compiles the architecture's own
+    device SM count into its schedule build (``LIMITS["exact_num_sms_by_arch"]``), so only that count's
+    ``:exact:<sms>`` route is exported for ``arch``; ``LIMITS["exact_num_sms"]`` is the union over all
+    architectures."""
     layout = "paged" if paged else "contiguous"
     prefix = f"metadata:{layout}:exact:"
+    compiled = LIMITS["exact_num_sms_by_arch"].get(arch, ())
     return tuple(
         sorted(
             int(key[len(prefix) :])
             for key, name in ROUTES.items()
-            if key.startswith(prefix) and arch in MODULES[name]["arches"]
+            if key.startswith(prefix)
+            and arch in MODULES[name]["arches"]
+            and int(key[len(prefix) :]) in compiled
         )
     )
 
@@ -538,14 +500,24 @@ def metadata_route_key(
 
 
 def _arguments(record, bindings):
+    # "launch" is a host-side launch option of the generated binding (``enable_pdl``, int 0 / 1), bound in the
+    # plan's own order (before the grid triple) like every other scalar.
     arguments = []
     for kind, key in record["arg_plan"]:
-        if kind not in ("buffer", "tma_buffer", "parameter", "grid"):
+        if kind not in ("buffer", "tma_buffer", "parameter", "launch", "grid"):
             raise NotImplementedError(
                 f"unsupported argument kind {kind!r} in the exported plan"
             )
         arguments.append(bindings[key])
     return tuple(arguments)
+
+
+def logits_takes_pdl(program: str) -> bool:
+    """Whether logits program ``program`` takes the ``enable_pdl`` launch argument (exported with ``LIMITS["pdl_chain"]``)."""
+    return any(
+        (kind, key) == ("launch", "enable_pdl")
+        for kind, key in MODULES[program]["arg_plan"]
+    )
 
 
 def _check_tensors(tensors, device):
@@ -731,6 +703,18 @@ class SparseMetadataPlan:
             self._entry(*self._args)
         return self.metadata
 
+    def kv_context_tokens(self) -> int:
+        """Mean of the per-request KV context lengths bound to this plan, in whole tokens: the paged
+        ``context_lens`` or the contiguous ``ends - starts`` (int64 sum, floor division; the same reduction as
+        the Cake dispatcher's ``kv_context_tokens_mean``).  One device-to-host read; call it outside stream
+        capture.  Later in-place edits of the bound window vectors do not re-resolve it (a construction-time
+        scalar, like every other binding)."""
+        import torch
+
+        _sparse, starts, ends, context_lens = self._retained[:4]
+        lengths = context_lens if self.config["paged"] else ends - starts
+        return int(lengths.sum(dtype=torch.int64).item()) // int(lengths.numel())
+
 
 class SparseMqaPlan:
     """Bind quantized q/kv and emit compressed BF16 logits, metadata generation included.
@@ -745,9 +729,29 @@ class SparseMqaPlan:
     only selected valid slots are written.  ``run()`` submits metadata then logits
     on the current stream.  Do not use one plan's mutable buffers concurrently on
     different streams.
+
+    ``use_pdl`` selects the launch form of the logits kernel: ``None`` (default)
+    takes the exported route's per-(architecture, format, layout) default
+    ``LIMITS["pdl_default"][arch]["<fmt>:<layout>"]``; ``True`` / ``False`` force
+    programmatic dependent launch on / off.  Under programmatic dependent launch
+    the logits kernel is scheduled while the metadata kernel drains and waits on
+    the metadata grid before its first global read, so the output is identical
+    either way.  ``enable_pdl`` records the bound value (``None`` when the
+    exported program takes no such argument).
     """
 
-    def __init__(self, q, sf_q, kv, sf_kv, weights, metadata_plan, *, output=None):
+    def __init__(
+        self,
+        q,
+        sf_q,
+        kv,
+        sf_kv,
+        weights,
+        metadata_plan,
+        *,
+        output=None,
+        use_pdl=None,
+    ):
         import torch
 
         config = metadata_plan.config
@@ -843,6 +847,33 @@ class SparseMqaPlan:
             grid_z=1,
         )
         program = ROUTES[f"logits:{fmt}:{layout}"]
+        if any(key == "kv_ef" for _kind, key in MODULES[program]["arg_plan"]):
+            # K gate of the paged logits programs (Cake SOURCE_SPARSE_KV_EF_GATE, round 38): kv_ef = 1 selects the
+            # evict_first L2 cache hint on the KV-row gather when the mean per-request KV context length is at or
+            # below LIMITS["kv_ef_k_max"][fmt]; eviction priority only, the output is bitwise identical either way.
+            # Resolved once here from the metadata plan's bound window vectors (one device-to-host read, never in
+            # run()); later in-place edits of those vectors do not re-resolve it, like every other scalar binding.
+            bindings["kv_ef"] = (
+                1
+                if metadata_plan.kv_context_tokens() <= LIMITS["kv_ef_k_max"][fmt]
+                else 0
+            )
+        if use_pdl not in (None, True, False):
+            raise ValueError(
+                f"use_pdl must be None (exported default), True or False, got {use_pdl!r}"
+            )
+        if logits_takes_pdl(program):
+            # Programmatic dependent launch of the logits kernel behind the metadata kernel on the same stream: the
+            # exported per-(architecture, format, layout) default of LIMITS["pdl_default"] unless the caller names the
+            # form.  The logits kernel waits on the metadata grid before its first global read; the output is
+            # identical either way.
+            default = LIMITS["pdl_default"][metadata_plan.arch][f"{fmt}:{layout}"]
+            bindings["enable_pdl"] = int(default if use_pdl is None else use_pdl)
+        elif use_pdl:
+            raise NotImplementedError(
+                f"the exported {fmt} {layout} logits program takes no programmatic dependent launch argument"
+            )
+        self.enable_pdl = bindings.get("enable_pdl")
         module, _spec = load_program(metadata_plan.arch, program)
         self.programs = {"metadata": metadata_plan.program, "logits": program}
         self._submissions = (
