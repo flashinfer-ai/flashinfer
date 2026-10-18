@@ -172,10 +172,12 @@ class _Program:
 # (``chunkpar_*``, round 6 item 1a) and the three-phase chunk-parallel
 # program (``chunkpar3_*``, the three-phase program kept as the second
 # chunk-parallel family).  The three exact-scan families ship two schedule
-# variants of every program: the ring program (``<family>_<state>_<mode>``)
-# and the ``_noring`` program (the same kernel built with
-# ``epilogue_ring=False``, bitwise-identical outputs), selected per call by
-# :func:`_exact_scan_variant` from host-known shape quantities.  The two-kernel
+# variants of a program only where :func:`_exact_scan_variant` can select the
+# ``_noring`` one from host-known shape quantities: the ring program
+# (``<family>_<state>_<mode>``) of every (state, mode) and, for those shapes
+# (one-chunk items, so never the two-kernel family; never an f32 state on
+# the varlen path), the ``_noring`` program (the same kernel built with
+# ``epilogue_ring=False``, bitwise-identical outputs).  The two-kernel
 # family also ships the ``_tail`` pair program (the ring kernel launched as
 # 2-CTA clusters that split an odd pair's first item at its middle chunk,
 # bitwise-identical outputs), selected by :func:`tail_selected` for long-item
@@ -197,7 +199,6 @@ _SCAN_MODULES = {
     "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163",
     "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e",
     "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
-    "exact_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_52f48bcff4",
 }
 _EXACTFUSED_MODULES = {
     "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_8c7b44b307",
@@ -211,7 +212,6 @@ _EXACTFUSED_MODULES = {
     "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_8ed0414605",
     "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_7e139175b9",
     "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_a7396a5cd1",
-    "exactfused_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_9a01330fab",
 }
 _CHUNKPAR_MODULES = {
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_85d05a5141",
@@ -228,12 +228,6 @@ _EXACTPRE_MODULES = {
     "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_a3449eb47f",
     "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_e3f2303844",
     "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_4a14185e67",
-    "exactpre_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_noring_de273c1877",
-    "exactpre_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_noring_fcd82e0d5e",
-    "exactpre_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_noring_1359f15e0a",
-    "exactpre_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_noring_82c49c5513",
-    "exactpre_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_noring_2908329d5d",
-    "exactpre_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_noring_2ac9896da5",
     "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_db861d91ee",
     "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_fdfc5e2e6f",
     "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_b1586273cc",
@@ -261,7 +255,6 @@ _EXACTMETA_MODULES = {
     "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_1fbd76a85d",
     "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_eafa9cec60",
     "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_7e139175b9",
-    "exactmeta_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_9a01330fab",
 }
 # The one-launch fused varlen programs (``exactone_*``): the exact scan's fused
 # varlen entries as SM103 renders them -- the main kernel's CTA prologue
@@ -277,7 +270,6 @@ _EXACTONE_MODULES = {
     "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_a44539089a",
     "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0ea2f04df1",
     "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_c99424e391",
-    "exactone_f32_varlen_noring": "mamba_ssd_q_tmem_alias_f32_varlen_noring_0bf916128c",
 }
 # sm_107a (Rubin) device modules of the exported programs, filled by the Cake
 # export: the tcgen05 SMEM descriptor address field is 15 bits on sm_107a
@@ -399,11 +391,10 @@ _EXACTONE_NORING_SMEM_BYTES = 232192
 # ``exact_*_noring``): literals of the round-5 files, not refreshed.
 _EXACT_SMEM_BYTES = 231808
 _EXACT_NORING_SMEM_BYTES = 232448
-# Main dynamic SMEM of the two-kernel exact-scan programs (``exactpre_*``) and
-# of their ``_noring`` twins; refreshed by the Cake export with the
-# ``exactpre_*`` table entries (0 = not exported yet).
+# Main dynamic SMEM of the two-kernel exact-scan programs (``exactpre_*``);
+# refreshed by the Cake export with the ``exactpre_*`` table entries (0 = not
+# exported yet).
 _EXACTPRE_SMEM_BYTES = 232320
-_EXACTPRE_NORING_SMEM_BYTES = 232192
 # Main dynamic SMEM of the tail-wave pair programs (``exactpre_*_tail``: the
 # two-kernel ring programs launched as 2-CTA clusters, with the hand-off
 # mbarrier); refreshed by the Cake export with the ``exactpre_*_tail`` table
@@ -681,7 +672,6 @@ _VARIANT_SMEM_BYTES = {
     ("exactfused", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactmeta", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactone", "noring"): _EXACTONE_NORING_SMEM_BYTES,
-    ("exactpre", "noring"): _EXACTPRE_NORING_SMEM_BYTES,
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
 }
 # Cluster shape of the main kernels (the Cake export checks the generated
@@ -743,8 +733,8 @@ def _program_name(
 ) -> str:
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
-    family (``"noring"`` for the three exact-scan families, ``"tail"`` for
-    the two-kernel exact-scan family)."""
+    family (``"noring"`` for the exact-scan families other than the two-kernel
+    one, ``"tail"`` for the two-kernel exact-scan family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
