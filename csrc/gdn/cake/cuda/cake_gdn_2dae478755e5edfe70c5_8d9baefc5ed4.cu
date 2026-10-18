@@ -15,6 +15,15 @@
 // clang-format off
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
+// The common preamble's fallback helper this module's helper library does not provide; the shared
+// header carries another member's library definition of the name (kept translation-unit-local).
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -35,17 +44,6 @@
 #define SMEM_SSCALAR_STRIDE 32
 #define SMEM_TOTAL 39040
 #define THREADS 128
-// Specializations of this record its compile line does not define (the shipped record carries them in its
-// own text); the values are the record's.
-#define H 16
-#define HV 32
-#define T_STEPS 4
-#define UPDATE_STATE 1
-#define CACHE_INTERMEDIATE_STATES 1
-#define INTERMEDIATE_BATCH_STRIDE 2097152
-#define INTERMEDIATE_TOKEN_STRIDE 524288
-#define STRIDED_INPUTS 1
-#define SCALE 0.08838834764831845
 #ifndef H
 #error "H is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -77,7 +75,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_gdn_decode_pretranspose_mtp_t4_splitv2_tile64(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, float* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long state_stride_p1, long long state_stride_p2, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2)
+kernel_cake_gdn_2dae478755e5edfe70c5(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, float* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, int* __restrict__ output_state_indices, long long state_size_p0, long long state_stride_p0, long long state_stride_p1, long long state_stride_p2, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -129,15 +127,35 @@ kernel_gdn_decode_pretranspose_mtp_t4_splitv2_tile64(__nv_bfloat16* __restrict__
     float r_v[4];
     float r_h[4];
     #pragma unroll
-    for (int copy_iter = 0; copy_iter < 16; copy_iter++) {
-        int copy_seg = copy_iter * 128 + tid;
-        int copy_row = copy_seg / 32;
-        int copy_k_vec = copy_seg - copy_row * 32;
-        int copy_v_row = split_v_base + copy_row;
-        int copy_k_base = copy_k_vec * 4;
-        int copy_dst = sState_addr + (unsigned int)((copy_row * 128 + copy_k_base) * 4);
-        asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-            :: "r"(copy_dst), "l"(state + (read_state_head_base + (long long)copy_v_row * state_stride_p2 + (long long)copy_k_base)));
+    for (int copy_quad = 0; copy_quad < 2; copy_quad++) {
+        #pragma unroll
+        for (int copy_warp = 0; copy_warp < 4; copy_warp++) {
+            int copy_iter = copy_warp * 4 + copy_quad;
+            int copy_seg = copy_iter * 128 + tid;
+            int copy_row = copy_seg / 32;
+            int copy_k_vec = copy_seg - copy_row * 32;
+            int copy_v_row = split_v_base + copy_row;
+            int copy_k_base = copy_k_vec * 4;
+            int copy_dst = sState_addr + (unsigned int)((copy_row * 128 + copy_k_base) * 4);
+            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
+                :: "r"(copy_dst), "l"(state + (read_state_head_base + (long long)copy_v_row * state_stride_p2 + (long long)copy_k_base)));
+        }
+    }
+    asm volatile("cp.async.commit_group;");
+    #pragma unroll
+    for (int copy_quad_1 = 2; copy_quad_1 < 4; copy_quad_1++) {
+        #pragma unroll
+        for (int copy_warp_1 = 0; copy_warp_1 < 4; copy_warp_1++) {
+            int copy_iter_1 = copy_warp_1 * 4 + copy_quad_1;
+            int copy_seg_1 = copy_iter_1 * 128 + tid;
+            int copy_row_1 = copy_seg_1 / 32;
+            int copy_k_vec_1 = copy_seg_1 - copy_row_1 * 32;
+            int copy_v_row_1 = split_v_base + copy_row_1;
+            int copy_k_base_1 = copy_k_vec_1 * 4;
+            int copy_dst_1 = sState_addr + (unsigned int)((copy_row_1 * 128 + copy_k_base_1) * 4);
+            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
+                :: "r"(copy_dst_1), "l"(state + (read_state_head_base + (long long)copy_v_row_1 * state_stride_p2 + (long long)copy_k_base_1)));
+        }
     }
     asm volatile("cp.async.commit_group;");
     int producer_t = warp_local;
@@ -246,10 +264,10 @@ kernel_gdn_decode_pretranspose_mtp_t4_splitv2_tile64(__nv_bfloat16* __restrict__
         sScalar[producer_t * 2] = _expf_3;
         sScalar[producer_t * 2 + 1] = beta_val;
     }
-    asm volatile("cp.async.wait_group 0;");
+    asm volatile("cp.async.wait_group 1;");
     __syncthreads();
     #pragma unroll
-    for (int row_quad = 0; row_quad < 4; row_quad++) {
+    for (int row_quad = 0; row_quad < 2; row_quad++) {
         int local_row_a = warp_local * 16 + row_quad * 4;
         int local_row_b = local_row_a + 1;
         int local_row_c = local_row_a + 2;
@@ -492,6 +510,256 @@ kernel_gdn_decode_pretranspose_mtp_t4_splitv2_tile64(__nv_bfloat16* __restrict__
                 {
                     float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
                     *reinterpret_cast<float4*>((state + (write_state_head_base + (long long)v_row_d * state_stride_p2)) + k_start) = _v4;
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+    #pragma unroll
+    for (int row_quad_1 = 2; row_quad_1 < 4; row_quad_1++) {
+        int local_row_a_1 = warp_local * 16 + row_quad_1 * 4;
+        int local_row_b_1 = local_row_a_1 + 1;
+        int local_row_c_1 = local_row_a_1 + 2;
+        int local_row_d_1 = local_row_a_1 + 3;
+        int v_row_a_1 = split_v_base + local_row_a_1;
+        int v_row_b_1 = split_v_base + local_row_b_1;
+        int v_row_c_1 = split_v_base + local_row_c_1;
+        int v_row_d_1 = split_v_base + local_row_d_1;
+        float2 _f2_33 = make_float2(sState[local_row_a_1 * 128 + k_start], sState[local_row_a_1 * 128 + k_start + 1]);
+        float2 h_a_pair0_1 = _f2_33;
+        float2 _f2_34 = make_float2(sState[local_row_a_1 * 128 + k_start + 2], sState[local_row_a_1 * 128 + k_start + 3]);
+        float2 h_a_pair1_1 = _f2_34;
+        float2 _f2_35 = make_float2(sState[local_row_b_1 * 128 + k_start], sState[local_row_b_1 * 128 + k_start + 1]);
+        float2 h_b_pair0_1 = _f2_35;
+        float2 _f2_36 = make_float2(sState[local_row_b_1 * 128 + k_start + 2], sState[local_row_b_1 * 128 + k_start + 3]);
+        float2 h_b_pair1_1 = _f2_36;
+        float2 _f2_37 = make_float2(sState[local_row_c_1 * 128 + k_start], sState[local_row_c_1 * 128 + k_start + 1]);
+        float2 h_c_pair0_1 = _f2_37;
+        float2 _f2_38 = make_float2(sState[local_row_c_1 * 128 + k_start + 2], sState[local_row_c_1 * 128 + k_start + 3]);
+        float2 h_c_pair1_1 = _f2_38;
+        float2 _f2_39 = make_float2(sState[local_row_d_1 * 128 + k_start], sState[local_row_d_1 * 128 + k_start + 1]);
+        float2 h_d_pair0_1 = _f2_39;
+        float2 _f2_40 = make_float2(sState[local_row_d_1 * 128 + k_start + 2], sState[local_row_d_1 * 128 + k_start + 3]);
+        float2 h_d_pair1_1 = _f2_40;
+        #pragma unroll
+        for (int t_1 = 0; t_1 < T_STEPS; t_1++) {
+            float2 _f2_41 = make_float2(sQ[t_1 * 128 + k_start], sQ[t_1 * 128 + k_start + 1]);
+            float2 q_pair0_0_1 = _f2_41;
+            float2 _f2_42 = make_float2(sQ[t_1 * 128 + k_start + 2], sQ[t_1 * 128 + k_start + 3]);
+            float2 q_pair1_1_1 = _f2_42;
+            float2 _f2_43 = make_float2(sK[t_1 * 128 + k_start], sK[t_1 * 128 + k_start + 1]);
+            float2 k_pair0_2_1 = _f2_43;
+            float2 _f2_44 = make_float2(sK[t_1 * 128 + k_start + 2], sK[t_1 * 128 + k_start + 3]);
+            float2 k_pair1_3_1 = _f2_44;
+            float decay_val_1 = sScalar[t_1 * 2];
+            float beta_val_2 = sScalar[t_1 * 2 + 1];
+            float2 _f2_45 = make_float2(decay_val_1, decay_val_1);
+            float2 decay_pair_1 = _f2_45;
+            float2 _mul_f32x2_12;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_12) : "l"(*(const unsigned long long*)&h_a_pair0_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_a_pair0_1 = _mul_f32x2_12;
+            float2 _mul_f32x2_13;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_13) : "l"(*(const unsigned long long*)&h_a_pair1_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_a_pair1_1 = _mul_f32x2_13;
+            float2 _mul_f32x2_14;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_14) : "l"(*(const unsigned long long*)&h_b_pair0_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_b_pair0_1 = _mul_f32x2_14;
+            float2 _mul_f32x2_15;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_15) : "l"(*(const unsigned long long*)&h_b_pair1_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_b_pair1_1 = _mul_f32x2_15;
+            float2 _mul_f32x2_16;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_16) : "l"(*(const unsigned long long*)&h_c_pair0_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_c_pair0_1 = _mul_f32x2_16;
+            float2 _mul_f32x2_17;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_17) : "l"(*(const unsigned long long*)&h_c_pair1_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_c_pair1_1 = _mul_f32x2_17;
+            float2 _mul_f32x2_18;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_18) : "l"(*(const unsigned long long*)&h_d_pair0_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_d_pair0_1 = _mul_f32x2_18;
+            float2 _mul_f32x2_19;
+            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_19) : "l"(*(const unsigned long long*)&h_d_pair1_1), "l"(*(const unsigned long long*)&decay_pair_1));
+            h_d_pair1_1 = _mul_f32x2_19;
+            float2 _f2_46 = make_float2(0.0f, 0.0f);
+            float2 sum_hk_a_pair_1 = fma_f32x2_rn_ftz(h_a_pair0_1, k_pair0_2_1, _f2_46);
+            sum_hk_a_pair_1 = fma_f32x2_rn_ftz(h_a_pair1_1, k_pair1_3_1, sum_hk_a_pair_1);
+            float2 _f2_47 = make_float2(0.0f, 0.0f);
+            float2 sum_hk_b_pair_1 = fma_f32x2_rn_ftz(h_b_pair0_1, k_pair0_2_1, _f2_47);
+            sum_hk_b_pair_1 = fma_f32x2_rn_ftz(h_b_pair1_1, k_pair1_3_1, sum_hk_b_pair_1);
+            float2 _f2_48 = make_float2(0.0f, 0.0f);
+            float2 sum_hk_c_pair_1 = fma_f32x2_rn_ftz(h_c_pair0_1, k_pair0_2_1, _f2_48);
+            sum_hk_c_pair_1 = fma_f32x2_rn_ftz(h_c_pair1_1, k_pair1_3_1, sum_hk_c_pair_1);
+            float2 _f2_49 = make_float2(0.0f, 0.0f);
+            float2 sum_hk_d_pair_1 = fma_f32x2_rn_ftz(h_d_pair0_1, k_pair0_2_1, _f2_49);
+            sum_hk_d_pair_1 = fma_f32x2_rn_ftz(h_d_pair1_1, k_pair1_3_1, sum_hk_d_pair_1);
+            float sum_hk_a_1 = sum_hk_a_pair_1.x + sum_hk_a_pair_1.y;
+            float sum_hk_b_1 = sum_hk_b_pair_1.x + sum_hk_b_pair_1.y;
+            float sum_hk_c_1 = sum_hk_c_pair_1.x + sum_hk_c_pair_1.y;
+            float sum_hk_d_1 = sum_hk_d_pair_1.x + sum_hk_d_pair_1.y;
+            float _warp_reduce_10 = sum_hk_a_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_10 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_10, offset);
+            sum_hk_a_1 = _warp_reduce_10;
+            float _warp_reduce_11 = sum_hk_b_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_11 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_11, offset);
+            sum_hk_b_1 = _warp_reduce_11;
+            float _warp_reduce_12 = sum_hk_c_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_12 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_12, offset);
+            sum_hk_c_1 = _warp_reduce_12;
+            float _warp_reduce_13 = sum_hk_d_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_13 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_13, offset);
+            sum_hk_d_1 = _warp_reduce_13;
+            float v_val_a_1 = sV[t_1 * 64 + local_row_a_1];
+            float v_val_b_1 = sV[t_1 * 64 + local_row_b_1];
+            float v_val_c_1 = sV[t_1 * 64 + local_row_c_1];
+            float v_val_d_1 = sV[t_1 * 64 + local_row_d_1];
+            float v_new_a_1 = (v_val_a_1 - sum_hk_a_1) * beta_val_2;
+            float v_new_b_1 = (v_val_b_1 - sum_hk_b_1) * beta_val_2;
+            float v_new_c_1 = (v_val_c_1 - sum_hk_c_1) * beta_val_2;
+            float v_new_d_1 = (v_val_d_1 - sum_hk_d_1) * beta_val_2;
+            float2 _f2_50 = make_float2(v_new_a_1, v_new_a_1);
+            float2 v_new_a_pair_1 = _f2_50;
+            float2 _f2_51 = make_float2(v_new_b_1, v_new_b_1);
+            float2 v_new_b_pair_1 = _f2_51;
+            float2 _f2_52 = make_float2(v_new_c_1, v_new_c_1);
+            float2 v_new_c_pair_1 = _f2_52;
+            float2 _f2_53 = make_float2(v_new_d_1, v_new_d_1);
+            float2 v_new_d_pair_1 = _f2_53;
+            h_a_pair0_1 = fma_f32x2_rn_ftz(k_pair0_2_1, v_new_a_pair_1, h_a_pair0_1);
+            h_a_pair1_1 = fma_f32x2_rn_ftz(k_pair1_3_1, v_new_a_pair_1, h_a_pair1_1);
+            h_b_pair0_1 = fma_f32x2_rn_ftz(k_pair0_2_1, v_new_b_pair_1, h_b_pair0_1);
+            h_b_pair1_1 = fma_f32x2_rn_ftz(k_pair1_3_1, v_new_b_pair_1, h_b_pair1_1);
+            h_c_pair0_1 = fma_f32x2_rn_ftz(k_pair0_2_1, v_new_c_pair_1, h_c_pair0_1);
+            h_c_pair1_1 = fma_f32x2_rn_ftz(k_pair1_3_1, v_new_c_pair_1, h_c_pair1_1);
+            h_d_pair0_1 = fma_f32x2_rn_ftz(k_pair0_2_1, v_new_d_pair_1, h_d_pair0_1);
+            h_d_pair1_1 = fma_f32x2_rn_ftz(k_pair1_3_1, v_new_d_pair_1, h_d_pair1_1);
+            if (read_state_slot_valid != 0) {
+                long long cache_head_base_1 = (long long)n * (long long)INTERMEDIATE_BATCH_STRIDE + (long long)t_1 * (long long)INTERMEDIATE_TOKEN_STRIDE + (long long)h * 16384;
+                r_h[0] = h_a_pair0_1.x;
+                r_h[1] = h_a_pair0_1.y;
+                r_h[2] = h_a_pair1_1.x;
+                r_h[3] = h_a_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>(intermediate_state + cache_head_base_1 + (long long)(v_row_a_1 * 128) + (long long)k_start) = _v4;
+                }
+                r_h[0] = h_b_pair0_1.x;
+                r_h[1] = h_b_pair0_1.y;
+                r_h[2] = h_b_pair1_1.x;
+                r_h[3] = h_b_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>(intermediate_state + cache_head_base_1 + (long long)(v_row_b_1 * 128) + (long long)k_start) = _v4;
+                }
+                r_h[0] = h_c_pair0_1.x;
+                r_h[1] = h_c_pair0_1.y;
+                r_h[2] = h_c_pair1_1.x;
+                r_h[3] = h_c_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>(intermediate_state + cache_head_base_1 + (long long)(v_row_c_1 * 128) + (long long)k_start) = _v4;
+                }
+                r_h[0] = h_d_pair0_1.x;
+                r_h[1] = h_d_pair0_1.y;
+                r_h[2] = h_d_pair1_1.x;
+                r_h[3] = h_d_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>(intermediate_state + cache_head_base_1 + (long long)(v_row_d_1 * 128) + (long long)k_start) = _v4;
+                }
+            }
+            float2 _f2_54 = make_float2(0.0f, 0.0f);
+            float2 sum_hq_a_pair_1 = fma_f32x2_rn_ftz(h_a_pair0_1, q_pair0_0_1, _f2_54);
+            sum_hq_a_pair_1 = fma_f32x2_rn_ftz(h_a_pair1_1, q_pair1_1_1, sum_hq_a_pair_1);
+            float2 _f2_55 = make_float2(0.0f, 0.0f);
+            float2 sum_hq_b_pair_1 = fma_f32x2_rn_ftz(h_b_pair0_1, q_pair0_0_1, _f2_55);
+            sum_hq_b_pair_1 = fma_f32x2_rn_ftz(h_b_pair1_1, q_pair1_1_1, sum_hq_b_pair_1);
+            float2 _f2_56 = make_float2(0.0f, 0.0f);
+            float2 sum_hq_c_pair_1 = fma_f32x2_rn_ftz(h_c_pair0_1, q_pair0_0_1, _f2_56);
+            sum_hq_c_pair_1 = fma_f32x2_rn_ftz(h_c_pair1_1, q_pair1_1_1, sum_hq_c_pair_1);
+            float2 _f2_57 = make_float2(0.0f, 0.0f);
+            float2 sum_hq_d_pair_1 = fma_f32x2_rn_ftz(h_d_pair0_1, q_pair0_0_1, _f2_57);
+            sum_hq_d_pair_1 = fma_f32x2_rn_ftz(h_d_pair1_1, q_pair1_1_1, sum_hq_d_pair_1);
+            float sum_hq_a_1 = sum_hq_a_pair_1.x + sum_hq_a_pair_1.y;
+            float sum_hq_b_1 = sum_hq_b_pair_1.x + sum_hq_b_pair_1.y;
+            float sum_hq_c_1 = sum_hq_c_pair_1.x + sum_hq_c_pair_1.y;
+            float sum_hq_d_1 = sum_hq_d_pair_1.x + sum_hq_d_pair_1.y;
+            float _warp_reduce_14 = sum_hq_a_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_14 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_14, offset);
+            sum_hq_a_1 = _warp_reduce_14;
+            float _warp_reduce_15 = sum_hq_b_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_15 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_15, offset);
+            sum_hq_b_1 = _warp_reduce_15;
+            float _warp_reduce_16 = sum_hq_c_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_16 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_16, offset);
+            sum_hq_c_1 = _warp_reduce_16;
+            float _warp_reduce_17 = sum_hq_d_1;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                _warp_reduce_17 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_17, offset);
+            sum_hq_d_1 = _warp_reduce_17;
+            if (lane_local == 0) {
+                if (read_state_slot_valid != 0) {
+                    r_v[0] = sum_hq_a_1;
+                    r_v[1] = sum_hq_b_1;
+                    r_v[2] = sum_hq_c_1;
+                    r_v[3] = sum_hq_d_1;
+                    {
+                        uint2 _pk2;
+                        __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                        _pk[0] = __floats2bfloat162_rn(r_v[0 + 0], r_v[0 + 1]);
+                        _pk[1] = __floats2bfloat162_rn(r_v[0 + 2], r_v[0 + 3]);
+                        *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out + (((n * T_STEPS + t_1) * HV + h) * 128 + v_row_a_1)))[0]) = _pk2;
+                    }
+                }
+            }
+        }
+        if (read_state_slot_valid != 0) {
+            if (write_state_slot_valid != 0) {
+                r_h[0] = h_a_pair0_1.x;
+                r_h[1] = h_a_pair0_1.y;
+                r_h[2] = h_a_pair1_1.x;
+                r_h[3] = h_a_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>((state + (write_state_head_base + (long long)v_row_a_1 * state_stride_p2)) + k_start) = _v4;
+                }
+                r_h[0] = h_b_pair0_1.x;
+                r_h[1] = h_b_pair0_1.y;
+                r_h[2] = h_b_pair1_1.x;
+                r_h[3] = h_b_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>((state + (write_state_head_base + (long long)v_row_b_1 * state_stride_p2)) + k_start) = _v4;
+                }
+                r_h[0] = h_c_pair0_1.x;
+                r_h[1] = h_c_pair0_1.y;
+                r_h[2] = h_c_pair1_1.x;
+                r_h[3] = h_c_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>((state + (write_state_head_base + (long long)v_row_c_1 * state_stride_p2)) + k_start) = _v4;
+                }
+                r_h[0] = h_d_pair0_1.x;
+                r_h[1] = h_d_pair0_1.y;
+                r_h[2] = h_d_pair1_1.x;
+                r_h[3] = h_d_pair1_1.y;
+                {
+                    float4 _v4 = make_float4(r_h[0 + 0], r_h[0 + 1], r_h[0 + 2], r_h[0 + 3]);
+                    *reinterpret_cast<float4*>((state + (write_state_head_base + (long long)v_row_d_1 * state_stride_p2)) + k_start) = _v4;
                 }
             }
         }

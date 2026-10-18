@@ -15,6 +15,15 @@
 // clang-format off
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
+// The common preamble's fallback helper this module's helper library does not provide; the shared
+// header carries another member's library definition of the name (kept translation-unit-local).
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -29,10 +38,6 @@
 #define SMEM_SK_STRIDE 512
 #define SMEM_TOTAL 38016
 #define THREADS 256
-// Specializations of this record its compile line does not define (the shipped record carries them in its
-// own text); the values are the record's.
-#define H 16
-#define HV 32
 #ifndef H
 #error "H is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -46,7 +51,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, long long q_stride_p0, long long k_stride_p0, long long v_stride_p0, long long a_stride_p0, long long b_stride_p0)
+kernel_cake_gdn_63436c3f5a9c7e93218a(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, long long q_stride_p0, long long k_stride_p0, long long v_stride_p0, long long a_stride_p0, long long b_stride_p0)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -70,7 +75,10 @@ kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloa
     const int sK_addr = smem + SMEM_SK_OFF;
 
     // === Task calls (dependency order) ===
-    int state_head = blockIdx.x;
+    int linear_block = blockIdx.x;
+    int state_head = linear_block / 2;
+    int half = linear_block - state_head * 2;
+    int half_v_base = half * 64;
     int n = state_head / HV;
     int h = state_head - n * HV;
     int qk_h = h / (HV / H);
@@ -96,7 +104,7 @@ kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloa
         int copy_v_base = copy_v_vec * 4;
         int copy_dst = sState_addr + (unsigned int)((copy_k * 36 + copy_v_base) * 4);
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-            :: "r"(copy_dst), "l"(state + (state_head_base + (long long)(copy_k * 128) + (long long)copy_v_base)));
+            :: "r"(copy_dst), "l"(state + (state_head_base + (long long)(copy_k * 128) + (long long)half_v_base + (long long)copy_v_base)));
     }
     asm volatile("cp.async.commit_group;");
     if (warp_local == 0) {
@@ -171,15 +179,15 @@ kernel_gdn_decode_nontranspose_fp32_t1(__nv_bfloat16* __restrict__ q, __nv_bfloa
     float _shfl_1 = __shfl_sync(0xFFFFFFFF, beta_lane, 0);
     float beta_val = _shfl_1;
     #pragma unroll
-    for (int tile = 0; tile < 4; tile++) {
+    for (int tile = 0; tile < 2; tile++) {
         int stage = tile % 2;
-        int tile_v_base = tile * 32;
+        int tile_v_base = half_v_base + tile * 32;
         asm volatile("cp.async.wait_group 0;");
         __syncthreads();
-        if (tile + 1 < 4) {
+        if (tile + 1 < 2) {
             int next_tile = tile + 1;
             int next_stage = next_tile % 2;
-            int next_v_base = next_tile * 32;
+            int next_v_base = half_v_base + next_tile * 32;
             #pragma unroll
             for (int copy_iter_1 = 0; copy_iter_1 < 4; copy_iter_1++) {
                 int copy_seg_1 = copy_iter_1 * 256 + tid;
