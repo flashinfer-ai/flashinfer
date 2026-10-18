@@ -43,7 +43,7 @@ def _load_cake_benchmark_module():
 _ATOL = _RTOL = 1e-2
 # Upper bound on the fraction of Cake outputs / final-state entries outside
 # ``atol = rtol = 1e-2`` of the fp64 recurrence.  Measured on GB300 with
-# ``cake_ssd_accuracy_probe.py`` (FP16 delta): <= 0.15 % of the outputs on the
+# ``benchmarks/cake_ssd_accuracy_probe.py`` (FP16 delta): <= 0.15 % of outputs on the
 # ``_case`` distribution, 0.53-0.57 % on the CAKE-950 realistic-decay
 # distribution (CuTe, bf16 delta: <= 0.20 % and 1.34-1.40 %); 0 final-state
 # entries in every case.
@@ -187,7 +187,7 @@ def _assert_cake_accuracy(
     and their outlier sets no longer coincide: elementwise Cake-vs-CuTe parity
     at 1e-2 (the previous oracle) fails on 0.0-0.2 % of the outputs although
     Cake is the more accurate kernel.  Measured on GB300
-    (``cake_ssd_accuracy_probe.py``; outputs outside 1e-2 of the fp64
+    (``benchmarks/cake_ssd_accuracy_probe.py``; outputs outside 1e-2 of the fp64
     recurrence, Cake vs CuTe): H8/G8 batched 23 vs 79 of 131072, H128/G8
     batched S=1024 5352 vs 16813 of 16.8 M, realistic decay varlen 8x128
     0.573 % vs 1.403 %.  CuTe measured against a reference with a bf16-rounded

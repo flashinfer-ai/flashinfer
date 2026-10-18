@@ -80,7 +80,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "ac633d5c418b867c69bdc8ada8ab7084224f1357c990140580a555b95e94dc9a",
         "defines": [],
         "instantiations": {},
     },
@@ -115,7 +114,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "40009ccfacfd7b3ddf971a29d4a0c1c7c30d1ec9ce9f10d11e759abc42235a76",
         "defines": [],
         "instantiations": {},
     },
@@ -146,7 +144,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "7e79daa081015a648aabc05b2216e5b09d3daf17ec41086ac36d60f5065dbacb",
         "defines": [],
         "instantiations": {},
     },
@@ -190,7 +187,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "66a187691c92afe452af60f509506dd19e0a3732a677b3df30bd845419b799de",
         "defines": ["COEFFICIENT_BF16", "INDEX_I32", "PREFETCH_ROWS", "DIM_TILES"],
         "instantiations": {
             "3b6308a422404887": {
@@ -255,7 +251,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "ad886299d19168efa74f7879a586b074aa8c990ef5292ad2df5ff3b4bdc0f5cf",
         "defines": [
             "HEADS_PER_GROUP_STATIC",
             "DIRECT_UNROLL",
@@ -405,7 +400,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "85a247ab778a89506b34947e3c32941f76e5d368052070b6b727423bc04b2e77",
         "defines": [
             "COEFFICIENT_BF16",
             "INDEX_I32",
@@ -505,7 +499,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "139ae38be8d9877f0405d679d5e68887aaa7eb813ac7cd1728b599b7ae094cff",
         "defines": ["COEFFICIENT_BF16", "INDEX_I32", "PREFETCH_ROWS", "DIM_TILES"],
         "instantiations": {
             "3b6308a422404887": {
@@ -558,7 +551,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "0763fc5846da523d666cbc43ea52987ddeb1f55f88b5069fcced77857dc0c7a2",
         "defines": [],
         "instantiations": {},
     },
@@ -1310,15 +1302,15 @@ def _plan_stp_batch(
     dt_softplus,
     disable_state_update,
     pad_slot_id,
-    paired,
     arch,
     device_index,
     sms,
 ) -> Optional[RoutePlan]:
-    """One TMA batch-family launch (direct or persistent) on dense rows at runtime batch strides.
+    """One paired row-major batch-family launch on dense rows at runtime batch strides.
 
-    ``paired`` folds two adjacent 64-row heads into one 128-row program head (``PAIRED_HEADS=1``); the
-    state is then viewed as ``(slots, nheads / 2, 128, 128)``.  One ``shape``/``stride()`` read per tensor.
+    Two adjacent 64-row heads fold into one 128-row program head
+    (``PAIRED_HEADS=1``); the state is viewed as ``(slots, nheads / 2, 128, 128)``.
+    One ``shape``/``stride()`` read per tensor.
     """
     x_shape, x_stride = x.shape, x.stride()
     batch_size = x_shape[0]
@@ -1366,16 +1358,12 @@ def _plan_stp_batch(
         or _dense_rows(z.shape, z.stride(), batch_size, nheads, dim) != x_batch
     ):
         return None
-    program_heads = nheads >> 1 if paired else nheads
+    program_heads = nheads >> 1
     heads_per_group = program_heads // ngroups
-    heads_per_cta = (
-        _paired_heads_per_cta(batch_size * program_heads, sms, arch)
-        if paired
-        else _STP_HEADS_PER_CTA
-    )
+    heads_per_cta = _paired_heads_per_cta(batch_size * program_heads, sms, arch)
     head_tiles = (heads_per_group + heads_per_cta - 1) // heads_per_cta
     total_head_tiles = batch_size * ngroups * head_tiles
-    state_tma = state.view(state.shape[0], program_heads, 128, 128) if paired else state
+    state_tma = state.view(state.shape[0], program_heads, 128, 128)
     bindings = dict(
         state_tma=state_tma,
         x=x,
@@ -1402,24 +1390,13 @@ def _plan_stp_batch(
         disable_state_update=int(disable_state_update),
         pad_slot_id=pad_slot_id,
     )
-    abi = batch_abi_defines(dt.dtype, source.dtype, paired, heads_per_cta)
+    abi = batch_abi_defines(dt.dtype, source.dtype, True, heads_per_cta)
     defines = direct_defines(heads_per_group, total_head_tiles) + abi
-    if paired:
-        # The paired row-major program always runs one CTA per work tile.
-        program, residency = _paired_rows_program(batch_size * program_heads, sms, arch)
-        defines += residency
-        return RoutePlan(
-            program, defines, (total_head_tiles, 1, 1), bindings, arch, device_index
-        )
-    resident = _STP_RESIDENT_CTAS_PER_SM * sms
-    if total_head_tiles > _STP_DIRECT_MAX_RESIDENT_WAVES * resident:
-        workers = _balanced_workers(total_head_tiles, resident)
-        bindings["total_head_tiles"] = total_head_tiles
-        return RoutePlan(
-            "stp_persistent", abi, (workers, 1, 1), bindings, arch, device_index
-        )
+    # The paired row-major program always runs one CTA per work tile.
+    program, residency = _paired_rows_program(batch_size * program_heads, sms, arch)
+    defines += residency
     return RoutePlan(
-        "stp_direct", defines, (total_head_tiles, 1, 1), bindings, arch, device_index
+        program, defines, (total_head_tiles, 1, 1), bindings, arch, device_index
     )
 
 
@@ -1525,7 +1502,6 @@ def _plan_stp_hd64(
             dt_softplus=dt_softplus,
             disable_state_update=disable_state_update,
             pad_slot_id=pad_slot_id,
-            paired=True,
             arch=arch,
             device_index=device_index,
             sms=sms,
