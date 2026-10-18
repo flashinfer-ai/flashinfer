@@ -115,7 +115,7 @@ kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, 
     if (kb_r == 0) {
         kb_r = 1;
     }
-    float acc[EPI_CHUNK];
+    float acc[16];
     #pragma unroll
     for (int i0 = 0; i0 < EPI_CHUNK; i0++) {
         acc[i0] = 0.0f;
@@ -199,3 +199,4 @@ kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, 
 }
 
 } // extern "C"
+

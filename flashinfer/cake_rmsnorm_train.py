@@ -55,266 +55,21 @@ from typing import Optional
 
 import torch
 
+from . import cake_rmsnorm_train_backend as _backend
 from .api_logging import flashinfer_api
-from .jit import cake_rmsnorm_train as _loader
-from .jit.cake_rmsnorm_train import (
-    ARCH_BY_CAPABILITY,
+from .cake_rmsnorm_train_backend import (  # noqa: F401
     ARCHES,
-    BACKWARD_ALIGNMENT_BYTES,
-    FORWARD_ALIGNMENT_BYTES,
-    arch_for_capability,
-    route_applies,
+    SUPPORTED_COMPUTE_CAPABILITIES,
+    CakeRMSNormFunction,
+    cake_rmsnorm_train_backward_workspace,
+    cake_rmsnorm_train_backward_workspace_bytes,
+    is_cake_rmsnorm_train_supported,
     route_key,
-    route_modules,
-    selected_modules,
-    supported_hidden_sizes,
 )
 
-SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
-    sorted(ARCH_BY_CAPABILITY)
-)
-
-
-def _device_index(device: torch.device) -> int:
-    return device.index if device.index is not None else torch.cuda.current_device()
-
-
-def _device_arch(device: torch.device) -> str:
-    if device.type != "cuda":
-        raise ValueError(f"Cake RMSNorm training requires CUDA tensors, got {device}")
-    capability = tuple(torch.cuda.get_device_capability(device))
-    arch = arch_for_capability(capability)
-    if arch is None:
-        raise ValueError(
-            "Cake RMSNorm training supports compute capability "
-            f"{sorted(ARCH_BY_CAPABILITY)} only, got {capability}"
-        )
-    return arch
-
-
-def is_cake_rmsnorm_train_supported(
-    device: torch.device, hidden: Optional[int] = None
-) -> bool:
-    """Whether ``device`` (and optionally ``hidden``) has an exported route."""
-
-    device = torch.device(device)
-    if device.type != "cuda":
-        return False
-    arch = arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
-    if arch is None:
-        return False
-    if hidden is None:
-        return bool(supported_hidden_sizes(arch))
-    return int(hidden) in supported_hidden_sizes(arch)
-
-
-def _validate_tensor(
-    tensor: torch.Tensor,
-    name: str,
-    *,
-    shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if tensor.device != device:
-        raise ValueError(f"{name} must live on {device}, got {tensor.device}")
-    if tensor.dtype != dtype:
-        raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
-    if tuple(tensor.shape) != shape:
-        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
-
-
-def _materialize(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
-    """A contiguous copy whose storage satisfies ``alignment`` (fresh allocations are 256-byte aligned)."""
-
-    out = tensor.contiguous()
-    if out.data_ptr() % alignment:
-        out = out.clone(memory_format=torch.contiguous_format)
-    return out
-
-
-def _kernel_input(
-    tensor: torch.Tensor,
-    name: str,
-    *,
-    rows: int,
-    hidden: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    alignment: int,
-) -> torch.Tensor:
-    """Validate a ``[rows, hidden]`` input of any layout and return what the kernel can read.
-
-    The kernels read a row-strided tensor in place when the feature dimension is
-    contiguous, the storage base is ``alignment``-byte aligned and the row stride
-    in bytes is a multiple of ``alignment`` (``stride(0) == 0`` of an expanded
-    gradient included).  Any other layout -- odd column offset, odd row stride,
-    transposed storage -- is materialized once as a contiguous copy.  A single row
-    never dereferences its row stride and is re-viewed with the canonical stride.
-    """
-
-    _validate_tensor(tensor, name, shape=(rows, hidden), device=device, dtype=dtype)
-    if rows == 0 or hidden == 0:
-        return tensor
-    feature_contiguous = tensor.stride(1) == 1 or hidden == 1
-    if feature_contiguous and tensor.data_ptr() % alignment == 0:
-        if rows == 1:
-            return (
-                tensor
-                if tensor.stride(0) == hidden
-                else tensor.as_strided((1, hidden), (hidden, 1))
-            )
-        row_stride = tensor.stride(0)
-        if (row_stride * tensor.element_size()) % alignment == 0 and (
-            row_stride >= hidden or row_stride == 0
-        ):
-            return tensor
-    return _materialize(tensor, alignment)
-
-
-def _contiguous_input(
-    tensor: torch.Tensor,
-    name: str,
-    *,
-    shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    alignment: int,
-) -> torch.Tensor:
-    """Validate a small input (``w``, ``rstd``); contiguous and aligned in place, else a copy."""
-
-    _validate_tensor(tensor, name, shape=shape, device=device, dtype=dtype)
-    if tensor.numel() == 0 or (
-        tensor.is_contiguous() and tensor.data_ptr() % alignment == 0
-    ):
-        return tensor
-    return _materialize(tensor, alignment)
-
-
-def _output_buffer(
-    tensor: Optional[torch.Tensor],
-    name: str,
-    *,
-    shape: tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    alignment: int,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """``(kernel buffer, user buffer to copy back into or None)``.
-
-    A caller-provided output of any layout is honoured: the kernel writes a
-    contiguous aligned buffer directly when the caller's tensor is one, otherwise
-    into a temporary that is copied back into the caller's view after the launch.
-    """
-
-    if tensor is None:
-        return torch.empty(shape, dtype=dtype, device=device), None
-    _validate_tensor(tensor, name, shape=shape, device=device, dtype=dtype)
-    if tensor.numel() == 0 or (
-        tensor.is_contiguous() and tensor.data_ptr() % alignment == 0
-    ):
-        return tensor, None
-    return torch.empty(shape, dtype=dtype, device=device), tensor
-
-
-def _copy_back(pairs: list[tuple[torch.Tensor, Optional[torch.Tensor]]]) -> None:
-    for kernel_buffer, user_buffer in pairs:
-        if user_buffer is not None:
-            user_buffer.copy_(kernel_buffer)
-
-
-def _backward_module_records(arch: str, hidden: int, residual: bool) -> list[dict]:
-    return [
-        _loader.MODULES[name] for name in route_modules(arch, hidden, "bwd", residual)
-    ]
-
-
-def _workspace_record(arch: str, hidden: int, residual: bool) -> dict:
-    """The backward module that owns the partial / counter workspace."""
-
-    owners = [
-        record
-        for record in _backward_module_records(arch, hidden, residual)
-        if record.get("workspace_rule") is not None
-    ]
-    if len(owners) != 1:
-        raise RuntimeError(
-            f"the exported backward route for hidden={hidden} declares "
-            f"{len(owners)} workspace owners; expected exactly one"
-        )
-    return owners[0]
-
-
-def cake_rmsnorm_train_backward_workspace_bytes(
-    rows: int, hidden: int, device: torch.device, *, residual: bool = False
-) -> int:
-    """Bytes of the caller-owned backward workspace of width ``hidden`` on ``device``.
-
-    The workspace holds the FP32 per-chunk ``dw`` partials (one row per CTA of
-    the persistent backward grid, sized for the device's largest chunk count
-    so it is independent of ``rows``) followed by the ``uint32`` completion
-    counters.  Counters must be zero on first use (allocate with
-    ``torch.zeros`` or use :func:`cake_rmsnorm_train_backward_workspace`); the
-    kernels leave them zero, so the same buffer is reusable across calls, any
-    token count and CUDA Graph replays without host writes.
-    """
-
-    device = torch.device(device)
-    rows = int(rows)
-    hidden = int(hidden)
-    if rows < 0:
-        raise ValueError("rows must be non-negative")
-    arch = _device_arch(device)
-    record = _workspace_record(arch, hidden, residual)
-    layout = _loader.workspace_layout(
-        record, max(rows, 1), device_index=_device_index(device)
-    )
-    return int(layout["total_bytes"])
-
-
-def cake_rmsnorm_train_backward_workspace(
-    rows: int, hidden: int, device: torch.device, *, residual: bool = False
-) -> torch.Tensor:
-    """Allocate a zero-initialized backward workspace (see ``..._workspace_bytes``)."""
-
-    nbytes = cake_rmsnorm_train_backward_workspace_bytes(
-        rows, hidden, device, residual=residual
-    )
-    return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
-
-
-def _workspace_views(
-    workspace: torch.Tensor, record: dict, *, rows: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
-    layout = _loader.workspace_layout(record, rows, device_index=_device_index(device))
-    if not isinstance(workspace, torch.Tensor):
-        raise TypeError("workspace must be a torch.Tensor")
-    if (
-        workspace.device != device
-        or workspace.dtype != torch.uint8
-        or workspace.ndim != 1
-    ):
-        raise ValueError(
-            f"workspace must be a 1-D uint8 CUDA tensor on {device}, got "
-            f"{workspace.dtype} {tuple(workspace.shape)} on {workspace.device}"
-        )
-    if not workspace.is_contiguous() or workspace.data_ptr() % 256 != 0:
-        raise ValueError("workspace must be contiguous and 256-byte aligned")
-    if workspace.numel() < layout["total_bytes"]:
-        raise ValueError(
-            f"workspace holds {workspace.numel()} bytes; this call needs "
-            f"{layout['total_bytes']} (cake_rmsnorm_train_backward_workspace_bytes)"
-        )
-    hidden = int(record["hidden"])
-    partial = workspace[: 4 * layout["n_chunks"] * hidden].view(torch.float32)
-    partial = partial.view(layout["n_chunks"], hidden)
-    begin = layout["counters_offset"]
-    counters = workspace[begin : begin + 4 * max(layout["counters"], 1)].view(
-        torch.uint32
-    )
-    return partial, counters, layout
+# The three stable entry points are real ``def``s here (public-API tooling reads the
+# decorated signatures of this module); their bodies live in the self-contained
+# backend package next to the generated CUDA sources.
 
 
 @flashinfer_api
@@ -358,103 +113,9 @@ def cake_rmsnorm_train_forward(
     needs; no other ``[T, H]`` temporary is produced.
     """
 
-    if not isinstance(x, torch.Tensor) or x.ndim != 2:
-        raise ValueError("x must be a [T, H] tensor")
-    device = x.device
-    rows, hidden = int(x.shape[0]), int(x.shape[1])
-    arch = _device_arch(device)
-    has_residual = residual is not None
-    align = FORWARD_ALIGNMENT_BYTES
-    x = _kernel_input(
-        x,
-        "x",
-        rows=rows,
-        hidden=hidden,
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=align,
+    return _backend.cake_rmsnorm_train_forward(
+        x, w, eps, residual=residual, out=out, rstd=rstd, residual_out=residual_out
     )
-    w = _contiguous_input(
-        w,
-        "w",
-        shape=(hidden,),
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=BACKWARD_ALIGNMENT_BYTES,
-    )
-    if has_residual:
-        residual = _kernel_input(
-            residual,
-            "residual",
-            rows=rows,
-            hidden=hidden,
-            device=device,
-            dtype=torch.bfloat16,
-            alignment=align,
-        )
-    if not route_applies(
-        device_capability=tuple(torch.cuda.get_device_capability(device)),
-        hidden=hidden,
-        kind="fwd",
-        residual=has_residual,
-    ):
-        raise ValueError(
-            f"no exported Cake RMSNorm training forward for hidden={hidden} "
-            f"(residual={has_residual}) on {arch}; supported hidden sizes: "
-            f"{supported_hidden_sizes(arch)}"
-        )
-    out, out_user = _output_buffer(
-        out,
-        "out",
-        shape=(rows, hidden),
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=align,
-    )
-    rstd, rstd_user = _output_buffer(
-        rstd,
-        "rstd",
-        shape=(rows,),
-        device=device,
-        dtype=torch.float32,
-        alignment=BACKWARD_ALIGNMENT_BYTES,
-    )
-    residual_out_user = None
-    if has_residual:
-        residual_out, residual_out_user = _output_buffer(
-            residual_out,
-            "residual_out",
-            shape=(rows, hidden),
-            device=device,
-            dtype=torch.bfloat16,
-            alignment=align,
-        )
-    copy_backs = [(out, out_user), (rstd, rstd_user), (residual_out, residual_out_user)]
-    results = tuple(
-        user if user is not None else kernel
-        for kernel, user in copy_backs[: 3 if has_residual else 2]
-    )
-    if rows == 0:
-        return results
-    # The plain kernel keeps the residual parameters in its signature and never
-    # reads them: bind them to ``x`` / ``y`` / 0 exactly like the source launcher.
-    values: dict[str, object] = {
-        "x": x,
-        "w": w,
-        "y": out,
-        "r": rstd,
-        "rows": rows,
-        "eps": float(eps),
-        "x_stride": int(x.stride(0)),
-        "u": residual if has_residual else x,
-        "h_new": residual_out if has_residual else out,
-        "u_stride": int(residual.stride(0)) if has_residual else 0,
-    }
-    device_index = _device_index(device)
-    for name in selected_modules(arch, hidden, "fwd", has_residual, rows=rows):
-        _loader.run_module(name, values, rows=rows, device_index=device_index)
-    _copy_back(copy_backs)
-    return results
 
 
 @flashinfer_api
@@ -507,153 +168,17 @@ def cake_rmsnorm_train_backward(
     For a fixed token count and architecture ``dw`` is bitwise reproducible.
     """
 
-    if not deterministic:
-        raise ValueError(
-            "cake_rmsnorm_train_backward exports only the deterministic dw reduction"
-        )
-    if not isinstance(x, torch.Tensor) or x.ndim != 2:
-        raise ValueError("x must be a [T, H] tensor")
-    device = x.device
-    rows, hidden = int(x.shape[0]), int(x.shape[1])
-    arch = _device_arch(device)
-    has_residual = g_residual is not None
-    align = BACKWARD_ALIGNMENT_BYTES
-    x = _kernel_input(
-        x,
-        "x",
-        rows=rows,
-        hidden=hidden,
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=align,
-    )
-    w = _contiguous_input(
-        w, "w", shape=(hidden,), device=device, dtype=torch.bfloat16, alignment=align
-    )
-    rstd = _contiguous_input(
-        rstd, "rstd", shape=(rows,), device=device, dtype=torch.float32, alignment=4
-    )
-    g = _kernel_input(
+    return _backend.cake_rmsnorm_train_backward(
         g,
-        "g",
-        rows=rows,
-        hidden=hidden,
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=align,
+        x,
+        w,
+        rstd,
+        deterministic=deterministic,
+        g_residual=g_residual,
+        workspace=workspace,
+        dx=dx,
+        dw=dw,
     )
-    if has_residual:
-        g_residual = _kernel_input(
-            g_residual,
-            "g_residual",
-            rows=rows,
-            hidden=hidden,
-            device=device,
-            dtype=torch.bfloat16,
-            alignment=align,
-        )
-    if not route_applies(
-        device_capability=tuple(torch.cuda.get_device_capability(device)),
-        hidden=hidden,
-        kind="bwd",
-        residual=has_residual,
-    ):
-        raise ValueError(
-            f"no exported Cake RMSNorm training backward for hidden={hidden} "
-            f"(residual={has_residual}) on {arch}; supported hidden sizes: "
-            f"{supported_hidden_sizes(arch)}"
-        )
-    dx, dx_user = _output_buffer(
-        dx,
-        "dx",
-        shape=(rows, hidden),
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=align,
-    )
-    dw, dw_user = _output_buffer(
-        dw, "dw", shape=(hidden,), device=device, dtype=torch.float32, alignment=align
-    )
-    copy_backs = [(dx, dx_user), (dw, dw_user)]
-    dx_result = dx_user if dx_user is not None else dx
-    dw_result = dw_user if dw_user is not None else dw
-    if rows == 0:
-        dw_result.zero_()
-        return dx_result, dw_result
-    record = _workspace_record(arch, hidden, has_residual)
-    if workspace is None:
-        workspace = cake_rmsnorm_train_backward_workspace(
-            rows, hidden, device, residual=has_residual
-        )
-    partial, counters, layout = _workspace_views(
-        workspace, record, rows=rows, device=device
-    )
-    # The plain kernel keeps the residual-gradient parameters in its signature
-    # and never reads them: bind them to ``g`` exactly like the source launcher.
-    g_h = g_residual if has_residual else g
-    values: dict[str, object] = {
-        "g": g,
-        "x": x,
-        "w": w,
-        "r": rstd,
-        "dx": dx,
-        "dw": dw,
-        "partial": partial,
-        "counters": counters,
-        "g_h": g_h,
-        "rows": rows,
-        "g_stride": int(g.stride(0)),
-        "x_stride": int(x.stride(0)),
-        "g_h_stride": int(g_h.stride(0)),
-        "n_chunks": int(layout["n_chunks"]),
-        "rows_per_chunk": int(layout["rows_per_chunk"]),
-    }
-    device_index = _device_index(device)
-    for name in selected_modules(arch, hidden, "bwd", has_residual, rows=rows):
-        _loader.run_module(name, values, rows=rows, device_index=device_index)
-    _copy_back(copy_backs)
-    return dx_result, dw_result
-
-
-class CakeRMSNormFunction(torch.autograd.Function):
-    """Autograd wrapper saving only ``(x_or_h_new, w, rstd)`` for the backward.
-
-    ``forward(x, w, eps, residual=None, deterministic=True)`` returns ``y`` or
-    ``(y, h_new)``.  In residual mode the gradient of ``x`` and of ``residual``
-    is the same tensor (``dx + g_h_new``).  The weight gradient is accumulated
-    in FP32 by the kernel and returned in ``w.dtype``.
-    """
-
-    @staticmethod
-    def forward(ctx, x, w, eps, residual=None, deterministic=True):
-        outputs = cake_rmsnorm_train_forward(x, w, eps, residual=residual)
-        y, rstd = outputs[0], outputs[1]
-        normalized = outputs[2] if residual is not None else x
-        ctx.save_for_backward(normalized, w, rstd)
-        ctx.deterministic = bool(deterministic)
-        ctx.has_residual = residual is not None
-        if residual is not None:
-            return y, outputs[2]
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_y, *grad_rest):
-        normalized, w, rstd = ctx.saved_tensors
-        grad_h = None
-        if ctx.has_residual and grad_rest and grad_rest[0] is not None:
-            grad_h = grad_rest[0].to(torch.bfloat16)
-        if grad_y is None:
-            grad_y = torch.zeros_like(normalized)
-        dx, dw = cake_rmsnorm_train_backward(
-            grad_y.to(torch.bfloat16),
-            normalized,
-            w,
-            rstd,
-            deterministic=ctx.deterministic,
-            g_residual=grad_h,
-        )
-        dw = dw if w.dtype == torch.float32 else dw.to(w.dtype)
-        return dx, dw, None, (dx if ctx.has_residual else None), None
 
 
 @flashinfer_api
@@ -689,7 +214,9 @@ def cake_rmsnorm(
         kernels of :func:`cake_rmsnorm_train_backward`.
     """
 
-    return CakeRMSNormFunction.apply(x, w, eps, residual, deterministic)
+    return _backend.cake_rmsnorm(
+        x, w, eps, residual=residual, deterministic=deterministic
+    )
 
 
 __all__ = [

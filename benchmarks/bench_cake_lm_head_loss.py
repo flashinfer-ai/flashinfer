@@ -66,6 +66,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
+from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss  # noqa: E402
 from flashinfer.experimental.cake_lm_head_loss import cake_backend  # noqa: E402
@@ -475,13 +476,26 @@ class ArmCake(ArmAutograd):
         self.abi = cake_backend.record_abi(record)
 
     def versions(self):
+        # the switches this arm runs with: the public module's resolution of its FLASHINFER_CAKE_LM_HEAD_LOSS_*
+        # variables (every keyword left at None), which it passes down to the backend
+        switches = public_lm_head._resolve_knobs(
+            compact_rows=None,
+            fuse_dw_cast=None,
+            dx_finalize=None,
+            dw_stream=None,
+            hidden_count=None,
+            gemm_tuning=None,
+        )
         return dict(
             module=self.module_name,
             abi=self.abi,
-            stages=list(cake_backend.stages_for_entry(self.entry)),
-            compact_rows=cake_backend.compact_rows_default(),
-            fuse_dw_cast=cake_backend.fuse_dw_cast_default(),
-        )  # valid-row compaction (the labels carry ignored rows); fused weight-gradient cast
+            stages=list(
+                cake_backend.stages_for_entry(
+                    self.entry, fuse_dw_cast=switches["fuse_dw_cast"]
+                )
+            ),
+            **switches,
+        )
 
     def forward(self):
         inp = self.inp

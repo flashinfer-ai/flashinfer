@@ -17,8 +17,13 @@ submission with the per-stage programmatic-dependent-launch attributes intact.
 standalone program, so it returns a real schedule (unlike the SM100 dense
 family's placeholder).
 
-Routes are selected from host-known scalars only: head count, page size and
-``next_n``.  Output: FP32 ``[B * next_n, paged_logits_stride(max_context_len)]``
+Routes are selected from host-known scalars only: head count, page size,
+``next_n``, the batch (``context_lens.shape[0]``) and the optional
+``max_context_hint``.  The batch, the head count and the hint pick the Q-atom
+schedule of a ``(H, page_kv, next_n)`` geometry through
+the catalog's ``atom_rule`` (:func:`atom_variant`); the route name carries the
+realised atom (``...:n5:a5``).  Output: FP32
+``[B * next_n, paged_logits_stride(max_context_len)]``
 with DeepGEMM's ``clean_logits=False`` semantics -- positions at or past a
 token's own context length carry unspecified values and the consumer masks by
 length.  Consume ``plan.logical_output`` (``[:, :max_context_len]``).
@@ -84,26 +89,114 @@ def max_batch():
     return int(policy()["max_batch"])
 
 
-def next_n_atoms(next_n):
-    """``num_next_n_atoms`` of the Q-atom rule for ``next_n`` (catalog rule).
+def atom_rule():
+    """The catalog's Q-atom selection rule (data, evaluated here without the producer).
 
-    Independent of the head count and the page size, so the metadata entry keeps
-    DeepGEMM's ``(context_lens, block_kv, num_sms)`` signature.
+    ``batch_class_min[i]`` is the first batch of batch class ``i`` (the last
+    class is open up to ``max_batch()``); ``selection["h<H>:n<N>"][i]`` the
+    atom variant (``"a<tokens per Q atom>"``) that class selects for a head
+    count and ``next_n``; ``num_atoms["n<N>:a<A>"]`` the ``num_next_n_atoms``
+    of that variant's schedule.  ``long_context_min_kv`` and ``selection_long``
+    (R3): when the caller passes ``max_context_hint`` -- an upper bound of the
+    batch's context lengths in KV tokens -- of at least ``long_context_min_kv``,
+    ``selection_long`` replaces ``selection`` (it differs only for batches 2..8,
+    where the native-atom programs are selected).  The exporter derives every
+    value from the kernel's own rule, so this is the single source of truth on
+    the host.
     """
-    rule = policy()["next_n_atoms"]
-    key = str(int(next_n))
-    if key not in rule:
+    return policy()["atom_rule"]
+
+
+def _selection_table(max_context_hint):
+    """The variant table ``max_context_hint`` selects (``None`` = batch-only)."""
+    rule = atom_rule()
+    if max_context_hint is None:
+        return rule["selection"]
+    hint = int(max_context_hint)
+    if hint < 1:
         raise ValueError(
-            f"next_n = {next_n} has no exported program; exported: {sorted(rule)}"
+            f"max_context_hint must be a positive KV length, got {max_context_hint}"
         )
-    return int(rule[key])
+    if hint >= int(rule["long_context_min_kv"]):
+        return rule["selection_long"]
+    return rule["selection"]
 
 
-def route_name(num_heads, page_kv, next_n, logits_dtype="float32"):
-    """Logical route of a problem (host-known scalars only)."""
+def batch_class(batch):
+    """Index of the batch class ``batch`` requests fall into."""
+    batch = int(batch)
+    if batch < 1:
+        raise ValueError("batch must be at least one request")
+    starts = [int(v) for v in atom_rule()["batch_class_min"]]
+    return sum(1 for start in starts if batch >= start) - 1
+
+
+def atom_variant(num_heads, next_n, batch, max_context_hint=None):
+    """Q-atom variant (``"a<N>"``) the catalog selects for (heads, next_n, batch).
+
+    ``max_context_hint`` (R3): the caller's upper bound of the batch's context
+    lengths; at or above ``atom_rule()["long_context_min_kv"]`` the long-context
+    table applies (batches 2..8 take the native-atom programs).  ``None`` keeps
+    the batch-only selection.
+    """
+    selection = _selection_table(max_context_hint)
+    key = f"h{int(num_heads)}:n{int(next_n)}"
+    if key not in selection:
+        raise ValueError(
+            f"no exported program for {num_heads} heads and next_n = {next_n}; "
+            f"exported: {sorted(selection)}"
+        )
+    return str(selection[key][batch_class(batch)])
+
+
+def next_n_atoms(next_n, batch, num_heads=None, max_context_hint=None):
+    """``num_next_n_atoms`` of the schedule for ``(next_n, batch[, num_heads, hint])``.
+
+    The head count is optional exactly where every exported head count selects
+    the same Q-atom schedule for this ``(next_n, batch class)`` -- ``next_n``
+    1-4 at every batch and every ``next_n`` at small batch -- which keeps
+    DeepGEMM's ``(context_lens, block_kv, num_sms)`` metadata signature there.
+    Where the head counts differ (``next_n`` 5 and 6 above the small-batch
+    bound, and at batches 2..8 once ``max_context_hint`` reaches the
+    long-context bound) ``num_heads`` is required and a ``ValueError`` says so.
+    ``max_context_hint`` must be the value the logits call of the same decode
+    step receives: the schedule carries no atom count, so the two calls agree
+    only by construction.
+    """
+    selection = _selection_table(max_context_hint)
+    heads = exported_heads() if num_heads is None else (int(num_heads),)
+    variants = {}
+    for candidate in heads:
+        key = f"h{candidate}:n{int(next_n)}"
+        if key in selection:
+            variants[candidate] = str(selection[key][batch_class(batch)])
+        elif num_heads is not None:
+            raise ValueError(
+                f"no exported program for {num_heads} heads and next_n = {next_n}; "
+                f"exported: {sorted(selection)}"
+            )
+    if not variants:
+        raise ValueError(
+            f"next_n = {next_n} has no exported program; exported: {sorted(selection)}"
+        )
+    if len(set(variants.values())) != 1:
+        raise ValueError(
+            f"num_heads is required for next_n = {next_n} at batch {batch} "
+            f"(max_context_hint={max_context_hint}): the exported head counts "
+            f"select different Q-atom schedules {variants}"
+        )
+    variant = next(iter(variants.values()))
+    return int(atom_rule()["num_atoms"][f"n{int(next_n)}:{variant}"])
+
+
+def route_name(
+    num_heads, page_kv, next_n, batch, logits_dtype="float32", max_context_hint=None
+):
+    """Logical route of a problem (host-known scalars only, incl. the batch)."""
     if logits_dtype not in LOGITS_DTYPES:
         raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
-    return f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}"
+    variant = atom_variant(num_heads, next_n, batch, max_context_hint)
+    return f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}:{variant}"
 
 
 def metadata_route_name():
@@ -111,16 +204,44 @@ def metadata_route_name():
     return str(policy()["metadata_route"])
 
 
-def route_available(num_heads, page_kv, next_n, logits_dtype="float32"):
-    """True when the shipped catalog carries this paged route (host-only)."""
+def route_available(
+    num_heads,
+    page_kv,
+    next_n,
+    batch=None,
+    logits_dtype="float32",
+    max_context_hint=None,
+):
+    """True when the shipped catalog carries this paged route (host-only).
+
+    With ``batch`` the exact variant route (of ``batch`` and the optional
+    ``max_context_hint``) is checked; without it, whether any variant of the
+    ``(heads, page_kv, next_n)`` geometry is shipped.
+    """
     try:
         if num_heads not in exported_heads() or page_kv not in exported_page_sizes():
             return False
-        next_n_atoms(next_n)
-        route = route_name(num_heads, page_kv, next_n, logits_dtype)
+        if logits_dtype not in LOGITS_DTYPES:
+            return False
+        selection = atom_rule()["selection"]
+        key = f"h{int(num_heads)}:n{int(next_n)}"
+        if key not in selection:
+            return False
+        if batch is None:
+            variants = list(
+                dict.fromkeys(
+                    str(v)
+                    for v in list(selection[key])
+                    + list(atom_rule()["selection_long"][key])
+                )
+            )
+        else:
+            variants = [atom_variant(num_heads, next_n, batch, max_context_hint)]
     except ValueError:
         return False
-    return route in _catalog()["routes"]
+    routes = _catalog()["routes"]
+    prefix = f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}"
+    return any(f"{prefix}:{variant}" in routes for variant in variants)
 
 
 def paged_logits_stride(max_context_len):
@@ -408,15 +529,22 @@ def fused_cache_rows(kv_cache, page_kv=None):
     return fused, pages, page_kv, block_stride_bytes
 
 
-def metadata_bindings(context_lens, schedule_meta, *, num_sms):
-    """Argument plan of the scheduler stage (one warp, grid (1, 1, 1))."""
+def metadata_bindings(
+    context_lens, schedule_meta, *, num_sms, num_heads=None, max_context_hint=None
+):
+    """Argument plan of the scheduler stage (one warp, grid (1, 1, 1)).
+
+    The schedule is sized for the Q-atom variant of ``(num_heads, next_n,
+    batch[, max_context_hint])``; ``num_heads`` may be omitted where
+    :func:`next_n_atoms` resolves without it.
+    """
     batch, next_n = (int(v) for v in context_lens.shape)
     return dict(
         context_lens=context_lens.reshape(-1),
         schedule_meta=schedule_meta.reshape(-1),
         batch_size=batch,
         next_n=next_n,
-        num_next_n_atoms=next_n_atoms(next_n),
+        num_next_n_atoms=next_n_atoms(next_n, batch, num_heads, max_context_hint),
         split_kv=split_kv(),
         num_sms=int(num_sms),
         grid_x=1,
@@ -468,28 +596,51 @@ class Sm120MetadataPlan:
 
     ``context_lens`` int32 ``[B, next_n]``; ``page_kv`` an exported page size
     with an exported ``next_n``; ``num_sms`` the CTA budget of the logits call
-    the schedule is built for (``None`` = the device's SM count).  ``out`` is an
+    the schedule is built for (``None`` = the device's SM count).  ``num_heads``
+    selects the Q-atom schedule together with ``B`` and ``next_n``; it may be
+    omitted where every exported head count selects the same schedule
+    (:func:`next_n_atoms`), otherwise a ``ValueError`` names it.
+    ``max_context_hint`` (R3) is the caller's upper bound of the batch's context
+    lengths; it selects the long-context Q-atom schedule at batches 2..8 and
+    must equal the hint of the logits call this schedule serves.  ``out`` is an
     int32 ``[num_sms + 1, 2]`` buffer, allocated when not supplied.  ``run()``
     submits one launch on the current PyTorch stream and returns it.
     """
 
-    def __init__(self, context_lens, page_kv, num_sms=None, *, out=None):
+    def __init__(
+        self,
+        context_lens,
+        page_kv,
+        num_sms=None,
+        *,
+        num_heads=None,
+        max_context_hint=None,
+        out=None,
+    ):
         import torch
 
         arch, num_sms = _resolve_device(context_lens, num_sms)
-        _batch, next_n = _check_context_lens(context_lens)
+        batch, next_n = _check_context_lens(context_lens)
         if int(page_kv) not in exported_page_sizes():
             raise ValueError(
                 f"page_kv {page_kv} is not exported; exported page sizes: {exported_page_sizes()}"
             )
-        next_n_atoms(next_n)
+        if num_heads is not None and int(num_heads) not in exported_heads():
+            raise ValueError(
+                f"{num_heads} heads is not exported; exported head counts: {exported_heads()}"
+            )
+        self.num_next_n_atoms = next_n_atoms(next_n, batch, num_heads, max_context_hint)
+        self.max_context_hint = (
+            None if max_context_hint is None else int(max_context_hint)
+        )
         if out is None:
             out = torch.empty(
                 metadata_shape(num_sms), dtype=torch.int32, device=context_lens.device
             )
         _check_schedule_meta(out, num_sms, context_lens.device)
         self.arch, self.num_sms = arch, num_sms
-        self.page_kv, self.next_n = int(page_kv), next_n
+        self.page_kv, self.next_n, self.batch = int(page_kv), next_n, batch
+        self.num_heads = None if num_heads is None else int(num_heads)
         self.route_name = metadata_route_name()
         self.route = _catalog()["routes"][self.route_name]
         stages = list(self.route["stages"])
@@ -500,7 +651,13 @@ class Sm120MetadataPlan:
         if self.route.get("sequence"):
             raise ValueError("the metadata route must not be a prepared sequence")
         bindings = {
-            "metadata": metadata_bindings(context_lens, out, num_sms=num_sms),
+            "metadata": metadata_bindings(
+                context_lens,
+                out,
+                num_sms=num_sms,
+                num_heads=num_heads,
+                max_context_hint=max_context_hint,
+            ),
         }
         self._submissions, self._programs = [], []
         self.program_names = [program for _stage, program in stages]
@@ -536,7 +693,11 @@ class Sm120PagedIndexerPlan:
     ``[B, next_n]`` contiguous; ``block_table`` int32 ``[B, S]`` with
     ``stride(1) == 1`` (any row stride, e.g. an engine's ``[::next_n]`` view);
     ``1 <= max_context_len <= S * page_kv``.  The route is
-    ``(H, page_kv, next_n)`` and must be shipped (:func:`route_available`).
+    ``(H, page_kv, next_n)`` plus the Q-atom variant the catalog rule selects
+    from ``(H, next_n, B)`` and the optional ``max_context_hint`` (R3: an upper
+    bound of the batch's context lengths; from ``long_context_min_kv`` up,
+    batches 2..8 take the large-batch atoms) and must be shipped
+    (:func:`route_available`).
 
     ``output`` (FP32 ``[B * next_n, paged_logits_stride(max_context_len)]``) and
     ``schedule_meta`` (int32 ``[num_sms + 1, 2]``) are allocated when not
@@ -562,6 +723,7 @@ class Sm120PagedIndexerPlan:
         output=None,
         sm_count=None,
         logits_dtype="float32",
+        max_context_hint=None,
     ):
         import torch
 
@@ -604,10 +766,10 @@ class Sm120PagedIndexerPlan:
         max_context_len = int(max_context_len)
         if max_context_len < 1 or max_context_len > int(block_table.shape[1]) * page_kv:
             raise ValueError("max_context_len must be in 1..S * page_kv")
-        if not route_available(num_heads, page_kv, next_n, logits_dtype):
+        if not route_available(num_heads, page_kv, next_n, batch, logits_dtype):
             raise ValueError(
                 f"no exported SM120 paged MQA route for {num_heads} heads, page "
-                f"{page_kv}, next_n {next_n}, {logits_dtype}"
+                f"{page_kv}, next_n {next_n}, batch {batch}, {logits_dtype}"
             )
         tensors = [q, kv_cache, weights, context_lens, block_table]
         if any(tensor.device != q.device for tensor in tensors):
@@ -635,7 +797,14 @@ class Sm120PagedIndexerPlan:
         self.page_kv, self.next_n, self.batch = page_kv, next_n, batch
         self.pages, self.block_stride_bytes = pages, block_stride_bytes
         self.max_context_len = max_context_len
-        self.route_name = route_name(num_heads, page_kv, next_n, logits_dtype)
+        self.max_context_hint = (
+            None if max_context_hint is None else int(max_context_hint)
+        )
+        self.atom_variant = atom_variant(num_heads, next_n, batch, max_context_hint)
+        self.num_next_n_atoms = next_n_atoms(next_n, batch, num_heads, max_context_hint)
+        self.route_name = route_name(
+            num_heads, page_kv, next_n, batch, logits_dtype, max_context_hint
+        )
         self.route = _catalog()["routes"][self.route_name]
         stages = list(self.route["stages"])
         if [stage for stage, _program in stages] != ["metadata", "logits"]:
@@ -643,7 +812,13 @@ class Sm120PagedIndexerPlan:
                 f"route {self.route_name} must be the ordered (metadata, logits) pair, catalog has {stages}"
             )
         bindings = {
-            "metadata": metadata_bindings(context_lens, schedule_meta, num_sms=num_sms),
+            "metadata": metadata_bindings(
+                context_lens,
+                schedule_meta,
+                num_sms=num_sms,
+                num_heads=num_heads,
+                max_context_hint=max_context_hint,
+            ),
             "logits": logits_bindings(
                 q,
                 fused,
@@ -695,21 +870,45 @@ class Sm120PagedIndexerPlan:
 
 
 def get_paged_mqa_logits_metadata(
-    context_lens, page_kv, num_sms, indices=None, *, out=None
+    context_lens,
+    page_kv,
+    num_sms,
+    indices=None,
+    *,
+    num_heads=None,
+    max_context_hint=None,
+    out=None,
 ):
     """DeepGEMM's ``get_paged_mqa_logits_metadata``: a REAL scheduler launch.
 
     ``context_lens`` int32 ``[B, next_n]``, ``page_kv`` an exported page size
     with an exported ``next_n``, ``num_sms`` the CTA budget of the logits call,
     ``indices`` must be ``None`` (variable-length request selection is not
-    ported).  Returns -- or fills ``out`` with -- the int32 ``[num_sms + 1, 2]``
-    schedule the exported logits programs read.  The buffer is not
-    interchangeable with DeepGEMM's: it carries this port's ``(q_atom_idx,
-    kv_split_idx)`` walk boundaries.
+    ported).  ``num_heads`` is the head count of the logits call the schedule
+    is built for: it is required only where the exported head counts select
+    different Q-atom schedules (``next_n`` 5 and 6 above the small-batch class;
+    the ``ValueError`` names it) and may be omitted everywhere else, exactly
+    like DeepGEMM's signature.  ``max_context_hint`` (R3, keyword-only) is an
+    upper bound of the batch's context lengths in KV tokens that the host knows;
+    from ``atom_rule()["long_context_min_kv"]`` (16384) up it selects the
+    native-atom schedules at batches 2..8 (``num_heads`` is then required for
+    ``next_n`` 5/6 there too); ``None`` keeps the batch-only selection.  The
+    logits call this schedule serves must receive the same hint.  Returns -- or
+    fills ``out`` with -- the int32
+    ``[num_sms + 1, 2]`` schedule the exported logits programs read.  The buffer
+    is not interchangeable with DeepGEMM's: it carries this port's
+    ``(q_atom_idx, kv_split_idx)`` walk boundaries.
     """
     if indices is not None:
         raise ValueError("indices (variable-length request selection) is unsupported")
-    return Sm120MetadataPlan(context_lens, page_kv, num_sms, out=out).run()
+    return Sm120MetadataPlan(
+        context_lens,
+        page_kv,
+        num_sms,
+        num_heads=num_heads,
+        max_context_hint=max_context_hint,
+        out=out,
+    ).run()
 
 
 def fp8_paged_mqa_logits(
@@ -724,15 +923,24 @@ def fp8_paged_mqa_logits(
     indices=None,
     *,
     page_kv=None,
+    max_context_hint=None,
 ):
     """One-shot paged logits with DeepGEMM's ``fp8_paged_mqa_logits`` signature.
+
+    ``max_context_hint`` (R3, keyword-only) selects the Q-atom program together
+    with ``(H, next_n, B)``: an upper bound of the batch's context lengths of at
+    least ``atom_rule()["long_context_min_kv"]`` takes the native-atom programs
+    at batches 2..8; ``None`` keeps the batch-only selection.  It must equal the
+    hint ``schedule_meta`` was built with; the positional ``max_context_len``
+    only sizes the logits row and never selects the program.
 
     ``schedule_meta`` is the int32 ``[num_sms + 1, 2]`` buffer from
     :func:`get_paged_mqa_logits_metadata`: its first dimension fixes the CTA
     budget, and the call REBUILDS it in the same sequence before the logits
     program reads it (the schedule is a pure function of ``context_lens``,
-    ``split_kv``, ``next_n`` and the budget, so a buffer produced by the
-    metadata entry on the same inputs is rewritten with identical bytes).
+    ``split_kv``, the Q-atom variant of ``(H, next_n, B)`` and the budget, so a
+    buffer produced by the metadata entry on the same inputs is rewritten with
+    identical bytes).
     ``None`` selects the device's SM count and an internal buffer.
     ``clean_logits=True`` is rejected for two-dimensional context lengths
     exactly as DeepGEMM does; ``indices`` must be ``None``.  Returns the FP32
@@ -766,6 +974,7 @@ def fp8_paged_mqa_logits(
         page_kv=page_kv,
         schedule_meta=schedule_meta,
         sm_count=num_sms,
+        max_context_hint=max_context_hint,
     )
     return plan.run()
 
@@ -782,8 +991,12 @@ def prepare_sm120_paged_mqa_logits(
     schedule_meta=None,
     output=None,
     sm_count=None,
+    max_context_hint=None,
 ):
-    """Prepare repeated paged MQA logits on caller-provided operands."""
+    """Prepare repeated paged MQA logits on caller-provided operands.
+
+    ``max_context_hint`` (R3): see :func:`fp8_paged_mqa_logits`.
+    """
     return Sm120PagedIndexerPlan(
         q,
         kv_cache,
@@ -795,4 +1008,5 @@ def prepare_sm120_paged_mqa_logits(
         schedule_meta=schedule_meta,
         output=output,
         sm_count=sm_count,
+        max_context_hint=max_context_hint,
     )

@@ -10,8 +10,10 @@ SM100 (B200 / GB200) is the acceptance architecture of the native kernels and
 SM103 (B300 / GB300) is compiled from the same sources; SM107 (Rubin R200) is
 the acceptance architecture of the packed / strided-layout extension
 (flashinfer-ai/flashinfer#5675) and is compiled from the same sources with an
-nvcc that emits `compute_107a`.  The feature is JIT-only and does not
-participate in automatic backend selection, autotuning or trace-apply.
+nvcc that emits `compute_107a`.  The feature does not participate in
+automatic backend selection, autotuning or trace-apply.  Its libraries are
+loaded prebuilt from `aot/` when the package ships them and JIT-built by
+FlashInfer from `build.json` otherwise (see "Layout of this package").
 
 ## Public entry points (`flashinfer/dsa_sparse_attention.py`)
 
@@ -122,10 +124,13 @@ context-parallel window):
   needs `S_dst >= S`.
 * The kernel does not range-check `dkv_dst_map`: every value must lie in
   `[0, S_dst)` (the rows of `dkv_acc`), and a value outside that range would
-  add into memory outside the buffer.  Setting
-  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1` validates the values on every call
-  (one device synchronization) and raises `ValueError` on a violation; leave
-  it unset in production.
+  add into memory outside the buffer.  The keyword `check_dst_map` of the
+  entry points (default `False`) validates the values on every call when
+  `True` (one device synchronization) and raises `ValueError` on a violation;
+  leave it off in production.  The backend reads no environment variable:
+  flashinfer's public wrapper `flashinfer.dsa_sparse_attention` maps
+  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` onto the keyword when the caller leaves
+  it at `None`.
 * With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
   autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
   `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain
@@ -156,8 +161,11 @@ reduce-bound rows per tile, and only rows with many keys per query token pay
 it back (B200 backward: `S / T >= 16` 0.5-4 % faster, `S = T` 3.7 % slower), so
 the host takes the direct path by the size rule the record carries
 (`dkv_direct`: `min_keys_per_query`, 4 -- direct iff `S >= 4 T`) whenever
-`dkv_acc` is given; `FLASHINFER_CAKE_DSA_DKV_DIRECT=1` / `=0` forces or
-disables it (`auto` = the rule; the value is part of the binding key).  Both
+`dkv_acc` is given; the keyword `dkv_direct` of the entry points (default
+`None` = the rule) forces (`True`) or disables (`False`) it, and the resolved
+value is part of the binding key (flashinfer's public wrapper maps
+`FLASHINFER_CAKE_DSA_DKV_DIRECT=auto|1|0` onto the keyword when the caller
+leaves it at `None`).  Both
 paths add the same FP32 contributions into the same rows in another summation
 order; dq is bitwise the same.  Without the natural stages every `dkv_acc`
 call takes the cast's accumulate path.
@@ -169,9 +177,11 @@ resolved once per input geometry (shapes, strides, dtypes, device, alignment
 and the call options): the prepared runner carves its scratch from the
 workspace it is given; the eager entry points keep the resolved plans in a
 bounded, lock-protected cache (`BINDING_CACHE`, 64 entries by default,
-`FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` sets the capacity, least
-recently used first out; a plan owns only the full-length `topk_length` vector it
-materializes when the caller passes none) and, per call, allocate the outputs
+`BINDING_CACHE.configure(capacity=...)` resizes it -- flashinfer's public
+wrapper applies `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` through it
+when that variable is set; least recently used first out; a plan owns only the
+full-length `topk_length` vector it materializes when the caller passes none)
+and, per call, allocate the outputs
 and the backward scratch from the caching allocator and launch the stages
 through the generated positional launchers of `cake_launch.py`.  During
 CUDA-graph capture the eager entry points plan privately and leave the cache
@@ -286,18 +296,35 @@ pass stages serves the single pass only.
 ## Layout of this package
 
 * `cake_jit.py` -- the `MODULES` registry (one record for every architecture,
-  filled by the generated-program export), stage names and the JIT specs
-  (compiled per architecture with its exact flag set; `sm_107a` only with an
-  nvcc that lists `compute_107`).
+  filled by the generated-program export: per stage the `library` stem of its
+  `build.json` entries, the FFI entry and the launch geometry), stage names
+  and the loader glue: `library_name(stage, arch)` is the `build.json` entry
+  `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch)` loads
+  through `cake_build`; `specs_for_arch(arch)` lists the JIT specs of an
+  architecture for `flashinfer.jit.build_jit_specs`.
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  package (byte-identical copies) and this package's build manifest (schema
+  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
+  (eight stages x three architectures) with its translation units, digests,
+  nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
+  path.  `cake_build.load_library(name)` loads the prebuilt library when
+  `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
+  must agree with the library's exported `build_cuda_version()`) and otherwise
+  JIT-builds the entry through FlashInfer (`gen_jit_spec`, sources
+  digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
+  `aot/` is never tracked (`.gitignore`).
 * `cake_launch.py` -- generated positional launchers and grid functions, one
   per stage, over the kernels' own argument names.
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
+* `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
+  (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
+  shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
   eight pairs, one per stage (the main stage and its key-range-pass form each
   with a natural-layout variant), shared by `sm_100a`, `sm_103a` and `sm_107a` and
   compiled once per architecture (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+  identity-checked by the digests in `build.json`).
 
 ## Status
 
@@ -307,6 +334,9 @@ its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
 from the kernel snapshot named in the pull request.
 
-Tests: `tests/experimental/test_cake_dsa_train.py` (skips without a registered
-program or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
+Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
+only this package; skips without a registered program or a compute capability
+10.0 / 10.3 / 10.7 device) and `tests/experimental/test_cake_dsa_train_api.py`
+(the flashinfer public entry points and the environment variables the wrapper
+resolves into this package's keyword switches).  Benchmark:
 `benchmarks/bench_cake_dsa_train.py`.

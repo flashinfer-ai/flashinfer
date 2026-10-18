@@ -41,7 +41,8 @@ def _mega_dispatch_reference(
     row offsets, tile list, and total M. Row assignment within an expert is
     runtime-nondeterministic (atomic claim order), so pool/metadata are checked
     via token_to_permuted, not by fixed row — this returns only the
-    order-independent quantities."""
+    order-independent quantities. A negative id routes its slot to no expert
+    (a masked token) and takes no row."""
     import torch
 
     T, TK = topk_idx.shape
@@ -49,7 +50,9 @@ def _mega_dispatch_reference(
     ids = topk_idx.cpu()
     for t in range(T):
         for k in range(TK):
-            counts[int(ids[t, k].item())] += 1
+            expert = int(ids[t, k].item())
+            if expert >= 0:
+                counts[expert] += 1
     pad = ((counts + align_m - 1) // align_m) * align_m
     offsets = torch.zeros(num_experts, dtype=torch.int64)
     running = 0
@@ -156,7 +159,9 @@ def prepare_pipeline_bindings(inputs, num_sms):
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
     grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
     ref = _mega_dispatch_reference(inputs["topk_idx"], E)
-    M_total = ref["M_total"]
+    # A batch whose every slot is -1 routes no row; its pools keep one aligned
+    # block so that their tensor maps stay valid.
+    M_total = max(ref["M_total"], ALIGN_M)
     total_m_tiles = ref["total_m_tiles"]
     topk_idx_i32 = inputs["topk_idx"].contiguous().view(torch.int32)
     topk_weights_flat = inputs["topk_weights"].contiguous().view(-1)
@@ -185,6 +190,10 @@ def prepare_pipeline_bindings(inputs, num_sms):
     persistent_grid = max(CTA_GROUP, min(num_sms - num_sms % CTA_GROUP, num_tiles))
     if persistent_grid % CTA_GROUP != 0:
         persistent_grid += CTA_GROUP - persistent_grid % CTA_GROUP
+    if source_schedule:
+        # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
+        # the routes fill, e.g. when -1 slots leave fewer routed tokens.
+        persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
     residual_readiness = (
         source_schedule

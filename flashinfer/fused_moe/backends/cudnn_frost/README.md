@@ -103,8 +103,9 @@ assembler patch release for SM107 tensor-map updates.
 Setting `CUDA_HOME` alone does not select the external assembler.
 Older or unidentified assemblers are rejected when building or refreshing a
 MoE runner. Explicit use reports the requirement; automatic
-selection retains the other candidates. SM120 BF16 sources do not patch tensor
-maps and retain capability-based admission without this SM107 assembler minimum.
+selection retains the other candidates. SM120 sources, of every dtype, do not
+patch tensor maps and retain capability-based admission without this SM107
+assembler minimum.
 
 The original operation in this prototype is cuDNN Frost's fused dual grouped GEMM1:
 
@@ -198,8 +199,9 @@ packaging and generated-file exclusions cover the same layout for future dtypes.
 ## MXFP8 block-scale grouped pipelines
 
 `mxfp8/runtime.py` provides explicit prepared execution of frozen MXFP8 × MXFP8
-FC1/activation and FC2 pipelines on SM107a. Both operands use E4M3 data with E8M0
-scales per 32 K elements. Both grouped stages produce BF16 output.
+FC1/activation and FC2 pipelines on SM107a and SM120a. Both operands use E4M3
+data with E8M0 scales per 32 K elements. Both grouped stages produce BF16
+output.
 `mxfp8/moe.py` and `csrc/moe_mxfp8.cu` compose them into the automatic
 `cudnn_frost_mxfp8` MoELayer candidate:
 
@@ -225,9 +227,9 @@ activation, including both gate and up branches; FC2 applies its multiplier
 before BF16 output conversion. Bias, shared experts, expert parallelism,
 non-default activation parameters and logits-based routing are unsupported.
 
-Automatic admission requires SM107a, MXFP8 operands, BF16 finalized output,
-precomputed routing and legal artifacts for both stages. No experimental auto
-opt-in is required. Existing
+Automatic admission requires SM107a or SM120a, MXFP8 operands, BF16 finalized
+output, precomputed routing and legal artifacts for both stages. No
+experimental auto opt-in is required. Existing
 `(activation,E,H,I,top_k,tokens)` measurements retain their two FC1/activation
 and two FC2 configurations and fused variants. Intermediate token counts use
 the next measured profile; native executors use the actual input shape at launch.
@@ -323,11 +325,13 @@ New compilation checks the actual assembler before and after compiling.
 Measure ordinary warm calls separately from CUDA Graph replay, which bypasses
 Python admission and packing.
 
-The `artifacts/mxfp8/` pool retains 169 selected BF16-output configurations in
-39 source templates, with 400 measured two-by-two profiles. It also includes
-111 fused FC1 configurations in twenty templates (60 STG and 51 TMA). The offline pool covers all
-44 families: ten FC1 activations and one shared FC2, each with normal/swap-AB
-and STG/TMA output variants. Only families used by the selected profiles ship.
+The SM107 catalog of `artifacts/mxfp8/` expands to 483 kernels from 15 shared
+templates: 308 BF16-output kernels and 175 fused FC1 kernels (95 STG and 80
+TMA). Its 400 measured two-by-two profiles reference 169 of them. The offline
+SM107 pool covers all 44 families: ten FC1 activations and one shared FC2,
+each with normal/swap-AB and STG/TMA output variants. Only families used by
+the selected profiles ship. The SM120 catalog is summarized under
+[SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
 Geometry records share these templates. CTA/MMA/cluster geometry,
 pipeline stages, scale-factor geometry, and persistent grid parameters live
 in `source.parameters`, not in duplicated Python implementations. At runtime
@@ -443,12 +447,20 @@ python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
 The benchmark preserves the original backend tactics, checks all Frost
 plans eagerly and through CUDA Graph replay, and records actual autotune winners.
 It alternates timing order over batched graph replays and reports numerical
-error, raw timings and GPU telemetry. Use `--artifacts DIR` to benchmark another
-selected pool containing `moe_shortlists.json`.
+error, raw timings and GPU telemetry. It also reports `paired_speedup`, the
+median of per-round original / with-Frost ratios, which cancels clock drift
+between rounds when SM clocks are not locked. Use `--artifacts DIR` to
+benchmark another selected pool containing `moe_shortlists.json`.
 Backend eligibility
 follows the existing registry: on SM107, the current original MXFP8 pool is
-CUTLASS; TRT-LLM MXFP8 supports SM100/SM103. Stage timing cannot establish an
-end-to-end improvement.
+CUTLASS; TRT-LLM MXFP8 supports SM100/SM103. On SM120 it is cuDNN grouped
+GEMM, which serves SwiGLU, GeGLU, Identity, ReLU, GELU and SiLU; no other
+pre-quantized MXFP8 backend serves the remaining four activations. All three
+block-scale benchmarks prepare a weight view for every eligible backend and
+exclude backends that quantize BF16 hidden states themselves (cuTile, b12x and
+the SM12x MXFP8 × MXFP4 runner): one MoELayer call cannot pass them Frost's
+pre-quantized activations. The audit records each exclusion. Stage timing
+cannot establish an end-to-end improvement.
 
 `benchmarks/bench_cudnn_frost_moe_mxfp8.py` validates and times the prepared
 grouped stages. Select an idle GPU with `CUDA_VISIBLE_DEVICES` and set
@@ -491,10 +503,10 @@ The native pipeline gathers packed inputs, runs FC1/activation and intermediate
 NVFP4 quantization, runs FC2 with BF16 output, and reduces routed outputs in
 FP32 before the final BF16 conversion.
 
-Normal-orientation FC1 also has a fused quantization variant. Its graph marks
-the post-activation intermediate as BF16 before applying the FP32 global
-quantization scale. Frost preserves that BF16 conversion in registers, then
-writes packed E2M1 data and expert-segmented E4M3 scales directly for FC2.
+On SM107a, normal-orientation FC1 also has a fused quantization variant. Its
+graph marks the post-activation intermediate as BF16 before applying the FP32
+global quantization scale. Frost preserves that BF16 conversion in registers,
+then writes packed E2M1 data and expert-segmented E4M3 scales directly for FC2.
 The data output has STG and TMA variants; the scale output uses STG in both.
 This removes the BF16 intermediate write/read and the standalone quantization
 launch. Blocks whose E4M3 scale underflows to zero may have different FP4 codes
@@ -552,14 +564,15 @@ its weights can be registered with
 adds no weight copy. Keeping distinct backend layouts consumes additional
 weight memory; Frost does not convert other backends' views.
 
-`artifacts/nvfp4/` retains 154 selected BF16-output configurations in 34
-geometry-parameterized source templates and 400 measured two-by-two profiles.
-It also contains 98 fused FC1 configurations (53 STG and 45 TMA) in twenty
-additional source templates, using the normal FC1 geometries from those profiles.
-Fused TMA templates retain only the 32-element epilogue drain. The offline sweep
-covers all 44 operation/orientation/store families, including every default
-gated and non-gated activation and the shared FC2. Only templates referenced
-by the selected profiles are packaged.
+The SM107 catalog of `artifacts/nvfp4/` expands to 464 kernels from 14 shared
+templates: 289 BF16-output kernels and 175 fused FC1 kernels (95 STG and 80
+TMA) on the normal FC1 geometries. Its 400 measured two-by-two profiles
+reference 154 of them. Fused TMA templates retain only the 32-element epilogue
+drain. The offline SM107 sweep covers all 44 operation/orientation/store
+families, including every default gated and non-gated activation and the
+shared FC2. Only templates referenced by the selected profiles are packaged.
+The SM120 catalog is summarized under
+[SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
 
 Use `--dtype nvfp4` with the shared exporter; add `--quantize-output` and
 `--store-mode stg` or `--store-mode tma` for a normal FC1 quantization variant.
@@ -575,7 +588,13 @@ validation checks both other eligible backends and an independent
 dequantized reference. On SM107, the benchmark checks lower-level activation
 support as well as registry declarations before including a backend. It also
 autotunes and times each original backend separately, preserving its complete
-tactic pool and including GPU work performed by `pack_inputs`.
+tactic pool and including GPU work performed by `pack_inputs`. On SM120 the
+eligible pool also includes cuDNN grouped GEMM, which missed the dequantized
+reference by 21-50% relative L2 (eager and graph, every tested shape and
+activation; CUTLASS stays below 3%), so the SM120 comparisons pass
+`--exclude-backend cudnn_grouped_gemm_nvfp4`. All three block-scale
+benchmarks accept `--exclude-backend KEY`, and the audit records the
+exclusion.
 
 ## MXFP8 × MXFP4 block-scale grouped pipelines
 
@@ -605,11 +624,12 @@ Automatic candidates are added during tuning when a compatible view exists.
 The quantization configuration uses
 `QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)`.
 
-`artifacts/mxfp8_mxfp4/` retains 169 selected BF16-output configurations in 42
-geometry-parameterized source templates and 400 measured two-by-two profiles.
-It also includes 101 fused FC1 configurations in twenty templates (52 STG and
-49 TMA).
-The offline pool covers all 44 operation/orientation/store families.
+The SM107 catalog of `artifacts/mxfp8_mxfp4/` expands to 434 kernels from 16
+shared templates: 279 BF16-output kernels and 155 fused FC1 kernels (80 STG
+and 75 TMA). Its 400 measured two-by-two profiles reference 169 of them. The
+offline SM107 pool covers all 44 operation/orientation/store families. The
+SM120 catalog is summarized under
+[SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts).
 
 Use `--dtype mxfp8_mxfp4` with the shared exporter and
 `benchmarks/bench_cudnn_frost_moe_mxfp8_mxfp4.py` for stage sweeps or full
@@ -620,12 +640,11 @@ the current CuTe DSL runner rejects W4A8 on this architecture.
 
 ## Activation sources
 
-The SM107 selected source pool additionally supports default `GeGLU()`,
+The selected source pools additionally support default `GeGLU()`,
 `GeGLUTanh()`, `ReLU2()`, `SiTU()`, `SwiGLUStep()`, `GELU()`, `ReLU()`,
-`SiLU()`, and `Identity()`. The block-scaled pipelines support only SM107a
-(Rubin); BF16 additionally supports SM120a (see
-[SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts)). Availability is checked
-against the architecture, geometry and activation in the manifest.
+`SiLU()`, and `Identity()`. Every dtype supports SM107a (Rubin) and SM120a
+(see [SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts)). Availability is
+checked against the architecture, geometry and activation in the manifest.
 
 Set `MoEConfig(activation=...)` using the existing typed activation API.
 Non-default scalar parameters and per-expert overrides are rejected rather
@@ -886,108 +905,225 @@ selected for packaging.
 
 ### SM120 warp-MMA artifacts
 
-`artifacts/bf16/` also packages kernels of cuDNN Frost's SM120 MoE template,
-`sm120_moe_grouped_matmul_fwd.py`, for consumer and workstation Blackwell
-(`sm_120a`). Eight compute warps issue warp-level `mma.sync` from TMA-filled
-shared memory; a scheduler warp runs the same grouped persistent scheduler as
-SM100. The template addresses tokens by coordinate on one global TMA descriptor
-and stores through STG, so it patches no tensormap: the workspace is one
-128-byte scheduler-counter slot. There is no swap-AB orientation, CTA pair,
-cluster or TMA-store variant. Its families sit next to the SM107 ones as
-`sm120_cudnn_frost_*_bf16_normal_stg.py`, and its artifact ids start with
-`sm120_cudnn_frost_`; manifest and shortlist records carry `arch: sm_120a`.
+Every dtype directory also packages kernels of cuDNN Frost's SM120 MoE
+templates for consumer and workstation Blackwell (`sm_120a`):
+`sm120_moe_grouped_matmul_fwd.py` (BF16) and
+`sm120_moe_grouped_block_scale_matmul_fwd.py` (MXFP8, NVFP4 and MXFP8 ×
+MXFP4), each with its `_swap_ab` counterpart. Up to eight compute warps issue
+warp-level `mma.sync` from TMA-filled shared memory: block-scaled
+`kind::mxf8f6f4` for MXFP8 and MXFP8 × MXFP4 (E2M1 weights unpacked in
+registers) and `kind::mxf4nvf4` for NVFP4, with the scale factors as register
+operands. A scheduler warp runs the same grouped persistent scheduler as SM100.
+The templates address tokens and token scales by coordinate on one global TMA
+descriptor each and store through STG, so they patch no tensormap: the
+workspace is one 128-byte scheduler-counter slot. There is no CTA pair,
+cluster or TMA-store variant. A swap-AB kernel puts the expert's weight rows on
+the MMA M dimension and its routed tokens on N, so narrow token tiles serve
+the few tokens per expert of decoding; the native adapters exchange operands,
+problem dimensions and output strides exactly as for SM107. In each dtype's
+schema-v4 catalog, the SM120 templates sit next to the SM107 ones as
+`sm120_{fc1,fc2}_{gated,non_gated}_{normal,swap}_{bf16,quantized}_stg.py`:
+one template per topology, orientation and output, from which every
+activation of the topology expands through its exact source fragments. Kernel
+IDs start with `sm120_cudnn_frost_`, and catalog and shortlist records carry
+`arch: sm_120a`.
 
-The sources are exported from cuDNN Frontend `a74b1b21`. Its SM120 host zeroes
-the scheduler counter with a one-thread kernel before the PDL main launch, as
-the SM100 MoE hosts do; earlier SM120 producers relied on the in-process cuDNN
-Frost launcher for that reset, which the FlashInfer adapter does not run. Like
-the SM107 sources, its scheduler takes `G+1` explicit group boundaries (launch
-ABI `v2`). The producer warpgroup (the TMA, scheduler and donor warps after the
-eight compute warps) releases its registers with one warpgroup-uniform
+All SM120 sources are exported from cuDNN Frontend `89f40871`. Each host
+zeroes its scheduler counter with a one-thread kernel before the PDL main
+launch, as the SM100 MoE hosts do, so the exported TVM-FFI function needs no
+caller-side reset. Like the SM107 sources, the schedulers take `G+1` explicit
+group boundaries. The producer warpgroup (the TMA, scheduler and donor warps
+after the compute warps) releases its registers with one warpgroup-uniform
 `setmaxnreg` before the per-warp roles diverge, as the `.aligned` PTX
-instruction requires; the kernel body is otherwise that of `c132d859`.
+instruction requires, and every main launch declares `min_blocks_per_mp=1`:
+with only `.reqntid`, ptxas drops `setmaxnreg` and may budget registers for
+several CTAs per SM. This producer revision also emits (empty) reduction hooks
+after the tile constants; `extract_template` keeps their decorators.
 
-Admission, token-count shortlists, the native routing/finalize adapter and the
-MoELayer integration are shared with SM107a; the adapter is compiled with the
-`sm_120a` flags. Only CC 12.0 devices are admitted: SM121a sources have not been
-selected. The small-token FMA tactic remains SM107a-only, so SM120 keeps its
-Tensor Core candidates at those geometries. On SM120 the original BF16 pool is
-CUTLASS and cuTile.
+The frozen source of a tile does not depend on E, N or K: exports of one tile
+at several model geometries render identical templates and parameters and
+coalesce into one logical kernel. Every SM120 kernel therefore uses the
+catalog's generic contract (N and K multiples of 128, up to 1024 experts), as
+on SM107. MXFP8 and MXFP8 × MXFP4 FC1 also
+fuse the intermediate quantization (E4M3 data and segmented E8M0 scales, both
+through STG) in the normal orientation, for the tiles whose warp tile drains
+whole 32-column quantization blocks. cuDNN Frost cannot store packed FP4 on
+SM120, so NVFP4 plans always use the separate intermediate quantizer.
+
+Admission, token-count shortlists, the heuristic pool for unlisted shapes,
+the native routing/finalize adapters and the MoELayer
+integration are shared with SM107a; the adapters are compiled with the
+`sm_120a` flags. Only CC 12.0 devices are admitted: SM121a sources have not
+been selected. The SM107 assembler minimum does not apply, and the small-token
+FMA tactics remain SM107a-only, so SM120 keeps its Tensor Core candidates at
+those geometries.
 
 Kernels were selected on an RTX PRO 6000 Blackwell Server Edition (188 SMs,
-128 MB L2). The persistent grid size and the L2 rasterization budget are
-compile-time constants of each source, as on SM107; other CC 12.0 parts run
-the same kernels correctly, but should be revalidated before relying on their
-performance.
+128 MB L2, 600 W), with PyTorch 2.14.0, CuTe DSL 4.7.1 and CUDA 13.4. As on
+SM107, `device.py` resolves the persistent grid size, the L2 rasterization
+budget and the pipeline stage count from the preparation device. The SM120
+stage count follows cuDNN Frost's SM120 renderer: packed operand tiles plus,
+for block-scale kernels, their scale-factor boxes per stage, after the
+template's reserve and the transposed-STG epilogue staging, and for gated
+kernels the aligned buffer layout. On the RTX PRO 6000 these values reproduce
+every exported kernel's constants and workspace. Other CC 12.0 parts derive
+their own and should be revalidated before relying on their performance.
 
-On an SM120 GPU, `bench_cudnn_frost_moe_bf16.py export` exports its 34 SM120
-tiles (CTA M 32..256, N 32..256, K 32..128 bytes, four compute-warp grids) for
-the requested activation and model geometries. A single configuration can also
-be exported directly; SM120 configurations have no CTA pair or TMA store:
+#### Selection
+
+Every dtype uses the five shortlist geometries (E12/H7168/I3072 with top-k 1,
+2 and 4, E8/H4096/I14336/K2 and E64/H2048/I1408/K6), tokens
+`1,16,128,512,2048,4096,8192,12288` and uniform/skew routing. Stage sweeps
+check each candidate against a reference eagerly and on CUDA Graph replay,
+then time interleaved graph replays over seven rounds and keep the median.
+SwiGLU and ReLU2 screen every tile of their FC1 class. The other gated or
+non-gated activations share the mainloop of their class, so they time only the
+union of the eight tiles their screener ranked fastest for either routing of
+the same case. FC2 is swept once. Per profile and stage, the two candidates
+with the best geometric mean of latency normalized by each routing's fastest
+are kept. Stage timings repeat one call, so a decode working set that fits in
+the 128 MB L2 is measured warm, as in the SM107 sweeps.
+
+On an SM120 GPU, `bench_cudnn_frost_moe_bf16.py export` exports its 86 SM120
+tiles for the requested activation and model geometries: 34 normal tiles (CTA
+M 32..256, N 32..256, K 32..128 bytes) and 52 swap-AB tiles (M 64..256 weight
+rows, N 16..128 tokens, K 64 or 128 bytes), each with the compute-warp grids
+that cut it into whole 16x16 warp tiles. A single configuration can also be
+exported directly:
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
-  --op grouped_gemm1_swiglu --config CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2 \
+python -m flashinfer.fused_moe.backends.cudnn_frost.export \
+  --op grouped_gemm1_swiglu --config CONFIG_sm120_128x16x128_16x16x32_cluster1x1_warps8x1_swapAB \
   --cta-group 1 --store-mode stg --experts 12 --n 3072 --k 7168 \
   --output-dir "$SM120_POOL" --cudnn-frost-revision "$FROST_REVISION"
 ```
 
-The offline search exports every tile for every activation and model geometry,
-then runs stage-only sweeps over tokens
-`1,16,128,512,2048,4096,8192,12288` and uniform/skew routing. SwiGLU and
-ReLU2 screen every tile. The other gated or non-gated activations share the
-mainloop of their class, so `--candidates-from` screens only the eight tiles
-that SwiGLU or ReLU2 ranked fastest for the same case. FC2 is swept once. The
-`shortlist` command then keeps, per profile and stage, the two candidates with
-the best geometric mean of latency normalized by each routing's fastest, and
-validates every resulting FC1 x FC2 pair with routed inputs and CUDA Graph
-replay before copying it:
+The `sweep` and `shortlist` commands implement the search above for BF16; the
+shortlist validates every resulting FC1 x FC2 pair with routed inputs and CUDA
+Graph replay before copying it:
 
 ```bash
 python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --artifacts "$SM120_POOL" \
   --output sweep-swiglu.jsonl --activation swiglu --stage-only 1 \
   --geometries 12:7168:3072:1,12:7168:3072:2,12:7168:3072:4,8:4096:14336:2,64:2048:1408:6 \
-  --tokens 1,16,128,512,2048,4096,8192,12288 --rounds 7 --batch 16 --keep-going
+  --tokens 1,16,128,512,2048,4096,8192,12288 --routing uniform,skew \
+  --rounds 7 --batch 16 --keep-going
 python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --artifacts "$SM120_POOL" \
   --output sweep-geglu.jsonl --activation geglu --stage-only 1 \
   --candidates-from sweep-swiglu.jsonl ...   # same geometry/token/timing options
 python benchmarks/bench_cudnn_frost_moe_bf16.py shortlist --artifacts "$SM120_POOL" \
   --results sweep-swiglu.jsonl --results sweep-geglu.jsonl ... --results sweep-fc2.jsonl \
-  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
+  --selected-dir flashinfer/fused_moe/backends/cudnn_frost/artifacts/bf16 \
   --validate --output shortlist.jsonl
 ```
 
-Dual-GEMM tiles whose two accumulators exceed the compute warps' register
-grant (128x256 and 256x128 CTA tiles) are accepted by cuDNN Frost but measured
-20-240x slower than the best tile; the SwiGLU screen skips them with
-`--skip-kernel`.
+cuDNN Frost accepts dual-GEMM (gated FC1) tiles whose two accumulators exceed
+the compute warps' register grant: every gated tile with a CTA M x N of at
+least 128x256, in either orientation, spills 0.4-2.2 KB per thread for every
+dtype (up to 2.9 KB with fused quantization), and no smaller unfused gated
+tile spills more than 288 bytes. BF16 measured
+these tiles 20-240x slower than the best tile, so the BF16 SwiGLU screen skips
+them with `--skip-kernel`. The block-scale SwiGLU screens timed them at a
+median 3-14x the best tile's latency (other gated tiles: at most 2.9x) and
+selected none.
 
-The packaged SM120 pool holds 373 selected model configurations (24 tiles, 11
-templates) and 400 two-by-two profiles; all 3,200 shortlisted FC1 x FC2 pairs
-passed eager and CUDA Graph validation with uniform and skew routing. Stage
-timings repeat one call, so a decode working set that fits in the 128 MB L2
-is measured warm, as in the SM107 sweeps.
+The BF16 search exported all 86 tiles for the 11 operations at each of the
+three model geometries (2,838 records). SwiGLU screened 74 tiles
+per case, ReLU2 and FC2 all 86, and the other activations 8-16. A swap-AB tile
+was fastest in 53 of the 80 SwiGLU cases and 52 of the 80 ReLU2 cases, at
+every token count. The BF16 catalog also keeps three normal and two swap-AB
+small tiles, exported at E8/H128/I256 for every operation, that the tests run.
 
-Complete-MoE comparisons against the original CUTLASS and cuTile pool used
-`benchmark --rounds 9 --iterations 10 --graph-batch 8`, tokens
-`1,16,128,512,2048,4096,8192,12288`. SM clocks were not locked, and the card
-power-capped at 600 W under sustained load: when both pools selected the same
-original backend, individual cases still varied by up to 11%. The benchmark
-therefore also reports `paired_speedup`, the median of per-round ratios.
+The block-scale template steps K by 128 bytes (128 E4M3 or 256 E2M1
+elements). Its catalog has 38 tile shapes per orientation (CTA M 32..256, N
+16..256, four compute-warp grids). cuDNN Frost accepts all of them for
+non-gated FC1 and FC2. Gated FC1 stages two weight tiles, and Frost rejects
+the tiles whose stage plus epilogue staging exceed the 99 KB shared-memory
+budget (128x256, and for NVFP4 also 64x256), leaving 34 MXFP8 and MXFP8 ×
+MXFP4 or 31 NVFP4 tiles. Fused quantization keeps 25 non-gated and 21 gated
+normal tiles. Each accepted tile was exported once per family with
+`python -m flashinfer.fused_moe.backends.cudnn_frost.export --dtype DTYPE
+--config CONFIG_sm120_... --cta-group 1 --store-mode stg` (1,026 MXFP8, 766
+NVFP4 and 1,026 MXFP8 × MXFP4 records). Their stage sweeps time the prepared
+grouped plans that the runner launches, as `bench_cudnn_frost_moe_mxfp8.py`
+does: routed operands, workspace reset, grouped GEMM and the fused FC1
+activation, without intermediate quantization. The selection keeps the fused
+variants of every selected normal FC1 tile for full-pipeline autotuning.
 
-| Slice (152 cases) | Cases | With Frost (geomean / peak) | Frost only |
-| --- | --- | --- | --- |
-| All | 152 | 1.011x / 1.357x | 0.975x |
-| SwiGLU, E8/H4096/I14336/K2 | 16 | 1.083x / 1.357x | 1.077x |
-| SwiGLU, E64/H2048/I1408/K6 | 16 | 1.028x / 1.156x | 0.980x |
-| SwiGLU, E12/H7168/I3072/K1, K2, K4 | 48 | 1.004x / 1.145x | 0.994x |
-| Nine other activations, E12/H7168/I3072/K2, uniform | 72 | 0.996x / 1.078x | 0.940x |
+| Dtype | Profiles | Shortlisted kernels (swap-AB) | Catalog kernels (fused FC1) | Templates | Checks | Worst relative L2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| BF16 | 400 | 327 (220) | 479 (0) | 6 | 3,200 | 0.0020 |
+| MXFP8 | 400 | 196 (61) | 342 (100) | 8 | 5,160 | 0.0017 |
+| NVFP4 | 400 | 146 (41) | 182 (0) | 6 | 3,200 | 0.0019 |
+| MXFP8 × MXFP4 | 400 | 197 (94) | 320 (70) | 8 | 4,124 | 0.0009 |
 
-Speedups are original / with-Frost median latency; SwiGLU rows cover uniform
-and skew routing. Frost won the cross-backend selection in 64 cases. At one
-token, cuTile or CUTLASS remained faster and was kept (Frost only 0.854x).
-Results below 1x arise from that same-backend variation or from autotuning
-choosing between plans within a few percent of each other under it.
+The catalog offers every tile of a template to each activation of its
+topology, so it holds more kernels than the shortlists reference; the bounded
+heuristic draws from the whole catalog for other shapes. Every activation
+needs its exact fragment in each template, and no selected MXFP8 × MXFP4
+GeGLU tile fuses quantization, so that catalog also takes the fused GeGLU
+exports of its five fused gated tiles from the same pool.
+
+A check runs one complete FC1 x FC2 plan for one profile and routing, eagerly
+and through CUDA Graph replay: every compound tactic that the packaged runner
+exposes, including fused FC1 variants, against an FP32 reference (of the
+dequantized operands for the block-scale dtypes). A swap-AB kernel is in the
+FC1 shortlist of 354 BF16, 190 MXFP8, 123 NVFP4 and 294 MXFP8 × MXFP4
+profiles, and in the FC2 shortlist of 360, 150, 130 and 220.
+
+#### Complete-MoE comparison
+
+Each dtype's `benchmark` subcommand compared the original pool with the same
+pool plus Frost: SwiGLU at the five shortlist geometries with uniform and skew
+routing, and the other activations at E12/H7168/I3072/K2 with uniform routing.
+The original pool is every registered backend that consumes the same
+activation pack on SM120: CUTLASS, cuTile and cuDNN grouped GEMM for BF16,
+cuDNN grouped GEMM for MXFP8, and CUTLASS for NVFP4 and MXFP8 × MXFP4. cuDNN
+grouped GEMM serves SwiGLU, GeGLU, Identity, ReLU, GELU and SiLU; MXFP8
+GeGLUTanh, SwiGLUStep, SiTU and ReLU2 have no other pre-quantized SM120
+backend, so they are not compared, and cuDNN grouped-GEMM NVFP4 is excluded
+(see [NVFP4](#nvfp4-block-scale-grouped-pipelines)).
+
+SM clocks were not locked, and the card power-caps at 600 W. Tokens
+`1,16,128,512` used `--rounds 9 --iterations 10 --graph-batch 8`; SM clocks
+stayed at 2.2-2.4 GHz and the nine rounds of a case varied by a median 0.3% or
+less (BF16 at 512 tokens: 3.6%). From 2048 tokens the larger cases draw enough
+power that per-round SM clocks spanned 1.2-2.3 GHz (10th to 90th percentile)
+and rounds of that protocol varied by a median 1.2-1.5x, more than rotating
+the pool order cancels. Tokens `2048,4096,8192,12288` therefore ran
+separately with `--rounds 61 --iterations 1 --graph-batch 2`, which times the
+three pools of a round within a few milliseconds. Every case under 6.7 ms per
+call then had a per-round ratio interquartile range below 5% (median 0.35%).
+The other 33 of those 288 cases (19 BF16) still ranged from 5% to 32%;
+differences of up to about 10% are not significant there. Speedups are
+original / with-Frost median latency; `Paired` is the median of per-round
+ratios, `Frost only` times the best Frost plan alone against the original
+pool's choice, and every column but the last is a geometric mean.
+
+| Dtype | Original pool | Cases | With Frost (geomean, min-max) | Paired | Frost only | T ≤ 16 | T = 128-512 | T ≥ 2048 | Frost selected |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BF16 | CUTLASS, cuTile, cuDNN | 152 | 1.030x, 0.828-1.510x | 1.031x | 1.024x | 1.005x | 1.013x | 1.051x | 63 |
+| MXFP8 | cuDNN | 120 | 1.326x, 1.000-3.480x | 1.325x | 1.335x | 1.786x | 1.312x | 1.149x | 111 |
+| NVFP4 | CUTLASS | 152 | 1.041x, 0.968-1.490x | 1.041x | 1.015x | 1.137x | 1.013x | 1.009x | 66 |
+| MXFP8 × MXFP4 | CUTLASS | 152 | 1.021x, 0.854-1.400x | 1.022x | 0.946x | 1.095x | 1.001x | 0.995x | 30 |
+
+Against cuDNN grouped GEMM, MXFP8 Frost won the autotuner's selection in 111
+of 120 cases and no case got slower: 3.48x at one token (SwiGLU,
+E12/H7168/I3072/K1) and 1.15x at 2048 tokens or more. Against CUTLASS, NVFP4
+and MXFP8 × MXFP4 Frost win decode (up to 1.49x and 1.40x at one token), and
+CUTLASS keeps most larger cases: the autotuner selected Frost there in 28 of
+114 NVFP4 and 12 of 114 MXFP8 × MXFP4 cases. BF16 is neutral up to 512 tokens
+(CUTLASS, cuTile or cuDNN remain fastest at one token; Frost only 0.97x) and
+reaches 1.51x for SwiGLU at E8/H4096/I14336/K2 with 4096 tokens.
+
+Results below 0.98x come from autotuning, whose own measurements see the same
+clock drift. In nine cases (seven BF16), all at 2048 tokens or more, Frost was
+not selected and the two layers' autotuners chose different original
+backends, up to 17% apart (CUTLASS or cuDNN grouped GEMM for BF16). In eight
+cases Frost was selected and timed 2-15% slower: two BF16 cases at 8192
+tokens (4.3-4.4 ms per call, 2.4% and 3.0%) and six block-scale cases at
+8192-12288 tokens on the two largest geometries (7.6-14.8 ms per call, where
+the per-round interquartile range was 11-20%).
 
 ## Standalone cuDNN Frost FC2 PoC
 
@@ -1146,13 +1282,13 @@ Schema-v1 precompiled-object manifests are intentionally rejected; re-export
 research candidates with this source exporter before sweeping them.
 
 The four fixed routing/finalize adapters use `jit/cudnn_frost.py` for both JIT
-and AOT registration (all four formats on SM107, BF16 on SM120). Geometry-specialized device kernels remain
-source-distributed. Public configuration GPU coverage lives in
-`tests/moe/test_unified_moe_frost.py`; the standalone public grouped-GEMM API
-retains its experimental API test.
+and AOT registration (all four formats on SM107 and SM120).
+Geometry-specialized device kernels remain source-distributed. Public
+configuration GPU coverage lives in `tests/moe/test_unified_moe_frost.py`; the
+standalone public grouped-GEMM API retains its experimental API test.
 
-Run the backend suites from the repository root on SM107 or SM120 (BF16 only) with the dependencies
-described in `docs/api/fused_moe.rst`:
+Run the backend suites from the repository root on SM107 or SM120 with the
+dependencies described in `docs/api/fused_moe.rst`:
 
 ```bash
 pytest tests/moe/test_unified_moe_frost.py tests/moe/test_cudnn_frost_kernels.py

@@ -14,6 +14,38 @@ before the decode loop takes over.
 
     chunk_gated_delta_rule
 
+Cake GDN non-CP backend: host-free launch
+-----------------------------------------
+
+``chunk_gated_delta_rule(..., backend="cake_gdn")`` with ``use_cp=False`` or
+``"auto"`` runs the Cake non-CP prefill kernels on SM100a/SM103a.  The route
+performs no device-to-host synchronization: the sequence count and the token
+count are tensor shapes, the kernel variant and the persistent grid follow an
+upper bound on the longest sequence, and the kernel resolves ``cu_seqlens``
+on the device at every launch (offsets are clamped into
+``[0, total_seq_len]``; a non-monotonic pair is an empty sequence, a
+documented no-op rather than an out-of-bounds access).
+
+Pass the host copy of the offsets an engine already holds as
+``cu_seqlens_cpu`` (keyword-only; a CPU int32/int64 tensor or a sequence of
+Python ints of length ``num_seqs + 1`` -- vLLM's ``query_start_loc_cpu``, the
+prefix sums of SGLang's ``extend_seq_lens_cpu``).  The route then validates
+the offsets on the host before any launch and uses the exact longest sequence
+to pick the kernel and grid.  Without it, ``max_seqlen`` (or
+``total_seq_len``) is the bound; a loose bound is always correct and only
+affects the grid size and whether the stateless single-chunk kernel is
+eligible.  Other backends ignore ``cu_seqlens_cpu``.
+
+Int32 ``cu_seqlens`` / ``state_indices`` / ``checkpoint_cu_starts`` reach the
+kernel as is; int64 metadata is cast on the stream at every call.  Nothing is
+cached by tensor identity, so a metadata buffer rewritten in place is always
+read live.  CUDA Graph capture needs no eager warm-up call for the same
+metadata: the one-time ``nvcc`` compile and load of a kernel variant is the
+only eager step, and replay reads the live buffers.  The consistency of
+``checkpoint_cu_starts`` with ``cu_seqlens`` and the checkpoint interval
+remains a caller precondition.  See ``csrc/gdn/cake/README.md`` ("Non-CP
+prefill: host-free launch") for the full contract.
+
 Cake GDN CP context-parallel backend
 ------------------------------------
 

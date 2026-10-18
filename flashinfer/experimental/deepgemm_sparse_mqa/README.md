@@ -5,7 +5,7 @@ prepares the compressed sparse MQA indexer (metadata generation followed by the
 block-scaled logits kernel) on SM100a and SM103a. Each prepared call returns a
 plan; `plan.run()` submits on the current PyTorch stream.
 
-Ten generated programs serve both architectures (the loader compiles each
+Eight generated programs serve both architectures (the loader compiles each
 program's source with the exact flag set of the attached device):
 
 - two runtime-geometry metadata programs, one per KV layout (contiguous,
@@ -13,19 +13,34 @@ program's source with the exact flag set of the attached device):
   `LIMITS["max_sparse_blocks"]`), the split width (640 MXFP4 / 512 MXFP8 KV
   tokens over the block size), the sparse block size (8 or 16) and the page
   size (any multiple of the block size) are runtime arguments;
-- four exact-geometry metadata programs: the production geometry (capacity
-  `LIMITS["exact_capacity"]`, 8-token blocks, 64-token pages) per layout,
-  compiled with the device SM count folded into the schedule layout, one per
-  (architecture, SM count) pair of the measured devices (`ROUTES` keys
-  `metadata:<layout>:exact:<sms>`; `exported_exact_sms(arch, paged=...)` lists
-  the SM counts exported for an architecture, `LIMITS["exact_num_sms"]` their
-  union). `metadata_route_key()` selects an exact program only for an
-  (architecture, SM count) pair it was exported for and the runtime program
-  otherwise (e.g. 152 SMs on SM100a), never a program compiled for another SM
-  count;
+- two exact-geometry metadata programs: the production geometry (capacity
+  `LIMITS["exact_capacity"]`, 8-token blocks, 64-token pages) per layout, with
+  the device SM count folded into the schedule layout. One program text per
+  layout serves both architectures and compiles each architecture's measured
+  SM count in (`LIMITS["exact_num_sms_by_arch"]`: 148 on SM100a, 152 on
+  SM103a; `ROUTES` keys `metadata:<layout>:exact:<sms>`;
+  `exported_exact_sms(arch, paged=...)` lists the SM counts exported for an
+  architecture, `LIMITS["exact_num_sms"]` their union). `metadata_route_key()`
+  selects an exact program only for an (architecture, SM count) pair it was
+  exported for and the runtime program otherwise (e.g. 152 SMs on SM100a),
+  never a program compiled for another SM count;
 - four logits programs, one per format x layout (MXFP4 runs five math
   warpgroups over 640-token splits, MXFP8 four over 512-token splits), with
-  32 heads, D=128, 8-token blocks, 64-token pages and aligned windows.
+  32 heads, D=128, 8-token blocks, 64-token pages and aligned windows. The
+  paged logits programs take one extra scalar, `kv_ef`: the evict-first L2
+  hint on the KV-row gather, `1` when the mean per-request KV context length
+  bound to the metadata plan is at or below `LIMITS["kv_ef_k_max"][fmt]`
+  (`SparseMetadataPlan.kv_context_tokens()`), `0` otherwise; the output is
+  bitwise identical either way. Every logits program takes one launch option,
+  `enable_pdl`: programmatic dependent launch of the logits kernel behind the
+  metadata kernel on the same stream (the metadata kernel signals its
+  dependents after its last split write; the logits kernel waits on the
+  metadata grid before its first global read, so the output is identical
+  either way). `prepare_sparse_mqa_logits(..., use_pdl=None)` binds the
+  exported per-(architecture, format, layout) default
+  `LIMITS["pdl_default"][arch]["<fmt>:<layout>"]` (on for the paged programs
+  of both architectures, off for the contiguous ones, as measured on the
+  exported route); `use_pdl=True` / `False` force the form.
 
 `prepare_sparse_mqa_metadata(sparse_indices, ...)` binds sorted int32 `[Q, capacity]`
 indices with duplicate padding in unused slots. Contiguous inputs pass `starts`, `ends`

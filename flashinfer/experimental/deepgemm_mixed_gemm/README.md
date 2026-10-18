@@ -11,16 +11,21 @@ int32/uint32 word, packed-K major with the 4-aligned MN extent contiguous
 (`[K/(4*gran_k), align(MN,4)]`). B scales are per 32 K elements; A scales are
 per 32 (default) or per 128 (`gran_k_a=128`).
 
-Eight generated programs cover every shape (`mixed_gemm.py`):
+Eight generated programs cover every shape, plus one split-K program for one
+measured problem (`mixed_gemm.py`):
 
 | schedule | tiles | selected for |
 | --- | --- | --- |
 | normal BN128/160/224/256 | BM128 x BK128, 7/7/6/5 stages | M > 128 with an even M tile count |
 | swap-AB BM16/32/48 | BN128 x BK128, 12/11/10 stages | M <= 128 (and odd M tile counts) |
 | BK128 BN224 | BM128 x BK128, 6 stages, per-128 A scales | `gran_k_a=128` |
+| swap-AB BM16 split-K S=3 (SM100a only) | BN128 x BK128, 12 stages, 3 K slices, fixed-order fp32 combine | M=16, N=4608, K=5120 on a 148-SM device |
 
 The route is chosen per problem shape and device SM count with the DeepGEMM
-rule (fewest waves, then fullest last wave, then the smaller tile). Constraints:
+rule (fewest waves, then fullest last wave, then the smaller tile); the split-K
+program replaces the swap-AB BM16 program only for the one problem above (its
+three partial sums are combined in a fixed slice order, so the output is
+deterministic but not bitwise equal to the single-chain program). Constraints:
 K is a multiple of 128; M <= 128 needs an even `ceil(N/128)`; M > 128 needs an
 even `ceil(M/128)` or an even `ceil(N/128)`; `gran_k_a=128` needs an even
 `ceil(M/128)` and N >= 224. Other shapes raise `NotImplementedError`.

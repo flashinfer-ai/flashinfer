@@ -6,9 +6,14 @@ an in-place ``addmm_`` LoRA correction.  Timing uses
 :func:`flashinfer.testing.bench_gpu_time` with CUPTI activity tracing and a cold
 L2 cache, so the numbers are GPU kernel time only.
 
+``--adapter-state prepared`` (NVFP4 only) times the prepared-adapter path: the adapter
+is folded once by :func:`flashinfer.gemm.prepare_nvfp4_lora_adapter` outside the timed
+call and passed as ``lora_adapter=``.
+
 Example::
 
     python benchmarks/bench_cake_quant_lora_gemm.py --family fp8 --m 4096 --n 3072 --k 3072 --rank 64 --bias
+    python benchmarks/bench_cake_quant_lora_gemm.py --family nvfp4 --adapter-state prepared --m 32768 --n 3072 --k 3072
 """
 
 from __future__ import annotations
@@ -18,7 +23,12 @@ import argparse
 import torch
 
 from flashinfer import SfLayout, nvfp4_quantize
-from flashinfer.gemm import mm_fp4, mm_fp8_lora, mm_nvfp4_lora
+from flashinfer.gemm import (
+    mm_fp4,
+    mm_fp8_lora,
+    mm_nvfp4_lora,
+    prepare_nvfp4_lora_adapter,
+)
 from flashinfer.testing.utils import bench_gpu_time
 
 E4M3_MAX = 448.0
@@ -109,13 +119,57 @@ def main() -> None:
         action="store_true",
         help="skip the base GEMM + addmm_ reference chain",
     )
+    parser.add_argument(
+        "--adapter-state",
+        choices=("raw", "prepared"),
+        default="raw",
+        help="raw: lora_b + lora_scale per call; prepared (NVFP4 only): a prepared adapter (lora_adapter=)",
+    )
     args = parser.parse_args()
+    if args.adapter_state == "prepared" and args.family != "nvfp4":
+        parser.error("--adapter-state prepared is an NVFP4 path")
 
     device = torch.device("cuda", torch.cuda.current_device())
     p = _problem(args, device)
     flops = 2.0 * args.m * args.n * args.k + 2.0 * args.m * args.n * args.rank
 
-    if args.family == "nvfp4":
+    if args.family == "nvfp4" and args.adapter_state == "prepared":
+        # the adapter-switch step (one fold kernel), outside the timed call
+        adapter = prepare_nvfp4_lora_adapter(p["lora_b"], p["lora_scale"], p["alpha"])
+
+        def fused():
+            mm_nvfp4_lora(
+                p["a"],
+                p["b"],
+                p["a_sf"],
+                p["b_sf"],
+                p["alpha"],
+                p["d"],
+                lora_adapter=adapter,
+                bias=p["bias"],
+                out=p["out"],
+            )
+
+        def unfused():
+            base = mm_fp4(
+                p["a"],
+                p["b"].T,
+                p["a_sf_2d"],
+                p["b_sf_2d"].T,
+                p["alpha"],
+                torch.bfloat16,
+                None,
+                block_size=16,
+                use_8x4_sf_layout=False,
+                backend="auto",
+                use_nvfp4=True,
+            )
+            base.addmm_(p["d"], p["lora_b"].t(), alpha=args.lora_scale)
+            if p["bias"] is not None:
+                base.add_(p["bias"])
+            return base
+
+    elif args.family == "nvfp4":
 
         def fused():
             mm_nvfp4_lora(
@@ -184,7 +238,7 @@ def main() -> None:
     times = bench_gpu_time(fused, enable_cupti=True, cold_l2_cache=True)
     median_ms = float(torch.tensor(times).median())
     print(
-        f"{args.family} M={args.m} N={args.n} K={args.k} rank={args.rank} bias={args.bias}: "
+        f"{args.family} ({args.adapter_state} adapter) M={args.m} N={args.n} K={args.k} rank={args.rank} bias={args.bias}: "
         f"fused {median_ms * 1e3:.1f} us  ({flops / median_ms / 1e9:.1f} TFLOP/s)"
     )
     if not args.no_unfused:
