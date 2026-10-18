@@ -21,6 +21,8 @@
 
 #include <cstdint>
 
+#include "cake_bgmv_moe_fma.cuh"
+
 __device__ __forceinline__ int make_warp_uniform(int x) {
   int result;
   asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
@@ -4522,612 +4524,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_3;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_3) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_3));
-#else
-              acc[0] = __fmaf_rn(w_t[0], x_values[0], acc[0]);
-              acc[1] = __fmaf_rn(w_t[1], x_values[0], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_4;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_4) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_4));
-#else
-              acc[0] = __fmaf_rn(w_t[2], x_values[1], acc[0]);
-              acc[1] = __fmaf_rn(w_t[3], x_values[1], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_5;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_5) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_5));
-#else
-              acc[0] = __fmaf_rn(w_t[4], x_values[2], acc[0]);
-              acc[1] = __fmaf_rn(w_t[5], x_values[2], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_6;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_6) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_6));
-#else
-              acc[0] = __fmaf_rn(w_t[6], x_values[3], acc[0]);
-              acc[1] = __fmaf_rn(w_t[7], x_values[3], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_7;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_7) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_7));
-#else
-              acc[0] = __fmaf_rn(w_t[8], x_values[4], acc[0]);
-              acc[1] = __fmaf_rn(w_t[9], x_values[4], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_8;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_8) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_8));
-#else
-              acc[0] = __fmaf_rn(w_t[10], x_values[5], acc[0]);
-              acc[1] = __fmaf_rn(w_t[11], x_values[5], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_9;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_9) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_9));
-#else
-              acc[0] = __fmaf_rn(w_t[12], x_values[6], acc[0]);
-              acc[1] = __fmaf_rn(w_t[13], x_values[6], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_10;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_10) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_10));
-#else
-              acc[0] = __fmaf_rn(w_t[14], x_values[7], acc[0]);
-              acc[1] = __fmaf_rn(w_t[15], x_values[7], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_11;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_11) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_11));
-#else
-              acc[8] = __fmaf_rn(w_t[0], x_values[8], acc[8]);
-              acc[9] = __fmaf_rn(w_t[1], x_values[8], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_12;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_12) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_12));
-#else
-              acc[8] = __fmaf_rn(w_t[2], x_values[9], acc[8]);
-              acc[9] = __fmaf_rn(w_t[3], x_values[9], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_13;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_13) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_13));
-#else
-              acc[8] = __fmaf_rn(w_t[4], x_values[10], acc[8]);
-              acc[9] = __fmaf_rn(w_t[5], x_values[10], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_14;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_14) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_14));
-#else
-              acc[8] = __fmaf_rn(w_t[6], x_values[11], acc[8]);
-              acc[9] = __fmaf_rn(w_t[7], x_values[11], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_15;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_15) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_15));
-#else
-              acc[8] = __fmaf_rn(w_t[8], x_values[12], acc[8]);
-              acc[9] = __fmaf_rn(w_t[9], x_values[12], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_16;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_16) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_16));
-#else
-              acc[8] = __fmaf_rn(w_t[10], x_values[13], acc[8]);
-              acc[9] = __fmaf_rn(w_t[11], x_values[13], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_17;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_17) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_17));
-#else
-              acc[8] = __fmaf_rn(w_t[12], x_values[14], acc[8]);
-              acc[9] = __fmaf_rn(w_t[13], x_values[14], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_18;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_18) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_18));
-#else
-              acc[8] = __fmaf_rn(w_t[14], x_values[15], acc[8]);
-              acc[9] = __fmaf_rn(w_t[15], x_values[15], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_19;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_19) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_19));
-#else
-              acc[16] = __fmaf_rn(w_t[0], x_values[16], acc[16]);
-              acc[17] = __fmaf_rn(w_t[1], x_values[16], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_20;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_20) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_20));
-#else
-              acc[16] = __fmaf_rn(w_t[2], x_values[17], acc[16]);
-              acc[17] = __fmaf_rn(w_t[3], x_values[17], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_21;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_21) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_21));
-#else
-              acc[16] = __fmaf_rn(w_t[4], x_values[18], acc[16]);
-              acc[17] = __fmaf_rn(w_t[5], x_values[18], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_22;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_22) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_22));
-#else
-              acc[16] = __fmaf_rn(w_t[6], x_values[19], acc[16]);
-              acc[17] = __fmaf_rn(w_t[7], x_values[19], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_23;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_23) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_23));
-#else
-              acc[16] = __fmaf_rn(w_t[8], x_values[20], acc[16]);
-              acc[17] = __fmaf_rn(w_t[9], x_values[20], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_24;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_24) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_24));
-#else
-              acc[16] = __fmaf_rn(w_t[10], x_values[21], acc[16]);
-              acc[17] = __fmaf_rn(w_t[11], x_values[21], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_25;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_25) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_25));
-#else
-              acc[16] = __fmaf_rn(w_t[12], x_values[22], acc[16]);
-              acc[17] = __fmaf_rn(w_t[13], x_values[22], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_26;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_26) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_26));
-#else
-              acc[16] = __fmaf_rn(w_t[14], x_values[23], acc[16]);
-              acc[17] = __fmaf_rn(w_t[15], x_values[23], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_27;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_27) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_27));
-#else
-              acc[24] = __fmaf_rn(w_t[0], x_values[24], acc[24]);
-              acc[25] = __fmaf_rn(w_t[1], x_values[24], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_28;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_28) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_28));
-#else
-              acc[24] = __fmaf_rn(w_t[2], x_values[25], acc[24]);
-              acc[25] = __fmaf_rn(w_t[3], x_values[25], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_29;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_29) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_29));
-#else
-              acc[24] = __fmaf_rn(w_t[4], x_values[26], acc[24]);
-              acc[25] = __fmaf_rn(w_t[5], x_values[26], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_30;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_30) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_30));
-#else
-              acc[24] = __fmaf_rn(w_t[6], x_values[27], acc[24]);
-              acc[25] = __fmaf_rn(w_t[7], x_values[27], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_31;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_31) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_31));
-#else
-              acc[24] = __fmaf_rn(w_t[8], x_values[28], acc[24]);
-              acc[25] = __fmaf_rn(w_t[9], x_values[28], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_32;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_32) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_32));
-#else
-              acc[24] = __fmaf_rn(w_t[10], x_values[29], acc[24]);
-              acc[25] = __fmaf_rn(w_t[11], x_values[29], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_33;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_33) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_33));
-#else
-              acc[24] = __fmaf_rn(w_t[12], x_values[30], acc[24]);
-              acc[25] = __fmaf_rn(w_t[13], x_values[30], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_34;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_34) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_34));
-#else
-              acc[24] = __fmaf_rn(w_t[14], x_values[31], acc[24]);
-              acc[25] = __fmaf_rn(w_t[15], x_values[31], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[14], w_t[15], x_values[31]);
             }
             {
               uint32_t _uv4_35_0;
@@ -5206,612 +4696,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_37;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_37) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_37));
-#else
-              acc[2] = __fmaf_rn(w_t[0], x_values[0], acc[2]);
-              acc[3] = __fmaf_rn(w_t[1], x_values[0], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_38;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_38) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_38));
-#else
-              acc[2] = __fmaf_rn(w_t[2], x_values[1], acc[2]);
-              acc[3] = __fmaf_rn(w_t[3], x_values[1], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_39;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_39) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_39));
-#else
-              acc[2] = __fmaf_rn(w_t[4], x_values[2], acc[2]);
-              acc[3] = __fmaf_rn(w_t[5], x_values[2], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_40;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_40) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_40));
-#else
-              acc[2] = __fmaf_rn(w_t[6], x_values[3], acc[2]);
-              acc[3] = __fmaf_rn(w_t[7], x_values[3], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_41;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_41) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_41));
-#else
-              acc[2] = __fmaf_rn(w_t[8], x_values[4], acc[2]);
-              acc[3] = __fmaf_rn(w_t[9], x_values[4], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_42;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_42) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_42));
-#else
-              acc[2] = __fmaf_rn(w_t[10], x_values[5], acc[2]);
-              acc[3] = __fmaf_rn(w_t[11], x_values[5], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_43;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_43) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_43));
-#else
-              acc[2] = __fmaf_rn(w_t[12], x_values[6], acc[2]);
-              acc[3] = __fmaf_rn(w_t[13], x_values[6], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_44;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_44) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_44));
-#else
-              acc[2] = __fmaf_rn(w_t[14], x_values[7], acc[2]);
-              acc[3] = __fmaf_rn(w_t[15], x_values[7], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_45;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_45) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_45));
-#else
-              acc[10] = __fmaf_rn(w_t[0], x_values[8], acc[10]);
-              acc[11] = __fmaf_rn(w_t[1], x_values[8], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_46;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_46) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_46));
-#else
-              acc[10] = __fmaf_rn(w_t[2], x_values[9], acc[10]);
-              acc[11] = __fmaf_rn(w_t[3], x_values[9], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_47;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_47) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_47));
-#else
-              acc[10] = __fmaf_rn(w_t[4], x_values[10], acc[10]);
-              acc[11] = __fmaf_rn(w_t[5], x_values[10], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_48;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_48) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_48));
-#else
-              acc[10] = __fmaf_rn(w_t[6], x_values[11], acc[10]);
-              acc[11] = __fmaf_rn(w_t[7], x_values[11], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_49;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_49) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_49));
-#else
-              acc[10] = __fmaf_rn(w_t[8], x_values[12], acc[10]);
-              acc[11] = __fmaf_rn(w_t[9], x_values[12], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_50;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_50) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_50));
-#else
-              acc[10] = __fmaf_rn(w_t[10], x_values[13], acc[10]);
-              acc[11] = __fmaf_rn(w_t[11], x_values[13], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_51;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_51) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_51));
-#else
-              acc[10] = __fmaf_rn(w_t[12], x_values[14], acc[10]);
-              acc[11] = __fmaf_rn(w_t[13], x_values[14], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_52;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_52) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_52));
-#else
-              acc[10] = __fmaf_rn(w_t[14], x_values[15], acc[10]);
-              acc[11] = __fmaf_rn(w_t[15], x_values[15], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_53;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_53) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_53));
-#else
-              acc[18] = __fmaf_rn(w_t[0], x_values[16], acc[18]);
-              acc[19] = __fmaf_rn(w_t[1], x_values[16], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_54;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_54) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_54));
-#else
-              acc[18] = __fmaf_rn(w_t[2], x_values[17], acc[18]);
-              acc[19] = __fmaf_rn(w_t[3], x_values[17], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_55;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_55) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_55));
-#else
-              acc[18] = __fmaf_rn(w_t[4], x_values[18], acc[18]);
-              acc[19] = __fmaf_rn(w_t[5], x_values[18], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_56;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_56) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_56));
-#else
-              acc[18] = __fmaf_rn(w_t[6], x_values[19], acc[18]);
-              acc[19] = __fmaf_rn(w_t[7], x_values[19], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_57;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_57) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_57));
-#else
-              acc[18] = __fmaf_rn(w_t[8], x_values[20], acc[18]);
-              acc[19] = __fmaf_rn(w_t[9], x_values[20], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_58;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_58) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_58));
-#else
-              acc[18] = __fmaf_rn(w_t[10], x_values[21], acc[18]);
-              acc[19] = __fmaf_rn(w_t[11], x_values[21], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_59;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_59) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_59));
-#else
-              acc[18] = __fmaf_rn(w_t[12], x_values[22], acc[18]);
-              acc[19] = __fmaf_rn(w_t[13], x_values[22], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_60;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_60) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_60));
-#else
-              acc[18] = __fmaf_rn(w_t[14], x_values[23], acc[18]);
-              acc[19] = __fmaf_rn(w_t[15], x_values[23], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_61;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_61) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_61));
-#else
-              acc[26] = __fmaf_rn(w_t[0], x_values[24], acc[26]);
-              acc[27] = __fmaf_rn(w_t[1], x_values[24], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_62;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_62) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_62));
-#else
-              acc[26] = __fmaf_rn(w_t[2], x_values[25], acc[26]);
-              acc[27] = __fmaf_rn(w_t[3], x_values[25], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_63;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_63) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_63));
-#else
-              acc[26] = __fmaf_rn(w_t[4], x_values[26], acc[26]);
-              acc[27] = __fmaf_rn(w_t[5], x_values[26], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_64;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_64) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_64));
-#else
-              acc[26] = __fmaf_rn(w_t[6], x_values[27], acc[26]);
-              acc[27] = __fmaf_rn(w_t[7], x_values[27], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_65;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_65) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_65));
-#else
-              acc[26] = __fmaf_rn(w_t[8], x_values[28], acc[26]);
-              acc[27] = __fmaf_rn(w_t[9], x_values[28], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_66;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_66) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_66));
-#else
-              acc[26] = __fmaf_rn(w_t[10], x_values[29], acc[26]);
-              acc[27] = __fmaf_rn(w_t[11], x_values[29], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_67;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_67) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_67));
-#else
-              acc[26] = __fmaf_rn(w_t[12], x_values[30], acc[26]);
-              acc[27] = __fmaf_rn(w_t[13], x_values[30], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_68;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_68) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_68));
-#else
-              acc[26] = __fmaf_rn(w_t[14], x_values[31], acc[26]);
-              acc[27] = __fmaf_rn(w_t[15], x_values[31], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[14], w_t[15], x_values[31]);
             }
             {
               uint32_t _uv4_69_0;
@@ -5890,612 +4868,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_71;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_71) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_71));
-#else
-              acc[4] = __fmaf_rn(w_t[0], x_values[0], acc[4]);
-              acc[5] = __fmaf_rn(w_t[1], x_values[0], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_72;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_72) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_72));
-#else
-              acc[4] = __fmaf_rn(w_t[2], x_values[1], acc[4]);
-              acc[5] = __fmaf_rn(w_t[3], x_values[1], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_73;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_73) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_73));
-#else
-              acc[4] = __fmaf_rn(w_t[4], x_values[2], acc[4]);
-              acc[5] = __fmaf_rn(w_t[5], x_values[2], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_74;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_74) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_74));
-#else
-              acc[4] = __fmaf_rn(w_t[6], x_values[3], acc[4]);
-              acc[5] = __fmaf_rn(w_t[7], x_values[3], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_75;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_75) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_75));
-#else
-              acc[4] = __fmaf_rn(w_t[8], x_values[4], acc[4]);
-              acc[5] = __fmaf_rn(w_t[9], x_values[4], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_76;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_76) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_76));
-#else
-              acc[4] = __fmaf_rn(w_t[10], x_values[5], acc[4]);
-              acc[5] = __fmaf_rn(w_t[11], x_values[5], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_77;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_77) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_77));
-#else
-              acc[4] = __fmaf_rn(w_t[12], x_values[6], acc[4]);
-              acc[5] = __fmaf_rn(w_t[13], x_values[6], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_78;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_78) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_78));
-#else
-              acc[4] = __fmaf_rn(w_t[14], x_values[7], acc[4]);
-              acc[5] = __fmaf_rn(w_t[15], x_values[7], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_79;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_79) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_79));
-#else
-              acc[12] = __fmaf_rn(w_t[0], x_values[8], acc[12]);
-              acc[13] = __fmaf_rn(w_t[1], x_values[8], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_80;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_80) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_80));
-#else
-              acc[12] = __fmaf_rn(w_t[2], x_values[9], acc[12]);
-              acc[13] = __fmaf_rn(w_t[3], x_values[9], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_81;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_81) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_81));
-#else
-              acc[12] = __fmaf_rn(w_t[4], x_values[10], acc[12]);
-              acc[13] = __fmaf_rn(w_t[5], x_values[10], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_82;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_82) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_82));
-#else
-              acc[12] = __fmaf_rn(w_t[6], x_values[11], acc[12]);
-              acc[13] = __fmaf_rn(w_t[7], x_values[11], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_83;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_83) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_83));
-#else
-              acc[12] = __fmaf_rn(w_t[8], x_values[12], acc[12]);
-              acc[13] = __fmaf_rn(w_t[9], x_values[12], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_84;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_84) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_84));
-#else
-              acc[12] = __fmaf_rn(w_t[10], x_values[13], acc[12]);
-              acc[13] = __fmaf_rn(w_t[11], x_values[13], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_85;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_85) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_85));
-#else
-              acc[12] = __fmaf_rn(w_t[12], x_values[14], acc[12]);
-              acc[13] = __fmaf_rn(w_t[13], x_values[14], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_86;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_86) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_86));
-#else
-              acc[12] = __fmaf_rn(w_t[14], x_values[15], acc[12]);
-              acc[13] = __fmaf_rn(w_t[15], x_values[15], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_87;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_87) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_87));
-#else
-              acc[20] = __fmaf_rn(w_t[0], x_values[16], acc[20]);
-              acc[21] = __fmaf_rn(w_t[1], x_values[16], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_88;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_88) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_88));
-#else
-              acc[20] = __fmaf_rn(w_t[2], x_values[17], acc[20]);
-              acc[21] = __fmaf_rn(w_t[3], x_values[17], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_89;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_89) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_89));
-#else
-              acc[20] = __fmaf_rn(w_t[4], x_values[18], acc[20]);
-              acc[21] = __fmaf_rn(w_t[5], x_values[18], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_90;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_90) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_90));
-#else
-              acc[20] = __fmaf_rn(w_t[6], x_values[19], acc[20]);
-              acc[21] = __fmaf_rn(w_t[7], x_values[19], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_91;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_91) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_91));
-#else
-              acc[20] = __fmaf_rn(w_t[8], x_values[20], acc[20]);
-              acc[21] = __fmaf_rn(w_t[9], x_values[20], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_92;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_92) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_92));
-#else
-              acc[20] = __fmaf_rn(w_t[10], x_values[21], acc[20]);
-              acc[21] = __fmaf_rn(w_t[11], x_values[21], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_93;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_93) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_93));
-#else
-              acc[20] = __fmaf_rn(w_t[12], x_values[22], acc[20]);
-              acc[21] = __fmaf_rn(w_t[13], x_values[22], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_94;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_94) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_94));
-#else
-              acc[20] = __fmaf_rn(w_t[14], x_values[23], acc[20]);
-              acc[21] = __fmaf_rn(w_t[15], x_values[23], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_95;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_95) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_95));
-#else
-              acc[28] = __fmaf_rn(w_t[0], x_values[24], acc[28]);
-              acc[29] = __fmaf_rn(w_t[1], x_values[24], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_96;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_96) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_96));
-#else
-              acc[28] = __fmaf_rn(w_t[2], x_values[25], acc[28]);
-              acc[29] = __fmaf_rn(w_t[3], x_values[25], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_97;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_97) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_97));
-#else
-              acc[28] = __fmaf_rn(w_t[4], x_values[26], acc[28]);
-              acc[29] = __fmaf_rn(w_t[5], x_values[26], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_98;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_98) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_98));
-#else
-              acc[28] = __fmaf_rn(w_t[6], x_values[27], acc[28]);
-              acc[29] = __fmaf_rn(w_t[7], x_values[27], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_99;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_99) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_99));
-#else
-              acc[28] = __fmaf_rn(w_t[8], x_values[28], acc[28]);
-              acc[29] = __fmaf_rn(w_t[9], x_values[28], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_100;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_100) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_100));
-#else
-              acc[28] = __fmaf_rn(w_t[10], x_values[29], acc[28]);
-              acc[29] = __fmaf_rn(w_t[11], x_values[29], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_101;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_101) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_101));
-#else
-              acc[28] = __fmaf_rn(w_t[12], x_values[30], acc[28]);
-              acc[29] = __fmaf_rn(w_t[13], x_values[30], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_102;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_102) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_102));
-#else
-              acc[28] = __fmaf_rn(w_t[14], x_values[31], acc[28]);
-              acc[29] = __fmaf_rn(w_t[15], x_values[31], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[14], w_t[15], x_values[31]);
             }
             {
               uint32_t _uv4_103_0;
@@ -6574,612 +5040,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_105;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_105) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_105));
-#else
-              acc[6] = __fmaf_rn(w_t[0], x_values[0], acc[6]);
-              acc[7] = __fmaf_rn(w_t[1], x_values[0], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_106;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_106) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_106));
-#else
-              acc[6] = __fmaf_rn(w_t[2], x_values[1], acc[6]);
-              acc[7] = __fmaf_rn(w_t[3], x_values[1], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_107;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_107) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_107));
-#else
-              acc[6] = __fmaf_rn(w_t[4], x_values[2], acc[6]);
-              acc[7] = __fmaf_rn(w_t[5], x_values[2], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_108;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_108) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_108));
-#else
-              acc[6] = __fmaf_rn(w_t[6], x_values[3], acc[6]);
-              acc[7] = __fmaf_rn(w_t[7], x_values[3], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_109;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_109) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_109));
-#else
-              acc[6] = __fmaf_rn(w_t[8], x_values[4], acc[6]);
-              acc[7] = __fmaf_rn(w_t[9], x_values[4], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_110;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_110) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_110));
-#else
-              acc[6] = __fmaf_rn(w_t[10], x_values[5], acc[6]);
-              acc[7] = __fmaf_rn(w_t[11], x_values[5], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_111;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_111) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_111));
-#else
-              acc[6] = __fmaf_rn(w_t[12], x_values[6], acc[6]);
-              acc[7] = __fmaf_rn(w_t[13], x_values[6], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_112;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_112) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_112));
-#else
-              acc[6] = __fmaf_rn(w_t[14], x_values[7], acc[6]);
-              acc[7] = __fmaf_rn(w_t[15], x_values[7], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_113;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_113) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_113));
-#else
-              acc[14] = __fmaf_rn(w_t[0], x_values[8], acc[14]);
-              acc[15] = __fmaf_rn(w_t[1], x_values[8], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_114;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_114) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_114));
-#else
-              acc[14] = __fmaf_rn(w_t[2], x_values[9], acc[14]);
-              acc[15] = __fmaf_rn(w_t[3], x_values[9], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_115;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_115) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_115));
-#else
-              acc[14] = __fmaf_rn(w_t[4], x_values[10], acc[14]);
-              acc[15] = __fmaf_rn(w_t[5], x_values[10], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_116;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_116) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_116));
-#else
-              acc[14] = __fmaf_rn(w_t[6], x_values[11], acc[14]);
-              acc[15] = __fmaf_rn(w_t[7], x_values[11], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_117;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_117) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_117));
-#else
-              acc[14] = __fmaf_rn(w_t[8], x_values[12], acc[14]);
-              acc[15] = __fmaf_rn(w_t[9], x_values[12], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_118;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_118) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_118));
-#else
-              acc[14] = __fmaf_rn(w_t[10], x_values[13], acc[14]);
-              acc[15] = __fmaf_rn(w_t[11], x_values[13], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_119;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_119) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_119));
-#else
-              acc[14] = __fmaf_rn(w_t[12], x_values[14], acc[14]);
-              acc[15] = __fmaf_rn(w_t[13], x_values[14], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_120;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_120) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_120));
-#else
-              acc[14] = __fmaf_rn(w_t[14], x_values[15], acc[14]);
-              acc[15] = __fmaf_rn(w_t[15], x_values[15], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_121;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_121) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_121));
-#else
-              acc[22] = __fmaf_rn(w_t[0], x_values[16], acc[22]);
-              acc[23] = __fmaf_rn(w_t[1], x_values[16], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_122;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_122) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_122));
-#else
-              acc[22] = __fmaf_rn(w_t[2], x_values[17], acc[22]);
-              acc[23] = __fmaf_rn(w_t[3], x_values[17], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_123;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_123) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_123));
-#else
-              acc[22] = __fmaf_rn(w_t[4], x_values[18], acc[22]);
-              acc[23] = __fmaf_rn(w_t[5], x_values[18], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_124;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_124) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_124));
-#else
-              acc[22] = __fmaf_rn(w_t[6], x_values[19], acc[22]);
-              acc[23] = __fmaf_rn(w_t[7], x_values[19], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_125;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_125) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_125));
-#else
-              acc[22] = __fmaf_rn(w_t[8], x_values[20], acc[22]);
-              acc[23] = __fmaf_rn(w_t[9], x_values[20], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_126;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_126) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_126));
-#else
-              acc[22] = __fmaf_rn(w_t[10], x_values[21], acc[22]);
-              acc[23] = __fmaf_rn(w_t[11], x_values[21], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_127;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_127) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_127));
-#else
-              acc[22] = __fmaf_rn(w_t[12], x_values[22], acc[22]);
-              acc[23] = __fmaf_rn(w_t[13], x_values[22], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_128;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_128) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_128));
-#else
-              acc[22] = __fmaf_rn(w_t[14], x_values[23], acc[22]);
-              acc[23] = __fmaf_rn(w_t[15], x_values[23], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_129;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_129) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_129));
-#else
-              acc[30] = __fmaf_rn(w_t[0], x_values[24], acc[30]);
-              acc[31] = __fmaf_rn(w_t[1], x_values[24], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_130;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_130) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_130));
-#else
-              acc[30] = __fmaf_rn(w_t[2], x_values[25], acc[30]);
-              acc[31] = __fmaf_rn(w_t[3], x_values[25], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_131;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_131) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_131));
-#else
-              acc[30] = __fmaf_rn(w_t[4], x_values[26], acc[30]);
-              acc[31] = __fmaf_rn(w_t[5], x_values[26], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_132;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_132) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_132));
-#else
-              acc[30] = __fmaf_rn(w_t[6], x_values[27], acc[30]);
-              acc[31] = __fmaf_rn(w_t[7], x_values[27], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_133;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_133) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_133));
-#else
-              acc[30] = __fmaf_rn(w_t[8], x_values[28], acc[30]);
-              acc[31] = __fmaf_rn(w_t[9], x_values[28], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_134;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_134) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_134));
-#else
-              acc[30] = __fmaf_rn(w_t[10], x_values[29], acc[30]);
-              acc[31] = __fmaf_rn(w_t[11], x_values[29], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_135;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_135) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_135));
-#else
-              acc[30] = __fmaf_rn(w_t[12], x_values[30], acc[30]);
-              acc[31] = __fmaf_rn(w_t[13], x_values[30], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_136;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_136) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_136));
-#else
-              acc[30] = __fmaf_rn(w_t[14], x_values[31], acc[30]);
-              acc[31] = __fmaf_rn(w_t[15], x_values[31], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[14], w_t[15], x_values[31]);
             }
           }
         }
@@ -8243,612 +6197,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_0;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_0) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_0));
-#else
-              acc[0] = __fmaf_rn(w_t[0], x_values[0], acc[0]);
-              acc[1] = __fmaf_rn(w_t[1], x_values[0], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_1;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_1) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_1));
-#else
-              acc[0] = __fmaf_rn(w_t[2], x_values[1], acc[0]);
-              acc[1] = __fmaf_rn(w_t[3], x_values[1], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_2;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_2) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_2));
-#else
-              acc[0] = __fmaf_rn(w_t[4], x_values[2], acc[0]);
-              acc[1] = __fmaf_rn(w_t[5], x_values[2], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_3;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_3) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_3));
-#else
-              acc[0] = __fmaf_rn(w_t[6], x_values[3], acc[0]);
-              acc[1] = __fmaf_rn(w_t[7], x_values[3], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_4;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_4) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_4));
-#else
-              acc[0] = __fmaf_rn(w_t[8], x_values[4], acc[0]);
-              acc[1] = __fmaf_rn(w_t[9], x_values[4], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_5;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_5) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_5));
-#else
-              acc[0] = __fmaf_rn(w_t[10], x_values[5], acc[0]);
-              acc[1] = __fmaf_rn(w_t[11], x_values[5], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_6;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_6) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_6));
-#else
-              acc[0] = __fmaf_rn(w_t[12], x_values[6], acc[0]);
-              acc[1] = __fmaf_rn(w_t[13], x_values[6], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_7;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_7) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[0]), "+f"(acc[1])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_7));
-#else
-              acc[0] = __fmaf_rn(w_t[14], x_values[7], acc[0]);
-              acc[1] = __fmaf_rn(w_t[15], x_values[7], acc[1]);
-#endif
+              bgmv_moe_fma2(acc[0], acc[1], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_8;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_8) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_8));
-#else
-              acc[8] = __fmaf_rn(w_t[0], x_values[8], acc[8]);
-              acc[9] = __fmaf_rn(w_t[1], x_values[8], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_9;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_9) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_9));
-#else
-              acc[8] = __fmaf_rn(w_t[2], x_values[9], acc[8]);
-              acc[9] = __fmaf_rn(w_t[3], x_values[9], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_10;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_10) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_10));
-#else
-              acc[8] = __fmaf_rn(w_t[4], x_values[10], acc[8]);
-              acc[9] = __fmaf_rn(w_t[5], x_values[10], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_11;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_11) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_11));
-#else
-              acc[8] = __fmaf_rn(w_t[6], x_values[11], acc[8]);
-              acc[9] = __fmaf_rn(w_t[7], x_values[11], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_12;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_12) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_12));
-#else
-              acc[8] = __fmaf_rn(w_t[8], x_values[12], acc[8]);
-              acc[9] = __fmaf_rn(w_t[9], x_values[12], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_13;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_13) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_13));
-#else
-              acc[8] = __fmaf_rn(w_t[10], x_values[13], acc[8]);
-              acc[9] = __fmaf_rn(w_t[11], x_values[13], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_14;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_14) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_14));
-#else
-              acc[8] = __fmaf_rn(w_t[12], x_values[14], acc[8]);
-              acc[9] = __fmaf_rn(w_t[13], x_values[14], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_15;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_15) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[8]), "+f"(acc[9])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_15));
-#else
-              acc[8] = __fmaf_rn(w_t[14], x_values[15], acc[8]);
-              acc[9] = __fmaf_rn(w_t[15], x_values[15], acc[9]);
-#endif
+              bgmv_moe_fma2(acc[8], acc[9], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_16;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_16) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_16));
-#else
-              acc[16] = __fmaf_rn(w_t[0], x_values[16], acc[16]);
-              acc[17] = __fmaf_rn(w_t[1], x_values[16], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_17;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_17) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_17));
-#else
-              acc[16] = __fmaf_rn(w_t[2], x_values[17], acc[16]);
-              acc[17] = __fmaf_rn(w_t[3], x_values[17], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_18;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_18) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_18));
-#else
-              acc[16] = __fmaf_rn(w_t[4], x_values[18], acc[16]);
-              acc[17] = __fmaf_rn(w_t[5], x_values[18], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_19;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_19) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_19));
-#else
-              acc[16] = __fmaf_rn(w_t[6], x_values[19], acc[16]);
-              acc[17] = __fmaf_rn(w_t[7], x_values[19], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_20;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_20) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_20));
-#else
-              acc[16] = __fmaf_rn(w_t[8], x_values[20], acc[16]);
-              acc[17] = __fmaf_rn(w_t[9], x_values[20], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_21;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_21) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_21));
-#else
-              acc[16] = __fmaf_rn(w_t[10], x_values[21], acc[16]);
-              acc[17] = __fmaf_rn(w_t[11], x_values[21], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_22;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_22) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_22));
-#else
-              acc[16] = __fmaf_rn(w_t[12], x_values[22], acc[16]);
-              acc[17] = __fmaf_rn(w_t[13], x_values[22], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_23;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_23) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[16]), "+f"(acc[17])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_23));
-#else
-              acc[16] = __fmaf_rn(w_t[14], x_values[23], acc[16]);
-              acc[17] = __fmaf_rn(w_t[15], x_values[23], acc[17]);
-#endif
+              bgmv_moe_fma2(acc[16], acc[17], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_24;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_24) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_24));
-#else
-              acc[24] = __fmaf_rn(w_t[0], x_values[24], acc[24]);
-              acc[25] = __fmaf_rn(w_t[1], x_values[24], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_25;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_25) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_25));
-#else
-              acc[24] = __fmaf_rn(w_t[2], x_values[25], acc[24]);
-              acc[25] = __fmaf_rn(w_t[3], x_values[25], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_26;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_26) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_26));
-#else
-              acc[24] = __fmaf_rn(w_t[4], x_values[26], acc[24]);
-              acc[25] = __fmaf_rn(w_t[5], x_values[26], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_27;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_27) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_27));
-#else
-              acc[24] = __fmaf_rn(w_t[6], x_values[27], acc[24]);
-              acc[25] = __fmaf_rn(w_t[7], x_values[27], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_28;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_28) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_28));
-#else
-              acc[24] = __fmaf_rn(w_t[8], x_values[28], acc[24]);
-              acc[25] = __fmaf_rn(w_t[9], x_values[28], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_29;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_29) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_29));
-#else
-              acc[24] = __fmaf_rn(w_t[10], x_values[29], acc[24]);
-              acc[25] = __fmaf_rn(w_t[11], x_values[29], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_30;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_30) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_30));
-#else
-              acc[24] = __fmaf_rn(w_t[12], x_values[30], acc[24]);
-              acc[25] = __fmaf_rn(w_t[13], x_values[30], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_31;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_31) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[24]), "+f"(acc[25])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_31));
-#else
-              acc[24] = __fmaf_rn(w_t[14], x_values[31], acc[24]);
-              acc[25] = __fmaf_rn(w_t[15], x_values[31], acc[25]);
-#endif
+              bgmv_moe_fma2(acc[24], acc[25], w_t[14], w_t[15], x_values[31]);
             }
             asm volatile(
                 "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -8909,612 +6351,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_32;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_32) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_32));
-#else
-              acc[2] = __fmaf_rn(w_t[0], x_values[0], acc[2]);
-              acc[3] = __fmaf_rn(w_t[1], x_values[0], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_33;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_33) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_33));
-#else
-              acc[2] = __fmaf_rn(w_t[2], x_values[1], acc[2]);
-              acc[3] = __fmaf_rn(w_t[3], x_values[1], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_34;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_34) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_34));
-#else
-              acc[2] = __fmaf_rn(w_t[4], x_values[2], acc[2]);
-              acc[3] = __fmaf_rn(w_t[5], x_values[2], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_35;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_35) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_35));
-#else
-              acc[2] = __fmaf_rn(w_t[6], x_values[3], acc[2]);
-              acc[3] = __fmaf_rn(w_t[7], x_values[3], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_36;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_36) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_36));
-#else
-              acc[2] = __fmaf_rn(w_t[8], x_values[4], acc[2]);
-              acc[3] = __fmaf_rn(w_t[9], x_values[4], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_37;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_37) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_37));
-#else
-              acc[2] = __fmaf_rn(w_t[10], x_values[5], acc[2]);
-              acc[3] = __fmaf_rn(w_t[11], x_values[5], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_38;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_38) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_38));
-#else
-              acc[2] = __fmaf_rn(w_t[12], x_values[6], acc[2]);
-              acc[3] = __fmaf_rn(w_t[13], x_values[6], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_39;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_39) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[2]), "+f"(acc[3])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_39));
-#else
-              acc[2] = __fmaf_rn(w_t[14], x_values[7], acc[2]);
-              acc[3] = __fmaf_rn(w_t[15], x_values[7], acc[3]);
-#endif
+              bgmv_moe_fma2(acc[2], acc[3], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_40;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_40) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_40));
-#else
-              acc[10] = __fmaf_rn(w_t[0], x_values[8], acc[10]);
-              acc[11] = __fmaf_rn(w_t[1], x_values[8], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_41;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_41) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_41));
-#else
-              acc[10] = __fmaf_rn(w_t[2], x_values[9], acc[10]);
-              acc[11] = __fmaf_rn(w_t[3], x_values[9], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_42;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_42) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_42));
-#else
-              acc[10] = __fmaf_rn(w_t[4], x_values[10], acc[10]);
-              acc[11] = __fmaf_rn(w_t[5], x_values[10], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_43;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_43) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_43));
-#else
-              acc[10] = __fmaf_rn(w_t[6], x_values[11], acc[10]);
-              acc[11] = __fmaf_rn(w_t[7], x_values[11], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_44;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_44) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_44));
-#else
-              acc[10] = __fmaf_rn(w_t[8], x_values[12], acc[10]);
-              acc[11] = __fmaf_rn(w_t[9], x_values[12], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_45;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_45) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_45));
-#else
-              acc[10] = __fmaf_rn(w_t[10], x_values[13], acc[10]);
-              acc[11] = __fmaf_rn(w_t[11], x_values[13], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_46;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_46) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_46));
-#else
-              acc[10] = __fmaf_rn(w_t[12], x_values[14], acc[10]);
-              acc[11] = __fmaf_rn(w_t[13], x_values[14], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_47;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_47) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[10]), "+f"(acc[11])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_47));
-#else
-              acc[10] = __fmaf_rn(w_t[14], x_values[15], acc[10]);
-              acc[11] = __fmaf_rn(w_t[15], x_values[15], acc[11]);
-#endif
+              bgmv_moe_fma2(acc[10], acc[11], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_48;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_48) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_48));
-#else
-              acc[18] = __fmaf_rn(w_t[0], x_values[16], acc[18]);
-              acc[19] = __fmaf_rn(w_t[1], x_values[16], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_49;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_49) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_49));
-#else
-              acc[18] = __fmaf_rn(w_t[2], x_values[17], acc[18]);
-              acc[19] = __fmaf_rn(w_t[3], x_values[17], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_50;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_50) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_50));
-#else
-              acc[18] = __fmaf_rn(w_t[4], x_values[18], acc[18]);
-              acc[19] = __fmaf_rn(w_t[5], x_values[18], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_51;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_51) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_51));
-#else
-              acc[18] = __fmaf_rn(w_t[6], x_values[19], acc[18]);
-              acc[19] = __fmaf_rn(w_t[7], x_values[19], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_52;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_52) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_52));
-#else
-              acc[18] = __fmaf_rn(w_t[8], x_values[20], acc[18]);
-              acc[19] = __fmaf_rn(w_t[9], x_values[20], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_53;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_53) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_53));
-#else
-              acc[18] = __fmaf_rn(w_t[10], x_values[21], acc[18]);
-              acc[19] = __fmaf_rn(w_t[11], x_values[21], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_54;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_54) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_54));
-#else
-              acc[18] = __fmaf_rn(w_t[12], x_values[22], acc[18]);
-              acc[19] = __fmaf_rn(w_t[13], x_values[22], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_55;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_55) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[18]), "+f"(acc[19])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_55));
-#else
-              acc[18] = __fmaf_rn(w_t[14], x_values[23], acc[18]);
-              acc[19] = __fmaf_rn(w_t[15], x_values[23], acc[19]);
-#endif
+              bgmv_moe_fma2(acc[18], acc[19], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_56;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_56) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_56));
-#else
-              acc[26] = __fmaf_rn(w_t[0], x_values[24], acc[26]);
-              acc[27] = __fmaf_rn(w_t[1], x_values[24], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_57;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_57) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_57));
-#else
-              acc[26] = __fmaf_rn(w_t[2], x_values[25], acc[26]);
-              acc[27] = __fmaf_rn(w_t[3], x_values[25], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_58;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_58) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_58));
-#else
-              acc[26] = __fmaf_rn(w_t[4], x_values[26], acc[26]);
-              acc[27] = __fmaf_rn(w_t[5], x_values[26], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_59;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_59) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_59));
-#else
-              acc[26] = __fmaf_rn(w_t[6], x_values[27], acc[26]);
-              acc[27] = __fmaf_rn(w_t[7], x_values[27], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_60;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_60) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_60));
-#else
-              acc[26] = __fmaf_rn(w_t[8], x_values[28], acc[26]);
-              acc[27] = __fmaf_rn(w_t[9], x_values[28], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_61;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_61) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_61));
-#else
-              acc[26] = __fmaf_rn(w_t[10], x_values[29], acc[26]);
-              acc[27] = __fmaf_rn(w_t[11], x_values[29], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_62;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_62) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_62));
-#else
-              acc[26] = __fmaf_rn(w_t[12], x_values[30], acc[26]);
-              acc[27] = __fmaf_rn(w_t[13], x_values[30], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_63;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_63) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[26]), "+f"(acc[27])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_63));
-#else
-              acc[26] = __fmaf_rn(w_t[14], x_values[31], acc[26]);
-              acc[27] = __fmaf_rn(w_t[15], x_values[31], acc[27]);
-#endif
+              bgmv_moe_fma2(acc[26], acc[27], w_t[14], w_t[15], x_values[31]);
             }
             asm volatile(
                 "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -9575,612 +6505,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_64;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_64) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_64));
-#else
-              acc[4] = __fmaf_rn(w_t[0], x_values[0], acc[4]);
-              acc[5] = __fmaf_rn(w_t[1], x_values[0], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_65;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_65) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_65));
-#else
-              acc[4] = __fmaf_rn(w_t[2], x_values[1], acc[4]);
-              acc[5] = __fmaf_rn(w_t[3], x_values[1], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_66;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_66) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_66));
-#else
-              acc[4] = __fmaf_rn(w_t[4], x_values[2], acc[4]);
-              acc[5] = __fmaf_rn(w_t[5], x_values[2], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_67;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_67) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_67));
-#else
-              acc[4] = __fmaf_rn(w_t[6], x_values[3], acc[4]);
-              acc[5] = __fmaf_rn(w_t[7], x_values[3], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_68;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_68) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_68));
-#else
-              acc[4] = __fmaf_rn(w_t[8], x_values[4], acc[4]);
-              acc[5] = __fmaf_rn(w_t[9], x_values[4], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_69;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_69) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_69));
-#else
-              acc[4] = __fmaf_rn(w_t[10], x_values[5], acc[4]);
-              acc[5] = __fmaf_rn(w_t[11], x_values[5], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_70;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_70) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_70));
-#else
-              acc[4] = __fmaf_rn(w_t[12], x_values[6], acc[4]);
-              acc[5] = __fmaf_rn(w_t[13], x_values[6], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_71;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_71) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[4]), "+f"(acc[5])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_71));
-#else
-              acc[4] = __fmaf_rn(w_t[14], x_values[7], acc[4]);
-              acc[5] = __fmaf_rn(w_t[15], x_values[7], acc[5]);
-#endif
+              bgmv_moe_fma2(acc[4], acc[5], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_72;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_72) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_72));
-#else
-              acc[12] = __fmaf_rn(w_t[0], x_values[8], acc[12]);
-              acc[13] = __fmaf_rn(w_t[1], x_values[8], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_73;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_73) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_73));
-#else
-              acc[12] = __fmaf_rn(w_t[2], x_values[9], acc[12]);
-              acc[13] = __fmaf_rn(w_t[3], x_values[9], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_74;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_74) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_74));
-#else
-              acc[12] = __fmaf_rn(w_t[4], x_values[10], acc[12]);
-              acc[13] = __fmaf_rn(w_t[5], x_values[10], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_75;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_75) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_75));
-#else
-              acc[12] = __fmaf_rn(w_t[6], x_values[11], acc[12]);
-              acc[13] = __fmaf_rn(w_t[7], x_values[11], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_76;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_76) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_76));
-#else
-              acc[12] = __fmaf_rn(w_t[8], x_values[12], acc[12]);
-              acc[13] = __fmaf_rn(w_t[9], x_values[12], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_77;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_77) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_77));
-#else
-              acc[12] = __fmaf_rn(w_t[10], x_values[13], acc[12]);
-              acc[13] = __fmaf_rn(w_t[11], x_values[13], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_78;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_78) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_78));
-#else
-              acc[12] = __fmaf_rn(w_t[12], x_values[14], acc[12]);
-              acc[13] = __fmaf_rn(w_t[13], x_values[14], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_79;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_79) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[12]), "+f"(acc[13])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_79));
-#else
-              acc[12] = __fmaf_rn(w_t[14], x_values[15], acc[12]);
-              acc[13] = __fmaf_rn(w_t[15], x_values[15], acc[13]);
-#endif
+              bgmv_moe_fma2(acc[12], acc[13], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_80;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_80) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_80));
-#else
-              acc[20] = __fmaf_rn(w_t[0], x_values[16], acc[20]);
-              acc[21] = __fmaf_rn(w_t[1], x_values[16], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_81;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_81) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_81));
-#else
-              acc[20] = __fmaf_rn(w_t[2], x_values[17], acc[20]);
-              acc[21] = __fmaf_rn(w_t[3], x_values[17], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_82;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_82) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_82));
-#else
-              acc[20] = __fmaf_rn(w_t[4], x_values[18], acc[20]);
-              acc[21] = __fmaf_rn(w_t[5], x_values[18], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_83;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_83) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_83));
-#else
-              acc[20] = __fmaf_rn(w_t[6], x_values[19], acc[20]);
-              acc[21] = __fmaf_rn(w_t[7], x_values[19], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_84;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_84) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_84));
-#else
-              acc[20] = __fmaf_rn(w_t[8], x_values[20], acc[20]);
-              acc[21] = __fmaf_rn(w_t[9], x_values[20], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_85;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_85) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_85));
-#else
-              acc[20] = __fmaf_rn(w_t[10], x_values[21], acc[20]);
-              acc[21] = __fmaf_rn(w_t[11], x_values[21], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_86;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_86) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_86));
-#else
-              acc[20] = __fmaf_rn(w_t[12], x_values[22], acc[20]);
-              acc[21] = __fmaf_rn(w_t[13], x_values[22], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_87;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_87) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[20]), "+f"(acc[21])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_87));
-#else
-              acc[20] = __fmaf_rn(w_t[14], x_values[23], acc[20]);
-              acc[21] = __fmaf_rn(w_t[15], x_values[23], acc[21]);
-#endif
+              bgmv_moe_fma2(acc[20], acc[21], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_88;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_88) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_88));
-#else
-              acc[28] = __fmaf_rn(w_t[0], x_values[24], acc[28]);
-              acc[29] = __fmaf_rn(w_t[1], x_values[24], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_89;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_89) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_89));
-#else
-              acc[28] = __fmaf_rn(w_t[2], x_values[25], acc[28]);
-              acc[29] = __fmaf_rn(w_t[3], x_values[25], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_90;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_90) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_90));
-#else
-              acc[28] = __fmaf_rn(w_t[4], x_values[26], acc[28]);
-              acc[29] = __fmaf_rn(w_t[5], x_values[26], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_91;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_91) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_91));
-#else
-              acc[28] = __fmaf_rn(w_t[6], x_values[27], acc[28]);
-              acc[29] = __fmaf_rn(w_t[7], x_values[27], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_92;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_92) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_92));
-#else
-              acc[28] = __fmaf_rn(w_t[8], x_values[28], acc[28]);
-              acc[29] = __fmaf_rn(w_t[9], x_values[28], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_93;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_93) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_93));
-#else
-              acc[28] = __fmaf_rn(w_t[10], x_values[29], acc[28]);
-              acc[29] = __fmaf_rn(w_t[11], x_values[29], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_94;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_94) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_94));
-#else
-              acc[28] = __fmaf_rn(w_t[12], x_values[30], acc[28]);
-              acc[29] = __fmaf_rn(w_t[13], x_values[30], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_95;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_95) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[28]), "+f"(acc[29])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_95));
-#else
-              acc[28] = __fmaf_rn(w_t[14], x_values[31], acc[28]);
-              acc[29] = __fmaf_rn(w_t[15], x_values[31], acc[29]);
-#endif
+              bgmv_moe_fma2(acc[28], acc[29], w_t[14], w_t[15], x_values[31]);
             }
             asm volatile(
                 "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -10241,612 +6659,100 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
             w_t[13] = w_values[6];
             w_t[15] = w_values[7];
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_96;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_96) : "f"(x_values[0]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_96));
-#else
-              acc[6] = __fmaf_rn(w_t[0], x_values[0], acc[6]);
-              acc[7] = __fmaf_rn(w_t[1], x_values[0], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[0], w_t[1], x_values[0]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_97;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_97) : "f"(x_values[1]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_97));
-#else
-              acc[6] = __fmaf_rn(w_t[2], x_values[1], acc[6]);
-              acc[7] = __fmaf_rn(w_t[3], x_values[1], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[2], w_t[3], x_values[1]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_98;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_98) : "f"(x_values[2]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_98));
-#else
-              acc[6] = __fmaf_rn(w_t[4], x_values[2], acc[6]);
-              acc[7] = __fmaf_rn(w_t[5], x_values[2], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[4], w_t[5], x_values[2]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_99;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_99) : "f"(x_values[3]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_99));
-#else
-              acc[6] = __fmaf_rn(w_t[6], x_values[3], acc[6]);
-              acc[7] = __fmaf_rn(w_t[7], x_values[3], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[6], w_t[7], x_values[3]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_100;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_100) : "f"(x_values[4]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_100));
-#else
-              acc[6] = __fmaf_rn(w_t[8], x_values[4], acc[6]);
-              acc[7] = __fmaf_rn(w_t[9], x_values[4], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[8], w_t[9], x_values[4]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_101;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_101) : "f"(x_values[5]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_101));
-#else
-              acc[6] = __fmaf_rn(w_t[10], x_values[5], acc[6]);
-              acc[7] = __fmaf_rn(w_t[11], x_values[5], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[10], w_t[11], x_values[5]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_102;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_102) : "f"(x_values[6]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_102));
-#else
-              acc[6] = __fmaf_rn(w_t[12], x_values[6], acc[6]);
-              acc[7] = __fmaf_rn(w_t[13], x_values[6], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[12], w_t[13], x_values[6]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_103;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_103) : "f"(x_values[7]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[6]), "+f"(acc[7])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_103));
-#else
-              acc[6] = __fmaf_rn(w_t[14], x_values[7], acc[6]);
-              acc[7] = __fmaf_rn(w_t[15], x_values[7], acc[7]);
-#endif
+              bgmv_moe_fma2(acc[6], acc[7], w_t[14], w_t[15], x_values[7]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_104;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_104) : "f"(x_values[8]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_104));
-#else
-              acc[14] = __fmaf_rn(w_t[0], x_values[8], acc[14]);
-              acc[15] = __fmaf_rn(w_t[1], x_values[8], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[0], w_t[1], x_values[8]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_105;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_105) : "f"(x_values[9]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_105));
-#else
-              acc[14] = __fmaf_rn(w_t[2], x_values[9], acc[14]);
-              acc[15] = __fmaf_rn(w_t[3], x_values[9], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[2], w_t[3], x_values[9]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_106;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_106) : "f"(x_values[10]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_106));
-#else
-              acc[14] = __fmaf_rn(w_t[4], x_values[10], acc[14]);
-              acc[15] = __fmaf_rn(w_t[5], x_values[10], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[4], w_t[5], x_values[10]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_107;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_107) : "f"(x_values[11]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_107));
-#else
-              acc[14] = __fmaf_rn(w_t[6], x_values[11], acc[14]);
-              acc[15] = __fmaf_rn(w_t[7], x_values[11], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[6], w_t[7], x_values[11]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_108;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_108) : "f"(x_values[12]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_108));
-#else
-              acc[14] = __fmaf_rn(w_t[8], x_values[12], acc[14]);
-              acc[15] = __fmaf_rn(w_t[9], x_values[12], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[8], w_t[9], x_values[12]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_109;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_109) : "f"(x_values[13]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_109));
-#else
-              acc[14] = __fmaf_rn(w_t[10], x_values[13], acc[14]);
-              acc[15] = __fmaf_rn(w_t[11], x_values[13], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[10], w_t[11], x_values[13]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_110;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_110) : "f"(x_values[14]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_110));
-#else
-              acc[14] = __fmaf_rn(w_t[12], x_values[14], acc[14]);
-              acc[15] = __fmaf_rn(w_t[13], x_values[14], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[12], w_t[13], x_values[14]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_111;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_111) : "f"(x_values[15]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[14]), "+f"(acc[15])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_111));
-#else
-              acc[14] = __fmaf_rn(w_t[14], x_values[15], acc[14]);
-              acc[15] = __fmaf_rn(w_t[15], x_values[15], acc[15]);
-#endif
+              bgmv_moe_fma2(acc[14], acc[15], w_t[14], w_t[15], x_values[15]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_112;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_112) : "f"(x_values[16]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_112));
-#else
-              acc[22] = __fmaf_rn(w_t[0], x_values[16], acc[22]);
-              acc[23] = __fmaf_rn(w_t[1], x_values[16], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[0], w_t[1], x_values[16]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_113;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_113) : "f"(x_values[17]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_113));
-#else
-              acc[22] = __fmaf_rn(w_t[2], x_values[17], acc[22]);
-              acc[23] = __fmaf_rn(w_t[3], x_values[17], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[2], w_t[3], x_values[17]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_114;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_114) : "f"(x_values[18]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_114));
-#else
-              acc[22] = __fmaf_rn(w_t[4], x_values[18], acc[22]);
-              acc[23] = __fmaf_rn(w_t[5], x_values[18], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[4], w_t[5], x_values[18]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_115;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_115) : "f"(x_values[19]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_115));
-#else
-              acc[22] = __fmaf_rn(w_t[6], x_values[19], acc[22]);
-              acc[23] = __fmaf_rn(w_t[7], x_values[19], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[6], w_t[7], x_values[19]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_116;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_116) : "f"(x_values[20]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_116));
-#else
-              acc[22] = __fmaf_rn(w_t[8], x_values[20], acc[22]);
-              acc[23] = __fmaf_rn(w_t[9], x_values[20], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[8], w_t[9], x_values[20]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_117;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_117) : "f"(x_values[21]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_117));
-#else
-              acc[22] = __fmaf_rn(w_t[10], x_values[21], acc[22]);
-              acc[23] = __fmaf_rn(w_t[11], x_values[21], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[10], w_t[11], x_values[21]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_118;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_118) : "f"(x_values[22]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_118));
-#else
-              acc[22] = __fmaf_rn(w_t[12], x_values[22], acc[22]);
-              acc[23] = __fmaf_rn(w_t[13], x_values[22], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[12], w_t[13], x_values[22]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_119;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_119) : "f"(x_values[23]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[22]), "+f"(acc[23])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_119));
-#else
-              acc[22] = __fmaf_rn(w_t[14], x_values[23], acc[22]);
-              acc[23] = __fmaf_rn(w_t[15], x_values[23], acc[23]);
-#endif
+              bgmv_moe_fma2(acc[22], acc[23], w_t[14], w_t[15], x_values[23]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_120;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_120) : "f"(x_values[24]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_120));
-#else
-              acc[30] = __fmaf_rn(w_t[0], x_values[24], acc[30]);
-              acc[31] = __fmaf_rn(w_t[1], x_values[24], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[0], w_t[1], x_values[24]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_121;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_121) : "f"(x_values[25]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_121));
-#else
-              acc[30] = __fmaf_rn(w_t[2], x_values[25], acc[30]);
-              acc[31] = __fmaf_rn(w_t[3], x_values[25], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[2], w_t[3], x_values[25]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_122;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_122) : "f"(x_values[26]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_122));
-#else
-              acc[30] = __fmaf_rn(w_t[4], x_values[26], acc[30]);
-              acc[31] = __fmaf_rn(w_t[5], x_values[26], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[4], w_t[5], x_values[26]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_123;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_123) : "f"(x_values[27]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_123));
-#else
-              acc[30] = __fmaf_rn(w_t[6], x_values[27], acc[30]);
-              acc[31] = __fmaf_rn(w_t[7], x_values[27], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[6], w_t[7], x_values[27]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_124;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_124) : "f"(x_values[28]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_124));
-#else
-              acc[30] = __fmaf_rn(w_t[8], x_values[28], acc[30]);
-              acc[31] = __fmaf_rn(w_t[9], x_values[28], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[8], w_t[9], x_values[28]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_125;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_125) : "f"(x_values[29]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_125));
-#else
-              acc[30] = __fmaf_rn(w_t[10], x_values[29], acc[30]);
-              acc[31] = __fmaf_rn(w_t[11], x_values[29], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[10], w_t[11], x_values[29]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_126;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_126) : "f"(x_values[30]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_126));
-#else
-              acc[30] = __fmaf_rn(w_t[12], x_values[30], acc[30]);
-              acc[31] = __fmaf_rn(w_t[13], x_values[30], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[12], w_t[13], x_values[30]);
             }
             {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-              unsigned long long _fma_acc_scale2_127;
-              asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_127) : "f"(x_values[31]));
-              asm volatile(
-                  "{\n\t"
-                  ".reg .b64 _src2, _acc2, _out2;\n\t"
-                  "mov.b64 _src2, {%2, %3};\n\t"
-                  "mov.b64 _acc2, {%0, %1};\n\t"
-                  "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                  "mov.b64 {%0, %1}, _out2;\n\t"
-                  "}"
-                  : "+f"(acc[30]), "+f"(acc[31])
-                  : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_127));
-#else
-              acc[30] = __fmaf_rn(w_t[14], x_values[31], acc[30]);
-              acc[31] = __fmaf_rn(w_t[15], x_values[31], acc[31]);
-#endif
+              bgmv_moe_fma2(acc[30], acc[31], w_t[14], w_t[15], x_values[31]);
             }
           }
         }
@@ -11164,612 +7070,100 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
           w_t[13] = w_values[6];
           w_t[15] = w_values[7];
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_0;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_0) : "f"(x_values[0]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_0));
-#else
-            acc[0] = __fmaf_rn(w_t[0], x_values[0], acc[0]);
-            acc[1] = __fmaf_rn(w_t[1], x_values[0], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[0], w_t[1], x_values[0]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_1;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_1) : "f"(x_values[1]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_1));
-#else
-            acc[0] = __fmaf_rn(w_t[2], x_values[1], acc[0]);
-            acc[1] = __fmaf_rn(w_t[3], x_values[1], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[2], w_t[3], x_values[1]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_2;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_2) : "f"(x_values[2]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_2));
-#else
-            acc[0] = __fmaf_rn(w_t[4], x_values[2], acc[0]);
-            acc[1] = __fmaf_rn(w_t[5], x_values[2], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[4], w_t[5], x_values[2]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_3;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_3) : "f"(x_values[3]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_3));
-#else
-            acc[0] = __fmaf_rn(w_t[6], x_values[3], acc[0]);
-            acc[1] = __fmaf_rn(w_t[7], x_values[3], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[6], w_t[7], x_values[3]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_4;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_4) : "f"(x_values[4]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_4));
-#else
-            acc[0] = __fmaf_rn(w_t[8], x_values[4], acc[0]);
-            acc[1] = __fmaf_rn(w_t[9], x_values[4], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[8], w_t[9], x_values[4]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_5;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_5) : "f"(x_values[5]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_5));
-#else
-            acc[0] = __fmaf_rn(w_t[10], x_values[5], acc[0]);
-            acc[1] = __fmaf_rn(w_t[11], x_values[5], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[10], w_t[11], x_values[5]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_6;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_6) : "f"(x_values[6]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_6));
-#else
-            acc[0] = __fmaf_rn(w_t[12], x_values[6], acc[0]);
-            acc[1] = __fmaf_rn(w_t[13], x_values[6], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[12], w_t[13], x_values[6]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_7;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_7) : "f"(x_values[7]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[0]), "+f"(acc[1])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_7));
-#else
-            acc[0] = __fmaf_rn(w_t[14], x_values[7], acc[0]);
-            acc[1] = __fmaf_rn(w_t[15], x_values[7], acc[1]);
-#endif
+            bgmv_moe_fma2(acc[0], acc[1], w_t[14], w_t[15], x_values[7]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_8;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_8) : "f"(x_values[8]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_8));
-#else
-            acc[8] = __fmaf_rn(w_t[0], x_values[8], acc[8]);
-            acc[9] = __fmaf_rn(w_t[1], x_values[8], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[0], w_t[1], x_values[8]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_9;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_9) : "f"(x_values[9]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_9));
-#else
-            acc[8] = __fmaf_rn(w_t[2], x_values[9], acc[8]);
-            acc[9] = __fmaf_rn(w_t[3], x_values[9], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[2], w_t[3], x_values[9]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_10;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_10) : "f"(x_values[10]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_10));
-#else
-            acc[8] = __fmaf_rn(w_t[4], x_values[10], acc[8]);
-            acc[9] = __fmaf_rn(w_t[5], x_values[10], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[4], w_t[5], x_values[10]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_11;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_11) : "f"(x_values[11]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_11));
-#else
-            acc[8] = __fmaf_rn(w_t[6], x_values[11], acc[8]);
-            acc[9] = __fmaf_rn(w_t[7], x_values[11], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[6], w_t[7], x_values[11]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_12;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_12) : "f"(x_values[12]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_12));
-#else
-            acc[8] = __fmaf_rn(w_t[8], x_values[12], acc[8]);
-            acc[9] = __fmaf_rn(w_t[9], x_values[12], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[8], w_t[9], x_values[12]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_13;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_13) : "f"(x_values[13]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_13));
-#else
-            acc[8] = __fmaf_rn(w_t[10], x_values[13], acc[8]);
-            acc[9] = __fmaf_rn(w_t[11], x_values[13], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[10], w_t[11], x_values[13]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_14;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_14) : "f"(x_values[14]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_14));
-#else
-            acc[8] = __fmaf_rn(w_t[12], x_values[14], acc[8]);
-            acc[9] = __fmaf_rn(w_t[13], x_values[14], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[12], w_t[13], x_values[14]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_15;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_15) : "f"(x_values[15]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[8]), "+f"(acc[9])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_15));
-#else
-            acc[8] = __fmaf_rn(w_t[14], x_values[15], acc[8]);
-            acc[9] = __fmaf_rn(w_t[15], x_values[15], acc[9]);
-#endif
+            bgmv_moe_fma2(acc[8], acc[9], w_t[14], w_t[15], x_values[15]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_16;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_16) : "f"(x_values[16]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_16));
-#else
-            acc[16] = __fmaf_rn(w_t[0], x_values[16], acc[16]);
-            acc[17] = __fmaf_rn(w_t[1], x_values[16], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[0], w_t[1], x_values[16]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_17;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_17) : "f"(x_values[17]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_17));
-#else
-            acc[16] = __fmaf_rn(w_t[2], x_values[17], acc[16]);
-            acc[17] = __fmaf_rn(w_t[3], x_values[17], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[2], w_t[3], x_values[17]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_18;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_18) : "f"(x_values[18]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_18));
-#else
-            acc[16] = __fmaf_rn(w_t[4], x_values[18], acc[16]);
-            acc[17] = __fmaf_rn(w_t[5], x_values[18], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[4], w_t[5], x_values[18]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_19;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_19) : "f"(x_values[19]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_19));
-#else
-            acc[16] = __fmaf_rn(w_t[6], x_values[19], acc[16]);
-            acc[17] = __fmaf_rn(w_t[7], x_values[19], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[6], w_t[7], x_values[19]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_20;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_20) : "f"(x_values[20]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_20));
-#else
-            acc[16] = __fmaf_rn(w_t[8], x_values[20], acc[16]);
-            acc[17] = __fmaf_rn(w_t[9], x_values[20], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[8], w_t[9], x_values[20]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_21;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_21) : "f"(x_values[21]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_21));
-#else
-            acc[16] = __fmaf_rn(w_t[10], x_values[21], acc[16]);
-            acc[17] = __fmaf_rn(w_t[11], x_values[21], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[10], w_t[11], x_values[21]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_22;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_22) : "f"(x_values[22]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_22));
-#else
-            acc[16] = __fmaf_rn(w_t[12], x_values[22], acc[16]);
-            acc[17] = __fmaf_rn(w_t[13], x_values[22], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[12], w_t[13], x_values[22]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_23;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_23) : "f"(x_values[23]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[16]), "+f"(acc[17])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_23));
-#else
-            acc[16] = __fmaf_rn(w_t[14], x_values[23], acc[16]);
-            acc[17] = __fmaf_rn(w_t[15], x_values[23], acc[17]);
-#endif
+            bgmv_moe_fma2(acc[16], acc[17], w_t[14], w_t[15], x_values[23]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_24;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_24) : "f"(x_values[24]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_24));
-#else
-            acc[24] = __fmaf_rn(w_t[0], x_values[24], acc[24]);
-            acc[25] = __fmaf_rn(w_t[1], x_values[24], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[0], w_t[1], x_values[24]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_25;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_25) : "f"(x_values[25]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_25));
-#else
-            acc[24] = __fmaf_rn(w_t[2], x_values[25], acc[24]);
-            acc[25] = __fmaf_rn(w_t[3], x_values[25], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[2], w_t[3], x_values[25]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_26;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_26) : "f"(x_values[26]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_26));
-#else
-            acc[24] = __fmaf_rn(w_t[4], x_values[26], acc[24]);
-            acc[25] = __fmaf_rn(w_t[5], x_values[26], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[4], w_t[5], x_values[26]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_27;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_27) : "f"(x_values[27]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_27));
-#else
-            acc[24] = __fmaf_rn(w_t[6], x_values[27], acc[24]);
-            acc[25] = __fmaf_rn(w_t[7], x_values[27], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[6], w_t[7], x_values[27]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_28;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_28) : "f"(x_values[28]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_28));
-#else
-            acc[24] = __fmaf_rn(w_t[8], x_values[28], acc[24]);
-            acc[25] = __fmaf_rn(w_t[9], x_values[28], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[8], w_t[9], x_values[28]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_29;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_29) : "f"(x_values[29]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_29));
-#else
-            acc[24] = __fmaf_rn(w_t[10], x_values[29], acc[24]);
-            acc[25] = __fmaf_rn(w_t[11], x_values[29], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[10], w_t[11], x_values[29]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_30;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_30) : "f"(x_values[30]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_30));
-#else
-            acc[24] = __fmaf_rn(w_t[12], x_values[30], acc[24]);
-            acc[25] = __fmaf_rn(w_t[13], x_values[30], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[12], w_t[13], x_values[30]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_31;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_31) : "f"(x_values[31]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[24]), "+f"(acc[25])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_31));
-#else
-            acc[24] = __fmaf_rn(w_t[14], x_values[31], acc[24]);
-            acc[25] = __fmaf_rn(w_t[15], x_values[31], acc[25]);
-#endif
+            bgmv_moe_fma2(acc[24], acc[25], w_t[14], w_t[15], x_values[31]);
           }
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
@@ -11829,612 +7223,100 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
           w_t[13] = w_values[6];
           w_t[15] = w_values[7];
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_32;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_32) : "f"(x_values[0]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_32));
-#else
-            acc[2] = __fmaf_rn(w_t[0], x_values[0], acc[2]);
-            acc[3] = __fmaf_rn(w_t[1], x_values[0], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[0], w_t[1], x_values[0]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_33;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_33) : "f"(x_values[1]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_33));
-#else
-            acc[2] = __fmaf_rn(w_t[2], x_values[1], acc[2]);
-            acc[3] = __fmaf_rn(w_t[3], x_values[1], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[2], w_t[3], x_values[1]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_34;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_34) : "f"(x_values[2]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_34));
-#else
-            acc[2] = __fmaf_rn(w_t[4], x_values[2], acc[2]);
-            acc[3] = __fmaf_rn(w_t[5], x_values[2], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[4], w_t[5], x_values[2]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_35;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_35) : "f"(x_values[3]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_35));
-#else
-            acc[2] = __fmaf_rn(w_t[6], x_values[3], acc[2]);
-            acc[3] = __fmaf_rn(w_t[7], x_values[3], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[6], w_t[7], x_values[3]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_36;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_36) : "f"(x_values[4]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_36));
-#else
-            acc[2] = __fmaf_rn(w_t[8], x_values[4], acc[2]);
-            acc[3] = __fmaf_rn(w_t[9], x_values[4], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[8], w_t[9], x_values[4]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_37;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_37) : "f"(x_values[5]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_37));
-#else
-            acc[2] = __fmaf_rn(w_t[10], x_values[5], acc[2]);
-            acc[3] = __fmaf_rn(w_t[11], x_values[5], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[10], w_t[11], x_values[5]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_38;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_38) : "f"(x_values[6]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_38));
-#else
-            acc[2] = __fmaf_rn(w_t[12], x_values[6], acc[2]);
-            acc[3] = __fmaf_rn(w_t[13], x_values[6], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[12], w_t[13], x_values[6]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_39;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_39) : "f"(x_values[7]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[2]), "+f"(acc[3])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_39));
-#else
-            acc[2] = __fmaf_rn(w_t[14], x_values[7], acc[2]);
-            acc[3] = __fmaf_rn(w_t[15], x_values[7], acc[3]);
-#endif
+            bgmv_moe_fma2(acc[2], acc[3], w_t[14], w_t[15], x_values[7]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_40;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_40) : "f"(x_values[8]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_40));
-#else
-            acc[10] = __fmaf_rn(w_t[0], x_values[8], acc[10]);
-            acc[11] = __fmaf_rn(w_t[1], x_values[8], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[0], w_t[1], x_values[8]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_41;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_41) : "f"(x_values[9]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_41));
-#else
-            acc[10] = __fmaf_rn(w_t[2], x_values[9], acc[10]);
-            acc[11] = __fmaf_rn(w_t[3], x_values[9], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[2], w_t[3], x_values[9]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_42;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_42) : "f"(x_values[10]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_42));
-#else
-            acc[10] = __fmaf_rn(w_t[4], x_values[10], acc[10]);
-            acc[11] = __fmaf_rn(w_t[5], x_values[10], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[4], w_t[5], x_values[10]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_43;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_43) : "f"(x_values[11]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_43));
-#else
-            acc[10] = __fmaf_rn(w_t[6], x_values[11], acc[10]);
-            acc[11] = __fmaf_rn(w_t[7], x_values[11], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[6], w_t[7], x_values[11]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_44;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_44) : "f"(x_values[12]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_44));
-#else
-            acc[10] = __fmaf_rn(w_t[8], x_values[12], acc[10]);
-            acc[11] = __fmaf_rn(w_t[9], x_values[12], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[8], w_t[9], x_values[12]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_45;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_45) : "f"(x_values[13]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_45));
-#else
-            acc[10] = __fmaf_rn(w_t[10], x_values[13], acc[10]);
-            acc[11] = __fmaf_rn(w_t[11], x_values[13], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[10], w_t[11], x_values[13]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_46;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_46) : "f"(x_values[14]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_46));
-#else
-            acc[10] = __fmaf_rn(w_t[12], x_values[14], acc[10]);
-            acc[11] = __fmaf_rn(w_t[13], x_values[14], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[12], w_t[13], x_values[14]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_47;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_47) : "f"(x_values[15]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[10]), "+f"(acc[11])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_47));
-#else
-            acc[10] = __fmaf_rn(w_t[14], x_values[15], acc[10]);
-            acc[11] = __fmaf_rn(w_t[15], x_values[15], acc[11]);
-#endif
+            bgmv_moe_fma2(acc[10], acc[11], w_t[14], w_t[15], x_values[15]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_48;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_48) : "f"(x_values[16]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_48));
-#else
-            acc[18] = __fmaf_rn(w_t[0], x_values[16], acc[18]);
-            acc[19] = __fmaf_rn(w_t[1], x_values[16], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[0], w_t[1], x_values[16]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_49;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_49) : "f"(x_values[17]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_49));
-#else
-            acc[18] = __fmaf_rn(w_t[2], x_values[17], acc[18]);
-            acc[19] = __fmaf_rn(w_t[3], x_values[17], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[2], w_t[3], x_values[17]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_50;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_50) : "f"(x_values[18]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_50));
-#else
-            acc[18] = __fmaf_rn(w_t[4], x_values[18], acc[18]);
-            acc[19] = __fmaf_rn(w_t[5], x_values[18], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[4], w_t[5], x_values[18]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_51;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_51) : "f"(x_values[19]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_51));
-#else
-            acc[18] = __fmaf_rn(w_t[6], x_values[19], acc[18]);
-            acc[19] = __fmaf_rn(w_t[7], x_values[19], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[6], w_t[7], x_values[19]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_52;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_52) : "f"(x_values[20]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_52));
-#else
-            acc[18] = __fmaf_rn(w_t[8], x_values[20], acc[18]);
-            acc[19] = __fmaf_rn(w_t[9], x_values[20], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[8], w_t[9], x_values[20]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_53;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_53) : "f"(x_values[21]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_53));
-#else
-            acc[18] = __fmaf_rn(w_t[10], x_values[21], acc[18]);
-            acc[19] = __fmaf_rn(w_t[11], x_values[21], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[10], w_t[11], x_values[21]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_54;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_54) : "f"(x_values[22]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_54));
-#else
-            acc[18] = __fmaf_rn(w_t[12], x_values[22], acc[18]);
-            acc[19] = __fmaf_rn(w_t[13], x_values[22], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[12], w_t[13], x_values[22]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_55;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_55) : "f"(x_values[23]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[18]), "+f"(acc[19])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_55));
-#else
-            acc[18] = __fmaf_rn(w_t[14], x_values[23], acc[18]);
-            acc[19] = __fmaf_rn(w_t[15], x_values[23], acc[19]);
-#endif
+            bgmv_moe_fma2(acc[18], acc[19], w_t[14], w_t[15], x_values[23]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_56;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_56) : "f"(x_values[24]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_56));
-#else
-            acc[26] = __fmaf_rn(w_t[0], x_values[24], acc[26]);
-            acc[27] = __fmaf_rn(w_t[1], x_values[24], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[0], w_t[1], x_values[24]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_57;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_57) : "f"(x_values[25]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_57));
-#else
-            acc[26] = __fmaf_rn(w_t[2], x_values[25], acc[26]);
-            acc[27] = __fmaf_rn(w_t[3], x_values[25], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[2], w_t[3], x_values[25]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_58;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_58) : "f"(x_values[26]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_58));
-#else
-            acc[26] = __fmaf_rn(w_t[4], x_values[26], acc[26]);
-            acc[27] = __fmaf_rn(w_t[5], x_values[26], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[4], w_t[5], x_values[26]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_59;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_59) : "f"(x_values[27]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_59));
-#else
-            acc[26] = __fmaf_rn(w_t[6], x_values[27], acc[26]);
-            acc[27] = __fmaf_rn(w_t[7], x_values[27], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[6], w_t[7], x_values[27]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_60;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_60) : "f"(x_values[28]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_60));
-#else
-            acc[26] = __fmaf_rn(w_t[8], x_values[28], acc[26]);
-            acc[27] = __fmaf_rn(w_t[9], x_values[28], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[8], w_t[9], x_values[28]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_61;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_61) : "f"(x_values[29]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_61));
-#else
-            acc[26] = __fmaf_rn(w_t[10], x_values[29], acc[26]);
-            acc[27] = __fmaf_rn(w_t[11], x_values[29], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[10], w_t[11], x_values[29]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_62;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_62) : "f"(x_values[30]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_62));
-#else
-            acc[26] = __fmaf_rn(w_t[12], x_values[30], acc[26]);
-            acc[27] = __fmaf_rn(w_t[13], x_values[30], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[12], w_t[13], x_values[30]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_63;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_63) : "f"(x_values[31]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[26]), "+f"(acc[27])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_63));
-#else
-            acc[26] = __fmaf_rn(w_t[14], x_values[31], acc[26]);
-            acc[27] = __fmaf_rn(w_t[15], x_values[31], acc[27]);
-#endif
+            bgmv_moe_fma2(acc[26], acc[27], w_t[14], w_t[15], x_values[31]);
           }
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
@@ -12494,612 +7376,100 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
           w_t[13] = w_values[6];
           w_t[15] = w_values[7];
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_64;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_64) : "f"(x_values[0]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_64));
-#else
-            acc[4] = __fmaf_rn(w_t[0], x_values[0], acc[4]);
-            acc[5] = __fmaf_rn(w_t[1], x_values[0], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[0], w_t[1], x_values[0]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_65;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_65) : "f"(x_values[1]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_65));
-#else
-            acc[4] = __fmaf_rn(w_t[2], x_values[1], acc[4]);
-            acc[5] = __fmaf_rn(w_t[3], x_values[1], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[2], w_t[3], x_values[1]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_66;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_66) : "f"(x_values[2]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_66));
-#else
-            acc[4] = __fmaf_rn(w_t[4], x_values[2], acc[4]);
-            acc[5] = __fmaf_rn(w_t[5], x_values[2], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[4], w_t[5], x_values[2]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_67;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_67) : "f"(x_values[3]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_67));
-#else
-            acc[4] = __fmaf_rn(w_t[6], x_values[3], acc[4]);
-            acc[5] = __fmaf_rn(w_t[7], x_values[3], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[6], w_t[7], x_values[3]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_68;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_68) : "f"(x_values[4]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_68));
-#else
-            acc[4] = __fmaf_rn(w_t[8], x_values[4], acc[4]);
-            acc[5] = __fmaf_rn(w_t[9], x_values[4], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[8], w_t[9], x_values[4]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_69;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_69) : "f"(x_values[5]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_69));
-#else
-            acc[4] = __fmaf_rn(w_t[10], x_values[5], acc[4]);
-            acc[5] = __fmaf_rn(w_t[11], x_values[5], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[10], w_t[11], x_values[5]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_70;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_70) : "f"(x_values[6]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_70));
-#else
-            acc[4] = __fmaf_rn(w_t[12], x_values[6], acc[4]);
-            acc[5] = __fmaf_rn(w_t[13], x_values[6], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[12], w_t[13], x_values[6]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_71;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_71) : "f"(x_values[7]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[4]), "+f"(acc[5])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_71));
-#else
-            acc[4] = __fmaf_rn(w_t[14], x_values[7], acc[4]);
-            acc[5] = __fmaf_rn(w_t[15], x_values[7], acc[5]);
-#endif
+            bgmv_moe_fma2(acc[4], acc[5], w_t[14], w_t[15], x_values[7]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_72;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_72) : "f"(x_values[8]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_72));
-#else
-            acc[12] = __fmaf_rn(w_t[0], x_values[8], acc[12]);
-            acc[13] = __fmaf_rn(w_t[1], x_values[8], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[0], w_t[1], x_values[8]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_73;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_73) : "f"(x_values[9]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_73));
-#else
-            acc[12] = __fmaf_rn(w_t[2], x_values[9], acc[12]);
-            acc[13] = __fmaf_rn(w_t[3], x_values[9], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[2], w_t[3], x_values[9]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_74;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_74) : "f"(x_values[10]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_74));
-#else
-            acc[12] = __fmaf_rn(w_t[4], x_values[10], acc[12]);
-            acc[13] = __fmaf_rn(w_t[5], x_values[10], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[4], w_t[5], x_values[10]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_75;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_75) : "f"(x_values[11]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_75));
-#else
-            acc[12] = __fmaf_rn(w_t[6], x_values[11], acc[12]);
-            acc[13] = __fmaf_rn(w_t[7], x_values[11], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[6], w_t[7], x_values[11]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_76;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_76) : "f"(x_values[12]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_76));
-#else
-            acc[12] = __fmaf_rn(w_t[8], x_values[12], acc[12]);
-            acc[13] = __fmaf_rn(w_t[9], x_values[12], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[8], w_t[9], x_values[12]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_77;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_77) : "f"(x_values[13]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_77));
-#else
-            acc[12] = __fmaf_rn(w_t[10], x_values[13], acc[12]);
-            acc[13] = __fmaf_rn(w_t[11], x_values[13], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[10], w_t[11], x_values[13]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_78;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_78) : "f"(x_values[14]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_78));
-#else
-            acc[12] = __fmaf_rn(w_t[12], x_values[14], acc[12]);
-            acc[13] = __fmaf_rn(w_t[13], x_values[14], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[12], w_t[13], x_values[14]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_79;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_79) : "f"(x_values[15]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[12]), "+f"(acc[13])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_79));
-#else
-            acc[12] = __fmaf_rn(w_t[14], x_values[15], acc[12]);
-            acc[13] = __fmaf_rn(w_t[15], x_values[15], acc[13]);
-#endif
+            bgmv_moe_fma2(acc[12], acc[13], w_t[14], w_t[15], x_values[15]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_80;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_80) : "f"(x_values[16]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_80));
-#else
-            acc[20] = __fmaf_rn(w_t[0], x_values[16], acc[20]);
-            acc[21] = __fmaf_rn(w_t[1], x_values[16], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[0], w_t[1], x_values[16]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_81;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_81) : "f"(x_values[17]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_81));
-#else
-            acc[20] = __fmaf_rn(w_t[2], x_values[17], acc[20]);
-            acc[21] = __fmaf_rn(w_t[3], x_values[17], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[2], w_t[3], x_values[17]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_82;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_82) : "f"(x_values[18]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_82));
-#else
-            acc[20] = __fmaf_rn(w_t[4], x_values[18], acc[20]);
-            acc[21] = __fmaf_rn(w_t[5], x_values[18], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[4], w_t[5], x_values[18]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_83;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_83) : "f"(x_values[19]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_83));
-#else
-            acc[20] = __fmaf_rn(w_t[6], x_values[19], acc[20]);
-            acc[21] = __fmaf_rn(w_t[7], x_values[19], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[6], w_t[7], x_values[19]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_84;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_84) : "f"(x_values[20]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_84));
-#else
-            acc[20] = __fmaf_rn(w_t[8], x_values[20], acc[20]);
-            acc[21] = __fmaf_rn(w_t[9], x_values[20], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[8], w_t[9], x_values[20]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_85;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_85) : "f"(x_values[21]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_85));
-#else
-            acc[20] = __fmaf_rn(w_t[10], x_values[21], acc[20]);
-            acc[21] = __fmaf_rn(w_t[11], x_values[21], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[10], w_t[11], x_values[21]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_86;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_86) : "f"(x_values[22]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_86));
-#else
-            acc[20] = __fmaf_rn(w_t[12], x_values[22], acc[20]);
-            acc[21] = __fmaf_rn(w_t[13], x_values[22], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[12], w_t[13], x_values[22]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_87;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_87) : "f"(x_values[23]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[20]), "+f"(acc[21])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_87));
-#else
-            acc[20] = __fmaf_rn(w_t[14], x_values[23], acc[20]);
-            acc[21] = __fmaf_rn(w_t[15], x_values[23], acc[21]);
-#endif
+            bgmv_moe_fma2(acc[20], acc[21], w_t[14], w_t[15], x_values[23]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_88;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_88) : "f"(x_values[24]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_88));
-#else
-            acc[28] = __fmaf_rn(w_t[0], x_values[24], acc[28]);
-            acc[29] = __fmaf_rn(w_t[1], x_values[24], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[0], w_t[1], x_values[24]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_89;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_89) : "f"(x_values[25]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_89));
-#else
-            acc[28] = __fmaf_rn(w_t[2], x_values[25], acc[28]);
-            acc[29] = __fmaf_rn(w_t[3], x_values[25], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[2], w_t[3], x_values[25]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_90;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_90) : "f"(x_values[26]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_90));
-#else
-            acc[28] = __fmaf_rn(w_t[4], x_values[26], acc[28]);
-            acc[29] = __fmaf_rn(w_t[5], x_values[26], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[4], w_t[5], x_values[26]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_91;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_91) : "f"(x_values[27]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_91));
-#else
-            acc[28] = __fmaf_rn(w_t[6], x_values[27], acc[28]);
-            acc[29] = __fmaf_rn(w_t[7], x_values[27], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[6], w_t[7], x_values[27]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_92;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_92) : "f"(x_values[28]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_92));
-#else
-            acc[28] = __fmaf_rn(w_t[8], x_values[28], acc[28]);
-            acc[29] = __fmaf_rn(w_t[9], x_values[28], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[8], w_t[9], x_values[28]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_93;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_93) : "f"(x_values[29]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_93));
-#else
-            acc[28] = __fmaf_rn(w_t[10], x_values[29], acc[28]);
-            acc[29] = __fmaf_rn(w_t[11], x_values[29], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[10], w_t[11], x_values[29]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_94;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_94) : "f"(x_values[30]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_94));
-#else
-            acc[28] = __fmaf_rn(w_t[12], x_values[30], acc[28]);
-            acc[29] = __fmaf_rn(w_t[13], x_values[30], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[12], w_t[13], x_values[30]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_95;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_95) : "f"(x_values[31]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[28]), "+f"(acc[29])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_95));
-#else
-            acc[28] = __fmaf_rn(w_t[14], x_values[31], acc[28]);
-            acc[29] = __fmaf_rn(w_t[15], x_values[31], acc[29]);
-#endif
+            bgmv_moe_fma2(acc[28], acc[29], w_t[14], w_t[15], x_values[31]);
           }
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
@@ -13159,612 +7529,100 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
           w_t[13] = w_values[6];
           w_t[15] = w_values[7];
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_96;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_96) : "f"(x_values[0]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_96));
-#else
-            acc[6] = __fmaf_rn(w_t[0], x_values[0], acc[6]);
-            acc[7] = __fmaf_rn(w_t[1], x_values[0], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[0], w_t[1], x_values[0]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_97;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_97) : "f"(x_values[1]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_97));
-#else
-            acc[6] = __fmaf_rn(w_t[2], x_values[1], acc[6]);
-            acc[7] = __fmaf_rn(w_t[3], x_values[1], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[2], w_t[3], x_values[1]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_98;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_98) : "f"(x_values[2]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_98));
-#else
-            acc[6] = __fmaf_rn(w_t[4], x_values[2], acc[6]);
-            acc[7] = __fmaf_rn(w_t[5], x_values[2], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[4], w_t[5], x_values[2]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_99;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_99) : "f"(x_values[3]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_99));
-#else
-            acc[6] = __fmaf_rn(w_t[6], x_values[3], acc[6]);
-            acc[7] = __fmaf_rn(w_t[7], x_values[3], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[6], w_t[7], x_values[3]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_100;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_100) : "f"(x_values[4]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_100));
-#else
-            acc[6] = __fmaf_rn(w_t[8], x_values[4], acc[6]);
-            acc[7] = __fmaf_rn(w_t[9], x_values[4], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[8], w_t[9], x_values[4]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_101;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_101) : "f"(x_values[5]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_101));
-#else
-            acc[6] = __fmaf_rn(w_t[10], x_values[5], acc[6]);
-            acc[7] = __fmaf_rn(w_t[11], x_values[5], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[10], w_t[11], x_values[5]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_102;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_102) : "f"(x_values[6]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_102));
-#else
-            acc[6] = __fmaf_rn(w_t[12], x_values[6], acc[6]);
-            acc[7] = __fmaf_rn(w_t[13], x_values[6], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[12], w_t[13], x_values[6]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_103;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_103) : "f"(x_values[7]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[6]), "+f"(acc[7])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_103));
-#else
-            acc[6] = __fmaf_rn(w_t[14], x_values[7], acc[6]);
-            acc[7] = __fmaf_rn(w_t[15], x_values[7], acc[7]);
-#endif
+            bgmv_moe_fma2(acc[6], acc[7], w_t[14], w_t[15], x_values[7]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_104;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_104) : "f"(x_values[8]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_104));
-#else
-            acc[14] = __fmaf_rn(w_t[0], x_values[8], acc[14]);
-            acc[15] = __fmaf_rn(w_t[1], x_values[8], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[0], w_t[1], x_values[8]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_105;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_105) : "f"(x_values[9]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_105));
-#else
-            acc[14] = __fmaf_rn(w_t[2], x_values[9], acc[14]);
-            acc[15] = __fmaf_rn(w_t[3], x_values[9], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[2], w_t[3], x_values[9]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_106;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_106) : "f"(x_values[10]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_106));
-#else
-            acc[14] = __fmaf_rn(w_t[4], x_values[10], acc[14]);
-            acc[15] = __fmaf_rn(w_t[5], x_values[10], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[4], w_t[5], x_values[10]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_107;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_107) : "f"(x_values[11]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_107));
-#else
-            acc[14] = __fmaf_rn(w_t[6], x_values[11], acc[14]);
-            acc[15] = __fmaf_rn(w_t[7], x_values[11], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[6], w_t[7], x_values[11]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_108;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_108) : "f"(x_values[12]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_108));
-#else
-            acc[14] = __fmaf_rn(w_t[8], x_values[12], acc[14]);
-            acc[15] = __fmaf_rn(w_t[9], x_values[12], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[8], w_t[9], x_values[12]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_109;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_109) : "f"(x_values[13]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_109));
-#else
-            acc[14] = __fmaf_rn(w_t[10], x_values[13], acc[14]);
-            acc[15] = __fmaf_rn(w_t[11], x_values[13], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[10], w_t[11], x_values[13]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_110;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_110) : "f"(x_values[14]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_110));
-#else
-            acc[14] = __fmaf_rn(w_t[12], x_values[14], acc[14]);
-            acc[15] = __fmaf_rn(w_t[13], x_values[14], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[12], w_t[13], x_values[14]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_111;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_111) : "f"(x_values[15]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[14]), "+f"(acc[15])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_111));
-#else
-            acc[14] = __fmaf_rn(w_t[14], x_values[15], acc[14]);
-            acc[15] = __fmaf_rn(w_t[15], x_values[15], acc[15]);
-#endif
+            bgmv_moe_fma2(acc[14], acc[15], w_t[14], w_t[15], x_values[15]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_112;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_112) : "f"(x_values[16]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_112));
-#else
-            acc[22] = __fmaf_rn(w_t[0], x_values[16], acc[22]);
-            acc[23] = __fmaf_rn(w_t[1], x_values[16], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[0], w_t[1], x_values[16]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_113;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_113) : "f"(x_values[17]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_113));
-#else
-            acc[22] = __fmaf_rn(w_t[2], x_values[17], acc[22]);
-            acc[23] = __fmaf_rn(w_t[3], x_values[17], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[2], w_t[3], x_values[17]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_114;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_114) : "f"(x_values[18]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_114));
-#else
-            acc[22] = __fmaf_rn(w_t[4], x_values[18], acc[22]);
-            acc[23] = __fmaf_rn(w_t[5], x_values[18], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[4], w_t[5], x_values[18]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_115;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_115) : "f"(x_values[19]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_115));
-#else
-            acc[22] = __fmaf_rn(w_t[6], x_values[19], acc[22]);
-            acc[23] = __fmaf_rn(w_t[7], x_values[19], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[6], w_t[7], x_values[19]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_116;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_116) : "f"(x_values[20]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_116));
-#else
-            acc[22] = __fmaf_rn(w_t[8], x_values[20], acc[22]);
-            acc[23] = __fmaf_rn(w_t[9], x_values[20], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[8], w_t[9], x_values[20]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_117;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_117) : "f"(x_values[21]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_117));
-#else
-            acc[22] = __fmaf_rn(w_t[10], x_values[21], acc[22]);
-            acc[23] = __fmaf_rn(w_t[11], x_values[21], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[10], w_t[11], x_values[21]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_118;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_118) : "f"(x_values[22]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_118));
-#else
-            acc[22] = __fmaf_rn(w_t[12], x_values[22], acc[22]);
-            acc[23] = __fmaf_rn(w_t[13], x_values[22], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[12], w_t[13], x_values[22]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_119;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_119) : "f"(x_values[23]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[22]), "+f"(acc[23])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_119));
-#else
-            acc[22] = __fmaf_rn(w_t[14], x_values[23], acc[22]);
-            acc[23] = __fmaf_rn(w_t[15], x_values[23], acc[23]);
-#endif
+            bgmv_moe_fma2(acc[22], acc[23], w_t[14], w_t[15], x_values[23]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_120;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_120) : "f"(x_values[24]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[0]), "f"(w_t[1]), "l"(_fma_acc_scale2_120));
-#else
-            acc[30] = __fmaf_rn(w_t[0], x_values[24], acc[30]);
-            acc[31] = __fmaf_rn(w_t[1], x_values[24], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[0], w_t[1], x_values[24]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_121;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_121) : "f"(x_values[25]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[2]), "f"(w_t[3]), "l"(_fma_acc_scale2_121));
-#else
-            acc[30] = __fmaf_rn(w_t[2], x_values[25], acc[30]);
-            acc[31] = __fmaf_rn(w_t[3], x_values[25], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[2], w_t[3], x_values[25]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_122;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_122) : "f"(x_values[26]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[4]), "f"(w_t[5]), "l"(_fma_acc_scale2_122));
-#else
-            acc[30] = __fmaf_rn(w_t[4], x_values[26], acc[30]);
-            acc[31] = __fmaf_rn(w_t[5], x_values[26], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[4], w_t[5], x_values[26]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_123;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_123) : "f"(x_values[27]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[6]), "f"(w_t[7]), "l"(_fma_acc_scale2_123));
-#else
-            acc[30] = __fmaf_rn(w_t[6], x_values[27], acc[30]);
-            acc[31] = __fmaf_rn(w_t[7], x_values[27], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[6], w_t[7], x_values[27]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_124;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_124) : "f"(x_values[28]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[8]), "f"(w_t[9]), "l"(_fma_acc_scale2_124));
-#else
-            acc[30] = __fmaf_rn(w_t[8], x_values[28], acc[30]);
-            acc[31] = __fmaf_rn(w_t[9], x_values[28], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[8], w_t[9], x_values[28]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_125;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_125) : "f"(x_values[29]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[10]), "f"(w_t[11]), "l"(_fma_acc_scale2_125));
-#else
-            acc[30] = __fmaf_rn(w_t[10], x_values[29], acc[30]);
-            acc[31] = __fmaf_rn(w_t[11], x_values[29], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[10], w_t[11], x_values[29]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_126;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_126) : "f"(x_values[30]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[12]), "f"(w_t[13]), "l"(_fma_acc_scale2_126));
-#else
-            acc[30] = __fmaf_rn(w_t[12], x_values[30], acc[30]);
-            acc[31] = __fmaf_rn(w_t[13], x_values[30], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[12], w_t[13], x_values[30]);
           }
           {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-            unsigned long long _fma_acc_scale2_127;
-            asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_127) : "f"(x_values[31]));
-            asm volatile(
-                "{\n\t"
-                ".reg .b64 _src2, _acc2, _out2;\n\t"
-                "mov.b64 _src2, {%2, %3};\n\t"
-                "mov.b64 _acc2, {%0, %1};\n\t"
-                "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t"
-                "mov.b64 {%0, %1}, _out2;\n\t"
-                "}"
-                : "+f"(acc[30]), "+f"(acc[31])
-                : "f"(w_t[14]), "f"(w_t[15]), "l"(_fma_acc_scale2_127));
-#else
-            acc[30] = __fmaf_rn(w_t[14], x_values[31], acc[30]);
-            acc[31] = __fmaf_rn(w_t[15], x_values[31], acc[31]);
-#endif
+            bgmv_moe_fma2(acc[30], acc[31], w_t[14], w_t[15], x_values[31]);
           }
         }
       }
