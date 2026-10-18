@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import pathlib
 import re
 
 import pytest
 import torch
 
 from flashinfer.experimental.cake_kimi_k3_attn_res import cake_backend as cb
+from flashinfer.experimental.cake_kimi_k3_attn_res import cake_jit
 from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
     ARCHES,
     HIDDEN_SIZE,
@@ -472,6 +474,62 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_co
     for record in MODULES.values():
         assert record["tma_workspace_bytes"] == 0
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
+
+
+_PROGRAM_MACRO_DEFAULT = re.compile(
+    r"^#define (CAKE_PROGRAM_KERNEL|CAKE_PROGRAM_SHIM) (\w+)$", re.M
+)
+
+
+def _program_identity(name, record):
+    """(kernel symbol, declared kernel symbol, host-shim namespace) of a record's build.
+
+    A ``-DCAKE_PROGRAM_*`` entry of ``compile_flags`` wins, else the ``#ifndef``
+    default of the translation unit, else the literal the exported source spells.
+    """
+    root = pathlib.Path(cake_jit.__file__).resolve().parent / "csrc"
+    kernel, binding = (root / relative for relative in record["sources"])
+    assert kernel.is_file() and binding.is_file(), (name, record["sources"])
+    kernel_text = kernel.read_text(encoding="utf-8")
+    binding_text = binding.read_text(encoding="utf-8")
+    flags = dict(
+        flag[2:].split("=", 1)
+        for flag in record["compile_flags"]
+        if flag.startswith("-DCAKE_PROGRAM_")
+    )
+    kernel_defaults = dict(_PROGRAM_MACRO_DEFAULT.findall(kernel_text))
+    binding_defaults = dict(_PROGRAM_MACRO_DEFAULT.findall(binding_text))
+    defined = re.search(r"^(kernel_\w+)\(", kernel_text, re.M)
+    declared = re.search(r'^extern "C" __global__ void (\w+)\(', binding_text, re.M)
+    namespace = re.search(r"^namespace (\w+) \{$", binding_text, re.M)
+    return (
+        flags.get(
+            "CAKE_PROGRAM_KERNEL",
+            kernel_defaults.get("CAKE_PROGRAM_KERNEL", defined and defined.group(1)),
+        ),
+        flags.get(
+            "CAKE_PROGRAM_KERNEL",
+            binding_defaults.get("CAKE_PROGRAM_KERNEL", declared and declared.group(1)),
+        ),
+        flags.get(
+            "CAKE_PROGRAM_SHIM",
+            binding_defaults.get("CAKE_PROGRAM_SHIM", namespace and namespace.group(1)),
+        ),
+    )
+
+
+def test_shared_sources_keep_distinct_program_symbols():
+    """Every JIT library of the family loads into one process, so no two records may
+    export one kernel symbol or host-shim namespace.  Records sharing a translation
+    unit select their own through ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM``
+    in ``compile_flags``; a file's ``#ifndef`` defaults name the program that owns it."""
+    shims = set()
+    for name, record in MODULES.items():
+        defined, declared, shim = _program_identity(name, record)
+        assert defined == declared == f"kernel_{name}", (name, defined, declared)
+        assert shim and shim.startswith("cake_host_shim_"), (name, shim)
+        shims.add(shim)
+    assert len(shims) == len(MODULES)
 
 
 # Every token count a decoder step can present in the small / mid range, plus the measured

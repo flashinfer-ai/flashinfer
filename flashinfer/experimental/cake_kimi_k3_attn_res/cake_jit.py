@@ -379,10 +379,13 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_3055514f3a17ac73dc8d": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3055514f3a17ac73dc8d_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3055514f3a17ac73dc8d_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_14855b6501f28a8af20c_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_14855b6501f28a8af20c_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_3055514f3a17ac73dc8d",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2560d48b6b112705",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -999,10 +1002,14 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_767d23dd29a86915ae01": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_767d23dd29a86915ae01_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_767d23dd29a86915ae01_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_110f5de77158b1bcfe57_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_110f5de77158b1bcfe57_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_767d23dd29a86915ae01",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2b549692c339cfd3",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -1768,10 +1775,14 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_b0f25d64586277608a9b": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b0f25d64586277608a9b_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b0f25d64586277608a9b_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_959261ede770f517ff44_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_959261ede770f517ff44_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_b0f25d64586277608a9b",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_773d9a3b48b36231",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -2202,10 +2213,14 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_ce52de03a90dc1af2f74": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ce52de03a90dc1af2f74_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ce52de03a90dc1af2f74_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_ce52de03a90dc1af2f74",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_7e9d778cfcea4671",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -2233,10 +2248,14 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_d0dc3859ec7be0407f60": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d0dc3859ec7be0407f60_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d0dc3859ec7be0407f60_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_4f0cabee0d8f305aace2_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_4f0cabee0d8f305aace2_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_d0dc3859ec7be0407f60",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_57b11a8eb6be1e9a",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -2295,10 +2314,13 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_d510b7826e8e4cf50bed": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d510b7826e8e4cf50bed_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d510b7826e8e4cf50bed_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_6468e67b15dab2e973eb_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_6468e67b15dab2e973eb_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_d510b7826e8e4cf50bed",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3d5f0b1e8a40b2cb",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -2326,10 +2348,14 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_d534d40d8b49f19bd050": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d534d40d8b49f19bd050_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d534d40d8b49f19bd050_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99cdfcf0127721240020_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99cdfcf0127721240020_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_d534d40d8b49f19bd050",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_095e112c65779b13",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -2357,10 +2383,13 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_d57d39706cbed5379055": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d57d39706cbed5379055_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d57d39706cbed5379055_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8e61459b47e062ea2e03_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8e61459b47e062ea2e03_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_d57d39706cbed5379055",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3499ea8cbe2be749",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
@@ -2701,10 +2730,13 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_attn_res_ece2ac302cbe5d39ff8c": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ece2ac302cbe5d39ff8c_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ece2ac302cbe5d39ff8c_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_1974170f2264826fd01b_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_1974170f2264826fd01b_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_attn_res_ece2ac302cbe5d39ff8c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_53941faf776b1286",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "out"],
