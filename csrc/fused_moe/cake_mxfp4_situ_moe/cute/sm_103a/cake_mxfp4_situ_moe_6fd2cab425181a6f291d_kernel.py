@@ -42,6 +42,7 @@ from cutlass.experimental.cuda.tensor_map import (
 from cutlass._mlir.dialects.nvvm import CTAGroupKind as DialectCTAGroup
 from cutlass._mlir.dialects.nvvm import TMALoadMode as DialectTMALoadMode
 
+USE_PDL = True  # programmatic dependent launch attribute of the launch; compile_program(use_pdl=...) sets it
 TMEM_NCOLS = 476
 TMEM_ACC_OFFSET = 0
 TMEM_SF_A_OFFSET = 464
@@ -1491,11 +1492,13 @@ def launch_gemm2_dense_finalize_n256_c12(A: cute.Tensor, _cake_tma_A_dim_0: cutl
         block=(256, 1, 1),
         cluster=(2, 1, 1),
         smem=223360,
-        use_pdl=True,
+        use_pdl=USE_PDL,
         stream=stream,
     )
 
-def compile_program():
+def compile_program(use_pdl: bool = True):
+    global USE_PDL
+    USE_PDL = bool(use_pdl)
     return cute.compile(launch_gemm2_dense_finalize_n256_c12,
         make_fake_tensor(cutlass.Uint8, (cute.sym_int64(symbol='A'),), (1,), assumed_align=16),
         cutlass.Int64(0),

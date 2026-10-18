@@ -583,41 +583,6 @@
       "tp8_sum_t00512_uniform_spread": "split_two_stage"
     },
     "forms": {
-      "dispatch_mixed192_dual": {
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "dual": true,
-        "gate": "e2e_registry",
-        "kind": "dispatch_mixed",
-        "narrow_count_base": true,
-        "pdl": true,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_dispatch_mixed192",
-        "stage_alt": 494,
-        "stage_base": 826,
-        "staged_words": 2640,
-        "template": "kimi_k3_mxfp4_situ_dispatch_mixed",
-        "token": "dispatch_mixed192",
-        "trace": false,
-        "use_pdl": true
-      },
-      "dispatch_mixed_lists": {
-        "all_lists": true,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "gate": "e2e_registry",
-        "kind": "dispatch",
-        "pdl": true,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_dispatch",
-        "template": "kimi_k3_mxfp4_situ_dispatch",
-        "token": "dispatch",
-        "use_pdl": true
-      },
       "dispatch_wide_narrow_lists": {
         "all_lists": false,
         "backends": [
@@ -651,24 +616,6 @@
         "top_k": 16,
         "use_pdl": true
       },
-      "finalize_top8": {
-        "accumulate": false,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "expanded_rows": false,
-        "gate": "e2e_registry",
-        "kind": "finalize",
-        "plan_selected": true,
-        "registry": "kimi_k3_mxfp4_situ_finalize_rows",
-        "skip_wide": false,
-        "template": "kimi_k3_mxfp4_situ_finalize_rows",
-        "threads": 256,
-        "token": "finalize_rows",
-        "top_k": 8,
-        "use_pdl": true
-      },
       "finalize_top8_split": {
         "accumulate": true,
         "backends": [
@@ -686,63 +633,6 @@
         "token": "finalize_rows_split",
         "top_k": 8,
         "use_pdl": true
-      },
-      "gemm1_dense_situ_m128_n128_rowgroup": {
-        "a_offset": 24576,
-        "a_stage_bytes": 16384,
-        "acc_cols": 256,
-        "acc_stride": 128,
-        "b_offset": 122880,
-        "b_rows": 128,
-        "b_stage_bytes": 16384,
-        "b_tx_bytes": 8704,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "c_offset": 0,
-        "c_stage_bytes": 8192,
-        "cluster_split": false,
-        "cta_v": 1,
-        "footer_dep_launch": true,
-        "gate": "e2e_registry",
-        "info_offset": 227328,
-        "kind": "gemm1_dense",
-        "n_steps": 1,
-        "n_tile": 128,
-        "num_ab_stage": 6,
-        "num_acc_stage": 2,
-        "num_c_stage": 3,
-        "overlap_acc": false,
-        "pdl_trigger_early": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm1_dense_m128_n128_rowgroup",
-        "row_group_list": true,
-        "sc_per_tile": 2,
-        "sfa_col": 256,
-        "sfa_offset": 221184,
-        "sfa_stage_bytes": 512,
-        "sfb_atoms": 1,
-        "sfb_col": 272,
-        "sfb_offset": 224256,
-        "sfb_stage_bytes": 512,
-        "sfb_width": 4,
-        "smem_bytes": 227368,
-        "template": "gemm1_dense_situ_m128_n128_rowgroup",
-        "threads": 384,
-        "threads_wo_sched": 320,
-        "tile_m": 128,
-        "tile_swizzle": false,
-        "tile_swizzle_m": 1,
-        "token": "dense_gemm1_m128_n128_rowgroup",
-        "two_cta": false,
-        "use_pdl": true,
-        "weight_l2_hint": true,
-        "zero_fill": false,
-        "zero_fill_secondary": false,
-        "zf_bulk_bytes": 16384,
-        "zf_per_claim": 4,
-        "zf_unit_vec": 1024
       },
       "gemm1_dense_situ_m128_n128_rowgroup_early": {
         "a_offset": 24576,
@@ -1366,63 +1256,6 @@
         "use_pdl": false,
         "weight_l2_hint": true,
         "zero_fill": true,
-        "zero_fill_secondary": false,
-        "zf_bulk_bytes": 16384,
-        "zf_per_claim": 4,
-        "zf_unit_vec": 1024
-      },
-      "gemm1_dense_situ_m256_n256_2cta_rowgroup": {
-        "a_offset": 24576,
-        "a_stage_bytes": 16384,
-        "acc_cols": 464,
-        "acc_stride": 208,
-        "b_offset": 122880,
-        "b_rows": 128,
-        "b_stage_bytes": 16384,
-        "b_tx_bytes": 18432,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "c_offset": 0,
-        "c_stage_bytes": 8192,
-        "cluster_split": false,
-        "cta_v": 2,
-        "footer_dep_launch": true,
-        "gate": "e2e_registry",
-        "info_offset": 230400,
-        "kind": "gemm1_dense",
-        "n_steps": 2,
-        "n_tile": 256,
-        "num_ab_stage": 6,
-        "num_acc_stage": 1,
-        "num_c_stage": 3,
-        "overlap_acc": true,
-        "pdl_trigger_early": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm1_dense_m256_2cta_rowgroup",
-        "row_group_list": true,
-        "sc_per_tile": 4,
-        "sfa_col": 464,
-        "sfa_offset": 221184,
-        "sfa_stage_bytes": 512,
-        "sfb_atoms": 2,
-        "sfb_col": 480,
-        "sfb_offset": 224256,
-        "sfb_stage_bytes": 1024,
-        "sfb_width": 8,
-        "smem_bytes": 230440,
-        "template": "gemm1_dense_situ_m256_n256_2cta_rowgroup",
-        "threads": 384,
-        "threads_wo_sched": 352,
-        "tile_m": 256,
-        "tile_swizzle": false,
-        "tile_swizzle_m": 1,
-        "token": "dense_gemm1_m256_2cta_rowgroup",
-        "two_cta": true,
-        "use_pdl": true,
-        "weight_l2_hint": true,
-        "zero_fill": false,
         "zero_fill_secondary": false,
         "zf_bulk_bytes": 16384,
         "zf_per_claim": 4,
@@ -2112,71 +1945,6 @@
         "use_pdl": true,
         "weight_l2_hint": true
       },
-      "gemm2_dense_finalize_n128": {
-        "a_mcast": false,
-        "a_offset": 0,
-        "a_part_bytes": 16384,
-        "a_part_rows": 128,
-        "a_stage_bytes": 16384,
-        "ab_free_count": 1,
-        "ab_tx_bytes": 25600,
-        "acc_buf_stride": 128,
-        "acc_cols": 256,
-        "acc_early_release_subtile": 1,
-        "b_offset": 81920,
-        "b_rows": 128,
-        "b_stage_bytes": 16384,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "c_offset": 168960,
-        "c_row_bytes": 272,
-        "c_stage_bytes": 34816,
-        "c_stages": 1,
-        "cluster_n": 1,
-        "cta_group": 1,
-        "epi_issue_all_warps": true,
-        "epi_issue_warps": 4,
-        "epi_pair": false,
-        "footer_dep_launch": true,
-        "gate": "e2e_registry",
-        "half_atoms_per_tile": 2,
-        "info_offset": 203776,
-        "kind": "gemm2_dense",
-        "mcast_mask": 1,
-        "meta_scale_offset": 204848,
-        "meta_tok_offset": 203824,
-        "n_tile": 128,
-        "num_ab_stage": 5,
-        "num_acc_stage": 2,
-        "overlap_acc": false,
-        "pdl_trigger_early": false,
-        "plan_selected": false,
-        "raster_along_m": false,
-        "raster_auto": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n128",
-        "row_group": false,
-        "sched_mode_offset": 205872,
-        "sfa_col": 256,
-        "sfa_offset": 163840,
-        "sfa_part_bytes": 512,
-        "sfa_part_d1": 4,
-        "sfa_stage_bytes": 512,
-        "sfb_atoms": 1,
-        "sfb_col": 260,
-        "sfb_offset": 166400,
-        "sfb_op_width": 4,
-        "sfb_shift_dynamic": false,
-        "sfb_stage_bytes": 512,
-        "sfb_width": 4,
-        "smem_bytes": 205872,
-        "template": "gemm2_dense_finalize_n128",
-        "token": "dense_n128",
-        "two_cta": false,
-        "use_pdl": true,
-        "use_row_group": false
-      },
       "gemm2_dense_finalize_n192": {
         "a_mcast": false,
         "a_offset": 0,
@@ -2545,7 +2313,7 @@
         "num_acc_stage": 2,
         "overlap_acc": false,
         "pdl_trigger_early": false,
-        "plan_selected": false,
+        "plan_selected": true,
         "raster_along_m": "auto",
         "raster_auto": true,
         "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n192_c12_rg_rauto",
@@ -3353,71 +3121,6 @@
         "use_pdl": false,
         "use_row_group": false
       },
-      "gemm2_dense_finalize_n256_rg": {
-        "a_mcast": false,
-        "a_offset": 0,
-        "a_part_bytes": 16384,
-        "a_part_rows": 128,
-        "a_stage_bytes": 16384,
-        "ab_free_count": 1,
-        "ab_tx_bytes": 34304,
-        "acc_buf_stride": 208,
-        "acc_cols": 464,
-        "acc_early_release_subtile": 1,
-        "b_offset": 49152,
-        "b_rows": 256,
-        "b_stage_bytes": 32768,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "c_offset": 152576,
-        "c_row_bytes": 528,
-        "c_stage_bytes": 67584,
-        "c_stages": 1,
-        "cluster_n": 1,
-        "cta_group": 1,
-        "epi_issue_all_warps": true,
-        "epi_issue_warps": 4,
-        "epi_pair": false,
-        "footer_dep_launch": true,
-        "gate": "e2e_registry",
-        "half_atoms_per_tile": 4,
-        "info_offset": 220160,
-        "kind": "gemm2_dense",
-        "mcast_mask": 1,
-        "meta_scale_offset": 221232,
-        "meta_tok_offset": 220208,
-        "n_tile": 256,
-        "num_ab_stage": 3,
-        "num_acc_stage": 1,
-        "overlap_acc": true,
-        "pdl_trigger_early": false,
-        "plan_selected": false,
-        "raster_along_m": false,
-        "raster_auto": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n256_rg",
-        "row_group": true,
-        "sched_mode_offset": 222256,
-        "sfa_col": 464,
-        "sfa_offset": 147456,
-        "sfa_part_bytes": 512,
-        "sfa_part_d1": 4,
-        "sfa_stage_bytes": 512,
-        "sfb_atoms": 2,
-        "sfb_col": 468,
-        "sfb_offset": 148992,
-        "sfb_op_width": 8,
-        "sfb_shift_dynamic": false,
-        "sfb_stage_bytes": 1024,
-        "sfb_width": 8,
-        "smem_bytes": 222256,
-        "template": "gemm2_dense_finalize_n256_rg",
-        "token": "dense_n256_rg",
-        "two_cta": false,
-        "use_pdl": true,
-        "use_row_group": true
-      },
       "gemm2_dense_finalize_n256_rg_early": {
         "a_mcast": false,
         "a_offset": 0,
@@ -3497,41 +3200,6 @@
         "token": "gemm2_gate",
         "use_pdl": true
       },
-      "gemm2_swapab_finalize_n128": {
-        "ab_tx_bytes": 25088,
-        "acc_cols": 256,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "cta_v": 1,
-        "epi_n": 32,
-        "gate": "e2e_registry",
-        "hold_meta": true,
-        "is_situ": false,
-        "k_stage": 128,
-        "kbps": 4,
-        "kind": "gemm2_swapab",
-        "kt": 1,
-        "late_dep_wait": false,
-        "m_group": 1,
-        "n_tile": 128,
-        "num_ab_stage": 6,
-        "num_gather_warps": 1,
-        "partial": false,
-        "pdl_trigger_after_wait": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_n128",
-        "row_tma": true,
-        "sched_chunk_major": false,
-        "sched_m_block": 1,
-        "smem_bytes": 219648,
-        "template": "gemm2_swapab_finalize_n128",
-        "threads": 256,
-        "token": "n128",
-        "use_pdl": true,
-        "weight_l2_hint": true
-      },
       "gemm2_swapab_finalize_n16": {
         "ab_tx_bytes": 8704,
         "acc_cols": 32,
@@ -3601,41 +3269,6 @@
         "token": "n16_k8_nol2",
         "use_pdl": true,
         "weight_l2_hint": false
-      },
-      "gemm2_swapab_finalize_n192_2cta": {
-        "ab_tx_bytes": 17408,
-        "acc_cols": 384,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "cta_v": 2,
-        "epi_n": 32,
-        "gate": "e2e_registry",
-        "hold_meta": true,
-        "is_situ": false,
-        "k_stage": 128,
-        "kbps": 4,
-        "kind": "gemm2_swapab",
-        "kt": 1,
-        "late_dep_wait": false,
-        "m_group": 1,
-        "n_tile": 192,
-        "num_ab_stage": 6,
-        "num_gather_warps": 4,
-        "partial": false,
-        "pdl_trigger_after_wait": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_n192_2cta",
-        "row_tma": false,
-        "sched_chunk_major": false,
-        "sched_m_block": 1,
-        "smem_bytes": 213376,
-        "template": "gemm2_swapab_finalize_n192_2cta",
-        "threads": 384,
-        "token": "n192",
-        "use_pdl": true,
-        "weight_l2_hint": true
       },
       "gemm2_swapab_finalize_n192_2cta_cm4": {
         "ab_tx_bytes": 17408,
@@ -3812,41 +3445,6 @@
         "use_pdl": true,
         "weight_l2_hint": false
       },
-      "gemm2_swapab_finalize_n64": {
-        "ab_tx_bytes": 25600,
-        "acc_cols": 256,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "cta_v": 1,
-        "epi_n": 32,
-        "gate": "e2e_registry",
-        "hold_meta": true,
-        "is_situ": false,
-        "k_stage": 128,
-        "kbps": 4,
-        "kind": "gemm2_swapab",
-        "kt": 1,
-        "late_dep_wait": false,
-        "m_group": 2,
-        "n_tile": 64,
-        "num_ab_stage": 4,
-        "num_gather_warps": 1,
-        "partial": false,
-        "pdl_trigger_after_wait": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_n64",
-        "row_tma": true,
-        "sched_chunk_major": false,
-        "sched_m_block": 1,
-        "smem_bytes": 182784,
-        "template": "gemm2_swapab_finalize_n64",
-        "threads": 256,
-        "token": "n64",
-        "use_pdl": true,
-        "weight_l2_hint": true
-      },
       "gemm2_swapab_finalize_n8": {
         "ab_tx_bytes": 8704,
         "acc_cols": 16,
@@ -3987,41 +3585,6 @@
         "use_pdl": true,
         "weight_l2_hint": true
       },
-      "gemm2_swapab_partial_n16_m2": {
-        "ab_tx_bytes": 17408,
-        "acc_cols": 64,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "cta_v": 1,
-        "epi_n": 16,
-        "gate": "e2e_registry",
-        "hold_meta": false,
-        "is_situ": false,
-        "k_stage": 128,
-        "kbps": 4,
-        "kind": "gemm2_swapab_partial",
-        "kt": 1,
-        "late_dep_wait": true,
-        "m_group": 2,
-        "n_tile": 16,
-        "num_ab_stage": 5,
-        "num_gather_warps": 1,
-        "partial": true,
-        "pdl_trigger_after_wait": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_partial_n16_m2",
-        "row_tma": false,
-        "sched_chunk_major": false,
-        "sched_m_block": 1,
-        "smem_bytes": 187392,
-        "template": "gemm2_swapab_partial_n16_m2",
-        "threads": 256,
-        "token": "partial_n16_m2",
-        "use_pdl": true,
-        "weight_l2_hint": true
-      },
       "gemm2_swapab_partial_n16_m2_nodp": {
         "ab_tx_bytes": 17408,
         "acc_cols": 64,
@@ -4057,41 +3620,6 @@
         "use_pdl": true,
         "weight_l2_hint": true
       },
-      "gemm2_swapab_partial_n32_m2": {
-        "ab_tx_bytes": 17408,
-        "acc_cols": 128,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "cta_v": 1,
-        "epi_n": 32,
-        "gate": "e2e_registry",
-        "hold_meta": false,
-        "is_situ": false,
-        "k_stage": 128,
-        "kbps": 4,
-        "kind": "gemm2_swapab_partial",
-        "kt": 1,
-        "late_dep_wait": true,
-        "m_group": 2,
-        "n_tile": 32,
-        "num_ab_stage": 5,
-        "num_gather_warps": 1,
-        "partial": true,
-        "pdl_trigger_after_wait": false,
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_partial_n32_m2",
-        "row_tma": false,
-        "sched_chunk_major": false,
-        "sched_m_block": 1,
-        "smem_bytes": 202752,
-        "template": "gemm2_swapab_partial_n32_m2",
-        "threads": 256,
-        "token": "partial_n32_m2",
-        "use_pdl": true,
-        "weight_l2_hint": true
-      },
       "gemm2_swapab_partial_n32_m2_nodp": {
         "ab_tx_bytes": 17408,
         "acc_cols": 128,
@@ -4124,41 +3652,6 @@
         "template": "gemm2_swapab_partial_n32_m2_nodp",
         "threads": 256,
         "token": "partial_n32_m2_nodp",
-        "use_pdl": true,
-        "weight_l2_hint": true
-      },
-      "gemm2_swapab_partial_n8_m2": {
-        "ab_tx_bytes": 17408,
-        "acc_cols": 32,
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "cta_v": 1,
-        "epi_n": 8,
-        "gate": "e2e_registry",
-        "hold_meta": false,
-        "is_situ": false,
-        "k_stage": 128,
-        "kbps": 4,
-        "kind": "gemm2_swapab_partial",
-        "kt": 1,
-        "late_dep_wait": true,
-        "m_group": 2,
-        "n_tile": 8,
-        "num_ab_stage": 6,
-        "num_gather_warps": 1,
-        "partial": true,
-        "pdl_trigger_after_wait": false,
-        "plan_selected": true,
-        "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_partial_n8_m2",
-        "row_tma": false,
-        "sched_chunk_major": false,
-        "sched_m_block": 1,
-        "smem_bytes": 215040,
-        "template": "gemm2_swapab_partial_n8_m2",
-        "threads": 256,
-        "token": "partial_n8_m2",
         "use_pdl": true,
         "weight_l2_hint": true
       },
@@ -4291,54 +3784,6 @@
         "template": "kimi_k3_mxfp4_situ_route_preprocess",
         "threads": 256,
         "token": "route_preprocess_separate_fp32_noclear",
-        "use_pdl": true
-      },
-      "routing_cluster8": {
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "chunk_routes": 1024,
-        "clear": true,
-        "cluster": 8,
-        "dispatch_lists": true,
-        "gate": "e2e_registry",
-        "kind": "routing",
-        "max_routes": 8192,
-        "mode": "packed",
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_routing_cluster8",
-        "single_tile_per_expert": false,
-        "smem_bytes": 16640,
-        "split_layout": false,
-        "staged_rows": 0,
-        "template": "kimi_k3_mxfp4_situ_routing",
-        "threads": 1024,
-        "token": "routing_cluster8",
-        "use_pdl": true
-      },
-      "routing_ep8_decode": {
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "chunk_routes": 8192,
-        "clear": true,
-        "cluster": 1,
-        "dispatch_lists": true,
-        "gate": "e2e_registry",
-        "kind": "routing",
-        "max_routes": 8192,
-        "mode": "packed",
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_routing_ep8_decode",
-        "single_tile_per_expert": true,
-        "smem_bytes": 45312,
-        "split_layout": false,
-        "staged_rows": 0,
-        "template": "kimi_k3_mxfp4_situ_routing",
-        "threads": 1024,
-        "token": "routing_ep8_decode",
         "use_pdl": true
       },
       "routing_packed_c1": {
@@ -5636,21 +5081,6 @@
         "threads": 1024,
         "token": "routing_split",
         "use_pdl": true
-      },
-      "token_index_top8": {
-        "backends": [
-          "cuda_cpp",
-          "cutedsl"
-        ],
-        "gate": "e2e_registry",
-        "kind": "token_index",
-        "plan_selected": false,
-        "registry": "kimi_k3_mxfp4_situ_token_index",
-        "template": "kimi_k3_mxfp4_situ_token_index",
-        "threads": 256,
-        "token": "token_index_top8",
-        "top_k": 8,
-        "use_pdl": true
       }
     },
     "gates": {
@@ -5665,16 +5095,16 @@
         "sha256": "9f5874a683450ccef80252ead30776124e442d4a810cbd92df5b403e5e54a343"
       },
       {
-        "bytes": 15942,
+        "bytes": 16300,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_kernels.py",
-        "sha256": "d88e4987e71e51dcd69175ad6a994a18fa8603b093638c60e971c99892102455"
+        "sha256": "8ccf406c0419199892e46f64411a50535113f00c0931435c558a7d30e8ca6280"
       },
       {
-        "bytes": 288629,
+        "bytes": 288343,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py",
-        "sha256": "050d0623e6f8a51ab15a8a10104ac21dc44bbd6cccadada1537b1cebeede3685"
+        "sha256": "26b7eb19d7cdb60a30c5a542fef35d9fdb85607fcfea4ef08ec4c7834ec0e058"
       },
       {
         "bytes": 454,
@@ -5683,10 +5113,10 @@
         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
       },
       {
-        "bytes": 73035,
+        "bytes": 73198,
         "kind": "integration",
         "path": "tests/moe/test_cake_mxfp4_situ_moe_cute.py",
-        "sha256": "39aa2005cddf136162470b2012a59594318f7d02ab29b0fff753c140a7e4ad78"
+        "sha256": "afcb64d486f4f5a60c2e5df5536ec4a6a26b7e22b326feb356385b82749159a6"
       }
     ],
     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
@@ -5759,10 +5189,10 @@
         "sha256": "209f7d0f79347a81cc8999134002b74722e181e4667a5b9c105bcd730f57c9a8"
       },
       {
-        "bytes": 24703,
+        "bytes": 23041,
         "kind": "shared",
         "path": "docs/api/cake_mxfp4_situ_moe.rst",
-        "sha256": "3ddf847f982d3f4c4856bcc797c3cd8e90641893ba2f0787a97b2f5b961a485c"
+        "sha256": "bff641ac293dc33ccae2e4e4d641b5685b32fe77d0740484f22f58eb25b60701"
       }
     ],
     "sibling_backend_forms": {
@@ -5849,31 +5279,16 @@
       "cake_cute": {}
     },
     "unlaunched_registry_forms": [
-      "dispatch_mixed192_dual",
-      "dispatch_mixed_lists",
-      "gemm1_dense_situ_m128_n128_rowgroup",
-      "gemm1_dense_situ_m256_n256_2cta_rowgroup",
       "gemm1_swapab_situ_n16",
       "gemm1_swapab_situ_n32",
-      "gemm2_dense_finalize_n128",
       "gemm2_dense_finalize_n192_c12_rg",
-      "gemm2_dense_finalize_n192_c12_rg_rauto",
       "gemm2_dense_finalize_n256_2cta_rg",
       "gemm2_dense_finalize_n256_c12_rg",
-      "gemm2_dense_finalize_n256_rg",
-      "gemm2_swapab_finalize_n128",
       "gemm2_swapab_finalize_n16",
-      "gemm2_swapab_finalize_n192_2cta",
       "gemm2_swapab_finalize_n32",
-      "gemm2_swapab_finalize_n64",
       "gemm2_swapab_finalize_n8",
-      "gemm2_swapab_partial_n16_m2",
-      "gemm2_swapab_partial_n32_m2",
       "moe_sort_coop_t384_dual_mixed",
-      "moe_sort_init_t384",
-      "routing_cluster8",
-      "routing_ep8_decode",
-      "token_index_top8"
+      "moe_sort_init_t384"
     ],
     "unsupported_forms": {
       "moe_sort_coop_t384_dual_mixed": "cooperative moe_sort (init + coop kernels): register state carried across grid.sync, which the CuTe DSL backend refuses (no device-side grid barrier form); served by backend=\"cake\" (CUDA C++) only",
@@ -5995,10 +5410,10 @@
       "sha256": "39c2c655aaccc599e337a969ec132891cad85cd571d015d7a7afa3c8be1a8ad1"
     },
     {
-      "bytes": 201854,
+      "bytes": 202034,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py",
-      "sha256": "de0ecc0f5fbb677fbf3c039a4d603c9edbdea4607a01fe6150df5ee0778c2a70"
+      "sha256": "e0325e0e57030db85731415a20b916ae8ed5e7a2b9668e62875e6aacadf6ec6f"
     },
     {
       "bytes": 6266,
@@ -6067,10 +5482,10 @@
       "sha256": "0001eda1cad4ea1162fa8c2a52af691d1f1d8493ce2aa28eec0f23dbd79b110a"
     },
     {
-      "bytes": 108762,
+      "bytes": 108942,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py",
-      "sha256": "c19803e5b1816857f67b1b707383e337174ae5d084e093148714556889917932"
+      "sha256": "4b7efa3cbb2975a2b30d691f3d3b9798812a32a6d9d9934f4c7de6fe0e384c8d"
     },
     {
       "bytes": 2949,
@@ -6083,30 +5498,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2db9055c033d3772880a_kernel.py",
       "sha256": "1f75b3c53ffebbaf92e4450d0b9c2097c29aceddd067a138a03a8e8a9e89b759"
-    },
-    {
-      "bytes": 5021,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2e676288804ed795d54d_binding.py",
-      "sha256": "1964b27b61c1c3292a6883b0c088978299e932d0894aac94b92bf3816e910251"
-    },
-    {
-      "bytes": 83631,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2e676288804ed795d54d_kernel.py",
-      "sha256": "74464a64e2ad55431c489e1134d941c7930dbdfb51e9973d32a621b5023b59fd"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_binding.py",
-      "sha256": "12b504dfdf9985a9b44cd6093cb164e64039a8064a0f70959ce5d46e1c2a7abc"
-    },
-    {
-      "bytes": 126451,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_kernel.py",
-      "sha256": "c5cecea560fdc926d8487e1d604c199d8ea5f06351a4685b65462b7c09fee7e8"
     },
     {
       "bytes": 6266,
@@ -6157,30 +5548,6 @@
       "sha256": "c6c3dafde66d4499d7d110d42be19221c460ddd59ef01a5574885cdfa498da34"
     },
     {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_binding.py",
-      "sha256": "ff516640bcefbc44fb02b5aad1d69e4d46e5a96cc2696689e66cbb0835f501ee"
-    },
-    {
-      "bytes": 201832,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_kernel.py",
-      "sha256": "2e45b99bbc4ff690cc500a6cc1030b434d756a0bc04f1971486859ee572fc0a0"
-    },
-    {
-      "bytes": 8891,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_393ac1cd3fcb03843977_binding.py",
-      "sha256": "7b4f57eb74e1b30bbd55f6145ab06cfb55aaee75b15a3e1ff961847f6faa4ab1"
-    },
-    {
-      "bytes": 260432,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_393ac1cd3fcb03843977_kernel.py",
-      "sha256": "ba10a3228fe483dabb98df4f085e3acf2a30ae74f9539b403a3d4039e4362df7"
-    },
-    {
       "bytes": 6266,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_394ae8bc3951d3e66cbe_binding.py",
@@ -6229,18 +5596,6 @@
       "sha256": "4d97c87bef3bd7617e7133de2e48958d3b09e79d50a7bcffb2f96432d3e1cb79"
     },
     {
-      "bytes": 8882,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_binding.py",
-      "sha256": "97e9f6f419d7ac785bbf2b98a52f977047c2df1f07729926da4d4355200f2e43"
-    },
-    {
-      "bytes": 266517,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_kernel.py",
-      "sha256": "a9878bd768e83a7bf7f3c11ac6bac9949f4d5fd3900f3d5187b26733272dde4a"
-    },
-    {
       "bytes": 6266,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_48a8beddc50f3585743e_binding.py",
@@ -6271,10 +5626,10 @@
       "sha256": "04511102abbc75bf67c16de704a290c3f58c4a938486bee90dfdd70b13d000f4"
     },
     {
-      "bytes": 189908,
+      "bytes": 190088,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py",
-      "sha256": "76b0d224b25f9ff5e683645f4d4fc65fb24dcba7a9ed0e012b9d598f51a249f4"
+      "sha256": "6d0d3f4bf7a5559ac43ad87f5f4bb15b374e4f917e7df4e8b0cd05487a3b6d57"
     },
     {
       "bytes": 8237,
@@ -6335,18 +5690,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e5ee0eae63df027f2b0_kernel.py",
       "sha256": "b75e4bc00a7c43a8a4ecf931140f764342335bc474190ff1f995bbfa14855327"
-    },
-    {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_binding.py",
-      "sha256": "354283d0f7ec0b42e477e0827d1033aac55f6a550fff4c8e0c0de5d24d952d38"
-    },
-    {
-      "bytes": 208825,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_kernel.py",
-      "sha256": "8124bde8532f82813274ea6852a8d38e78c4140c9e560e06c44484d4a1c17c2d"
     },
     {
       "bytes": 6266,
@@ -6431,18 +5774,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_5c2a4f52a093fd54e5fc_kernel.py",
       "sha256": "8f7fdd9ef33c1f350a933eda86d73b3134f62a6486f7b2f628c230bbaffe19a8"
-    },
-    {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6178437287f22580294a_binding.py",
-      "sha256": "64e146a267eda5951ebbf880d98f2422b0a14d259cbcfafc14d50cc477948f9b"
-    },
-    {
-      "bytes": 196918,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6178437287f22580294a_kernel.py",
-      "sha256": "007443c59b06745a8c1cfdbeb11fb72df20eada023b01a7949975dfe76137f17"
     },
     {
       "bytes": 8237,
@@ -6547,10 +5878,10 @@
       "sha256": "2124bc5a2ded8884c6f8cfa87788467da6e45349e59d0d844b6f9dbce62d4715"
     },
     {
-      "bytes": 126271,
+      "bytes": 126451,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py",
-      "sha256": "68b91151b7d21b8ec8cfea332e03ce7a5f86beb149d57f87ed79ab5f019c4cc7"
+      "sha256": "ee6b42d379be618a0323eb9beec0e237bf124be48eaf7974ea9b2ccc221fa231"
     },
     {
       "bytes": 8237,
@@ -6631,10 +5962,10 @@
       "sha256": "6d3bec475784debdb2f032adae2cb6798de436bb0bef79f6229926eb0b2ac96b"
     },
     {
-      "bytes": 129144,
+      "bytes": 129324,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py",
-      "sha256": "6949329d0ec53f422f7b075b45b41dcb3703cdf8c9688106ed9b7e190ffff019"
+      "sha256": "e05da9c2e94520083f4b71e9be58652c22e38deca0a964a7e162d3b01cd034c5"
     },
     {
       "bytes": 9138,
@@ -6667,10 +5998,10 @@
       "sha256": "b452e920087c28e6a01bc9d165705f4b06c846378a07d610a7c0be753acc8886"
     },
     {
-      "bytes": 266539,
+      "bytes": 266719,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py",
-      "sha256": "002914067fb66ea687ea653bdb7db379b77f6e671642c33ff87a6e5ff91c7cf6"
+      "sha256": "2c3c4ae43583303e214a52278e93ea1361eb8adbde0a4b154a996618d0844954"
     },
     {
       "bytes": 6266,
@@ -6683,42 +6014,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7528d4a7c36462909dd5_kernel.py",
       "sha256": "7c2eaf97574f09bec1aa9928a3941350a2daec776853ff2459b6c7e5702f14fc"
-    },
-    {
-      "bytes": 9137,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_binding.py",
-      "sha256": "fb9aaf2cc1d7daab5ab9c8c38026e48f46a355d3f6fa925c4c3bf5f98c340c9f"
-    },
-    {
-      "bytes": 129122,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_kernel.py",
-      "sha256": "6a3185474e32584b1e2984b9fa5441415a893c1f128ab37b488e4ce835183584"
-    },
-    {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_binding.py",
-      "sha256": "a27fc55e5b19d14881d68b0898f676307dffeef60403079101659e4fcc7fa804"
-    },
-    {
-      "bytes": 189886,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_kernel.py",
-      "sha256": "72fe1340a1e0a6b2a6c2c56f2b4899382d36ab008d73a2cb0a515d79b236ab47"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_binding.py",
-      "sha256": "c9bef4dac596bac97d9fdb8043686556fc03f6588d61b1337d6854a53def9da3"
-    },
-    {
-      "bytes": 108740,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_kernel.py",
-      "sha256": "c80834e051e459ecee80367f1ebce095d2f80e8078edd719cf01e2eead8cd397"
     },
     {
       "bytes": 6266,
@@ -6795,18 +6090,6 @@
     {
       "bytes": 8237,
       "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_8b5503910626cf61880e_binding.py",
-      "sha256": "048f09a3db586fa398e627266ada6b6c7d4caf77e5001238b4e525af73218a7a"
-    },
-    {
-      "bytes": 184626,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_8b5503910626cf61880e_kernel.py",
-      "sha256": "1e5f5a54886e723b10c64f3f56e6b9b22ec27ad4208ff083d6fe07c6312cd014"
-    },
-    {
-      "bytes": 8237,
-      "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9221d6e47489705fb9f3_binding.py",
       "sha256": "c2da0c260a2c5ceb2a408e03350af09df1e0f56fee7a9205e52a0a66737467ca"
     },
@@ -6815,30 +6098,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9221d6e47489705fb9f3_kernel.py",
       "sha256": "2d62c21c79b0038cedb20a09877ea745ed0be33d17ee70879a02a934c11a6579"
-    },
-    {
-      "bytes": 9137,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_binding.py",
-      "sha256": "8bbe4963c2b59f165676f42e793553ea93b546af847f864dfcd404099e9583a1"
-    },
-    {
-      "bytes": 111612,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_kernel.py",
-      "sha256": "b4e194f1a98911cd5500be18f4cba0e2e50c4008aaf6a9e66bef203af2dd44d6"
-    },
-    {
-      "bytes": 8237,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_binding.py",
-      "sha256": "948608e6c3cf792b3fe231a18da21b326da91657abafef28456260908d4637ee"
-    },
-    {
-      "bytes": 140585,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_kernel.py",
-      "sha256": "e78923ec0f5826dc8643ea018f12c56a6785a25822943d43a91d4a10e402f1ad"
     },
     {
       "bytes": 6266,
@@ -6863,18 +6122,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9900d238b6650db9e724_kernel.py",
       "sha256": "96cf41d8520e631e4c6bdd554b1ef724df51642aeab98aaeff3818875c98e6da"
-    },
-    {
-      "bytes": 8237,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_99ec7667c0ae20892a69_binding.py",
-      "sha256": "f4db7504de8732d5d49488a25c5e9011cdd9788dd99de7fbfe4ddf28330da440"
-    },
-    {
-      "bytes": 193594,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_99ec7667c0ae20892a69_kernel.py",
-      "sha256": "d7cdade317cf1e1f6b784a654d47bf3b4f382f0e71b7af30fb3ee823c4408ecb"
     },
     {
       "bytes": 8237,
@@ -6947,18 +6194,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a46c66d8be5f0df3df60_kernel.py",
       "sha256": "4920c986d5a0b6faad072257733ca0a65d3c85d59e274847194e59a7c1dd1ccf"
-    },
-    {
-      "bytes": 3492,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_binding.py",
-      "sha256": "623e4d2526bc135fe5e161d224a2784b8afb1d271ff356640a519840eb2b77d1"
-    },
-    {
-      "bytes": 61452,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_kernel.py",
-      "sha256": "2f11aca98c36481c2d23d87d9c480162a4a89e2448bdc635ead8057b8523ccc9"
     },
     {
       "bytes": 6266,
@@ -7051,34 +6286,10 @@
       "sha256": "188366be6962f6db0033ac29f989583ac4cd81a2ff9d777599e522298f4d49d1"
     },
     {
-      "bytes": 129505,
+      "bytes": 129685,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py",
-      "sha256": "4ba88cd7bdfb8eaaab89473c1060942a8894aaa248d5f3ac6736a0081dd38202"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_binding.py",
-      "sha256": "4ffc06f9a1724084734b1837660275a5a022cfc4c0429b66a7d4879654a7907e"
-    },
-    {
-      "bytes": 129483,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_kernel.py",
-      "sha256": "c3d87c1d6bf86a6e5ea75318650966d52a01f927a37c03909254463c107cb506"
-    },
-    {
-      "bytes": 6266,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_binding.py",
-      "sha256": "a2315877705d4c186539a48b171c03dcb9ff2ea5bef5febc9ee7e9a3da3265a1"
-    },
-    {
-      "bytes": 65575,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_kernel.py",
-      "sha256": "ba18928dd0303b706eb38177ec6801b7df8707f10d80f810051f10c3dc248b1b"
+      "sha256": "705dcb41e7f63816fd33f15b488243b1e77e897247ae70b6284a55943f31a03d"
     },
     {
       "bytes": 8237,
@@ -7119,18 +6330,6 @@
     {
       "bytes": 8854,
       "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_binding.py",
-      "sha256": "ecec8acd2d902ad481b5f41d0e9f7c8739d1b6f3e03b577ec278f2c0f69c6f8b"
-    },
-    {
-      "bytes": 188291,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_kernel.py",
-      "sha256": "08326a27c6615a75a83d6f439bf1d034bb649f66dec571d4a5aca8e699d2f387"
-    },
-    {
-      "bytes": 8854,
-      "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c591abec0d51e23d9210_binding.py",
       "sha256": "71ce7b5d4ad5b890ad0e0a26e09838d5a0b1b41e88d29793cfa4cc817b6da200"
     },
@@ -7163,18 +6362,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c6d09364a66d1c1190ad_kernel.py",
       "sha256": "dcb3a4bcb51a9aa32e129357d772c05d71c89ebf90bcbae4322ff619c85f243c"
-    },
-    {
-      "bytes": 8237,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c74665305c56a5c975aa_binding.py",
-      "sha256": "7599a672d2bde8a7b12165554cd0012b03ee065ba69dc40b55aba00a0eac21de"
-    },
-    {
-      "bytes": 122837,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c74665305c56a5c975aa_kernel.py",
-      "sha256": "61e388e15e43a88b26298022b69fe347c4af34b948eed7a6a9af44e423fda4b2"
     },
     {
       "bytes": 6266,
@@ -7225,18 +6412,6 @@
       "sha256": "57c11311b4f7b232d95f567b385bac35569a8be3fc7fd694f254bba9e8abdded"
     },
     {
-      "bytes": 2180,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_binding.py",
-      "sha256": "08a35b37f523f70ed8f127fb9019fbce69ce412137a75461a90ef3e03fc62a99"
-    },
-    {
-      "bytes": 5053,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_kernel.py",
-      "sha256": "07ef621169d549910b342bf8a84e629fdb13d2e6d33f77fe085098d3114a03b2"
-    },
-    {
       "bytes": 8237,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_cfbc94891bd6ce2c40c8_binding.py",
@@ -7255,22 +6430,10 @@
       "sha256": "58568bd0568dd65171654cf5f4a83a06104faea37d292db5dded0348cf351833"
     },
     {
-      "bytes": 208847,
+      "bytes": 209027,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py",
-      "sha256": "56813ec6ead85eb2f469c466c1428e9f29f049c375285702695571c51a0f3b4b"
-    },
-    {
-      "bytes": 6266,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d4e456c26269c9634d1b_binding.py",
-      "sha256": "7bb06ea74e9e89925a53ea29690654285040050ce6c55813fe99b65e6f4d5b21"
-    },
-    {
-      "bytes": 72083,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d4e456c26269c9634d1b_kernel.py",
-      "sha256": "15062ce3b35a7f355f6295d23038d0e374ccddc5d68f2af74a5c8ee17d85c585"
+      "sha256": "1dda13f1b4b65e6a853378504b7721fc8abf7357b5d422a23bddd02711a97c12"
     },
     {
       "bytes": 6266,
@@ -7303,10 +6466,10 @@
       "sha256": "27435911e4609d7771976085183906535312f0edb98004539c3c8218e8cd1f49"
     },
     {
-      "bytes": 111634,
+      "bytes": 111814,
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py",
-      "sha256": "a55f32be31f5ea0289fa860a21d515f69a5dd33bdc14c6f423f00f0a9f1e12c0"
+      "sha256": "7d63f9416cd95e72c512b00299217a0ea40722aeb950092c1dd806eb4eca9e9c"
     },
     {
       "bytes": 6266,
@@ -7319,18 +6482,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_da3b1d07a34de335619a_kernel.py",
       "sha256": "55657be3ee4cb440c82b53f284f4cda6b49ad670ba0a563aab861972857338e8"
-    },
-    {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_db71f2faa41b45521738_binding.py",
-      "sha256": "5c50a46c26a79f8c958e2af4b7f4715eb65d5784f8bf37258a9cccd90f2645a2"
-    },
-    {
-      "bytes": 91544,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_db71f2faa41b45521738_kernel.py",
-      "sha256": "61eedd87764d5c1fa08c3470e0081186f44a8c8b5c38a81dee8a18f580653ebe"
     },
     {
       "bytes": 8237,
@@ -7405,18 +6556,6 @@
       "sha256": "b742dedeeb224b69e5f7b02b8bca1184eb8dd2d5c9532e89f1f53a2dee9dbe2e"
     },
     {
-      "bytes": 9138,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_binding.py",
-      "sha256": "f6059df5e8e21e0987a8377d421a95edcf3d50f7f20c575f2aac5f00ea7fe02a"
-    },
-    {
-      "bytes": 126249,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_kernel.py",
-      "sha256": "0b76b08f353ed0905aea29191d3a6e49334d8d92013c58290bef70317a0ea705"
-    },
-    {
       "bytes": 6266,
       "kind": "tvm_ffi_binding",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e351d891a41b1f3c5b31_binding.py",
@@ -7439,18 +6578,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ea96c4c8eb07264a9fd4_kernel.py",
       "sha256": "892cf3953c826fb208032c6fa33129b7c6ec196d9b197d665ea63c4039bf87c9"
-    },
-    {
-      "bytes": 8892,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_eb7248d0be17c99499e0_binding.py",
-      "sha256": "3e3221b9f0723a3c381d695a869506f3f2b1e5ade7680a99f830535492b22eae"
-    },
-    {
-      "bytes": 245129,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_eb7248d0be17c99499e0_kernel.py",
-      "sha256": "37ca6893da7cee58438ca6a9c13bd4ac8b5cb591f3ee691e56a25a5f9b5e6b92"
     },
     {
       "bytes": 6266,
@@ -7523,18 +6650,6 @@
       "kind": "device_source",
       "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_f8ffa5365621d970babf_kernel.py",
       "sha256": "58b15aff38845e5445532cd6e00f4cb8c9b72140923ba4f8cb80731c98187ff2"
-    },
-    {
-      "bytes": 3059,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_binding.py",
-      "sha256": "62ac6a8ec3db8f047ae548c1dad34216d4228f064613e4baa3e37c936975a307"
-    },
-    {
-      "bytes": 23894,
-      "kind": "device_source",
-      "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_kernel.py",
-      "sha256": "a95888c8e6fdc0c4fdbc6336b8e5bfc7865b73f6530785c13c5540e005844b60"
     },
     {
       "bytes": 8854,
@@ -10285,9 +9400,9 @@
       },
       "closure": [
         {
-          "bytes": 201854,
+          "bytes": 202034,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py",
-          "sha256": "de0ecc0f5fbb677fbf3c039a4d603c9edbdea4607a01fe6150df5ee0778c2a70"
+          "sha256": "e0325e0e57030db85731415a20b916ae8ed5e7a2b9668e62875e6aacadf6ec6f"
         },
         {
           "bytes": 8854,
@@ -12102,9 +11217,9 @@
       },
       "closure": [
         {
-          "bytes": 108762,
+          "bytes": 108942,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py",
-          "sha256": "c19803e5b1816857f67b1b707383e337174ae5d084e093148714556889917932"
+          "sha256": "4b7efa3cbb2975a2b30d691f3d3b9798812a32a6d9d9934f4c7de6fe0e384c8d"
         },
         {
           "bytes": 9138,
@@ -12433,558 +11548,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2db9055c033d3772880a_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2db9055c033d3772880a_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "expert_idx"
-        ],
-        [
-          "buffer",
-          "mn_limit"
-        ],
-        [
-          "buffer",
-          "num_groups_ptr"
-        ],
-        [
-          "buffer",
-          "alt_expert_idx"
-        ],
-        [
-          "buffer",
-          "alt_mn_limit"
-        ],
-        [
-          "buffer",
-          "alt_num_groups_ptr"
-        ],
-        [
-          "buffer",
-          "base_active_ptr"
-        ],
-        [
-          "buffer",
-          "wide_list"
-        ],
-        [
-          "buffer",
-          "wide_count"
-        ],
-        [
-          "buffer",
-          "alt_wide_list"
-        ],
-        [
-          "buffer",
-          "alt_wide_count"
-        ],
-        [
-          "buffer",
-          "narrow_list"
-        ],
-        [
-          "buffer",
-          "narrow_count"
-        ],
-        [
-          "buffer",
-          "narrow_count_base"
-        ],
-        [
-          "buffer",
-          "trace"
-        ],
-        [
-          "scalar",
-          "group_rows"
-        ],
-        [
-          "scalar",
-          "alt_group_rows"
-        ],
-        [
-          "scalar",
-          "narrow_tile"
-        ],
-        [
-          "scalar",
-          "row_unit"
-        ],
-        [
-          "scalar",
-          "max_rows"
-        ],
-        [
-          "scalar",
-          "min_total_rows"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "9efcef9ad52fc7d8f9a5936dbebdca542cfd14ace3910cec75d7efec65b4cbd9",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 83631,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2e676288804ed795d54d_kernel.py",
-          "sha256": "74464a64e2ad55431c489e1134d941c7930dbdfb51e9973d32a621b5023b59fd"
-        },
-        {
-          "bytes": 5021,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2e676288804ed795d54d_binding.py",
-          "sha256": "1964b27b61c1c3292a6883b0c088978299e932d0894aac94b92bf3816e910251"
-        }
-      ],
-      "closure_sha256": "371f838d243c51a63cd487c3f3c988323aeeda684348bd7fa9c66e9b3a37ea77",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_2e676288804ed795d54d",
-      "launch": {
-        "block": [
-          1024,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 11008,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_2e676288804ed795d54d_sm_103a",
-      "name": "cake_mxfp4_situ_moe_2e676288804ed795d54d",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "alt_groups_in",
-          "base_active_in",
-          "alt",
-          "num_groups",
-          "staged_len",
-          "rows",
-          "use_smem",
-          "windows",
-          "carry_w",
-          "carry_n",
-          "carry_a",
-          "pass_idx",
-          "nwide",
-          "nnarrow",
-          "v",
-          "first",
-          "v_0",
-          "c",
-          "lo",
-          "hi",
-          "v_0_1",
-          "v_0_2",
-          "dense_only",
-          "best_cover",
-          "w",
-          "nwide_1",
-          "nnarrow_2",
-          "v_1",
-          "first_1",
-          "v_0_3",
-          "c_1",
-          "lo_1",
-          "hi_1",
-          "v_0_4",
-          "v_0_5",
-          "dense_only_1",
-          "best_cover_1",
-          "w_1",
-          "nwide_4",
-          "nnarrow_5",
-          "v_2",
-          "first_2",
-          "v_0_6",
-          "c_2",
-          "lo_2",
-          "hi_2",
-          "v_0_7",
-          "v_0_8",
-          "dense_only_2",
-          "best_cover_2",
-          "w_2",
-          "nwide_7",
-          "nnarrow_8",
-          "v_3",
-          "first_3",
-          "v_0_9",
-          "c_3",
-          "lo_3",
-          "hi_3",
-          "v_0_10",
-          "v_0_11",
-          "dense_only_3",
-          "best_cover_3",
-          "w_3",
-          "acc",
-          "acc_16",
-          "acc_23",
-          "exc_w",
-          "exc_n",
-          "exc_a",
-          "total_w",
-          "total_n",
-          "total_a",
-          "prefix_w",
-          "prefix_n",
-          "prefix_a",
-          "run_w",
-          "run_n",
-          "wide_out",
-          "alt_wide_out",
-          "narrow_base_out"
-        ],
-        "form": {
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "dual": true,
-          "gate": "e2e_registry",
-          "kind": "dispatch_mixed",
-          "narrow_count_base": true,
-          "pdl": true,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_dispatch_mixed192",
-          "stage_alt": 494,
-          "stage_base": 826,
-          "staged_words": 2640,
-          "trace": false,
-          "use_pdl": true
-        },
-        "source_identity": "2e676288804ed795d54d97248935f7031874e7069e422cc8264a4436f362d167",
-        "stage": "dispatch_mixed192_dual",
-        "template": "kimi_k3_mxfp4_situ_dispatch_mixed"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "b5109cf238db6750ead7d60fa3a7c1a728be25215fa799a7103e8e340872cd62",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2e676288804ed795d54d_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2e676288804ed795d54d_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "num_n_tiles"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "f806ae6ebacb3b811bdd03804a9fcda962f91deb9785acb567a0894bb4fc05f6",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 126451,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_kernel.py",
-          "sha256": "c5cecea560fdc926d8487e1d604c199d8ea5f06351a4685b65462b7c09fee7e8"
-        },
-        {
-          "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_binding.py",
-          "sha256": "12b504dfdf9985a9b44cd6093cb164e64039a8064a0f70959ce5d46e1c2a7abc"
-        }
-      ],
-      "closure_sha256": "ebd740fb14221dc464893d6c8c18cd6a03321806f7ab10d08cbb0465938f3ed8",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 223360,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_sm_103a",
-      "name": "cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "acc_stage",
-          "tile_stage",
-          "meta_stage",
-          "acc_buf",
-          "_phase_tile_full",
-          "e_coord_m",
-          "e_coord_n",
-          "e_limit",
-          "_phase_meta_full",
-          "_phase_acc_full",
-          "reduce_row",
-          "sa",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "acc_buf_1",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "_phase_tile_free",
-          "group",
-          "tile_stage_4",
-          "meta_stage_1",
-          "_phase_tile_full_3",
-          "_phase_meta_free"
-        ],
-        "form": {
-          "a_mcast": false,
-          "a_offset": 0,
-          "a_part_bytes": 16384,
-          "a_part_rows": 128,
-          "a_stage_bytes": 16384,
-          "ab_free_count": 1,
-          "ab_tx_bytes": 34304,
-          "acc_buf_stride": 208,
-          "acc_cols": 464,
-          "acc_early_release_subtile": 1,
-          "b_offset": 49152,
-          "b_rows": 256,
-          "b_stage_bytes": 32768,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "c_offset": 152576,
-          "c_row_bytes": 528,
-          "c_stage_bytes": 67584,
-          "c_stages": 1,
-          "cluster_n": 1,
-          "cta_group": 1,
-          "epi_issue_all_warps": true,
-          "epi_issue_warps": 4,
-          "epi_pair": false,
-          "footer_dep_launch": true,
-          "gate": "e2e_registry",
-          "half_atoms_per_tile": 4,
-          "info_offset": 220160,
-          "kind": "gemm2_dense",
-          "mcast_mask": 1,
-          "meta_scale_offset": 221232,
-          "meta_tok_offset": 220208,
-          "n_tile": 256,
-          "num_ab_stage": 3,
-          "num_acc_stage": 1,
-          "overlap_acc": true,
-          "pdl_trigger_early": false,
-          "plan_selected": false,
-          "raster_along_m": false,
-          "raster_auto": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n256_rg",
-          "row_group": true,
-          "sched_mode_offset": 222256,
-          "sfa_col": 464,
-          "sfa_offset": 147456,
-          "sfa_part_bytes": 512,
-          "sfa_part_d1": 4,
-          "sfa_stage_bytes": 512,
-          "sfb_atoms": 2,
-          "sfb_col": 468,
-          "sfb_offset": 148992,
-          "sfb_op_width": 8,
-          "sfb_shift_dynamic": false,
-          "sfb_stage_bytes": 1024,
-          "sfb_width": 8,
-          "smem_bytes": 222256,
-          "two_cta": false,
-          "use_pdl": true,
-          "use_row_group": true
-        },
-        "source_identity": "2ee85b5b6f5865f7edf01bd3cc347fe62b82826c190922db8c39e4bbfb2c6772",
-        "stage": "gemm2_dense_finalize_n256_rg",
-        "template": "gemm2_dense_finalize_n256_rg"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "009246e13bb4a68d40ba13c45e1061586cce96ed2bb46d71800a1e56569354bf",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_2ee85b5b6f5865f7edf0_kernel.py"
       }
     },
     {
@@ -14334,14 +12897,14 @@
       },
       "closure": [
         {
-          "bytes": 201832,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_kernel.py",
-          "sha256": "2e45b99bbc4ff690cc500a6cc1030b434d756a0bc04f1971486859ee572fc0a0"
+          "bytes": 202034,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py",
+          "sha256": "e0325e0e57030db85731415a20b916ae8ed5e7a2b9668e62875e6aacadf6ec6f"
         },
         {
           "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_binding.py",
-          "sha256": "ff516640bcefbc44fb02b5aad1d69e4d46e5a96cc2696689e66cbb0835f501ee"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_binding.py",
+          "sha256": "39c2c655aaccc599e337a969ec132891cad85cd571d015d7a7afa3c8be1a8ad1"
         }
       ],
       "closure_sha256": "543168463a2301b78b9719b865dd2622925e29f2a1448bb8fcdf0d934b6f54cc",
@@ -14351,7 +12914,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_38c94c53571235d152a9",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_1d4a75945e58e438939d",
       "launch": {
         "block": [
           384,
@@ -14494,292 +13057,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_38c94c53571235d152a9_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "group_capacity"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "act_sf"
-        ],
-        [
-          "buffer",
-          "zero_buf"
-        ],
-        [
-          "scalar",
-          "zero_words"
-        ],
-        [
-          "scalar",
-          "num_rows_b"
-        ],
-        [
-          "scalar",
-          "act_cols"
-        ],
-        [
-          "scalar",
-          "act_sf_cols"
-        ],
-        [
-          "scalar",
-          "g1_geom"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d361400c67a0bbae0a906ab77445eceaaaa3552fb0e8b17e3f1d344d70eda63a",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 260432,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_393ac1cd3fcb03843977_kernel.py",
-          "sha256": "ba10a3228fe483dabb98df4f085e3acf2a30ae74f9539b403a3d4039e4362df7"
-        },
-        {
-          "bytes": 8891,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_393ac1cd3fcb03843977_binding.py",
-          "sha256": "7b4f57eb74e1b30bbd55f6145ab06cfb55aaee75b15a3e1ff961847f6faa4ab1"
-        }
-      ],
-      "closure_sha256": "953a04cf4ff7433aa4dac2411b46a28760f24bde6b1ce240fda3da6426155f4b",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_393ac1cd3fcb03843977",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 183808,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_393ac1cd3fcb03843977_sm_103a",
-      "name": "cake_mxfp4_situ_moe_393ac1cd3fcb03843977",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "nrec_epilogue",
-          "nst_epilogue",
-          "acc_stage",
-          "tile_stage",
-          "meta_alpha",
-          "rec_m_tile",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "nrec_mma",
-          "nst_mma",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "nrec_tma",
-          "nst_tma",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "_phase_tile_free",
-          "nrec_gather",
-          "nst_gather",
-          "stage_1",
-          "tile_stage_4",
-          "_phase_tile_full_3",
-          "_phase_ab_free_1"
-        ],
-        "form": {
-          "ab_tx_bytes": 25600,
-          "acc_cols": 256,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "cta_v": 1,
-          "epi_n": 32,
-          "gate": "e2e_registry",
-          "hold_meta": true,
-          "is_situ": false,
-          "k_stage": 128,
-          "kbps": 4,
-          "kind": "gemm2_swapab",
-          "kt": 1,
-          "late_dep_wait": false,
-          "m_group": 2,
-          "n_tile": 64,
-          "num_ab_stage": 4,
-          "num_gather_warps": 1,
-          "partial": false,
-          "pdl_trigger_after_wait": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_n64",
-          "row_tma": true,
-          "sched_chunk_major": false,
-          "sched_m_block": 1,
-          "smem_bytes": 182784,
-          "threads": 256,
-          "use_pdl": true,
-          "weight_l2_hint": true
-        },
-        "source_identity": "393ac1cd3fcb0384397764277ac6b3ea950ab0c125975be6997ea6dacdac73a9",
-        "stage": "gemm2_swapab_finalize_n64",
-        "template": "gemm2_swapab_finalize_n64"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "1825893d4359af146cef7c6c3916a10ba5cd9e1438ab64e1a63db452f48e292c",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_393ac1cd3fcb03843977_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_393ac1cd3fcb03843977_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_1d4a75945e58e438939d_kernel.py"
       }
     },
     {
@@ -16257,14 +14537,14 @@
       },
       "closure": [
         {
-          "bytes": 266517,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_kernel.py",
-          "sha256": "a9878bd768e83a7bf7f3c11ac6bac9949f4d5fd3900f3d5187b26733272dde4a"
+          "bytes": 266719,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py",
+          "sha256": "2c3c4ae43583303e214a52278e93ea1361eb8adbde0a4b154a996618d0844954"
         },
         {
           "bytes": 8882,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_binding.py",
-          "sha256": "97e9f6f419d7ac785bbf2b98a52f977047c2df1f07729926da4d4355200f2e43"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_binding.py",
+          "sha256": "b452e920087c28e6a01bc9d165705f4b06c846378a07d610a7c0be753acc8886"
         }
       ],
       "closure_sha256": "ec1c5f6454b35a0381e2e222fe3c021b54fd960eac3ada2a503d3c12a624d356",
@@ -16274,7 +14554,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_461999ab4ec89487bba9",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_732677fc893d245b8761",
       "launch": {
         "block": [
           384,
@@ -16413,9 +14693,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_461999ab4ec89487bba9_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py"
       }
     },
     {
@@ -17219,9 +15499,9 @@
       },
       "closure": [
         {
-          "bytes": 189908,
+          "bytes": 190088,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py",
-          "sha256": "76b0d224b25f9ff5e683645f4d4fc65fb24dcba7a9ed0e012b9d598f51a249f4"
+          "sha256": "6d0d3f4bf7a5559ac43ad87f5f4bb15b374e4f917e7df4e8b0cd05487a3b6d57"
         },
         {
           "bytes": 8854,
@@ -19111,14 +17391,14 @@
       },
       "closure": [
         {
-          "bytes": 208825,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_kernel.py",
-          "sha256": "8124bde8532f82813274ea6852a8d38e78c4140c9e560e06c44484d4a1c17c2d"
+          "bytes": 209027,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py",
+          "sha256": "1dda13f1b4b65e6a853378504b7721fc8abf7357b5d422a23bddd02711a97c12"
         },
         {
           "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_binding.py",
-          "sha256": "354283d0f7ec0b42e477e0827d1033aac55f6a550fff4c8e0c0de5d24d952d38"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_binding.py",
+          "sha256": "58568bd0568dd65171654cf5f4a83a06104faea37d292db5dded0348cf351833"
         }
       ],
       "closure_sha256": "db698efdb396f84729f76c4eb501159ecbaebe94cf3dec19b791dcc6a62713ba",
@@ -19128,7 +17408,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_4e682a0086945425259c",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_d440250f695cbc9f1c43",
       "launch": {
         "block": [
           384,
@@ -19275,9 +17555,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4e682a0086945425259c_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py"
       }
     },
     {
@@ -21279,302 +19559,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_5c2a4f52a093fd54e5fc_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_5c2a4f52a093fd54e5fc_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "X"
-        ],
-        [
-          "buffer",
-          "XSF"
-        ],
-        [
-          "buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "WSF"
-        ],
-        [
-          "buffer",
-          "C"
-        ],
-        [
-          "buffer",
-          "CSF"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "token_id_mapping"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "zero_fill_words"
-        ],
-        [
-          "buffer",
-          "zero_fill_counters"
-        ],
-        [
-          "buffer",
-          "zero_fill_other_tiles"
-        ],
-        [
-          "scalar",
-          "zero_fill_num_words"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "n_tiles"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "scalar",
-          "sf_n_blocks"
-        ],
-        [
-          "scalar",
-          "beta_stride"
-        ],
-        [
-          "scalar",
-          "linear_beta_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "b7437fb52624268f98222b339e4384d478b2fe18f79bd6ecfabafc7ecf59d0f4",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 196918,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6178437287f22580294a_kernel.py",
-          "sha256": "007443c59b06745a8c1cfdbeb11fb72df20eada023b01a7949975dfe76137f17"
-        },
-        {
-          "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6178437287f22580294a_binding.py",
-          "sha256": "64e146a267eda5951ebbf880d98f2422b0a14d259cbcfafc14d50cc477948f9b"
-        }
-      ],
-      "closure_sha256": "51cd38acd81e84f04ba8b465a260656e1afccac48ea1b5c2a846afa098ee7e4b",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_6178437287f22580294a",
-      "launch": {
-        "block": [
-          384,
-          1,
-          1
-        ],
-        "cluster": [
-          2,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 231552,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_6178437287f22580294a_sm_103a",
-      "name": "cake_mxfp4_situ_moe_6178437287f22580294a",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "acc_stage",
-          "acc_idx",
-          "tile_stage",
-          "c_buf",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "amax0",
-          "amax1",
-          "stage",
-          "tile_stage_1",
-          "_phase_tile_full_1",
-          "_phase_a_free",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "acc_idx_1",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_acc_free",
-          "_phase_a_sync_full",
-          "_phase_b_full",
-          "stage_1",
-          "tile_stage_3",
-          "_phase_tile_full_3",
-          "_phase_b_free",
-          "tile_stage_4",
-          "_phase_tile_free",
-          "stage_2",
-          "tile_stage_5",
-          "_phase_tile_full_4",
-          "_phase_a_full"
-        ],
-        "form": {
-          "a_offset": 24576,
-          "a_stage_bytes": 16384,
-          "acc_cols": 464,
-          "acc_stride": 208,
-          "b_offset": 122880,
-          "b_rows": 128,
-          "b_stage_bytes": 16384,
-          "b_tx_bytes": 18432,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "c_offset": 0,
-          "c_stage_bytes": 8192,
-          "cluster_split": false,
-          "cta_v": 2,
-          "footer_dep_launch": true,
-          "gate": "e2e_registry",
-          "info_offset": 230400,
-          "kind": "gemm1_dense",
-          "n_steps": 2,
-          "n_tile": 256,
-          "num_ab_stage": 6,
-          "num_acc_stage": 1,
-          "num_c_stage": 3,
-          "overlap_acc": true,
-          "pdl_trigger_early": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm1_dense_m256_2cta_rowgroup",
-          "row_group_list": true,
-          "sc_per_tile": 4,
-          "sfa_col": 464,
-          "sfa_offset": 221184,
-          "sfa_stage_bytes": 512,
-          "sfb_atoms": 2,
-          "sfb_col": 480,
-          "sfb_offset": 224256,
-          "sfb_stage_bytes": 1024,
-          "sfb_width": 8,
-          "smem_bytes": 230440,
-          "threads": 384,
-          "threads_wo_sched": 352,
-          "tile_m": 256,
-          "tile_swizzle": false,
-          "tile_swizzle_m": 1,
-          "two_cta": true,
-          "use_pdl": true,
-          "weight_l2_hint": true,
-          "zero_fill": false,
-          "zero_fill_secondary": false,
-          "zf_bulk_bytes": 16384,
-          "zf_per_claim": 4,
-          "zf_unit_vec": 1024
-        },
-        "source_identity": "6178437287f22580294a3b51474fa4e82819cf570032ca92f6360d56c9516f54",
-        "stage": "gemm1_dense_situ_m256_n256_2cta_rowgroup",
-        "template": "gemm1_dense_situ_m256_n256_2cta_rowgroup"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "c6d373b293674f7950d7d82a288051f3adabf71913de2d89023175be823aa704",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6178437287f22580294a_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6178437287f22580294a_kernel.py"
       }
     },
     {
@@ -23889,9 +21873,9 @@
       },
       "closure": [
         {
-          "bytes": 126271,
+          "bytes": 126451,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py",
-          "sha256": "68b91151b7d21b8ec8cfea332e03ce7a5f86beb149d57f87ed79ab5f019c4cc7"
+          "sha256": "ee6b42d379be618a0323eb9beec0e237bf124be48eaf7974ea9b2ccc221fa231"
         },
         {
           "bytes": 9138,
@@ -26061,9 +24045,9 @@
       },
       "closure": [
         {
-          "bytes": 129144,
+          "bytes": 129324,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py",
-          "sha256": "6949329d0ec53f422f7b075b45b41dcb3703cdf8c9688106ed9b7e190ffff019"
+          "sha256": "e05da9c2e94520083f4b71e9be58652c22e38deca0a964a7e162d3b01cd034c5"
         },
         {
           "bytes": 9137,
@@ -26977,9 +24961,9 @@
       },
       "closure": [
         {
-          "bytes": 266539,
+          "bytes": 266719,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_732677fc893d245b8761_kernel.py",
-          "sha256": "002914067fb66ea687ea653bdb7db379b77f6e671642c33ff87a6e5ff91c7cf6"
+          "sha256": "2c3c4ae43583303e214a52278e93ea1361eb8adbde0a4b154a996618d0844954"
         },
         {
           "bytes": 8882,
@@ -27568,14 +25552,14 @@
       },
       "closure": [
         {
-          "bytes": 129122,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_kernel.py",
-          "sha256": "6a3185474e32584b1e2984b9fa5441415a893c1f128ab37b488e4ce835183584"
+          "bytes": 129324,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py",
+          "sha256": "e05da9c2e94520083f4b71e9be58652c22e38deca0a964a7e162d3b01cd034c5"
         },
         {
           "bytes": 9137,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_binding.py",
-          "sha256": "fb9aaf2cc1d7daab5ab9c8c38026e48f46a355d3f6fa925c4c3bf5f98c340c9f"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_binding.py",
+          "sha256": "6d3bec475784debdb2f032adae2cb6798de436bb0bef79f6229926eb0b2ac96b"
         }
       ],
       "closure_sha256": "3308eb3388a896f437e7675248b5987de32f598221db065ab0f003a4dac0f750",
@@ -27585,7 +25569,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_75bd0a129e437c606531",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_6fd2cab425181a6f291d",
       "launch": {
         "block": [
           256,
@@ -27739,9 +25723,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_75bd0a129e437c606531_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6fd2cab425181a6f291d_kernel.py"
       }
     },
     {
@@ -27875,14 +25859,14 @@
       },
       "closure": [
         {
-          "bytes": 189886,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_kernel.py",
-          "sha256": "72fe1340a1e0a6b2a6c2c56f2b4899382d36ab008d73a2cb0a515d79b236ab47"
+          "bytes": 190088,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py",
+          "sha256": "6d0d3f4bf7a5559ac43ad87f5f4bb15b374e4f917e7df4e8b0cd05487a3b6d57"
         },
         {
           "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_binding.py",
-          "sha256": "a27fc55e5b19d14881d68b0898f676307dffeef60403079101659e4fcc7fa804"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_binding.py",
+          "sha256": "04511102abbc75bf67c16de704a290c3f58c4a938486bee90dfdd70b13d000f4"
         }
       ],
       "closure_sha256": "3034391f1fdfabe922e47c3496e6ef92b53218fed67994dbb8b243ed0d0fbcf9",
@@ -27892,7 +25876,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_7ba2742add8b70703b98",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_4a9166a7c40e96ae6031",
       "launch": {
         "block": [
           384,
@@ -28031,9 +26015,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7ba2742add8b70703b98_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_4a9166a7c40e96ae6031_kernel.py"
       }
     },
     {
@@ -28131,14 +26115,14 @@
       },
       "closure": [
         {
-          "bytes": 108740,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_kernel.py",
-          "sha256": "c80834e051e459ecee80367f1ebce095d2f80e8078edd719cf01e2eead8cd397"
+          "bytes": 108942,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py",
+          "sha256": "4b7efa3cbb2975a2b30d691f3d3b9798812a32a6d9d9934f4c7de6fe0e384c8d"
         },
         {
           "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_binding.py",
-          "sha256": "c9bef4dac596bac97d9fdb8043686556fc03f6588d61b1337d6854a53def9da3"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_binding.py",
+          "sha256": "0001eda1cad4ea1162fa8c2a52af691d1f1d8493ce2aa28eec0f23dbd79b110a"
         }
       ],
       "closure_sha256": "255061841d74c0ad0dc736a2f0809d2de09de5ff1059f7e634f1a53731be121e",
@@ -28148,7 +26132,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_7bbbab73a144bc109348",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_28f8827fbe1200a49d77",
       "launch": {
         "block": [
           256,
@@ -28296,9 +26280,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_7bbbab73a144bc109348_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_28f8827fbe1200a49d77_kernel.py"
       }
     },
     {
@@ -30267,297 +28251,6 @@
       },
       "closure": [
         {
-          "bytes": 184626,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_8b5503910626cf61880e_kernel.py",
-          "sha256": "1e5f5a54886e723b10c64f3f56e6b9b22ec27ad4208ff083d6fe07c6312cd014"
-        },
-        {
-          "bytes": 8237,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_8b5503910626cf61880e_binding.py",
-          "sha256": "048f09a3db586fa398e627266ada6b6c7d4caf77e5001238b4e525af73218a7a"
-        }
-      ],
-      "closure_sha256": "7aff80787eca060877236d8caccf967d93f3d7ee068ba8b402e40a4a09ad44be",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_8b5503910626cf61880e",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 203776,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_8b5503910626cf61880e_sm_103a",
-      "name": "cake_mxfp4_situ_moe_8b5503910626cf61880e",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "nrec_epilogue",
-          "nst_epilogue",
-          "acc_stage",
-          "tile_stage",
-          "meta_alpha",
-          "rec_m_tile",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "nrec_mma",
-          "nst_mma",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "nrec_tma",
-          "nst_tma",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "sb_nbase",
-          "sb_it",
-          "sb_rg",
-          "sb_ok",
-          "sb_rgs",
-          "sb_lk",
-          "sb_lkl",
-          "sb_prow",
-          "_phase_tile_free",
-          "nrec_gather",
-          "nst_gather",
-          "stage_1",
-          "tile_stage_4",
-          "_phase_tile_full_3",
-          "_phase_ab_free_1"
-        ],
-        "form": {
-          "ab_tx_bytes": 17408,
-          "acc_cols": 128,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "cta_v": 1,
-          "epi_n": 32,
-          "gate": "e2e_registry",
-          "hold_meta": false,
-          "is_situ": false,
-          "k_stage": 128,
-          "kbps": 4,
-          "kind": "gemm2_swapab_partial",
-          "kt": 1,
-          "late_dep_wait": true,
-          "m_group": 2,
-          "n_tile": 32,
-          "num_ab_stage": 5,
-          "num_gather_warps": 1,
-          "partial": true,
-          "pdl_trigger_after_wait": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_partial_n32_m2",
-          "row_tma": false,
-          "sched_chunk_major": false,
-          "sched_m_block": 1,
-          "smem_bytes": 202752,
-          "threads": 256,
-          "use_pdl": true,
-          "weight_l2_hint": true
-        },
-        "source_identity": "8b5503910626cf61880e5666df5e00f50b8b71b609c6b002feb72dc6930ce8d2",
-        "stage": "gemm2_swapab_partial_n32_m2",
-        "template": "gemm2_swapab_partial_n32_m2"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "5a124f6f2d93c9b4a44fcb562d451476f2f1d8cce34bce51cbe7b5cfe980e0b0",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_8b5503910626cf61880e_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_8b5503910626cf61880e_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "group_capacity"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "act_sf"
-        ],
-        [
-          "buffer",
-          "zero_buf"
-        ],
-        [
-          "scalar",
-          "zero_words"
-        ],
-        [
-          "scalar",
-          "num_rows_b"
-        ],
-        [
-          "scalar",
-          "act_cols"
-        ],
-        [
-          "scalar",
-          "act_sf_cols"
-        ],
-        [
-          "scalar",
-          "g1_geom"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d361400c67a0bbae0a906ab77445eceaaaa3552fb0e8b17e3f1d344d70eda63a",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
           "bytes": 97643,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9221d6e47489705fb9f3_kernel.py",
           "sha256": "2d62c21c79b0038cedb20a09877ea745ed0be33d17ee70879a02a934c11a6579"
@@ -30809,14 +28502,14 @@
       },
       "closure": [
         {
-          "bytes": 111612,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_kernel.py",
-          "sha256": "b4e194f1a98911cd5500be18f4cba0e2e50c4008aaf6a9e66bef203af2dd44d6"
+          "bytes": 111814,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py",
+          "sha256": "7d63f9416cd95e72c512b00299217a0ea40722aeb950092c1dd806eb4eca9e9c"
         },
         {
           "bytes": 9137,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_binding.py",
-          "sha256": "8bbe4963c2b59f165676f42e793553ea93b546af847f864dfcd404099e9583a1"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_binding.py",
+          "sha256": "27435911e4609d7771976085183906535312f0edb98004539c3c8218e8cd1f49"
         }
       ],
       "closure_sha256": "cce4acd9851cda674eeebf670ac5db0ba63b28d27b70286dfd67f1d9a29ea6d7",
@@ -30826,7 +28519,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_9259590e6c86f26a96ae",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c",
       "launch": {
         "block": [
           256,
@@ -30979,300 +28672,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9259590e6c86f26a96ae_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "group_capacity"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "act_sf"
-        ],
-        [
-          "buffer",
-          "zero_buf"
-        ],
-        [
-          "scalar",
-          "zero_words"
-        ],
-        [
-          "scalar",
-          "num_rows_b"
-        ],
-        [
-          "scalar",
-          "act_cols"
-        ],
-        [
-          "scalar",
-          "act_sf_cols"
-        ],
-        [
-          "scalar",
-          "g1_geom"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d361400c67a0bbae0a906ab77445eceaaaa3552fb0e8b17e3f1d344d70eda63a",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 140585,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_kernel.py",
-          "sha256": "e78923ec0f5826dc8643ea018f12c56a6785a25822943d43a91d4a10e402f1ad"
-        },
-        {
-          "bytes": 8237,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_binding.py",
-          "sha256": "948608e6c3cf792b3fe231a18da21b326da91657abafef28456260908d4637ee"
-        }
-      ],
-      "closure_sha256": "33bf7033b28d293a2f7f05c8988d24918db86aadd7fa9682667afbdc06b855b6",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_94a3955b90be1c46dd2d",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 188416,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_sm_103a",
-      "name": "cake_mxfp4_situ_moe_94a3955b90be1c46dd2d",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "nrec_epilogue",
-          "nst_epilogue",
-          "acc_stage",
-          "tile_stage",
-          "meta_alpha",
-          "rec_m_tile",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "nrec_mma",
-          "nst_mma",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "nrec_tma",
-          "nst_tma",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "sb_nbase",
-          "sb_it",
-          "sb_rg",
-          "sb_ok",
-          "sb_rgs",
-          "sb_lk",
-          "sb_lkl",
-          "sb_prow",
-          "_phase_tile_free",
-          "nrec_gather",
-          "nst_gather",
-          "stage_1",
-          "tile_stage_4",
-          "_phase_tile_full_3",
-          "_phase_ab_free_1"
-        ],
-        "form": {
-          "ab_tx_bytes": 17408,
-          "acc_cols": 64,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "cta_v": 1,
-          "epi_n": 16,
-          "gate": "e2e_registry",
-          "hold_meta": false,
-          "is_situ": false,
-          "k_stage": 128,
-          "kbps": 4,
-          "kind": "gemm2_swapab_partial",
-          "kt": 1,
-          "late_dep_wait": true,
-          "m_group": 2,
-          "n_tile": 16,
-          "num_ab_stage": 5,
-          "num_gather_warps": 1,
-          "partial": true,
-          "pdl_trigger_after_wait": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_partial_n16_m2",
-          "row_tma": false,
-          "sched_chunk_major": false,
-          "sched_m_block": 1,
-          "smem_bytes": 187392,
-          "threads": 256,
-          "use_pdl": true,
-          "weight_l2_hint": true
-        },
-        "source_identity": "94a3955b90be1c46dd2d1b60800a175ea4a8457979fb5ed976975dec7324d9f8",
-        "stage": "gemm2_swapab_partial_n16_m2",
-        "template": "gemm2_swapab_partial_n16_m2"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "571f7e3c74f2b5981373e461a407a92327649e094e268ddf8642e8366c56cdff",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_94a3955b90be1c46dd2d_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py"
       }
     },
     {
@@ -31943,295 +29345,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9900d238b6650db9e724_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_9900d238b6650db9e724_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "group_capacity"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "act_sf"
-        ],
-        [
-          "buffer",
-          "zero_buf"
-        ],
-        [
-          "scalar",
-          "zero_words"
-        ],
-        [
-          "scalar",
-          "num_rows_b"
-        ],
-        [
-          "scalar",
-          "act_cols"
-        ],
-        [
-          "scalar",
-          "act_sf_cols"
-        ],
-        [
-          "scalar",
-          "g1_geom"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d361400c67a0bbae0a906ab77445eceaaaa3552fb0e8b17e3f1d344d70eda63a",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 193594,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_99ec7667c0ae20892a69_kernel.py",
-          "sha256": "d7cdade317cf1e1f6b784a654d47bf3b4f382f0e71b7af30fb3ee823c4408ecb"
-        },
-        {
-          "bytes": 8237,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_99ec7667c0ae20892a69_binding.py",
-          "sha256": "f4db7504de8732d5d49488a25c5e9011cdd9788dd99de7fbfe4ddf28330da440"
-        }
-      ],
-      "closure_sha256": "47d786f06f995a6e627100898b8f572ea6d07eb131600dc84bbdb8587549be19",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_99ec7667c0ae20892a69",
-      "launch": {
-        "block": [
-          384,
-          1,
-          1
-        ],
-        "cluster": [
-          2,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 214400,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_99ec7667c0ae20892a69_sm_103a",
-      "name": "cake_mxfp4_situ_moe_99ec7667c0ae20892a69",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "nrec_epilogue",
-          "nst_epilogue",
-          "acc_stage",
-          "tile_stage",
-          "meta_alpha",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "nrec_mma",
-          "nst_mma",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "_phase_b_relay_full",
-          "nrec_tma",
-          "nst_tma",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "_phase_tile_free",
-          "nrec_gather",
-          "nst_gather",
-          "stage_1",
-          "tile_stage_4",
-          "_phase_tile_full_3",
-          "cta_row0",
-          "g_half",
-          "_phase_b_free",
-          "stage_2",
-          "tile_stage_5",
-          "_phase_tile_full_4",
-          "_phase_b_full"
-        ],
-        "form": {
-          "ab_tx_bytes": 17408,
-          "acc_cols": 384,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "cta_v": 2,
-          "epi_n": 32,
-          "gate": "e2e_registry",
-          "hold_meta": true,
-          "is_situ": false,
-          "k_stage": 128,
-          "kbps": 4,
-          "kind": "gemm2_swapab",
-          "kt": 1,
-          "late_dep_wait": false,
-          "m_group": 1,
-          "n_tile": 192,
-          "num_ab_stage": 6,
-          "num_gather_warps": 4,
-          "partial": false,
-          "pdl_trigger_after_wait": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_n192_2cta",
-          "row_tma": false,
-          "sched_chunk_major": false,
-          "sched_m_block": 1,
-          "smem_bytes": 213376,
-          "threads": 384,
-          "use_pdl": true,
-          "weight_l2_hint": true
-        },
-        "source_identity": "99ec7667c0ae20892a691edffa1546338ab33c6c8a4c1c6be9c199919db161b6",
-        "stage": "gemm2_swapab_finalize_n192_2cta",
-        "template": "gemm2_swapab_finalize_n192_2cta"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "638e2164b6aa6c7d7332bc5b4986dfc5c8313b7e8db45153ae3dbdce8bce1ae6",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_99ec7667c0ae20892a69_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_99ec7667c0ae20892a69_kernel.py"
       }
     },
     {
@@ -33928,198 +31041,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a46c66d8be5f0df3df60_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a46c66d8be5f0df3df60_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "mn_limit"
-        ],
-        [
-          "buffer",
-          "num_groups_ptr"
-        ],
-        [
-          "buffer",
-          "wide_list"
-        ],
-        [
-          "buffer",
-          "wide_count"
-        ],
-        [
-          "buffer",
-          "narrow_list"
-        ],
-        [
-          "buffer",
-          "narrow_count"
-        ],
-        [
-          "buffer",
-          "all_list"
-        ],
-        [
-          "buffer",
-          "all_count"
-        ],
-        [
-          "scalar",
-          "group_rows"
-        ],
-        [
-          "scalar",
-          "narrow_tile"
-        ],
-        [
-          "scalar",
-          "wide_min_rows"
-        ],
-        [
-          "scalar",
-          "wide_min_permille"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "2bab5f823d851b5e1a4e959e9480b5e10629c06ac92a1c85b346a972e8bd96a8",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 61452,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_kernel.py",
-          "sha256": "2f11aca98c36481c2d23d87d9c480162a4a89e2448bdc635ead8057b8523ccc9"
-        },
-        {
-          "bytes": 3492,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_binding.py",
-          "sha256": "623e4d2526bc135fe5e161d224a2784b8afb1d271ff356640a519840eb2b77d1"
-        }
-      ],
-      "closure_sha256": "13614ec00726754b0c4bae9e13d7a5c5542e6306053c7d6ef94d4caca1187449",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4",
-      "launch": {
-        "block": [
-          1024,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 13056,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_sm_103a",
-      "name": "cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "wide_min",
-          "wide_rows",
-          "all_rows",
-          "rows",
-          "acc",
-          "acc_4",
-          "total_wide",
-          "total_all",
-          "use_wide",
-          "carry_w",
-          "carry_n",
-          "carry_a",
-          "rows_1",
-          "rows_0",
-          "mine_all",
-          "mine_wide",
-          "mine_narrow",
-          "partial",
-          "acc_1",
-          "exclusive",
-          "running",
-          "partial_67",
-          "acc_99",
-          "exclusive_107",
-          "running_110",
-          "partial_143",
-          "acc_175",
-          "exclusive_183",
-          "running_186"
-        ],
-        "form": {
-          "all_lists": true,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "gate": "e2e_registry",
-          "kind": "dispatch",
-          "pdl": true,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_dispatch",
-          "use_pdl": true
-        },
-        "source_identity": "a50a97d74c5a8c998eb4a9e020d6493f46cf75fca13754c0215d5c1a80dd0ca3",
-        "stage": "dispatch_mixed_lists",
-        "template": "kimi_k3_mxfp4_situ_dispatch"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "2a53a1d6467c9cff273746caf2d937d10527cfad8d4d224cfc3696c2c3342897",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_a50a97d74c5a8c998eb4_kernel.py"
       }
     },
     {
@@ -36326,9 +33247,9 @@
       },
       "closure": [
         {
-          "bytes": 129505,
+          "bytes": 129685,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py",
-          "sha256": "4ba88cd7bdfb8eaaab89473c1060942a8894aaa248d5f3ac6736a0081dd38202"
+          "sha256": "705dcb41e7f63816fd33f15b488243b1e77e897247ae70b6284a55943f31a03d"
         },
         {
           "bytes": 9138,
@@ -36596,14 +33517,14 @@
       },
       "closure": [
         {
-          "bytes": 129483,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_kernel.py",
-          "sha256": "c3d87c1d6bf86a6e5ea75318650966d52a01f927a37c03909254463c107cb506"
+          "bytes": 129685,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py",
+          "sha256": "705dcb41e7f63816fd33f15b488243b1e77e897247ae70b6284a55943f31a03d"
         },
         {
           "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_binding.py",
-          "sha256": "4ffc06f9a1724084734b1837660275a5a022cfc4c0429b66a7d4879654a7907e"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_binding.py",
+          "sha256": "188366be6962f6db0033ac29f989583ac4cd81a2ff9d777599e522298f4d49d1"
         }
       ],
       "closure_sha256": "81a90268f1df865e5753fa66d74d6ddb210d0d21f7d973691662e6bd9906eb43",
@@ -36613,7 +33534,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_ba6019321e44f6c49a14",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_b97edc7bde63a08c2f75",
       "launch": {
         "block": [
           256,
@@ -36766,344 +33687,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ba6019321e44f6c49a14_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "ids_src"
-        ],
-        [
-          "buffer",
-          "weights_src"
-        ],
-        [
-          "buffer",
-          "ids_dst"
-        ],
-        [
-          "buffer",
-          "weights_dst"
-        ],
-        [
-          "buffer",
-          "output"
-        ],
-        [
-          "buffer",
-          "tile_expert"
-        ],
-        [
-          "buffer",
-          "tile_limit"
-        ],
-        [
-          "buffer",
-          "expanded"
-        ],
-        [
-          "buffer",
-          "permuted"
-        ],
-        [
-          "buffer",
-          "padded_total"
-        ],
-        [
-          "buffer",
-          "active_total"
-        ],
-        [
-          "buffer",
-          "wide_list"
-        ],
-        [
-          "buffer",
-          "wide_count"
-        ],
-        [
-          "buffer",
-          "narrow_list"
-        ],
-        [
-          "buffer",
-          "narrow_count"
-        ],
-        [
-          "buffer",
-          "all_list"
-        ],
-        [
-          "buffer",
-          "all_count"
-        ],
-        [
-          "buffer",
-          "wide_expert"
-        ],
-        [
-          "buffer",
-          "wide_limit"
-        ],
-        [
-          "buffer",
-          "chunk_counts"
-        ],
-        [
-          "scalar",
-          "num_routes"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "scalar",
-          "output_words"
-        ],
-        [
-          "scalar",
-          "num_experts"
-        ],
-        [
-          "scalar",
-          "local_experts"
-        ],
-        [
-          "scalar",
-          "local_offset"
-        ],
-        [
-          "scalar",
-          "tile_size"
-        ],
-        [
-          "scalar",
-          "narrow_tile"
-        ],
-        [
-          "scalar",
-          "wide_min_rows"
-        ],
-        [
-          "scalar",
-          "wide_min_permille"
-        ],
-        [
-          "scalar",
-          "wide_tile"
-        ],
-        [
-          "scalar",
-          "ids_stride0"
-        ],
-        [
-          "scalar",
-          "ids_stride1"
-        ],
-        [
-          "scalar",
-          "w_stride0"
-        ],
-        [
-          "scalar",
-          "w_stride1"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "84f9b952e94cd9543f2e21dac1192659a75671bd8186acc33f0edc99d2037f9c",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 65575,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_kernel.py",
-          "sha256": "ba18928dd0303b706eb38177ec6801b7df8707f10d80f810051f10c3dc248b1b"
-        },
-        {
-          "bytes": 6266,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_binding.py",
-          "sha256": "a2315877705d4c186539a48b171c03dcb9ff2ea5bef5febc9ee7e9a3da3265a1"
-        }
-      ],
-      "closure_sha256": "e89050248a58d025eec4b9a94c7537e892f04c8055e30347a2446db1191a7e5f",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df",
-      "launch": {
-        "block": [
-          1024,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 45312,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": false
-      },
-      "module_ident": "cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_sm_103a",
-      "name": "cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "chunk",
-          "expert",
-          "rank",
-          "expert_1",
-          "rank_1",
-          "expert_2",
-          "rank_2",
-          "expert_3",
-          "rank_3",
-          "expert_4",
-          "rank_4",
-          "expert_5",
-          "rank_5",
-          "expert_6",
-          "rank_6",
-          "expert_7",
-          "rank_7",
-          "expert_8",
-          "rank_8",
-          "count",
-          "pre",
-          "total",
-          "pre_0",
-          "wide",
-          "nwide",
-          "acc",
-          "subtotal",
-          "acc_0",
-          "preceding",
-          "acc_10",
-          "subtotal_1",
-          "acc_0_1",
-          "preceding_18",
-          "ntiles",
-          "within_warp",
-          "acc_1",
-          "subtotal_2",
-          "acc_2",
-          "preceding_warps",
-          "row_base",
-          "wide_total",
-          "wide_base",
-          "wide_row0",
-          "acc_3",
-          "subtotal_3",
-          "acc_0_2",
-          "preceding_1",
-          "limit_w",
-          "wide_rows",
-          "acc_4",
-          "subtotal_4",
-          "acc_0_3",
-          "preceding_2",
-          "acc_10_1",
-          "subtotal_5",
-          "acc_0_4",
-          "preceding_18_1",
-          "effective_min",
-          "acc_23",
-          "subtotal_6",
-          "acc_0_5",
-          "preceding_31",
-          "acc_36",
-          "subtotal_7",
-          "acc_0_6",
-          "preceding_44",
-          "acc_49",
-          "subtotal_8",
-          "acc_0_7",
-          "preceding_57",
-          "limit"
-        ],
-        "form": {
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "chunk_routes": 8192,
-          "clear": true,
-          "cluster": 1,
-          "dispatch_lists": true,
-          "gate": "e2e_registry",
-          "kind": "routing",
-          "max_routes": 8192,
-          "mode": "packed",
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_routing_ep8_decode",
-          "single_tile_per_expert": true,
-          "smem_bytes": 45312,
-          "split_layout": false,
-          "staged_rows": 0,
-          "threads": 1024,
-          "use_pdl": true
-        },
-        "source_identity": "bae0ebdbe0d16b41f2df657a55746c5ef72e34c3f2224bc04f1157ff457ca08a",
-        "stage": "routing_ep8_decode",
-        "template": "kimi_k3_mxfp4_situ_routing"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "368105b6ee5d2f8656e80de63c441dee56f5556a64ccdc4b254924e3923fdefc",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": false,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_bae0ebdbe0d16b41f2df_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_b97edc7bde63a08c2f75_kernel.py"
       }
     },
     {
@@ -38208,296 +34794,6 @@
       },
       "closure": [
         {
-          "bytes": 188291,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_kernel.py",
-          "sha256": "08326a27c6615a75a83d6f439bf1d034bb649f66dec571d4a5aca8e699d2f387"
-        },
-        {
-          "bytes": 8854,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_binding.py",
-          "sha256": "ecec8acd2d902ad481b5f41d0e9f7c8739d1b6f3e03b577ec278f2c0f69c6f8b"
-        }
-      ],
-      "closure_sha256": "df8ab6e5267c8c1c3c6af8a6f93b42d04672b9ab497fb4f521482f1d0d512192",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1",
-      "launch": {
-        "block": [
-          384,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 228480,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_sm_103a",
-      "name": "cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "acc_stage",
-          "tile_stage",
-          "c_buf",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "amax0",
-          "amax1",
-          "stage",
-          "tile_stage_1",
-          "_phase_tile_full_1",
-          "_phase_a_free",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_acc_free",
-          "_phase_a_full",
-          "_phase_b_full",
-          "stage_1",
-          "tile_stage_3",
-          "_phase_tile_full_3",
-          "_phase_b_free",
-          "tile_stage_4",
-          "_phase_tile_free"
-        ],
-        "form": {
-          "a_offset": 24576,
-          "a_stage_bytes": 16384,
-          "acc_cols": 256,
-          "acc_stride": 128,
-          "b_offset": 122880,
-          "b_rows": 128,
-          "b_stage_bytes": 16384,
-          "b_tx_bytes": 8704,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "c_offset": 0,
-          "c_stage_bytes": 8192,
-          "cluster_split": false,
-          "cta_v": 1,
-          "footer_dep_launch": true,
-          "gate": "e2e_registry",
-          "info_offset": 227328,
-          "kind": "gemm1_dense",
-          "n_steps": 1,
-          "n_tile": 128,
-          "num_ab_stage": 6,
-          "num_acc_stage": 2,
-          "num_c_stage": 3,
-          "overlap_acc": false,
-          "pdl_trigger_early": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm1_dense_m128_n128_rowgroup",
-          "row_group_list": true,
-          "sc_per_tile": 2,
-          "sfa_col": 256,
-          "sfa_offset": 221184,
-          "sfa_stage_bytes": 512,
-          "sfb_atoms": 1,
-          "sfb_col": 272,
-          "sfb_offset": 224256,
-          "sfb_stage_bytes": 512,
-          "sfb_width": 4,
-          "smem_bytes": 227368,
-          "threads": 384,
-          "threads_wo_sched": 320,
-          "tile_m": 128,
-          "tile_swizzle": false,
-          "tile_swizzle_m": 1,
-          "two_cta": false,
-          "use_pdl": true,
-          "weight_l2_hint": true,
-          "zero_fill": false,
-          "zero_fill_secondary": false,
-          "zf_bulk_bytes": 16384,
-          "zf_per_claim": 4,
-          "zf_unit_vec": 1024
-        },
-        "source_identity": "c3453a93aa40a8cde8e109d2fb8771736830808f5cfb8ad241261c9884e79278",
-        "stage": "gemm1_dense_situ_m128_n128_rowgroup",
-        "template": "gemm1_dense_situ_m128_n128_rowgroup"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "156a0d3565c12558f61bf361cc86eeca36a24e1ec18bab14675b524ed0783efa",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c3453a93aa40a8cde8e1_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "X"
-        ],
-        [
-          "buffer",
-          "XSF"
-        ],
-        [
-          "buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "WSF"
-        ],
-        [
-          "buffer",
-          "C"
-        ],
-        [
-          "buffer",
-          "CSF"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "token_id_mapping"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "zero_fill_words"
-        ],
-        [
-          "buffer",
-          "zero_fill_counters"
-        ],
-        [
-          "buffer",
-          "zero_fill_other_tiles"
-        ],
-        [
-          "scalar",
-          "zero_fill_num_words"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "n_tiles"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "scalar",
-          "sf_n_blocks"
-        ],
-        [
-          "scalar",
-          "beta_stride"
-        ],
-        [
-          "scalar",
-          "linear_beta_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "b7437fb52624268f98222b339e4384d478b2fe18f79bd6ecfabafc7ecf59d0f4",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
           "bytes": 189992,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c591abec0d51e23d9210_kernel.py",
           "sha256": "76c8b185707402aac35d372951ad400e90504eafae3d43905abf3e88d3da0f6d"
@@ -39327,297 +35623,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c6d09364a66d1c1190ad_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c6d09364a66d1c1190ad_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "group_capacity"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "act_sf"
-        ],
-        [
-          "buffer",
-          "zero_buf"
-        ],
-        [
-          "scalar",
-          "zero_words"
-        ],
-        [
-          "scalar",
-          "num_rows_b"
-        ],
-        [
-          "scalar",
-          "act_cols"
-        ],
-        [
-          "scalar",
-          "act_sf_cols"
-        ],
-        [
-          "scalar",
-          "g1_geom"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d361400c67a0bbae0a906ab77445eceaaaa3552fb0e8b17e3f1d344d70eda63a",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 122837,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c74665305c56a5c975aa_kernel.py",
-          "sha256": "61e388e15e43a88b26298022b69fe347c4af34b948eed7a6a9af44e423fda4b2"
-        },
-        {
-          "bytes": 8237,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c74665305c56a5c975aa_binding.py",
-          "sha256": "7599a672d2bde8a7b12165554cd0012b03ee065ba69dc40b55aba00a0eac21de"
-        }
-      ],
-      "closure_sha256": "767b006bb7fd958dc79445fb67720f8d6ba63270f5726ee213f02ca2856416e3",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_c74665305c56a5c975aa",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 216064,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_c74665305c56a5c975aa_sm_103a",
-      "name": "cake_mxfp4_situ_moe_c74665305c56a5c975aa",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "nrec_epilogue",
-          "nst_epilogue",
-          "acc_stage",
-          "tile_stage",
-          "meta_alpha",
-          "rec_m_tile",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "nrec_mma",
-          "nst_mma",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "nrec_tma",
-          "nst_tma",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "sb_nbase",
-          "sb_it",
-          "sb_rg",
-          "sb_ok",
-          "sb_rgs",
-          "sb_lk",
-          "sb_lkl",
-          "sb_prow",
-          "_phase_tile_free",
-          "nrec_gather",
-          "nst_gather",
-          "stage_1",
-          "tile_stage_4",
-          "_phase_tile_full_3",
-          "_phase_ab_free_1"
-        ],
-        "form": {
-          "ab_tx_bytes": 17408,
-          "acc_cols": 32,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "cta_v": 1,
-          "epi_n": 8,
-          "gate": "e2e_registry",
-          "hold_meta": false,
-          "is_situ": false,
-          "k_stage": 128,
-          "kbps": 4,
-          "kind": "gemm2_swapab_partial",
-          "kt": 1,
-          "late_dep_wait": true,
-          "m_group": 2,
-          "n_tile": 8,
-          "num_ab_stage": 6,
-          "num_gather_warps": 1,
-          "partial": true,
-          "pdl_trigger_after_wait": false,
-          "plan_selected": true,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_partial_n8_m2",
-          "row_tma": false,
-          "sched_chunk_major": false,
-          "sched_m_block": 1,
-          "smem_bytes": 215040,
-          "threads": 256,
-          "use_pdl": true,
-          "weight_l2_hint": true
-        },
-        "source_identity": "c74665305c56a5c975aa67cbf8999940b50d4b23852bbb2deee7f1d804704096",
-        "stage": "gemm2_swapab_partial_n8_m2",
-        "template": "gemm2_swapab_partial_n8_m2"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "96deaf722d18db7a9fbcaa1eda5031c143589f584371c0b1ed74ff2547bb7356",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c74665305c56a5c975aa_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_c74665305c56a5c975aa_kernel.py"
       }
     },
     {
@@ -40890,136 +36895,6 @@
       "arg_plan": [
         [
           "buffer",
-          "src"
-        ],
-        [
-          "buffer",
-          "dst"
-        ],
-        [
-          "scalar",
-          "rows"
-        ],
-        [
-          "scalar",
-          "num_tokens"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "2b74cc4cbfba2a75b3d1d0d3b0e44e3e5f3bdff43608c3aca3fafd34a2b40c8b",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 5053,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_kernel.py",
-          "sha256": "07ef621169d549910b342bf8a84e629fdb13d2e6d33f77fe085098d3114a03b2"
-        },
-        {
-          "bytes": 2180,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_binding.py",
-          "sha256": "08a35b37f523f70ed8f127fb9019fbce69ce412137a75461a90ef3e03fc62a99"
-        }
-      ],
-      "closure_sha256": "6f5580529f515c66f135cda7f79be012401863272499e0c914a2f7e36d007001",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 0,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": false
-      },
-      "module_ident": "cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_sm_103a",
-      "name": "cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [],
-        "form": {
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "gate": "e2e_registry",
-          "kind": "token_index",
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_token_index",
-          "threads": 256,
-          "top_k": 8,
-          "use_pdl": true
-        },
-        "source_identity": "ceb8a2793c57fecb43c57fbf8595e03cce161f795bb16ed42bbe8c2e3189e21a",
-        "stage": "token_index_top8",
-        "template": "kimi_k3_mxfp4_situ_token_index"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "61221bcaaf70ad818f91856c3d09721968baf083e51567ef90db942148d88ce9",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": false,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ceb8a2793c57fecb43c5_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
           "A"
         ],
         [
@@ -41441,9 +37316,9 @@
       },
       "closure": [
         {
-          "bytes": 208847,
+          "bytes": 209027,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py",
-          "sha256": "56813ec6ead85eb2f469c466c1428e9f29f049c375285702695571c51a0f3b4b"
+          "sha256": "1dda13f1b4b65e6a853378504b7721fc8abf7357b5d422a23bddd02711a97c12"
         },
         {
           "bytes": 8854,
@@ -41608,341 +37483,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d440250f695cbc9f1c43_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "ids_src"
-        ],
-        [
-          "buffer",
-          "weights_src"
-        ],
-        [
-          "buffer",
-          "ids_dst"
-        ],
-        [
-          "buffer",
-          "weights_dst"
-        ],
-        [
-          "buffer",
-          "output"
-        ],
-        [
-          "buffer",
-          "tile_expert"
-        ],
-        [
-          "buffer",
-          "tile_limit"
-        ],
-        [
-          "buffer",
-          "expanded"
-        ],
-        [
-          "buffer",
-          "permuted"
-        ],
-        [
-          "buffer",
-          "padded_total"
-        ],
-        [
-          "buffer",
-          "active_total"
-        ],
-        [
-          "buffer",
-          "wide_list"
-        ],
-        [
-          "buffer",
-          "wide_count"
-        ],
-        [
-          "buffer",
-          "narrow_list"
-        ],
-        [
-          "buffer",
-          "narrow_count"
-        ],
-        [
-          "buffer",
-          "all_list"
-        ],
-        [
-          "buffer",
-          "all_count"
-        ],
-        [
-          "buffer",
-          "wide_expert"
-        ],
-        [
-          "buffer",
-          "wide_limit"
-        ],
-        [
-          "buffer",
-          "chunk_counts"
-        ],
-        [
-          "scalar",
-          "num_routes"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "scalar",
-          "output_words"
-        ],
-        [
-          "scalar",
-          "num_experts"
-        ],
-        [
-          "scalar",
-          "local_experts"
-        ],
-        [
-          "scalar",
-          "local_offset"
-        ],
-        [
-          "scalar",
-          "tile_size"
-        ],
-        [
-          "scalar",
-          "narrow_tile"
-        ],
-        [
-          "scalar",
-          "wide_min_rows"
-        ],
-        [
-          "scalar",
-          "wide_min_permille"
-        ],
-        [
-          "scalar",
-          "wide_tile"
-        ],
-        [
-          "scalar",
-          "ids_stride0"
-        ],
-        [
-          "scalar",
-          "ids_stride1"
-        ],
-        [
-          "scalar",
-          "w_stride0"
-        ],
-        [
-          "scalar",
-          "w_stride1"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "84f9b952e94cd9543f2e21dac1192659a75671bd8186acc33f0edc99d2037f9c",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 72083,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d4e456c26269c9634d1b_kernel.py",
-          "sha256": "15062ce3b35a7f355f6295d23038d0e374ccddc5d68f2af74a5c8ee17d85c585"
-        },
-        {
-          "bytes": 6266,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d4e456c26269c9634d1b_binding.py",
-          "sha256": "7bb06ea74e9e89925a53ea29690654285040050ce6c55813fe99b65e6f4d5b21"
-        }
-      ],
-      "closure_sha256": "fc2dedfd2bc9d6f9356785b122119ad05461d33c1d61a33eabf43d1f5d6662bc",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_d4e456c26269c9634d1b",
-      "launch": {
-        "block": [
-          1024,
-          1,
-          1
-        ],
-        "cluster": [
-          8,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 16640,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": false
-      },
-      "module_ident": "cake_mxfp4_situ_moe_d4e456c26269c9634d1b_sm_103a",
-      "name": "cake_mxfp4_situ_moe_d4e456c26269c9634d1b",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "chunk",
-          "expert",
-          "rank",
-          "expert_1",
-          "rank_1",
-          "expert_2",
-          "rank_2",
-          "expert_3",
-          "rank_3",
-          "expert_4",
-          "rank_4",
-          "expert_5",
-          "rank_5",
-          "expert_6",
-          "rank_6",
-          "expert_7",
-          "rank_7",
-          "expert_8",
-          "rank_8",
-          "count",
-          "pre",
-          "total",
-          "pre_0",
-          "wide",
-          "nwide",
-          "acc",
-          "subtotal",
-          "acc_0",
-          "preceding",
-          "acc_10",
-          "subtotal_1",
-          "acc_0_1",
-          "preceding_18",
-          "ntiles",
-          "within_warp",
-          "acc_1",
-          "subtotal_2",
-          "acc_2",
-          "preceding_warps",
-          "row_base",
-          "wide_total",
-          "wide_base",
-          "wide_row0",
-          "acc_3",
-          "subtotal_3",
-          "acc_0_2",
-          "preceding_1",
-          "limit_w",
-          "wide_rows",
-          "acc_4",
-          "subtotal_4",
-          "acc_0_3",
-          "preceding_2",
-          "acc_10_1",
-          "subtotal_5",
-          "acc_0_4",
-          "preceding_18_1",
-          "effective_min",
-          "acc_23",
-          "subtotal_6",
-          "acc_0_5",
-          "preceding_31",
-          "acc_36",
-          "subtotal_7",
-          "acc_0_6",
-          "preceding_44",
-          "acc_49",
-          "subtotal_8",
-          "acc_0_7",
-          "preceding_57",
-          "limit"
-        ],
-        "form": {
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "chunk_routes": 1024,
-          "clear": true,
-          "cluster": 8,
-          "dispatch_lists": true,
-          "gate": "e2e_registry",
-          "kind": "routing",
-          "max_routes": 8192,
-          "mode": "packed",
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_routing_cluster8",
-          "single_tile_per_expert": false,
-          "smem_bytes": 16640,
-          "split_layout": false,
-          "staged_rows": 0,
-          "threads": 1024,
-          "use_pdl": true
-        },
-        "source_identity": "d4e456c26269c9634d1b19fffaedb49b847aabbbb87e43f11cbf91f93090303c",
-        "stage": "routing_cluster8",
-        "template": "kimi_k3_mxfp4_situ_routing"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "a8b45a9eb56a12d0a08cb6285fcec34b2bc7be374bd0e0a08e4de796937449de",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": false,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d4e456c26269c9634d1b_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d4e456c26269c9634d1b_kernel.py"
       }
     },
     {
@@ -42544,9 +38084,9 @@
       },
       "closure": [
         {
-          "bytes": 111634,
+          "bytes": 111814,
           "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_d7e5beb9121c9d91a86c_kernel.py",
-          "sha256": "a55f32be31f5ea0289fa860a21d515f69a5dd33bdc14c6f423f00f0a9f1e12c0"
+          "sha256": "7d63f9416cd95e72c512b00299217a0ea40722aeb950092c1dd806eb4eca9e9c"
         },
         {
           "bytes": 9137,
@@ -43055,270 +38595,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_da3b1d07a34de335619a_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_da3b1d07a34de335619a_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "num_n_tiles"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "f806ae6ebacb3b811bdd03804a9fcda962f91deb9785acb567a0894bb4fc05f6",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 91544,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_db71f2faa41b45521738_kernel.py",
-          "sha256": "61eedd87764d5c1fa08c3470e0081186f44a8c8b5c38a81dee8a18f580653ebe"
-        },
-        {
-          "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_db71f2faa41b45521738_binding.py",
-          "sha256": "5c50a46c26a79f8c958e2af4b7f4715eb65d5784f8bf37258a9cccd90f2645a2"
-        }
-      ],
-      "closure_sha256": "0d5b94f1daa86a739b20e9551bbdcd7b13b9850a38eda00873bc6ab5714e05c0",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_db71f2faa41b45521738",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 206976,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_db71f2faa41b45521738_sm_103a",
-      "name": "cake_mxfp4_situ_moe_db71f2faa41b45521738",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "acc_stage",
-          "tile_stage",
-          "meta_stage",
-          "_phase_tile_full",
-          "e_coord_m",
-          "e_coord_n",
-          "e_limit",
-          "_phase_meta_full",
-          "_phase_acc_full",
-          "reduce_row",
-          "sa",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "_phase_tile_free",
-          "tile_stage_4",
-          "meta_stage_1",
-          "_phase_tile_full_3",
-          "_phase_meta_free"
-        ],
-        "form": {
-          "a_mcast": false,
-          "a_offset": 0,
-          "a_part_bytes": 16384,
-          "a_part_rows": 128,
-          "a_stage_bytes": 16384,
-          "ab_free_count": 1,
-          "ab_tx_bytes": 25600,
-          "acc_buf_stride": 128,
-          "acc_cols": 256,
-          "acc_early_release_subtile": 1,
-          "b_offset": 81920,
-          "b_rows": 128,
-          "b_stage_bytes": 16384,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "c_offset": 168960,
-          "c_row_bytes": 272,
-          "c_stage_bytes": 34816,
-          "c_stages": 1,
-          "cluster_n": 1,
-          "cta_group": 1,
-          "epi_issue_all_warps": true,
-          "epi_issue_warps": 4,
-          "epi_pair": false,
-          "footer_dep_launch": true,
-          "gate": "e2e_registry",
-          "half_atoms_per_tile": 2,
-          "info_offset": 203776,
-          "kind": "gemm2_dense",
-          "mcast_mask": 1,
-          "meta_scale_offset": 204848,
-          "meta_tok_offset": 203824,
-          "n_tile": 128,
-          "num_ab_stage": 5,
-          "num_acc_stage": 2,
-          "overlap_acc": false,
-          "pdl_trigger_early": false,
-          "plan_selected": false,
-          "raster_along_m": false,
-          "raster_auto": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n128",
-          "row_group": false,
-          "sched_mode_offset": 205872,
-          "sfa_col": 256,
-          "sfa_offset": 163840,
-          "sfa_part_bytes": 512,
-          "sfa_part_d1": 4,
-          "sfa_stage_bytes": 512,
-          "sfb_atoms": 1,
-          "sfb_col": 260,
-          "sfb_offset": 166400,
-          "sfb_op_width": 4,
-          "sfb_shift_dynamic": false,
-          "sfb_stage_bytes": 512,
-          "sfb_width": 4,
-          "smem_bytes": 205872,
-          "two_cta": false,
-          "use_pdl": true,
-          "use_row_group": false
-        },
-        "source_identity": "db71f2faa41b45521738dbe29b5799c8fcb7e4b8c5090467d766804842552374",
-        "stage": "gemm2_dense_finalize_n128",
-        "template": "gemm2_dense_finalize_n128"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "2eeb113f71e43676b514929b0c4ab4cd09d87e4d4fa44b5c6d045cd5bc4a2046",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_db71f2faa41b45521738_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_db71f2faa41b45521738_kernel.py"
       }
     },
     {
@@ -45056,7 +40332,7 @@
           "num_acc_stage": 2,
           "overlap_acc": false,
           "pdl_trigger_early": false,
-          "plan_selected": false,
+          "plan_selected": true,
           "raster_along_m": "auto",
           "raster_auto": true,
           "registry": "kimi_k3_mxfp4_situ_gemm2_dense_n192_c12_rg_rauto",
@@ -45210,14 +40486,14 @@
       },
       "closure": [
         {
-          "bytes": 126249,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_kernel.py",
-          "sha256": "0b76b08f353ed0905aea29191d3a6e49334d8d92013c58290bef70317a0ea705"
+          "bytes": 126451,
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py",
+          "sha256": "ee6b42d379be618a0323eb9beec0e237bf124be48eaf7974ea9b2ccc221fa231"
         },
         {
           "bytes": 9138,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_binding.py",
-          "sha256": "f6059df5e8e21e0987a8377d421a95edcf3d50f7f20c575f2aac5f00ea7fe02a"
+          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_binding.py",
+          "sha256": "2124bc5a2ded8884c6f8cfa87788467da6e45349e59d0d844b6f9dbce62d4715"
         }
       ],
       "closure_sha256": "f23e2a7e33adfb81966af24adb4acef6462bdf038b96709d01ea50c2c37d1cf4",
@@ -45227,7 +40503,7 @@
         "--gpu-arch=sm_103a"
       ],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_e1933c9307851db41e03",
+      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_6a021d55b7aaa069c148",
       "launch": {
         "block": [
           256,
@@ -45376,9 +40652,9 @@
       "specializations": {},
       "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_binding.py",
+        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_binding.py",
         "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_e1933c9307851db41e03_kernel.py"
+        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_6a021d55b7aaa069c148_kernel.py"
       }
     },
     {
@@ -46010,288 +41286,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ea96c4c8eb07264a9fd4_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_ea96c4c8eb07264a9fd4_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "A"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_expert_idx"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_mn_limit"
-        ],
-        [
-          "buffer",
-          "num_non_exiting_tiles"
-        ],
-        [
-          "buffer",
-          "tile_idx_to_row_group"
-        ],
-        [
-          "buffer",
-          "alpha"
-        ],
-        [
-          "buffer",
-          "permuted_idx_to_expanded_idx"
-        ],
-        [
-          "buffer",
-          "token_final_scales"
-        ],
-        [
-          "scalar",
-          "num_m_tiles"
-        ],
-        [
-          "scalar",
-          "group_capacity"
-        ],
-        [
-          "scalar",
-          "k_tiles"
-        ],
-        [
-          "scalar",
-          "k_cols"
-        ],
-        [
-          "scalar",
-          "sf_cols"
-        ],
-        [
-          "scalar",
-          "out_cols"
-        ],
-        [
-          "scalar",
-          "top_k"
-        ],
-        [
-          "buffer",
-          "situ_beta"
-        ],
-        [
-          "buffer",
-          "situ_linear_beta"
-        ],
-        [
-          "buffer",
-          "act_sf"
-        ],
-        [
-          "buffer",
-          "zero_buf"
-        ],
-        [
-          "scalar",
-          "zero_words"
-        ],
-        [
-          "scalar",
-          "num_rows_b"
-        ],
-        [
-          "scalar",
-          "act_cols"
-        ],
-        [
-          "scalar",
-          "act_sf_cols"
-        ],
-        [
-          "scalar",
-          "g1_geom"
-        ],
-        [
-          "buffer",
-          "dbg"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d361400c67a0bbae0a906ab77445eceaaaa3552fb0e8b17e3f1d344d70eda63a",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 245129,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_eb7248d0be17c99499e0_kernel.py",
-          "sha256": "37ca6893da7cee58438ca6a9c13bd4ac8b5cb591f3ee691e56a25a5f9b5e6b92"
-        },
-        {
-          "bytes": 8892,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_eb7248d0be17c99499e0_binding.py",
-          "sha256": "3e3221b9f0723a3c381d695a869506f3f2b1e5ade7680a99f830535492b22eae"
-        }
-      ],
-      "closure_sha256": "74c50eed1911e108e9c332bca4653611a413fa5a273256d175c86c86cc5c035d",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_eb7248d0be17c99499e0",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 220672,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": true
-      },
-      "module_ident": "cake_mxfp4_situ_moe_eb7248d0be17c99499e0_sm_103a",
-      "name": "cake_mxfp4_situ_moe_eb7248d0be17c99499e0",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "nrec_epilogue",
-          "nst_epilogue",
-          "acc_stage",
-          "tile_stage",
-          "meta_alpha",
-          "_phase_tile_full",
-          "_phase_acc_full",
-          "nrec_mma",
-          "nst_mma",
-          "sa",
-          "sb",
-          "acc_stage_1",
-          "tile_stage_1",
-          "pha",
-          "ab_tok",
-          "_phase_tile_full_1",
-          "_phase_acc_free",
-          "nrec_tma",
-          "nst_tma",
-          "stage",
-          "tile_stage_2",
-          "_phase_tile_full_2",
-          "_phase_ab_free",
-          "tile_stage_3",
-          "_phase_tile_free",
-          "nrec_gather",
-          "nst_gather",
-          "stage_1",
-          "tile_stage_4",
-          "_phase_tile_full_3",
-          "_phase_ab_free_1"
-        ],
-        "form": {
-          "ab_tx_bytes": 25088,
-          "acc_cols": 256,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "cta_v": 1,
-          "epi_n": 32,
-          "gate": "e2e_registry",
-          "hold_meta": true,
-          "is_situ": false,
-          "k_stage": 128,
-          "kbps": 4,
-          "kind": "gemm2_swapab",
-          "kt": 1,
-          "late_dep_wait": false,
-          "m_group": 1,
-          "n_tile": 128,
-          "num_ab_stage": 6,
-          "num_gather_warps": 1,
-          "partial": false,
-          "pdl_trigger_after_wait": false,
-          "plan_selected": false,
-          "registry": "kimi_k3_mxfp4_situ_gemm2_swapab_n128",
-          "row_tma": true,
-          "sched_chunk_major": false,
-          "sched_m_block": 1,
-          "smem_bytes": 219648,
-          "threads": 256,
-          "use_pdl": true,
-          "weight_l2_hint": true
-        },
-        "source_identity": "eb7248d0be17c99499e0e094400a8597d4fdf81a5858945a594f4c033a81ddf4",
-        "stage": "gemm2_swapab_finalize_n128",
-        "template": "gemm2_swapab_finalize_n128"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "76653ca8eb7528ba5e41f1be212e8c285fe5284d22e371188a79da6be46561f8",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": true,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_eb7248d0be17c99499e0_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_eb7248d0be17c99499e0_kernel.py"
       }
     },
     {
@@ -48037,175 +43031,6 @@
         "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_f8ffa5365621d970babf_binding.py",
         "compile_separately": true,
         "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_f8ffa5365621d970babf_kernel.py"
-      }
-    },
-    {
-      "arch": "sm_103a",
-      "arg_plan": [
-        [
-          "buffer",
-          "rows"
-        ],
-        [
-          "buffer",
-          "perm"
-        ],
-        [
-          "buffer",
-          "weights"
-        ],
-        [
-          "buffer",
-          "out"
-        ],
-        [
-          "buffer",
-          "narrow_count"
-        ],
-        [
-          "buffer",
-          "wide_count"
-        ],
-        [
-          "scalar",
-          "chunks"
-        ],
-        [
-          "scalar",
-          "tasks"
-        ],
-        [
-          "scalar",
-          "narrow_tile"
-        ],
-        [
-          "scalar",
-          "wide_tile"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "arg_plan_sha256": "d0c63dd40205e5129b92f93878cc1da85476b37fb73a59e0b08925b4861d4548",
-      "binding_infrastructure": {
-        "runtime": "cutedsl_tvm_ffi",
-        "target_owned_headers": []
-      },
-      "closure": [
-        {
-          "bytes": 23894,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_kernel.py",
-          "sha256": "a95888c8e6fdc0c4fdbc6336b8e5bfc7865b73f6530785c13c5540e005844b60"
-        },
-        {
-          "bytes": 3059,
-          "path": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_binding.py",
-          "sha256": "62ac6a8ec3db8f047ae548c1dad34216d4228f064613e4baa3e37c936975a307"
-        }
-      ],
-      "closure_sha256": "4781223396aa202ec89824c2c5320bff4c48dc4e914fbe860ae3269aca778c5d",
-      "compile_flags": [
-        "--enable-tvm-ffi",
-        "--ptxas-options=--opt-level=2",
-        "--gpu-arch=sm_103a"
-      ],
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b",
-      "launch": {
-        "block": [
-          256,
-          1,
-          1
-        ],
-        "cluster": [
-          1,
-          1,
-          1
-        ],
-        "cluster_scheduling_policy": "spread",
-        "cooperative": false,
-        "dynamic_smem_bytes": 0,
-        "max_persistent_clusters": null,
-        "persistent_ctas_per_sm": 1,
-        "use_pdl": false
-      },
-      "module_ident": "cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_sm_103a",
-      "name": "cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b",
-      "noncontiguous_tensors": [],
-      "role": "kernel",
-      "route": {
-        "cutedsl_mutable_state": [
-          "wide_row0",
-          "has_wide",
-          "active",
-          "row",
-          "row_1",
-          "row_2",
-          "row_3",
-          "row_4",
-          "row_5",
-          "row_6",
-          "row_7"
-        ],
-        "form": {
-          "accumulate": false,
-          "backends": [
-            "cuda_cpp",
-            "cutedsl"
-          ],
-          "expanded_rows": false,
-          "gate": "e2e_registry",
-          "kind": "finalize",
-          "plan_selected": true,
-          "registry": "kimi_k3_mxfp4_situ_finalize_rows",
-          "skip_wide": false,
-          "threads": 256,
-          "top_k": 8,
-          "use_pdl": true
-        },
-        "source_identity": "fae0d0c1bc23d66c853b98b40fb4b36c500c85a3413bb9f1edd9f26d996a67b5",
-        "stage": "finalize_top8",
-        "template": "kimi_k3_mxfp4_situ_finalize_rows"
-      },
-      "source_build": {
-        "backend": "cutedsl",
-        "compile_options": [
-          "--enable-tvm-ffi",
-          "--ptxas-options=--opt-level=2",
-          "--gpu-arch=sm_103a"
-        ],
-        "cooperative": false,
-        "entry": "run",
-        "kind": "production_kernel_factory",
-        "lowering_policies": {
-          "preserve_full_role_guard": "false",
-          "ptxas_opt_level": "2"
-        },
-        "persistent_ctas_per_sm": 1,
-        "physical_schedule": "resolved_final_ir",
-        "schedule_identity": "cb5f52f08701712c824777bbf6a7e3e8fff9aefd8ac377bc030febd90b00637f",
-        "source_arch": "sm_103a",
-        "source_cluster_scheduling_policy": "spread",
-        "source_tma_abi": "grid_constant",
-        "specializations": {},
-        "use_pdl": false,
-        "validate": true
-      },
-      "specializations": {},
-      "tma_abi": "grid_constant",
-      "translation_units": {
-        "binding": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_binding.py",
-        "compile_separately": true,
-        "device": "csrc/fused_moe/cake_mxfp4_situ_moe/cute/sm_103a/cake_mxfp4_situ_moe_fae0d0c1bc23d66c853b_kernel.py"
       }
     },
     {
