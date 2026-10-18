@@ -32,9 +32,11 @@ PREPARED_EXPORTS = ("run", "run_prepare_tma", "run_prepared")
 def test_every_module_has_one_binding_row_and_one_kernel_source():
     assert sorted(BINDINGS) == sorted(cake_kda_tf32.MODULES)
     for record in cake_kda_tf32.MODULES.values():
-        assert [Path(path).name for path in record["sources"]] == [
-            f"{record['cache_name']}_kernel.cu"
-        ]
+        # The fold test pins which body a module compiles.
+        (source,) = record["sources"]
+        assert re.fullmatch(
+            r"csrc/kda/(bf16|tf32)/cake_kda_\1_[0-9a-f]{64}_kernel\.cu", source
+        ), source
 
 
 def test_bindings_render_to_the_pinned_text():
@@ -108,7 +110,7 @@ def test_spec_lists_the_kernel_body_and_the_rendered_binding(
         spec = cake_kda_tf32.spec(name, arch)
         assert spec.name == f"{record['cache_name']}_{arch}"
         kernel, binding = spec.sources
-        assert kernel.name == f"{record['cache_name']}_kernel.cu"
+        assert kernel.name == Path(record["sources"][0]).name
         assert kernel.is_file()
         assert binding == tmp_path / spec.name / f"{record['cache_name']}_binding.cu"
         assert binding.read_text(encoding="utf-8") == cake_kda_tf32.render_binding(name)
