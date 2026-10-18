@@ -50,6 +50,7 @@ from .jit.attention.modules import (
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
+from .jit.cake_fp4_allreduce import gen_cake_fp4_allreduce_aot_modules
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
@@ -1039,6 +1040,13 @@ def gen_all_modules(
             jit_specs.append(gen_moe_alltoall_module("sm100a"))
         if has_sm103a_exact:
             jit_specs.append(gen_moe_alltoall_module("sm103a"))
+        # Cake NVFP4-transport tensor-parallel all-reduce: exact-architecture
+        # programs, one module per (program, exact target); never a family
+        # target.
+        if has_sm100a_exact:
+            jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_100a"))
+        if has_sm103a_exact:
+            jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_103a"))
         # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
         # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
         if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:
