@@ -418,8 +418,8 @@ GPC-clock Mcycles per call) the context kernel measured:
 | --- | ---: | ---: |
 | Per-tensor FP8 (no Sage) | 162 | 261 |
 | Sage, 16-token K blocks | 169 | 252 |
-| Sage, 4-token K blocks | 209 | 295 |
-| Sage, 1-token K blocks | 229 | 332 |
+| Sage, 4-token K blocks | 202 | 278 |
+| Sage, 1-token K blocks | 204 | 300 |
 
 The decode kernel's dense Sage plan on the same layer takes 202, 220 and 260
 Mcycles on GB300 for the three block sizes.

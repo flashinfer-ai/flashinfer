@@ -2293,6 +2293,17 @@ def create_softmax_task(
                 sp.store_p()
                 pb.commit()
                 return p_chunk
+            if use_sage:
+                # The scores carry sfK already; sfQ joins the exp2 scale.
+                p_chunk = sp.sage_dequantized_exp2_p_smem(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
             if p_in_smem:
                 # The S stage is released already, so exp2 and the P store are
                 # auxiliary work on the loaded S and the SMEM P tile.
@@ -2332,7 +2343,7 @@ def create_softmax_task(
             def load_sage_k_scales(section: FmhaStage) -> Any:
                 """Obtain the K tile's ``sfK`` before the wait for its scores.
 
-                Register scales and multipliers load from the prepared
+                Register block scales and words load from the prepared
                 buffer, so the wait hides their latency; staged words wait
                 for the load warp's ring stage and take its offset."""
                 if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
@@ -2340,10 +2351,8 @@ def create_softmax_task(
                         sage_k_first_atom=sage_k_first_atom, section=section
                     )
                 if sage_mode is SageSoftmaxMode.HOISTED:
-                    return sp.load_sage_k_multipliers(
-                        sage_q_scale=sage_q_scale,
-                        sage_k_first_atom=sage_k_first_atom,
-                        section=section,
+                    return sp.load_sage_k_words(
+                        sage_k_first_atom=sage_k_first_atom, section=section
                     )
                 skr.wait()
                 return skr.open_stage()
@@ -2362,7 +2371,10 @@ def create_softmax_task(
                     )
                 if sage_mode is SageSoftmaxMode.HOISTED:
                     return sp.sage_dequantized_row_max(
-                        row_max=row_max, sage_k_multipliers=k_scales, section=section
+                        row_max=row_max,
+                        sage_q_scale=sage_q_scale,
+                        sage_k_words=k_scales,
+                        section=section,
                     )
                 maxima = sp.sage_staged_row_max(
                     row_max=row_max,
