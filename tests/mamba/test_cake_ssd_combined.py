@@ -4467,10 +4467,11 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
     assert _host_run_arguments(template, "preprocess") == module._PREPROCESS_ARGS
     assert _host_run_arguments(template, "main") == module._MAIN_ARGS_START
     assert "if (preprocess_grid_x != 0)" not in template
-    # The fused and the exactpre families bind the 41 start arguments followed
-    # by the three inputs the fused kernel takes over from the preprocess; the
-    # exactpre template differs from the fused one only by its mandatory
-    # preprocess stage.
+    # The fused template serves the exactfused, exactone and exactpre
+    # families: all bind the 41 start arguments followed by the three inputs
+    # the fused kernel takes over from the preprocess.  Its preprocess stage
+    # runs when the grid is nonzero; the loader zeroes that grid only for the
+    # exactfused / exactone programs, so the exactpre programs always run it.
     fused_template = (
         module._source_dir() / module._EXACTFUSED_HOST_TEMPLATE
     ).read_text(encoding="utf-8")
@@ -4487,20 +4488,8 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
         "metadata_from_cu_seqlens",
         "preprocess_status",
     )
-    exactpre_template = (
-        module._source_dir() / module._EXACTPRE_HOST_TEMPLATE
-    ).read_text(encoding="utf-8")
-    assert (
-        _host_prepare_arguments(exactpre_template, "preprocess")
-        == module._PREPROCESS_ARGS
-    )
-    assert _host_prepare_arguments(exactpre_template, "main") == module._MAIN_ARGS
-    assert (
-        _host_run_arguments(exactpre_template, "preprocess") == module._PREPROCESS_ARGS
-    )
-    assert _host_run_arguments(exactpre_template, "main") == module._MAIN_ARGS
     assert "if (preprocess_grid_x != 0)" in fused_template
-    assert "if (preprocess_grid_x != 0)" not in exactpre_template
+    assert module._FAMILY_HOST["exactpre"][0] == module._EXACTFUSED_HOST_TEMPLATE
     assert module._PREPROCESS_ARGS[-1] == "preprocess_status"
     assert len(module._PREPROCESS_ARGS) == 27
     # The exactmeta template is the fused template with the 12-argument
@@ -4888,7 +4877,7 @@ def test_source_program_table_names_shipped_sources():
             module._CHUNKPAR_SMEM_BYTES,
         ),
         "exactpre": (
-            module._EXACTPRE_HOST_TEMPLATE,
+            module._EXACTFUSED_HOST_TEMPLATE,
             module._MAIN_ARGS,
             module._EXACTPRE_SMEM_BYTES,
         ),
@@ -5734,7 +5723,7 @@ def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
                     "exactfused": module._EXACTFUSED_HOST_TEMPLATE,
                     "exactmeta": module._EXACTMETA_HOST_TEMPLATE,
                     "exactone": module._EXACTFUSED_HOST_TEMPLATE,
-                    "exactpre": module._EXACTPRE_HOST_TEMPLATE,
+                    "exactpre": module._EXACTFUSED_HOST_TEMPLATE,
                 }[family]
             )
 

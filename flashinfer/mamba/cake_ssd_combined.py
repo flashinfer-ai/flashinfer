@@ -54,19 +54,17 @@ _DEVICE_DIR = Path("generated") / "device"
 # more (``_MAIN_ARGS_CHUNKPAR3``).
 # The start two-kernel exact-scan programs (``exact_*``: the retained files,
 # 41 main arguments ``_MAIN_ARGS_START``) keep their original launcher; the
-# fused programs (``exactfused_*``) have their own.
+# fused launcher serves ``exactfused_*``, ``exactone_*`` and the two-kernel
+# ``exactpre_*`` programs (44 main arguments ``_MAIN_ARGS``).  Its preprocess
+# stage runs when the preprocess grid is nonzero; the loader zeroes that grid
+# only for ``exactfused_*`` / ``exactone_*`` (``_plan``), so the ``exactpre_*``
+# programs always run the segment preprocess their scan reads.
 _HOST_TEMPLATE = Path("generated") / "host" / "mamba_ssd_combined_sequence.cpp"
 _EXACTFUSED_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_fused_sequence.cpp"
 )
 _CHUNKPAR_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel_sequence.cpp"
-)
-# The two-kernel exact-scan programs (``exactpre_*``, the start pre+scan form)
-# bind the same main arguments as the fused programs and always run their
-# preprocess stage.
-_EXACTPRE_HOST_TEMPLATE = (
-    Path("generated") / "host" / "mamba_ssd_combined_precomputed_sequence.cpp"
 )
 # The fused exact-scan programs of the seq_idx triple form without a trusted
 # caller ``seq_chunk_cumsum`` (``exactmeta_*``): the ``exactfused_*`` varlen
@@ -650,7 +648,7 @@ _FAMILY_HOST = {
     "exactmeta": (_EXACTMETA_HOST_TEMPLATE, _MAIN_ARGS, _EXACTFUSED_SMEM_BYTES),
     "exactone": (_EXACTFUSED_HOST_TEMPLATE, _MAIN_ARGS, _EXACTONE_SMEM_BYTES),
     "chunkpar": (_CHUNKPAR_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR, _CHUNKPAR_SMEM_BYTES),
-    "exactpre": (_EXACTPRE_HOST_TEMPLATE, _MAIN_ARGS, _EXACTPRE_SMEM_BYTES),
+    "exactpre": (_EXACTFUSED_HOST_TEMPLATE, _MAIN_ARGS, _EXACTPRE_SMEM_BYTES),
     "chunkpar3": (
         _CHUNKPAR3_HOST_TEMPLATE,
         _MAIN_ARGS_CHUNKPAR3,
