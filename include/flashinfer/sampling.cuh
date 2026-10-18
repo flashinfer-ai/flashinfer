@@ -84,6 +84,15 @@ __device__ __forceinline__ float ieee_div(float a, float b) {
     __VA_ARGS__                                                                \
   }
 
+#define DISPATCH_TOP_K_NUM_THREADS(compute_capacity, BLOCK_THREADS, ...) \
+  if (compute_capacity.first >= 9) {                                     \
+    constexpr uint32_t BLOCK_THREADS = 1024;                             \
+    __VA_ARGS__                                                          \
+  } else {                                                               \
+    constexpr uint32_t BLOCK_THREADS = 512;                              \
+    __VA_ARGS__                                                          \
+  }
+
 #define DISPATCH_SOFTMAX_CACHE_INPUT(cache_input, CACHE_INPUT, ...) \
   if (cache_input) {                                                \
     constexpr bool CACHE_INPUT = true;                              \
@@ -1550,7 +1559,7 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
-  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+  DISPATCH_TOP_K_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
