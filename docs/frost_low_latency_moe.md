@@ -198,6 +198,42 @@ quantization and routing selection are excluded. Check A/A and cross-process
 stability before interpreting a small difference. These are kernel GPU times
 at model-relevant shapes, not model throughput measurements.
 
+## Individual-call B300 latency
+
+These paired measurements bracket each complete call with external events
+inside a CUDA Graph. They are separate from the historical amortized table
+below. H/I/E/K denotes hidden size, physical intermediate size, expert count
+and top-k. The current matrix uses H=2048, I=512, E=512 and K=10 unless shown
+otherwise; rows with failed controls are omitted. These results qualify the
+stated capture configuration. Alternate graph granularities remain under
+investigation; no unqualified timing-method change is included.
+
+| H / I / E / K | Weights | T | Cache / expert sets | Best original | Original µs | Frost µs | Speedup |
+|---|---|---:|---|---|---:|---:|---:|
+| 2048 / 512 / 512 / 10 | MXFP8 | 1 | warm / disjoint | trtllm_default | 23.68 | 13.44 | 1.762×† |
+| 2048 / 512 / 512 / 10 | MXFP8 | 2 | warm / disjoint | trtllm_default | 27.74 | 17.55 | 1.581× |
+| 2048 / 512 / 512 / 10 | MXFP8 | 4 | warm / disjoint | trtllm | 42.08 | 31.86 | 1.321× |
+| 2048 / 512 / 512 / 10 | MXFP4 | 8 | warm / disjoint | cute_dsl | 45.86 | 38.02 | 1.206× |
+| 2048 / 512 / 512 / 10 | MXFP8 | 8 | warm / disjoint | trtllm | 62.52 | 54.22 | 1.153×† |
+| 2048 / 512 / 512 / 10 | MXFP4 | 1 | cold / disjoint | cute_dsl | 26.62 | 18.43 | 1.444×† |
+| 2048 / 512 / 512 / 10 | MXFP4 | 4 | cold / shared | cute_dsl | 22.53 | 22.54 | 1.000× |
+| 2048 / 512 / 512 / 10 | MXFP8 | 4 | cold / shared | trtllm | 30.72 | 24.58 | 1.250× |
+| 2048 / 512 / 512 / 10 | MXFP4 | 4 | cold / disjoint | cute_dsl | 36.88 | 30.72 | 1.201× |
+| 2048 / 512 / 512 / 10 | MXFP8 | 4 | cold / disjoint | trtllm | 51.20 | 40.96 | 1.250× |
+
+The original set includes tuned and default TRT-LLM, plus native CuTe DSL for
+MXFP4. All selected Frost tactics in this table use Tensor Cores. † The displayed
+pair passed; another candidate had unstable timing. Values close to 1× indicate
+parity, not a meaningful gain. Cold shared-expert cases demonstrate why a native
+fallback remains necessary.
+
+B300/SM103, PyTorch 2.13.0+cu130, CUDA 13.0, CuTe DSL 4.8.0, FI base
+`3184bbea`. The corrected device kernels match the current implementation;
+tactics were explicitly retuned and pinned with benchmark source `bed1b997e`.
+The subsequent production dispatcher fixes are validated separately. See the
+[results and control metrics](frost_low_latency_b300_latency.json) for exact
+tactics, cache policy, numerical tolerances and excluded cases.
+
 ## Historical B300 performance: amortized warm replay
 
 Single B300/SM103, FlashInfer 0.7.2 at base `3184bbea`, PyTorch 2.13.0+cu130,

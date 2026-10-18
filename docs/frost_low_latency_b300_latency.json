@@ -1,0 +1,2310 @@
+{
+  "scope": "Individual-call warm/cold CUDA Graph GPU latency for complete public routed MoE. Excludes cache eviction, input quantization, routing selection, shared experts, communication, attention, and host submission. Not serving/model throughput.",
+  "benchmark_source_commit": "bed1b997e6f63885a3f6e52f4a4ddac445247db6",
+  "kernel_note": "Device kernels match the current common-cache-policy commit 4ef610c13; production tuning changes postdate this matrix. Every reported tactic was independently retuned and pinned by the latency benchmark.",
+  "method": "Six changing-input graph checks plus post-timing reference checks; independent normal/reverse processes; 16 event-delimited calls per graph; two sweeps of nine timed replays per backend. Show only selected pairs passing repeat, cross-process, native A/A, and same-tactic controls within 1%. A stable selected pair does not imply all other candidate timings were stable.",
+  "cold_cache": "Read/write sweep of at least 512 MiB and twice queried L2 before every measured call, outside events.",
+  "numerics": "Same canonical quantized weights, activation and routing inputs. Packed Frost/TRT narrows routing weights to BF16; native CuTe keeps FP32. Relative L2 < 1%, normalized max < 3%; not bitwise identity.",
+  "cases": [
+    {
+      "status": "admitted_selected_public_pair",
+      "all_variants_stable": false,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 25.71200020611286,
+        "frost": 13.439999893307686,
+        "trtllm_default": 23.679999634623528,
+        "frost_tc128": 14.408000046387315,
+        "frost_tc256": 13.439999893307686,
+        "frost_ffma": 27.748000575229526
+      },
+      "best_original_backend": "trtllm_default",
+      "speedup": 1.7619047487057458,
+      "baseline_aa": [
+        0.0012453394909258027,
+        0.0012453394909258027
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "frost": 0.0,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.003337034170777974,
+        "frost_tc256": 0.0,
+        "frost_ffma": 0.0002883360377180261
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0012453394909258027,
+          "frost": 0.0,
+          "trtllm_default": 0.0006761376843016336,
+          "frost_tc128": 0.05542723582107449,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0011547431815540597
+        },
+        {
+          "frost_ffma": 0.0005766720754360522,
+          "frost_tc256": 0.002380970529599635,
+          "frost_tc128": 0.032402221048241274,
+          "trtllm_default": 0.0,
+          "frost": 0.0,
+          "trtllm": 0.0012453394909258027
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 8)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 8)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0009509707529233982,
+          12.152106585839359,
+          105.00477004858526,
+          0.0009480947731203093,
+          11.820557454339129,
+          109.89113374022162
+        ],
+        [
+          0.0009509707529233982,
+          12.152106585839359,
+          105.00477004858526,
+          0.0009480947731203093,
+          11.820557454339129,
+          109.89113374022162
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm_default",
+          "speedup": 1.7619047487057458,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm_default",
+          "speedup": 1.6435313408095864,
+          "stable": false
+        },
+        "frost_tc256": {
+          "original": "trtllm_default",
+          "speedup": 1.7619047487057458,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm_default",
+          "speedup": 0.853394808408737,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.0
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 25.71200020611286,
+          "frost": 13.439999893307686,
+          "trtllm_default": 23.679999634623528,
+          "frost_tc128": 14.384000096470118,
+          "frost_tc256": 13.439999893307686,
+          "frost_ffma": 27.744000777602196
+        },
+        {
+          "frost_ffma": 27.752000372856855,
+          "frost_tc256": 13.439999893307686,
+          "frost_tc128": 14.431999996304512,
+          "trtllm_default": 23.679999634623528,
+          "frost": 13.439999893307686,
+          "trtllm": 25.71200020611286
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 1,
+        "cache_mode": "warm",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 8)",
+        "cute_tactic": null,
+        "frost_tile_k": 256,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "ee07346d1f3a152da5e2b0adeccc660661b089e703fec39eefc101124cb92476",
+        "a8801257bc88db7212400f238477c335086263a3a5ff0b85d773a0f823f5ef8b"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t1-warm-disjoint"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 29.791999608278275,
+        "frost": 17.547999508678913,
+        "trtllm_default": 27.744000777602196,
+        "frost_tc128": 17.535999417304993,
+        "frost_tc256": 19.567999988794327,
+        "frost_ffma": 37.991998717188835
+      },
+      "best_original_backend": "trtllm_default",
+      "speedup": 1.5810349643491004,
+      "baseline_aa": [
+        0.0005370610245123655,
+        0.0005373496140466066
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "frost": 0.001368623605459114,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.0,
+        "frost_tc256": 0.0016366736846116473,
+        "frost_ffma": 0.00042123321392998134
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0005370610245123655,
+          "frost": 0.0009124157369727427,
+          "trtllm_default": 0.0005766720754360522,
+          "frost_tc128": 0.0,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0008424664278599627,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0,
+          "trtllm_default": 0.0,
+          "frost": 0.0018248314739454854,
+          "trtllm": 0.0005373496140466066
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 126)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 126)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(2, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0012946743825492729,
+          14.445175980078757,
+          149.07855292381586,
+          0.0012695772365477088,
+          14.379349047935085,
+          200.9788940368043
+        ],
+        [
+          0.0012946743825492729,
+          14.445175980078757,
+          149.07855292381586,
+          0.0012695772365477088,
+          14.379349047935085,
+          200.9788940368043
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm_default",
+          "speedup": 1.5810349643491004,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm_default",
+          "speedup": 1.5821168852357326,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "trtllm_default",
+          "speedup": 1.4178250609919194,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm_default",
+          "speedup": 0.730259047020074,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.001368623605459114
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 29.791999608278275,
+          "frost": 17.535999417304993,
+          "trtllm_default": 27.744000777602196,
+          "frost_tc128": 17.535999417304993,
+          "frost_tc256": 19.58400011062622,
+          "frost_ffma": 37.98399865627289
+        },
+        {
+          "frost_ffma": 37.99999877810478,
+          "frost_tc256": 19.551999866962433,
+          "frost_tc128": 17.535999417304993,
+          "trtllm_default": 27.744000777602196,
+          "frost": 17.559999600052834,
+          "trtllm": 29.791999608278275
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 2,
+        "cache_mode": "warm",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 126)",
+        "cute_tactic": null,
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "114992b462ddd496aac01a9f4fcfaefc2ab59fc7ea44f326937e595c384d1b60",
+        "9f6dd5cf7cb70bbf324e79a475a4433e5e91e09ed43080cc05ab4b4ddaae8d46"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t2-warm-disjoint"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 42.080000042915344,
+        "frost": 31.86000045388937,
+        "trtllm_default": 42.080000042915344,
+        "frost_tc128": 31.844000332057476,
+        "frost_tc256": 35.83200089633465,
+        "frost_ffma": 60.54399907588959
+      },
+      "best_original_backend": "trtllm",
+      "speedup": 1.3207783880548674,
+      "baseline_aa": [
+        0.0007604620634779551,
+        0.0007604620634779551
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "frost": 0.00025113199427454137,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.00025125819221631955,
+        "frost_tc256": 0.0013404927541086856,
+        "frost_ffma": 0.0
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0007604620634779551,
+          "frost": 0.0010050327688652782,
+          "trtllm_default": 0.0003802310317389776,
+          "frost_tc128": 0.0005025163844326391,
+          "frost_tc256": 0.0008932626986807581,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0008936618360724572,
+          "frost_tc128": 0.0010050327688652782,
+          "trtllm_default": 0.0007604620634779551,
+          "frost": 0.0005022639885490827,
+          "trtllm": 0.0007604620634779551
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0020114322696128937,
+          24.69354188654628,
+          225.40047675641,
+          0.002119919583077581,
+          21.257276527028033,
+          237.04677406689987
+        ],
+        [
+          0.0020114322696128937,
+          24.69354188654628,
+          225.40047675641,
+          0.002119919583077581,
+          21.257276527028033,
+          237.04677406689987
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm",
+          "speedup": 1.3207783880548674,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm",
+          "speedup": 1.3214420174639065,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "trtllm",
+          "speedup": 1.1743692506778158,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm",
+          "speedup": 0.695031723790985,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0005025163844326391,
+        0.0005023901547905592
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 42.080000042915344,
+          "frost": 31.856000423431396,
+          "trtllm_default": 42.080000042915344,
+          "frost_tc128": 31.840000301599503,
+          "frost_tc256": 35.85600107908249,
+          "frost_ffma": 60.54399907588959
+        },
+        {
+          "frost_ffma": 60.54399907588959,
+          "frost_tc256": 35.80800071358681,
+          "frost_tc128": 31.84800036251545,
+          "trtllm_default": 42.080000042915344,
+          "frost": 31.864000484347343,
+          "trtllm": 42.080000042915344
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 4,
+        "cache_mode": "warm",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "-1",
+        "cute_tactic": null,
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "61577e0ca5eaa4bc11d8dfa8de2c23f4be75b9b92d3227227a52c53f8be91b6e",
+        "f83b370ddc1a2259edd080f7d5fd2378f5ae9accb34d778f0d90c14de5d63aa6"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t4-warm-disjoint"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 46.192001551389694,
+        "cute_dsl": 45.86399998515844,
+        "frost": 38.02399896085262,
+        "trtllm_default": 46.1760014295578,
+        "frost_tc128": 38.03999908268452,
+        "frost_tc256": 44.18000113219023,
+        "frost_ffma": 74.90399666130543
+      },
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.2061855995835011,
+      "baseline_aa": [
+        0.0006930059483951789,
+        0.0006930059483951789
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "cute_dsl": 0.00524658894759694,
+        "frost": 0.00042087863780742517,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.00042070157350224607,
+        "frost_tc256": 0.00018109518101296085,
+        "frost_ffma": 0.00021363120270984838
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0006930059483951789,
+          "cute_dsl": 0.0045550044659185985,
+          "frost": 0.0,
+          "trtllm_default": 0.00034650297419758946,
+          "frost_tc128": 0.0008417572756148503,
+          "frost_tc256": 0.0007246431828285717,
+          "frost_ffma": 0.0004273537015049318
+        },
+        {
+          "frost_ffma": 0.00021363120270984838,
+          "frost_tc256": 0.00036232159141428585,
+          "frost_tc128": 0.0008417572756148503,
+          "trtllm_default": 0.0006930059483951789,
+          "frost": 0.00042087863780742517,
+          "cute_dsl": 0.001044576205259346,
+          "trtllm": 0.0006930059483951789
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0027715853313780192,
+          33.476304178451464,
+          312.0042977474072,
+          0.002685567760527173,
+          36.23069880197509,
+          321.4817492160758
+        ],
+        [
+          0.0027715853313780192,
+          33.476304178451464,
+          312.0042977474072,
+          0.002685567760527173,
+          36.23069880197509,
+          321.4817492160758
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "cute_dsl",
+          "speedup": 1.2061855995835011,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "cute_dsl",
+          "speedup": 1.2056782621226545,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "cute_dsl",
+          "speedup": 1.03811676799033,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "cute_dsl",
+          "speedup": 0.6123037758925256,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.00042087863780742517,
+        0.00042070157350224607
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 46.192001551389694,
+          "cute_dsl": 45.744000002741814,
+          "frost": 38.015998899936676,
+          "trtllm_default": 46.1760014295578,
+          "frost_tc128": 38.03199902176857,
+          "frost_tc256": 44.1840011626482,
+          "frost_ffma": 74.89599660038948
+        },
+        {
+          "frost_ffma": 74.91199672222137,
+          "frost_tc256": 44.176001101732254,
+          "frost_tc128": 38.047999143600464,
+          "trtllm_default": 46.1760014295578,
+          "frost": 38.03199902176857,
+          "cute_dsl": 45.98399996757507,
+          "trtllm": 46.192001551389694
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 8,
+        "cache_mode": "warm",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp4",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "-1",
+        "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))",
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "d66c22e7ca48858154fbf411451cd1435bbcc2c8dbf82b2b3a267d933bf29915",
+        "a5b22388f46bf4e5bfc56a944e53722d064aa657f7c7cb8db1e9a306e881da27"
+      ],
+      "case": "mxfp4-h2048-i512-e512-k10-t8-warm-disjoint"
+    },
+    {
+      "status": "admitted_selected_public_pair",
+      "all_variants_stable": false,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 62.51999922096729,
+        "frost": 54.22399938106537,
+        "trtllm_default": 62.523999251425266,
+        "frost_tc128": 54.29199989885092,
+        "frost_tc256": 58.463999070227146,
+        "frost_ffma": 106.37999977916479
+      },
+      "best_original_backend": "trtllm",
+      "speedup": 1.1529949825648387,
+      "baseline_aa": [
+        0.0007678584294318438,
+        0.0015368969781635387
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0007680550152710915,
+        "frost": 0.0002951180838226745,
+        "trtllm_default": 0.0008960641844829401,
+        "frost_tc128": 0.00044215517378345476,
+        "frost_tc256": 0.0005474675110267108,
+        "frost_ffma": 0.009596496611332413
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0007678584294318438,
+          "frost": 0.0026595947797221843,
+          "trtllm_default": 0.0005117746294668274,
+          "frost_tc128": 0.0,
+          "frost_tc256": 0.0005473495601131911,
+          "frost_ffma": 0.012723408268217516
+        },
+        {
+          "frost_ffma": 0.017719212449200307,
+          "frost_tc256": 0.0008216351508833088,
+          "frost_tc128": 0.0011792542678811292,
+          "trtllm_default": 0.0010245979854423591,
+          "frost": 0.0017725393824271946,
+          "trtllm": 0.0015368969781635387
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 862)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 862)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(8, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0025354460717182067,
+          32.09368779534765,
+          331.60090806693137,
+          0.0027022199841027273,
+          35.46725072705477,
+          345.44514421050076
+        ],
+        [
+          0.0025354460717182067,
+          32.09368779534765,
+          331.60090806693137,
+          0.0027022199841027273,
+          35.46725072705477,
+          345.44514421050076
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm",
+          "speedup": 1.1529949825648387,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm",
+          "speedup": 1.1515508608532676,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "trtllm",
+          "speedup": 1.0693760299542299,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm",
+          "speedup": 0.5877044496216688,
+          "stable": false
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0013276395667570868,
+        0.001180472335290698
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 62.543999403715134,
+          "frost": 54.231999441981316,
+          "trtllm_default": 62.55199946463108,
+          "frost_tc128": 54.30399999022484,
+          "frost_tc256": 58.479998260736465,
+          "frost_ffma": 105.87199963629246
+        },
+        {
+          "frost_ffma": 106.88799992203712,
+          "frost_tc256": 58.44799987971783,
+          "frost_tc128": 54.279999807477,
+          "trtllm_default": 62.49599903821945,
+          "frost": 54.21599932014942,
+          "trtllm": 62.49599903821945
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 8,
+        "cache_mode": "warm",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 862)",
+        "cute_tactic": null,
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "06fbe873b05b1736e73f2c1c9becbe0569265327ee89c31ea5d992a13e8e860d",
+        "349be7b7ef23db47388e3f12b5568d69cb6c20307038e04beec69a075905ba09"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t8-warm-disjoint"
+    },
+    {
+      "status": "admitted_selected_public_pair",
+      "all_variants_stable": false,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 30.719999223947525,
+        "cute_dsl": 26.623999699950218,
+        "frost": 18.432000651955605,
+        "trtllm_default": 28.672000393271446,
+        "frost_tc128": 18.47200025804341,
+        "frost_tc256": 18.432000651955605,
+        "frost_ffma": 22.52800017595291
+      },
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.4444443770744688,
+      "baseline_aa": [
+        0.0005208373123727541,
+        0.0
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "cute_dsl": 0.0,
+        "frost": 0.0,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.0043402348820511735,
+        "frost_tc256": 0.0,
+        "frost_ffma": 0.0
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0005208373123727541,
+          "cute_dsl": 0.0,
+          "frost": 0.0,
+          "trtllm_default": 0.0,
+          "frost_tc128": 0.10398611490111002,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0,
+          "trtllm_default": 0.0,
+          "frost": 0.0,
+          "cute_dsl": 0.0,
+          "trtllm": 0.0
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 256), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 256), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(1, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0011404986286472464,
+          10.727130170414462,
+          103.91420343453805,
+          0.0008924457850750187,
+          9.149463110844392,
+          116.37561622214892
+        ],
+        [
+          0.0011404986286472464,
+          10.727130170414462,
+          103.91420343453805,
+          0.0008924457850750187,
+          9.149463110844392,
+          116.37561622214892
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "cute_dsl",
+          "speedup": 1.4444443770744688,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "cute_dsl",
+          "speedup": 1.441316550889345,
+          "stable": false
+        },
+        "frost_tc256": {
+          "original": "cute_dsl",
+          "speedup": 1.4444443770744688,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "cute_dsl",
+          "speedup": 1.1818181592687267,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.0
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 30.719999223947525,
+          "cute_dsl": 26.623999699950218,
+          "frost": 18.432000651955605,
+          "trtllm_default": 28.672000393271446,
+          "frost_tc128": 18.511999864131212,
+          "frost_tc256": 18.432000651955605,
+          "frost_ffma": 22.52800017595291
+        },
+        {
+          "frost_ffma": 22.52800017595291,
+          "frost_tc256": 18.432000651955605,
+          "frost_tc128": 18.432000651955605,
+          "trtllm_default": 28.672000393271446,
+          "frost": 18.432000651955605,
+          "cute_dsl": 26.623999699950218,
+          "trtllm": 30.719999223947525
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 1,
+        "cache_mode": "cold",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp4",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "-1",
+        "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 256), (1, 1), False))",
+        "frost_tile_k": 256,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "a052f8148e853dbe497d10453ac8796edcf2258a44ee2b5136e2a82665ba2df7",
+        "e4934e462b3e4137b5b888217f7190ff2d97d27785009eb7cf09299b0a699411"
+      ],
+      "case": "mxfp4-h2048-i512-e512-k10-t1-cold-disjoint"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 30.719999223947525,
+        "cute_dsl": 22.52800017595291,
+        "frost": 22.53600023686886,
+        "trtllm_default": 30.719999223947525,
+        "frost_tc128": 22.52800017595291,
+        "frost_tc256": 28.672000393271446,
+        "frost_ffma": 45.05600035190582
+      },
+      "best_original_backend": "cute_dsl",
+      "speedup": 0.9996450097252458,
+      "baseline_aa": [
+        0.0,
+        0.0
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "cute_dsl": 0.0,
+        "frost": 0.0007102326752009239,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.0,
+        "frost_tc256": 0.0,
+        "frost_ffma": 0.0
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0,
+          "cute_dsl": 0.0,
+          "frost": 0.0,
+          "trtllm_default": 0.0,
+          "frost_tc128": 0.0,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0007102326752009239,
+          "trtllm_default": 0.0,
+          "frost": 0.0007102326752009239,
+          "cute_dsl": 0.0,
+          "trtllm": 0.0
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 5)"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 5)"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0019364996647817856,
+          23.935220175414802,
+          233.5234345238611,
+          0.0017983252404496996,
+          22.35786682585714,
+          209.5225710732594
+        ],
+        [
+          0.0019364996647817856,
+          23.935220175414802,
+          233.5234345238611,
+          0.0017983252404496996,
+          22.35786682585714,
+          209.5225710732594
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "cute_dsl",
+          "speedup": 0.9996450097252458,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "cute_dsl",
+          "speedup": 1.0,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "cute_dsl",
+          "speedup": 0.7857142810740066,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "cute_dsl",
+          "speedup": 0.5,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.0007102326752009239
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 30.719999223947525,
+          "cute_dsl": 22.52800017595291,
+          "frost": 22.52800017595291,
+          "trtllm_default": 30.719999223947525,
+          "frost_tc128": 22.52800017595291,
+          "frost_tc256": 28.672000393271446,
+          "frost_ffma": 45.05600035190582
+        },
+        {
+          "frost_ffma": 45.05600035190582,
+          "frost_tc256": 28.672000393271446,
+          "frost_tc128": 22.52800017595291,
+          "trtllm_default": 30.719999223947525,
+          "frost": 22.544000297784805,
+          "cute_dsl": 22.52800017595291,
+          "trtllm": 30.719999223947525
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 4,
+        "cache_mode": "cold",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "shared",
+        "weight_format": "mxfp4",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 5)",
+        "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))",
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "db3d651f4ebc005ef68faf2a560eec9c998488f5a57545db1a8b8da696fb8a3e",
+        "dc7eb6d7ec5603aa12877a6cf15d92ded6cc69777b49a1602728449324cab2f6"
+      ],
+      "case": "mxfp4-h2048-i512-e512-k10-t4-cold-shared"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 30.719999223947525,
+        "frost": 24.5840004645288,
+        "trtllm_default": 30.719999223947525,
+        "frost_tc128": 24.57600086927414,
+        "frost_tc256": 30.719999223947525,
+        "frost_ffma": 61.43999844789505
+      },
+      "best_original_backend": "trtllm",
+      "speedup": 1.2495931761908359,
+      "baseline_aa": [
+        0.0,
+        0.0
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "frost": 0.0006510087053798125,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.0,
+        "frost_tc256": 0.0,
+        "frost_ffma": 0.0
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0,
+          "frost": 0.0,
+          "trtllm_default": 0.0,
+          "frost_tc128": 0.0,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0006510087053798125,
+          "trtllm_default": 0.0005208373123727541,
+          "frost": 0.003255157213732763,
+          "trtllm": 0.0
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 1088)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 1088)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.002025431536709506,
+          22.52072070911474,
+          218.72722996769437,
+          0.0020657692543229883,
+          22.491969321457457,
+          256.3920051361785
+        ],
+        [
+          0.002025431536709506,
+          22.52072070911474,
+          218.72722996769437,
+          0.0020657692543229883,
+          22.491969321457457,
+          256.3920051361785
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm",
+          "speedup": 1.2495931761908359,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm",
+          "speedup": 1.2499999242087776,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "trtllm",
+          "speedup": 1.0,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm",
+          "speedup": 0.5,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.0006510087053798125
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 30.719999223947525,
+          "frost": 24.57600086927414,
+          "trtllm_default": 30.719999223947525,
+          "frost_tc128": 24.57600086927414,
+          "frost_tc256": 30.719999223947525,
+          "frost_ffma": 61.43999844789505
+        },
+        {
+          "frost_ffma": 61.43999844789505,
+          "frost_tc256": 30.719999223947525,
+          "frost_tc128": 24.57600086927414,
+          "trtllm_default": 30.719999223947525,
+          "frost": 24.59200005978346,
+          "trtllm": 30.719999223947525
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 4,
+        "cache_mode": "cold",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "shared",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 1088)",
+        "cute_tactic": null,
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "22294d1e8edcc09495619d6cc413c2e086fbca4acea4d738904b539cc6c2fade",
+        "f4f53695b9ad510cf0a644d21593a62abe4d92403bf3255f6a6451c990cf8717"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t4-cold-shared"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 43.007999658584595,
+        "cute_dsl": 36.8800014257431,
+        "frost": 30.719999223947525,
+        "trtllm_default": 40.95999896526337,
+        "frost_tc128": 30.719999223947525,
+        "frost_tc256": 34.81600061058998,
+        "frost_ffma": 47.10400104522705
+      },
+      "best_original_backend": "cute_dsl",
+      "speedup": 1.2005209100719507,
+      "baseline_aa": [
+        0.002237153555893506,
+        0.002237153555893506
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "cute_dsl": 0.0004339368962802414,
+        "frost": 0.0,
+        "trtllm_default": 0.0,
+        "frost_tc128": 0.0,
+        "frost_tc256": 0.0,
+        "frost_ffma": 0.0
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.002237153555893506,
+          "cute_dsl": 0.00043403106732736404,
+          "frost": 0.0,
+          "trtllm_default": 0.0,
+          "frost_tc128": 0.0,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0,
+          "trtllm_default": 0.0,
+          "frost": 0.0,
+          "cute_dsl": 0.0008680621346547281,
+          "trtllm": 0.002237153555893506
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "cute_dsl": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0019386739473432372,
+          23.535896371540634,
+          236.6130573871223,
+          0.001809818327119346,
+          22.329501858939206,
+          229.040382984265
+        ],
+        [
+          0.0019386739473432372,
+          23.535896371540634,
+          236.6130573871223,
+          0.001809818327119346,
+          22.329501858939206,
+          229.040382984265
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "cute_dsl",
+          "speedup": 1.2005209100719507,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "cute_dsl",
+          "speedup": 1.2005209100719507,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "cute_dsl",
+          "speedup": 1.0592831106087848,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "cute_dsl",
+          "speedup": 0.7829483824597545,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.0
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 43.007999658584595,
+          "cute_dsl": 36.872001364827156,
+          "frost": 30.719999223947525,
+          "trtllm_default": 40.95999896526337,
+          "frost_tc128": 30.719999223947525,
+          "frost_tc256": 34.81600061058998,
+          "frost_ffma": 47.10400104522705
+        },
+        {
+          "frost_ffma": 47.10400104522705,
+          "frost_tc256": 34.81600061058998,
+          "frost_tc128": 30.719999223947525,
+          "trtllm_default": 40.95999896526337,
+          "frost": 30.719999223947525,
+          "cute_dsl": 36.88800148665905,
+          "trtllm": 43.007999658584595
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 4,
+        "cache_mode": "cold",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp4",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": true,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "-1",
+        "cute_tactic": "(128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False))",
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "5fc14e95ccd610efd3601793944759e7678b205962218e117fd2c2af0e47438e",
+        "75d92514603f7b7bc8680aa6979a616f6c8a6281798657e8138e2d5b10e3a6fa"
+      ],
+      "case": "mxfp4-h2048-i512-e512-k10-t4-cold-disjoint"
+    },
+    {
+      "status": "admitted_paired_public_call",
+      "all_variants_stable": true,
+      "selected_pair_stable": true,
+      "median_us": {
+        "trtllm": 51.19999870657921,
+        "frost": 40.95999896526337,
+        "trtllm_default": 51.207998767495155,
+        "frost_tc128": 40.95999896526337,
+        "frost_tc256": 43.007999658584595,
+        "frost_ffma": 63.48799914121628
+      },
+      "best_original_backend": "trtllm",
+      "speedup": 1.25,
+      "baseline_aa": [
+        0.0006250047748473049,
+        0.0
+      ],
+      "cross_process_spread": {
+        "trtllm": 0.0,
+        "frost": 0.0,
+        "trtllm_default": 0.00031250238742365244,
+        "frost_tc128": 0.0,
+        "frost_tc256": 0.0,
+        "frost_ffma": 0.0
+      },
+      "sweep_spread": [
+        {
+          "trtllm": 0.0006250047748473049,
+          "frost": 0.0,
+          "trtllm_default": 0.0,
+          "frost_tc128": 0.0,
+          "frost_tc256": 0.0,
+          "frost_ffma": 0.0
+        },
+        {
+          "frost_ffma": 0.0,
+          "frost_tc256": 0.0,
+          "frost_tc128": 0.0,
+          "trtllm_default": 0.0,
+          "frost": 0.0,
+          "trtllm": 0.0
+        }
+      ],
+      "environment": {
+        "gpu": "NVIDIA B300 SXM6 AC",
+        "torch": "2.13.0+cu130",
+        "cutlass_dsl": "4.8.0",
+        "flashinfer": "0.7.2",
+        "flashinfer_base_commit": "3184bbea6e41290320237fbda2ed87b05661881e",
+        "cuda": "13.0"
+      },
+      "selected_tactics": [
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 1250)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        },
+        {
+          "trtllm": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "(8, 1250)"
+            }
+          ],
+          "frost": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "trtllm_default": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "-1"
+            }
+          ],
+          "frost_tc128": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "128"
+            }
+          ],
+          "frost_tc256": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "256"
+            }
+          ],
+          "frost_ffma": [
+            {
+              "bucket": "(4, RoutingInputMode.PackedPrecomputed, (0,))",
+              "tactic": "('ffma', 1)"
+            }
+          ]
+        }
+      ],
+      "reference_norms": [
+        [
+          0.0020114322696128937,
+          24.69354188654628,
+          225.40047675641,
+          0.002119919583077581,
+          21.257276527028033,
+          237.04677406689987
+        ],
+        [
+          0.0020114322696128937,
+          24.69354188654628,
+          225.40047675641,
+          0.002119919583077581,
+          21.257276527028033,
+          237.04677406689987
+        ]
+      ],
+      "per_tactic_comparisons": {
+        "frost": {
+          "original": "trtllm",
+          "speedup": 1.25,
+          "stable": true
+        },
+        "frost_tc128": {
+          "original": "trtllm",
+          "speedup": 1.25,
+          "stable": true
+        },
+        "frost_tc256": {
+          "original": "trtllm",
+          "speedup": 1.1904761698527278,
+          "stable": true
+        },
+        "frost_ffma": {
+          "original": "trtllm",
+          "speedup": 0.8064516034391809,
+          "stable": true
+        }
+      },
+      "duplicate_tactic_spreads": [
+        0.0,
+        0.0
+      ],
+      "process_medians_us": [
+        {
+          "trtllm": 51.19999870657921,
+          "frost": 40.95999896526337,
+          "trtllm_default": 51.2159988284111,
+          "frost_tc128": 40.95999896526337,
+          "frost_tc256": 43.007999658584595,
+          "frost_ffma": 63.48799914121628
+        },
+        {
+          "frost_ffma": 63.48799914121628,
+          "frost_tc256": 43.007999658584595,
+          "frost_tc128": 40.95999896526337,
+          "trtllm_default": 51.19999870657921,
+          "frost": 40.95999896526337,
+          "trtllm": 51.19999870657921
+        }
+      ],
+      "args": {
+        "hidden": 2048,
+        "intermediate": 512,
+        "logical_intermediate": null,
+        "experts": 512,
+        "top_k": 10,
+        "tokens": 4,
+        "cache_mode": "cold",
+        "timing_mode": "latency",
+        "retune_cache": false,
+        "route_pattern": "disjoint",
+        "weight_format": "mxfp8",
+        "activation_limit": 0.0,
+        "routing_weights_dtype": "fp32",
+        "reverse": false,
+        "include_cutedsl": false,
+        "include_native_default": true,
+        "include_frost_tactics": true,
+        "trtllm_tactic": "(8, 1250)",
+        "cute_tactic": null,
+        "frost_tile_k": 128,
+        "frost_ffma": false
+      },
+      "raw_result_sha256": [
+        "9d551b301662a3cf7ddf04f70cc354f533bc70753c3f3dd3f795f9e435052f38",
+        "cee4a7bf54fdb7d225761984c0ecd23910a4dea54aa4d1176917cf1ef74c2818"
+      ],
+      "case": "mxfp8-h2048-i512-e512-k10-t4-cold-disjoint"
+    }
+  ],
+  "excluded_cases": [
+    {
+      "case": "mxfp4-h2048-i512-e512-k10-t1-warm-disjoint",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    },
+    {
+      "case": "mxfp4-h2048-i512-e512-k10-t2-warm-disjoint",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    },
+    {
+      "case": "mxfp4-h2048-i512-e512-k10-t4-warm-disjoint",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    },
+    {
+      "case": "mxfp8-h2048-i512-e512-k10-t1-cold-disjoint",
+      "reason": "repeat, cross-process, or identical-tactic control failed"
+    }
+  ]
+}
