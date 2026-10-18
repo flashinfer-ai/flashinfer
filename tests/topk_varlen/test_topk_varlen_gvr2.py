@@ -1764,17 +1764,17 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 @pytest.mark.parametrize(
     "pattern", ["constant", "quantized4", "huge_flood_gt_k", "posinf", "neginf_tail"]
 )
-@pytest.mark.parametrize("band", ["vpt4", "narrow"])
+@pytest.mark.parametrize("band", ["vpt4", "vpt4_k2048", "narrow"])
 def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern, band):
     """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
     main launch (the register body's escape, narrowing fallback and
-    degenerate-bracket arms), hinted and hint-free, on the VPT 4 body and on rows
-    of top_k < n <= 2048 columns (the VPT 2 body), with SPLIT launches in
-    clusters of 8 and of 4 (B200: 3 rows; 9 and 16 rows) and one CTA per row.
-    Rows of cap - 3 columns put the last column outside the float4 batch
-    (n % 4 == 1)."""
-    top_k = 1024 if band == "vpt4" else 512
-    n = (_main_reg_cap(rows, msl_c, top_k) if band == "vpt4" else _NAR_CAP) - 3
+    degenerate-bracket arms), hinted and hint-free, on the VPT 4 body (K = 1024
+    and 2048) and on rows of top_k < n <= 2048 columns (the VPT 2 body), with
+    SPLIT launches in clusters of 8 and of 4 (B200: 3 rows; 9 and 16 rows) and one
+    CTA per row. Rows of cap - 3 columns put the last column outside the float4
+    batch (n % 4 == 1)."""
+    top_k = {"vpt4": 1024, "vpt4_k2048": 2048, "narrow": 512}[band]
+    n = (_NAR_CAP if band == "narrow" else _main_reg_cap(rows, msl_c, top_k)) - 3
     gen = torch.Generator(device=_DEV).manual_seed(rows + len(pattern))
     if pattern == "posinf":
         x = torch.randn(rows, n, generator=gen, device=_DEV) * 2.0
@@ -2239,6 +2239,8 @@ def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
         (3, 1048640, 2048, None),
         (3, 1048640, 2048, 64),
         (8, 1048640, 2048, 64),
+        (3, 262144, 2048, 256),
+        (8, 262144, 2048, 256),
     ],
     ids=[
         "cs4_k1024",
@@ -2249,6 +2251,8 @@ def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
         "cs8_k2048",
         "cs8_k2048_paged64",
         "cs4_k2048_paged64",
+        "cs8_k2048_paged256",
+        "cs4_k2048_paged256",
     ],
 )
 @pytest.mark.parametrize(
@@ -2273,7 +2277,8 @@ def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, page_size, patte
     refinement and whole-row fallback. Lengths: just above the register path (the
     VPT 2 body), a slot step and the cluster cap - 3 (n % 4 == 1; the VPT 4 body).
     Paged output is hint-free; at K = 2048 below 16 rows it is written by every
-    rank through the page table instead of staged in rank 0."""
+    rank through the page table instead of staged in rank 0, the table read from
+    global (page 64) or staged in smem (page 256: 1024 entries)."""
     reg_cap, cs, cap = _main_clus_caps(rows, msl_c, top_k)
     band = [reg_cap + 1, cs * 4096 * 2 + 5, cap - 3]
     lens = [band[r % len(band)] for r in range(rows)]
