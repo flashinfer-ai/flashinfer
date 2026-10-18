@@ -7278,6 +7278,7 @@ kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_co
 namespace {
 
 constexpr int64_t kHidden = 5376;
+constexpr int64_t kAdalnRows = 9;  // rows of the AdaLN tables indexed by the norm/AdaLN kernels
 constexpr int64_t kFfn = 14336;
 constexpr int64_t kFc1Rows = 28672;  // prepacked FC1 weight rows (128 gate + 128 up per output tile)
 constexpr int64_t kSfBlock = 16;
@@ -7382,11 +7383,15 @@ CommonArgs CheckCommon(const TensorView& x, const TensorView& x_norm_weight, con
   args.device = x.device();
   CheckTensor(x, "x", args.device, dl_bfloat16, {args.rows, kHidden});
   CheckTensor(x_norm_weight, "x_norm_weight", args.device, dl_bfloat16, {kHidden});
-  TVM_FFI_CHECK(adaln_scale.ndim() == 2 && adaln_scale.size(0) >= 1 && adaln_scale.size(1) == kHidden, ValueError)
-      << "adaln_scale must be [rows, 5376]";
-  const int64_t adaln_rows = adaln_scale.size(0);
-  CheckTensor(adaln_scale, "adaln_scale", args.device, dl_bfloat16, {adaln_rows, kHidden});
-  CheckTensor(adaln_shift, "adaln_shift", args.device, dl_bfloat16, {adaln_rows, kHidden});
+  TVM_FFI_CHECK(adaln_scale.ndim() == 2 && adaln_scale.size(1) == kHidden, ValueError)
+      << "adaln_scale must be [" << kAdalnRows << ", 5376]";
+  // The norm/AdaLN kernels index a 9-row table and zero the activation of indices outside [0, 9):
+  // a shorter table would be read past its end, a longer one would silently drop its extra rows.
+  TVM_FFI_CHECK(adaln_scale.size(0) == kAdalnRows, ValueError)
+      << "adaln_scale must have exactly " << kAdalnRows << " rows (the norm/AdaLN kernels index a "
+      << kAdalnRows << "-row table), got " << adaln_scale.size(0);
+  CheckTensor(adaln_scale, "adaln_scale", args.device, dl_bfloat16, {kAdalnRows, kHidden});
+  CheckTensor(adaln_shift, "adaln_shift", args.device, dl_bfloat16, {kAdalnRows, kHidden});
   CheckTensor(adaln_index, "adaln_index", args.device, dl_int32, {args.rows});
   CheckTensor(out, "out", args.device, dl_bfloat16, {args.rows, kFfn});
   args.out = static_cast<unsigned int*>(out.data_ptr());
