@@ -10,6 +10,17 @@ prepared weights as the Tensor Core tactic. Switching tactics needs no second
 weight copy, requantization, or per-call layout conversion. Autotuning compares
 the complete pipelines; the untuned default remains Tensor Core.
 
+When Frost is an eligible candidate, `MoELayer` tunes every candidate's tactics
+and the cross-backend choice using individual-call CUDA Graph GPU latency.
+An explicit autotune measurement policy can still override cache or execution
+mode. External event nodes bracket each invocation inside the graph; the median
+excludes Python submission and first-replay initialization. This objective can
+rank FMA and Tensor Core differently from amortized back-to-back replay. The
+autotuner records the timing mode as provenance, so a tuning request remeasures
+a winner selected under the other mode. Layers without an eligible Frost
+candidate retain their existing timing behavior. This remains kernel GPU time,
+not model decode-step latency or throughput.
+
 ```mermaid
 flowchart TD
   W[One prepared MX weight view] --> A[Low-latency runner and per-call workspace]

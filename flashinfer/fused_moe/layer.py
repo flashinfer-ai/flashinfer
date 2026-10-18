@@ -29,7 +29,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.moe_layer import moe_layer_trace
-from ..autotuner import AutoTuner
+from ..autotuner import AutoTuner, TunableRunner
 from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
@@ -221,6 +221,19 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }
+
+
+class _PackedMoEProfileRunner(TunableRunner):
+    """Include per-call packing in the shared autotuner measurement path."""
+
+    def __init__(self, run_candidate):
+        self.run_candidate = run_candidate
+
+    def get_valid_tactics(self, inputs, profile):
+        return [-1]
+
+    def forward(self, inputs, tactic=-1, **kwargs):
+        return self.run_candidate()
 
 
 class MoELayer:
@@ -477,15 +490,32 @@ class MoELayer:
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
         best_inputs: Optional[List[torch.Tensor]] = None
+        individual_timing = any(
+            getattr(
+                getattr(runner, "tuning_config", None),
+                "use_cuda_graph_individual_timing",
+                False,
+            )
+            for runner in runners
+        )
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
             launch_kwargs = runner.launch_kwargs_for(inputs)
+            tuning_config = runner.tuning_config_for(inputs)
+            if individual_timing:
+                # Rank every candidate under the same decode-latency objective,
+                # including its internal tactics and the cross-backend choice.
+                tuning_config = replace(
+                    tuning_config,
+                    use_cuda_graph=True,
+                    use_cuda_graph_individual_timing=True,
+                )
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
                 custom_op=f"moe_{runner.backend_key}",
                 runners=[runner],
-                tuning_config=runner.tuning_config_for(inputs),
+                tuning_config=tuning_config,
                 inputs=inputs,
                 **launch_kwargs,
             )
@@ -506,13 +536,33 @@ class MoELayer:
                 )
 
             # Measure packing + forward GPU time after warmup.
-            times = bench_gpu_time(
-                run_candidate,
-                dry_run_iters=5,
-                repeat_iters=30,
-                use_cuda_graph=True,
-            )
-            t_ms = median(times)
+            if individual_timing:
+                from ..testing.utils import aggregate_gpu_time_across_ranks
+
+                # Use the same policy machinery as internal tactic selection,
+                # including an explicit cold-cache or eager-serving override.
+                measurement_config = replace(tuning_config, profiling_repeat=16)
+                policy = self.tuner._effective_measure_policy
+                if policy is not None:
+                    measurement_config = self.tuner._apply_measure_policy(
+                        measurement_config, policy
+                    )
+                t_ms = self.tuner.profile_tactic(
+                    _PackedMoEProfileRunner(run_candidate),
+                    inputs,
+                    tactic,
+                    measurement_config,
+                    [inputs],
+                )
+                t_ms = aggregate_gpu_time_across_ranks(t_ms, max)
+            else:
+                times = bench_gpu_time(
+                    run_candidate,
+                    dry_run_iters=5,
+                    repeat_iters=30,
+                    use_cuda_graph=True,
+                )
+                t_ms = median(times)
             if t_ms < best_time_ms:
                 best_time_ms = t_ms
                 best_runner = runner

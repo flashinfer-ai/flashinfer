@@ -23,7 +23,9 @@ from flashinfer.fused_moe import (
     QuantFormat,
     RoutingConfig,
     SwiGLU,
+    TrtllmFp8BlockConfig,
 )
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe.api import RoutingInputMode
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
 
@@ -110,6 +112,76 @@ def _require_gpu():
     pytest.importorskip("cutlass")
     if Version(version("nvidia-cutlass-dsl")) < Version("4.8"):
         pytest.skip("requires nvidia-cutlass-dsl >= 4.8")
+
+
+def test_frost_cross_backend_latency_tuning(monkeypatch):
+    """Exercise real packing, native/Frost tuning, and the resulting graph."""
+    _require_gpu()
+    torch.manual_seed(318)
+    e, h, i, k = 8, 1024, 256, 2
+    device = torch.device("cuda", torch.cuda.current_device())
+    w1 = (torch.randn(e, 2 * i, h, device=device) / h**0.5).bfloat16()
+    w2 = (torch.randn(e, h, i, device=device) / i**0.5).bfloat16()
+    _, q1, s1 = _quant(w1)
+    _, q2, s2 = _quant(w2)
+    quant = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+    activation = SwiGLU()
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        "frost_low_latency", FrostLowLatencyConfig.prepare_weights(q1, s1, q2, s2)
+    )
+    weights.prepare_for(
+        "trtllm_fp8_block",
+        TrtllmFp8BlockConfig.prepare_weights(
+            w1,
+            w2,
+            quant=quant,
+            num_local_experts=e,
+            hidden_size=h,
+            intermediate_size=i,
+            activation=activation,
+        ),
+    )
+    config = MoEConfig(
+        RoutingConfig(e, k),
+        quant,
+        ExpertConfig(i),
+        activation=activation,
+        backend=BackendOptions((TrtllmFp8BlockConfig(), FrostLowLatencyConfig())),
+    )
+    layer = MoELayer(config, device=device)
+    assert len(layer.runners) == 2
+    _, q, sf = _quant(torch.randn(1, h, device=device).bfloat16())
+    ids = torch.arange(k, device=device, dtype=torch.int32)[None, :]
+    rw = torch.softmax(torch.randn(1, k, device=device), -1)
+    act = MoEActivationPack(q, sf, ids, rw)
+    measured = []
+    tuner = AutoTuner.get()
+    original_profile = tuner.profile_tactic
+
+    def record_profile(runner, inputs, tactic, tuning_config, batches, **kwargs):
+        measured.append(tuning_config.use_cuda_graph_individual_timing)
+        return original_profile(
+            runner, inputs, tactic, tuning_config, batches, **kwargs
+        )
+
+    monkeypatch.setattr(tuner, "profile_tactic", record_profile)
+    with autotune(True):
+        layer(act, weights)
+    assert measured == [True, True]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = layer(act, weights)
+    for step in range(3):
+        dq, qn, sn = _quant(torch.randn(1, h, device=device).bfloat16())
+        q.copy_(qn)
+        sf.copy_(sn)
+        ids.copy_(
+            (torch.arange(k, device=device, dtype=torch.int32)[None, :] + step) % e
+        )
+        graph.replay()
+        _, expected = _reference(dq, q1, s1, q2, s2, ids, rw.bfloat16(), activation)
+        _assert_near(output, expected)
 
 
 @pytest.mark.parametrize("weight_format", [QuantFormat.MXFP4, QuantFormat.MXFP8])

@@ -525,6 +525,12 @@ class TuningConfig:
             lane views in the reusable A/B profiling arenas. Their contents are
             staged once per profile even when they are not value-aware. Shared
             read-only tensors may be omitted and retain one pointer.
+        use_cuda_graph_individual_timing: When using CUDA graphs, measure each
+            invocation with its own in-graph event interval and return the
+            median latency. The default measures amortized sustained execution.
+            Cold-L2 profiling already measures individual invocations. This
+            choice is recorded as tuning provenance because it can change the
+            winner; ordinary lookup can still consume that winner.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -544,6 +550,7 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
+    use_cuda_graph_individual_timing: bool = False
 
 
 class ValueProfileArena:
@@ -2174,6 +2181,7 @@ class AutoTuner:
             value_aware_input_indices=tuning_config.value_aware_input_indices,
             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
+            use_cuda_graph_individual_timing=tuning_config.use_cuda_graph_individual_timing,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -3135,11 +3143,25 @@ class AutoTuner:
                     for _ in range(self.warmup):
                         runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-                    avg_time = (
-                        cold_l2_profile(stream, profiling_repeat)
-                        if tuning_config.use_cold_l2_cache
-                        else pure_profile(stream, profiling_repeat)
-                    )
+                    if tuning_config.use_cold_l2_cache:
+                        avg_time = cold_l2_profile(stream, profiling_repeat)
+                    elif (
+                        tuning_config.use_cuda_graph
+                        and tuning_config.use_cuda_graph_individual_timing
+                    ):
+                        from ._graph_timing import profile_individual_graph_calls
+
+                        avg_time = profile_individual_graph_calls(
+                            lambda index: runner(
+                                input_tensor_batches[index % len(input_tensor_batches)],
+                                tactic=tactic,
+                                **kwargs,
+                            ),
+                            repeat=profiling_repeat,
+                            replays=tuning_config.cuda_graph_profile_replays,
+                        )
+                    else:
+                        avg_time = pure_profile(stream, profiling_repeat)
         except BaseException as e:  # noqa: BLE001
             # Catch everything (incl. KeyboardInterrupt / SystemExit): this
             # rank must still reach the all-reduce below or peers already
@@ -3456,7 +3478,7 @@ class AutoTuner:
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Return measurement provenance that can change tactic ranking."""
-        return (
+        policy: tuple = (
             "cuda_graph_profile_replays",
             (
                 int(tuning_config.cuda_graph_profile_replays)
@@ -3466,6 +3488,14 @@ class AutoTuner:
             "l2_cache_policy",
             "cold" if tuning_config.use_cold_l2_cache else "hot",
         )
+        # Preserve the existing provenance for all legacy callers. A tuning
+        # request with a different timing objective must remeasure its tactics.
+        if (
+            tuning_config.use_cuda_graph
+            and tuning_config.use_cuda_graph_individual_timing
+        ):
+            policy += ("cuda_graph_timing_mode", "individual")
+        return policy
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:

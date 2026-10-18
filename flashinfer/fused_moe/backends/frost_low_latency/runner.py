@@ -36,7 +36,9 @@ class FrostLowLatencyRunner(MoERunner):
         )
         # Exact shapes, no synthetic token buckets: route IDs remain valid and
         # workspace shapes cannot drift away from the profiled activation.
-        self.tuning_config = TuningConfig(use_cuda_graph=True)
+        self.tuning_config = TuningConfig(
+            use_cuda_graph=True, use_cuda_graph_individual_timing=True
+        )
 
     def _check_support(self):
         super()._check_support()
@@ -77,7 +79,7 @@ class FrostLowLatencyRunner(MoERunner):
 
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
-            "unified-fma-tc-v1",
+            "unified-fma-tc-individual-latency-v2",
             self.options.max_num_tokens,
             self.config.execution.enable_pdl,
         )
