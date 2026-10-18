@@ -119,70 +119,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_8ab15b919ac98b5e1735": {
-        "sources": [
-            "cake_selective_state_update_8ab15b919ac98b5e1735_kernel.cu",
-            "cake_selective_state_update_8ab15b919ac98b5e1735_binding.cu",
-        ],
-        "compile_flags": ["--fmad=false"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "state_tma"],
-            ["buffer", "x"],
-            ["parameter", "dt_addr"],
-            ["parameter", "a_addr"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["parameter", "d_addr"],
-            ["buffer", "z"],
-            ["parameter", "dt_bias_addr"],
-            ["buffer", "output"],
-            ["parameter", "state_batch_indices_addr"],
-            ["parameter", "dst_state_batch_indices_addr"],
-            ["parameter", "nheads"],
-            ["parameter", "ngroups"],
-            ["parameter", "head_tiles"],
-            ["parameter", "x_batch_stride"],
-            ["parameter", "b_batch_stride"],
-            ["parameter", "c_batch_stride"],
-            ["parameter", "out_batch_stride"],
-            ["parameter", "dt_batch_stride"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "has_z"],
-            ["parameter", "disable_state_update"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "61a0ba983cee1e6c7b66af24c5d0e074885e56be56134af2c041cfc89bad1131",
-        "defines": [
-            "HEADS_PER_GROUP_STATIC",
-            "DIRECT_UNROLL",
-            "COEFFICIENT_BF16",
-            "INDEX_I32",
-            "PAIRED_HEADS",
-            "HEADS_PER_CTA",
-        ],
-        "instantiations": {
-            "1b867acabd879d71": {
-                "HEADS_PER_GROUP_STATIC": 8,
-                "DIRECT_UNROLL": 4,
-                "COEFFICIENT_BF16": 1,
-                "INDEX_I32": 1,
-                "PAIRED_HEADS": 1,
-                "HEADS_PER_CTA": 2,
-            },
-            "29f069839e5f8528": {
-                "HEADS_PER_GROUP_STATIC": 0,
-                "DIRECT_UNROLL": 4,
-                "COEFFICIENT_BF16": 1,
-                "INDEX_I32": 1,
-                "PAIRED_HEADS": 1,
-                "HEADS_PER_CTA": 4,
-            },
-        },
-    },
     "cake_selective_state_update_ae6bcb235d195b6ef079": {
         "sources": [
             "cake_selective_state_update_ae6bcb235d195b6ef079_kernel.cu",
@@ -327,87 +263,116 @@ MODULES: dict[str, dict[str, Any]] = {
             "INDEX_I32",
             "PAIRED_HEADS",
             "HEADS_PER_CTA",
+            "LAUNCH_MIN_BLOCKS",
         ],
         "instantiations": {
-            "1b867acabd879d71": {
+            "0ef4f75b1e360d42": {
                 "HEADS_PER_GROUP_STATIC": 8,
                 "DIRECT_UNROLL": 4,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 2,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "54d9c7146d5e63fd": {
+            "90e05c037f900ab9": {
                 "HEADS_PER_GROUP_STATIC": 8,
                 "DIRECT_UNROLL": 1,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 2,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "60eeb72df257bd1b": {
+            "80dc8f9040de9883": {
                 "HEADS_PER_GROUP_STATIC": 8,
                 "DIRECT_UNROLL": 1,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 4,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "3604ff48332fe3e0": {
+            "6e02ef17e364337e": {
                 "HEADS_PER_GROUP_STATIC": 8,
                 "DIRECT_UNROLL": 1,
                 "COEFFICIENT_BF16": 0,
                 "INDEX_I32": 0,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 2,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "1b56e59cd8506a91": {
+            "a7585c92d0cc7f52": {
                 "HEADS_PER_GROUP_STATIC": 8,
                 "DIRECT_UNROLL": 1,
                 "COEFFICIENT_BF16": 0,
                 "INDEX_I32": 0,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 4,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "2efb77f68f198cde": {
+            "cbae468805744c5f": {
                 "HEADS_PER_GROUP_STATIC": 0,
                 "DIRECT_UNROLL": 4,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 2,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "864d53685dccb16e": {
+            "4bacba31250124a4": {
                 "HEADS_PER_GROUP_STATIC": 0,
                 "DIRECT_UNROLL": 1,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 2,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "df63e8e9e9b93e43": {
+            "926b7d2f2406c2a7": {
                 "HEADS_PER_GROUP_STATIC": 0,
                 "DIRECT_UNROLL": 1,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 4,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "2b56e729f03021aa": {
+            "e040590c16f18e04": {
                 "HEADS_PER_GROUP_STATIC": 8,
                 "DIRECT_UNROLL": 4,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 4,
+                "LAUNCH_MIN_BLOCKS": 3,
             },
-            "29f069839e5f8528": {
+            "e69bc193d5be52de": {
                 "HEADS_PER_GROUP_STATIC": 0,
                 "DIRECT_UNROLL": 4,
                 "COEFFICIENT_BF16": 1,
                 "INDEX_I32": 1,
                 "PAIRED_HEADS": 1,
                 "HEADS_PER_CTA": 4,
+                "LAUNCH_MIN_BLOCKS": 3,
+            },
+            "f31ded7dc93f9b94": {
+                "HEADS_PER_GROUP_STATIC": 8,
+                "DIRECT_UNROLL": 4,
+                "COEFFICIENT_BF16": 1,
+                "INDEX_I32": 1,
+                "PAIRED_HEADS": 1,
+                "HEADS_PER_CTA": 2,
+                "LAUNCH_MIN_BLOCKS": 4,
+            },
+            "b23c23bc28ccd787": {
+                "HEADS_PER_GROUP_STATIC": 0,
+                "DIRECT_UNROLL": 4,
+                "COEFFICIENT_BF16": 1,
+                "INDEX_I32": 1,
+                "PAIRED_HEADS": 1,
+                "HEADS_PER_CTA": 4,
+                "LAUNCH_MIN_BLOCKS": 4,
             },
         },
     },
@@ -607,7 +572,6 @@ PROGRAMS: dict[str, str] = {
     "stp_hd64_rows_bf16": "cake_selective_state_update_b065d399492897c1b957",
     "stp_hd64_rows_fp32": "cake_selective_state_update_f75fba6195c641c8ea09",
     "stp_paired_rows": "cake_selective_state_update_c7e08dcbb58896052ee9",
-    "stp_paired_rows_mb4": "cake_selective_state_update_8ab15b919ac98b5e1735",
 }
 
 _ARCH_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
@@ -670,7 +634,8 @@ def jit_spec(
 
 
 def gen_cake_selective_state_update_modules(arch: str) -> list[JitSpec]:
-    """Build specifications of every delivered program and instantiation for ``arch`` (the AOT table).
+    """Build specifications of every delivered program and of every instantiation a route of
+    ``arch`` selects (the AOT table).
 
     The shipped BF16 single-token programs are built from their embedded device sources at first
     use and have no build specification; a disabled JIT with a cache that lacks one of these
@@ -681,7 +646,8 @@ def gen_cake_selective_state_update_modules(arch: str) -> list[JitSpec]:
         instantiations = record["instantiations"] or {"": {}}
         for values in instantiations.values():
             defines = tuple((name, int(values[name])) for name in record["defines"])
-            specs.append(jit_spec(module, arch, defines))
+            if _routed_on(arch, defines):
+                specs.append(jit_spec(module, arch, defines))
     return specs
 
 
@@ -1059,20 +1025,35 @@ def rows_defines(
 
 
 _PAIRED_ROWS = "stp_paired_rows"
-_PAIRED_ROWS_MB4 = "stp_paired_rows_mb4"
-_PAIRED_ROWS_MIN_BLOCKS_BANDS = {"sm_100a": ((6, 16), _PAIRED_ROWS_MB4)}
+_PAIRED_ROWS_MIN_BLOCKS = 3
+_PAIRED_ROWS_MIN_BLOCKS_BANDS = {"sm_100a": ((6, 16), 4)}
 
 
-def _paired_rows_program(program_blocks: int, sm_count: int, arch: str) -> str:
-    """Paired row-major program of one launch: the four-CTA residency schedule inside the per-arch band of
-    program heads per SM, the three-CTA default elsewhere (``seed_stp_paired_rows.min_blocks_for``)."""
+def _paired_rows_program(
+    program_blocks: int, sm_count: int, arch: str
+) -> tuple[str, tuple[tuple[str, int], ...]]:
+    """Paired row-major program of one launch with its ``LAUNCH_MIN_BLOCKS`` define: the four-CTA
+    residency schedule inside the per-arch band of program heads per SM, the three-CTA default
+    elsewhere (``seed_stp_paired_rows.min_blocks_for``)."""
     band = _PAIRED_ROWS_MIN_BLOCKS_BANDS.get(arch)
+    min_blocks = _PAIRED_ROWS_MIN_BLOCKS
     if (
         band is not None
         and band[0][0] * sm_count <= program_blocks < band[0][1] * sm_count
     ):
-        return band[1]
-    return _PAIRED_ROWS
+        min_blocks = band[1]
+    return _PAIRED_ROWS, (("LAUNCH_MIN_BLOCKS", min_blocks),)
+
+
+def _routed_on(arch: str, defines: Sequence[tuple[str, int]]) -> bool:
+    """Whether a route of ``arch`` selects this define set: the four-CTA residency schedule exists only
+    inside the per-arch band, so the other architectures do not build its instantiations.  Only the
+    paired row-major record lists ``LAUNCH_MIN_BLOCKS`` among its compile-line defines."""
+    min_blocks = dict(defines).get("LAUNCH_MIN_BLOCKS", _PAIRED_ROWS_MIN_BLOCKS)
+    if min_blocks == _PAIRED_ROWS_MIN_BLOCKS:
+        return True
+    band = _PAIRED_ROWS_MIN_BLOCKS_BANDS.get(arch)
+    return band is not None and min_blocks == band[1]
 
 
 def shipped_stp_program(
@@ -1425,7 +1406,8 @@ def _plan_stp_batch(
     defines = direct_defines(heads_per_group, total_head_tiles) + abi
     if paired:
         # The paired row-major program always runs one CTA per work tile.
-        program = _paired_rows_program(batch_size * program_heads, sms, arch)
+        program, residency = _paired_rows_program(batch_size * program_heads, sms, arch)
+        defines += residency
         return RoutePlan(
             program, defines, (total_head_tiles, 1, 1), bindings, arch, device_index
         )
