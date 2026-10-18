@@ -284,16 +284,6 @@ class MSAIcpIndexerWorkspace:
             x_par_stride=self.par_stride,
         )
 
-    def stamp_rows_of(self, token_count: int) -> torch.Tensor:
-        """CPU ``[rows, 3]`` globaltimer stamps (ns) of the last merge launch over ``token_count`` tokens."""
-        rows = int(token_count) * NUM_HEADS
-        return self.stamps_i64[: rows * 3].view(rows, 3).cpu()
-
-    def owner_rows(self, token_count: int) -> torch.Tensor:
-        """CPU indices of the (token, head) rows whose head this rank owns (the rows that poll and write ``out``)."""
-        rows = torch.arange(int(token_count) * NUM_HEADS)
-        return rows[((rows % NUM_HEADS) // self.heads_local) == self.rank]
-
     def destroy(self) -> None:
         """Release the workspace.  Collective in ``symmetric`` mode: every rank calls it, after its last launch completed."""
         if getattr(self, "destroyed", False):

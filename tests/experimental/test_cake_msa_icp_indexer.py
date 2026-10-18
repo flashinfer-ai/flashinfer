@@ -102,6 +102,9 @@ def test_registry_records_are_consistent() -> None:
             assert 32 * int(record["warps"]) >= TOPK * int(record["world_size"])
             assert int(record["entries_per_thread"]) % 2 == 0
     for role, plan in cake_jit.ARG_PLANS.items():
+        # cake_backend._bind binds grid values and named buffers / parameters.
+        kinds = {kind for kind, _name in plan}
+        assert kinds <= {"buffer", "grid", "parameter", "tma_buffer"}, role
         names = [name for _kind, name in plan]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"], role
         assert len(set(names)) == len(names), role
