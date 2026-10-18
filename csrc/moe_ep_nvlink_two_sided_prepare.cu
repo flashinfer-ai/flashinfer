@@ -20,11 +20,11 @@
 
 #include <cub/cub.cuh>
 
-#include "flashinfer/comm/trtllm_alltoall_prepare.cuh"
 #include "flashinfer/exception.h"
 #include "flashinfer/utils.cuh"
+#include "moe_ep_nvlink_two_sided_prepare.cuh"
 
-// Local definition to avoid multiple definition issues from trtllm_alltoall.cuh
+// Local definition to avoid multiple definition issues from moe_ep_nvlink_two_sided_alltoall.cuh
 static int getMultiProcessorCount() {
   int device_id;
   int multi_processor_count;
@@ -36,7 +36,7 @@ static int getMultiProcessorCount() {
 
 namespace cg = cooperative_groups;
 
-namespace flashinfer::trtllm_alltoall {
+namespace flashinfer::moe_ep_nvlink_two_sided {
 
 namespace moe_prepare {
 
@@ -620,4 +620,4 @@ size_t getMoePrepareWorkspaceSize(int epSize) {
 
 }  // namespace moe_prepare
 
-}  // namespace flashinfer::trtllm_alltoall
+}  // namespace flashinfer::moe_ep_nvlink_two_sided

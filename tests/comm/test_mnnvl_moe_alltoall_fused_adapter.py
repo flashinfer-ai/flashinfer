@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,9 +9,9 @@ import pytest
 import torch
 
 from flashinfer import mxfp4_quantize, nvfp4_quantize
-from flashinfer.comm import moe_a2a_active_rank_mask
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
+from flashinfer.moe_ep.backends.split.comm.cake.kernels import active_rank_mask
 from flashinfer.tllm_enums import SfLayout
 from tests.utils_fp8 import mxfp8_quantize_reference
 
@@ -20,192 +19,46 @@ from .conftest import mnnvl_available
 from .moe_a2a_driver import MoeA2ADriver, workspace_bytes_per_rank
 
 
-def test_fused_module_keeps_the_public_python_contract():
+def test_cake_ops_are_not_public_comm_api():
     import flashinfer.comm as public_api
-    import flashinfer.comm.trtllm_moe_alltoall as api
 
-    expected_module_parameters = {
-        "moe_a2a_active_rank_mask": ("active_ranks", "ep_size"),
-        "moe_a2a_initialize": (
-            "workspace",
-            "ep_rank",
-            "ep_size",
-            "max_num_tokens",
-            "eplb_stats_num_experts",
-            "backend",
-        ),
-        "moe_a2a_wrap_payload_tensor_in_workspace": (
-            "workspace",
-            "leading_shape",
-            "slice_start",
-            "slice_end",
-            "dtype",
-        ),
-        "moe_a2a_dispatch": (
-            "token_selected_experts",
-            "input_payloads",
-            "workspace",
-            "metainfo",
-            "runtime_max_tokens_per_rank",
-            "ep_rank",
-            "ep_size",
-            "top_k",
-            "num_experts",
-            "enable_pdl",
-            "eplb_local_stats",
-            "enable_rank_mask",
-            "active_rank_mask",
-            "backend",
-            "recv_view_cache",
-        ),
-        "moe_a2a_combine": (
-            "payload",
-            "local_num_tokens",
-            "workspace",
-            "metainfo",
-            "runtime_max_tokens_per_rank",
-            "ep_rank",
-            "ep_size",
-            "top_k",
-            "combine_payload_offset",
-            "payload_in_workspace",
-            "output_dtype",
-            "output_scales",
-            "output_scalar_scale",
-            "sf_layout",
-            "output",
-            "use_low_precision",
-            "enable_pdl",
-            "enable_rank_mask",
-            "active_rank_mask",
-            "backend",
-        ),
-        "moe_a2a_sanitize_expert_ids": (
-            "expert_ids",
-            "workspace",
-            "metainfo",
-            "ep_rank",
-            "invalid_expert_id",
-            "enable_pdl",
-            "backend",
-        ),
-        "moe_a2a_get_workspace_size_per_rank": (
-            "ep_size",
-            "max_num_tokens",
-            "total_dispatch_payload_size_per_token",
-            "combine_payload_size_per_token",
-            "eplb_stats_num_experts",
-            "backend",
-        ),
-    }
-    expected_module_defaults = {
-        "moe_a2a_active_rank_mask": {},
-        "moe_a2a_initialize": {"eplb_stats_num_experts": 0, "backend": "cake"},
-        "moe_a2a_wrap_payload_tensor_in_workspace": {},
-        "moe_a2a_dispatch": {
-            "enable_pdl": None,
-            "eplb_local_stats": None,
-            "enable_rank_mask": False,
-            "active_rank_mask": None,
-            "backend": "cake",
-            "recv_view_cache": None,
-        },
-        "moe_a2a_combine": {
-            "payload_in_workspace": False,
-            "output_dtype": None,
-            "output_scales": None,
-            "output_scalar_scale": 1.0,
-            "sf_layout": SfLayout.layout_linear,
-            "output": None,
-            "use_low_precision": False,
-            "enable_pdl": None,
-            "enable_rank_mask": False,
-            "active_rank_mask": None,
-            "backend": "cake",
-        },
-        "moe_a2a_sanitize_expert_ids": {"enable_pdl": None, "backend": "cake"},
-        "moe_a2a_get_workspace_size_per_rank": {
-            "eplb_stats_num_experts": 0,
-            "backend": "cake",
-        },
-    }
-    assert set(api.__all__) == set(expected_module_parameters)
-    for name, expected_parameters in expected_module_parameters.items():
-        assert getattr(public_api, name) is getattr(api, name)
-        signature = inspect.signature(getattr(api, name))
-        assert tuple(signature.parameters) == expected_parameters
-        assert {
-            parameter_name: parameter.default
-            for parameter_name, parameter in signature.parameters.items()
-            if parameter.default is not inspect.Parameter.empty
-        } == expected_module_defaults[name]
-        if "backend" in signature.parameters:
-            assert (
-                signature.parameters["backend"].kind is inspect.Parameter.KEYWORD_ONLY
-            )
-
-    combine = inspect.signature(api.moe_a2a_combine)
-    assert (
-        combine.parameters["use_low_precision"].kind is inspect.Parameter.KEYWORD_ONLY
-    )
+    assert not [name for name in dir(public_api) if name.startswith("moe_a2a_")]
     assert not hasattr(public_api, "MoeAlltoAll")
 
 
 def test_active_rank_mask_preserves_upper_u64_bits_in_dispatch():
-    mask = moe_a2a_active_rank_mask((0, 31, 32, 63), 64)
+    mask = active_rank_mask((0, 31, 32, 63), 64)
     assert mask.dtype is torch.uint64
     assert mask.device.type == "cpu"
     assert mask.tolist() == [0x8000000180000001]
 
 
-def test_backends_register_distinct_custom_ops(monkeypatch):
-    import flashinfer.comm.trtllm_moe_alltoall as api
+def test_each_target_loads_its_own_module(monkeypatch):
+    import flashinfer.jit.comm as jit_comm
+    from flashinfer.moe_ep.backends.split.comm.cake import kernels
 
-    registrations = []
-
-    def register(name, *, mutates_args):
-        def decorate(function):
-            registrations.append((name, tuple(mutates_args), function.__name__))
-            return function
-
-        return decorate
+    built = []
 
     class FakeSpec:
-        def build_and_load(self):
-            return SimpleNamespace()
+        def __init__(self, target):
+            self.target = target
 
-    api.get_moe_alltoall_module.cache_clear()
-    monkeypatch.setattr(api, "register_custom_op", register)
-    monkeypatch.setattr(api, "gen_moe_alltoall_module", lambda target: FakeSpec())
-    operation_names = {
-        "moe_a2a_initialize",
-        "moe_a2a_dispatch",
-        "moe_a2a_combine",
-        "moe_a2a_combine_into",
-        "moe_a2a_sanitize_expert_ids",
-        "moe_a2a_get_metainfo_index_pairs",
-        "moe_a2a_get_aux_data_size",
-    }
+        def build_and_load(self):
+            built.append(self.target)
+            return SimpleNamespace(target=self.target)
+
+    kernels.get_cake_module.cache_clear()
+    monkeypatch.setattr(jit_comm, "gen_moe_ep_cake_module", FakeSpec)
     try:
-        expected_registrations = set()
-        for target in ("sm100a", "sm103a"):
-            module = api._get_moe_alltoall_module_for_target(target)
-            assert api._get_moe_alltoall_module_for_target(target) is module
-            assert set(vars(module)) == operation_names
-            suffix = f"_{target}"
-            expected_registrations.update(
-                f"flashinfer::{name}{suffix}" for name in operation_names
-            )
-            combine_into = next(
-                row
-                for row in registrations
-                if row[0] == f"flashinfer::moe_a2a_combine_into{suffix}"
-            )
-            assert combine_into[1] == ("workspace", "output")
-        assert {name for name, _, _ in registrations} == expected_registrations
-        assert len(registrations) == len(expected_registrations)
+        modules = {
+            target: kernels.get_cake_module(target) for target in ("sm100a", "sm103a")
+        }
+        for target, module in modules.items():
+            assert module.target == target
+            assert kernels.get_cake_module(target) is module
+        assert built == ["sm100a", "sm103a"]
     finally:
-        api.get_moe_alltoall_module.cache_clear()
+        kernels.get_cake_module.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -213,13 +66,13 @@ def test_backends_register_distinct_custom_ops(monkeypatch):
     [
         (
             "sm100a",
-            "mnnvl_moe_alltoall_sm100a",
+            "moe_ep_cake_alltoall_sm100a",
             "mnnvl_moe_alltoall_sm100.cu",
             "compute_100a,code=sm_100a",
         ),
         (
             "sm103a",
-            "mnnvl_moe_alltoall_sm103a",
+            "moe_ep_cake_alltoall_sm103a",
             "mnnvl_moe_alltoall_sm103.cu",
             "compute_103a,code=sm_103a",
         ),
@@ -237,7 +90,7 @@ def test_fused_jit_inventory_is_exact_arch_and_self_contained(
         return object()
 
     monkeypatch.setattr(jit_comm, "gen_jit_spec", capture)
-    jit_comm.gen_moe_alltoall_module(target)
+    jit_comm.gen_moe_ep_cake_module(target)
     names = {path.name for path in captured["sources"]}
     assert captured["name"] == module_name
     assert generated_name in names
@@ -265,48 +118,31 @@ def test_fused_jit_inventory_is_exact_arch_and_self_contained(
 def test_runtime_module_selection_follows_the_device(
     monkeypatch, capability, cake_target
 ):
-    import flashinfer.comm.trtllm_moe_alltoall as api
+    from flashinfer.moe_ep.backends.split.comm.cake import kernels
 
-    monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 7)
-    selected = []
+    monkeypatch.setattr(kernels.torch.cuda, "current_device", lambda: 7)
     capability_queries = []
 
     def get_device_capability(device):
         capability_queries.append(device)
         return capability
 
-    def select_target(target):
-        selected.append(target)
-        return target
-
-    select_target.cache_clear = lambda: None
-    monkeypatch.setattr(api, "_get_moe_alltoall_module_for_target", select_target)
-    monkeypatch.setattr(api.torch.cuda, "get_device_capability", get_device_capability)
+    monkeypatch.setattr(kernels, "get_cake_module", lambda target: target)
+    monkeypatch.setattr(
+        kernels.torch.cuda, "get_device_capability", get_device_capability
+    )
 
     try:
-        api.get_moe_alltoall_module.cache_clear()
-        with pytest.raises(ValueError, match="NVLinkOneSidedAlltoAll"):
-            api.get_moe_alltoall_module(backend="trtllm")
-        assert capability_queries == []
+        kernels._device_target.cache_clear()
         if cake_target is None:
             with pytest.raises(ValueError, match="compute capability"):
-                api.get_moe_alltoall_module()
-            assert selected == []
+                kernels.current_module()
         else:
-            assert api.get_moe_alltoall_module() == cake_target
-            assert api.get_moe_alltoall_module(backend="cake") == cake_target
-            assert selected == [cake_target, cake_target]
+            assert kernels.current_module() == cake_target
+            assert kernels.current_module() == cake_target
         assert capability_queries == [7]
     finally:
-        api.get_moe_alltoall_module.cache_clear()
-
-
-@pytest.mark.parametrize("backend", ["auto", "trtllm", "legacy", "sm100a", "", None])
-def test_runtime_module_selection_rejects_invalid_backends(backend):
-    import flashinfer.comm.trtllm_moe_alltoall as api
-
-    with pytest.raises(ValueError, match="backend"):
-        api.get_moe_alltoall_module(backend=backend)
+        kernels._device_target.cache_clear()
 
 
 def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
@@ -321,7 +157,9 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     monkeypatch.setattr(aot, "gen_spdlog_module", lambda: spec("spdlog"))
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
     monkeypatch.setattr(aot, "gen_cudnn_fmha_module", lambda: spec("cudnn"))
-    monkeypatch.setattr(jit_comm, "gen_comm_alltoall_module", lambda: spec("comm"))
+    monkeypatch.setattr(
+        jit_comm, "gen_moe_ep_nvlink_two_sided_module", lambda: spec("two_sided")
+    )
     monkeypatch.setattr(jit_comm, "gen_vllm_comm_module", lambda: spec("vllm"))
     monkeypatch.setattr(jit_comm, "gen_pcie_ipc_comm_module", lambda: spec("pcie"))
     monkeypatch.setattr(
@@ -329,8 +167,8 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     )
     monkeypatch.setattr(
         jit_comm,
-        "gen_moe_alltoall_module",
-        lambda target: selected.append(target) or spec(f"mnnvl_{target}"),
+        "gen_moe_ep_cake_module",
+        lambda target: selected.append(target) or spec(f"cake_{target}"),
     )
 
     aot.gen_all_modules(
@@ -1027,10 +865,6 @@ def _run_public_mpi2_cycle():
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("the Cake backend requires SM100 or SM103")
 
-    from flashinfer.comm.trtllm_moe_alltoall import get_moe_alltoall_module
-
-    assert get_moe_alltoall_module() is get_moe_alltoall_module(backend="cake")
-
     routes = torch.tensor(_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda")
     payloads = _payloads(rank, routes)
     max_tokens = routes.shape[0]
@@ -1043,7 +877,6 @@ def _run_public_mpi2_cycle():
         _HIDDEN_SIZE,
         extra_payload_bytes_per_token=extra_payload_bytes,
         eplb_stats_num_experts=5,
-        backend="cake",
     )
     mapping = Mapping(rank=rank, moe_ep_size=2, tp_size=2, world_size=2)
     collective = MoeA2ADriver(
@@ -1054,9 +887,8 @@ def _run_public_mpi2_cycle():
         workspace_size_per_rank=workspace_size,
         eplb_stats_num_experts=5,
         enable_rank_mask=True,
-        backend="cake",
     )
-    active_mask = moe_a2a_active_rank_mask((0, 1), 2)
+    active_mask = active_rank_mask((0, 1), 2)
     _run_public_combine_round(
         collective,
         rank,
@@ -1089,7 +921,6 @@ def _run_public_mpi2_cycle():
         max_tokens,
         _HIDDEN_SIZE,
         extra_payload_bytes_per_token=extra_payload_bytes,
-        backend="cake",
     )
     topk8_collective = MoeA2ADriver(
         mapping,
@@ -1098,7 +929,6 @@ def _run_public_mpi2_cycle():
         num_experts=16,
         workspace_size_per_rank=topk8_workspace_size,
         enable_rank_mask=True,
-        backend="cake",
     )
     _run_public_combine_round(
         topk8_collective,
@@ -1164,7 +994,7 @@ def test_public_mpi2_nondivisible_six_payload_eplb_and_external_output():
     if rank == 0:
         routes = torch.tensor(_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda")
         payloads = _payloads(rank, routes)
-        rank_zero_mask = moe_a2a_active_rank_mask((0,), 2)
+        rank_zero_mask = active_rank_mask((0,), 2)
         for collective in (first[0],):
             _run_public_combine_round(
                 collective,

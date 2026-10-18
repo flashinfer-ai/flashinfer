@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``moe_a2a_dispatch``'s optional receive-view cache.
+"""The optional receive-view cache of the Cake kernels' ``dispatch``.
 
 The cache is a pure host-side optimization: it skips rebuilding the workspace-backed
 views on every dispatch. These tests pin the three properties that make that safe, and
 they run without a GPU or an MPI harness by stubbing the FFI module -- the real
-``tests/comm/test_trtllm_moe_alltoall.py`` path needs multi-rank NVLink hardware.
+``tests/comm/test_cake_moe_alltoall.py`` path needs multi-rank NVLink hardware.
 """
 
 import torch
 
-import flashinfer.comm.trtllm_moe_alltoall as a2a
+from flashinfer.moe_ep.backends.split.comm.cake import kernels as a2a
 
 
 _RECV_OFFSETS = [0, 512]
@@ -41,7 +41,7 @@ class _FakeModule:
 
 def _dispatch(workspace, cache, wrap_calls):
     payloads = [torch.zeros(2, 4), torch.zeros(2, 2)]
-    return a2a.moe_a2a_dispatch(
+    return a2a.dispatch(
         torch.zeros(2, 1, dtype=torch.int32),
         payloads,
         workspace,
@@ -57,13 +57,13 @@ def _dispatch(workspace, cache, wrap_calls):
 
 
 def _patch(monkeypatch, wrap_calls):
-    monkeypatch.setattr(a2a, "get_moe_alltoall_module", lambda *a, **k: _FakeModule)
+    monkeypatch.setattr(a2a, "current_module", lambda: _FakeModule)
 
     def fake_wrap(workspace, leading_shape, slice_start, slice_end, dtype):
         wrap_calls.append((int(slice_start), int(slice_end), dtype))
         return torch.zeros(1)
 
-    monkeypatch.setattr(a2a, "moe_a2a_wrap_payload_tensor_in_workspace", fake_wrap)
+    monkeypatch.setattr(a2a, "wrap_workspace", fake_wrap)
 
 
 def test_cache_none_rebuilds_every_call(monkeypatch):
@@ -125,7 +125,7 @@ class _IdentityInt(int):
 def test_cache_key_survives_an_identity_hashing_ffi_int(monkeypatch):
     """The key must hash by value even if the FFI hands back a wrapper.
 
-    ``moe_a2a_dispatch`` returns ``tvm::ffi::Array<int64_t>``, and each read boxes a
+    The module's ``moe_a2a_dispatch`` returns ``tvm::ffi::Array<int64_t>``, and each read boxes a
     fresh object (``a[0] is a[0]`` is False outside CPython's small-int intern
     range).  Value-based hashing is what makes that harmless.  Were the elements
     ever boxed in something that hashed by identity, every lookup would miss:
@@ -148,7 +148,7 @@ def test_cache_key_survives_an_identity_hashing_ffi_int(monkeypatch):
                 0,
             )
 
-    monkeypatch.setattr(a2a, "get_moe_alltoall_module", lambda *a, **k: _WrapperModule)
+    monkeypatch.setattr(a2a, "current_module", lambda: _WrapperModule)
 
     ws = torch.zeros(4)
     cache = {}

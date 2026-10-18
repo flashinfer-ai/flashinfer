@@ -30,12 +30,13 @@ from itertools import product
 from typing import Any, Dict, List, Literal, Tuple
 
 
-def gen_comm_alltoall_module() -> JitSpec:
+def gen_moe_ep_nvlink_two_sided_module() -> JitSpec:
+    """NVLink two-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkTwoSidedAlltoAll``."""
     return gen_jit_spec(
-        "comm",
+        "moe_ep_nvlink_two_sided_alltoall",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall_prepare.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "moe_ep_nvlink_two_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "moe_ep_nvlink_two_sided_prepare.cu",
         ],
     )
 
@@ -304,31 +305,31 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
-MoeAlltoAllTarget = Literal["sm100a", "sm103a"]
+CakeAlltoAllTarget = Literal["sm100a", "sm103a"]
 
-_MOE_ALLTOALL_GENERATED_SOURCE = {
+_CAKE_ALLTOALL_GENERATED_SOURCE = {
     "sm100a": "mnnvl_moe_alltoall_sm100.cu",
     "sm103a": "mnnvl_moe_alltoall_sm103.cu",
 }
-_MOE_ALLTOALL_NVCC_FLAGS = {
+_CAKE_ALLTOALL_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
 }
 
 
-def gen_moe_alltoall_module(target: MoeAlltoAllTarget) -> JitSpec:
-    """Cake MoE all-to-all module behind the ``flashinfer.comm`` ``moe_a2a_*`` ops."""
-    if target not in _MOE_ALLTOALL_GENERATED_SOURCE:
-        raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
-    module_name = f"mnnvl_moe_alltoall_{target}"
+def gen_moe_ep_cake_module(target: CakeAlltoAllTarget) -> JitSpec:
+    """Cake MoE all-to-all of one architecture behind ``flashinfer.moe_ep.CakeAlltoAll``."""
+    if target not in _CAKE_ALLTOALL_GENERATED_SOURCE:
+        raise ValueError(f"unsupported Cake MoE all-to-all target: {target}")
+    module_name = f"moe_ep_cake_alltoall_{target}"
     kernel_sources = [
         jit_env.FLASHINFER_CSRC_DIR / "cake_moe_alltoall_dispatch.cu",
         jit_env.FLASHINFER_CSRC_DIR
         / "generated"
         / "moe_alltoall"
-        / _MOE_ALLTOALL_GENERATED_SOURCE[target],
+        / _CAKE_ALLTOALL_GENERATED_SOURCE[target],
     ]
-    arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
+    arch_flags = _CAKE_ALLTOALL_NVCC_FLAGS[target]
     return gen_jit_spec(
         module_name,
         [
