@@ -23,7 +23,9 @@ sequence module per (world size, dtype, weight layout, architecture)
 launcher ``run`` (barrier, bridge event, copy-engine pushes with their
 readiness epochs, main kernel with cached tensor maps) and ``run_push`` for
 the calls ``uses_sm_push`` routes through the SM push kernel (the base rule
-plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands). The main kernels are
+plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands; the push launch of a
+call is the architecture's ``PUSH_LAUNCH_ROWS_BY_ARCH`` row of its world size
+and padded rows, else the per-peer payload rule). The main kernels are
 tcgen05 code, so a sequence is compiled for its exact architecture
 (``sm_100a`` or ``sm_103a``).
 A route whose (world size, dtype, weight layout) class is listed in
@@ -156,6 +158,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
+    "cake_all_gather_matmul_aa1b0acc28e1e23913d9": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_b4f547b76a4b6c14c87b": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
@@ -201,6 +211,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_d0fc2abec5d93b9a81ec": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -257,6 +275,7 @@ ROUTES: dict[str, str] = {
     "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
     "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
     "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_bb046ade8e857469f0c6",
+    "main_bfloat16_ws2_k_major_cg2": "cake_all_gather_matmul_d0fc2abec5d93b9a81ec",
     "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_c27adeb3c14305afd206",
     "main_bfloat16_ws2_n_major_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
     "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_a01c4436c21e679aaed9",
@@ -269,6 +288,7 @@ ROUTES: dict[str, str] = {
     "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_f2e488e6c8974711b331",
     "main_bfloat16_ws8_n_major_n128": "cake_all_gather_matmul_ef0a40fd8365adef0679",
     "main_float16_ws2_k_major": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
+    "main_float16_ws2_k_major_cg2": "cake_all_gather_matmul_aa1b0acc28e1e23913d9",
     "main_float16_ws2_n_major": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
     "main_float16_ws4_k_major": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
     "main_float16_ws4_k_major_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
@@ -308,6 +328,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bb046ade8e857469f0c6_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -320,6 +341,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_bb046ade8e857469f0c6",
+            "main_cg2": "cake_all_gather_matmul_d0fc2abec5d93b9a81ec",
         },
     },
     "bfloat16_ws2_n_major_sm_100a": {
@@ -584,6 +606,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c0a6678e73a6e854bfac_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -596,6 +619,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
+            "main_cg2": "cake_all_gather_matmul_aa1b0acc28e1e23913d9",
         },
     },
     "float16_ws2_n_major_sm_100a": {
@@ -842,6 +866,16 @@ SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
     "sm_100a": [],
     "sm_103a": [[8, 1024, 1619]],
 }
+# Per-architecture SM push launch rows ``[world_size, padded_rows, ctas_per_peer,
+# unroll]`` beyond the payload rule of ``push_launch`` (copied from the kernel
+# module): an SM-push call of exactly ``padded_rows`` padded rows at
+# ``world_size`` launches ``ctas_per_peer`` CTAs per peer of the push program
+# with ``unroll`` vectors in flight; an arch outside the table is an error,
+# never the payload rule alone.
+PUSH_LAUNCH_ROWS_BY_ARCH: dict[str, list[list[int]]] = {
+    "sm_100a": [],
+    "sm_103a": [[4, 512, 16, 8]],
+}
 # Classes ``[world_size, dtype, b_layout]`` with a delivered ``_cg2`` main (the
 # CTA-pair twin of the N256 main), per architecture; ``main_form`` selects the
 # twin only inside this table.
@@ -852,7 +886,9 @@ CG2_CLASSES: dict[str, list[list[Any]]] = {
         [8, "bfloat16", "k_major"],
     ],
     "sm_103a": [
+        [2, "bfloat16", "k_major"],
         [2, "bfloat16", "n_major"],
+        [2, "float16", "k_major"],
         [4, "bfloat16", "k_major"],
         [8, "bfloat16", "k_major"],
     ],
@@ -881,6 +917,9 @@ CG2_REGIONS: dict[str, list[list[Any]]] = {
         [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
         [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
         [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+        [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
+        [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
+        [2, "float16", "k_major", 1024, 1024, 2048, 2048],
     ],
 }
 
@@ -918,10 +957,11 @@ CHUNK_ROWS = 2432
 # of a contiguous ``[N, K]`` parameter.
 B_LAYOUTS: tuple[str, ...] = ("n_major", "k_major")
 MAIN_THREADS = 192
-# SM push launch: the per-peer payload of a call, ``padded_rows x K x
-# dtype_bytes``, selects it (``push_launch``). Below
-# ``PUSH_PAYLOAD_THRESHOLD_BYTES``: ``PUSH_CTAS_PER_PEER`` CTAs per remote peer
-# along grid x (one peer per grid y) of the ``peer_push`` program
+# SM push launch: the architecture's ``PUSH_LAUNCH_ROWS_BY_ARCH`` row of the
+# call's (world size, padded rows) when it lists one, else the per-peer payload
+# of the call, ``padded_rows x K x dtype_bytes``, selects it (``push_launch``).
+# Below ``PUSH_PAYLOAD_THRESHOLD_BYTES``: ``PUSH_CTAS_PER_PEER`` CTAs per remote
+# peer along grid x (one peer per grid y) of the ``peer_push`` program
 # (``PUSH_UNROLL`` 16-byte vectors in flight per lane); at or above it:
 # ``PUSH_WIDE_CTAS_PER_PEER`` CTAs of the ``peer_push_wide`` program
 # (``PUSH_WIDE_UNROLL``). ``PUSH_CARVEOUT`` is both push functions' preferred
@@ -929,7 +969,7 @@ MAIN_THREADS = 192
 # local rows up to which the base rule routes a ws4/ws8 call through the SM
 # push (``SM_PUSH_BANDS_BY_ARCH`` adds per-architecture bands beyond it). All
 # mirror the Cake export adapter; the host sequence compiles the launch
-# constants and its bands in and chooses per call itself.
+# constants, its launch rows and its bands in and chooses per call itself.
 PUSH_CTAS_PER_PEER = 32
 PUSH_UNROLL = 1
 PUSH_WIDE_CTAS_PER_PEER = 8
@@ -1246,15 +1286,40 @@ def push_payload_bytes(padded_rows: int, dtype_bytes: int) -> int:
     return int(padded_rows) * K * int(dtype_bytes)
 
 
-def push_launch(padded_rows: int, dtype_bytes: int) -> tuple[str, int, int]:
+def push_launch_rows(arch: str) -> tuple[tuple[int, int, int, int], ...]:
+    """``PUSH_LAUNCH_ROWS_BY_ARCH[arch]`` as ``(world_size, padded_rows, ctas_per_peer,
+    unroll)`` 4-tuples; an arch outside the table is an error, never an empty default."""
+
+    if arch not in PUSH_LAUNCH_ROWS_BY_ARCH:
+        raise ValueError(
+            f"PUSH_LAUNCH_ROWS_BY_ARCH has no SM push launch rows for arch {arch!r} "
+            f"(known: {sorted(PUSH_LAUNCH_ROWS_BY_ARCH)})"
+        )
+    return tuple(
+        (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        for row in PUSH_LAUNCH_ROWS_BY_ARCH[arch]
+    )
+
+
+def push_launch(
+    padded_rows: int, dtype_bytes: int, *, world_size: int, arch: str
+) -> tuple[str, int, int]:
     """``(route key, CTAs per peer, vectors in flight)`` of the SM push launch a call takes.
 
     The mirror of the rule compiled into ``run_push`` (which makes the choice
-    itself): the ``peer_push`` program with the 32-CTA grid below
-    ``PUSH_PAYLOAD_THRESHOLD_BYTES`` per peer, the ``peer_push_wide`` program
-    with the wide grid at or above it.
+    itself): the architecture's launch row of exactly ``(world_size,
+    padded_rows)`` when ``PUSH_LAUNCH_ROWS_BY_ARCH`` lists one (its route key is
+    the push program of its vectors in flight), else the ``peer_push`` program
+    with the 32-CTA grid below ``PUSH_PAYLOAD_THRESHOLD_BYTES`` per peer and the
+    ``peer_push_wide`` program with the wide grid at or above it. An unknown
+    arch raises, never defaults.
     """
 
+    programs = {PUSH_UNROLL: "peer_push", PUSH_WIDE_UNROLL: "peer_push_wide"}
+    rows = push_launch_rows(arch)
+    for row_world_size, row_padded_rows, ctas_per_peer, unroll in rows:
+        if (row_world_size, row_padded_rows) == (int(world_size), int(padded_rows)):
+            return programs[unroll], ctas_per_peer, unroll
     if push_payload_bytes(padded_rows, dtype_bytes) >= PUSH_PAYLOAD_THRESHOLD_BYTES:
         return "peer_push_wide", PUSH_WIDE_CTAS_PER_PEER, PUSH_WIDE_UNROLL
     return "peer_push", PUSH_CTAS_PER_PEER, PUSH_UNROLL
@@ -1435,6 +1500,7 @@ __all__ = [
     "COMPILE_FLAGS",
     "PUSH_CARVEOUT",
     "PUSH_CTAS_PER_PEER",
+    "PUSH_LAUNCH_ROWS_BY_ARCH",
     "PUSH_PAYLOAD_THRESHOLD_BYTES",
     "PUSH_UNROLL",
     "PUSH_WIDE_CTAS_PER_PEER",
@@ -1473,6 +1539,7 @@ __all__ = [
     "peer_push_program",
     "peer_push_wide_program",
     "push_launch",
+    "push_launch_rows",
     "push_payload_bytes",
     "sequence_name",
     "sequence_programs",
