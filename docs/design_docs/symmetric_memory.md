@@ -68,8 +68,10 @@ may have settled on a type that the other ranks of this group (say, its EP
 group) never saw. The votes likewise turn a failure on one rank into the same
 outcome on all of them instead of leaving the others blocked in a collective.
 
-The callers' `make_prop(handle_type)` builds the allocation properties and
-size for the handle type being tried. `SymmDeviceMemory` sizes its buffer
+Each caller passes a callback, `make_prop(handle_type)`, that returns the
+allocation properties and size for a handle type; `allocate_mnnvl_handles`
+calls it for each type it attempts, since the handle type is part of the
+properties. `SymmDeviceMemory` sizes its buffer
 there, including the multicast granularity. `MnnvlMemory` must place the
 allocation in its address reservation before the handle type is settled, so it
 sizes allocations with a granularity that fits both handle types.
