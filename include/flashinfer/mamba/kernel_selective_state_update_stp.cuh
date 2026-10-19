@@ -773,8 +773,8 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
     // Write output — wait for all consumer warps to finish writing sram.out
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
-    auto d = warp * warpSize + lane;
-    if (d < DIM) {
+    // The consumer warps cover consumerWarps * warpSize rows per iteration, so loop for DIM > 128.
+    for (int d = warp * warpSize + lane; d < DIM; d += consumerWarps * warpSize) {
       auto out_value = sram.out[d];
       if (z) {
         float z_value = toFloat(sram.z[d]);
@@ -783,10 +783,8 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
         out_value *= silu_z;
       }
       convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
-    }
-    if constexpr (scaleState) {
-      if (params.update_state && state_batch != params.pad_slot_id) {
-        if (d < DIM) {
+      if constexpr (scaleState) {
+        if (params.update_state && state_batch != params.pad_slot_id) {
           state_scale[dst_state_batch * params.state_scale_stride_batch + head * DIM + d] =
               sram.state_scale[d];
         }
