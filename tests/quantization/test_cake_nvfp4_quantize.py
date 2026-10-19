@@ -30,6 +30,12 @@ from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import (
     kernel_definitions,
     kernel_module_name,
 )
+from tests.test_helpers.cake_nvfp4_per_token import (
+    VALIDATED_F16_INPUT_ROWS,
+    VALIDATED_OFF_MATRIX_QUANTIZE_K,
+    VALIDATED_QUANTIZE_K,
+    required_kernel_keys,
+)
 
 FLT_MAX = 3.4028234663852886e38
 GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
@@ -214,7 +220,7 @@ def test_quant_plan_grid_and_keys():
 
 # Row lengths of the validated matrix and dense token counts around every
 # dispatch boundary (single row, one wave, two CTAs per SM, the many-CTA split).
-REACHABLE_K = cb.VALIDATED_QUANTIZE_K + cb.VALIDATED_OFF_MATRIX_QUANTIZE_K
+REACHABLE_K = VALIDATED_QUANTIZE_K + VALIDATED_OFF_MATRIX_QUANTIZE_K
 REACHABLE_M = tuple(range(1, 33)) + (
     *range(48, 160, 4),
     *range(160, 600, 16),
@@ -244,7 +250,7 @@ def test_f16_quantizer_shapes_match_the_validated_f16_rows():
     """fp16 activations are generated for the validated fp16 rows (K = 7168 at
     256 threads, scale not folded); every other fp16 shape names its missing
     program instead of mis-dispatching."""
-    for m in cb.VALIDATED_F16_INPUT_ROWS:
+    for m in VALIDATED_F16_INPUT_ROWS:
         _registered(cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a")
     unregistered = 0
     for k in REACHABLE_K:
@@ -305,7 +311,7 @@ def test_static_k_programs_are_built_with_their_compile_line_definition():
 
 @pytest.mark.parametrize("arch", cb.ARCHES)
 def test_required_kernel_keys_are_registered_when_programs_exist(arch):
-    required = cb.required_kernel_keys(arch)
+    required = required_kernel_keys(arch)
     assert any(key.startswith("quant:") for key in required)
     assert any(key.startswith("gemm:") for key in required)
     if arch in KERNELS:
@@ -503,7 +509,8 @@ def _check_against_reference(x, gs_inv, out_scale, fp4, sf, scale):
     assert bool(((decoded - ref_codes).abs() <= quantum * 1.001).all())
 
 
-# The validated matrix (cake_backend.validated_problems): bf16 activations on
+# The validated matrix (validated_problems in tests/test_helpers/
+# cake_nvfp4_per_token.py): bf16 activations on
 # every K x M x fold; fp16 activations on the validated fp16 rows of K=7168 only.
 _QUANT_CASES = (
     [
@@ -512,7 +519,7 @@ _QUANT_CASES = (
         for k in (7168, 16384)
         for m in (1, 17, 130, 257, 4097)
     ]
-    + [(m, 7168, torch.float16, False) for m in cb.VALIDATED_F16_INPUT_ROWS]
+    + [(m, 7168, torch.float16, False) for m in VALIDATED_F16_INPUT_ROWS]
     # Row lengths outside the measured families and the token counts between tiles.
     + [
         (m, k, torch.bfloat16, False)

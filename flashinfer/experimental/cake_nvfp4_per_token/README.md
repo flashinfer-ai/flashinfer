@@ -52,7 +52,8 @@ cb.prepare_nvfp4_per_token_quantize(x, gs_inv, ws)()      # quantizer alone
 cb.prepare_mm_fp4_per_token(ws.fp4, ws.sf, w_fp4, w_sf, ws.scale, out)()   # GEMM alone
 ```
 
-Validated matrix (`cake_backend.validated_problems`): `(K, N)` in {(7168, 2112),
+Validated matrix (`validated_problems` in `tests/test_helpers/cake_nvfp4_per_token.py`):
+`(K, N)` in {(7168, 2112),
 (7168, 1536), (16384, 7168), (7168, 18432), (18432, 7168), (8192, 8192),
 (8192, 28672), (28672, 8192)} x `M` in {1, 8, 17, 32, 128, 130, 257, 512, 2048, 8192}
 x bf16 / fp16 output, ragged `M` in {3, 1000, 4097}, fp16 activations and a folded
@@ -65,7 +66,9 @@ Correctness: quantizer outputs bitwise equal to the CuTe-DSL per-token kernel; G
 `|out - ref| <= 1e-2 + 1e-2 |ref| + half an output ulp` against the FP32 dequantized
 operands (`tests/gemm/test_cake_mm_fp4.py`, `tests/quantization/test_cake_nvfp4_quantize.py`).
 
-Generated sources live under `csrc/cake_nvfp4_per_token/<arch>/` and are registered in
+Generated sources live flat under `csrc/cake_nvfp4_per_token/` (architecture-neutral
+`*_kernel.cu` / `*_binding.cu` sources whose per-architecture lowering is selected by
+`__CUDA_ARCH__` guards, plus the shared `*_common.cuh` headers) and are registered in
 `cake_jit.py` (`MODULES`, `KERNELS`) by the Cake generated-program export (see the
 hand-maintained exception below).
 

@@ -4040,10 +4040,9 @@ ARCH_NVCC_FLAGS = {
 }
 
 
-def route_available(arch: str, required_keys: tuple[str, ...] = ()) -> bool:
-    """True when ``arch`` is registered and carries every key in ``required_keys``."""
-    table = KERNELS.get(arch)
-    return table is not None and all(key in table for key in required_keys)
+def route_available(arch: str) -> bool:
+    """True when ``arch`` is registered."""
+    return arch in KERNELS
 
 
 def kernel_module_name(arch: str, key: str) -> str:
