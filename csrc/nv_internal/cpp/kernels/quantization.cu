@@ -90,13 +90,22 @@ inline int computeEffectiveRows(int m, QuantizationSFLayout layout) {
   return effectiveRows;
 }
 
-// SM10x devices with <= 1024 threads/SM (SM107) use the LOADS_IN_FLIGHT=2 kernels.
-inline bool useTwoLoadsInFlight() {
-  int device = -1, maxThreadsPerSM = 0, major = 0;
+// Resident threads/SM if the device uses the LOADS_IN_FLIGHT=2 kernels, else 0. That is
+// devices with <= 1024 threads/SM (today only SM107); major >= 10 is where the device code
+// uses kSm100EltsPerThread. Cached per device.
+inline int twoLoadsMaxThreadsPerSM() {
+  static thread_local int cachedDevice = -1;
+  static thread_local int cachedValue = 0;
+  int device = -1;
   cudaGetDevice(&device);
-  cudaDeviceGetAttribute(&maxThreadsPerSM, cudaDevAttrMaxThreadsPerMultiProcessor, device);
-  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  return major >= 10 && maxThreadsPerSM <= 1024;
+  if (device != cachedDevice) {
+    int maxThreadsPerSM = 0, major = 0;
+    cudaDeviceGetAttribute(&maxThreadsPerSM, cudaDevAttrMaxThreadsPerMultiProcessor, device);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cachedValue = (major >= 10 && maxThreadsPerSM <= 1024) ? maxThreadsPerSM : 0;
+    cachedDevice = device;
+  }
+  return cachedValue;
 }
 
 // Device-side CVT_FP16_TO_*_ELTS_PER_THREAD (the host pass sees 8).
@@ -230,10 +239,11 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   // Each thread converts 8/16 values.
   // Two-load path: block = half a row of vectors.
   int const numColThreads = n / kSm100EltsPerThread;
-  bool const twoLoads = useTwoLoadsInFlight() && numColThreads % 64 == 0;
+  int const twoLoadsThreadsPerSM = twoLoadsMaxThreadsPerSM();
+  bool const twoLoads = twoLoadsThreadsPerSM > 0 && numColThreads % 64 == 0;
   dim3 block(twoLoads ? std::min(numColThreads / 2, 512) : 128);
-  int const numBlocksPerSM =
-      twoLoads ? runtimeBlocksPerSM(block.x) : static_cast<int>(std::max(1u, 2048u / block.x));
+  int const numBlocksPerSM = twoLoads ? std::max(1, twoLoadsThreadsPerSM / int(block.x))
+                                      : static_cast<int>(std::max(1u, 2048u / block.x));
   int effectiveRows = computeEffectiveRows(m, layout);
   dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
@@ -606,11 +616,12 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     // Each thread converts 8 values.
     // MXFP4 two-load path: block = half a row of vectors.
     int const numColThreads = n / kSm100EltsPerThread;
-    bool const twoLoads = SF_VEC_SIZE == 32 && useTwoLoadsInFlight() && numColThreads % 64 == 0;
+    int const twoLoadsThreadsPerSM = SF_VEC_SIZE == 32 ? twoLoadsMaxThreadsPerSM() : 0;
+    bool const twoLoads = twoLoadsThreadsPerSM > 0 && numColThreads % 64 == 0;
     dim3 block(twoLoads ? std::min(numColThreads / 2, 512)
                         : std::min(int(n / CVT_FP16_TO_FP4_ELTS_PER_THREAD), 512));
-    int const numBlocksPerSM =
-        twoLoads ? runtimeBlocksPerSM(block.x) : static_cast<int>(std::max(1u, 2048u / block.x));
+    int const numBlocksPerSM = twoLoads ? std::max(1, twoLoadsThreadsPerSM / int(block.x))
+                                        : static_cast<int>(std::max(1u, 2048u / block.x));
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 

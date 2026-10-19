@@ -363,6 +363,9 @@ quantize_with_block_size(
                 optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numColsForSf / SF_VEC_SIZE,
                 SFout, layout);
 
+            // The input tensor offset.
+            int64_t inOffset =
+                static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
             int64_t outOffset =
                 static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
 
@@ -385,13 +388,12 @@ quantize_with_block_size(
                 sf_out[0] = 0x00;
               }
             } else {
-              PackedVecT& in_vec = in_vecs[u];
+              PackedVecT in_vec;
               if constexpr (LOADS_IN_FLIGHT == 1) {
                 // Load the input vector.
-                loadPackedVec(
-                    in_vec, reinterpret_cast<PackedVecT const*>(in) +
-                                static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads +
-                                colIdx);
+                loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+              } else {
+                in_vec = in_vecs[u];
               }
 
               // Dispatch the quantization kernel.
