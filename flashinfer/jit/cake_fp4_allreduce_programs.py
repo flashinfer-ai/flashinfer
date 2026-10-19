@@ -111,7 +111,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_binding.cu",
         ),
         "block": 352,
-        "dynamic_smem_bytes": 226176,
+        "dynamic_smem_bytes": 205696,
         "params": (
             "x",
             "res_in",
@@ -150,7 +150,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_bf16_bf16_pf_binding.cu",
         ),
         "block": 352,
-        "dynamic_smem_bytes": 226176,
+        "dynamic_smem_bytes": 205696,
         "params": (
             "x",
             "res_in",
@@ -353,7 +353,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_binding.cu",
         ),
         "block": 288,
-        "dynamic_smem_bytes": 211456,
+        "dynamic_smem_bytes": 195072,
         "params": (
             "xq",
             "gs",
@@ -393,7 +393,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_binding.cu",
         ),
         "block": 288,
-        "dynamic_smem_bytes": 211456,
+        "dynamic_smem_bytes": 195072,
         "params": (
             "xq",
             "gs",
@@ -433,7 +433,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pa_pf_binding.cu",
         ),
         "block": 288,
-        "dynamic_smem_bytes": 211456,
+        "dynamic_smem_bytes": 195072,
         "params": (
             "xq",
             "gs",
@@ -473,7 +473,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_fp4_allreduce/cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf_binding.cu",
         ),
         "block": 288,
-        "dynamic_smem_bytes": 211456,
+        "dynamic_smem_bytes": 195072,
         "params": (
             "xq",
             "gs",
