@@ -730,29 +730,27 @@ cvt_fp16_to_fp4_expert(
 //        padded columns get scale byte 0.
 // mask:  [numExperts]; only the first min(mask[e], numRows) rows of expert e are read and written.
 //
-// blockIdx.x is the expert; blockIdx.y and threadIdx.y stride over its rows, threadIdx.x over the
-// half scale blocks of a row. Two lanes quantize a scale block and shuffle its maximum within the
-// warp, so every lane runs every column iteration.
+// The valid rows of all experts form one list, so a skewed mask still spreads over the whole grid.
+// blockIdx.x and threadIdx.y stride over the list, threadIdx.x over the half scale blocks of a row.
+// Two lanes quantize a scale block and shuffle its maximum within the warp, so a warp holds one row
+// and every lane runs every column iteration. With at most 32 experts each warp keeps the experts'
+// first rows in registers; otherwise the block keeps them in numExperts + 1 int32 of dynamic
+// shared memory.
 template <class Type, bool USE_SILU_AND_MUL>
-__global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32_t numPaddedCols,
-                                         Type const* in, int32_t const* mask, uint8_t* out,
-                                         uint32_t* SFout) {
+__global__ void cvt_fp16_to_mxfp8_expert(int32_t numExperts, int32_t numRows, int32_t numCols,
+                                         int32_t numPaddedCols, Type const* in, int32_t const* mask,
+                                         uint8_t* out, uint32_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static constexpr int SF_VEC_SIZE = 32;
   // Half a scale block, read with one 32-byte load.
   using HalfBlockT = PackedVec<Type, SF_VEC_SIZE / 2>;
   static_assert(sizeof(HalfBlockT) == sizeof(PackedU32x8));
+  extern __shared__ int32_t expertFirstRow[];
 
-  cudaGridDependencySynchronize();
-
-  int const expertIdx = blockIdx.x;
-  int const numValidRows = min(mask[expertIdx], numRows);
   int const numHalfBlocks = numCols / (SF_VEC_SIZE / 2);
   int const numPaddedHalfBlocks = numPaddedCols / (SF_VEC_SIZE / 2);
   int const numInHalfBlocks = USE_SILU_AND_MUL ? 2 * numHalfBlocks : numHalfBlocks;
-
-  for (int rowIdx = blockIdx.y * blockDim.y + threadIdx.y; rowIdx < numValidRows;
-       rowIdx += gridDim.y * blockDim.y) {
+  auto const quantizeRow = [&](int expertIdx, int rowIdx) {
     // Non-negative indices let the scale-offset math use shifts instead of signed division.
     __builtin_assume(rowIdx >= 0);
     int64_t const rowOffset = static_cast<int64_t>(expertIdx) * numRows + rowIdx;
@@ -780,6 +778,71 @@ __global__ void cvt_fp16_to_mxfp8_expert(int32_t numRows, int32_t numCols, int32
       if (colIdx < numPaddedHalfBlocks) {
         reinterpret_cast<uint4*>(out)[rowOffset * numPaddedHalfBlocks + colIdx] = outVec;
       }
+    }
+  };
+
+  cudaGridDependencySynchronize();
+
+  int const tid = threadIdx.y * blockDim.x + threadIdx.x;
+  int const laneIdx = tid % 32;
+  int const listBegin = blockIdx.x * blockDim.y + threadIdx.y;
+  int const listStride = gridDim.x * blockDim.y;
+  // Inclusive warp scan of value; every lane passes the same carry.
+  auto const warpScan = [&](int value, int carry) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      int const prev = __shfl_up_sync(0xffffffffu, value, offset);
+      value += laneIdx >= offset ? prev : 0;
+    }
+    return value + carry;
+  };
+
+  if (numExperts <= 32) {
+    int const count = laneIdx < numExperts ? max(0, min(mask[laneIdx], numRows)) : 0;
+    int const lastRow = warpScan(count, 0);
+    int const firstRow = lastRow - count;
+    int const numValidRows = __shfl_sync(0xffffffffu, lastRow, 31);
+    for (int listIdx = listBegin; listIdx < numValidRows; listIdx += listStride) {
+      // The row's expert is the last one whose first row is at most listIdx.
+      int const expertIdx =
+          __popc(__ballot_sync(0xffffffffu, laneIdx < numExperts && firstRow <= listIdx)) - 1;
+      quantizeRow(expertIdx, listIdx - __shfl_sync(0xffffffffu, firstRow, expertIdx));
+    }
+  } else {
+    for (int e = tid; e < numExperts; e += blockDim.x * blockDim.y) {
+      expertFirstRow[e + 1] = max(0, min(mask[e], numRows));
+    }
+    __syncthreads();
+    if (tid < 32) {
+      int carry = 0;
+      for (int base = 0; base < numExperts; base += 32) {
+        int const e = base + laneIdx;
+        int const lastRow = warpScan(e < numExperts ? expertFirstRow[e + 1] : 0, carry);
+        if (e < numExperts) {
+          expertFirstRow[e + 1] = lastRow;
+        }
+        carry = __shfl_sync(0xffffffffu, lastRow, 31);
+      }
+      if (laneIdx == 0) {
+        expertFirstRow[0] = 0;
+      }
+    }
+    __syncthreads();
+    int const numValidRows = expertFirstRow[numExperts];
+    for (int listIdx = listBegin; listIdx < numValidRows; listIdx += listStride) {
+      // The row's expert is the last one whose first row is at most listIdx; the first rows are
+      // non-decreasing, so the warp counts them 32 at a time.
+      int expertIdx = -1;
+      for (int base = 0; base < numExperts; base += 32) {
+        int const e = base + laneIdx;
+        unsigned const atOrBefore =
+            __ballot_sync(0xffffffffu, e < numExperts && expertFirstRow[e] <= listIdx);
+        expertIdx += __popc(atOrBefore);
+        if (atOrBefore != 0xffffffffu) {
+          break;
+        }
+      }
+      quantizeRow(expertIdx, listIdx - expertFirstRow[expertIdx]);
     }
   }
   cudaTriggerProgrammaticLaunchCompletion();

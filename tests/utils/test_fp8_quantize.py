@@ -1017,24 +1017,30 @@ def _grouped_mxfp8_scales(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
 @pytest.mark.parametrize(
     "batch_shape",
     [
-        # One block per expert, so each block loops over several row tiles.
+        # More experts than one warp scans at a time.
         (1024, 200, 128),
-        # More row tiles per expert than resident blocks.
+        # More valid rows than the grid holds at once.
         (2, 8192, 1024),
     ],
 )
+@pytest.mark.parametrize("skewed", [False, True])
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
-def test_mxfp8_experts_quantize_grid_stride(batch_shape, use_silu_and_mul):
-    """Blocks that loop over several row tiles quantize every valid row exactly."""
+def test_mxfp8_experts_quantize_grid_stride(batch_shape, skewed, use_silu_and_mul):
+    """Every valid row is quantized exactly, however the rows spread over the experts."""
     _skip_unless_grouped_backend("cuda")
 
     torch.manual_seed(0)
     b, m, k = batch_shape
     in_k = 2 * k if use_silu_and_mul else k
     a = torch.randn((b, m, in_k), dtype=torch.bfloat16, device="cuda") * 4
-    mask = torch.randint(0, m + 1, (b,), dtype=torch.int32, device="cuda")
-    mask[0] = m
+    if skewed:
+        # Only the last expert has rows.
+        mask = torch.zeros((b,), dtype=torch.int32, device="cuda")
+        mask[-1] = m
+    else:
+        mask = torch.randint(0, m + 1, (b,), dtype=torch.int32, device="cuda")
+        mask[0] = m
 
     out, out_scale = _run_mxfp8_experts_quantize(a, mask, use_silu_and_mul)
 

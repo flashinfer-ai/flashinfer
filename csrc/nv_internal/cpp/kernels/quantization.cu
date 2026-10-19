@@ -19,6 +19,7 @@
 #include <float.h>
 
 #include <cub/cub.cuh>
+#include <limits>
 #include <type_traits>
 
 #include "tensorrt_llm/common/assert.h"
@@ -267,21 +268,26 @@ void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_
   int const blockY = std::max(1, kMaxBlockThreads / blockX);
   dim3 const block(blockX, blockY);
 
-  // The mask is read on the device, so the grid covers all m rows, capped at one wave of resident
-  // blocks (at least one per expert). Experts are on grid x so that, with few valid rows, the
-  // active blocks spread over all SMs.
+  // The mask is read on the device, so the grid covers all numExperts * m rows, capped at one wave
+  // of resident blocks; the kernel spreads the valid rows over it.
+  int64_t const numRows = static_cast<int64_t>(numExperts) * m;
+  TLLM_CHECK_WITH_INFO(numRows <= std::numeric_limits<int32_t>::max(),
+                       "numExperts * m must fit in int32");
+  size_t const smemBytes = (numExperts + 1) * sizeof(int32_t);
+  constexpr size_t kMaxSmemBytes = 48 * 1024;
+  TLLM_CHECK_WITH_INFO(smemBytes <= kMaxSmemBytes, "numExperts must be at most %zu",
+                       kMaxSmemBytes / sizeof(int32_t) - 1);
   auto const kernel =
       use_silu_and_mul ? cvt_fp16_to_mxfp8_expert<T, true> : cvt_fp16_to_mxfp8_expert<T, false>;
   int numBlocksPerSM = 0;
-  TLLM_CUDA_CHECK(
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM, kernel, blockX * blockY, 0));
-  int const numRowBlocks = (m + blockY - 1) / blockY;
-  int const maxBlocksPerExpert =
-      std::max(1, multiProcessorCount * std::max(1, numBlocksPerSM) / numExperts);
-  dim3 const grid(numExperts, std::min(numRowBlocks, maxBlocksPerExpert));
+  TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM, kernel,
+                                                                blockX * blockY, smemBytes));
+  int64_t const numRowBlocks = (numRows + blockY - 1) / blockY;
+  dim3 const grid(static_cast<unsigned>(
+      std::min<int64_t>(numRowBlocks, multiProcessorCount * std::max(1, numBlocksPerSM))));
 
-  launchWithPdlWhenEnabled("cvt_fp16_to_mxfp8_expert", enable_pdl, kernel, grid, block, 0, stream,
-                           m, n, padded_n, input, mask, output, SFOutput);
+  launchWithPdlWhenEnabled("cvt_fp16_to_mxfp8_expert", enable_pdl, kernel, grid, block, smemBytes,
+                           stream, numExperts, m, n, padded_n, input, mask, output, SFOutput);
 }
 
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
