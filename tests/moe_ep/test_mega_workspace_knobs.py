@@ -2,12 +2,305 @@
 
 from __future__ import annotations
 
+import dataclasses
 from unittest import mock
 
 import pytest
 import torch
 
+from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+    Sm100GenphaseMoeConfig,
+)
+from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+    default_sm100_genphase_knobs,
+    is_valid_sm100_genphase_knobs,
+    sm100_genphase_candidates,
+)
+
 from .test_mega_workspace_api import _inputs
+
+
+def _mxfp8_backend(*, capacity=129, hidden=384, **kwargs):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    config = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=192, top_k=3, **kwargs
+    )
+    backend = create_mega_kernel(config)
+    bootstrap = BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    backend.bind_ep_bootstrap(bootstrap)
+    fleet = FleetParams(
+        num_experts=8, max_tokens_per_rank=capacity, token_hidden_size=hidden
+    )
+    return backend, bootstrap, fleet
+
+
+def test_blackwell_mxfp8_legacy_config_and_dispatch(monkeypatch, dist_not_initialized):
+    """Old positional arguments, allocator and cache key retain their contract."""
+    import dataclasses
+
+    from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    assert [
+        f.name for f in dataclasses.fields(Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig)
+    ][:9] == [
+        "intermediate_size",
+        "top_k",
+        "kernel_name",
+        "kind",
+        "gate_up_clamp",
+        "activation_clamp",
+        "fast_math",
+        "enable_in_kernel_fc2_reduce",
+        "knobs",
+    ]
+    kernel, _, fleet = _mxfp8_backend()
+    assert kernel._kernel_config.kernel_variant == "inference"
+    allocator = mock.Mock(return_value=mock.sentinel.workspace)
+    monkeypatch.setattr(pkg, "get_symm_buffer_for_mxfp8_mega_moe", allocator)
+    monkeypatch.setattr(kernel, "_workspace_knobs", lambda fp: {"flag_batch": 4})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert kernel._allocate_workspace(fleet) is mock.sentinel.workspace
+    allocator.assert_called_once_with(
+        8,
+        129,
+        3,
+        384,
+        192,
+        0,
+        1,
+        kind="mxfp8_e4m3",
+        gate_up_clamp=None,
+        activation_clamp=None,
+        enable_in_kernel_fc2_reduce=False,
+        knobs={"flag_batch": 4},
+    )
+    assert kernel._tuning_key(fleet) == dict(
+        dtype="mxfp8_e4m3",
+        world_size=1,
+        hidden=384,
+        intermediate=192,
+        num_experts=8,
+        topk=3,
+        max_tokens=129,
+        enable_in_kernel_fc2_reduce=False,
+    )
+    assert kernel._workspace_pool_key(fleet) == (
+        kernel.kernel_name(),
+        0,
+        0,
+        1,
+        id(None),
+        8,
+        129,
+        3,
+        384,
+        192,
+        "mxfp8_e4m3",
+        None,
+        False,
+        (("flag_batch", 4),),
+    )
+
+
+@pytest.mark.parametrize(
+    "tile,cluster", [(None, None), ((256, 64, 128), (2, 1)), ((256, 64, 128), (4, 1))]
+)
+def test_blackwell_genphase_backend_selects_own_workspace(
+    tile, cluster, monkeypatch, dist_not_initialized
+):
+    """GenPhase allocation and pool identity stay separate from legacy inference."""
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    kernel, bootstrap, fleet = _mxfp8_backend(
+        kernel_variant="genphase",
+        mma_tiler_mnk=tile,
+        cluster_shape_mn=cluster,
+    )
+    kernel.validate_init(bootstrap, fleet)
+    monkeypatch.setattr(
+        kernel, "_tuning_cache", mock.Mock(side_effect=AssertionError("legacy cache"))
+    )
+    assert kernel.live_token_buckets(fleet) == []
+    allocator = mock.Mock(return_value=mock.sentinel.workspace)
+    monkeypatch.setattr(pkg, "Sm100GenphaseSymmBuffer", allocator)
+    assert kernel._allocate_workspace(fleet) is mock.sentinel.workspace
+    config = allocator.call_args.args[0]
+    assert config.resolved_mma_tiler_mnk == (tile or (256, 64, 128))
+    assert config.cluster_shape_mn == (cluster or (4, 1))
+    assert config.fc2_use_bulk and not config.reduce_topk_in_kernel
+    assert kernel._workspace_pool_key(fleet)[-1] == config
+    explicit, _, _ = _mxfp8_backend(
+        kernel_variant="genphase",
+        mma_tiler_mnk=config.resolved_mma_tiler_mnk,
+        cluster_shape_mn=config.cluster_shape_mn,
+    )
+    assert kernel._workspace_pool_key(fleet) == explicit._workspace_pool_key(fleet)
+    legacy, _, _ = _mxfp8_backend()
+    monkeypatch.setattr(legacy, "_workspace_knobs", lambda fp: None)
+    assert kernel._workspace_pool_key(fleet) != legacy._workspace_pool_key(fleet)
+    other, _, _ = _mxfp8_backend(
+        kernel_variant="genphase",
+        mma_tiler_mnk=(256, 64, 128),
+        cluster_shape_mn=(4, 1) if cluster == (2, 1) else (2, 1),
+    )
+    assert kernel._workspace_pool_key(fleet) != other._workspace_pool_key(fleet)
+
+
+@pytest.mark.parametrize(
+    "tile,cluster,hint",
+    [
+        (None, None, 148),
+        ((256, 128, 128), (4, 1), 148),
+        ((256, 64, 128), (4, 1), 148),
+        ((256, 64, 128), (2, 1), 296),
+    ],
+)
+def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch):
+    """Explicit geometry constrains schedule estimation and workspace pooling."""
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: mock.Mock(major=10, minor=3, multi_processor_count=148),
+    )
+
+    def make(**overrides):
+        """Bind a GenPhase backend with selected geometry and optional overrides."""
+        params = dict(
+            intermediate_size=1024,
+            top_k=8,
+            kernel_variant="genphase",
+            mma_tiler_mnk=tile,
+            cluster_shape_mn=cluster,
+        )
+        params.update(overrides)
+        backend = create_mega_kernel(
+            Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(**params)
+        )
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False)
+        )
+        return backend
+
+    fleet = FleetParams(
+        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
+    )
+    kernel = make()
+    resolved = kernel._genphase_config(fleet)
+    assert resolved.schedule_policy == ("grouped", hint)
+    explicit = make(schedule_policy=("grouped", hint))
+    original = make(schedule_policy=("grouped", None))
+    assert kernel._workspace_pool_key(fleet) == explicit._workspace_pool_key(fleet)
+    assert kernel._workspace_pool_key(fleet) != original._workspace_pool_key(fleet)
+
+    assert original._genphase_config(fleet).schedule_policy == ("grouped", None)
+    # The rule depends on geometry and hardware, not one benchmark shape.
+    for kwargs in (
+        dict(top_k=6),
+        dict(intermediate_size=2048),
+        dict(gate_up_clamp=10.0),
+    ):
+        assert make(**kwargs)._genphase_config(fleet).schedule_policy == (
+            "grouped",
+            hint,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"kernel_variant": "unknown"},
+        {"kernel_variant": "genphase", "capacity": 1025},
+        {"kernel_variant": "genphase", "kind": "mxfp8_e5m2"},
+        {"kernel_variant": "genphase", "knobs": "bad"},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", 0)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", -1)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", True)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped", 1.5)},
+        {"kernel_variant": "genphase", "schedule_policy": ("phase_interleave", None)},
+        {"kernel_variant": "genphase", "schedule_policy": ("grouped",)},
+        {"kernel_variant": "genphase", "schedule_policy": ["grouped", 148]},
+        {"schedule_policy": ("grouped", None)},
+        {"kernel_variant": "genphase", "knobs": {"group_hint": 4}},
+        {
+            "kernel_variant": "genphase",
+            "mma_tiler_mnk": (256, 64, 128),
+            "knobs": {"mma_tiler_mnk": (256, 128, 128)},
+        },
+        {"kernel_variant": "genphase", "enable_in_kernel_fc2_reduce": True},
+        {"kernel_variant": "genphase", "hidden": 192},
+        {
+            "kernel_variant": "genphase",
+            "mma_tiler_mnk": (256, 128, 128),
+            "cluster_shape_mn": (2, 1),
+        },
+        {"mma_tiler_mnk": (256, 64, 128)},
+    ],
+)
+def test_blackwell_genphase_backend_rejects_unsupported_config(
+    overrides, monkeypatch, dist_not_initialized
+):
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(MoEEpConfigError):
+        kernel, bootstrap, fleet = _mxfp8_backend(**overrides)
+        kernel.validate_init(bootstrap, fleet)
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e8m0fnu, torch.uint8])
+def test_blackwell_genphase_backend_weights_and_layout_validation(
+    scale_dtype, dist_not_initialized
+):
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+
+    generator = torch.Generator().manual_seed(6447)
+    w13 = torch.randn(8, 384, 384, generator=generator).bfloat16()
+    w2 = torch.randn(8, 384, 192, generator=generator).bfloat16()
+    kernel, _, fleet = _mxfp8_backend(kernel_variant="genphase")
+    transformed = kernel.preprocess_weights(MoEWeightPack(w13, w2), fleet)
+    q13, sf13 = pkg.quantize_genphase_mxfp8(w13, torch.float8_e4m3fn)
+    q2, sf2 = pkg.quantize_genphase_mxfp8(w2, torch.float8_e4m3fn)
+    packed = kernel.preprocess_weights(
+        MoEWeightPack(q13, q2, sf13.view(scale_dtype), sf2.view(scale_dtype)), fleet
+    )
+    for expected, actual in zip(transformed, packed, strict=True):
+        for a, b in zip(expected, actual, strict=True):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    config = kernel._genphase_config(fleet)
+    pkg.validate_genphase_weights(transformed, config, torch.device("cpu"))
+    legacy = preprocess_mega_weights(
+        MoEWeightPack(w13, w2), intermediate_size=192, hidden_size=384
+    )
+    with pytest.raises(ValueError, match="K-major"):
+        pkg.validate_genphase_weights(legacy, config, torch.device("cpu"))
+    with pytest.raises(ValueError, match="tuple"):
+        pkg.validate_genphase_weights(None, config, torch.device("cpu"))
+    bad = ((transformed[0][0], transformed[0][1].view(torch.uint8)), transformed[1])
+    with pytest.raises(ValueError, match="scales"):
+        pkg.validate_genphase_weights(bad, config, torch.device("cpu"))
 
 
 @pytest.fixture
@@ -163,3 +456,623 @@ def test_override_does_not_replace_allocated_default(make_layer):
     raw.destroy.assert_not_called()
     handle = layer.create_workspace(64)
     assert handle._backend_workspace is raw
+
+
+@pytest.mark.parametrize(
+    "world,count,ncu,expected",
+    [
+        (1, 128, "0", False),
+        (2, 128, "0", True),
+        (4, 4096, "0", True),
+        (4, 4097, "0", False),
+        (4, 128, "1", False),
+    ],
+)
+def test_single_cta_reset_admission(world, count, ncu, expected, monkeypatch):
+    """EP1, large prefixes and NCU retain the distributed reset protocol."""
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    cutlass = pytest.importorskip("cutlass")
+
+    monkeypatch.setenv("MEGA_USE_NCU", ncu)
+    comm = pkg.TokenInPullTokenBackPush(
+        world_size=world,
+        num_topk=4,
+        num_experts_per_rank=4,
+        num_total_experts=4 * world,
+        hidden=128,
+        fc1_token_dtype=cutlass.BFloat16,
+        sf_uint32_per_token=0,
+        token_padding_block=64,
+        sf_padding_block=128,
+        cluster_tile_tokens=64,
+        cluster_shape_mn=(2, 1),
+        dispatch_warp_start=8,
+        num_other_warps=8,
+    )
+    assert comm.use_single_cta_tail_reset(count) is expected
+
+
+@pytest.mark.parametrize("world", [1, 2, 4])
+@pytest.mark.parametrize("tile_n,cluster_m", [(128, 4), (64, 4), (64, 2)])
+def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    cutlass = pytest.importorskip("cutlass")
+    # DSL 4.6/4.7 expose the SMEM query through cutlass.utils only.
+    monkeypatch.delattr(cutlass, "memory", raising=False)
+    cfg = pkg.Sm100GenphaseMoeConfig(
+        num_total_experts=8 * world,
+        max_tokens_per_rank=129,
+        num_topk=3,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=world,
+        mma_tiler_mnk=(256, tile_n, 128),
+        cluster_shape_mn=(cluster_m, 1),
+    )
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled._max_active_clusters",
+        lambda size: 32,
+    )
+    kernel = pkg.Sm100GenphaseSymmBuffer._build_kernel(cfg)
+    assert type(kernel).__module__.startswith(
+        "blackwell_genphase_sources.kernel_src.blackwell."
+    )
+    assert kernel.architecture == "sm_100"
+    assert kernel._mainloop.architecture == "sm_100"
+    assert kernel._mainloop.instruction_k == 32
+    assert kernel._mainloop.num_mma_instructions_per_ab_stage == 4
+    plan = kernel._mainloop.tmem_plan
+    assert plan.allocation_columns == 512
+    assert plan.accumulator_stage_count == (3 if tile_n == 128 else 7)
+    assert plan.accumulator_stage_stride_columns == tile_n
+    mainloop = kernel._mainloop
+    assert mainloop.gather_b_rows_per_cta == tile_n // 2
+    assert mainloop.gather_b_runs_per_unit == 1
+    assert mainloop.num_gather_b_warps == (2 if tile_n == 64 and cluster_m == 4 else 4)
+    assert not mainloop.dynamic_gather
+    assert kernel.masks_invalid_combine_slots
+
+
+def test_blackwell_genphase_import_is_lazy():
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, types\n"
+            "sentinel = types.ModuleType('sources')\n"
+            "sentinel.__file__ = '/unrelated/sources/__init__.py'\n"
+            "sys.modules['sources'] = sentinel\n"
+            "from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg\n"
+            "assert sys.modules['sources'] is sentinel\n"
+            "assert 'flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe' not in sys.modules\n"
+            "assert pkg.Sm100GenphaseMoeConfig.__module__.endswith('.sm100.next_cutedsl_megamoe.shim.genphase')\n"
+            "assert sys.modules['sources'] is sentinel\n"
+            "assert 'flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe' not in sys.modules\n"
+            "from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as genphase\n"
+            "assert pkg.Sm100GenphaseSymmBuffer is genphase.Sm100GenphaseSymmBuffer\n"
+            "del sys.modules['sources']\n"
+            "from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as rubin\n"
+            "assert not issubclass(pkg.Sm100GenphaseSymmBuffer, rubin.Sm107BlockScaledSymmBuffer)\n"
+            "assert not any(name.startswith('Sm100') for name in dir(rubin))\n",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"quant_kind": "nvfp4"},
+        {"quant_kind": "mxfp4_mxfp8", "intermediate": 256},
+        {"mma_tiler_mnk": (256, 64, 256)},
+        {"mma_tiler_mnk": (256, 64, 128), "cluster_shape_mn": (1, 1)},
+        {"cluster_shape_mn": (2, 1)},
+        {"mma_tiler_mnk": (256, 256, 128)},
+        {
+            "schedule_policy": ("phase_interleave", None),
+            "work_id_mode": "atomic_counter",
+        },
+        {"reduce_topk_in_kernel": True},
+        {"max_tokens_per_rank": 1025},
+        {"kernel_variant": "inference"},
+        {"combine_dtype": "mxfp8"},
+    ],
+)
+def test_blackwell_genphase_admission(override):
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    values = dict(
+        num_total_experts=8,
+        max_tokens_per_rank=129,
+        num_topk=3,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+    )
+    with pytest.raises(ValueError):
+        pkg.Sm100GenphaseMoeConfig(**(values | override))
+
+
+def _genphase_tuning_config(**overrides):
+    """Build a valid EP2 tuning workload with per-test field overrides."""
+    values = dict(
+        num_total_experts=256,
+        max_tokens_per_rank=1024,
+        num_topk=8,
+        hidden=4096,
+        intermediate=1024,
+        rank=0,
+        world_size=2,
+    )
+    return Sm100GenphaseMoeConfig(**(values | overrides))
+
+
+@pytest.mark.parametrize(
+    "tokens,n,cluster,hint",
+    [
+        (0, 128, 4, None),
+        (1, 64, 2, 296),
+        (4, 64, 4, 148),
+        (17, 64, 4, 148),
+        (65, 64, 4, 148),
+        (1024, 128, 4, 148),
+    ],
+)
+def test_blackwell_genphase_tuning_estimate_spans_latency_regimes(
+    tokens, n, cluster, hint
+):
+    """Host estimates cover empty, sparse and dense workloads at fixed capacity."""
+    cfg = _genphase_tuning_config()
+    knobs = default_sm100_genphase_knobs(cfg, sm_count=148, live_tokens=tokens)
+    assert knobs == dict(
+        mma_tiler_mnk=(256, n, 128),
+        cluster_shape_mn=(cluster, 1),
+        schedule_policy=("grouped", hint),
+    )
+    assert is_valid_sm100_genphase_knobs(knobs, cfg)
+
+
+@pytest.mark.parametrize("sms", [132, 148, 152])
+@pytest.mark.parametrize("world", [1, 2, 4])
+@pytest.mark.parametrize(
+    "hidden,intermediate,experts,topk", [(4096, 1024, 256, 8), (7168, 3072, 384, 6)]
+)
+def test_blackwell_genphase_tuning_candidate_domain_and_original_fallback(
+    sms, world, hidden, intermediate, experts, topk
+):
+    """All ranks enumerate twelve valid candidates including the original config."""
+    cfg = _genphase_tuning_config(
+        world_size=world,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_total_experts=experts,
+        num_topk=topk,
+    )
+    candidates = sm100_genphase_candidates(cfg, sm_count=sms, live_tokens=16)
+    assert len(candidates) == 12
+    assert len({repr(x) for x in candidates}) == 12
+    assert all(is_valid_sm100_genphase_knobs(x, cfg) for x in candidates)
+    assert (
+        dict(
+            mma_tiler_mnk=(256, 128, 128),
+            cluster_shape_mn=(4, 1),
+            schedule_policy=("grouped", None),
+        )
+        in candidates
+    )
+    assert candidates[0] == default_sm100_genphase_knobs(
+        cfg, sm_count=sms, live_tokens=16
+    )
+    assert candidates == sm100_genphase_candidates(
+        dataclasses.replace(cfg, rank=world - 1), sm_count=sms, live_tokens=16
+    )
+
+
+def test_blackwell_genphase_tuning_constraints_and_resource_budget():
+    """Candidate filtering respects explicit geometry, hints and limited SMs."""
+    cfg = _genphase_tuning_config()
+    rows = sm100_genphase_candidates(
+        cfg,
+        sm_count=148,
+        constraints=dict(
+            mma_tiler_mnk=(256, 64, 128), schedule_policy=("grouped", 333)
+        ),
+    )
+    assert len(rows) == 2
+    assert all(
+        x["schedule_policy"] == ("grouped", 333)
+        and x["mma_tiler_mnk"] == (256, 64, 128)
+        for x in rows
+    )
+    limited = dataclasses.replace(
+        cfg, max_sm_count=2, mma_tiler_mnk=(256, 64, 128), cluster_shape_mn=(2, 1)
+    )
+    rows = sm100_genphase_candidates(limited, sm_count=148, live_tokens=0)
+    assert len(rows) == 4 and all(x["cluster_shape_mn"] == (2, 1) for x in rows)
+    for constraints in [
+        dict(mma_tiler_mnk=(256, 128, 128), cluster_shape_mn=(2, 1)),
+        dict(schedule_policy=("grouped", 0)),
+        dict(schedule_policy=("grouped", True)),
+        dict(apply_topk_at_fc1=False),
+    ]:
+        with pytest.raises(ValueError):
+            sm100_genphase_candidates(cfg, sm_count=148, constraints=constraints)
+
+
+@pytest.mark.parametrize("tokens", [-1, 1025, 1.5, True])
+def test_blackwell_genphase_tuning_invalid_live_count(tokens):
+    """Reject noninteger and out-of-capacity workload counts before tuning."""
+    with pytest.raises(ValueError):
+        sm100_genphase_candidates(
+            _genphase_tuning_config(), sm_count=148, live_tokens=tokens
+        )
+
+
+@pytest.mark.parametrize("sms", [0, 1, 1.5, True])
+def test_blackwell_genphase_tuning_invalid_hardware_count(sms):
+    """Reject noninteger SM counts and devices too small for an admitted cluster."""
+    with pytest.raises(ValueError):
+        sm100_genphase_candidates(_genphase_tuning_config(), sm_count=sms)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("malformed", ["partial", "empty", "extra"])
+def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials(
+    monkeypatch, rank, malformed
+):
+    """Reject malformed shared candidates on every rank before trial collectives."""
+    from flashinfer.moe_ep.core import tuning as core_tuning
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        autotune,
+        correctness,
+        knob_cache,
+    )
+
+    cfg = _genphase_tuning_config(rank=rank)
+    valid = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[0]
+    invalid = {
+        "partial": {"schedule_policy": ("grouped", 296)},
+        "empty": {},
+        "extra": {**valid, "apply_topk_at_fc1": False},
+    }[malformed]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: mock.Mock(multi_processor_count=148),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda _: rank)
+
+    def gather(proposals, proposal, *, group):
+        proposals[:] = [proposal, proposal]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(core_tuning, "tuning_live_tokens", lambda *args: 16)
+    monkeypatch.setattr(knob_cache, "device_identity", lambda: "B200")
+    reference = mock.Mock(side_effect=AssertionError("entered candidate trials"))
+    record = mock.Mock()
+    monkeypatch.setattr(correctness, "sampled_reference", reference)
+    monkeypatch.setattr(knob_cache, "record_knobs", record)
+    with pytest.raises(ValueError, match="candidates must set every GenPhase knob"):
+        autotune.autotune_sm100_genphase_mega_moe(
+            None,
+            None,
+            None,
+            mock.Mock(config=cfg),
+            num_tokens=16,
+            candidates=[valid, invalid],
+        )
+    reference.assert_not_called()
+    record.assert_not_called()
+
+
+def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_record(
+    tmp_path, monkeypatch
+):
+    """Cache reuse requires exact profiles and preserves unrelated or invalid data."""
+    import json
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        knob_cache as cache,
+    )
+
+    path = tmp_path / "knobs.json"
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
+    cfg = _genphase_tuning_config()
+    winner = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[-1]
+    path.write_text(
+        json.dumps(dict(version=1, entries=[dict(device="legacy", knobs={})]))
+    )
+    assert cache.record_knobs(winner, cfg, live_tokens=16, p50_us=200, device="B300")
+    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300") == (
+        winner,
+        "cache",
+    )
+    assert cache.live_token_buckets(cfg, device="B300") == [16]
+    assert (
+        cache.resolve_knobs(
+            dataclasses.replace(cfg, rank=1),
+            sm_count=148,
+            live_tokens=16,
+            device="B300",
+        )[1]
+        == "cache"
+    )
+    for changes in [
+        dict(max_tokens_per_rank=512),
+        dict(world_size=4),
+        dict(gate_up_clamp=10),
+        dict(apply_topk_at_fc1=False),
+    ]:
+        assert (
+            cache.resolve_knobs(
+                dataclasses.replace(cfg, **changes),
+                sm_count=148,
+                live_tokens=16,
+                device="B300",
+            )[1]
+            == "heuristic"
+        )
+    assert (
+        cache.resolve_knobs(cfg, sm_count=148, live_tokens=17, device="B300")[1]
+        == "heuristic"
+    )
+    assert (
+        cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B200")[1]
+        == "heuristic"
+    )
+    assert cache.resolve_knobs(
+        cfg,
+        sm_count=148,
+        live_tokens=16,
+        device="B300",
+        constraints=dict(schedule_policy=("grouped", 333)),
+    )[0]["schedule_policy"] == ("grouped", 333)
+    data = json.loads(path.read_text())
+    assert data["entries"][0]["device"] == "legacy"
+    current_revision = data["entries"][-1]["backend_revision"]
+    for revision in (
+        "sm100-genphase-c8c67ae7-auto-v1",
+        "sm100-genphase-6b9a6e2e-auto-v2",
+    ):
+        data["entries"][-1]["backend_revision"] = revision
+        path.write_text(json.dumps(data))
+        assert (
+            cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300")[1]
+            == "heuristic"
+        )
+        assert cache.live_token_buckets(cfg, device="B300") == []
+    data["entries"][-1]["backend_revision"] = current_revision
+    data["entries"][-1]["knobs"]["apply_topk_at_fc1"] = False
+    path.write_text(json.dumps(data))
+    assert (
+        cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300")[1]
+        == "heuristic"
+    )
+    assert cache.live_token_buckets(cfg, device="B300") == []
+    path.write_text("invalid json")
+    with pytest.warns(RuntimeWarning):
+        assert not cache.record_knobs(
+            winner, cfg, live_tokens=16, p50_us=200, device="B300"
+        )
+    assert path.read_text() == "invalid json"
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    assert not cache.record_knobs(
+        winner, cfg, live_tokens=16, p50_us=200, device="B300"
+    )
+
+
+def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
+    monkeypatch,
+):
+    """Auto tuning retunes an unpooled workspace once and blocks early capture."""
+    from unittest import mock
+    import torch
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MoEEpConfigError,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.warns(UserWarning, match="COLLECTIVE"):
+        backend = create_mega_kernel(
+            Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                1024, 8, kernel_variant="genphase", knobs="auto"
+            )
+        )
+    backend.bind_ep_bootstrap(
+        BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
+    )
+    fleet = FleetParams(
+        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
+    )
+    assert backend._workspace_pool_request(fleet) is None
+    assert backend._workspace_pool_key(fleet) is None
+    with pytest.raises(MoEEpConfigError, match="warmup"):
+        backend.validate_capture_ready(None, None)
+    winner = sm100_genphase_candidates(_genphase_tuning_config(), sm_count=148)[-1]
+    tune = mock.Mock(return_value=winner)
+    launch = mock.Mock(return_value=mock.sentinel.output)
+    monkeypatch.setattr(pkg, "autotune_sm100_genphase_mega_moe", tune)
+    monkeypatch.setattr(pkg, "sm100_genphase_mega_moe", launch)
+    workspace = mock.Mock()
+    workspace.staged_tokens.return_value = 16
+    for _ in range(2):
+        assert backend.compute(workspace, (1, 2), output=None) is mock.sentinel.output
+    tune.assert_called_once()
+    workspace.retune.assert_called_once_with(winner)
+    assert backend.get_tuned_knobs() == winner
+    backend.validate_capture_ready(workspace, (1, 2))
+
+
+def test_blackwell_genphase_tuning_offline_cli_dispatch_and_admission(monkeypatch):
+    """The offline CLI dispatches GenPhase and rejects unsupported reduction modes."""
+    from unittest import mock
+    from flashinfer.moe_ep import tune
+
+    module = mock.Mock()
+    module.run_tuning.return_value = 0
+    loader = mock.Mock(return_value=module)
+    monkeypatch.setattr(tune.importlib, "import_module", loader)
+    args = [
+        "--arch",
+        "sm100",
+        "--dtype",
+        "mxfp8_e4m3",
+        "--kernel-variant",
+        "genphase",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "1024",
+        "--num-experts",
+        "256",
+        "--topk",
+        "8",
+        "--max-tokens",
+        "1024",
+        "--live-tokens",
+        "65",
+    ]
+    assert tune.main(args) == 0
+    assert "sm100.mxfp8_mxfp8_bf16_cutedsl.tuner" in loader.call_args.args[0]
+    assert module.run_tuning.call_args.args[0].kernel_variant == "genphase"
+    loader.reset_mock()
+    assert tune.main(args + ["--allow-nondeterministic"]) == 2
+    loader.assert_not_called()
+
+
+def test_blackwell_genphase_tuning_backend_selection_memo_separates_devices(
+    monkeypatch,
+):
+    """Memoized knob resolution never crosses device identities."""
+    from types import SimpleNamespace
+    from unittest import mock
+    import torch
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            major=10, minor=3, name="B300", multi_processor_count=148
+        ),
+    )
+    selected = sm100_genphase_candidates(_genphase_tuning_config(), sm_count=148)[0]
+    resolve = mock.Mock(return_value=(selected, "heuristic"))
+    monkeypatch.setattr(pkg, "resolve_genphase_knobs", resolve)
+    backend = create_mega_kernel(
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(1024, 8, kernel_variant="genphase")
+    )
+    backend.bind_ep_bootstrap(
+        BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
+    )
+    fleet = FleetParams(
+        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
+    )
+    first = backend._genphase_config(fleet)
+    assert backend._genphase_config(fleet) is first
+    resolve.assert_called_once()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    backend._genphase_config(fleet)
+    assert resolve.call_count == 2
+
+
+def test_blackwell_genphase_tuning_device_identity_separates_compiler_stacks_and_options(
+    monkeypatch,
+):
+    """Compiler library versions and options isolate tuning cache identities."""
+    from types import SimpleNamespace
+    import torch
+    from flashinfer.jit import cute_dsl_core
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import knob_cache
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            name="B300", major=10, minor=3, multi_processor_count=148
+        ),
+    )
+    monkeypatch.setattr(
+        cute_dsl_core, "_get_cute_dsl_version", lambda: "dsl==4.7.1;libs-cu13==4.7.1"
+    )
+    monkeypatch.delenv("CUTE_DSL_COMPILER_OPT", raising=False)
+    original = knob_cache.device_identity()
+    monkeypatch.setattr(
+        cute_dsl_core, "_get_cute_dsl_version", lambda: "dsl==4.7.1;libs-cu13==4.7.2"
+    )
+    updated = knob_cache.device_identity()
+    assert updated != original
+    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "iket")
+    assert knob_cache.device_identity() not in (original, updated)
+
+
+@pytest.mark.parametrize("minor", [0, 3])
+@pytest.mark.parametrize("initial_arch", ["unset", "bare", "native"])
+def test_blackwell_genphase_tuning_cache_hit_before_dsl_arch_configuration(
+    tmp_path, monkeypatch, minor, initial_arch
+):
+    """Native target aliases reuse cached winners before DSL initialization."""
+    from types import SimpleNamespace
+    import json
+    import torch
+    from flashinfer.jit import cute_dsl_core
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        knob_cache as cache,
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            name="Blackwell", major=10, minor=minor, multi_processor_count=148
+        ),
+    )
+    monkeypatch.setattr(
+        cute_dsl_core, "_get_cute_dsl_version", lambda: "test-dsl-stack"
+    )
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "preserve-options")
+    native = f"sm_10{minor}a"
+    cfg = _genphase_tuning_config()
+    winner = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[-1]
+    # A previous workspace configured the native compiler target before tuning.
+    monkeypatch.setenv("CUTE_DSL_ARCH", native)
+    assert cache.record_knobs(winner, cfg, live_tokens=16, p50_us=200)
+    # A fresh caller resolves the cache before creating its first workspace.
+    if initial_arch == "unset":
+        monkeypatch.delenv("CUTE_DSL_ARCH")
+    elif initial_arch == "bare":
+        monkeypatch.setenv("CUTE_DSL_ARCH", native.removesuffix("a"))
+    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16) == (winner, "cache")
+    identity = json.loads(cache.device_identity())
+    assert identity["compile_arch"] == native
+    assert identity["compiler_options"] == "preserve-options"
+    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "different-options")
+    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16)[1] == "heuristic"

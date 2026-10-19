@@ -840,6 +840,25 @@ TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
+### Cake StepFun backend (`cake_stepfun`)
+
+`CakeStepFunConfig(backend="cake_stepfun")` is an opt-in Blackwell (exact SM100 /
+SM103) backend for the StepFun fused MoE: `SwiGLUStep(limit)` with a per-expert
+`gemm1_clamp_limit`, over `BF16×BF16`, `FP8PerTensor×FP8PerTensor`, `MXFP8×MXFP8`
+and `NVFP4×NVFP4` (also with `per_token_scale`). It runs the trtllm-gen
+fused-MoE pipeline with exported Cake kernels in the FC1 stage and, when the
+generated inventory covers them (`fused_moe_cake_stepfun_full_*`), in the
+routing, FC2, requantization and finalize stages as well. It is not in the
+default backend list; weights must come from `CakeStepFunConfig.prepare_weights`
+(view `cake_stepfun`). A tactic is the FC1 tile x GEMM configuration; the
+module restricts the trtllm-gen tile ladder to the tiles with exported Cake
+kernels in every Cake stage, so neither the tactic windows nor `tactic=-1` (the
+smallest exported tile of the token window) can name a tile without a kernel.
+The full path routes `Renormalize` from logits or from unpacked pre-computed
+top-k ids + weights (each when the inventory exports that routing variant) and
+has no fused shared experts. The host contract lives in
+`csrc/fused_moe/cake_stepfun/README.md`.
+
 The class-level matrix below is generated from the registered runner classes.
 The Quantization column is always the MMA pair ``weight×activation``
 (``NVFP4×NVFP4``, not ``NVFP4``). The two W4A16 encodings appear as
@@ -856,6 +875,10 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
+| `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
+| `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
+| `cake_stepfun` | `CakeStepFunConfig` | `MXFP8×MXFP8` | `SwiGLUStep` |
+| `cake_stepfun` | `CakeStepFunConfig` | `NVFP4×NVFP4` | `SwiGLUStep` |
 | `cudnn_frost_bf16` | `CudnnFrostBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |

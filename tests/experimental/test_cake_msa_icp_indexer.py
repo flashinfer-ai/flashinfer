@@ -60,7 +60,12 @@ from tests.test_helpers.cake_msa_icp_inputs import (
 )
 
 WORKER_TIMEOUT_SECONDS = 20 * 60
-MULTI_GPU_CASES = ("tp2_q4_b8_ctx1500", "tp2_q1_b8_ctx1500", "tp4_q4_b8_ctx1500")
+MULTI_GPU_CASES = (
+    "tp2_q4_b8_ctx1500",
+    "tp2_q1_b8_ctx1500",
+    "tp4_q4_b8_ctx1500",
+    "tp2_q4_b52_cols2048",
+)
 
 
 # ---------------------------------------------------------------------------

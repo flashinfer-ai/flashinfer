@@ -206,21 +206,24 @@ from .gdn_kernels.experimental import (
     gdn_fused_decode_step as gdn_fused_decode_step,
     gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
 )
-from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
-from .gemm import mm_fp4 as mm_fp4
-from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
-from .gemm import mm_fp8_lora as mm_fp8_lora
-from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
-from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
-from .gemm import svdquant_linear as svdquant_linear
 from .gemm import mm_bf16_fp4 as mm_bf16_fp4
-from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
+from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
+from .gemm import mm_fp8_lora as mm_fp8_lora
 from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
+from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
+from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
+from .gemm import prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter
+from .gemm import PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter
+from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
+from .gemm import StaleAdapterError as StaleAdapterError
+from .gemm import svdquant_linear as svdquant_linear
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8

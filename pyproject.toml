@@ -78,20 +78,28 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 [tool.setuptools.package-data]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
-"flashinfer.cake_rmsnorm_train_backend" = ["csrc/**"]
-"flashinfer.experimental.cake_dsa_train" = ["csrc/**"]
-"flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
-"flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "sources.json", "README.md"]
+# Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
+# build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
+"flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
+"flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
-"flashinfer.experimental.cake_dsa_indexer" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**"]
+"flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
+# Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
+# next to its module.
+"flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
 # Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
 # importlib.resources.
@@ -105,7 +113,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
-"flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**"]
+"flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
+# Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
+"flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
 "flashinfer.fused_moe.backends.cudnn_frost" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.
@@ -175,6 +185,7 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/helpers/",
   "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
@@ -218,6 +229,7 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
@@ -230,7 +242,6 @@ extend-exclude = [
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
-  "flashinfer/experimental/cake_vsa_sm90_cute/attention_queue.py",
 ]
 force-exclude = true
 

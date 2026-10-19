@@ -14,14 +14,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "tvm_ffi_utils.h"
+#include "cake_ffi_checks.h"
 
 #include <cstdint>
 
 extern "C" __global__ void kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multicast_address, int rank, int numel);
 
 
-namespace cake_host_shim_405b749e1a5c677c {
+namespace cake_host_shim_2a2447d307dccff3 {
 
 using tvm::ffi::TensorView;
 
@@ -67,6 +67,7 @@ void Run(TensorView arg_local_routes, int64_t arg_multicast_address, int64_t arg
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_405b749e1a5c677c
+}  // namespace cake_host_shim_2a2447d307dccff3
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_405b749e1a5c677c::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_2a2447d307dccff3::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);

@@ -10,7 +10,12 @@ project outer bound (atol 1.0 / rtol 0.1 for NVFP4, 0.1 / 0.1 for FP8) and, for
 LoRA-isolation rows (quantized base weights zeroed), the elementwise BF16 rule
 atol = rtol = 1e-2.  Zero-adapter rows check the fast path bitwise, adapter-switch
 rows the pointer swap and CUDA-graph semantics, TP rows the host sharding
-contract.  The multi-GPU TP case runs under ``torchrun`` only.
+contract.  The NVFP4 prepared-adapter path (``lora_adapter=`` from
+``prepare_nvfp4_lora_adapter``) runs the same rows and gates through its own
+program, plus the fold / refold identities, the routing refusals, the snapshot
+(staleness) semantics, the ``lora_scale == 0`` adapter-off identity and the
+captured-refold CUDA-graph protocol.  The multi-GPU TP case runs under
+``torchrun`` only.
 """
 
 from __future__ import annotations
@@ -22,9 +27,12 @@ from typing import Any
 import pytest
 import torch
 
-from flashinfer.gemm import mm_fp8_lora, mm_nvfp4_lora
+from flashinfer.gemm import mm_fp8_lora, mm_nvfp4_lora, prepare_nvfp4_lora_adapter
 from flashinfer.gemm.cake_quant_lora_gemm import (
+    ADAPTER_STATES,
     SUPPORTED_RANKS,
+    PreparedNvFp4LoraAdapter,
+    StaleAdapterError,
     fp8_blackwell_l2_point,
     fp8_blackwell_program,
     fp8_blackwell_raster_group,
@@ -33,6 +41,7 @@ from flashinfer.gemm.cake_quant_lora_gemm import (
     launch_grid,
     nvfp4_blackwell_program,
     nvfp4_blackwell_raster_group,
+    nvfp4_svdq_raster_group,
     select_cake_quant_lora_template,
     sm90_fp8_lora_program,
 )
@@ -1565,6 +1574,7 @@ def test_programs_table_is_consistent():
         "nvfp4_blackwell_n256",
         "nvfp4_blackwell_n192",
         "nvfp4_blackwell_n192h",
+        "nvfp4_blackwell_svdq",
         "fp8_blackwell_n128",
         "fp8_blackwell_n256",
         "fp8_blackwell_n256_clc_blocked",
@@ -1581,6 +1591,24 @@ def test_programs_table_is_consistent():
         assert ["parameter", "rank"] in record["arg_plan"], name
         assert record["ranks"] == list(SUPPORTED_RANKS)
         assert {"m_min", "n_multiple", "k_multiple", "max_mn"} == set(record["rules"])
+        # every record names the adapter states (the call's API form) it serves; the prepared-path program serves
+        # "prepared" only, every other program the raw path and the adapter-off call
+        expected_states = (
+            ["prepared"] if name == "nvfp4_blackwell_svdq" else ["none", "raw"]
+        )
+        assert record["adapter_states"] == expected_states, name
+    assert ADAPTER_STATES == ("none", "raw", "prepared")
+    svdq = PROGRAMS["nvfp4_blackwell_svdq"]
+    assert (svdq["tile_n"], svdq["form"], svdq["dispatch_kernel"]) == (
+        256,
+        "folded_last_ordered",
+        "svdq_folded",
+    )
+    assert (
+        svdq["arches"] == ["sm_100a", "sm_103a"]
+        and svdq["grid"] == "nvfp4_pairs"
+        and svdq["tile_ns"] == [256]
+    )
     assert PROGRAMS["fp8_blackwell_n256"]["tile_n"] == 256
     assert PROGRAMS["fp8_blackwell_n128"]["tile_n"] == 128
     assert PROGRAMS["fp8_blackwell_n256_clc_blocked"]["tile_n"] == 256
@@ -2182,7 +2210,13 @@ NVFP4_RULE_CLAUSES = {
 
 
 def test_nvfp4_dispatch_rule():
-    """The delivered NVFP4 dispatch data (the per-architecture DISPATCH RULE v2) and the host's port of it."""
+    """The delivered NVFP4 dispatch data (the per-architecture DISPATCH RULE v2) and the host's port of it.
+
+    ``NVFP4_PROGRAMS`` are the four RAW dispatch-table programs (pair / n256 / n192 / n192h): the CHOICE rule names only
+    them.  The prepared-adapter program ``nvfp4_blackwell_svdq`` (kernel ``svdq_folded``) is the pre-switch path outside
+    ``choice_rule``; it appears in every architecture's ``kernels`` table with ``dispatched`` False and is pinned by
+    ``test_nvfp4_prepared_path_program``.
+    """
     records = {name: PROGRAMS[name] for name in NVFP4_PROGRAMS}
     pair, n256, n192, n192h = (records[name] for name in NVFP4_PROGRAMS)
     assert [record["dispatch_kernel"] for record in records.values()] == [
@@ -2232,7 +2266,15 @@ def test_nvfp4_dispatch_rule():
             *({"if": cond, "program": program} for cond, program in clauses),
             {"else": "n256"},
         ]
-        assert set(constants["kernels"]) == {"pair", "n256", "n192", "n192h"}
+        # The kernels table carries the four raw dispatch-table kernels AND the prepared-path kernel ``svdq_folded`` (schema v2,
+        # ``dispatched`` False; never named by ``choice_rule`` -- see ``test_nvfp4_prepared_path_program``).
+        assert set(constants["kernels"]) == {
+            "pair",
+            "n256",
+            "n192",
+            "n192h",
+            "svdq_folded",
+        }
         for kernel, (tile_n, hints) in {
             "pair": (128, None),
             "n256": (256, False),
@@ -2327,6 +2369,210 @@ def test_nvfp4_dispatch_rule():
             ), (name, arch)
 
 
+def test_nvfp4_prepared_path_program_and_raster_rule():
+    """The prepared-adapter pre-switch: ``adapter_state="prepared"`` runs the svdq program (every NVFP4 problem at or above
+    its K floor, both architectures) at the svdq kernel's own raster rule; the raw path and the adapter-off call keep today's
+    CHOICE table, which never names the prepared program."""
+    svdq = PROGRAMS["nvfp4_blackwell_svdq"]
+    raw = {name: PROGRAMS[name] for name in NVFP4_PROGRAMS}
+    arches = ("sm_100a", "sm_103a")
+    target = {"sm_100a": "sm100a", "sm_103a": "sm103a"}
+    sm_count = {"sm_100a": 148, "sm_103a": 152}
+    for arch in arches:
+        constants = svdq["dispatch"][arch]
+        assert (
+            constants == raw["nvfp4_blackwell_n256"]["dispatch"][arch]
+        )  # the same data on every NVFP4 record
+        assert constants["schema_version"] == 2
+        prepared = constants["prepared"]
+        assert prepared == {
+            "kernel": "svdq_folded",
+            "min_k": 2048,
+            "raster_rule": "k_band_then_n256_bytes_model",
+            "k_band_max_k": 4096,
+            "k_band_min_m": 32768,
+            "k_band_group": 1,
+            "bytes_model_candidates": [0, 8, 16],
+            "bytes_model_tile_n": 256,
+            "bytes_model_pair_m": 256,
+            "bytes_model_budget_bytes": 44_436_029,
+            "bytes_model_tie": prepared["bytes_model_tie"],
+        }
+        spec = constants["kernels"]["svdq_folded"]
+        assert (spec["form"], spec["tile_m"], spec["tile_n"], spec["min_k"]) == (
+            "folded_last_ordered",
+            256,
+            256,
+            2048,
+        )
+        assert spec["dispatched"] is False and spec["adapter_state"] == "prepared"
+        named = {
+            clause["program"] if "program" in clause else clause["else"]
+            for clause in constants["choice_rule"]
+        }
+        assert (
+            "svdq_folded" not in named
+        )  # the raw table is byte-identical to the table without the prepared path
+        assert all(
+            "dispatched" not in constants["kernels"][kernel]
+            for kernel in ("pair", "n256", "n192", "n192h")
+        )
+    select = select_cake_quant_lora_template
+    problems = (
+        (4096, 12288, 3072, 64),
+        (32768, 4096, 4096, 64),
+        (131072, 18432, 6144, 64),
+        (32768, 8192, 8192, 64),
+        (4096, 4096, 16384, 64),
+        (129, 4096, 4096, 32),
+        (4097, 6144, 6144, 128),
+        (4096, 3072, 2048, 64),
+    )
+    for m, n, k, rank in problems:
+        for arch in arches:
+            kwargs = dict(
+                family="nvfp4",
+                target=target[arch],
+                m=m,
+                n=n,
+                k=k,
+                rank=rank,
+                sm_count=sm_count[arch],
+            )
+            assert (
+                select(**kwargs, adapter_state="prepared") == "nvfp4_blackwell_svdq"
+            ), (arch, m, n, k, rank)
+            # "none" (adapter-off) and "raw" are today's table; the default is the raw path
+            assert (
+                select(**kwargs, adapter_state="none")
+                == select(**kwargs, adapter_state="raw")
+                == select(**kwargs)
+            )
+            assert select(**kwargs) != "nvfp4_blackwell_svdq"
+    # below the K floor the prepared path is refused (K = 1024 is a multiple of 256) and the raw path named
+    with pytest.raises(ValueError, match="requires K >= 2048"):
+        select(
+            family="nvfp4",
+            target="sm100a",
+            m=4096,
+            n=3072,
+            k=1024,
+            rank=64,
+            sm_count=148,
+            adapter_state="prepared",
+        )
+    assert (
+        select(
+            family="nvfp4",
+            target="sm100a",
+            m=4096,
+            n=3072,
+            k=1024,
+            rank=64,
+            sm_count=148,
+        )
+        != "nvfp4_blackwell_svdq"
+    )
+    # no prepared program outside NVFP4 Blackwell; unknown states are refused; the shape rules precede the pre-switch
+    with pytest.raises(ValueError, match="no prepared-adapter program"):
+        select(
+            family="fp8",
+            target="sm100a",
+            m=4096,
+            n=3072,
+            k=3072,
+            rank=64,
+            sm_count=148,
+            adapter_state="prepared",
+        )
+    with pytest.raises(ValueError, match="no prepared-adapter program"):
+        select(
+            family="nvfp4",
+            target="sm90a",
+            m=4096,
+            n=3072,
+            k=3072,
+            rank=64,
+            sm_count=132,
+            adapter_state="prepared",
+        )
+    with pytest.raises(ValueError, match="adapter_state must be one of"):
+        select(
+            family="nvfp4",
+            target="sm100a",
+            m=4096,
+            n=3072,
+            k=3072,
+            rank=64,
+            sm_count=148,
+            adapter_state="folded",
+        )
+    with pytest.raises(ValueError, match="multiple of 256"):
+        select(
+            family="nvfp4",
+            target="sm100a",
+            m=129,
+            n=3072,
+            k=3200,
+            rank=32,
+            sm_count=148,
+            adapter_state="prepared",
+        )
+    with pytest.raises(ValueError, match="rank"):
+        select(
+            family="nvfp4",
+            target="sm100a",
+            m=129,
+            n=3072,
+            k=3072,
+            rank=96,
+            sm_count=148,
+            adapter_state="prepared",
+        )
+    # The svdq raster rule (hand-computed; row bytes = K/2 + K/16 + 2 rank, budget 44,436,029 B, 256 x 256 tiles).
+    for arch in arches:
+
+        def group(m, n, k, rank=64, arch=arch):
+            return nvfp4_svdq_raster_group(svdq, arch, m, n, k, rank)
+
+        # the K band: K <= 4096 and M >= 32768 -> group 1 (whatever the bytes model says)
+        assert (
+            group(32768, 3072, 3072) == 1
+            and group(32768, 4096, 4096) == 1
+            and group(131072, 8192, 4096) == 1
+        )
+        # (4096, 3072, 3072): row 1856 B; A 7,602,176 B fits the budget, W 5,701,632 B fits beside every candidate's A
+        #   group -> every candidate models A + W = 13,303,808 B -> tie -> the smallest G >= 1 -> 8
+        # (4096, 12288, 3072): A 7,602,176 B, W 22,806,528 B, all three tie at A + W -> 8
+        # (32768, 3072, 4352): K above the band; row 2576 B; A 84,410,368 B > budget: G = 0 streams A once per W tile
+        #   (12 x), G = 8 / 16 keep the group's A (5,275,648 / 10,551,296 B) resident with W (7,913,472 B) beside it ->
+        #   A + W for both -> 8
+        # (32768, 8192, 8192): row 4736 B; A 155,189,248 B, W 38,797,312 B; G = 8 leaves 34,736,701 B < W -> 16 W passes
+        #   (620,756,992 B); G = 16 leaves 25,037,373 B < W -> 8 passes (310,378,496 B) -> 16
+        # (4096, 24576, 8192): A 19,398,656 B (all 16 token tiles), W 116,391,936 B; G = 0: A + W; G = 8: 2 W passes;
+        #   G = 16 = every token tile: one W pass = A + W -> tie between 0 and 16 -> G = 0 sorts last -> 16
+        # (131072, 18432, 6144): row 3584 B; A 469,762,048 B, W 66,060,288 B; G = 8 -> 64 W passes, G = 16 -> 32 -> 16
+        assert (
+            group(4096, 3072, 3072) == 8
+            and group(4096, 12288, 3072) == 8
+            and group(32768, 3072, 4352) == 8
+        )
+        assert (
+            group(32768, 8192, 8192) == 16
+            and group(4096, 24576, 8192) == 16
+            and group(131072, 18432, 6144) == 16
+        )
+        assert (
+            nvfp4_blackwell_raster_group(svdq, arch, 4096, 24576, 8192, 64) == 16
+        )  # the generic entry delegates
+        for record in raw.values():  # the raw records never take the prepared rule
+            with pytest.raises(ValueError, match="prepared-path raster rule applies"):
+                nvfp4_svdq_raster_group(record, arch, 4096, 3072, 3072, 64)
+    # the launch grid is the 256 x 256 CLC grid
+    assert launch_grid(svdq, 4097, 9216, 152) == (2 * 17 * 36, 1, 1)
+    assert launch_grid(svdq, 129, 3072, 148) == (2 * 1 * 12, 1, 1)
+
+
 def test_fp8_sm90_dispatch_rule():
     """The delivered SM90 dispatch data and the host's port of it: the rule-gated program on long runs of large-K panels."""
     default, gated = PROGRAMS["fp8_sm90"], PROGRAMS["fp8_sm90_hint"]
@@ -2337,10 +2583,14 @@ def test_fp8_sm90_dispatch_rule():
         "fp8_sm90",
         "fp8_sm90_hint",
     )
+    # The gated program's raster group is 1 since CAKE-2550 step 2 (4 since #6324): on the one contract row the rule
+    # selects (M 131072 x N 8192 x K 32768) this program reads 60.1-60.7 ms back to back / 58.7-60.4 ms cooled at group 1
+    # against 64.3-67.7 / 69.0-80.0 ms at group 4 (six same-GPU interleaved CUPTI cold-L2 runs on two H100 nodes, four of
+    # them sweeping the group; group 2 60.5-62.2 / 59.4-63.0 ms, group 8 79.5 ms); the output is bit-identical across groups.
     assert (
         (default["group_m"], gated["group_m"])
         == (constants["default_group_m"], constants["gated_group_m"])
-        == (8, 4)
+        == (8, 2)
     )
     assert default["form"] != gated["form"]
     assert default["block_n"] == gated["block_n"] == constants["block_n"] == 192
@@ -2438,7 +2688,13 @@ def test_launch_grid_rules():
         PROGRAMS["fp8_blackwell_n256_clc_blocked"], 32768, 8192, 148
     ) == (2 * 128 * 32, 1, 1)
     assert launch_grid(PROGRAMS["fp8_sm90"], 129, 3072, 132) == (132, 1, 1)
-    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (132, 1, 1)
+    # The gated program launches four cluster tiles per cluster: 512 m-pairs x 43 n-tiles = 22016 tiles -> 5504 clusters.
+    assert PROGRAMS["fp8_sm90"]["tiles_per_cluster"] is None
+    assert PROGRAMS["fp8_sm90_hint"]["tiles_per_cluster"] == 4
+    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (2 * 5504, 1, 1)
+    # A tail m-tile adds n_pairs single-m-tile tiles: 4097 rows = 33 m-tiles = 16 pairs + 1 tail, 3072 = 16 n-tiles
+    # -> 256 + 8 = 264 cluster tiles -> 66 clusters.
+    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 4097, 3072, 132) == (2 * 66, 1, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -2464,6 +2720,22 @@ def _require(family: str) -> torch.device:
 
 def _rows(family: str, *kinds: str) -> list[dict[str, Any]]:
     return [row for row in CONTRACT_ROWS.get(family, ()) if row["kind"] in kinds]
+
+
+def _prepared_min_k() -> int:
+    """The prepared path's K floor (the ``min_k`` of the prepared-path program on every architecture; 0 without one)."""
+    record = PROGRAMS.get("nvfp4_blackwell_svdq")
+    if record is None:
+        return 0
+    return max(
+        int(record["dispatch"][arch]["prepared"]["min_k"]) for arch in record["arches"]
+    )
+
+
+def _prepared_rows(*kinds: str) -> list[dict[str, Any]]:
+    """The NVFP4 contract rows the prepared path reproduces (every row at or above its K floor; a tp_sim row's K is the
+    shard's)."""
+    return [row for row in _rows("nvfp4", *kinds) if int(row["K"]) >= _prepared_min_k()]
 
 
 def _ids(rows: list[dict[str, Any]]) -> list[str]:
@@ -2672,6 +2944,31 @@ def _call(
         d,
         lora_b,
         lora_scale,
+        bias=p["bias"],
+        out=out,
+    )
+
+
+def _prepare(
+    p: dict[str, Any], *, lora_b=_UNSET, lora_scale=_UNSET
+) -> PreparedNvFp4LoraAdapter:
+    """The adapter-switch step of the prepared path: fold the row's adapter once against the call's ``alpha`` tensor."""
+    lora_b = p["lora_b"] if lora_b is _UNSET else lora_b
+    lora_scale = p["lora_scale_t"] if lora_scale is _UNSET else lora_scale
+    return prepare_nvfp4_lora_adapter(lora_b, lora_scale, p["alpha"])
+
+
+def _call_prepared(p: dict[str, Any], adapter, *, d=_UNSET, out=_UNSET) -> torch.Tensor:
+    d = p["d"] if d is _UNSET else d
+    out = p["out"] if out is _UNSET else out
+    return mm_nvfp4_lora(
+        p["a"],
+        p["b"],
+        p["a_sf"],
+        p["b_sf"],
+        p["alpha"],
+        d,
+        lora_adapter=adapter,
         bias=p["bias"],
         out=out,
     )
@@ -3003,6 +3300,60 @@ def test_cuda_graph_keeps_captured_adapter_pointers(family, row):
     eager2 = _call(p, out=torch.empty_like(p["out"]))
     torch.cuda.synchronize()
     assert torch.equal(copied, eager2)
+    if family != "nvfp4" or int(row["K"]) < _prepared_min_k():
+        return
+    # Prepared twin: the captured call keeps the prepared adapter; the adapter switch is the captured in-place refold
+    # (prepare_nvfp4_lora_adapter(..., out=adapter), no host read) right before the captured call.
+    p = _make_problem(family, row, device)
+    adapter = _prepare(p)
+    eager1 = _call_prepared(p, adapter).clone()
+    torch.cuda.synchronize()
+
+    def refold():
+        prepare_nvfp4_lora_adapter(
+            p["lora_b"], p["lora_scale_t"], p["alpha"], out=adapter
+        )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            refold()
+            _call_prepared(p, adapter)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        refold()
+        _call_prepared(p, adapter)
+    p["out"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(p["out"], eager1)
+    captured = {key: p[key] for key in ("d", "lora_b", "lora_scale_t")}
+    second = _fresh_adapter(p, rank=int(row["rank"]), salt=1, seed=int(row["seed"]))
+    # a pointer swap -- new source tensors and a new adapter prepared from them -- is invisible to the graph
+    swapped = dict(p, **{key: second[key] for key in captured})
+    _prepare(swapped)
+    p["out"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(p["out"], eager1), "the graph followed swapped adapter pointers"
+    # a copy_ into the captured source tensors is folded by the captured refold on the next replay
+    for key, tensor in captured.items():
+        tensor.copy_(second[key])
+    p["lora_scale"] = second["lora_scale"]
+    p["out"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    copied = p["out"].clone()
+    _assert_gates(family, row["label"], copied, _reference(p))
+    # eagerly the captured adapter is stale (its sources moved under it) until the refold, then bitwise the replay
+    with pytest.raises(StaleAdapterError, match="moved since prepare"):
+        _call_prepared(p, adapter, out=torch.empty_like(p["out"]))
+    refold()
+    eager2 = _call_prepared(p, adapter, out=torch.empty_like(p["out"]))
+    torch.cuda.synchronize()
+    assert torch.equal(copied, eager2)
 
 
 @pytest.mark.parametrize(
@@ -3032,6 +3383,223 @@ def test_tp_shards_on_one_gpu(family, row):
             total = total + out.float()
         combined = total.to(torch.bfloat16)
     _assert_gates(family, row["label"], combined, ref)
+
+
+# --------------------------------------------------------------------------- #
+# GPU: the NVFP4 prepared-adapter path (lora_adapter= from prepare_nvfp4_lora_adapter)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "row",
+    _prepared_rows("correctness", "lora_isolation"),
+    ids=_ids(_prepared_rows("correctness", "lora_isolation")),
+)
+def test_prepared_contract_row(row):
+    """The prepared path on the contract rows: the same gates and the same registered floors as the raw path."""
+    device = _require("nvfp4")
+    p = _make_problem("nvfp4", row, device)
+    ref = _reference(p)
+    adapter = _prepare(p)
+    out = _call_prepared(p, adapter)
+    torch.cuda.synchronize()
+    assert out is p["out"]
+    _assert_gates(
+        "nvfp4", row["label"], out, ref, isolation=row["kind"] == "lora_isolation"
+    )
+    again = _call_prepared(p, adapter, out=torch.empty_like(p["out"]))
+    torch.cuda.synchronize()
+    assert torch.equal(again, out), (
+        f"{row['label']}: repeated prepared call is not bitwise equal"
+    )
+    # the raw path is untouched by the prepared one: its output on the same tensors is its own bitwise repeat
+    raw = _call(p, out=torch.empty_like(p["out"])).clone()
+    assert torch.equal(raw, _call(p, out=torch.empty_like(p["out"])))
+
+
+def test_prepared_adapter_fold_refold_and_refusals():
+    """``b_folded = bf16(lora_b * lora_scale / alpha)`` with the fp32 ratio formed on the host and ONE bf16 rounding (PyTorch's
+    ``mul``); the in-place refold (``out=``, no host read) is bitwise the eager fold; the documented refusals."""
+    device = _require("nvfp4")
+    row = _rows("nvfp4", "correctness")[0]
+    p = _make_problem("nvfp4", row, device)
+    adapter = _prepare(p)
+    assert isinstance(adapter, PreparedNvFp4LoraAdapter) and (
+        adapter.n,
+        adapter.rank,
+    ) == (p["N"], p["rank"])
+    assert (
+        adapter.lora_b is p["lora_b"]
+        and adapter.lora_scale is p["lora_scale_t"]
+        and adapter.alpha is p["alpha"]
+    )
+    ratio = (
+        p["lora_scale_t"].cpu() / p["alpha"].cpu()
+    ).item()  # fp32 division, the reference fold's ratio
+    expected = torch.mul(p["lora_b"], ratio)
+    assert adapter.b_folded.dtype == torch.bfloat16 and adapter.b_folded.is_contiguous()
+    assert torch.equal(adapter.b_folded, expected)
+    buffer = adapter.b_folded
+    adapter.b_folded.zero_()
+    same = prepare_nvfp4_lora_adapter(
+        p["lora_b"], p["lora_scale_t"], p["alpha"], out=adapter
+    )
+    torch.cuda.synchronize()
+    assert (
+        same is adapter
+        and adapter.b_folded is buffer
+        and torch.equal(adapter.b_folded, expected)
+    )
+    # a new scale through the refold: the adapter carries it and the fold follows it
+    half = p["lora_scale_t"] * 0.5
+    prepare_nvfp4_lora_adapter(p["lora_b"], half, p["alpha"], out=adapter)
+    torch.cuda.synchronize()
+    assert adapter.lora_scale is half and torch.equal(
+        adapter.b_folded, torch.mul(p["lora_b"], (half.cpu() / p["alpha"].cpu()).item())
+    )
+    # refusals: alpha == 0, a non-finite ratio, scalar shapes, the operand form, and the refold contract
+    with pytest.raises(ValueError, match="alpha == 0"):
+        prepare_nvfp4_lora_adapter(
+            p["lora_b"], p["lora_scale_t"], torch.zeros_like(p["alpha"])
+        )
+    with pytest.raises(ValueError, match="not finite"):
+        prepare_nvfp4_lora_adapter(
+            p["lora_b"], torch.full_like(p["lora_scale_t"], float("inf")), p["alpha"]
+        )
+    with pytest.raises(ValueError, match="shape"):
+        prepare_nvfp4_lora_adapter(p["lora_b"], p["lora_scale_t"].repeat(2), p["alpha"])
+    with pytest.raises(ValueError, match="shape"):
+        prepare_nvfp4_lora_adapter(p["lora_b"], p["lora_scale_t"], p["alpha"].repeat(2))
+    with pytest.raises(ValueError, match="contiguous bf16"):
+        prepare_nvfp4_lora_adapter(p["lora_b"].float(), p["lora_scale_t"], p["alpha"])
+    with pytest.raises(TypeError, match="PreparedNvFp4LoraAdapter"):
+        prepare_nvfp4_lora_adapter(
+            p["lora_b"], p["lora_scale_t"], p["alpha"], out=object()
+        )
+    with pytest.raises(ValueError, match="alpha is fixed"):
+        prepare_nvfp4_lora_adapter(
+            p["lora_b"], p["lora_scale_t"], p["alpha"].clone(), out=adapter
+        )
+    with pytest.raises(ValueError, match="same geometry"):
+        prepare_nvfp4_lora_adapter(
+            p["lora_b"][: p["N"] - 8].contiguous(),
+            p["lora_scale_t"],
+            p["alpha"],
+            out=adapter,
+        )
+
+
+def test_prepared_routing_staleness_and_zero_scale():
+    """Routing by API form (both forms refused, ``d`` required, the adapter's own ``alpha`` tensor), the snapshot semantics
+    (a moved source raises ``StaleAdapterError`` until the refold) and ``lora_scale == 0`` prepared == adapter-off, bitwise."""
+    device = _require("nvfp4")
+    row = _rows("nvfp4", "correctness")[0]
+    p = _make_problem("nvfp4", row, device)
+    adapter = _prepare(p)
+    ref = _reference(p)
+    args = (p["a"], p["b"], p["a_sf"], p["b_sf"], p["alpha"])
+    with pytest.raises(ValueError, match="not both"):
+        mm_nvfp4_lora(
+            *args,
+            p["d"],
+            p["lora_b"],
+            p["lora_scale_t"],
+            lora_adapter=adapter,
+            out=p["out"],
+        )
+    with pytest.raises(ValueError, match="not both"):
+        mm_nvfp4_lora(
+            *args, p["d"], None, p["lora_scale_t"], lora_adapter=adapter, out=p["out"]
+        )
+    with pytest.raises(ValueError, match="needs d"):
+        _call_prepared(p, adapter, d=None)
+    with pytest.raises(ValueError, match="different alpha tensor"):
+        mm_nvfp4_lora(
+            p["a"],
+            p["b"],
+            p["a_sf"],
+            p["b_sf"],
+            p["alpha"].clone(),
+            p["d"],
+            lora_adapter=adapter,
+            out=p["out"],
+        )
+    with pytest.raises(TypeError, match="PreparedNvFp4LoraAdapter"):
+        _call_prepared(p, object())
+    out1 = _call_prepared(p, adapter).clone()
+    torch.cuda.synchronize()
+    _assert_gates("nvfp4", row["label"], out1, ref)
+    # snapshot semantics: an in-place write into a source tensor (its version counter moves) makes the adapter stale
+    p["lora_b"].mul_(1.0)
+    with pytest.raises(StaleAdapterError, match="lora_b moved since prepare"):
+        _call_prepared(p, adapter)
+    prepare_nvfp4_lora_adapter(p["lora_b"], p["lora_scale_t"], p["alpha"], out=adapter)
+    out2 = _call_prepared(p, adapter, out=torch.empty_like(p["out"]))
+    torch.cuda.synchronize()
+    assert torch.equal(out1, out2)
+    p["alpha"].mul_(1.0)
+    with pytest.raises(StaleAdapterError, match="alpha moved since prepare"):
+        _call_prepared(p, adapter)
+    # a prepared adapter with lora_scale == 0 is the adapter-off output, bitwise (the kernel's device-side switch)
+    zero = _prepare(p, lora_scale=torch.zeros_like(p["lora_scale_t"]))
+    assert bool((zero.b_folded == 0).all())
+    off = _call(
+        p, d=None, lora_b=None, lora_scale=None, out=torch.empty_like(p["out"])
+    ).clone()
+    prepared_zero = _call_prepared(p, zero, out=torch.empty_like(p["out"])).clone()
+    torch.cuda.synchronize()
+    assert torch.equal(prepared_zero, off)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [row for row in _prepared_rows("adapter_switch") if row["variant"] != "graph"],
+    ids=[
+        row["label"]
+        for row in _prepared_rows("adapter_switch")
+        if row["variant"] != "graph"
+    ],
+)
+def test_prepared_adapter_switch(row):
+    """Switching adapters on the prepared path is one prepare per adapter (same rank or a rank change)."""
+    device = _require("nvfp4")
+    p = _make_problem("nvfp4", row, device)
+    out1 = _call_prepared(p, _prepare(p)).clone()
+    torch.cuda.synchronize()
+    _assert_gates("nvfp4", row["label"], out1, _reference(p))
+    rank2 = 128 if row["variant"] == "rank32to128" else int(row["rank"])
+    second = _fresh_adapter(p, rank=rank2, salt=1, seed=int(row["seed"]))
+    out2 = _call_prepared(second, _prepare(second)).clone()
+    torch.cuda.synchronize()
+    _assert_gates("nvfp4", row["label"], out2, _reference(second))
+    assert not torch.equal(out1, out2), (
+        f"{row['label']}: switching the prepared adapter had no effect"
+    )
+
+
+@pytest.mark.parametrize(
+    "row", _prepared_rows("tp_sim"), ids=_ids(_prepared_rows("tp_sim"))
+)
+def test_prepared_tp_shards_on_one_gpu(row):
+    """The host TP contract on the prepared path: every rank prepares its own shard's adapter (a row-parallel non-owner
+    prepares the zero adapter from ``lora_scale = 0``)."""
+    device = _require("nvfp4")
+    full = _make_problem("nvfp4", row, device)
+    ref = _reference(full)
+    shards = _shards(full, tp=int(row["tp"]), mode=row["tp_mode"])
+    outs = []
+    for shard in shards:
+        outs.append(_call_prepared(shard, _prepare(shard)).clone())
+        torch.cuda.synchronize()
+        _assert_gates("nvfp4", row["label"], outs[-1], _reference(shard))
+    if row["tp_mode"] == "column":
+        combined = torch.cat(outs, dim=1)
+    else:
+        total = outs[0].float()
+        for out in outs[1:]:
+            total = total + out.float()
+        combined = total.to(torch.bfloat16)
+    _assert_gates("nvfp4", row["label"], combined, ref)
 
 
 @pytest.mark.parametrize("family", FAMILIES)
