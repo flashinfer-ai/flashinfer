@@ -2613,7 +2613,7 @@ class MxQuantSpec:
                     f"(got {self.descale_w_o})"
                 )
         elif fused and float(self.scale_o) != 1.0:
-            # D8 (per-tensor e4m3 O on the fully fused path).  Skipped under o_fp4: scale_o == 1.0 is already pinned above.
+            # The per-tensor e4m3 O on the fully fused path.  Skipped under o_fp4: scale_o == 1.0 is already pinned above.
             raise NotImplementedError(
                 f"MxQuantSpec.scale_o must be 1.0 on the FULLY FUSED MXFP8 path (got {self.scale_o}): the production MXFP8 SDPA writes "
                 "e4m3 O UNSCALED (its ABI has no per-tensor scale_o -- PR-B D8). Use scale_o=1.0, or the unfused pipeline."
@@ -3554,7 +3554,7 @@ class _FusedQkvProjection(_Stage):
             )
         if not g.qk_norm:
             # RoPE-only epilogue: no RMSNorm, so no rstd can be wanted, and the
-            # fork must know the knob (typed decline until slice S2 lands it).
+            # fork must know the knob (typed decline until a later slice lands it).
             if self.want_rstd:
                 raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and emits no rstd; want_rstd must be False")
             if not self._fork_supports_qk_norm():
@@ -8914,7 +8914,7 @@ class GatedAttentionBlockFwd(APIBase):
             else:
                 # (1) [FP8: e4m3 x e4m3, epilogue * alpha_qkvg, bf16 slab]
                 self._proj.execute(h_live, w_qkvg, proj_live, engine_ws, alpha=qd["alpha_qkvg"] if fp8 else None, stream=stream)
-            # (2)+(3) -- on EVERY unfused pipeline (bf16 / FP8 / MXFP8; the S5 bring-up
+            # (2)+(3) -- on EVERY unfused pipeline (bf16 / FP8 / MXFP8; the bring-up
             # bisect caught an MXFP8 arm that skipped this call: GEMM exact, SDPA
             # exact, end-to-end cos 0.73 -- the normed-Q/K comparison is the tell).
             # q_out/k_out=None means IN PLACE, which is the stage's own

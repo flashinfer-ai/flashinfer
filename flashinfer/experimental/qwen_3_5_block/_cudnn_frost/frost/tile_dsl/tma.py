@@ -96,6 +96,70 @@ def tma_load_tile(
 
 
 @cute.jit
+def tma_load_tile_multicast(
+    smem_tile,
+    gmem_slice,
+    mbar,
+    mcast_mask,
+    *,
+    acquire: cutlass.Constexpr[bool] = True,
+    l2_cache_hint=None,
+):
+    """ONE issuer, EVERY CTA of the cluster receives the tile: the ``cta_group::1`` ``.multicast::cluster`` tensor load.
+
+    Same tile walk as :func:`tma_load_tile` (``tma_loads_per_tile`` subtiles, one elected lane per subtile), but the op is
+    ``cp.async.bulk.tensor.<N>d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster`` WITHOUT a
+    ``.cta_group`` qualifier: the bytes land at the SAME CTA-relative SMEM offset in every CTA named by ``mcast_mask``
+    (a 16-bit rank mask), and the ``complete_tx`` is delivered to EACH destination CTA's OWN mbarrier at the same
+    CTA-relative offset (PTX ISA; the DSL primitive's "per-CTA local mbars" topology).  So the protocol is: every
+    receiving CTA initialises its own mbarrier and arms it with ``expect_tx = the tile's bytes`` (``tma_subtile`` boxes,
+    OOB rows / cols zero-filled AND counted), ONLY the issuing CTA calls this, every CTA waits on its own mbarrier.  A
+    ``complete_tx`` that lands before a peer's own arm leaves that peer's tx-count transiently negative, which the
+    mbarrier permits (the CUTLASS multicast-TMA pipelines rely on it); keep at most ONE fill per stage in flight so the
+    magnitude stays inside one tile.
+
+    NOT :func:`tma_load_tile`'s ``cta_group=2`` path, whose bytes complete on the 2-SM-group LEADER's mbarrier only
+    (``mbarrier-patterns.md`` P9 -- that is the collective-MMA operand form); the two forms differ in WHICH CTA's
+    barrier sees the bytes, which no numerics test shows: a peer waiting its own barrier under the cta_group::2 form
+    hangs.  ``mcast_mask`` is a VALUE (the native op keeps it in a register; a folded immediate would be the
+    ``commit_mma`` hazard of ``barrier.py``).  First consumer: the sm107 f16/bf16 prefill kernel's
+    ``streamed_multicast`` bias ring (``config_sm107.BIAS_MODE_STREAMED_MULTICAST``): two independent CTAs of a cluster
+    that read the same bias tile sequence."""
+    num_iters = smem_tile.tma_loads_per_tile
+    granu_elems = smem_tile.tma_granu_elems
+    sub_stride = smem_tile.tma_subtile_stride_elems
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        tma_desc_ptr = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                tma_desc_ptr,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        tma_desc_ptr = gmem_slice.tma_desc.get_ptr()
+    coord_d = gmem_slice.coord_d
+    outer_coords = tuple(gmem_slice.coords[1:])
+    for i in cutlass.range_constexpr(num_iters):
+        d = coord_d + cutlass.Int32(i * granu_elems)
+        smem_chunk = smem_tile.base.subview(i * sub_stride)
+        if nvvm.elect_sync():
+            coords = [d] + list(outer_coords)
+            # group=None: the cta_group::1 multicast (every destination CTA's own mbarrier), never CTAGroup.CTA_2.
+            nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                smem_chunk,
+                tma_desc_ptr,
+                coords,
+                mbar,
+                [],
+                multicast_mask=mcast_mask,
+                l2_cache_hint=l2_cache_hint,
+            )
+
+
+@cute.jit
 def tma_load_subtiles(
     smem_tile,
     gmem_slice,
@@ -250,6 +314,36 @@ def tma_store_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *,
         smem_chunk,
         tuple([d] + list(outer_coords)),
     )
+
+
+@cute.jit
+def tma_reduce_add_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *, acquire: cutlass.Constexpr[bool] = True):
+    """One elected tensor-map add from a source-sized SMEM subtile.
+
+    Both grid-constant and runtime maps follow the load/store slice contract.
+    The caller supplies a full issuing warp, publishes generic SMEM writes to
+    the async proxy, and owns bulk commit/wait plus source-reuse credits.
+    Runtime maps can be acquired once by the caller and passed with
+    ``acquire=False`` for subsequent subtiles of the same work item.
+    """
+    if cutlass.const_expr(subtile < 0 or subtile >= smem_tile.tma_loads_per_tile):
+        raise ValueError("tma_reduce_add_subtile: subtile outside the source tile")
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        desc = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                desc,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        desc = gmem_slice.tma_desc.get_ptr()
+    coords = [gmem_slice.coord_d + cutlass.Int32(subtile * smem_tile.tma_granu_elems)] + list(gmem_slice.coords[1:])
+    source = smem_tile.base.subview(subtile * smem_tile.tma_subtile_stride_elems)
+    if nvvm.elect_sync():
+        nvvm.cp_async_bulk_tensor_reduce(desc, source, "add", coords)
 
 
 @cute.jit

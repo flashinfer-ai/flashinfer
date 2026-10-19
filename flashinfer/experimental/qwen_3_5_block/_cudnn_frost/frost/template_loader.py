@@ -60,14 +60,23 @@ PARAMS_GLOBAL = "FROST_TEMPLATE_PARAMS"
 DIGEST_GLOBAL = "FROST_SOURCE_DIGEST"
 
 
-def load_template(path: str, params: Hashable, tag: str = "template") -> Any:
+def load_template(path: str, params: Hashable, tag: str = "template", extra_key: Hashable = None) -> Any:
     """Execute the kernel template at ``path`` specialized for ``params``.
 
     ``params`` must be hashable (a frozen dataclass); it is the cache key
     alongside ``path`` and is injected as the module global ``FROST_TEMPLATE_PARAMS``.
     ``tag`` only affects the generated module name (debuggability).
+
+    ``extra_key`` (appended, default None = the key every caller has had): a
+    hashable the caller folds into the cache key AND the source digest when the
+    body's specialization depends on process state OUTSIDE ``params`` -- the
+    sm107 config module's private sweep seams (``config_sm107.sweep_seam_state``),
+    which move ``Cfg`` fields (the K / V ring depth, the Q tile height) without
+    touching the record.  Without it two renderings that differ only by a seam
+    share one module in a process and one compiled-plan artifact on disk: the
+    second request silently runs the first rendering.
     """
-    key = (path, params)
+    key = (path, params) if extra_key is None else (path, params, extra_key)
     with _LOCK:
         mod = _MODULES.get(key)
         if mod is not None:
@@ -79,7 +88,10 @@ def load_template(path: str, params: Hashable, tag: str = "template") -> Any:
         # What the module's kernels are compiled FROM: this file, specialized by
         # these params. compiled_cache.template_key joins it with a compile()
         # call's arguments to name a persistent object.
-        setattr(mod, DIGEST_GLOBAL, hashlib.sha256(pathlib.Path(path).read_bytes() + repr(params).encode("utf-8")).hexdigest()[:16])
+        digest_src = pathlib.Path(path).read_bytes() + repr(params).encode("utf-8")
+        if extra_key is not None:
+            digest_src += repr(extra_key).encode("utf-8")
+        setattr(mod, DIGEST_GLOBAL, hashlib.sha256(digest_src).hexdigest()[:16])
         spec.loader.exec_module(mod)
         _MODULES[key] = mod
         return mod

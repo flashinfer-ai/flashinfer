@@ -300,6 +300,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
             "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
             "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
+            "sdpa_bwd_sm100_d128": EngineSlot(9, opt_in=True),
         },
         analyzer=('flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.graph_analyzer', "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick

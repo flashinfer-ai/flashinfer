@@ -626,6 +626,12 @@ def _kernel(
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _paged_load_tile(
     smem_tile,
@@ -2271,6 +2277,7 @@ def _host(
             n_thd_units,  # persistent cluster count; also seeds the claim counter
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
+            bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:

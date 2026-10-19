@@ -131,7 +131,7 @@ def wait_poll(mb, phase, tight_iters: cutlass.Constexpr[int] = POLL_TIGHT_ITERS,
     shared by two pairs), a twin CTA's remote ``mbarrier.arrive`` -- loses the wake-up of a parked waiter under GPU
     time-slicing (another process launching concurrently): the d512 2x2 BACKWARD hung within 2-74 launches with every
     parking form (default hint, 10 ms hint, hint-less spin) while this ``test_wait`` poll ran 200/200 and the pair-local
-    4x1 chain 30000/30000 (lane_d512_bprop/fix/HANDOFF2.md: heartbeat dump = the other three CTAs' copies of the same
+    4x1 chain 30000/30000 (an internal hang record: heartbeat dump = the other three CTAs' copies of the same
     barrier had advanced 5 chunks, the parked follower never woke).  ``MBarrier(poll=True)`` opts a barrier in; the SDPA
     2x2 forward's detector is ``test_sdpa_fwd_d512_2x2_sm100.py::test_two_by_two_cross_pair_waits_poll`` (+ its contention
     hygiene run).  Pair-local barriers keep :func:`wait`.  The DSL's ``nvvm.mbarrier_test_wait`` wrapper raises a TypeError on
@@ -214,10 +214,49 @@ def launch_dependent_grids():
 
 
 @cute.jit
-def mbar_arrive_on_peer(mb, peer_cta_id, pred=None):
+def mbar_arrive_on_peer(mb, peer_cta_id, pred=None, release_cta: cutlass.Constexpr[bool] = False):
+    """One arrive per calling lane on the PEER CTA's copy of ``mb`` (``mapa``; nothing here elects -- the caller counts lanes).
+
+    ``release_cta=False`` (the default; every call site that predates this kwarg compiles to the same cubin as before it existed):
+    ``mbarrier.arrive.relaxed.cluster`` -- RIGHT for a COUNT-ONLY credit whose data an async proxy already ordered (a ``tcgen05_st``
+    completed by ``tcgen05_wait(STORE)``, a TMA ``complete_tx``, a TMA store drained by ``tma_store_wait``) and for a one-shot
+    notification (``mb_tmem_dealloc``).  The default is what those callers COMPILED TO, not a statement that each of them is such a
+    credit: the d512 forwards' per-iteration cross-sub-group ``mb_alpha_xfer_empty`` credit follows the thread's own generic
+    ``alpha_addr.load()`` of the slot it frees and still takes the default -- a read-then-credit shape that is an OPEN family audit,
+    not a verified exemption (the d512 backward's ``mb_s_xfer_empty`` credit is not one: a named barrier performs the four warps' reads
+    before the elected arrive).  Static detector for any caller: name the last generic load of the stage before the arrive; if there
+    is one and nothing between them performs it (a ``bar.sync`` of every reading warp counts, a relaxed arrive does not), the site
+    belongs to the ``release_cta=True`` case below.
+
+    ``release_cta=True``: ``mbarrier.arrive.release.cta.shared::cluster`` -- for a READ-then-credit across CTAs: the credit that
+    lets the PEER refill a stage THIS thread has just read with generic loads (the multicast bias ring's ``_empty``: the peer's next
+    ``.multicast::cluster`` load overwrites that very stage in this CTA's SMEM).  A relaxed arrive does not order the issuing
+    thread's prior ``ld.shared`` before the credit becomes visible, so ptxas may hoist it above an independent load and the refill
+    lands under the read -- the same shape as the ``tcgen05_wait(LOAD)`` arrive-between-loads incident.  The CTA-scope release
+    is the scheduler credit's form (``scheduler.read_tile_id_arrive``: "a relaxed arrive would let the refill race a
+    still-in-flight decode") and CUTLASS's ``consumer_release``; on sm_107a the flip changes NO SASS text and costs nothing: the
+    relaxed and the release form lower to the same ``USYNCS.ARRIVE.TRANS64.RED.*`` instruction whose suffix is the LOWERING SHAPE,
+    not the memory order -- ``.RED.A1T0`` for the predicated inline-PTX credit (the multicast bias ring's four ring credits are the
+    same ``USYNCS.ARRIVE.TRANS64.RED.A1T0`` at the same positions before and after the flip, 3640 instructions identical, 16 cubin
+    bytes = the arrive's ordering bits), ``.RED.ACT0`` for the unpredicated DSL arrive (:func:`arrive_on_leader_release` and the
+    unpredicated arm here; a local arrive is the non-``RED`` ``USYNCS.ARRIVE.TRANS64.ACT0``) -- with no ``CGAERRBAR`` /
+    ``MEMBAR.ALL.GPU`` on either form; every mnemonic is pinned and printed by ``test_tile_dsl_release_arrive.py``.  Never
+    ``.release.cluster`` (a GPU-scope drain per arrive).  The predicated arms are inline PTX with one REGISTER operand (the
+    ``inline_ptx(predicate=)`` hazard needs an immediate operand, which these templates do not have).  Both ``release_cta=True`` arms are
+    pinned by ``test_tile_dsl_release_arrive.py`` (forms ``peer_release`` / ``peer_release_pred``: the PTX form, the SASS no-drain pins, a
+    2-CTA publish-then-read on Rubin); the unpredicated arm has no kernel caller yet -- the pin is what keeps it from rotting unseen."""
     peer_mb = nvvm.mapa(mb, peer_cta_id)
     if cutlass.const_expr(pred is None):
-        nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+        if cutlass.const_expr(release_cta):
+            nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA, relaxed=False)
+        else:
+            nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+    elif cutlass.const_expr(release_cta):
+        nvvm.inline_ptx(
+            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [{$r0}];",
+            read_only_args=[peer_mb.ir_value()],
+            predicate=pred,
+        )
     else:
         nvvm.inline_ptx(
             "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [{$r0}];",
@@ -421,5 +460,6 @@ class MBarrier:
                 )
             arrive_on_leader(self.smem_ptr, leader_cta_id, cta_group)
 
-    def arrive_on_peer(self, peer_cta_id, pred=None):
-        mbar_arrive_on_peer(self.smem_ptr, peer_cta_id, pred=pred)
+    def arrive_on_peer(self, peer_cta_id, pred=None, release_cta: bool = False):
+        # release_cta=True = the .release.cta cluster arrive of a READ-then-credit across CTAs (see mbar_arrive_on_peer); appended, default off.
+        mbar_arrive_on_peer(self.smem_ptr, peer_cta_id, pred=pred, release_cta=release_cta)
